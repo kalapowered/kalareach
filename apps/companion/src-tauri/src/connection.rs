@@ -571,6 +571,17 @@ impl Unopened {
         Self::of_kept_refusal(session.connection_refusal(), refusal)
     }
 
+    /// The link error that carries the host's refusal of the connection `session` runs on, when the
+    /// session kept one: the form in which a dial that a lease's keeper stopped holds it, which
+    /// [`Self::of_link`] gives its meaning. The session's kept refusal is asked for here and
+    /// nowhere else.
+    #[must_use]
+    pub(crate) fn refusal_kept_by(session: &Session) -> Option<LinkError> {
+        session
+            .connection_refusal()
+            .map(LinkError::ConnectionRefused)
+    }
+
     /// The host's refusal of a connection, when `refusal` is the one that the connection's owner
     /// kept as the host's answer to the connection itself (`kept`, as a session or a wire keeps
     /// it), and not a refusal of a request.

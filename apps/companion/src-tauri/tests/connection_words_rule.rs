@@ -19,32 +19,54 @@
 //! - a read of a protocol error's code that is not the code passed on as the first argument of a
 //!   constructor: a comparison, a `match` or a match arm, the code as text (`as_str()`,
 //!   `to_string()` or its wire name), its retry category, or any other use of `.code`;
-//! - a refusal's words compared or searched (`.message ==`, `.message.contains(..)`, an error's
-//!   `to_string()` searched, and the like);
-//! - a handling of a refused connection: the refusal a session or a wire kept
-//!   (`connection_refusal(`), the link errors that carry a host's refusal of a connection
-//!   (`LinkError::Refused`, `LinkError::ConnectionRefused`) and the cause that names it
-//!   (`Asked::Connection`), which only the functions above handle.
+//! - a refusal's words compared, searched or matched, from a receiver of any name (`.message`, or an
+//!   error's `to_string()`), with the search on the same line or on the next;
+//! - a handling of a refused connection: the link errors that carry a host's refusal of a
+//!   connection (`LinkError::Refused`, `LinkError::ConnectionRefused`) and the cause that names it
+//!   (`Asked::Connection`), which only the functions above handle;
+//! - the client's accessor of the refusal that a connection kept (`connection_refusal(`), which is
+//!   asked for in `connection.rs` and nowhere else. No exception excuses it.
 //!
 //! An exception names one file, one function, one needle and how many lines of that function it
-//! excuses, and says why: a line that is not excused, an exception that excuses more or fewer lines
-//! than it names, and one that excuses none, each fail the case. The rule has cases of its own: the
-//! forms that must fail, and the honest forms that must pass.
+//! excuses, and says why. It ends where its function ends: a line stands in the function whose
+//! braces hold it. Where a file holds two functions of one name the exception names the type of the
+//! `impl` too (`Type::name`, and `(free)::name` for a function that is in no `impl`). A line that is
+//! not excused, an exception that excuses more or fewer lines than it names, and one that excuses
+//! none, each fail the case. Comments (line, doc and block) and the contents of string and character
+//! literals are not read as code; only a code's wire name is looked for in a literal. The rule has
+//! cases of its own: the forms that must fail, and the honest forms that must pass.
+//!
+//! **What a rule over source text cannot see**, and does not try to:
+//!
+//! - a code that is read under another name or after a `use` that renames or imports the variants
+//!   (`use ErrorCode as Code`, `use ErrorCode::*`), or that is handed to a function through a
+//!   variable (`transient(code)`), so that the text names neither `.code` nor `ErrorCode::`;
+//! - words passed on through a variable (`let words = &refusal.message; words.contains(..)`);
+//! - a variant that is imported without its type's name. This arm cannot be written either:
+//!   `ConnectionRefused(refusal) => Unopened::NotAdmitted(refusal.into())`, because
+//!   `Unopened::NotAdmitted` holds the host's words (`connection::HostWords`) and no conversion from
+//!   a refusal into them exists, so only `Unopened::of_refused_connection` makes that cause, and the
+//!   compiler, not this rule, keeps it so.
+//!
+//! A reading of these forms is found by review of the change that adds it, and by the compiler where
+//! the cause's types forbid it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use kr_protocol::error::ErrorCode;
 
-/// The file that makes the cause, and the functions in it that read a host's refusal of a connection
-/// so that no other place does.
-const HOME: (&str, [&str; 4]) = (
+/// The file that makes the cause, the type whose functions in it read a host's refusal of a
+/// connection so that no other place does, and those functions.
+const HOME: (&str, &str, [&str; 5]) = (
     "connection.rs",
+    "Unopened",
     [
         "of_link",
         "of_connection",
         "of_kept_refusal",
         "of_refused_connection",
+        "refusal_kept_by",
     ],
 );
 
@@ -55,9 +77,12 @@ const AS_TEXT: &str = "a code as text";
 const CATEGORY: &str = "a code's retry category";
 const WORDS: &str = "words compared or searched";
 
+/// The client's accessor of the refusal that a connection kept. It is asked for in `HOME`'s file
+/// and nowhere else, and no exception excuses it.
+const ACCESSOR: &str = "connection_refusal(";
+
 /// The handling of a refused connection that only the functions of `HOME` do, each its own needle.
-const HANDLING: [&str; 6] = [
-    "connection_refusal(",
+const HANDLING: [&str; 5] = [
     "LinkError::Refused",
     "LinkError::ConnectionRefused",
     "Asked::Connection",
@@ -79,20 +104,20 @@ const WORD_READS: [&str; 10] = [
     ".eq(",
 ];
 
-/// What a receiver is called when it is an error, a refusal or a cause, so that its `to_string()`
-/// is an error's text and not an identifier's.
-const ERROR_NAMES: [&str; 8] = [
-    "error", "refus", "failure", "cause", "unopened", "reason", "problem", "stop",
-];
-
 /// What searches or compares an error's text when it follows `.to_string()`.
-const TEXT_READS: [&str; 5] = [".contains(", ".starts_with(", ".ends_with(", " ==", " !="];
+const TEXT_READS: [&str; 5] = [".contains(", ".starts_with(", ".ends_with(", "==", "!="];
 
 /// A read of a code or of words, or a handling of a refused connection, that the rule objects to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Hit {
     file: String,
+    /// The function the line stands in, or none outside any function.
     function: String,
+    /// The type of the `impl` the function stands in, or none.
+    owner: String,
+    /// Whether another function of the file has the same name in another `impl`, so that an
+    /// exception names the type too (`Type::name`).
+    shared: bool,
     needle: &'static str,
     line: usize,
     text: String,
@@ -132,6 +157,34 @@ const EXCEPTIONS: [Exception; 61] = [
         needle: COMPARED,
         lines: 1,
         reason: "the refusal of a snapshot read that asks for a resync, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "commands.rs",
+        function: "voice_allow",
+        needle: WORDS,
+        lines: 1,
+        reason: "compares the text of an environment identifier with another's; it reads no refusal's words",
+    },
+    Exception {
+        file: "settings/drafts.rs",
+        function: "keep_copies_listed",
+        needle: WORDS,
+        lines: 1,
+        reason: "compares the text of a draft's identifier with a listed one; it reads no refusal's words",
+    },
+    Exception {
+        file: "settings/drafts.rs",
+        function: "proven_host",
+        needle: WORDS,
+        lines: 1,
+        reason: "compares the text of a session identifier with a record's; it reads no refusal's words",
+    },
+    Exception {
+        file: "settings/sync/members.rs",
+        function: "join_in_a_step",
+        needle: WORDS,
+        lines: 1,
+        reason: "compares the text of a collection identifier with a reference; it reads no refusal's words",
     },
     Exception {
         file: "connection.rs",
@@ -212,7 +265,7 @@ const EXCEPTIONS: [Exception; 61] = [
     },
     Exception {
         file: "inbox.rs",
-        function: "from",
+        function: "Missed::from",
         needle: "Asked::Connection",
         lines: 1,
         reason: "tells the causes that are no refusal of a request, the host's bound and this computer's budget, as the visit's refusal in their own words; it reads no code",
@@ -251,20 +304,6 @@ const EXCEPTIONS: [Exception; 61] = [
         needle: USED,
         lines: 1,
         reason: "decides whether to present the lease again over a connection that is open; it chooses no words",
-    },
-    Exception {
-        file: "lease.rs",
-        function: "failed_on",
-        needle: "LinkError::ConnectionRefused",
-        lines: 1,
-        reason: "carries the refusal that the session kept to its cause (`Unopened::of_link`) at every stop of the lease's keeper; it reads no code or words",
-    },
-    Exception {
-        file: "lease.rs",
-        function: "failed_on",
-        needle: "connection_refusal(",
-        lines: 1,
-        reason: "carries the refusal that the session kept to its cause (`Unopened::of_link`) at every stop of the lease's keeper; it reads no code or words",
     },
     Exception {
         file: "mailbox.rs",
@@ -324,7 +363,7 @@ const EXCEPTIONS: [Exception; 61] = [
     },
     Exception {
         file: "questions.rs",
-        function: "settle",
+        function: "(free)::settle",
         needle: COMPARED,
         lines: 1,
         reason: "the refusal of a read of a session's questions, answered on a connection that is open; it decides nothing about a connection that was not opened",
@@ -362,14 +401,14 @@ const EXCEPTIONS: [Exception; 61] = [
         function: "of_link",
         needle: "LinkError::Refused",
         lines: 1,
-        reason: "a refusal at the handshake is answered by its code about listing, as before a host's refusal of a connection was read: only a refusal to list the host's devices to this computer is an answer about them",
+        reason: "a refusal at the handshake is the host's decision about this device, answered by its code about listing as on main: only a refusal to list the host's devices to this computer is an answer about them; it reads no refusal of a connection that was admitted",
     },
     Exception {
         file: "settings/connected.rs",
         function: "of_link",
         needle: USED,
         lines: 1,
-        reason: "a refusal at the handshake is answered by its code about listing, as before a host's refusal of a connection was read: only a refusal to list the host's devices to this computer is an answer about them",
+        reason: "a refusal at the handshake is the host's decision about this device, answered by its code about listing as on main: only a refusal to list the host's devices to this computer is an answer about them; it reads no refusal of a connection that was admitted",
     },
     Exception {
         file: "settings/connected.rs",
@@ -415,7 +454,7 @@ const EXCEPTIONS: [Exception; 61] = [
     },
     Exception {
         file: "settings/sync/fence.rs",
-        function: "change",
+        function: "raise",
         needle: WORDS,
         lines: 1,
         reason: "ends the host's own words with a full stop before this computer's words follow; it chooses no words from them",
@@ -493,13 +532,6 @@ const EXCEPTIONS: [Exception; 61] = [
     Exception {
         file: "terminal/view.rs",
         function: "open_paired",
-        needle: "connection_refusal(",
-        lines: 1,
-        reason: "hands the refusal that the view's wire kept to the one function that tells a refusal of a connection from a refusal of a request",
-    },
-    Exception {
-        file: "terminal/view.rs",
-        function: "open_paired",
         needle: "of_kept_refusal(",
         lines: 1,
         reason: "hands the refusal that the view's wire kept to the one function that tells a refusal of a connection from a refusal of a request",
@@ -510,13 +542,6 @@ const EXCEPTIONS: [Exception; 61] = [
         needle: USED,
         lines: 1,
         reason: "the refusal of a request of the view, answered on a connection that is open; it decides nothing about a connection that was not opened",
-    },
-    Exception {
-        file: "terminal/wire.rs",
-        function: "connection_refusal",
-        needle: "connection_refusal(",
-        lines: 1,
-        reason: "the wire's own record of the host's refusal of the connection, which only the view's opening hands to the one function that gives it its meaning",
     },
     Exception {
         file: "voice/host.rs",
@@ -568,28 +593,158 @@ fn sources(root: &Path, directory: &Path, found: &mut Vec<(String, String)>) {
     }
 }
 
-/// The lines of `text` that the product runs, with their numbers and without their comments. A test
-/// module (`#[cfg(test)]` on a `mod`, closed by a `}` in the first column) is left out wherever it
-/// stands, and a `#[cfg(test)]` on anything else leaves the scan where it is.
-fn code_lines(text: &str) -> Vec<(usize, String)> {
-    let lines: Vec<&str> = text.lines().collect();
+/// One line of the product's source, as the rule reads it.
+struct Line {
+    number: usize,
+    /// The line without its comments and without the contents of its string and character literals.
+    code: String,
+    /// The line without its comments and with its literals, where a code's wire name is looked for.
+    text: String,
+}
+
+/// Where the quoted text that starts at `start` (a `quote`) ends: the index after its closing quote.
+fn after_quoted(chars: &[char], start: usize, quote: char) -> usize {
+    let mut at = start + 1;
+    while at < chars.len() {
+        match chars[at] {
+            '\\' => at += 2,
+            character if character == quote => return at + 1,
+            _ => at += 1,
+        }
+    }
+    chars.len()
+}
+
+/// `text` without its comments (line, doc and block comments, the block ones nested) and, unless
+/// `keep_literals`, without the contents of its string and character literals, with every line
+/// break kept so that the numbers of the lines stay.
+fn stripped(text: &str, keep_literals: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < chars.len() {
+        let next = chars.get(at + 1).copied();
+        match (chars[at], next) {
+            ('/', Some('/')) => {
+                while at < chars.len() && chars[at] != '\n' {
+                    at += 1;
+                }
+            }
+            ('/', Some('*')) => {
+                let mut depth = 0_usize;
+                while at < chars.len() {
+                    match (chars[at], chars.get(at + 1).copied()) {
+                        ('/', Some('*')) => {
+                            depth += 1;
+                            at += 2;
+                        }
+                        ('*', Some('/')) => {
+                            depth -= 1;
+                            at += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        ('\n', _) => {
+                            out.push('\n');
+                            at += 1;
+                        }
+                        _ => at += 1,
+                    }
+                }
+                out.push(' ');
+            }
+            ('r', Some('"' | '#'))
+                if !at
+                    .checked_sub(1)
+                    .is_some_and(|before| is_word(chars[before])) =>
+            {
+                let hashes = chars[at + 1..].iter().take_while(|c| **c == '#').count();
+                if chars.get(at + 1 + hashes) != Some(&'"') {
+                    out.push('r');
+                    at += 1;
+                    continue;
+                }
+                let body = at + 2 + hashes;
+                let closing: Vec<char> = std::iter::once('"')
+                    .chain(std::iter::repeat_n('#', hashes))
+                    .collect();
+                let end = (body..chars.len())
+                    .find(|from| chars[*from..].starts_with(&closing))
+                    .map_or(chars.len(), |from| from + closing.len());
+                let literal: String = chars[at..end].iter().collect();
+                if keep_literals {
+                    out.push_str(&literal);
+                } else {
+                    out.push_str("\"\"");
+                    out.extend(literal.chars().filter(|c| *c == '\n'));
+                }
+                at = end;
+            }
+            ('"', _) => {
+                let end = after_quoted(&chars, at, '"');
+                let literal: String = chars[at..end.min(chars.len())].iter().collect();
+                if keep_literals {
+                    out.push_str(&literal);
+                } else {
+                    out.push_str("\"\"");
+                    out.extend(literal.chars().filter(|c| *c == '\n'));
+                }
+                at = end;
+            }
+            ('\'', _) => {
+                // A character literal, or the start of a lifetime.
+                let end = match (next, chars.get(at + 2).copied()) {
+                    (Some('\\'), _) => Some(after_quoted(&chars, at, '\'')),
+                    (Some(_), Some('\'')) => Some(at + 3),
+                    _ => None,
+                };
+                match end {
+                    Some(end) => {
+                        let literal: String = chars[at..end.min(chars.len())].iter().collect();
+                        out.push_str(if keep_literals { &literal } else { "' '" });
+                        at = end;
+                    }
+                    None => {
+                        out.push('\'');
+                        at += 1;
+                    }
+                }
+            }
+            (character, _) => {
+                out.push(character);
+                at += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The lines of `text` that the product runs, with their numbers, without their comments, and
+/// without the contents of their string literals. A test module (`#[cfg(test)]` on a `mod`, closed
+/// by a `}` in the first column) is left out wherever it stands, and a `#[cfg(test)]` on anything
+/// else leaves the scan where it is.
+fn code_lines(text: &str) -> Vec<Line> {
+    let code: Vec<String> = stripped(text, false).lines().map(str::to_owned).collect();
+    let literal: Vec<String> = stripped(text, true).lines().map(str::to_owned).collect();
     let mut kept = Vec::new();
     let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
+    while index < code.len() {
+        let line = &code[index];
         if line.trim_end() == "#[cfg(test)]" {
             let mut item = index + 1;
-            while lines
+            while code
                 .get(item)
                 .is_some_and(|next| next.trim_start().starts_with("#["))
             {
                 item += 1;
             }
-            let is_module = lines.get(item).is_some_and(|next| {
-                next.trim_start_matches("pub ").starts_with("mod ") && next.ends_with('{')
+            let is_module = code.get(item).is_some_and(|next| {
+                next.trim_start_matches("pub ").starts_with("mod ")
+                    && next.trim_end().ends_with('{')
             });
             if is_module {
-                while item < lines.len() && lines[item] != "}" {
+                while item < code.len() && code[item].trim_end() != "}" {
                     item += 1;
                 }
                 index = item + 1;
@@ -599,11 +754,13 @@ fn code_lines(text: &str) -> Vec<(usize, String)> {
             continue;
         }
         index += 1;
-        if line.trim_start().starts_with("//") {
-            continue;
+        if !line.trim().is_empty() {
+            kept.push(Line {
+                number: index,
+                code: line.clone(),
+                text: literal.get(index - 1).cloned().unwrap_or_default(),
+            });
         }
-        let code = line.split(" // ").next().unwrap_or(line);
-        kept.push((index, code.to_owned()));
     }
     kept
 }
@@ -613,6 +770,12 @@ fn function_named(line: &str) -> Option<String> {
     let mut rest = line.trim_start();
     loop {
         let before = rest;
+        // A visibility that names a path: `pub(in crate::settings) `.
+        if let Some(path) = rest.strip_prefix("pub(in ")
+            && let Some((_, after)) = path.split_once(") ")
+        {
+            rest = after;
+        }
         for prefix in [
             "pub(crate) ",
             "pub(super) ",
@@ -704,8 +867,23 @@ fn is_passed_on(line: &str, previous: &str, start: usize, end: usize) -> bool {
     opened && line[end..].trim_start().starts_with(',')
 }
 
-/// What `line` reads of a code or of words, or handles of a refused connection.
-fn needles(line: &str, previous: &str) -> Vec<&'static str> {
+/// What follows a field or a call on `line`, read through the end of the line: the rest of the line,
+/// and the start of the next one when the rest is empty, so a search that stands on the next line
+/// counts.
+fn continued<'a>(rest: &'a str, next: &'a str) -> &'a str {
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        next.trim_start()
+    } else {
+        rest
+    }
+}
+
+/// What `line` reads of a code or of words, or handles of a refused connection. `code` is the line
+/// without its comments and literals, `text` the line with its literals (where a code's wire name
+/// stands), `previous` and `next` the lines around it.
+fn needles(code: &str, text: &str, previous: &str, next: &str) -> Vec<&'static str> {
+    let line = code;
     let mut found: Vec<&'static str> = Vec::new();
     let mut note = |needle: &'static str| {
         if !found.contains(&needle) {
@@ -762,28 +940,43 @@ fn needles(line: &str, previous: &str) -> Vec<&'static str> {
     }
     if ErrorCode::ALL
         .iter()
-        .any(|code| line.contains(&format!("\"{}\"", code.as_str())))
+        .any(|code| text.contains(&format!("\"{}\"", code.as_str())))
     {
         note(AS_TEXT);
     }
+    // Words, from a receiver of any name: a refusal's `.message`, compared, searched or matched, on
+    // this line or with the search on the next.
     for (start, end) in fields(line, ".message") {
-        let (before, after) = (line[..start].trim_end(), line[end..].trim_start());
+        let before = line[..start].trim_end();
+        let after = continued(&line[end..], next);
         if before.ends_with("==")
             || before.ends_with("!=")
+            || before.ends_with("match")
+            || after.starts_with('{')
+            || (line.contains("matches!(") && after.starts_with(','))
             || WORD_READS.iter().any(|read| after.starts_with(read))
         {
             note(WORDS);
         }
     }
-    // An error's own text, searched or compared: the receiver names an error, a refusal or a cause.
-    if let Some(at) = line.find(".to_string()") {
-        let after = &line[at + ".to_string()".len()..];
-        let receiver = &line[receiver_start(&line[..at], '.')..at];
+    // An error's own text, searched or compared, from a receiver of any name.
+    let mut from = 0;
+    while let Some(offset) = line[from..].find(".to_string()") {
+        let at = from + offset;
+        let end = at + ".to_string()".len();
+        from = end;
+        let before = line[..receiver_start(&line[..at], '.')].trim_end();
+        let after = continued(&line[end..], next);
         if TEXT_READS.iter().any(|read| after.starts_with(read))
-            && ERROR_NAMES.iter().any(|name| receiver.contains(name))
+            || before.ends_with("==")
+            || before.ends_with("!=")
+            || before.ends_with("match")
         {
             note(WORDS);
         }
+    }
+    if line.contains(ACCESSOR) {
+        note(ACCESSOR);
     }
     for needle in HANDLING {
         if line.contains(needle) {
@@ -793,45 +986,174 @@ fn needles(line: &str, previous: &str) -> Vec<&'static str> {
     found
 }
 
+/// What a pair of braces holds that gives a line its function and its `impl`.
+enum Scope {
+    Impl(String),
+    Function(String),
+}
+
+/// The type an `impl` header on `line` is for, when it is one.
+fn impl_type(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("impl")?;
+    if !rest.starts_with(|character: char| character == '<' || character.is_whitespace()) {
+        return None;
+    }
+    let mut rest = rest.trim_start();
+    if rest.starts_with('<') {
+        let mut depth = 0_usize;
+        let end = rest.char_indices().find_map(|(index, character)| {
+            match character {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(index + 1)
+        })?;
+        rest = rest[end..].trim_start();
+    }
+    let target = rest.split_once(" for ").map_or(rest, |(_, target)| target);
+    let path: String = target
+        .trim_start()
+        .chars()
+        .take_while(|character| is_word(*character) || *character == ':')
+        .collect();
+    path.rsplit("::")
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 /// Every read of a code or of words, and every handling of a refused connection, that `text` holds
-/// outside its test modules, outside the functions that are `HOME`'s when `file` is.
+/// outside its test modules, outside the functions that are `HOME`'s when `file` is. A line stands
+/// in the function whose braces hold it, and no longer: where a function ends its exceptions end.
 fn scan(file: &str, text: &str) -> Vec<Hit> {
+    let lines = code_lines(text);
     let mut hits = Vec::new();
-    let mut function = String::new();
-    let mut previous = String::new();
-    for (number, line) in code_lines(text) {
-        if let Some(name) = function_named(&line) {
-            function = name;
+    let mut declared: Vec<(String, String)> = Vec::new();
+    let mut scopes: Vec<(Scope, i32)> = Vec::new();
+    let mut pending: Option<Scope> = None;
+    let (mut depth, mut parens) = (0_i32, 0_i32);
+    let owner_in = |scopes: &[(Scope, i32)]| {
+        scopes
+            .iter()
+            .rev()
+            .find_map(|(scope, _)| match scope {
+                Scope::Impl(owner) => Some(owner.clone()),
+                Scope::Function(_) => None,
+            })
+            .unwrap_or_default()
+    };
+    let function_in = |scopes: &[(Scope, i32)]| {
+        scopes
+            .iter()
+            .rev()
+            .find_map(|(scope, _)| match scope {
+                Scope::Function(name) => Some(name.clone()),
+                Scope::Impl(_) => None,
+            })
+            .unwrap_or_default()
+    };
+    let mut previous = "";
+    for (position, line) in lines.iter().enumerate() {
+        if let Some(name) = function_named(&line.code) {
+            declared.push((owner_in(&scopes), name.clone()));
+            pending = Some(Scope::Function(name));
+            parens = 0;
+        } else if pending.is_none()
+            && let Some(owner) = impl_type(&line.code)
+        {
+            pending = Some(Scope::Impl(owner));
+            parens = 0;
         }
-        for needle in needles(&line, &previous) {
+        let mut function = match &pending {
+            Some(Scope::Function(name)) => name.clone(),
+            _ => function_in(&scopes),
+        };
+        let mut owner = owner_in(&scopes);
+        for character in line.code.chars() {
+            match character {
+                '(' | '[' => parens += 1,
+                ')' | ']' => parens -= 1,
+                ';' if parens <= 0 => pending = None,
+                '{' => {
+                    depth += 1;
+                    if let Some(scope) = pending.take() {
+                        scopes.push((scope, depth));
+                        function = function_in(&scopes);
+                        owner = owner_in(&scopes);
+                    }
+                }
+                '}' => {
+                    if scopes.last().is_some_and(|(_, inside)| *inside == depth) {
+                        scopes.pop();
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let next = lines
+            .get(position + 1)
+            .map_or("", |next| next.code.as_str());
+        for needle in needles(&line.code, &line.text, previous, next) {
             hits.push(Hit {
                 file: file.to_owned(),
                 function: function.clone(),
+                owner: owner.clone(),
+                shared: false,
                 needle,
-                line: number,
-                text: line.trim().to_owned(),
+                line: line.number,
+                text: line.code.trim().to_owned(),
             });
         }
-        previous = line;
+        previous = &line.code;
     }
-    hits.retain(|hit| !(hit.file == HOME.0 && HOME.1.contains(&hit.function.as_str())));
+    for hit in &mut hits {
+        let mut owners: Vec<&String> = declared
+            .iter()
+            .filter(|(_, name)| *name == hit.function)
+            .map(|(owner, _)| owner)
+            .collect();
+        owners.sort();
+        owners.dedup();
+        hit.shared = owners.len() > 1;
+    }
+    hits.retain(|hit| {
+        let home = hit.file == HOME.0;
+        !(home && hit.owner == HOME.1 && HOME.2.contains(&hit.function.as_str()))
+            && !(home && hit.needle == ACCESSOR)
+    });
     hits
+}
+
+/// The name an exception gives a hit's function: the bare name, and the type too where the file
+/// holds two functions of that name.
+fn named_function(hit: &Hit) -> String {
+    if hit.shared && hit.owner.is_empty() {
+        format!("(free)::{}", hit.function)
+    } else if hit.shared {
+        format!("{}::{}", hit.owner, hit.function)
+    } else {
+        hit.function.clone()
+    }
 }
 
 /// What is wrong with `hits` against `exceptions`: a place that no exception excuses, an exception
 /// that excuses a different number of lines than the place has, and an exception that matches none.
 fn problems(hits: &[Hit], exceptions: &[Exception]) -> Vec<String> {
-    let mut places: BTreeMap<(&str, &str, &str), Vec<&Hit>> = BTreeMap::new();
+    let mut places: BTreeMap<(&str, String, &str), Vec<&Hit>> = BTreeMap::new();
     for hit in hits {
         places
-            .entry((&hit.file, &hit.function, hit.needle))
+            .entry((&hit.file, named_function(hit), hit.needle))
             .or_default()
             .push(hit);
     }
     let mut found = Vec::new();
     for ((file, function, needle), lines) in &places {
         let excuse = exceptions.iter().find(|exception| {
-            (exception.file, exception.function, exception.needle) == (*file, *function, *needle)
+            (exception.file, exception.function, exception.needle)
+                == (*file, function.as_str(), *needle)
+                && *needle != ACCESSOR
         });
         let shown = lines
             .iter()
@@ -849,7 +1171,11 @@ fn problems(hits: &[Hit], exceptions: &[Exception]) -> Vec<String> {
         }
     }
     for exception in exceptions {
-        if !places.contains_key(&(exception.file, exception.function, exception.needle)) {
+        if !places.contains_key(&(
+            exception.file,
+            exception.function.to_owned(),
+            exception.needle,
+        )) {
             found.push(format!(
                 "{} `{}` {}: the exception matches no line ({})",
                 exception.file, exception.function, exception.needle, exception.reason
@@ -907,9 +1233,9 @@ fn the_rule_reads_every_source_file_and_leaves_out_only_the_functions_that_make_
         .expect("the file that makes the cause");
     let declared: Vec<String> = code_lines(home)
         .iter()
-        .filter_map(|(_, line)| function_named(line))
+        .filter_map(|line| function_named(&line.code))
         .collect();
-    for function in HOME.1 {
+    for function in HOME.2 {
         assert!(
             declared.iter().any(|name| name == function),
             "{function} makes the cause in {}",
@@ -1005,7 +1331,7 @@ fn the_forms_that_read_a_refusal_fail_the_rule() {
         ),
         (
             "fn a(session: &Session) -> Option<ProtocolError> { session.connection_refusal() }",
-            "connection_refusal(",
+            ACCESSOR,
         ),
         (
             "fn a(error: LinkError) { match error { LinkError::ConnectionRefused(refusal) => drop(refusal), _ => {} } }",
@@ -1067,7 +1393,7 @@ fn the_honest_forms_pass_the_rule() {
         "fn a(error: ProtocolError) -> CommandError { Self::new(error.code, error.message) }",
         "fn a(error: LinkError) -> Unopened { Unopened::of_link(error) }",
         "fn a(unopened: &Unopened) -> bool { unopened.for_now() }",
-        "fn a(error: CommandError) -> Unopened { Unopened::NotAdmitted(error) }",
+        "fn a(words: HostWords) -> Unopened { Unopened::NotAdmitted(words) }",
         "fn a(refusal: ProtocolError) -> String { format!(\"the host said: {}\", refusal.message) }",
         "fn a(refusal: &ProtocolError) -> String { refusal.message.clone() }",
         "fn a(refusal: &ProtocolError) -> String { refusal.message.to_owned() }",
@@ -1084,6 +1410,201 @@ fn the_honest_forms_pass_the_rule() {
             read_by(snippet)
         );
     }
+}
+
+/// KR-REQ-19.08: the client's accessor of a connection's kept refusal is asked for in the file that
+/// makes the cause and nowhere else, and no exception excuses it.
+#[test]
+fn the_accessor_of_a_connections_kept_refusal_is_asked_for_in_one_file_only() {
+    let asked =
+        "fn a(session: &Session) -> Option<ProtocolError> {\n    session.connection_refusal()\n}\n";
+    for file in [
+        "lease.rs",
+        "terminal/view.rs",
+        "terminal/wire.rs",
+        "anything.rs",
+    ] {
+        let hits = scan(file, asked);
+        assert_eq!(
+            hits.iter().map(|hit| hit.needle).collect::<Vec<_>>(),
+            [ACCESSOR],
+            "{file}"
+        );
+    }
+    let defined = "impl Wire {\n    fn connection_refusal(&self) -> Option<ProtocolError> {\n        None\n    }\n}\n";
+    assert_eq!(
+        scan("terminal/wire.rs", defined)
+            .iter()
+            .map(|hit| hit.needle)
+            .collect::<Vec<_>>(),
+        [ACCESSOR],
+        "a function of that name is the accessor's name too"
+    );
+    assert!(
+        scan(HOME.0, asked).is_empty(),
+        "the file that makes the cause asks for it"
+    );
+
+    let hits = scan("lease.rs", asked);
+    let excuse = [Exception {
+        file: "lease.rs",
+        function: "a",
+        needle: ACCESSOR,
+        lines: 1,
+        reason: "a test",
+    }];
+    assert_eq!(
+        problems(&hits, &excuse).len(),
+        1,
+        "an exception for it excuses nothing"
+    );
+    assert!(
+        EXCEPTIONS
+            .iter()
+            .all(|exception| exception.needle != ACCESSOR),
+        "no exception holds the accessor"
+    );
+}
+
+/// KR-REQ-19.08: words compared, searched or matched are found from a receiver of any name, with the
+/// search on the line after the field or the call.
+#[test]
+fn words_are_found_from_a_receiver_of_any_name_and_across_a_line_end() {
+    let fails = [
+        "fn decides(e: &ProtocolError) -> bool {\n    e.to_string().contains(\"withdrawn\")\n}\n",
+        "fn decides(x: &ProtocolError) -> bool {\n    x.to_string() == \"the host withdrew it\"\n}\n",
+        "fn decides(x: &ProtocolError) -> bool {\n    \"the host withdrew it\" == x.to_string()\n}\n",
+        "fn decides(e: &ProtocolError) -> bool {\n    e.to_string()\n        .starts_with(\"no\")\n}\n",
+        "fn decides(r: &ProtocolError) -> bool {\n    r.message\n        .contains(\"withdrawn\")\n}\n",
+        "fn decides(r: &ProtocolError) -> bool {\n    q.message.ends_with(\"x\") || r.message\n        == \"y\"\n}\n",
+        "fn decides(m: &ProtocolError) -> u8 {\n    match m.message.as_str() {\n        _ => 1,\n    }\n}\n",
+        "fn decides(m: &ProtocolError) -> u8 {\n    match m.message {\n        _ => 1,\n    }\n}\n",
+    ];
+    for snippet in fails {
+        assert_eq!(
+            read_by(snippet),
+            [WORDS],
+            "the rule does not find the words in:\n{snippet}"
+        );
+    }
+    let passes = [
+        "fn a(e: &ProtocolError) -> String { e.to_string() }\n",
+        "fn a(e: &ProtocolError) -> String {\n    format!(\"the host said {}\", e.message)\n}\n",
+        "fn a(r: &ProtocolError) -> String {\n    r.message\n        .clone()\n}\n",
+    ];
+    for snippet in passes {
+        assert!(
+            read_by(snippet).is_empty(),
+            "the rule objects to:\n{snippet}"
+        );
+    }
+}
+
+/// KR-REQ-19.08: an exception ends where its function ends. A line after the function stands in no
+/// function, a line inside it stands in it whatever blocks it holds, and a function whose visibility
+/// names a path is the function.
+#[test]
+fn an_exception_ends_where_its_function_ends() {
+    let after = "fn a(r: Refusal) -> bool {\n    r.code == ErrorCode::A\n}\n\nimpl Thing {\n    const LATER: bool = r.code == ErrorCode::B;\n}\n";
+    let hits = scan("snippet.rs", after);
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.function.as_str())
+            .collect::<Vec<_>>(),
+        ["a", ""],
+        "{hits:?}"
+    );
+    let excuse = [Exception {
+        file: "snippet.rs",
+        function: "a",
+        needle: COMPARED,
+        lines: 1,
+        reason: "a test",
+    }];
+    let wrong = problems(&hits, &excuse);
+    assert_eq!(wrong.len(), 1, "{wrong:?}");
+    assert!(
+        wrong[0].contains("LATER"),
+        "the line after the function stays found: {wrong:?}"
+    );
+
+    let blocks = "fn a(r: Refusal) {\n    if x {\n        y();\n    }\n    let _ = r.code == ErrorCode::A;\n}\n";
+    assert_eq!(scan("snippet.rs", blocks)[0].function, "a");
+
+    let path = "fn first() {}\npub(in crate::settings) fn second(r: Refusal) -> bool {\n    r.code == ErrorCode::A\n}\n";
+    assert_eq!(scan("snippet.rs", path)[0].function, "second");
+
+    let signature = "fn a<T>(\n    r: Refusal,\n    other: [u8; 4],\n) -> bool\nwhere\n    T: Copy,\n{\n    r.code == ErrorCode::A\n}\n";
+    assert_eq!(scan("snippet.rs", signature)[0].function, "a");
+}
+
+/// KR-REQ-19.08: where a file holds two functions of one name, an exception names the type of the
+/// `impl` too, and a bare name excuses neither.
+#[test]
+fn two_functions_of_one_name_in_a_file_are_excused_by_their_types() {
+    let snippet = "impl A {\n    fn of(r: Refusal) -> bool {\n        r.code == ErrorCode::A\n    }\n}\n\nimpl B {\n    fn of(r: Refusal) -> bool {\n        r.code == ErrorCode::B\n    }\n}\n\nfn of(r: Refusal) -> bool {\n    r.code == ErrorCode::C\n}\n";
+    let hits = scan("snippet.rs", snippet);
+    let excuse = |function| Exception {
+        file: "snippet.rs",
+        function,
+        needle: COMPARED,
+        lines: 1,
+        reason: "a test",
+    };
+    assert!(
+        problems(
+            &hits,
+            &[excuse("A::of"), excuse("B::of"), excuse("(free)::of")]
+        )
+        .is_empty()
+    );
+    let bare = problems(&hits, &[excuse("of")]);
+    assert_eq!(
+        bare.len(),
+        4,
+        "three places stay found and the bare name is stale: {bare:?}"
+    );
+    let one = problems(&hits, &[excuse("A::of"), excuse("(free)::of")]);
+    assert_eq!(one.len(), 1, "{one:?}");
+    assert!(one[0].contains("B::of"), "{one:?}");
+}
+
+/// KR-REQ-19.08: comments (line, doc and block, nested) and string and character literals are not
+/// read as code, a brace in a character literal ends no function, and a code's wire name in a literal
+/// is still found.
+#[test]
+fn comments_and_literals_are_not_read_as_code() {
+    let passes = [
+        "/* refusal.code == ErrorCode::PermissionDenied */\nfn a() {}\n",
+        "/*\n * match refusal.code {\n *     ErrorCode::ResourceUnavailable => 1,\n * }\n */\nfn a() {}\n",
+        "/* outer /* inner */ refusal.code == ErrorCode::PermissionDenied */\nfn a() {}\n",
+        "fn a() -> &'static str { \"refusal.code == ErrorCode::PermissionDenied\" }\n",
+        "fn a() -> &'static str { \"refusal.message.contains(x)\" }\n",
+        "fn a() -> &'static str {\n    \"a literal over\n     two lines: e.to_string().contains(x)\"\n}\n",
+        "fn a() -> &'static str { r#\"e.to_string().contains(\"x\")\"# }\n",
+        "fn a(c: char) -> bool { c == '\"' || c == '\\'' }\n",
+    ];
+    for snippet in passes {
+        assert!(
+            read_by(snippet).is_empty(),
+            "the rule objects to:\n{snippet}"
+        );
+    }
+    let braces = "fn a(c: char) -> bool { c == '{' }\n\nfn b(r: Refusal) -> bool {\n    r.code == ErrorCode::A\n}\n";
+    let hits = scan("snippet.rs", braces);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].function, "b");
+    assert_eq!(
+        read_by("const FULL: &str = \"RESOURCE_UNAVAILABLE\";\n"),
+        [AS_TEXT],
+        "a code's wire name in a literal is found"
+    );
+    let after_a_comment = "/* refusal.code == ErrorCode::PermissionDenied */ fn a(r: Refusal) -> bool { r.code == ErrorCode::A }\n";
+    assert_eq!(
+        read_by(after_a_comment),
+        [COMPARED],
+        "code after a block comment is read"
+    );
 }
 
 /// KR-REQ-19.08: an exception excuses the needle, the function and the number of lines it names and

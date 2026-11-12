@@ -344,8 +344,8 @@ fn failed_on(session: &Session, stop: &LeaseStop) -> LinkError {
     {
         return LinkError::Membership(error);
     }
-    if let Some(refusal) = session.connection_refusal() {
-        return LinkError::ConnectionRefused(refusal);
+    if let Some(refused) = crate::connection::Unopened::refusal_kept_by(session) {
+        return refused;
     }
     failed(stop)
 }

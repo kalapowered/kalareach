@@ -475,9 +475,9 @@ async fn open_paired(
             // this request.
             not_opened_on(
                 dial,
-                Unopened::of_kept_refusal(wire.connection_refusal(), &refusal).unwrap_or_else(
-                    || Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal)),
-                ),
+                Unopened::of_kept_refusal(wire.kept_refusal(), &refusal).unwrap_or_else(|| {
+                    Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal))
+                }),
             )
         })?;
     let opened: SessionOpenResult = opened.to_typed().map_err(|error| {

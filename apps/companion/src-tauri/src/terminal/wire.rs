@@ -67,7 +67,7 @@ pub(super) struct Paired {
     next: u64,
     /// The first error the host answered with request identifier zero: its refusal of the
     /// connection itself, which a call that it answered is told apart from a refusal of its own
-    /// request by ([`Wire::connection_refusal`]).
+    /// request by ([`Wire::kept_refusal`]).
     refusal: Option<ProtocolError>,
 }
 
@@ -143,7 +143,7 @@ impl Wire {
     /// answered with request identifier zero, which no request of the view carries. A call that the
     /// host answered with an error equal to it was refused with the connection, whatever its code,
     /// since a request's refusal can carry the same code.
-    pub(super) fn connection_refusal(&self) -> Option<ProtocolError> {
+    pub(super) fn kept_refusal(&self) -> Option<ProtocolError> {
         match self {
             Self::Local(_) => None,
             Self::Paired(paired) => paired.refusal.clone(),
@@ -336,7 +336,7 @@ impl Wire {
         Ok(answer)
     }
 
-    /// Keeps the host's refusal of the connection, the first one, for [`Self::connection_refusal`].
+    /// Keeps the host's refusal of the connection, the first one, for [`Self::kept_refusal`].
     fn keep_refusal(&mut self, refusal: &ProtocolError) {
         if let Self::Paired(paired) = self {
             paired.refusal.get_or_insert_with(|| refusal.clone());
@@ -473,7 +473,7 @@ mod tests {
             .await
             .expect("the call is answered with the host's refusal, not with the connection ended");
         assert_eq!(answered.expect_err("the host refused"), refusal);
-        assert_eq!(wire.connection_refusal(), Some(refusal));
+        assert_eq!(wire.kept_refusal(), Some(refusal));
     }
 
     /// KR-REQ-19.08: a call whose write fails on a connection that ended with no refusal is told
@@ -486,6 +486,6 @@ mod tests {
             .await
             .expect_err("nothing answered the call");
         assert_eq!(lost.0, "the connection ended");
-        assert_eq!(wire.connection_refusal(), None);
+        assert_eq!(wire.kept_refusal(), None);
     }
 }
