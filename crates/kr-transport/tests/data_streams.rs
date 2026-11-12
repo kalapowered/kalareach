@@ -848,6 +848,13 @@ async fn a_frame_that_stops_arriving_is_cut_by_the_stall_deadline() {
     // The host ends a stream it cut by dropping it, which is what resets a revoked stream.
     drop(stream);
     assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+    // The reset of the half the device reads says nothing of the stop of the half it writes: they
+    // are two frames, so the write waits for the stop.
+    let stopped = awaited("the stop of the device's half", send.stopped()).await;
+    assert!(
+        matches!(stopped, Ok(Some(code)) if code.into_inner() == u64::from(STREAM_REVOKED)),
+        "the host did not stop the device's half with the revoked code: {stopped:?}"
+    );
     assert!(
         matches!(
             send.write_all(&[0u8; 8]).await,
