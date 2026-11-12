@@ -2022,6 +2022,30 @@ fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of
 
     // A program directory on a volume that is not NTFS: a small FAT volume in a virtual disk.
     let disk = folder.join("fat.vhd");
+    // The disk is detached when the case ends in any way, also when an assertion fails before the
+    // case's own detach: an attached disk would keep `Y:` in use for every later run.
+    struct Detach {
+        script: PathBuf,
+        disk: PathBuf,
+    }
+    impl Drop for Detach {
+        fn drop(&mut self) {
+            let lines = [
+                format!("select vdisk file=\"{}\"", self.disk.display()),
+                "detach vdisk".to_owned(),
+            ];
+            let _ = std::fs::write(&self.script, lines.join("\r\n"));
+            let _ = Command::new("diskpart")
+                .arg("/s")
+                .arg(&self.script)
+                .output();
+            let _ = std::fs::remove_file(&self.script);
+        }
+    }
+    let _detach = Detach {
+        script: folder.join("detach.txt"),
+        disk: disk.clone(),
+    };
     let diskpart = |lines: &[String]| {
         let script = folder.join("diskpart.txt");
         std::fs::write(&script, lines.join("\r\n")).unwrap();
@@ -2157,7 +2181,10 @@ fn git_started_by_the_installer_sees_no_variable_of_the_session_that_started_it(
         !made,
         "the installer's Git made the file that the session named"
     );
-    qualified.expect("Git is qualified");
+    // The run's exit status and its one line are read: the version recorded is Git's own.
+    let git = qualified.expect("Git is qualified");
+    assert!(git.version.starts_with("git version "), "{}", git.version);
+    assert!(!git.version.contains('\n'), "{}", git.version);
 }
 
 /// With no manifest there is no installation whose records a leftover could be: a refusal of what
