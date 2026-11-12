@@ -44,7 +44,14 @@ fn sdk_schema(description: &str, extra_member: bool) -> Value {
     if extra_member {
         manifest["properties"]["added"] = json!({ "type": "string" });
     }
-    json!({ "$defs": { "Manifest": manifest } })
+    json!({ "$defs": {
+        "Manifest": manifest,
+        "ConnectorManifest": {
+            "type": "object",
+            "properties": { "manifest": { "$ref": "#/$defs/Manifest" } },
+        },
+        "PluginManifest": { "type": "object", "properties": {} },
+    } })
 }
 
 /// A package contract as a release commits it: the SDK version and, from the release that has the
@@ -726,6 +733,78 @@ fn a_release_whose_contract_cannot_be_read_fails_with_its_own_message() {
     let releases = inventory(&repo.directory).expect("an inventory");
     check(&repo.directory, &repo.head(&now, &head), &releases)
         .expect("a release with no table has an empty one");
+}
+
+/// A run that fails still says the members that passed before it, so that one run shows the whole
+/// state: the member the table lists and the change that fails it.
+#[test]
+fn a_failed_run_still_names_the_members_that_passed() {
+    let before = Tree::the_level();
+    let level = whole_level("sdk-arrival-failed", &before);
+    let mut sdk = sdk_schema("The manifest.", true);
+    sdk["$defs"]["Manifest"]["properties"]["name"] = json!({ "type": "integer" });
+    let broken = Tree {
+        sdk: Some(sdk),
+        contract: Some(sdk_contract(
+            "0.1.7",
+            Some(&[("Manifest", "added", "0.1.7")]),
+        )),
+        ..before
+    };
+    let error = run(&level, &broken).expect_err("a changed member fails");
+    assert!(
+        error.contains("the plugin SDK schema: Manifest.name changed"),
+        "{error}"
+    );
+    assert!(
+        error.contains("note: the plugin SDK member Manifest.added")
+            && error.contains("SDK 0.1.7")
+            && error.contains("SDK 0.1.6"),
+        "{error}"
+    );
+}
+
+/// The head's own contract is read as strictly as a release's: a head whose contract file is
+/// missing, does not say its SDK version, or has a table that does not read fails with a message
+/// that names the file.
+#[test]
+fn the_heads_own_contract_that_cannot_be_read_fails_with_its_own_message() {
+    for (name, contract, expected) in [
+        (
+            "absent",
+            None,
+            "has no packages/plugin-sdk/schema/package-contract.json",
+        ),
+        (
+            "no-version",
+            Some(json!({ "arrivals": [] })),
+            "no sdk_version",
+        ),
+        (
+            "bad-table",
+            Some(json!({ "sdk_version": "0.1.7", "arrivals": "all" })),
+            "arrivals is not a list",
+        ),
+    ] {
+        let repo = Repo::new(&format!("sdk-head-contract-{name}"));
+        let tree = Tree {
+            version: Box::leak(
+                kr_protocol::hello::PACKAGE_VERSION
+                    .to_string()
+                    .into_boxed_str(),
+            ),
+            contract,
+            ..Tree::the_level()
+        };
+        let commit = repo.commit(&tree, "the head");
+        let error = Head::of_this_build(&repo.directory, &commit)
+            .err()
+            .expect("the head's contract is not one the check reads");
+        assert!(
+            error.contains("package-contract.json") && error.contains(expected),
+            "{name}: {error}"
+        );
+    }
 }
 
 /// A root the head no longer has cannot hide the difference: the release's own list is cut too, and

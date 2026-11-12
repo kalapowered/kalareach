@@ -36,9 +36,10 @@
 //!   --check` holds the committed ones equal to the generated ones. A release of the level without
 //!   the schema or without `package-contract.json`, or a file that does not read, fails the
 //!   check. The one kind of member that passes is an optional member of a definition that no
-//!   protocol schema has, which this commit's arrival table (in its `package-contract.json`)
-//!   lists at an SDK version above the release's own `sdk_version`, in a commit whose SDK version
-//!   is above that version too (`compare_sdk_for_a_level`). The table lists a member only where a
+//!   protocol schema has and that the connector table's root reaches and the package manifest's
+//!   root does not, which this commit's arrival table (in its `package-contract.json`) lists at
+//!   an SDK version above the release's own `sdk_version`, in a commit whose SDK version is above
+//!   that version too (`compare_sdk_for_a_level`). The table lists a member only where a
 //!   package that lacks it means what it meant before, and a host of an earlier SDK refuses a
 //!   package that uses it, because it tests the package's `sdk_range` first; the comparison sees
 //!   neither, and the review of the change that lists a member must. The run says each member it
@@ -379,6 +380,33 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
             ));
         }
     }
+    // The comparison cannot tell a member whose absence keeps the earlier meaning from one
+    // whose absence does not, so each member it passes is said once, with the version it
+    // arrived at and the version of the releases it is new to, for the review of the change
+    // that lists it. A run that fails says them too, so that one run shows the whole state.
+    let mut grouped: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    let mut arrival_notes: Vec<String> = Vec::new();
+    for (tag, passed) in arrivals {
+        grouped
+            .entry((
+                passed.member,
+                passed.arrived.to_string(),
+                passed.earlier.to_string(),
+            ))
+            .or_default()
+            .push(tag);
+    }
+    for ((member, arrived, earlier), tags) in grouped {
+        arrival_notes.push(format!(
+            "the plugin SDK member {member}, listed in the arrival table at SDK {arrived}, is \
+             new to {} (SDK {earlier}) and passes as an optional member of a definition that \
+             no protocol schema has, the connector table reaches and the package manifest does \
+             not; the comparison cannot tell it from a member whose absence \
+             changes the meaning, and the review of the change that lists it must \
+             (docs/releases/packages.md, \"A level is one surface\")",
+            tags.join(", ")
+        ));
+    }
     if problems.is_empty() {
         // The comparison cannot tell a section from a restriction filed as one, so each section it
         // passes is said once, with its level and the releases it is new to, for the review of the
@@ -397,36 +425,17 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
                 releases.join(", ")
             ));
         }
-        // The comparison cannot tell a member whose absence keeps the earlier meaning from one
-        // whose absence does not, so each member it passes is said once, with the version it
-        // arrived at and the version of the releases it is new to, for the review of the change
-        // that lists it.
-        let mut grouped: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
-        for (tag, passed) in arrivals {
-            grouped
-                .entry((
-                    passed.member,
-                    passed.arrived.to_string(),
-                    passed.earlier.to_string(),
-                ))
-                .or_default()
-                .push(tag);
-        }
-        for ((member, arrived, earlier), tags) in grouped {
-            notes.push(format!(
-                "the plugin SDK member {member}, listed in the arrival table at SDK {arrived}, is \
-                 new to {} (SDK {earlier}) and passes as an optional member of a definition that \
-                 no protocol schema has; the comparison cannot tell it from a member whose absence \
-                 changes the meaning, and the review of the change that lists it must \
-                 (docs/releases/packages.md, \"A level is one surface\")",
-                tags.join(", ")
-            ));
-        }
+        notes.extend(arrival_notes);
         return Ok(Outcome::Held {
             releases: peers.into_iter().map(|release| release.tag).collect(),
             notes,
         });
     }
+    problems.extend(
+        arrival_notes
+            .into_iter()
+            .map(|note| format!("note: {note}")),
+    );
     Err(format!(
         "{}\na level is one surface and one public contract: a change to either after the level's \
          first release moves the level in the train that makes it, with its cut \
