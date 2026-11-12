@@ -38,7 +38,7 @@ use crate::standing::{AMBIENT_LIMIT, OPENED_LIMIT};
 /// own place included: what the host lets a device use at once. The host holds twice as many live
 /// connections, so that each of these may linger once beside its replacement.
 ///
-/// The kinds that have a limit of their own come to [`IN_USE`] of them; the places left over are for
+/// The kinds that have a limit of their own come to `IN_USE` of them; the places left over are for
 /// the connections that finish beside a replacement: a link the person left that still finishes its
 /// requests, and an open that a later one superseded. A kind that has no limit of its own is held
 /// by this number and no other, and a connection that is never closed keeps its place: every dial
