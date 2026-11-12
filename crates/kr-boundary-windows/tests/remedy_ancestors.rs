@@ -214,6 +214,10 @@ fn the_program_trees_own_walk_has_its_own_list_words_and_the_same_link_words() {
     );
     assert!(text.contains("S-1-5-32-545 is allowed to add"), "{text}");
     assert!(text.contains("Whoever owns it, or can add to it"), "{text}");
+    assert!(
+        text.contains("Do not remove the program directory"),
+        "{text}"
+    );
     assert!(text.contains("Nothing was changed"), "{text}");
     assert!(!text.to_lowercase().contains("remove the link"), "{text}");
     let link = ancestor_refusal(r"C:\Program Files", Tree::Program, &AncestorFault::Link);

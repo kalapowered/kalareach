@@ -290,6 +290,11 @@ fn an_empty_data_directory_that_a_stopped_removal_left_is_removed_by_the_next_on
 fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
     assert!(next_step(true, false).contains("run the removal again"));
     assert!(next_step(true, true).contains("reads the manifest"));
+    // The next removal can refuse a link at a replacement's name before it reads the manifest, so
+    // the words promise no completion.
+    let kept = next_step(true, false);
+    assert!(kept.contains("says what remains"), "{kept}");
+    assert!(!kept.contains("finishes"), "{kept}");
     let empty = next_step(false, true);
     assert!(empty.contains("accepts an empty data directory"), "{empty}");
     assert!(!empty.contains("refuses"), "{empty}");
