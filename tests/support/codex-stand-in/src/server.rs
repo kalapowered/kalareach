@@ -47,6 +47,10 @@ struct Running {
     thread: String,
     turn: String,
     approval: Option<String>,
+    /// The command the turn's input asked to run and the approval asks about: it runs once when the
+    /// approval is accepted, and the turn completes when it ends. A turn with none completes with
+    /// the approval's answer.
+    command: Option<String>,
 }
 
 struct Server {
@@ -61,6 +65,8 @@ struct Server {
     /// The server's own requests the terminal has not answered, by identifier.
     sent: BTreeMap<String, String>,
     commands: Vec<Started>,
+    /// The place in `commands` of the command whose end completes the running turn.
+    awaited: Option<usize>,
     /// Whether the second approval has been asked, under `two-approvals`.
     second_asked: bool,
     /// The threads the server has made, and whether its one client is subscribed to each.
@@ -195,15 +201,20 @@ impl Server {
     }
 
     fn start_command(&mut self) {
-        let Some(words) = Variants::command() else {
-            return;
-        };
+        if let Some(words) = Variants::command() {
+            self.run_command(&words);
+        }
+    }
+
+    /// Starts `words` as a command of the server's, and returns its place in `commands` where it
+    /// started.
+    fn run_command(&mut self, words: &[String]) -> Option<usize> {
         let leads_group = !self.variants.command_shares_group;
         let mut command = if leads_group {
             // The program runs itself in a session of its own, which the command then leads: a
             // session leader leads a process group too.
             let mut command = Command::new(std::env::current_exe().expect("this program's path"));
-            command.arg(EXEC_IN_NEW_SESSION).args(&words);
+            command.arg(EXEC_IN_NEW_SESSION).args(words);
             command
         } else {
             let mut command = Command::new(&words[0]);
@@ -223,9 +234,61 @@ impl Server {
                     child.id().unwrap_or_default()
                 );
                 self.commands.push(Started { child, leads_group });
+                Some(self.commands.len() - 1)
             }
-            Err(error) => eprintln!("stand-in: the command could not start: {error}"),
+            Err(error) => {
+                eprintln!("stand-in: the command could not start: {error}");
+                None
+            }
         }
+    }
+
+    /// Waits for the command whose end completes the running turn, for ever where there is none.
+    async fn awaited_command_ends(&mut self) {
+        match self.awaited {
+            Some(place) => {
+                let _ = self.commands[place].child.wait().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// The awaited command has ended: the turn it was run for completes.
+    async fn finishes_the_turn_of_the_awaited_command(&mut self) {
+        self.awaited = None;
+        if let Some(running) = self.running.take() {
+            self.send(json!({
+                "method": "turn/completed",
+                "params": { "threadId": running.thread, "turn": turn(&running.turn, "completed") }
+            }))
+            .await;
+        }
+    }
+
+    /// Whether the agent's folder (`CODEX_HOME`) holds the record of `thread`, below
+    /// `sessions/<year>/<month>/<day>`: a conversation an earlier server saved, which this one
+    /// resumes as the pinned release resumes one from its files.
+    fn recorded(thread: &str) -> bool {
+        let Some(home) = std::env::var_os(crate::variants::CONFIG_VARIABLE) else {
+            return false;
+        };
+        if thread.is_empty() || thread.contains('/') {
+            return false;
+        }
+        let file = format!("rollout-{thread}.jsonl");
+        let list = |directory: &std::path::Path| {
+            std::fs::read_dir(directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        };
+        list(&std::path::Path::new(&home).join("sessions"))
+            .iter()
+            .flat_map(|year| list(year))
+            .flat_map(|month| list(&month))
+            .any(|day| day.join(&file).is_file())
     }
 
     /// Takes a frame the terminal wrote that the pinned release would not have written.
@@ -323,6 +386,28 @@ impl Server {
                         "params": { "threadId": thread_id, "requestId": request }
                     }))
                     .await;
+                    // The command the turn asked to run runs once where the answer allows it, and
+                    // the turn stays open until the command ends. Any other answer ends the turn
+                    // with the command not run.
+                    let asked = self
+                        .running
+                        .as_ref()
+                        .and_then(|running| running.command.clone());
+                    if let Some(command) = asked
+                        && matches!(
+                            frame["result"]["decision"].as_str(),
+                            Some("accept" | "acceptForSession")
+                        )
+                        && let Some(place) =
+                            self.run_command(&["/bin/sh".to_owned(), "-c".to_owned(), command])
+                    {
+                        self.awaited = Some(place);
+                        if let Some(running) = &mut self.running {
+                            running.approval = None;
+                            running.command = None;
+                        }
+                        return;
+                    }
                     if self.variants.two_approvals && !self.second_asked {
                         self.second_asked = true;
                         self.sent.insert(
@@ -406,7 +491,7 @@ impl Server {
                 let wanted = frame["params"]["threadId"].as_str().unwrap_or_default();
                 // A saved conversation is resumed by its identifier or by the name it was given.
                 let wanted = self.names.get(wanted).map_or(wanted, String::as_str);
-                if !self.threads.contains_key(wanted) {
+                if !self.threads.contains_key(wanted) && !Self::recorded(wanted) {
                     return self.refuse(id, -32600, "thread not found").await;
                 }
                 let wanted = wanted.to_owned();
@@ -580,6 +665,41 @@ impl Server {
         }
     }
 
+    /// Starts the turn `turn_id` of `thread_id`, which asked to run `command`, and asks for the
+    /// approval of that command. The command runs, once, when the approval allows it.
+    async fn asks_to_run(&mut self, id: &Value, thread_id: &str, turn_id: &str, command: String) {
+        let approval = format!("approval-{}", self.turns_made);
+        let request = json!({
+            "id": approval,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "itemId": format!("item-{}", self.turns_made),
+                "startedAtMs": 0,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "command": command,
+                "cwd": std::env::current_dir().unwrap_or_default().display().to_string()
+            }
+        });
+        let asked = request["id"].to_string();
+        self.running = Some(Running {
+            thread: thread_id.to_owned(),
+            turn: turn_id.to_owned(),
+            approval: Some(asked.clone()),
+            command: Some(command),
+        });
+        self.sent
+            .insert(asked, "item/commandExecution/requestApproval".to_owned());
+        self.send(json!({ "id": id, "result": { "turn": turn(turn_id, "inProgress") }}))
+            .await;
+        self.send(json!({
+            "method": "turn/started",
+            "params": { "threadId": thread_id, "turn": turn(turn_id, "inProgress") }
+        }))
+        .await;
+        self.send(request).await;
+    }
+
     async fn turn(&mut self, id: &Value, frame: &Value) {
         if self.variants.die_on_second_turn && self.turns_made >= 1 {
             std::process::exit(0);
@@ -595,6 +715,11 @@ impl Server {
         let turn_id = format!("turn-{}", self.turns_made);
         if self.variants.write_the_record {
             Self::writes_the_record(frame, &thread_id, &turn_id);
+        }
+        // A turn whose input asks to run a command asks for that command's approval.
+        if let Some(command) = crate::variants::command_asked(frame) {
+            self.asks_to_run(id, &thread_id, &turn_id, command).await;
+            return;
         }
         // A turn after the first is one somebody else started, and it runs to its end at once: it
         // asks for nothing and starts nothing.
@@ -635,6 +760,7 @@ impl Server {
             thread: thread_id.clone(),
             turn: turn_id.clone(),
             approval: Some(asked.clone()),
+            command: None,
         });
         let answer = json!({ "id": id, "result": { "turn": turn(&turn_id, "inProgress") }});
         let started = json!({
@@ -732,6 +858,7 @@ pub async fn run(variants: Variants) -> ! {
         received: BTreeMap::new(),
         sent: BTreeMap::new(),
         commands: Vec::new(),
+        awaited: None,
         second_asked: false,
         threads: saved()
             .into_iter()
@@ -769,6 +896,7 @@ pub async fn run(variants: Variants) -> ! {
                     server.start_command();
                 }
             }
+            () = server.awaited_command_ends() => server.finishes_the_turn_of_the_awaited_command().await,
             line = lines.next_line() => match line {
                 Ok(Some(line)) if line.trim().is_empty() => {}
                 Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
