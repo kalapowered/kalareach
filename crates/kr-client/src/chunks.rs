@@ -939,6 +939,9 @@ struct WindowSource {
     /// Runs inside [`WindowSource::turn_down`], between its check and its update.
     #[cfg(test)]
     between_check_and_update: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Runs inside [`WindowSource::turn_down`], once it holds the marker's lock and before its check.
+    #[cfg(test)]
+    after_lock: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl WindowSource {
@@ -948,6 +951,8 @@ impl WindowSource {
             turned_down: std::sync::Mutex::new(None),
             #[cfg(test)]
             between_check_and_update: None,
+            #[cfg(test)]
+            after_lock: None,
         }
     }
 
@@ -972,6 +977,10 @@ impl WindowSource {
             .turned_down
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        if let Some(hook) = &self.after_lock {
+            hook();
+        }
         if self.issued.borrow().window.action_window_id != *window {
             return;
         }
@@ -1513,6 +1522,25 @@ mod tests {
         assert!(
             source.turned_down(&newer),
             "the older refusal did not replace the newer one"
+        );
+    }
+
+    /// The check is made with the lock held and after it was taken, not before: a refusal whose
+    /// window stops being the newest while it takes the lock is dropped, whatever the order in which
+    /// the lanes ran. The hook issues the next window at the one point where a check made earlier
+    /// would already have passed, which is as the lock is taken.
+    #[test]
+    fn a_refusal_is_checked_against_the_newest_window_once_it_holds_the_lock() {
+        let (issued, held) = watch::channel(issued_as("older"));
+        let mut source = WindowSource::new(held);
+        source.after_lock = Some(Box::new(move || {
+            issued.send_replace(issued_as("newer"));
+        }));
+        let older = ActionWindowId::new("older").expect("a window");
+        source.turn_down(&older);
+        assert!(
+            !source.turned_down(&older),
+            "a window that stopped being the newest while the refusal took the lock is not kept"
         );
     }
 

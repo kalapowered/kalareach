@@ -1532,9 +1532,22 @@ struct Ending {
     code: ErrorCode,
     /// The opener the transport gives out instead of the inner transport's, when a case sets one.
     opener: Option<Arc<dyn StreamOpener>>,
-    /// The account signs out as the client sends a request of this method: the reason is recorded,
-    /// and that send fails with the connection ended, as a watcher that closes the connection does.
-    signs_out_at: Option<Method>,
+    /// The connection breaks as the client sends a request or a mutation of this method, in the
+    /// way the case chooses; that send fails with the connection ended, and so does every later one.
+    breaks_at: Option<(Method, Break)>,
+    /// Set once the network has ended the connection.
+    lost: AtomicBool,
+    /// The `upload.status` reads the client tried to send, whether or not they went.
+    status_sends: Arc<AtomicU64>,
+}
+
+/// How a connection breaks.
+#[derive(Clone, Copy, Debug)]
+enum Break {
+    /// The account signs out: the reason is recorded, as a watcher that closes the connection does.
+    SignOut,
+    /// The network ends the connection: no reason of this device's is recorded.
+    Loss,
 }
 
 impl ControlTransport for Ending {
@@ -1553,12 +1566,23 @@ impl ControlTransport for Ending {
             .then(|| ProtocolError::new(self.code, "the account signed out"))
     }
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
-        if let (ControlFrame::Request(request), Some(method)) = (frame, self.signs_out_at)
-            && request.method == MethodName::from(method)
-        {
-            self.ended.store(true, Ordering::Release);
+        let called = match frame {
+            ControlFrame::Request(request) => Some(&request.method),
+            ControlFrame::Mutation(mutation) => Some(&mutation.method),
+            _ => None,
+        };
+        if called == Some(&MethodName::from(Method::UploadStatus)) {
+            self.status_sends.fetch_add(1, Ordering::AcqRel);
         }
-        if self.ended.load(Ordering::Acquire) {
+        if let (Some(called), Some((method, kind))) = (called, self.breaks_at)
+            && *called == MethodName::from(method)
+        {
+            match kind {
+                Break::SignOut => self.ended.store(true, Ordering::Release),
+                Break::Loss => self.lost.store(true, Ordering::Release),
+            }
+        }
+        if self.lost.load(Ordering::Acquire) || self.ended.load(Ordering::Acquire) {
             return Box::pin(async { Err(ClientError::ConnectionEnded) });
         }
         self.inner.send(frame)
@@ -1613,7 +1637,9 @@ async fn a_lane_stops_when_the_transport_says_this_device_ended_the_connection()
             ended: flag,
             code: ErrorCode::LeaseLost,
             opener: None,
-            signs_out_at: None,
+            breaks_at: None,
+            lost: AtomicBool::new(false),
+            status_sends: Arc::new(AtomicU64::new(0)),
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1697,7 +1723,9 @@ async fn a_sign_out_during_the_wait_for_a_window_is_told_with_its_reason() {
             ended: flag,
             code: ErrorCode::LeaseLost,
             opener: None,
-            signs_out_at: None,
+            breaks_at: None,
+            lost: AtomicBool::new(false),
+            status_sends: Arc::new(AtomicU64::new(0)),
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1748,7 +1776,9 @@ async fn a_sign_out_that_reads_as_a_refused_window_reaches_the_caller_of_send_as
             ended: flag,
             code: ErrorCode::PermissionDenied,
             opener: None,
-            signs_out_at: None,
+            breaks_at: None,
+            lost: AtomicBool::new(false),
+            status_sends: Arc::new(AtomicU64::new(0)),
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1803,7 +1833,9 @@ async fn a_sign_out_that_cuts_the_open_of_the_stream_is_told_with_its_reason() {
             ended: flag,
             code: ErrorCode::LeaseLost,
             opener: Some(Arc::new(CutOpener { gate: cut })),
-            signs_out_at: None,
+            breaks_at: None,
+            lost: AtomicBool::new(false),
+            status_sends: Arc::new(AtomicU64::new(0)),
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1886,7 +1918,9 @@ async fn a_sign_out_between_a_lane_failure_and_the_status_read_reaches_the_calle
             ended: flag,
             code: ErrorCode::LeaseLost,
             opener: None,
-            signs_out_at: Some(Method::UploadStatus),
+            breaks_at: Some((Method::UploadStatus, Break::SignOut)),
+            lost: AtomicBool::new(false),
+            status_sends: Arc::new(AtomicU64::new(0)),
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1965,4 +1999,162 @@ async fn a_finish_the_status_does_not_show_published_ends_the_send_with_the_host
         assert_eq!(seen.finishes, 2);
         assert_eq!(seen.status_reads, 2);
     });
+}
+
+/// A finish that was sent and not answered, because the account signed out as it went, is
+/// `SubmissionUncertain` with its action and not the sign-out's refusal: the host may have
+/// published, and nothing is read on a connection that has gone.
+#[tokio::test]
+async fn a_finish_that_a_sign_out_leaves_unanswered_is_submission_uncertain() {
+    let script = Script::new(true);
+    let ended = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ended);
+    let status_sends = Arc::new(AtomicU64::new(0));
+    let counting = Arc::clone(&status_sends);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Ending {
+            inner: Arc::new(transport),
+            ended: flag,
+            code: ErrorCode::PermissionDenied,
+            opener: None,
+            breaks_at: Some((Method::UploadFinish, Break::SignOut)),
+            lost: AtomicBool::new(false),
+            status_sends: counting,
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let mut upload = plan(THREE_CHUNKS);
+    let told = within(uploads::send(
+        &session,
+        &route,
+        &target(),
+        &mut upload,
+        TTL,
+        &unwatched(),
+    ))
+    .await
+    .expect_err("the finish is not answered");
+    assert!(
+        ended.load(Ordering::Acquire),
+        "the sign-out came with the finish"
+    );
+    assert!(
+        matches!(told, ClientError::SubmissionUncertain { .. }),
+        "the caller is told the finish's outcome is unknown, with its action, and not the sign-out's refusal: {told:?}"
+    );
+    assert_eq!(
+        status_sends.load(Ordering::Acquire),
+        0,
+        "no read of the status was tried after it"
+    );
+    session.close();
+    serving.abort();
+}
+
+/// A finish that was sent and not answered, because the network ended the connection as it went, is
+/// `SubmissionUncertain` with its action and not a connection that ended: it is the same call
+/// whatever ended the connection.
+#[tokio::test]
+async fn a_finish_that_a_lost_connection_leaves_unanswered_is_submission_uncertain() {
+    let script = Script::new(true);
+    let ended = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ended);
+    let status_sends = Arc::new(AtomicU64::new(0));
+    let counting = Arc::clone(&status_sends);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Ending {
+            inner: Arc::new(transport),
+            ended: flag,
+            code: ErrorCode::PermissionDenied,
+            opener: None,
+            breaks_at: Some((Method::UploadFinish, Break::Loss)),
+            lost: AtomicBool::new(false),
+            status_sends: counting,
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let mut upload = plan(THREE_CHUNKS);
+    let told = within(uploads::send(
+        &session,
+        &route,
+        &target(),
+        &mut upload,
+        TTL,
+        &unwatched(),
+    ))
+    .await
+    .expect_err("the finish is not answered");
+    assert!(
+        !ended.load(Ordering::Acquire),
+        "this device recorded no reason: the network ended the connection"
+    );
+    assert!(
+        matches!(told, ClientError::SubmissionUncertain { .. }),
+        "the caller is told the finish's outcome is unknown, with its action: {told:?}"
+    );
+    assert_eq!(
+        status_sends.load(Ordering::Acquire),
+        0,
+        "no read of the status was tried after it"
+    );
+    session.close();
+    serving.abort();
+}
+
+/// The host answers the finish that it does not know what became of it, and the account signs out as
+/// the status read that follows is sent. The status read has failed, so the send ends with the host's
+/// own answer to the finish and not with the sign-out's refusal or the read's failure.
+#[tokio::test]
+async fn a_status_read_that_a_sign_out_stops_after_an_unknown_finish_leaves_the_hosts_answer() {
+    let script = Script::new(true);
+    script.finish_unknown_once.store(true, Ordering::Release);
+    let ended = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ended);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Ending {
+            inner: Arc::new(transport),
+            ended: flag,
+            code: ErrorCode::PermissionDenied,
+            opener: None,
+            breaks_at: Some((Method::UploadStatus, Break::SignOut)),
+            lost: AtomicBool::new(false),
+            status_sends: Arc::new(AtomicU64::new(0)),
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let mut upload = plan(THREE_CHUNKS);
+    let told = within(uploads::send(
+        &session,
+        &route,
+        &target(),
+        &mut upload,
+        TTL,
+        &unwatched(),
+    ))
+    .await
+    .expect_err("the host cannot say what became of the finish, and the status read is stopped");
+    assert!(
+        ended.load(Ordering::Acquire),
+        "the sign-out came with the status read"
+    );
+    assert!(
+        matches!(told, ClientError::OutcomeUnknown { .. }),
+        "the caller is told the host's answer to the finish: {told:?}"
+    );
+    assert_eq!(
+        script.seen(|seen| seen.finishes),
+        1,
+        "the finish was sent once"
+    );
+    session.close();
+    serving.abort();
 }

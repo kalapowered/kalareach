@@ -675,16 +675,20 @@ struct Unconditional {}
 ///   second such refusal in a row is the host's answer and ends the upload.
 /// * A connection this device ended, as a sign-out does, ends the send with the reason the
 ///   transport recorded (`ControlTransport::ended_by_this_device`) in place of
-///   [`ClientError::ConnectionEnded`], wherever in the send the connection ends: a lane's failure,
-///   the status read, a call that found the session ended. The reason can carry
-///   `PERMISSION_DENIED`, which only a host's answer to a chunk means a window refused. A
-///   reservation or publication that was sent and unanswered when the connection ended stays
-///   [`ClientError::SubmissionUncertain`], which names the action; the caller asks the transport
-///   for the reason as well.
+///   [`ClientError::ConnectionEnded`] when a call finds the connection ended: a lane's failure, the
+///   status read, a call made on a session that has ended. The reason can carry
+///   `PERMISSION_DENIED`, which only a host's answer to a chunk means a window refused. The
+///   reason is what the transport records when it is asked, so a sign-out that comes just after
+///   the network ended the connection is given as the reason, as it is at the lane's check.
+/// * A reservation or a finish that was sent and not answered when the connection ended is
+///   [`ClientError::SubmissionUncertain`] with its action, whatever ended the connection, and
+///   nothing is read after it: the caller asks the transport for the reason as well. A sign-out
+///   that closes the connection while a call is being written gives the transport's error for
+///   that write, not the reason.
 /// * A finish the host answers `OUTCOME_UNKNOWN`, as it does a device that may not view the session
 ///   of a session-bound upload though the upload is published, is read from `upload.status` once.
 ///   When that says published, the send returns the handle, and no second finish is sent;
-///   otherwise it returns the answer.
+///   otherwise, and when the read itself fails, it returns the host's answer.
 /// * The plan records a reservation as asked for before `upload.begin` leaves
 ///   ([`Upload::reserving`]), and only a definite answer clears that: the host's result, or its
 ///   refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt with no
@@ -693,10 +697,10 @@ struct Unconditional {}
 /// # Errors
 ///
 /// Returns [`ClientError::SubmissionUncertain`] when the session ended with a reservation or a
-/// publication unanswered, the reason this device ended the connection when it did,
-/// [`ClientError::ConnectionEnded`] when the host or the network did, a refusal the host decided
-/// under its own code, the last failure once the retries are spent, and the plan's refusal when the
-/// host's status says the upload was cancelled, invalidated or expired.
+/// finish sent and unanswered, the reason this device ended the connection when a call found it
+/// ended, [`ClientError::ConnectionEnded`] when the host or the network did, a refusal the host
+/// decided under its own code, the last failure once the retries are spent, and the plan's refusal
+/// when the host's status says the upload was cancelled, invalidated or expired.
 pub async fn send(
     session: &Session,
     route: &ChunkRoute,
@@ -886,14 +890,20 @@ async fn drive(
                     .await;
                 match finished {
                     Ok(settled) => plan.accept(Answer::Finished(Box::new(settled.to_typed()?)))?,
+                    // A finish that was sent and not answered: the session ended, or the frame
+                    // could not be written, and the host may have published. The action is what
+                    // the caller needs, so nothing is read on a connection that has gone.
+                    Err(error @ ClientError::SubmissionUncertain { .. }) => return Err(error),
                     // A host does not tell a device that may not view a session what became of its
                     // first finish of a session-bound upload, though the upload is published. The
                     // host's record decides: one read of the status, and no second finish. A
-                    // record that does not say published leaves the answer as it was.
+                    // record that does not say published, and a read that fails, leave the answer
+                    // as it was.
                     Err(error) if error.code() == kr_protocol::error::ErrorCode::OutcomeUnknown => {
-                        plan.accept(Answer::Status(Box::new(
-                            status(session, params.transfer_id).await?,
-                        )))?;
+                        let Ok(read) = status(session, params.transfer_id).await else {
+                            return Err(error);
+                        };
+                        plan.accept(Answer::Status(Box::new(read)))?;
                         if plan.handle().is_none() {
                             return Err(error);
                         }
