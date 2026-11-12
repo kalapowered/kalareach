@@ -3093,3 +3093,91 @@ async fn kr_req_12_06_a_new_conversation_stays_bound_when_the_old_one_is_left_an
             .is_some_and(|reason| reason.contains("not read"))
     );
 }
+
+/// What a device's prompt meets: the thread the request that carries it names, or the refusal.
+async fn device_prompt(world: &mut World) -> Result<String, String> {
+    let admitted =
+        match world
+            .broker
+            .admit_prompt(&World::owner_caller(), &world.prompt("hello"), false, NOW)
+        {
+            Ok(admitted) => admitted,
+            Err(refused) => return Err(refused.to_string()),
+        };
+    let taken = world
+        .broker
+        .take_mutation(&admitted)
+        .expect("nothing changed since the admission");
+    let (dispatch, request) = taken.transmission();
+    let _pending = dispatch
+        .submit(&request)
+        .expect("the frame is queued for the server");
+    let sent = world.server_reads().await;
+    assert_eq!(sent["method"], "turn/start");
+    Ok(sent["params"]["threadId"]
+        .as_str()
+        .expect("a thread")
+        .to_owned())
+}
+
+/// Walks the terminal's title flow once, sending a device's prompt at each boundary of it, and
+/// returns what each met: before the helper's start, between its start and its reply, between its
+/// reply and its turn, during its turn, between its turn's end and its leave, with its leave in
+/// flight, and after its leave.
+async fn prompts_at_each_boundary(
+    world: &mut World,
+) -> Vec<(&'static str, Result<String, String>)> {
+    let mut met = vec![("before the start", device_prompt(world).await)];
+    let asked = world.terminal_asks(HELPER_START).await;
+    assert_eq!(world.server_reads().await["method"], "thread/start");
+    met.push((
+        "between its start and its reply",
+        device_prompt(world).await,
+    ));
+    world
+        .server_answers(&asked, &named_thread("thread-2", true, "system"))
+        .await;
+    met.push(("between its reply and its turn", device_prompt(world).await));
+    world
+        .server_says(&turn_event("turn/started", "thread-2", "turn-2"))
+        .await;
+    met.push(("during its turn", device_prompt(world).await));
+    world
+        .server_says(&turn_event("turn/completed", "thread-2", "turn-2"))
+        .await;
+    met.push(("between its turn and its leave", device_prompt(world).await));
+    let leaving = world.terminal_asks(HELPER_LEAVE).await;
+    assert_eq!(world.server_reads().await["method"], "thread/unsubscribe");
+    met.push(("with its leave in flight", device_prompt(world).await));
+    world.server_answers(&leaving, r#""result":{}"#).await;
+    met.push(("after its leave", device_prompt(world).await));
+    met
+}
+
+/// KR-REQ-11.36 and KR-REQ-12.06: a device's prompt sent at any point of the title flow of the
+/// terminal goes to the conversation's thread, or is refused for the conversation's own running
+/// turn. It never goes to the hidden thread, and the hidden thread's turn never refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_36_a_devices_prompt_at_each_boundary_of_the_title_flow_never_meets_the_hidden_thread()
+ {
+    // The conversation's turn runs through the whole flow: each prompt is refused for that turn.
+    let (mut world, _notices) = running_conversation().await;
+    for (boundary, met) in prompts_at_each_boundary(&mut world).await {
+        let refusal = met.expect_err(boundary);
+        assert!(
+            refusal.contains("turn-1 is running"),
+            "{boundary}: {refusal}"
+        );
+        assert!(!refusal.contains("turn-2"), "{boundary}: {refusal}");
+    }
+    // The server was sent the terminal's two requests for the hidden thread and no prompt.
+    world.nothing_written().await;
+
+    // The conversation is idle: each prompt goes to its thread, including while the hidden
+    // thread's turn runs.
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    for (boundary, met) in prompts_at_each_boundary(&mut world).await {
+        assert_eq!(met.as_deref(), Ok("thread-1"), "{boundary}");
+    }
+}
