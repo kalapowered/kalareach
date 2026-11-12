@@ -139,8 +139,39 @@ struct Case {
 /// for what it shows: this fails first, with one text, so that the run is void and never a verdict
 /// on the product.
 fn require_clean_machine() {
+    let left = machine_problems(true);
+    assert!(
+        left.is_empty(),
+        "the machine is not clean: {}",
+        left.join(", ")
+    );
+}
+
+/// The Application Identity service's state, which a run begins with: whether it runs and how it
+/// starts.
+fn appid_state() -> (bool, u32) {
+    let appid = service::manager()
+        .unwrap()
+        .open("AppIDSvc")
+        .unwrap()
+        .expect("the Application Identity service exists");
+    (
+        appid.status().unwrap().running(),
+        appid.configuration().unwrap().0,
+    )
+}
+
+/// What a machine with no installation on it does not have: the broker's service (a service marked
+/// for deletion counts only when `strict`), the two accounts and their entries among the hidden
+/// accounts, the data directory and the folder above it, the program directory, the pipe's name,
+/// any rule of the application-control policy, and the Application Identity service in another
+/// state than the run began with.
+fn machine_problems(strict: bool) -> Vec<String> {
+    static RUN_START: std::sync::OnceLock<(bool, u32)> = std::sync::OnceLock::new();
+    let began = *RUN_START.get_or_init(appid_state);
     let mut left = Vec::new();
-    if service::manager().unwrap().open(SERVICE).unwrap().is_some() {
+    let service = service::manager().unwrap().open(SERVICE).unwrap();
+    if service.is_some_and(|service| strict || !service.marked_for_deletion().unwrap()) {
         left.push("the broker's service".to_owned());
     }
     for name in [CHECKOUT, CONNECT] {
@@ -148,9 +179,21 @@ fn require_clean_machine() {
             left.push(format!("the account {name}"));
         }
     }
+    let hidden = registry::open(SPECIAL_ACCOUNTS)
+        .unwrap()
+        .map(|key| key.value_names().unwrap())
+        .unwrap_or_default();
+    for name in [CHECKOUT, CONNECT] {
+        if hidden.iter().any(|hidden| hidden == name) {
+            left.push(format!("the hidden-account entry of {name}"));
+        }
+    }
     let paths = Paths::system().expect("the system's folders are read");
     if paths.data.exists() {
         left.push("the data directory".to_owned());
+    }
+    if paths.data_parent().exists() {
+        left.push("the folder above the data directory".to_owned());
     }
     if paths.program.exists() {
         left.push("the program directory".to_owned());
@@ -158,11 +201,17 @@ fn require_clean_machine() {
     if std::fs::metadata(kr_boundary_windows::win::pipe::NAME).is_ok() {
         left.push("the broker's pipe".to_owned());
     }
-    assert!(
-        left.is_empty(),
-        "the machine is not clean: {}",
-        left.join(", ")
-    );
+    if !channel().effective().unwrap().1.is_unconfigured() {
+        left.push("rules of the application-control policy".to_owned());
+    }
+    let now = appid_state();
+    if now != began {
+        left.push(format!(
+            "the Application Identity service (running {}, start type {}) is not as the run began (running {}, start type {})",
+            now.0, now.1, began.0, began.1
+        ));
+    }
+    left
 }
 
 impl Case {
@@ -203,8 +252,19 @@ impl Case {
 impl Drop for Case {
     fn drop(&mut self) {
         let _ = setup(&["remove"], "yes\n", &[]);
+        // What the removal left, read before the policy is cleared here: a case that ends with
+        // something of the installation still on the machine fails itself, and the next case's
+        // "not clean" is not the only sign of it.
+        let left = machine_problems(false);
         let _ = channel().set(CLEAR);
         let _ = account::delete(&self.name);
+        if !std::thread::panicking() {
+            assert!(
+                left.is_empty(),
+                "the removal left on the machine: {}",
+                left.join(", ")
+            );
+        }
     }
 }
 
@@ -3597,17 +3657,29 @@ fn an_application_identity_service_that_runs_and_starts_with_windows_is_left_as_
         "the installation leaves the service as it found it: {installed:?}"
     );
 
-    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    // The removal records its calls in the same file, so that what it did not do to the service shows.
+    let before_removal = recorded_calls(&log).len();
+    let (code, output) = setup(
+        &["remove"],
+        "yes\n",
+        &[("KR_BOUNDARY_CALL_LOG", log.to_str().unwrap())],
+    );
     assert_eq!(code, 0, "the removal succeeds: {output}");
+    let calls = recorded_calls(&log);
+    assert!(
+        calls.len() >= before_removal,
+        "the call log is only added to: {calls:?}"
+    );
+    assert!(
+        !calls[before_removal..]
+            .iter()
+            .any(|call| call.starts_with("appid ")),
+        "the removal makes no call on a service it did not start: {calls:?}"
+    );
     assert_eq!(
         snapshot(),
         before,
         "the computer is as it was, the service running and set to start with Windows"
-    );
-    let calls = recorded_calls(&log);
-    assert!(
-        !calls.iter().any(|call| call == "appid stop"),
-        "the removal does not stop a service it did not start: {calls:?}"
     );
     let _ = std::fs::remove_file(&log);
 }
