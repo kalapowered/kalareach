@@ -18,6 +18,10 @@
 //! mode replaces the one in force, while resetting either returns the original report.
 
 use kr_keys::{Modifiers, MouseAction, MouseButton, MouseEncoding, MouseEvent, WheelDirection};
+use kr_term::classify::CsiView;
+use kr_term::event::{DirectDisposition, Event, EventKind};
+use kr_term::lexer::Lexer;
+use kr_term::modes::{ModeKind, ModeState};
 use kr_term::win32::control_keys::{
     LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
 };
@@ -40,12 +44,6 @@ const MOUSE_WHEELED: u32 = 0x4;
 
 /// How much the wheel's amount changes for one notch of it.
 const WHEEL_DELTA: i16 = 120;
-
-/// How many parameters of one sequence are kept: as many as the worker's lexer takes in one
-/// sequence (`max_params` in `kr-term`'s lexer, 256, which its sequence length of 256 bytes caps at
-/// fewer). A sequence the worker forwards is always read whole, so a long list of resets cannot be
-/// ignored here while the worker acts on it.
-const PARAMETERS_KEPT: usize = 256;
 
 /// One mouse record, with the fields the console reported it in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,64 +155,51 @@ impl Restoration {
 
 /// What the session's application has asked for of the mouse, learned from what the session wrote.
 ///
-/// It reads the output as a terminal reads it, a byte at a time, so a mode setting cut in two
-/// between one write and the next is read whole.
+/// The output is cut into sequences by the lexer the worker cuts it with, under the worker's
+/// bounds, and a sequence is acted on only when the worker forwards it: a stretch that is padded
+/// or cancelled, a sequence that is too long, one the profile does not carry, and one that the
+/// worker never hands to a terminal are what the worker makes of them, because the worker's own
+/// lexer and classification decide. The lexer keeps its place across the events of one stream, so a
+/// mode setting cut in two between one write and the next is read whole.
 ///
-/// The tracking is one setting, as a terminal and the session's screen keep it: setting one of the
-/// three tracking modes replaces the one in force, and resetting any of them turns tracking off. A
-/// full reset of the terminal (`ESC c`) turns tracking off. The encoding is one setting too, as
-/// xterm documents it: a set of 1005 or 1006 replaces the one in force, and a reset returns the
-/// default only when it names the one in force. Terminal.app and iTerm return the default at a reset
-/// of either, so after a sequence that leaves them elsewhere than the session, live output is
-/// followed by the resets of both modes and the set of the one in force.
-#[derive(Debug, Default)]
+/// The modes are kept by the worker's own record of them ([`ModeState`]). The tracking is one
+/// setting, as a terminal and the session's screen keep it: setting one of the three tracking modes
+/// replaces the one in force, and resetting any of them turns tracking off. A full reset of the
+/// terminal (`ESC c`) turns every mode off. The encoding is one setting too, as xterm documents it:
+/// a set of 1005 or 1006 replaces the one in force, and a reset returns the default only when it
+/// names the one in force. Terminal.app and iTerm return the default at a reset of either, so after
+/// a sequence that leaves them elsewhere than the session, live output is followed by the resets of
+/// both modes and the set of the one in force.
 pub struct MouseReporting {
-    clicks: bool,
-    drag: bool,
-    motion: bool,
-    /// The encoding in force: 1005, 1006 or the default.
-    encoding: Option<u32>,
+    /// The mouse modes, as the worker records them.
+    modes: ModeState,
     /// The encoding a terminal holds that returns the default at a reset of either mode.
     reset_by_either: Option<u32>,
-    scan: Scan,
+    /// The worker's lexer, which cuts the output into sequences.
+    lexer: Lexer,
+    /// The events of the stretch being read, kept for the room they grew to.
+    events: Vec<Event>,
 }
 
-/// Where the reading of the output is.
-#[derive(Debug, Default)]
-enum Scan {
-    /// Outside a sequence.
-    #[default]
-    Ground,
-    /// After an escape.
-    Escape,
-    /// Inside a control sequence.
-    Control(Control),
-}
-
-/// A control sequence being read.
-#[derive(Debug, Default)]
-struct Control {
-    /// Whether the first byte after the opening was `?`.
-    private: bool,
-    /// Whether a byte came that makes the sequence something other than a mode setting.
-    other: bool,
-    /// Whether any byte after the opening has been read.
-    started: bool,
-    /// The parameters read, not counting the one being read.
-    parameters: Vec<u32>,
-    /// The parameter being read.
-    number: Option<u32>,
-}
-
-impl Control {
-    /// Closes the parameter being read, an empty one as zero.
-    fn close_number(&mut self) {
-        let number = self.number.take().unwrap_or(0);
-        if self.parameters.len() < PARAMETERS_KEPT {
-            self.parameters.push(number);
-        } else {
-            self.other = true;
+impl Default for MouseReporting {
+    fn default() -> Self {
+        Self {
+            modes: ModeState::new(),
+            reset_by_either: None,
+            lexer: Lexer::new(),
+            events: Vec::new(),
         }
+    }
+}
+
+impl std::fmt::Debug for MouseReporting {
+    /// What the application asked for, never the output it was read from.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MouseReporting")
+            .field("tracking", &self.tracking())
+            .field("encoding", &self.encoding())
+            .finish_non_exhaustive()
     }
 }
 
@@ -229,36 +214,44 @@ impl MouseReporting {
     /// terminal is to be written after it so that it holds the state the session holds.
     pub fn read(&mut self, output: &[u8], reading: Reading) -> Vec<Follow> {
         let mut follows = Vec::new();
-        for (at, &byte) in output.iter().enumerate() {
-            if self.step(byte, reading) && reading == Reading::Live && self.differs() {
-                self.reset_by_either = self.encoding;
+        let origin = self.lexer.offset();
+        let mut events = std::mem::take(&mut self.events);
+        events.clear();
+        self.lexer.feed(output, &mut events);
+        for event in &events {
+            if self.apply(event, reading) && reading == Reading::Live && self.differs() {
+                self.reset_by_either = self.encoding_in_force();
                 // A difference after a sequence that set or reset an encoding is the encoding in
                 // force, which the terminal that returned the default is put back to.
-                if let Some(encoding) = self.encoding {
+                if let Some(encoding) = self.encoding_in_force() {
+                    // The sequence ended at its final byte, which is in this stretch.
+                    let end = event.span.end().saturating_sub(origin);
                     follows.push(Follow {
-                        at: at + 1,
+                        at: usize::try_from(end).map_or(output.len(), |end| end.min(output.len())),
                         encoding,
                     });
                 }
             }
         }
+        events.clear();
+        self.events = events;
         follows
     }
 
     /// Whether a terminal that returns the default at any reset holds another encoding than the
     /// session.
     fn differs(&self) -> bool {
-        self.encoding != self.reset_by_either
+        self.encoding_in_force() != self.reset_by_either
     }
 
     /// What the application asked to be told of the mouse.
     #[must_use]
-    pub const fn tracking(&self) -> Tracking {
-        if self.motion {
+    pub fn tracking(&self) -> Tracking {
+        if self.modes.is_set(ModeKind::Dec, 1003) {
             Tracking::Motion
-        } else if self.drag {
+        } else if self.modes.is_set(ModeKind::Dec, 1002) {
             Tracking::Drag
-        } else if self.clicks {
+        } else if self.modes.is_set(ModeKind::Dec, 1000) {
             Tracking::Clicks
         } else {
             Tracking::Off
@@ -268,148 +261,99 @@ impl MouseReporting {
     /// The encoding the application asked for.
     #[must_use]
     pub fn encoding(&self) -> MouseEncoding {
-        if self.encoding == Some(1006) {
+        if self.encoding_in_force() == Some(1006) {
             MouseEncoding::Sgr
         } else {
             MouseEncoding::X10
         }
     }
 
-    /// Turns every mode off, as a terminal does at a full reset.
-    fn reset(&mut self) {
-        self.clicks = false;
-        self.drag = false;
-        self.motion = false;
-        self.encoding = None;
-        self.reset_by_either = None;
+    /// The encoding the application asked for: 1005, 1006, or none for the default.
+    #[must_use]
+    pub fn encoding_in_force(&self) -> Option<u32> {
+        [1005_u16, 1006]
+            .into_iter()
+            .find(|&mode| self.modes.is_set(ModeKind::Dec, mode))
+            .map(u32::from)
     }
 
-    /// Reads one byte, and says whether it finished a sequence that set or reset an encoding.
-    fn step(&mut self, byte: u8, reading: Reading) -> bool {
-        let mut touched = false;
-        self.scan = match std::mem::take(&mut self.scan) {
-            Scan::Ground => {
-                if byte == 0x1b {
-                    Scan::Escape
-                } else {
-                    Scan::Ground
-                }
-            }
-            Scan::Escape => match byte {
-                b'[' => Scan::Control(Control::default()),
-                0x1b => Scan::Escape,
-                // A full reset turns every mode off, the mouse's among them.
-                b'c' => {
-                    self.reset();
-                    Scan::Ground
-                }
-                _ => Scan::Ground,
-            },
-            Scan::Control(mut control) => match byte {
-                0x1b => Scan::Escape,
-                // Cancel and substitute end a sequence without finishing it.
-                0x18 | 0x1a => Scan::Ground,
-                // The other controls act where they stand and are no part of the sequence.
-                0x00..=0x1f | 0x7f => Scan::Control(control),
-                b'?' if !control.started => {
-                    control.private = true;
-                    control.started = true;
-                    Scan::Control(control)
-                }
-                b'0'..=b'9' => {
-                    control.started = true;
-                    let digit = u32::from(byte - b'0');
-                    control.number = Some(
-                        control
-                            .number
-                            .unwrap_or(0)
-                            .saturating_mul(10)
-                            .saturating_add(digit),
-                    );
-                    Scan::Control(control)
-                }
-                b';' => {
-                    control.started = true;
-                    control.close_number();
-                    Scan::Control(control)
-                }
-                // Intermediates, and the markers of other kinds of sequence.
-                0x20..=0x2f | 0x3a | 0x3c..=0x3f => {
-                    control.started = true;
-                    control.other = true;
-                    Scan::Control(control)
-                }
-                0x40..=0x7e => {
-                    if control.number.is_some() || control.started {
-                        control.close_number();
-                    }
-                    touched = self.apply(&control, byte, reading);
-                    Scan::Ground
-                }
-                _ => Scan::Ground,
-            },
-        };
-        touched
-    }
-
-    /// Applies a finished control sequence: the setting and resetting of the modes that ask for the
-    /// mouse, and nothing else. Says whether it set or reset an encoding.
-    fn apply(&mut self, control: &Control, last: u8, reading: Reading) -> bool {
-        let mut touched = false;
-        if !control.private || control.other || !matches!(last, b'h' | b'l') {
+    /// Acts on one event of the lexer, and says whether it set or reset an encoding.
+    ///
+    /// Only what the worker forwards is acted on: a full reset of the terminal, and the setting and
+    /// resetting of private modes, of which the mouse's are the ones kept.
+    fn apply(&mut self, event: &Event, reading: Reading) -> bool {
+        if event.disposition != DirectDisposition::Forward || event.passthrough_depth != 0 {
             return false;
         }
-        let set = last == b'h';
-        for &mode in &control.parameters {
-            match mode {
-                // One tracking state: a set of one of the three replaces the one in force, and a
-                // reset of any of them turns tracking off, as a terminal does. A screen drawn by a
-                // worker of an earlier build is the exception, and only while it is being drawn: it
-                // writes every tracking mode it holds, one by one, the ones that are off among them
-                // (`?1000h ?1002l ?1003l`), so a reset of a mode that is not on changes nothing
-                // there, and the screen is read as what its application asked for, the widest that
-                // is on. A current worker draws a screen that resets the three before it sets the
-                // one that is on, which reads the same under both rules.
-                // Remove the exception when no worker of an earlier build can still be running: when
-                // the lowest package version `check_build` accepts in `attach.rs` is at or above the
-                // first release that holds the one-state tracking in `kr-term`'s `ModeState`.
-                1000 | 1002 | 1003 => {
-                    let in_force = if self.motion {
-                        Some(1003)
-                    } else if self.drag {
-                        Some(1002)
-                    } else if self.clicks {
-                        Some(1000)
-                    } else {
-                        None
-                    };
-                    if set || reading != Reading::Restoration || in_force == Some(mode) {
-                        self.clicks = set && mode == 1000;
-                        self.drag = set && mode == 1002;
-                        self.motion = set && mode == 1003;
-                    }
-                }
-                // One encoding state, as xterm documents it: a set of 1005 or 1006 replaces the
-                // one in force, and a reset returns the default only when it names the one in
-                // force. A terminal that returns the default at a reset of either mode ends
-                // elsewhere after a reset of the mode that is not in force. Only the SGR report is
-                // spelled, so the console is spelled it while 1006 is the one in force, and the
-                // original report otherwise, which is also what UTF-8 coordinates (1005) are
-                // spelled as. A screen of a worker of an earlier build that holds both flags on
-                // draws `?1005h ?1006h`, which reads as 1006, the later number.
-                1005 | 1006 => {
-                    touched = true;
-                    if set {
-                        self.encoding = Some(mode);
-                    } else if self.encoding == Some(mode) {
-                        self.encoding = None;
-                    }
-                    self.reset_by_either = if set { Some(mode) } else { None };
-                }
-                _ => {}
+        match &event.kind {
+            // A full reset turns every mode off, the mouse's among them.
+            EventKind::Esc {
+                intermediate: None,
+                extra_intermediates: false,
+                final_byte: b'c',
+            } => {
+                self.modes.full_reset();
+                self.reset_by_either = None;
+                false
             }
+            EventKind::Csi {
+                params,
+                truncated,
+                final_byte: final_byte @ (b'h' | b'l'),
+            } => {
+                let csi = CsiView::with_truncation(params, *final_byte, *truncated);
+                if csi.private != Some(b'?') || !csi.intermediates.is_empty() {
+                    return false;
+                }
+                let set = *final_byte == b'h';
+                let mut touched = false;
+                for slot in &csi.numbers {
+                    if let Some(mode) = slot.and_then(|value| u16::try_from(value).ok()) {
+                        touched |= self.apply_mode(mode, set, reading);
+                    }
+                }
+                touched
+            }
+            _ => false,
         }
-        touched
+    }
+
+    /// Applies the setting or resetting of one private mode, and says whether it was an encoding.
+    fn apply_mode(&mut self, mode: u16, set: bool, reading: Reading) -> bool {
+        match mode {
+            // One tracking state: a set of one of the three replaces the one in force, and a
+            // reset of any of them turns tracking off, as a terminal does. A screen drawn by a
+            // worker of an earlier build is the exception, and only while it is being drawn: it
+            // writes every tracking mode it holds, one by one, the ones that are off among them
+            // (`?1000h ?1002l ?1003l`), so a reset of a mode that is not on changes nothing
+            // there, and the screen is read as what its application asked for, the widest that
+            // is on. A current worker draws a screen that resets the three before it sets the
+            // one that is on, which reads the same under both rules.
+            // Remove the exception when no worker of an earlier build can still be running: when
+            // the lowest package version `check_build` accepts in `attach.rs` is at or above the
+            // first release that holds the one-state tracking in `kr-term`'s `ModeState`.
+            1000 | 1002 | 1003 => {
+                if set || reading != Reading::Restoration || self.modes.is_set(ModeKind::Dec, mode)
+                {
+                    self.modes.set(ModeKind::Dec, mode, set);
+                }
+                false
+            }
+            // One encoding state, as xterm documents it: a set of 1005 or 1006 replaces the
+            // one in force, and a reset returns the default only when it names the one in
+            // force. A terminal that returns the default at a reset of either mode ends
+            // elsewhere after a reset of the mode that is not in force. Only the SGR report is
+            // spelled, so the console is spelled it while 1006 is the one in force, and the
+            // original report otherwise, which is also what UTF-8 coordinates (1005) are
+            // spelled as. A screen of a worker of an earlier build that holds both flags on
+            // draws `?1005h ?1006h`, which reads as 1006, the later number.
+            1005 | 1006 => {
+                self.modes.set(ModeKind::Dec, mode, set);
+                self.reset_by_either = set.then_some(u32::from(mode));
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -877,16 +821,45 @@ mod tests {
             .bytes(),
             b"\x1b[?1005;1006l\x1b[?1006h".to_vec()
         );
-        // A reset of the mode that is not in force in a long list of parameters, which the worker
-        // acts on, is read whole: nothing is restored that the application cleared.
-        let mut long = b"\x1b[?1000;1006h\x1b[?".to_vec();
-        for _ in 0..60 {
-            long.extend_from_slice(b"1006;");
+        // A reset in the longest list the worker forwards, which is as long as its lexer keeps one
+        // sequence, is read whole: nothing is restored that the application cleared. One byte more
+        // is a sequence the worker withholds and does not act on, so it is passed over here too,
+        // and the encoding it named stays in force.
+        let longest = kr_term::lexer::LexLimits::DEFAULT.max_sequence_bytes;
+        // Every slot of a list the worker forwards names a mode it tracks (an empty one makes it
+        // an extension), so the filler is the modes 1 and 12, which are tracked and not the mouse's.
+        let list = |bytes: usize| {
+            let mut list = b"\x1b[?".to_vec();
+            let mut room = bytes - list.len() - b"1006l".len();
+            if room % 2 == 1 {
+                list.extend_from_slice(b"12;");
+                room -= 3;
+            }
+            list.extend(b"1;".repeat(room / 2));
+            list.extend_from_slice(b"1006l");
+            list
+        };
+        for (bytes, cleared) in [(longest, true), (longest + 1, false)] {
+            let mut output = b"\x1b[?1000;1006h".to_vec();
+            output.extend_from_slice(&list(bytes));
+            assert_eq!(output.len(), 13 + bytes);
+            output.extend_from_slice(b"\x1b[?1005l");
+            let mut reporting = MouseReporting::default();
+            let follows = reporting.read(&output, Reading::Live);
+            if cleared {
+                assert_eq!(follows, Vec::new());
+                assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::X10);
+            } else {
+                assert_eq!(
+                    follows,
+                    vec![Follow {
+                        at: output.len(),
+                        encoding: 1006
+                    }]
+                );
+                assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::Sgr);
+            }
         }
-        long.extend_from_slice(b"1006l\x1b[?1005l");
-        let mut reporting = MouseReporting::default();
-        assert_eq!(reporting.read(&long, Reading::Live), Vec::new());
-        assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::X10);
         // The sequences that leave every terminal where the session is write nothing.
         for output in [
             &b"\x1b[?1006h"[..],
@@ -916,6 +889,46 @@ mod tests {
             let mut reporting = MouseReporting::default();
             let _ = reporting.read(b"\x1b[?1006h", reading);
             assert_eq!(reporting.read(b"\x1b[?1005l", reading), Vec::new());
+        }
+    }
+
+    /// A sequence is read where the worker's lexer reads it. Padding keeps a sequence whole, wherever
+    /// it comes in it. Cancel and substitute end it, an escape begins another, a raw 8-bit control
+    /// ends it, and a slot with nothing in it makes it a sequence the worker does not act on.
+    #[test]
+    fn a_reset_is_read_as_the_worker_reads_it() {
+        // After the set of 1000 and 1006, the application writes each of these and then `?1005l`.
+        for (written, cleared) in [
+            (&b"\x1b\x00[?1006l"[..], true),
+            (b"\x1b\x7f[?1006l", true),
+            (b"\x1b[\x00?1006l", true),
+            (b"\x1b[?10\x00\x7f06l", true),
+            (b"\x1b[?1006\x18l", false),
+            (b"\x1b[?1006\x1al", false),
+            (b"\x1b[?1006\x1b[?1000h", false),
+            (b"\x1b[?1006\x9bl", false),
+            (b"\x1b[?;1006l", false),
+            (b"\x1b[?1006;l", false),
+        ] {
+            let mut output = b"\x1b[?1000;1006h".to_vec();
+            output.extend_from_slice(written);
+            output.extend_from_slice(b"\x1b[?1005l");
+            let mut reporting = MouseReporting::default();
+            let follows = reporting.read(&output, Reading::Live);
+            let expected = if cleared {
+                Vec::new()
+            } else {
+                vec![Follow {
+                    at: output.len(),
+                    encoding: 1006,
+                }]
+            };
+            assert_eq!(follows, expected, "{written:?}");
+            assert_eq!(
+                reporting.encoding() == kr_keys::MouseEncoding::Sgr,
+                !cleared,
+                "{written:?}"
+            );
         }
     }
 
