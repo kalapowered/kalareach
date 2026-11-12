@@ -3540,6 +3540,78 @@ fn an_application_identity_service_that_already_runs_is_never_stopped_and_the_ev
     let _ = std::fs::remove_file(&log);
 }
 
+/// A computer whose owner already runs the Application Identity service, set to start with Windows,
+/// keeps it that way: the installation neither starts it, nor stops it, nor changes its start type,
+/// records the state it found, proves the policy, and the removal leaves the service as it was. The
+/// case starts from that state and does not make it: a run that finds the service stopped, or not
+/// automatic, is void.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_application_identity_service_that_runs_and_starts_with_windows_is_left_as_it_was_by_the_installation_and_the_removal()
+ {
+    let case = Case::new();
+    let paths = Paths::system().expect("the system's folders are read");
+    let before = snapshot();
+    assert!(
+        before.appid_running && before.appid_start == 2,
+        "the machine is not clean: the Application Identity service is not running and set to start with Windows"
+    );
+    assert!(
+        before.policy.is_unconfigured(),
+        "the guest starts with no application control"
+    );
+    let log = call_log();
+    let (code, output) = case.payload(
+        "payload",
+        &[("KR_BOUNDARY_CALL_LOG", log.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "the installation succeeds: {output}");
+    assert!(output.contains("already running"), "{output}");
+    for account in [CHECKOUT, CONNECT] {
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains(account)
+                    && line.contains("an unlisted program was refused")),
+            "the proof passes for {account}: {output}"
+        );
+    }
+    let calls = recorded_calls(&log);
+    assert!(
+        !calls.iter().any(|call| call.starts_with("appid ")),
+        "a service that runs and starts with Windows is neither started, stopped nor set: {calls:?}"
+    );
+    // The record of the earlier state says what was found.
+    let prior = Prior::load(&paths.prior).unwrap();
+    assert!(
+        prior.appid_running,
+        "the record says the service was running"
+    );
+    assert_eq!(
+        prior.appid_start_type, 2,
+        "and that it started with Windows"
+    );
+    let installed = snapshot();
+    assert!(
+        installed.appid_running && installed.appid_start == 2,
+        "the installation leaves the service as it found it: {installed:?}"
+    );
+
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_eq!(code, 0, "the removal succeeds: {output}");
+    assert_eq!(
+        snapshot(),
+        before,
+        "the computer is as it was, the service running and set to start with Windows"
+    );
+    let calls = recorded_calls(&log);
+    assert!(
+        !calls.iter().any(|call| call == "appid stop"),
+        "the removal does not stop a service it did not start: {calls:?}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_stopped_application_identity_service_is_started_once_and_its_first_event_comes_before_the_write()
