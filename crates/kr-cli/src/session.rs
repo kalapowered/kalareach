@@ -2222,6 +2222,13 @@ impl ConsoleMouse {
         follows
     }
 
+    /// Reads a screen this command drew from the session's own, which is read as a terminal reads
+    /// it: what a worker of an earlier build writes into a restoration is not what this command's
+    /// own painter writes.
+    fn painted(&mut self, output: &[u8], terminal: &ControllingTerminal, may_type: bool) {
+        let _ = self.shown(output, terminal, may_type, crate::mouse::Reading::Painted);
+    }
+
     /// How an output event of the session is read: as part of a restoration, or as what the
     /// application wrote.
     fn reading_of(&mut self, first: bool, cursor: u64, length: usize) -> crate::mouse::Reading {
@@ -2638,12 +2645,7 @@ async fn drive(
                                 window.return_to_live();
                             }
                             if !drawn.bytes.is_empty() {
-                                console_mouse.shown(
-                                    &drawn.bytes,
-                                    terminal,
-                                    epoch.is_some(),
-                                    crate::mouse::Reading::Painted,
-                                );
+                                console_mouse.painted(&drawn.bytes, terminal, epoch.is_some());
                                 let mut handle = output.as_ref();
                                 if handle.write_all(&drawn.bytes).is_err() {
                                     return AttachOutcome::Disconnected;
@@ -4570,6 +4572,30 @@ mod tests {
             "Shift going down and a click are not typing: {:?}",
             ran.said[0]
         );
+    }
+
+    /// What the command's own painter draws never takes the reading that is for a restoration of an
+    /// earlier worker: a reset of a tracking mode that is not on, in a screen it drew, turns tracking
+    /// off.
+    #[cfg(unix)]
+    #[test]
+    fn what_the_painter_draws_turns_tracking_off_at_a_reset_of_a_mode_that_is_not_on() {
+        let device = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("a device to hold the place of a terminal");
+        let terminal = crate::terminal::ControllingTerminal::over(device);
+        let mut mouse = super::ConsoleMouse::default();
+        mouse.shown(
+            b"\x1b[?1003h",
+            &terminal,
+            true,
+            crate::mouse::Reading::Restoration,
+        );
+        assert_eq!(mouse.reporting.tracking(), crate::mouse::Tracking::Motion);
+        mouse.painted(b"\x1b[?1002l", &terminal, true);
+        assert_eq!(mouse.reporting.tracking(), crate::mouse::Tracking::Off);
     }
 
     /// A mouse record that arrives after the application stopped asking for the mouse, because the
