@@ -651,6 +651,10 @@ impl Kr {
             .env_clear()
             .envs(environment.iter().map(|(name, value)| (name, value)))
             .env("PATH", path)
+            // A login session has a per-user runtime directory outside the home. The .NET 11
+            // runtime of PowerShell keeps its shared memory there, and with none it makes a
+            // `.dotnet` directory in the home, which this run would count as the installer's.
+            .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("KR_RUNTIME_DIR", &self.runtime)
             .env("KR_STATE_DIR", &self.state)
             .env(PACKAGE_ROOT_VARIABLE, package_root())
