@@ -4265,3 +4265,88 @@ fn after_a_restart_the_brokers_proof_passes_inside_its_bound() {
         }
     }
 }
+
+/// A client that connects to the waiting instance and goes before the server's wait for it ends only
+/// that connection: the listener goes on and serves the next client.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_the_listener() {
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    require_clean_machine();
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    drop(pipe::connect(std::process::id()).expect("the first client opens the pipe"));
+    let server = std::thread::spawn(move || {
+        listener
+            .accept()
+            .map(|connection| connection.is_some())
+            .map_err(|failure| failure.to_string())
+    });
+    let second = std::thread::spawn(|| pipe::connect(std::process::id()).map(drop));
+    let accepted = server.join().unwrap();
+    stop.set();
+    let second = second.join().unwrap();
+    assert_eq!(
+        accepted,
+        Ok(true),
+        "the first client's going ends its connection only; the second client's open: {second:?}"
+    );
+}
+
+/// The listener holds an instance of its own from the bind to its end, so that with every client gone
+/// and no accept pending, no other account can make the first instance of the pipe's name.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_listener_keeps_the_pipes_name_with_every_client_gone_and_no_accept_pending() {
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    require_clean_machine();
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    let client = pipe::connect(std::process::id()).expect("the client opens the pipe");
+    let served = listener.accept().unwrap().expect("a client is accepted");
+    drop(client);
+    drop(served);
+    // Any account's call that makes the first instance of the name, as the system's does here, fails.
+    let taken = Listener::bind(&[], Stop::new().unwrap());
+    assert!(
+        taken.is_err(),
+        "the name is free between two connections: another account could make its first instance"
+    );
+    stop.set();
+}
+
+/// Clients that connect and send nothing do not stop the service: the first frame of a connection has
+/// a deadline, so that eight of them, one more than the connections served at once, are closed and a
+/// real client is served once the deadline has passed.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn eight_clients_that_send_nothing_do_not_stop_the_service_and_a_real_client_is_served_after_one_deadline()
+ {
+    use kr_boundary_windows::win::pipe;
+    let case = Case::new();
+    let (code, output) = case.install();
+    assert_eq!(code, 0, "{output}");
+    let manager = service::manager().unwrap();
+    let broker = manager.open(SERVICE).unwrap().unwrap();
+    let pid = broker.status().unwrap().pid;
+    let silent: Vec<_> = (0..8)
+        .map(|number| {
+            pipe::connect(pid).unwrap_or_else(|failure| panic!("silent client {number}: {failure}"))
+        })
+        .collect();
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    let served = loop {
+        match install::open_session() {
+            Ok(session) => break Some(session),
+            Err(_) if std::time::Instant::now() < give_up => {}
+            Err(failure) => panic!("no real client was served after the silent ones: {failure}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    drop(served);
+    drop(silent);
+    assert!(
+        broker.status().unwrap().running(),
+        "the silent clients stopped the service"
+    );
+}
