@@ -22,8 +22,10 @@
 #               becomes a destination at the host under the authorisation the gateway issued, files
 #               the host's preview key in the limited store, and shows the host's generic alert
 #               for a question; the host's text reaches neither the provider's message nor the
-#               screen. A message it was not waiting for is not answered.
-#   does not    a real Firebase or APNs delivery, a real registration token, background limits of a
+#               screen. A message it was not waiting for is not answered. On the simulator the
+#               first tapped banner is tapped with the application in the background and the
+#               second with its process ended, and each opens the page on its Attention screen.
+#   does not a real Firebase or APNs delivery, a real registration token, background limits of a
 #               phone, the notification service extension on a device, or a force-quit
 #               application. A staging run with the staging sender credentials, or the person's
 #               own phone, adds those.
@@ -393,6 +395,11 @@ else:
     left_on_hosts = "left the page on Hosts: true" in notes and "left the page on Hosts: false" not in notes
 say("the application was on its Hosts screen when the notification was tapped, and the tap opened it on its Attention screen (09.21)",
     left_on_hosts and "PUSH-TAPPED" in tapped and "Attention" in tapped, tapped[:200].replace("\n", " "))
+if platform == "ios":
+    cold = read("tapped-cold.txt")
+    heard = read("application.log").count("(Foundation) KalaReach: a tap on a notification was heard")
+    say("the application heard both taps, the second with its process ended, and then stood in front on its Attention screen (09.21)",
+        heard >= 2 and "foreground=true" in cold and "Attention" in cold, f"taps heard {heard}; {cold[:160]}".replace("\n", " "))
 say("the person answered Yes from there, and the worker's ledger holds that answer as this paired device's (09.21)",
     report.get("question_answered_from_the_notification") is True and report.get("answer_is_the_paired_devices") is True
     and report.get("answer_is_yes") is True)
@@ -806,6 +813,12 @@ pump_ios() { # <udid>
             # person's acts bring it to the front, so it is asked to go every time.
             want_ios background
             deliveries=$((deliveries + 1))
+            # The second tap is the one that starts the application: the process is ended first, so the
+            # tap is a cold start and not a return to a process that was kept.
+            if [ "$deliveries" -eq 2 ]; then
+                xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
+                : >"$harness/cold-$n"
+            fi
             python3 "$here/scripts/lib/push-inject.py" banner "$file" >"$harness/banner-expect-$n.txt"
             xcrun simctl push "$udid" "$app_id" "$harness/payload-$n.json" >"$harness/push-$n.out" 2>&1
             : >"$harness/banner-wanted-$n"
@@ -831,6 +844,7 @@ pump_ios() { # <udid>
                     [ "$waited" -lt 150 ] || break
                 done
                 cp "$harness/tapped-$n" "$artefacts/tapped-$n.txt" 2>/dev/null
+                [ -e "$harness/cold-$n" ] && cp "$harness/tapped-$n" "$artefacts/tapped-cold.txt" 2>/dev/null
                 want_ios foreground && place=foreground
             fi
             say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> banner: $(head -c 200 "$harness/banner-$n.txt" 2>/dev/null)"

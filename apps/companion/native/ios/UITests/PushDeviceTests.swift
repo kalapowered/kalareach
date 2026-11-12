@@ -244,7 +244,14 @@ final class PushDeviceTests: DeviceTestCase {
             exists("tap-\(n)")
         else { return }
         banner.tap()
-        let opened = app.wait(for: .runningForeground, timeout: 30)
+        var opened = app.wait(for: .runningForeground, timeout: 30)
+        if !opened {
+            // The tap may have started a process this test did not: it is attached to by activating it.
+            app.activate()
+            opened = app.wait(for: .runningForeground, timeout: 30)
+        }
+        // A page that has just been started has no text yet, and is read once it has some.
+        _ = app.staticTexts.firstMatch.waitForExistence(timeout: 30)
         // What the page shows once the application is in front: the attention screen shows the
         // question, which the banner never did.
         let shown = app.staticTexts.allElementsBoundByIndex.prefix(60).map { $0.label }.joined(separator: " | ")

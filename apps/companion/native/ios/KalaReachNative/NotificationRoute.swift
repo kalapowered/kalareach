@@ -50,6 +50,7 @@ final class NotificationRouter: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         if response.actionIdentifier == UNNotificationDefaultActionIdentifier {
+            NSLog("KalaReach: a tap on a notification was heard")
             NotificationRoute.shared.opened(on: NotificationRoute.attention)
         }
         completionHandler()
