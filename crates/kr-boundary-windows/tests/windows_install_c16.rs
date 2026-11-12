@@ -341,6 +341,13 @@ fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
         !text.to_lowercase().contains("remove the link"),
         "an administrator is never told to remove it: {text}"
     );
+    // The folder is the boundary's own, so nothing sends the administrator to another computer's
+    // known folders.
+    assert!(
+        text.contains("The setup program makes this folder itself"),
+        "{text}"
+    );
+    assert!(!text.contains("plain folders"), "{text}");
 }
 
 /// A fresh installation reads the folders above the program tree before it makes, writes or stops
