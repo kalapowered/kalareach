@@ -362,9 +362,10 @@ fn ask_with(
     ask_given(program, arguments, inputs, allowed, inherited.as_deref())
 }
 
-/// The variable that names the per-user directory where the .NET runtime keeps the files of its
-/// named mutexes and shared memory: `TMPDIR` on macOS, `XDG_RUNTIME_DIR` on the other Unix systems.
-/// Where it is unset the runtime keeps them in a `.dotnet` directory of the home.
+/// The variable that names the per-user directory where the .NET 11 runtime keeps the files of its
+/// named mutexes and shared memory: `TMPDIR` on macOS and `XDG_RUNTIME_DIR` on Linux. Where it is
+/// unset the runtime keeps them in a `.dotnet` directory of the home, and on any other Unix system
+/// it always does, which a variable cannot change.
 #[cfg(unix)]
 const RUNTIME_DIRECTORY_VARIABLE: &str = if cfg!(target_os = "macos") {
     "TMPDIR"
