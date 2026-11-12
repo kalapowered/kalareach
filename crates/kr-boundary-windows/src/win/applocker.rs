@@ -70,6 +70,9 @@ pub enum Error {
         what: &'static str,
         /// The reason.
         source: LaunchError,
+        /// Whether the deadline that the query was given is the search's own, and not the query's
+        /// bound of its own, which is the earlier of the two when it is the shorter.
+        by_the_deadline: bool,
     },
     /// The answer could not be read.
     #[error("{0}")]
@@ -83,11 +86,12 @@ impl Error {
     #[must_use]
     pub fn query_end(&self) -> QueryEnd {
         match self {
-            Error::DeadlinePassed
-            | Error::Launch {
+            Error::DeadlinePassed => QueryEnd::DeadlinePassed,
+            Error::Launch {
                 source: LaunchError::DeadlinePassed,
+                by_the_deadline,
                 ..
-            } => QueryEnd::DeadlinePassed,
+            } => crate::window::launch_deadline_end(*by_the_deadline),
             Error::TimedOut {
                 by_the_deadline, ..
             } => QueryEnd::Cut {
@@ -357,7 +361,11 @@ fn wevtutil(
     let name = program.display().to_string();
     let mut parts = vec![name.as_str()];
     parts.extend_from_slice(arguments);
-    let launch_error = |source| Error::Launch { what, source };
+    let launch_error = |source| Error::Launch {
+        what,
+        source,
+        by_the_deadline: bound.by_the_window,
+    };
     let program = VerifiedPath::new(&program).map_err(launch_error)?;
     let captured = run_captured(
         Run {

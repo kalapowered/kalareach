@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use kr_boundary_windows::window::{
-    QueryEnd, bound, may_ask_the_log, query_ends_the_search, search_is_over,
+    QueryEnd, bound, launch_deadline_end, may_ask_the_log, query_ends_the_search, search_is_over,
 };
 
 #[test]
@@ -122,10 +122,21 @@ fn each_error_of_a_query_of_the_log_is_told_apart_by_what_ended_it() {
     assert_eq!(
         Error::Launch {
             what,
-            source: LaunchError::DeadlinePassed
+            source: LaunchError::DeadlinePassed,
+            by_the_deadline: true
         }
         .query_end(),
         QueryEnd::DeadlinePassed
+    );
+    // The query's own bound passed before its program started: the search's deadline did not.
+    assert_eq!(
+        Error::Launch {
+            what,
+            source: LaunchError::DeadlinePassed,
+            by_the_deadline: false
+        }
+        .query_end(),
+        QueryEnd::Failed
     );
     assert_eq!(
         Error::TimedOut {
@@ -150,7 +161,8 @@ fn each_error_of_a_query_of_the_log_is_told_apart_by_what_ended_it() {
     assert_eq!(
         Error::Launch {
             what,
-            source: LaunchError::NotStarted(5)
+            source: LaunchError::NotStarted(5),
+            by_the_deadline: true
         }
         .query_end(),
         QueryEnd::Failed
@@ -159,4 +171,14 @@ fn each_error_of_a_query_of_the_log_is_told_apart_by_what_ended_it() {
         Error::Unreadable("a bad answer".to_owned()).query_end(),
         QueryEnd::Failed
     );
+}
+
+/// A query's program that could not start because its deadline had passed ends the search only when
+/// the search's own deadline set that deadline; when the query's own bound did, the query failed.
+#[test]
+fn a_launch_that_missed_its_deadline_ends_the_search_only_when_the_searchs_deadline_set_it() {
+    assert_eq!(launch_deadline_end(true), QueryEnd::DeadlinePassed);
+    assert!(query_ends_the_search(launch_deadline_end(true)));
+    assert_eq!(launch_deadline_end(false), QueryEnd::Failed);
+    assert!(!query_ends_the_search(launch_deadline_end(false)));
 }
