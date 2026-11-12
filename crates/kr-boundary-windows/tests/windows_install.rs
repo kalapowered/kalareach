@@ -269,7 +269,7 @@ impl Case {
 
 impl Drop for Case {
     fn drop(&mut self) {
-        let _ = setup(&["remove"], "yes\n", &[]);
+        let (removal_code, removal_output) = setup(&["remove"], "yes\n", &[]);
         // What the removal left, read before the policy is cleared here: a case that ends with
         // something of the installation still on the machine fails itself, and the next case's
         // "not clean" is not the only sign of it.
@@ -282,6 +282,10 @@ impl Drop for Case {
         let _ = channel().set(CLEAR);
         let _ = account::delete(&self.name);
         if !std::thread::panicking() {
+            assert_eq!(
+                removal_code, 0,
+                "the case's own removal failed: {removal_output}"
+            );
             assert!(
                 left.is_empty(),
                 "the removal left on the machine: {}",
@@ -3499,9 +3503,12 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
 
 /// The calls the installation made on the Application Identity service, as the test build of the
 /// setup program records them in the file that `KR_BOUNDARY_CALL_LOG` names.
+///
+/// A log that is not there fails the case: a recorder that did not work must not read as a program
+/// that made no call.
 fn recorded_calls(log: &Path) -> Vec<String> {
     std::fs::read_to_string(log)
-        .unwrap_or_default()
+        .unwrap_or_else(|failure| panic!("the recorder wrote no call log at {log:?}: {failure}"))
         .lines()
         .map(str::to_owned)
         .collect()
@@ -3691,7 +3698,13 @@ fn an_application_identity_service_that_runs_and_starts_with_windows_is_left_as_
     );
 
     // The removal records its calls in the same file, so that what it did not do to the service shows.
+    // The installation's own lines are in the log, so the recorder works; the removal's recorder is
+    // shown working by the case of the stopped service, whose removal records the stop it makes.
     let before_removal = recorded_calls(&log).len();
+    assert!(
+        before_removal > 0,
+        "the recorder wrote the installation's calls"
+    );
     let (code, output) = setup(
         &["remove"],
         "yes\n",
@@ -3754,8 +3767,20 @@ fn a_stopped_application_identity_service_is_started_once_and_its_first_event_co
         .find("the policy is written")
         .expect("the policy is written");
     assert!(started < written, "{output}");
-    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    // The removal records its calls in the same file. The service was stopped and the installation
+    // started it, so the removal stops it again, and that line shows the removal's recorder works.
+    let (code, output) = setup(
+        &["remove"],
+        "yes\n",
+        &[("KR_BOUNDARY_CALL_LOG", log.to_str().unwrap())],
+    );
     assert_eq!(code, 0, "{output}");
+    let calls = recorded_calls(&log);
+    assert_eq!(
+        calls.iter().filter(|call| *call == "appid stop").count(),
+        1,
+        "the removal stops the service that the installation started, once: {calls:?}"
+    );
     assert_eq!(snapshot(), original);
     let _ = std::fs::remove_file(&log);
 }
@@ -4718,8 +4743,9 @@ fn seven_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrato
     assert_eq!(ended.expect("the service ends"), Ok(()));
 }
 
-/// A refill that fails once neither ends the listener nor drops the client that just connected: the
-/// instance in hand serves it, and the next call makes the waiting instance again.
+/// A refill that fails, and the try after it that fails too, neither ends the listener nor drops the
+/// client that just connected: the instance in hand serves it, and the next call makes the waiting
+/// instance again.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
@@ -4735,7 +4761,7 @@ fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_ha
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     let first = pipe::connect(std::process::id()).expect("the first client opens the pipe");
-    pipe::testing::fail_next_refill();
+    pipe::testing::fail_refills(2);
     let served = listener
         .accept()
         .expect("the failed refill does not end the listener")
@@ -4959,4 +4985,72 @@ fn the_clients_open_asks_for_the_least_rights_its_calls_need() {
             "the calls work with {access:#x}, one right fewer than the client asks for: that right is not needed"
         );
     }
+}
+
+/// A listener that cannot make its waiting instance again and again gives up its name in order: the
+/// service ends with the reason, after its open connections have ended, and does not report that it
+/// stopped while a thread is still answering.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_listener_that_cannot_make_its_instance_ends_the_service_after_its_connections() {
+    require_clean_machine();
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
+    kr_boundary_windows::win::pipe::testing::fail_refills(5000);
+    let (_stop, served) = serve_in_process();
+    // An administrator's connection has the longest idle bound, so only the stop set at the loop's
+    // end can have it ended inside this case's time.
+    let mut person = client_without(&[SYSTEM_SID]);
+    say_hello(&mut person);
+    // The refills fail a thousand times in a row, about twenty seconds, and the loop ends.
+    let ended = ended_within(served, 90)
+        .expect("the loop ends when it cannot make an instance")
+        .expect_err("the service ends with the reason");
+    assert!(ended.contains("making the pipe"), "{ended}");
+    // The connection was ended with the service: the client's next read finds the end of the stream.
+    person.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    ));
+    let after = kr_boundary_windows::frame::read::<_, Response>(&mut person);
+    assert!(
+        matches!(after, Err(kr_boundary_windows::frame::FrameError::Closed)),
+        "the connection stayed open after the service ended: {after:?}"
+    );
+}
+
+/// An administrator's connection is not closed at the bound of a person's: it waits longer than that
+/// bound without a request and is then served, as the installer's session is when its removal writes
+/// the policy between its first request and its last.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_administrators_connection_stays_open_past_the_bound_of_a_persons() {
+    require_clean_machine();
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
+    let (stop, served) = serve_in_process();
+    let mut administrator = client_without(&[SYSTEM_SID]);
+    say_hello(&mut administrator);
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    administrator.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    ));
+    let answer = install::ask(&mut administrator, &Request::Status {});
+    stop.set();
+    let ended = ended_within(served, 20);
+    drop(administrator);
+    assert!(
+        matches!(answer, Ok(Response::Status { .. })),
+        "the administrator's connection was closed while it was idle: {answer:?}"
+    );
+    assert_eq!(ended.expect("the service ends"), Ok(()));
 }
