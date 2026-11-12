@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::{ClientError, Said as _, Session};
 use kr_protocol::error::{ErrorCode, RetryCategory};
@@ -238,7 +239,17 @@ impl Dial {
         )
         .await
         .map_err(|_| Unopened::unreached("the host did not answer in time"))?
-        .map_err(Unopened::of_link)
+        .map_err(|error| match error {
+            LinkError::Refused(refusal) => {
+                Unopened::Refused(Asked::Connection, CommandError::from(refusal))
+            }
+            // This application's own budget refused the dial, so no host was asked.
+            LinkError::Declined(_) => Unopened::BudgetFull,
+            // A connection that could not be given the lease the host needs, or whose account left,
+            // is waited out: the opening stands and its watch dials again, as for a host that did
+            // not answer.
+            other => Unopened::unreached(other.said().into_string()),
+        })
     }
 
     /// Reaches the host on a connection of its own and has it open `session_id` under `grant_id`.
