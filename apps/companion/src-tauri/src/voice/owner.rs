@@ -2875,8 +2875,17 @@ pub(super) async fn stop_at_host(
 /// connection, or a computer that holds as many as it keeps, says so, and a refusal is the host's
 /// own word, naming the request it refused. A refusal of the connection itself asked the host
 /// nothing: this device may have been unable to give it the lease it needs, so the words say that
-/// the connection was not opened and not that the host refused it.
+/// the connection was not opened and not that the host refused it. The words are a sentence, ending
+/// in a full stop, since a problem adds its own sentence after them.
 fn not_reached_words(unopened: &Unopened) -> String {
+    let mut words = told_by_cause(unopened);
+    if !words.ends_with('.') {
+        words.push('.');
+    }
+    words
+}
+
+fn told_by_cause(unopened: &Unopened) -> String {
     match unopened {
         Unopened::Unreached(error) => format!("The host could not be reached: {}", error.message),
         Unopened::HostFull => "The host cannot take another connection from this computer just \
@@ -2992,6 +3001,26 @@ mod tests {
         assert!(request.contains("refused to say who it is"), "{request}");
     }
 
+    /// KR-REQ-19.08: the words a problem starts with end in a full stop whatever the host's own words
+    /// end in, since the problem adds a sentence after them.
+    #[test]
+    fn the_words_of_every_cause_end_in_a_full_stop() {
+        use crate::connection::Asked;
+
+        for unopened in [
+            Unopened::Unreached(CommandError::unavailable("gone")),
+            Unopened::NotAdmitted(CommandError::unavailable("open a new connection")),
+            Unopened::Refused(Asked::HostInfo, CommandError::unavailable("no")),
+            Unopened::Refused(Asked::Connection, CommandError::unavailable("no.")),
+            Unopened::HostFull,
+            Unopened::BudgetFull,
+        ] {
+            let words = not_reached_words(&unopened);
+            assert!(words.ends_with('.'), "{words}");
+            assert!(!words.ends_with(".."), "{words}");
+        }
+    }
+
     /// KR-REQ-19.08: a probe whose connection was not opened tells why for every cause but a host
     /// that was not reached: a refusal is not told as unreached.
     #[test]
@@ -3005,6 +3034,7 @@ mod tests {
         for unopened in [
             Unopened::HostFull,
             Unopened::BudgetFull,
+            Unopened::NotAdmitted(CommandError::unavailable("no")),
             Unopened::Refused(Asked::HostInfo, CommandError::unavailable("no")),
             Unopened::Refused(Asked::Connection, CommandError::unavailable("no")),
         ] {

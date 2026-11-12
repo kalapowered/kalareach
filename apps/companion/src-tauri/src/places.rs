@@ -17,9 +17,10 @@
 //! The number of such links is not bounded, and the cost is known. Each takes one of the places of
 //! the other kinds for as long as something holds it, so those kinds are declined sooner, in the
 //! words of this budget. A process that ends while it holds the total and `k` former main links
-//! leaves them at the host for up to 15 seconds, the time the host waits before it withdraws a
-//! connection it has not heard from, and its successor can be refused `k` more dials in that time.
-//! It is not bounded because more than the host's bound of twice the total would take as many
+//! leaves them at the host. The host withdraws a connection only when a later admission needs the
+//! room, and only one it has not heard from for more than 15 seconds; with no such attempt a dead
+//! connection stays until the transport's idle timeout of 30 seconds. Its successor can be refused
+//! `k` more dials meanwhile. It is not bounded because more than the host's bound of twice the total would take as many
 //! shares or calls held at once, each holding a former main link, and as many changes of host and
 //! back, which a person does not reach.
 //!
