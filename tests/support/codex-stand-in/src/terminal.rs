@@ -9,9 +9,10 @@
 //! composer ([`crate::keyboard`]). A line sent from the composer is a prompt, and starts a turn; a
 //! command of its list does what the command does (`/fork` and `/new` ask the server for a thread,
 //! `/quit` leaves); and the server's request to run a command is shown as a dialog that the person
-//! answers with a key, or that goes when the server says the request was answered. Its own turn at
-//! the start, and the answers it gives itself to a request that names no command, are as they are
-//! where no person is at it.
+//! answers with a key, or that goes when the server says the request was answered. Under
+//! `write-the-record` it starts no turn of its own where it has no words to start one with, as a
+//! terminal that waits for the person does. The answers it gives itself to a request that names no
+//! command are as they are where no person is at it.
 
 use std::collections::BTreeMap;
 
@@ -339,20 +340,25 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                             .unwrap_or_default()
                             .to_owned();
                         screen.begins();
-                        // A terminal a person resumes a conversation in starts no turn of its own
-                        // with the words typed to resume it.
-                        let own = if screen.is_typed_at() && prompt.starts_with("resume ") {
+                        // A terminal a person is at, for an agent that keeps a record of its
+                        // turns, starts a turn of its own only with words to start one with, and
+                        // not with the words that resume a conversation: its turns are the ones
+                        // typed at it or sent to it.
+                        let a_person_is_at_it = screen.is_typed_at() && variants.write_the_record;
+                        let own = if a_person_is_at_it && prompt.starts_with("resume ") {
                             ""
                         } else {
                             prompt
                         };
-                        let text = match Variants::pad() {
-                            Some(size) => {
-                                padded(size, |text| turn_request(&thread, text).to_string())
-                            }
-                            None => own.to_owned(),
-                        };
-                        send!(turn_request(&thread, &text));
+                        if !(a_person_is_at_it && own.is_empty()) {
+                            let text = match Variants::pad() {
+                                Some(size) => {
+                                    padded(size, |text| turn_request(&thread, text).to_string())
+                                }
+                                None => own.to_owned(),
+                            };
+                            send!(turn_request(&thread, &text));
+                        }
                     }
                     "turn/start" => {
                         turn = frame["result"]["turn"]["id"]
