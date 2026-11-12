@@ -80,6 +80,19 @@ fn a_package_that_needs_a_newer_sdk_is_refused_with_the_range_alone() {
     }
 }
 
+/// A range with no upper bound that starts above this SDK excludes it as well, and the package is
+/// refused for that before its table is read.
+#[test]
+fn a_range_with_no_upper_bound_that_excludes_this_sdk_is_refused_by_the_range() {
+    let home = tempfile::tempdir().expect("a directory");
+    let directory = package(home.path(), Some(">=0.1.99"), |connector| {
+        connector["a_member_of_a_newer_sdk"] = json!(true);
+    });
+    let findings = validate_package_directory(&directory).report.findings;
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].code, FindingCode::VersionRangeExcludesHost);
+}
+
 /// A package inside the range keeps what it had: a table with a member this SDK lacks is a finding
 /// that says the table does not read.
 #[test]

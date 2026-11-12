@@ -96,6 +96,61 @@ fn every_arrival_names_an_optional_member_of_a_definition_only_the_sdk_has() {
     }
 }
 
+/// A host reads some documents before it can test a package's range: the package manifest, whose
+/// members every host has to parse to read the range at all, and the catalogue index and the
+/// publisher record, which a host parses whole when it takes a generation. A member that arrives in
+/// a definition one of them reaches is a member an earlier host cannot parse, and no range
+/// refusal comes first, so no arrival is listed in such a definition.
+#[test]
+fn no_arrival_is_in_a_definition_a_host_reads_before_it_tests_the_range() {
+    fn reach(schema: &Value, name: &str, seen: &mut std::collections::BTreeSet<String>) {
+        if !seen.insert(name.to_owned()) {
+            return;
+        }
+        fn references(node: &Value, found: &mut Vec<String>) {
+            match node {
+                Value::Object(members) => {
+                    for (key, member) in members {
+                        match (key.as_str(), member.as_str()) {
+                            ("$ref", Some(target)) => {
+                                if let Some(name) = target.strip_prefix("#/$defs/") {
+                                    found.push(name.to_owned());
+                                }
+                            }
+                            _ => references(member, found),
+                        }
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(|item| references(item, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        references(&schema["$defs"][name], &mut found);
+        for next in found {
+            reach(schema, &next, seen);
+        }
+    }
+    let schema = sdk_schema();
+    let mut before_the_range = std::collections::BTreeSet::new();
+    for root in [
+        "PluginManifest",
+        "CatalogueIndex",
+        "IndexEntry",
+        "PublisherRecord",
+    ] {
+        reach(&schema, root, &mut before_the_range);
+    }
+    assert!(before_the_range.contains("PluginManifest"));
+    for arrival in ARRIVALS {
+        assert!(
+            !before_the_range.contains(arrival.definition),
+            "{} is reached from a document a host parses before it tests the range",
+            arrival.definition
+        );
+    }
+}
+
 /// A selection that states no conditions is written as it was before the member existed: the
 /// bytes of a package that never heard of it do not change.
 #[test]

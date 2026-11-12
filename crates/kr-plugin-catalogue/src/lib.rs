@@ -2346,6 +2346,8 @@ impl Catalogue {
         {
             Ok(bytes) => bytes,
             Err(CatalogueError::UnavailableOffline { .. } | CatalogueError::Integrity { .. }) => {
+                // A manifest of a package for another SDK is not fetched to describe it.
+                extract::check_sdk_range(&entry)?;
                 let prefix = format!(
                     "{PACKAGE_PREFIX}{}/{}/{}",
                     entry.publisher_id, entry.plugin_name, entry.version

@@ -15,12 +15,17 @@
 //!   same bytes as before;
 //! * its definition belongs to the SDK alone, with no definition of that name in the protocol
 //!   schema;
+//! * its definition is reached only from documents a host reads after it has tested the package's
+//!   `sdk_range`, which are the connector table and the presentation document, and never from the
+//!   package manifest, the catalogue index or the publisher record, which an earlier host parses
+//!   before it can refuse the package for its range and, for the index, whole;
 //! * the SDK version rose in the release that added it, and a package that uses it states an
 //!   `sdk_range` that starts at that version.
 //!
 //! The generator writes the table into the package contract, and the check of a level reads it
 //! from the commit it checks and from every release it compares with: a member passes only where
-//! the commit lists it at an SDK version above the earlier release's own.
+//! the commit lists it at an SDK version above the earlier release's own, and the commit's own SDK
+//! version is above that version too.
 
 use serde_json::{Value, json};
 

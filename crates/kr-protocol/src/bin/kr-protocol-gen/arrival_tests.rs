@@ -310,6 +310,84 @@ fn what_the_rule_does_not_name_still_fails() {
     fails("a new variant", &variant, &earlier, &listed_head);
 }
 
+/// A head whose SDK version is lower than a release's fails on that alone, with the same schema and
+/// the same table.
+#[test]
+fn a_lower_sdk_version_fails_on_its_own() {
+    let (old, protocol) = (with_hidden(&sdk_schema()), protocol_schema());
+    let table = Some(LISTED);
+    let lines = compare(
+        &old,
+        &old,
+        (&protocol, &protocol),
+        &contract("0.1.8", table),
+        &contract("0.1.7", table),
+    )
+    .lines;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("0.1.8") && lines[0].contains("0.1.7"),
+        "{lines:?}"
+    );
+}
+
+/// A definition that refers to another definition than it did cannot lend its arrival entry to a
+/// member added to a definition it no longer reaches: the comparison names differences by where a
+/// definition is used, so the member added to `Route` would be taken for one added to `Other`.
+#[test]
+fn a_reference_moved_to_another_definition_does_not_carry_an_arrival_with_it() {
+    let protocol = protocol_schema();
+    let mut old = sdk_schema();
+    old["$defs"]["Other"] = json!({
+        "type": "object",
+        "properties": { "method": { "type": "string" }, "hidden": { "type": "integer" } },
+        "required": ["method"],
+    });
+    let mut new = with_hidden(&old);
+    new["$defs"]["Wrapper"]["properties"]["route"] = json!({ "$ref": "#/$defs/Other" });
+    let outcome = compare(
+        &old,
+        &new,
+        (&protocol, &protocol),
+        &contract("0.1.6", None),
+        &contract("0.1.7", Some(LISTED)),
+    );
+    assert!(outcome.passed.is_empty(), "{:?}", outcome.passed);
+    assert!(
+        outcome
+            .lines
+            .iter()
+            .any(|line| line.contains("Wrapper refers to other definitions")),
+        "{:?}",
+        outcome.lines
+    );
+    assert!(
+        outcome
+            .lines
+            .iter()
+            .any(|line| line == "Route.hidden added: a member")
+    );
+}
+
+/// The first optional member of a definition that has no members yet is an arrival like any other:
+/// such a definition has no `properties` to hold the member's absence.
+#[test]
+fn the_first_member_of_a_definition_with_none_passes() {
+    let (mut old, protocol) = (sdk_schema(), protocol_schema());
+    old["$defs"]["Empty"] = json!({ "type": "object", "additionalProperties": false });
+    let mut new = old.clone();
+    new["$defs"]["Empty"]["properties"] = json!({ "first": { "type": "string" } });
+    let outcome = compare(
+        &old,
+        &new,
+        (&protocol, &protocol),
+        &contract("0.1.6", None),
+        &contract("0.1.7", Some(&[("Empty", "first", "0.1.7")])),
+    );
+    assert_eq!(outcome.lines, Vec::<String>::new());
+    assert_eq!(outcome.passed.len(), 1);
+}
+
 /// A member of a definition that the protocol schema has stays under the protocol's rule: the
 /// table cannot list it into the SDK's, whichever release the protocol schema is of.
 #[test]
@@ -409,6 +487,7 @@ fn a_contract_that_does_not_read_fails_with_its_own_message() {
         (r#"{"sdk_version": "0.1"}"#, "sdk_version"),
         (r#"{"sdk_version": "0.1.7-rc.1"}"#, "sdk_version"),
         (r#"{"sdk_version": "0.1.+7"}"#, "sdk_version"),
+        (r#"{"sdk_version": "0.01.7"}"#, "sdk_version"),
         (
             r#"{"sdk_version": "0.1.7", "arrivals": {}}"#,
             "arrivals is not a list",
