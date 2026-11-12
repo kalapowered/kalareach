@@ -4568,6 +4568,7 @@ mod tests {
     }
 
     /// Bytes as a case reads them in a failure.
+    #[cfg(unix)]
     fn shown(bytes: &[u8]) -> String {
         bytes.escape_ascii().to_string()
     }
