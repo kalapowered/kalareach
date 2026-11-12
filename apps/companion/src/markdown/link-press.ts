@@ -18,7 +18,10 @@
  * - a click that no pointer made (a keyboard, a screen reader) goes to the element it names, as it is.
  *
  * The listeners are on the document, not on the pane: a click listener on the pane would make the
- * pane a target of its own for the platforms' accessibility services.
+ * pane a target of its own for the platforms' accessibility services. On iOS the click for a tap on
+ * plain text comes because the page's other listeners (React's, on the root element below the body)
+ * count for WebKit as click listeners on the text's ancestors; a listener on the document alone would
+ * not count.
  */
 
 import { useEffect, type RefObject } from 'react'
@@ -103,9 +106,12 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
     }
     const down = (event: PointerEvent): void => {
       // A second finger, a pen's barrel and a mouse's other buttons are not the press that is going on.
-      if (!here(event.target) || !event.isPrimary || event.button !== 0) return
+      if (!event.isPrimary || event.button !== 0) return
+      // Every primary press ends the one before it, in the pane or outside it.
+      press = null
       stop()
       light(null)
+      if (!here(event.target)) return
       const choice = choose(element, event.clientX, event.clientY)
       press = { ...choice, pointer: event.pointerId, x: event.clientX, y: event.clientY, moved: false, endedAt: null }
       light(choice.link)
@@ -150,10 +156,9 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
       // The browser's own click on the control the press belongs to stands.
       if (pressed.link === null && hit === held) return
       // A link's click goes to the link whichever element the browser sent it to, and a control's goes
-      // to the control when a link's box lies over it.
+      // to the control when a link's box lies over it, if it is still there.
       stopped(event)
-      if (pressed.link !== null) pressed.link.focus({ preventScroll: true })
-      held.click()
+      if (held.isConnected && element.contains(held)) activate(held, event)
     }
 
     document.addEventListener('pointerdown', down, true)
@@ -170,6 +175,24 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
 function stopped(event: Event): void {
   event.preventDefault()
   event.stopPropagation()
+}
+
+/** Gives `target` what a pointer's press gives: the focus, and a click that counts as a pointer's. */
+function activate(target: HTMLElement, from: MouseEvent): void {
+  target.focus({ preventScroll: true })
+  target.dispatchEvent(
+    new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      detail: from.detail,
+      clientX: from.clientX,
+      clientY: from.clientY,
+      screenX: from.screenX,
+      screenY: from.screenY
+    })
+  )
 }
 
 /** What a press at (`x`, `y`) belongs to, read from the page as it is laid out now. */
