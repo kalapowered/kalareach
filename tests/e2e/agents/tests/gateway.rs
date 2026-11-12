@@ -1970,6 +1970,79 @@ fn thread_of(binding: &AgentBindingState) -> Option<String> {
     text_of(&binding.thread_id)
 }
 
+/// What the binding says while a request of the terminal's that selects or leaves a conversation has
+/// not been answered: rich work waits for the answer, which takes a round trip.
+const IN_FLIGHT_REASON: &str =
+    "the terminal has asked to change its conversation and the server has not answered";
+
+/// The longest a binding may stay held for a request in flight. A request is answered in a round
+/// trip; a hold that lasts past this is one the answer never ended.
+const IN_FLIGHT_BOUND: Duration = Duration::from_secs(10);
+
+/// How long a case keeps reading a binding after a turn, so that the terminal's own helper thread
+/// (a title for the conversation, which it leaves when the turn on it ends or after thirty seconds)
+/// has been started and left before the last read.
+const HELPER_FLOW: Duration = Duration::from_secs(35);
+
+/// What one read of a binding is, to a wait that takes a bounded hold for a request in flight.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Rich work is available: the read counts.
+    Open,
+    /// Rich work waits for a request in flight, for less than the bound: read again.
+    Waiting,
+    /// Anything else, with why: the wait fails.
+    Failed(String),
+}
+
+/// Judges each read of a binding for a wait that accepts a hold for a request in flight, for a
+/// bounded time, and no other suspension: a suspension for any other reason, a thread other than
+/// the one the wait is for, and a hold that does not end each fail it.
+struct InFlightWatch {
+    /// The thread every read must name, where the wait knows it.
+    thread: Option<String>,
+    /// When the hold that is still going on began.
+    since: std::cell::Cell<Option<Instant>>,
+}
+
+impl InFlightWatch {
+    fn new(thread: Option<&str>) -> Self {
+        Self {
+            thread: thread.map(str::to_owned),
+            since: std::cell::Cell::new(None),
+        }
+    }
+
+    /// The verdict on a read taken at `now`.
+    fn judge(&self, binding: &AgentBindingState, now: Instant) -> Verdict {
+        if let Some(want) = &self.thread {
+            match thread_of(binding) {
+                Some(got) if &got == want => {}
+                Some(got) => return Verdict::Failed(format!("it names the thread {got}, not {want}")),
+                None => return Verdict::Failed(format!("it names no thread, not {want}")),
+            }
+        }
+        if unsuspended(binding) {
+            self.since.set(None);
+            return Verdict::Open;
+        }
+        match binding.suspension_reason.0.as_deref() {
+            Some(reason) if binding.rich_mutations_suspended && reason.starts_with(IN_FLIGHT_REASON) => {
+                let since = self.since.get().unwrap_or(now);
+                self.since.set(Some(since));
+                if now.duration_since(since) >= IN_FLIGHT_BOUND {
+                    Verdict::Failed(format!(
+                        "rich work has waited more than {IN_FLIGHT_BOUND:?} for a request in flight: {reason}"
+                    ))
+                } else {
+                    Verdict::Waiting
+                }
+            }
+            other => Verdict::Failed(format!("rich work is suspended: {other:?}")),
+        }
+    }
+}
+
 /// A host, a paired device and a person in a managed shell, with the agent not yet started.
 struct Session<'a> {
     ctx: &'a Context,
@@ -2152,22 +2225,55 @@ impl<'a> Session<'a> {
             .binding_until(&self.remote, self.session_id(), instance, why, holds)
     }
 
-    /// Reads the binding until `holds` is true of it, and fails at once on any read, the last one
-    /// not excepted, that finds rich work suspended.
+    /// Reads the binding until `holds` is true of it with rich work available, and fails on any read
+    /// that finds rich work suspended for a reason other than a request in flight, and on a hold for
+    /// a request in flight that lasts past its bound.
     fn binding_unsuspended_until(
         &self,
         instance: ApplicationInstanceId,
         why: &str,
         holds: impl Fn(&AgentBindingState) -> bool,
     ) -> AgentBindingState {
+        self.binding_settled_until(instance, why, None, holds)
+    }
+
+    /// As [`Self::binding_unsuspended_until`], and fails too on a read that names a thread other than
+    /// `thread`, where one is given.
+    fn binding_settled_until(
+        &self,
+        instance: ApplicationInstanceId,
+        why: &str,
+        thread: Option<&str>,
+        holds: impl Fn(&AgentBindingState) -> bool,
+    ) -> AgentBindingState {
+        let watch = InFlightWatch::new(thread);
         self.binding_until(instance, why, |binding| {
-            assert!(
-                unsuspended(binding),
-                "{why}: rich work is suspended: {:?}",
-                binding.suspension_reason.0
-            );
-            holds(binding)
+            match watch.judge(binding, Instant::now()) {
+                Verdict::Open => holds(binding),
+                Verdict::Waiting => false,
+                Verdict::Failed(what) => panic!("{why}: {what}: {binding:?}"),
+            }
         })
+    }
+
+    /// Reads the binding for `HELPER_FLOW` and fails on any read that does not name `thread` with
+    /// no turn and rich work available (or held for a request in flight, within its bound): what the
+    /// terminal's own helper thread does to the conversation is over by the end of it.
+    fn binding_stays_on(&self, instance: ApplicationInstanceId, why: &str, thread: &str) {
+        let watch = InFlightWatch::new(Some(thread));
+        let until = Instant::now() + HELPER_FLOW;
+        while Instant::now() < until {
+            let binding = self.ctx.binding(&self.remote, self.session_id(), instance);
+            match watch.judge(&binding, Instant::now()) {
+                Verdict::Open => assert!(
+                    binding.turn_id.0.is_none(),
+                    "{why}: a turn runs: {binding:?}"
+                ),
+                Verdict::Waiting => {}
+                Verdict::Failed(what) => panic!("{why}: {what}: {binding:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// The approval the host holds, once its interpretation is verified under the package's
@@ -2766,6 +2872,21 @@ fn gateway_the_terminal_shows_a_turn_the_host_started() {
                         &sum,
                         &before,
                         "the terminal shows the turn the host started",
+                    );
+                    // After the host's turn, and after what the terminal does on a thread of its own
+                    // for the conversation's title has ended, the binding still names the thread the
+                    // turn ran on, with no turn, and rich work is available.
+                    let first = thread_of(&idle).expect("the idle binding names a thread");
+                    let _ = session.binding_settled_until(
+                        instance,
+                        "the host's turn ends on the thread it ran on",
+                        Some(&first),
+                        |binding| binding.turn_id.0.is_none(),
+                    );
+                    session.binding_stays_on(
+                        instance,
+                        "the terminal's own helper thread leaves the conversation as it was",
+                        &first,
                     );
                     serde_json::json!({ "turn_started_by_the_host": true })
                 }
@@ -4137,4 +4258,86 @@ fn a_row_the_failure_text_keeps_the_last_twenty_polls_and_the_screen() {
         "{text}"
     );
     assert_eq!(Polls::new().text(), "(no read)");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The wait that takes a bounded hold for a request in flight.
+// ---------------------------------------------------------------------------------------------
+
+/// A binding that names `thread`, with no turn, suspended for `reason` where one is given.
+fn a_binding(thread: Option<&str>, reason: Option<&str>) -> AgentBindingState {
+    serde_json::from_value(serde_json::json!({
+        "binding_revision": 1,
+        "thread_id": thread,
+        "turn_id": null,
+        "profile_id": null,
+        "mode": "gateway",
+        "rich_mutations_suspended": reason.is_some(),
+        "suspension_reason": reason,
+    }))
+    .expect("a binding")
+}
+
+#[test]
+fn a_hold_for_a_request_in_flight_is_waited_out_for_a_bounded_time() {
+    let watch = InFlightWatch::new(Some("thread-1"));
+    let held = a_binding(Some("thread-1"), Some(IN_FLIGHT_REASON));
+    let start = Instant::now();
+    assert_eq!(watch.judge(&held, start), Verdict::Waiting);
+    assert_eq!(
+        watch.judge(&held, start + IN_FLIGHT_BOUND / 2),
+        Verdict::Waiting
+    );
+    assert!(matches!(
+        watch.judge(&held, start + IN_FLIGHT_BOUND),
+        Verdict::Failed(why) if why.contains("waited")
+    ));
+}
+
+#[test]
+fn a_hold_that_ended_starts_its_bound_again() {
+    let watch = InFlightWatch::new(None);
+    let held = a_binding(Some("thread-1"), Some(IN_FLIGHT_REASON));
+    let open = a_binding(Some("thread-1"), None);
+    let start = Instant::now();
+    assert_eq!(watch.judge(&held, start), Verdict::Waiting);
+    assert_eq!(
+        watch.judge(&open, start + IN_FLIGHT_BOUND / 2),
+        Verdict::Open
+    );
+    assert_eq!(
+        watch.judge(&held, start + IN_FLIGHT_BOUND),
+        Verdict::Waiting
+    );
+}
+
+#[test]
+fn a_suspension_for_any_other_reason_fails_at_once() {
+    let watch = InFlightWatch::new(Some("thread-1"));
+    for reason in [
+        "the terminal's conversation is not read from its stream, so which thread it has selected is unknown",
+        "what became of the terminal's last request to change its conversation is unknown, so which conversation it is in is unknown",
+        "a method the table does not list was sent",
+    ] {
+        let binding = a_binding(Some("thread-1"), Some(reason));
+        assert!(
+            matches!(watch.judge(&binding, Instant::now()), Verdict::Failed(_)),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn a_thread_other_than_the_one_the_wait_is_for_fails_even_where_rich_work_is_available() {
+    let watch = InFlightWatch::new(Some("thread-1"));
+    assert_eq!(
+        watch.judge(&a_binding(Some("thread-1"), None), Instant::now()),
+        Verdict::Open
+    );
+    for other in [Some("thread-2"), None] {
+        assert!(matches!(
+            watch.judge(&a_binding(other, None), Instant::now()),
+            Verdict::Failed(_)
+        ));
+    }
 }
