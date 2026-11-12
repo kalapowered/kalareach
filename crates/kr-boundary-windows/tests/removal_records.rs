@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kr_boundary_windows::records::{Records, remove};
+use kr_boundary_windows::records::{Approved, Records, remove};
 
 struct Data {
     _root: tempfile::TempDir,
@@ -58,6 +58,18 @@ impl Data {
             manifest: &self.manifest(),
             prior: &self.prior(),
             staging: &self.staging(),
+            approved: &Approved::all_that_are_there(&self.data),
+        })
+    }
+
+    /// The removal of what the inspection approved, which is `approved`.
+    fn remove_approving(&self, approved: &Approved) -> Vec<String> {
+        remove(&Records {
+            data: &self.data,
+            manifest: &self.manifest(),
+            prior: &self.prior(),
+            staging: &self.staging(),
+            approved,
         })
     }
 }
@@ -198,6 +210,7 @@ impl Data {
                 manifest: &self.manifest(),
                 prior: &self.prior(),
                 staging: &self.staging(),
+                approved: &Approved::all_that_are_there(&self.data),
             },
             names,
         )
@@ -273,4 +286,67 @@ fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
     );
     assert!(!full.contains("remove them"), "{full}");
     assert!(!full.contains("accepts"), "{full}");
+}
+
+/// Rule 2 at the records: the removal deletes a record only where its own inspection opened it. One
+/// that is there now and that the inspection did not see is left where it is and named, and the
+/// manifest stays with it, so that the removal run again reads it.
+#[test]
+fn a_record_that_the_inspection_did_not_see_is_left_and_named() {
+    // The earlier-state record.
+    let case = Data::installed();
+    let stayed = case.remove_approving(&Approved {
+        prior: false,
+        ..Approved::all_that_are_there(&case.data)
+    });
+    assert!(
+        stayed.iter().any(|text| text.contains("prior.json")
+            && text.contains("was not there when the removal looked for it")),
+        "{stayed:?}"
+    );
+    assert!(case.prior().exists());
+    assert!(case.manifest().exists(), "the manifest stays with it");
+    assert!(case.staging().exists(), "nothing after it is deleted");
+
+    // A replacement of the manifest.
+    let case = Data::installed();
+    let stayed = case.remove_approving(&Approved {
+        replacements: Vec::new(),
+        ..Approved::all_that_are_there(&case.data)
+    });
+    assert!(
+        stayed
+            .iter()
+            .any(|text| text.contains("manifest-") && text.contains("so it was not removed")),
+        "{stayed:?}"
+    );
+    assert!(case.replacement().exists());
+    assert!(case.manifest().exists());
+    assert!(!case.prior().exists(), "what the inspection saw is deleted");
+}
+
+#[test]
+fn a_staging_directory_that_the_inspection_did_not_see_is_not_deleted() {
+    let case = Data::installed();
+    let stayed = case.remove_approving(&Approved {
+        staging: false,
+        ..Approved::all_that_are_there(&case.data)
+    });
+    assert!(
+        stayed.iter().any(|text| text.contains("staging")
+            && text.contains("was not there when the removal looked for it")),
+        "{stayed:?}"
+    );
+    assert!(case.staging().join("policy.xml").exists());
+    assert!(case.manifest().exists());
+}
+
+#[test]
+fn records_that_the_inspection_did_not_see_and_that_are_not_there_are_nothing_to_leave() {
+    let case = Data::new();
+    fs::write(case.manifest(), b"{}").unwrap();
+    // Nothing was seen, nothing is there but the manifest: it goes, and so does the directory.
+    let stayed = case.remove_approving(&Approved::default());
+    assert!(stayed.is_empty(), "{stayed:?}");
+    assert!(!case.data.exists());
 }

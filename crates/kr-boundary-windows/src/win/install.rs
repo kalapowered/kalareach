@@ -1105,6 +1105,10 @@ struct Inspected {
     staging: Option<DirHandle>,
     journal: Option<DirHandle>,
     run: Option<DirHandle>,
+    /// Whether the earlier-state record was opened and checked.
+    prior: bool,
+    /// The manifest's replacements that were opened and checked.
+    replacements: Vec<OsString>,
 }
 
 /// The names a directory directly in the data directory may have.
@@ -1147,6 +1151,8 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
         staging: None,
         journal: None,
         run: None,
+        prior: false,
+        replacements: Vec::new(),
     };
     if listed.is_empty() {
         return Ok(inspected);
@@ -1279,6 +1285,10 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 &mut inspected.run
             };
             *slot = Some(held);
+        } else if same_name(&child.name, &names[1].0) {
+            inspected.prior = true;
+        } else if is_manifest_replacement(&shown.to_string_lossy()) {
+            inspected.replacements.push(shown.clone());
         }
     }
     inspect_layout(
@@ -1616,16 +1626,6 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
     ))
 }
 
-/// Reads every existing folder above `top`, from the volume's root down to its parent, part by
-/// part: each opened on its own handle with no link followed, a plain folder, owned by the system,
-/// the Administrators group or the installer service, with no entry that lets another account
-/// delete or rename an entry in it, delete it, write its list or take it. The folder that holds a
-/// tree is read on its own handle with the rules of its kind; what is above it is read here, since
-/// an account that could rename a folder above could put a link in the place of the folder below it
-/// after the installation has read that one, and the system's default lists do not give that right
-/// but nothing here rests on a default. A folder that is not there ends the walk: nothing below it
-/// is there either.
-fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
 /// The refusal of the program directory's own name: a link or a file there is removed, the volume is
 /// a refusal that no change of owner, list or open handle cures.
 fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal) -> Error {
@@ -1643,6 +1643,16 @@ fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal) -> Error {
     )
 }
 
+/// Reads every existing folder above `top`, from the volume's root down to its parent, part by
+/// part: each opened on its own handle with no link followed, a plain folder, owned by the system,
+/// the Administrators group or the installer service, with no entry that lets another account
+/// delete or rename an entry in it, delete it, write its list or take it. The folder that holds a
+/// tree is read on its own handle with the rules of its kind; what is above it is read here, since
+/// an account that could rename a folder above could put a link in the place of the folder below it
+/// after the installation has read that one, and the system's default lists do not give that right
+/// but nothing here rests on a default. A folder that is not there ends the walk: nothing below it
+/// is there either.
+fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
     let mut chain: Vec<&Path> = top.ancestors().skip(1).collect();
     chain.reverse();
     for folder in chain {
@@ -2146,6 +2156,8 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
             staging: None,
             journal: None,
             run: None,
+            prior: false,
+            replacements: Vec::new(),
         }
     } else {
         inspect_data_directory(paths, &data)?
@@ -3103,11 +3115,17 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     // check opened is never read for a manifest and never deleted from. The handles are closed
     // before anything is deleted.
     let mut seen = records::Seen::default();
+    let mut approved = records::Approved::default();
     let found = match check_data_parent(paths)? {
         Some(parent) => match inspect_existing_data(paths, &parent)? {
             Some((_, inspected)) => {
                 seen.journal = inspected.journal.is_some();
                 seen.run = inspected.run.is_some();
+                approved = records::Approved {
+                    prior: inspected.prior,
+                    staging: inspected.staging.is_some(),
+                    replacements: inspected.replacements,
+                };
                 match inspected.manifest {
                     Some(manifest) => records::Inspection::Recorded(manifest),
                     None => records::Inspection::Empty,
@@ -3154,13 +3172,22 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     };
     let prior = Prior::load(&paths.prior).ok();
     // A removal that took `staging` and could not delete the manifest leaves a manifest with no
-    // `staging`, and the channel makes its temporary directory there: it is made again, empty, and
-    // goes with the records.
-    made_if_missing(
-        &paths.staging,
-        &Principals::default(),
-        "making the staging directory again",
-    )?;
+    // `staging`, and the channel makes its temporary directory there. Where the inspection did not
+    // open `staging`, the removal makes it itself, empty, with a creation that fails when anything is
+    // there, and it goes with the records; what appeared since the inspection is left and named,
+    // before anything is changed.
+    if !approved.staging {
+        match fresh::directory_at(&paths.staging, SdKind::AdminDir, &Principals::default()) {
+            Ok(()) => approved.staging = true,
+            Err(error) if error.raw_os_error() == i32::try_from(ERROR_ALREADY_EXISTS).ok() => {
+                return Err(Error::Refused(format!(
+                    "{}. Nothing was removed. Run the removal again: it checks the directory first, and says what to do about it if it is not the installation's own.",
+                    records::not_there_at_the_inspection(&paths.staging)
+                )));
+            }
+            Err(error) => return Err(io_error("making the staging directory again")(error)),
+        }
+    }
     let channel = Channel::new(&paths.staging);
     let manager = service::manager()?;
     let mut failures: Vec<String> = Vec::new();
@@ -3387,7 +3414,7 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     }
     if failures.is_empty() {
         // The records go last: a failed removal can be run again from them.
-        let stayed = remove_records(paths);
+        let stayed = remove_approved_records(paths, &approved);
         if stayed.is_empty() {
             say("the installation is removed");
             Ok(())
@@ -3417,13 +3444,22 @@ fn data_is_empty(paths: &Paths) -> bool {
 /// Removes the installation's own records, last of all, and then the data directory and, when it is
 /// empty, the folder above it. The records go in the order [`records::remove`] gives: the manifest
 /// last, so that a removal that stayed anywhere is run again from it. Returns each thing that could
-/// not be removed, with the reason; nothing is returned when everything is gone.
+/// not be removed, with the reason; nothing is returned when everything is gone. It approves every
+/// record that is there now, for a caller that has inspected nothing; the removal approves what its
+/// own inspection opened.
 pub fn remove_records(paths: &Paths) -> Vec<String> {
+    remove_approved_records(paths, &records::Approved::all_that_are_there(&paths.data))
+}
+
+/// [`remove_records`] for the records that the removal's own inspection approved: a record that is
+/// there now and that it did not see is left and named.
+fn remove_approved_records(paths: &Paths, approved: &records::Approved) -> Vec<String> {
     let stayed = records::remove(&Records {
         data: &paths.data,
         manifest: &paths.manifest,
         prior: &paths.prior,
         staging: &paths.staging,
+        approved,
     });
     if let Some(parent) = paths.data.parent() {
         let _ = fs::remove_dir(parent);
