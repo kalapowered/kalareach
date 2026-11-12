@@ -22,8 +22,9 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GENERIC_READ, HANDLE, LUID};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, TokenPrivileges,
+    AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    SE_PRIVILEGE_ENABLED, SE_PRIVILEGE_REMOVED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY, TokenPrivileges,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, OPEN_EXISTING,
@@ -94,6 +95,58 @@ fn state_in(token: HANDLE, name: &str) -> Option<bool> {
         .iter()
         .find(|entry| entry.Luid.LowPart == luid.LowPart && entry.Luid.HighPart == luid.HighPart)
         .map(|entry| entry.Attributes & SE_PRIVILEGE_ENABLED != 0)
+}
+
+/// Takes a privilege away from the process token for good, which is what the service manager does
+/// to the service's token for every privilege that is not in the broker's required list: the
+/// runner's system token holds the debug privilege enabled, and the service's token does not hold
+/// it. The privilege must be held.
+fn remove_from_process(name: &str) {
+    let mut luid = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+    let wide_name = wide(name);
+    // SAFETY: the name is NUL-terminated and the out-parameter is local.
+    assert_ne!(
+        unsafe { LookupPrivilegeValueW(null(), wide_name.as_ptr(), &raw mut luid) },
+        0
+    );
+    let mut token: HANDLE = null_mut();
+    // SAFETY: the pseudo-handle of the current process is valid and the out-parameter is local.
+    assert_ne!(
+        unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                &raw mut token,
+            )
+        },
+        0
+    );
+    let token = Handle::new(token, "the process token").unwrap();
+    let request = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_REMOVED,
+        }],
+    };
+    // SAFETY: the token is open for adjusting and the request has one entry.
+    let adjusted = unsafe {
+        AdjustTokenPrivileges(
+            token.raw(),
+            0,
+            &raw const request,
+            0,
+            null_mut(),
+            null_mut(),
+        )
+    };
+    assert_ne!(adjusted, 0, "{name} is taken away from the process token");
+    // SAFETY: reads the calling thread's last error, set by the call above.
+    let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    assert_eq!(last, 0, "{name} is held, so that it can be taken away");
 }
 
 fn process_state(name: &str) -> Option<bool> {
@@ -547,7 +600,17 @@ fn root_with_hostile_objects(
 fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_and_restore() {
     // The service's token holds its privileges and has none of them enabled, and holds no further
     // power that would remove a hostile object by itself: a token that has any of them enabled is
-    // not the service's form, and the case would show nothing.
+    // not the service's form, and the case would show nothing. The service manager takes away from
+    // the service's token every privilege that is not in the broker's required list, so the
+    // runner's system token, which holds the debug privilege enabled, is brought to that form by
+    // taking away the privileges that it holds enabled and the service's token lacks.
+    for name in ["SeDebugPrivilege"] {
+        if !kr_boundary_windows::win::install::BROKER_PRIVILEGES.contains(&name)
+            && process_state(name) == Some(true)
+        {
+            remove_from_process(name);
+        }
+    }
     for name in [
         "SeBackupPrivilege",
         "SeRestorePrivilege",
