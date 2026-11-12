@@ -1976,8 +1976,12 @@ pub async fn dial_unread(
     // attempt it turned away for that is made again.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let connection = loop {
-        match kr_transport::endpoint::connect(&endpoint, dial.addr.clone(), kr_protocol::hello::ALPN)
-            .await
+        match kr_transport::endpoint::connect(
+            &endpoint,
+            dial.addr.clone(),
+            kr_protocol::hello::ALPN,
+        )
+        .await
         {
             Ok(connection) => break connection,
             Err(error) if tokio::time::Instant::now() >= deadline => {
