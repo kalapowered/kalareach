@@ -44,6 +44,17 @@ fn sdk_schema() -> Value {
             "required": ["kind"],
         }] },
         "Gone": { "type": "object", "properties": {}, "required": [] },
+        "Named": { "type": "object", "properties": { "name": { "type": "string" } } },
+        "Both": { "type": "object", "properties": { "value": { "type": "string" } } },
+        "ConnectorManifest": { "type": "object", "properties": {
+            "wrapper": { "$ref": "#/$defs/Wrapper" },
+            "choice": { "$ref": "#/$defs/Choice" },
+            "both": { "$ref": "#/$defs/Both" },
+        } },
+        "PluginManifest": { "type": "object", "properties": {
+            "named": { "$ref": "#/$defs/Named" },
+            "both": { "$ref": "#/$defs/Both" },
+        } },
     } })
 }
 
@@ -343,6 +354,9 @@ fn a_reference_moved_to_another_definition_does_not_carry_an_arrival_with_it() {
         "properties": { "method": { "type": "string" }, "hidden": { "type": "integer" } },
         "required": ["method"],
     });
+    // `Route` stays reached from the connector table by a second way, so only the moved reference
+    // is left to tell the member from one added to `Other`.
+    old["$defs"]["ConnectorManifest"]["properties"]["route"] = json!({ "$ref": "#/$defs/Route" });
     let mut new = with_hidden(&old);
     new["$defs"]["Wrapper"]["properties"]["route"] = json!({ "$ref": "#/$defs/Other" });
     let outcome = compare(
@@ -375,6 +389,7 @@ fn a_reference_moved_to_another_definition_does_not_carry_an_arrival_with_it() {
 fn the_first_member_of_a_definition_with_none_passes() {
     let (mut old, protocol) = (sdk_schema(), protocol_schema());
     old["$defs"]["Empty"] = json!({ "type": "object", "additionalProperties": false });
+    old["$defs"]["ConnectorManifest"]["properties"]["empty"] = json!({ "$ref": "#/$defs/Empty" });
     let mut new = old.clone();
     new["$defs"]["Empty"]["properties"] = json!({ "first": { "type": "string" } });
     let outcome = compare(
@@ -388,15 +403,82 @@ fn the_first_member_of_a_definition_with_none_passes() {
     assert_eq!(outcome.passed.len(), 1);
 }
 
+/// A listed member passes only in a definition that the connector table reaches and the package
+/// manifest does not: a host parses all of `plugin.json` before it can test the range, so a member
+/// there would stop an earlier host before it read the range. Each of these fails with a message
+/// of its own, though the table lists the member and the SDK version rises.
+#[test]
+fn a_listed_member_outside_the_connector_tables_definitions_fails_with_its_own_message() {
+    let protocol = protocol_schema();
+    let (earlier, head) = (
+        contract("0.1.6", None),
+        contract(
+            "0.1.7",
+            Some(&[("Named", "hidden", "0.1.7"), ("Both", "hidden", "0.1.7")]),
+        ),
+    );
+    for (definition, expected) in [
+        ("Named", "Named is not reached from ConnectorManifest"),
+        ("Both", "Both is reached from PluginManifest"),
+    ] {
+        let old = sdk_schema();
+        let mut new = old.clone();
+        new["$defs"][definition]["properties"]["hidden"] = json!({ "type": "string" });
+        let outcome = compare(&old, &new, (&protocol, &protocol), &earlier, &head);
+        assert!(
+            outcome.passed.is_empty(),
+            "{definition}: {:?}",
+            outcome.passed
+        );
+        assert_eq!(outcome.lines.len(), 1, "{definition}: {:?}", outcome.lines);
+        assert!(
+            outcome.lines[0].starts_with(&format!("{definition}.hidden added: a member; "))
+                && outcome.lines[0].contains(expected),
+            "{definition}: {:?}",
+            outcome.lines
+        );
+    }
+
+    // A schema without the two roots cannot say where a definition is reached from.
+    let old = json!({ "$defs": { "Route": {
+        "type": "object",
+        "properties": { "method": { "type": "string" } },
+    } } });
+    let mut new = old.clone();
+    new["$defs"]["Route"]["properties"]["hidden"] = json!({ "type": "string" });
+    let outcome = compare(
+        &old,
+        &new,
+        (&protocol, &protocol),
+        &contract("0.1.6", None),
+        &contract("0.1.7", Some(LISTED)),
+    );
+    assert!(outcome.passed.is_empty(), "{:?}", outcome.passed);
+    assert!(
+        outcome
+            .lines
+            .iter()
+            .any(|line| line.contains("has no ConnectorManifest definition")),
+        "{:?}",
+        outcome.lines
+    );
+}
+
 /// A member of a definition that the protocol schema has stays under the protocol's rule: the
 /// table cannot list it into the SDK's, whichever release the protocol schema is of.
 #[test]
 fn a_member_of_a_definition_the_protocol_schema_shares_fails() {
-    let old = json!({ "$defs": { "Frame": {
-        "type": "object",
-        "properties": { "id": { "type": "string" } },
-        "required": ["id"],
-    } } });
+    let old = json!({ "$defs": {
+        "Frame": {
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+        },
+        "ConnectorManifest": { "type": "object", "properties": {
+            "frame": { "$ref": "#/$defs/Frame" },
+        } },
+        "PluginManifest": { "type": "object", "properties": {} },
+    } });
     let mut new = old.clone();
     new["$defs"]["Frame"]["properties"]["hidden"] = json!({ "type": "string" });
     let none = json!({ "$defs": {} });

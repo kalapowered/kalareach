@@ -427,7 +427,14 @@ pub struct PassedMember {
 /// * neither release's protocol schema has a definition of that name, because the protocol's own
 ///   rule holds what a client of the protocol reads;
 /// * the head's table lists the member at an SDK version above the earlier release's;
-/// * the head's SDK version is above the earlier release's.
+/// * the head's SDK version is above the earlier release's;
+/// * its definition is reached from the connector table's root and not from the package manifest's,
+///   in both SDK schemas: a host reads `connector.json` after it has tested the package's
+///   `sdk_range`, and parses all of `plugin.json` before it can, so a new member there would stop
+///   an earlier host before it read the range.
+///
+/// A member that meets all of these but the last is returned as an error that says why, since it
+/// is the SDK's table that lists it in the wrong place.
 fn is_a_listed_arrival(
     old: &Value,
     new: &Value,
@@ -435,13 +442,15 @@ fn is_a_listed_arrival(
     earlier: &SdkContract,
     head: &SdkContract,
     difference: &Difference,
-) -> Option<PassedMember> {
+) -> Result<Option<PassedMember>, String> {
     if difference.kind != DifferenceKind::Added || difference.detail != "a member" {
-        return None;
+        return Ok(None);
     }
-    let (definition, member) = difference.at.split_once('.')?;
+    let Some((definition, member)) = difference.at.split_once('.') else {
+        return Ok(None);
+    };
     if definition.contains(['.', '#', '[', '{']) || member.contains(['.', '#', '[', '{']) {
-        return None;
+        return Ok(None);
     }
     // The earlier definition exists, and has no such member: a definition that has no members at all
     // has no `properties` either.
@@ -461,18 +470,74 @@ fn is_a_listed_arrival(
     let shared = [protocols.0, protocols.1]
         .iter()
         .any(|protocol| protocol["$defs"].get(definition).is_some());
-    let arrived = head.listing(definition, member)?.version;
-    (has_no_member
+    let Some(listed) = head.listing(definition, member) else {
+        return Ok(None);
+    };
+    let arrived = listed.version;
+    if !(has_no_member
         && has_member
         && !required
         && !shared
         && arrived > earlier.version
         && head.version > earlier.version)
-        .then(|| PassedMember {
-            member: format!("{definition}.{member}"),
-            arrived,
-            earlier: earlier.version,
-        })
+    {
+        return Ok(None);
+    }
+    for (name, schema) in [("the earlier release's", old), ("this commit's", new)] {
+        for root in [CONNECTOR_ROOT, MANIFEST_ROOT] {
+            if schema["$defs"].get(root).is_none() {
+                return Err(format!(
+                    "{name} SDK schema has no {root} definition, so where {definition} is reached \
+                     from cannot be told"
+                ));
+            }
+        }
+        if !reached(schema, CONNECTOR_ROOT).contains(definition) {
+            return Err(format!(
+                "{definition} is not reached from {CONNECTOR_ROOT} in {name} SDK schema, and a \
+                 member listed in the arrival table has to be one the connector table carries"
+            ));
+        }
+        if reached(schema, MANIFEST_ROOT).contains(definition) {
+            return Err(format!(
+                "{definition} is reached from {MANIFEST_ROOT} in {name} SDK schema, which a host \
+                 parses whole before it tests the package's sdk_range, so a member listed in the \
+                 arrival table cannot be in it"
+            ));
+        }
+    }
+    Ok(Some(PassedMember {
+        member: format!("{definition}.{member}"),
+        arrived,
+        earlier: earlier.version,
+    }))
+}
+
+/// The root of the connector table in the SDK's schema: a host reads `connector.json` after it
+/// has tested the package's `sdk_range`.
+const CONNECTOR_ROOT: &str = "ConnectorManifest";
+
+/// The root of the package manifest in the SDK's schema: a host parses `plugin.json` whole before
+/// it can test the range it states.
+const MANIFEST_ROOT: &str = "PluginManifest";
+
+/// The definitions reached from `root`, itself among them, by following every `$ref`.
+fn reached(schema: &Value, root: &str) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let mut found = Vec::new();
+        references(&schema["$defs"][name.as_str()], "", &mut found);
+        pending.extend(
+            found
+                .into_iter()
+                .filter_map(|(_, target)| target.strip_prefix("#/$defs/").map(str::to_owned)),
+        );
+    }
+    seen
 }
 
 /// Every `$ref` under `node`, each with the path that leads to it.
@@ -551,11 +616,14 @@ pub fn compare_sdk_for_a_level(
     let mut arrived = Vec::new();
     for difference in rejected(old, new)? {
         match is_a_listed_arrival(old, new, protocols, earlier, head, &difference) {
-            Some(member) => arrived.push(member),
-            None => lines.push(difference.to_string()),
+            Ok(Some(member)) => arrived.push(member),
+            Ok(None) => lines.push(difference.to_string()),
+            Err(why) => lines.push(format!("{difference}; {why}")),
         }
     }
-    if let Some(definition) = moved_reference(old, new, &arrived) {
+    if !arrived.is_empty()
+        && let Some(definition) = moved_reference(old, new, &arrived)
+    {
         lines.push(format!(
             "{definition} refers to other definitions than it did there, so a member listed in \
              the arrival table cannot be told from one added to another definition"
