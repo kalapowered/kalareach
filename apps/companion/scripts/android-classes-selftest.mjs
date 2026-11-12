@@ -400,6 +400,19 @@ expectNames(
   'nothing'
 )
 expectNames(
+  'a platform class that the literal before it ran into is not the application\'s',
+  'names-glued-platform.apk',
+  [
+    application(dex({ defined: [] })),
+    library(
+      elf({
+        blobs: [Buffer.from('resultandroid/os/Build$VERSIONSDK_INTI\0', 'latin1')]
+      })
+    )
+  ],
+  'nothing'
+)
+expectNames(
   'a name that runs into the next string has no end to read, so it is not asked for',
   'names-packed.apk',
   [

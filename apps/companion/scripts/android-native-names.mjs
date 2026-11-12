@@ -38,6 +38,21 @@ const SLASHED = new RegExp(`${NOT_NAME}(${PACKAGE}(?:/${PACKAGE})+/${CLASS})(?=\
 const DESCRIPTOR = new RegExp(`${BEFORE_CLASS}L(${PACKAGE}(?:/${PACKAGE})+/${CLASS});`, 'g')
 
 /**
+ * Whether a name is a platform class that the string before it in the library ran into. Rust packs
+ * its literals one after another, so the tail of the literal before can come in front of a name
+ * (`result` before `android/os/Build$VERSION`, which reads as the package `resultandroid`). Only a
+ * name that starts inside its first package is read this way, so the packages after the first are
+ * still the application's own.
+ */
+function platformAfterAGluedPrefix(name) {
+  const firstEnd = name.indexOf('.')
+  for (let at = 1; at < firstEnd; at += 1) {
+    if (PLATFORM.test(name.slice(at))) return true
+  }
+  return false
+}
+
+/**
  * How much of a library is read as text at once, and how far past that a name may run. A debug
  * build's library carries its debug information and is far larger than the longest string the
  * runtime can hold, so it is read in pieces. Each piece takes the matches that start in it and
@@ -63,7 +78,7 @@ export function libraryClassNames(bytes, { chunk = CHUNK, overlap = OVERLAP } = 
       for (const match of text.matchAll(pattern)) {
         if (from + match.index < start || from + match.index >= start + chunk) continue
         const name = match[1].replaceAll('/', '.')
-        if (!PLATFORM.test(name)) names.add(name)
+        if (!PLATFORM.test(name) && !platformAfterAGluedPrefix(name)) names.add(name)
       }
     }
   }
