@@ -757,12 +757,14 @@ fn a_removal_where_nothing_is_installed_promises_no_repair() {
     assert!(!text.contains("the manifest records it"), "{text}");
 }
 
-/// A known folder that an administrator gave a network path is refused in both walks, as the
-/// installation does not go through a place that its checks did not read, and the folder above a
-/// share is the server's. The data walk refuses the share's root, and the program walk, which begins
-/// at the share's root as the program directory's top, says that it is a link or a mounted folder.
-/// The printing of a network path as a person can use it is for the words alone: a comparison that
-/// took it would accept the share.
+/// A known folder that an administrator gave a network path is refused in both walks, for its
+/// volume: each walk asks the volume of the folder that it opens before it reads anything else of
+/// it, and a volume on another computer is not one that the installation uses. The data walk
+/// refuses the share's root, and the program walk, which begins at the share's root as the program
+/// directory's top, refuses it the same way, from `entry` and from the removal. The comparisons
+/// that follow the volume check refuse a final path on a network share too, and the printing of a
+/// network path as a person can use it is for the words alone (portable cases in
+/// `remedy_ancestors.rs`); here the volume check is the first thing that says no.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_known_folder_on_a_network_share_is_refused_in_both_walks() {
@@ -796,7 +798,11 @@ fn a_known_folder_on_a_network_share_is_refused_in_both_walks() {
     let text = install::check_data_parent(&paths)
         .expect_err("a data parent on a network share")
         .to_string();
-    assert!(text.contains("not the root of its volume"), "{text}");
+    assert!(
+        text.contains("is on a volume that the installation does not use"),
+        "{text}"
+    );
+    assert!(text.contains("the volume is on another computer"), "{text}");
     assert!(text.contains(&format!(r"\\localhost\{name}\")), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
 
@@ -813,8 +819,11 @@ fn a_known_folder_on_a_network_share_is_refused_in_both_walks() {
         .expect_err("a program directory on a network share")
         .to_string();
     for text in [entry, removal] {
-        assert!(text.contains("it is a link or a mounted folder"), "{text}");
+        assert!(
+            text.contains("is on a volume that the installation does not use"),
+            "{text}"
+        );
+        assert!(text.contains("the volume is on another computer"), "{text}");
         assert!(text.contains(&format!(r"\\localhost\{name}\")), "{text}");
-        assert!(text.contains("This layout is not supported"), "{text}");
     }
 }

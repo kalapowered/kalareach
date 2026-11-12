@@ -2250,7 +2250,11 @@ fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of
     let program = PathBuf::from(r"Y:\Program");
     std::fs::create_dir(&program).unwrap();
     paths.program = program.clone();
-    // No folder above the program directory is read: the volume is what is refused.
+    // The program directory is its own top, so the walk reads the folders above it from the volume's
+    // root down: `Y:\` is the first folder opened. The volume of each folder is asked before its
+    // attributes are read (a FAT volume does not answer that query), so the root is refused for its
+    // volume, with the words for a volume that the installation does not use, before anything else
+    // about it is read; the program directory's own open would refuse the same volume next.
     paths.program_top = program.clone();
     paths.git = program.join("git");
     let refused = both(&paths, "a volume that is not used");
@@ -2264,6 +2268,8 @@ fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of
             "{text}"
         );
         assert!(text.contains("NTFS"), "{text}");
+        assert!(text.contains("the volume uses FAT32"), "{text}");
+        assert!(text.contains(r"Y:\ is a folder above"), "{text}");
         assert!(!text.contains("Make the Administrators group"), "{text}");
         assert!(!text.contains("Close the program"), "{text}");
         assert!(
@@ -4164,6 +4170,10 @@ fn stand_in_broker(
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
     require_clean_machine();
+    // The pipe's list names the system alone, so an account of another token cannot open it.
+    if needs_the_system() {
+        return;
+    }
     let mut listener =
         Listener::bind(Pipe::Persons, &[system], std::sync::Arc::clone(&stop)).unwrap();
     let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5143,10 +5153,12 @@ impl Drop for RefillsRestored {
     }
 }
 
-/// How many bytes this end of a pipe has written that the other end has not read yet: the quota of
-/// the outbound buffer less what is left of it.
+/// What a pipe's driver says of this end: its quotas, what waits to be read here and what is left of
+/// the quota for writing, or the failing status.
 #[cfg(feature = "testing")]
-fn unread_by_the_other_end(handle: windows_sys::Win32::Foundation::HANDLE) -> u32 {
+fn pipe_information(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<windows_sys::Wdk::Storage::FileSystem::FILE_PIPE_LOCAL_INFORMATION, i32> {
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_PIPE_LOCAL_INFORMATION, FilePipeLocalInformation, NtQueryInformationFile,
     };
@@ -5164,7 +5176,15 @@ fn unread_by_the_other_end(handle: windows_sys::Win32::Foundation::HANDLE) -> u3
             FilePipeLocalInformation,
         )
     };
-    assert_eq!(answer, 0, "reading what a pipe holds: status {answer:#x}");
+    if answer == 0 { Ok(info) } else { Err(answer) }
+}
+
+/// How many bytes this end of a pipe has written that the other end has not read yet: the quota of
+/// the outbound buffer less what is left of it.
+#[cfg(feature = "testing")]
+fn unread_by_the_other_end(handle: windows_sys::Win32::Foundation::HANDLE) -> u32 {
+    let info = pipe_information(handle)
+        .unwrap_or_else(|status| panic!("reading what a pipe holds: status {status:#x}"));
     info.OutboundQuota.saturating_sub(info.WriteQuotaAvailable)
 }
 
@@ -5263,20 +5283,43 @@ fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
         raw_transfer(client.0.raw(), true, part).is_some(),
         "the part of the frame is written"
     );
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let begun = std::time::Instant::now();
+    let until = begun + std::time::Duration::from_secs(10);
     let mut first = None;
+    let mut samples = Vec::new();
     loop {
-        let unread = unread_by_the_other_end(client.0.raw());
+        let info = pipe_information(client.0.raw());
+        let unread = info.map(|info| info.OutboundQuota.saturating_sub(info.WriteQuotaAvailable));
+        if samples.len() < 8 || samples.len() % 100 == 0 {
+            samples.push(format!(
+                "{} ms: {:?}",
+                begun.elapsed().as_millis(),
+                info.map(|info| (
+                    info.InboundQuota,
+                    info.ReadDataAvailable,
+                    info.OutboundQuota,
+                    info.WriteQuotaAvailable,
+                    info.NamedPipeEnd,
+                    info.NamedPipeState
+                ))
+            ));
+        }
+        let unread = unread.unwrap_or_else(|status| {
+            panic!("reading what the pipe holds: status {status:#x}; samples (inbound quota, read data available, outbound quota, write quota available, end, state) {samples:?}")
+        });
         first.get_or_insert(unread);
         if unread == 0 {
             break;
         }
         assert!(
             std::time::Instant::now() < until,
-            "the server did not take the {unread} bytes of the frame that were written: it never reached its read"
+            "the server did not take the {unread} bytes of the frame that were written: it never reached its read; samples {samples:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    eprintln!(
+        "EVIDENCE: samples of the client end (inbound quota, read data available, outbound quota, write quota available, end, state): {samples:?}"
+    );
     eprintln!(
         "EVIDENCE: the part of the frame that the server had not yet read right after the write: {} of 14 bytes",
         first.unwrap_or(0)

@@ -1725,6 +1725,11 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
             }
             Err(failure) => return Err(unreadable(&failure)),
         };
+        // The volume first, as the program directory's own open does: a file system that is not
+        // NTFS, or a volume on another computer, does not answer the attribute query that follows.
+        if let Some(reason) = volume_refused(&handle).map_err(|error| unreadable(&error))? {
+            return Err(refuse(Fault::Volume(&reason)));
+        }
         let attributes = attributes_of(&handle, "a folder above the installation")
             .map_err(|error| unreadable(&error))?;
         if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -1803,6 +1808,9 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
             // is told what can be done about that.
             Err(failure) => return Err(unreadable(&failure)),
         };
+        if let Some(reason) = volume_refused(&handle).map_err(|error| unreadable(&error))? {
+            return Err(refuse(Fault::Volume(&reason)));
+        }
         let attributes = attributes_of(&handle, "a folder above the program directory")
             .map_err(|error| unreadable(&error))?;
         if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -1824,6 +1832,15 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
         }
     }
     Ok(())
+}
+
+/// Why the volume that an open folder is on is not one that the installation uses (a file system
+/// that is not NTFS, a volume on another computer, removable media, a device that is not an
+/// ordinary disk), or none where it is.
+fn volume_refused(handle: &ffi::Handle) -> Result<Option<String>, ffi::Error> {
+    Ok(super::walk::check_volume(handle)?
+        .err()
+        .map(|refusal| refusal.to_string()))
 }
 
 /// A folder's final path as the system gives it, with the `\\?\` prefix of its extended form. The
