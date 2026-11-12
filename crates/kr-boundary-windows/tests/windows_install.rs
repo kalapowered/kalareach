@@ -1313,9 +1313,9 @@ fn the_removal_deletes_a_leftover_replacement_and_names_what_stayed_when_the_dat
 
 /// The whole removal can be run again after a failure in its middle. Another program holds the
 /// manifest open, so the last step cannot delete it and the removal fails and names it; the manifest
-/// is still read by a second removal, which reads the policy records through the channel and needs
-/// the staging directory that the first left in place. Once the program lets go, the second removal
-/// finishes and the computer is as it was.
+/// is still read by a second removal, which reads the policy records through the channel and makes
+/// the staging directory again, since the first took it. Once the program lets go, the second
+/// removal finishes and the computer is as it was.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
@@ -1343,6 +1343,66 @@ fn a_removal_that_could_not_delete_a_record_is_run_again_whole_and_finishes() {
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(snapshot(), before, "the second removal finished");
+}
+
+/// Every record that stays after a failed removal has the manifest beside it, so the whole removal
+/// is run again until it ends clean. The earlier-state record, a replacement of the manifest and a
+/// file in `staging` are each held open in turn, shared for reading and writing and not for
+/// deleting: the first removal fails and names what stayed, the manifest and `staging` stay with
+/// it, and once the program lets go the second removal reads the manifest, reaches the cleanup of
+/// the records again and ends with the computer as it was.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_removal_that_could_not_delete_the_earlier_state_record_a_replacement_or_staging_is_run_again_whole()
+ {
+    use std::os::windows::fs::OpenOptionsExt;
+    let case = Case::new();
+    let before = snapshot();
+    let paths = Paths::system();
+    let hex = "ab".repeat(16);
+    let held_in_turn = [
+        ("the earlier-state record", paths.prior.clone()),
+        (
+            "a replacement of the manifest",
+            paths.data.join(format!("manifest-{hex}.new")),
+        ),
+        (
+            "a file in staging",
+            paths.staging.join(format!("policy-{hex}.xml")),
+        ),
+    ];
+    for (what, record) in held_in_turn {
+        let (code, output) = case.install();
+        assert_eq!(code, 0, "{what}: {output}");
+        if !record.exists() {
+            owned_file(&record, b"x");
+        }
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&record)
+            .unwrap();
+        let (code, output) = setup(&["remove"], "yes\n", &[]);
+        drop(held);
+        assert_ne!(code, 0, "{what}: {output}");
+        assert!(
+            output.contains(&record.display().to_string()),
+            "{what}: the record that stayed is named: {output}"
+        );
+        assert!(
+            paths.manifest.is_file(),
+            "{what}: the manifest stays with what stayed"
+        );
+        assert!(
+            paths.staging.exists(),
+            "{what}: staging stays while a record stays"
+        );
+        assert!(output.contains("run the removal again"), "{what}: {output}");
+        let (code, output) = setup(&["remove"], "yes\n", &[]);
+        assert_eq!(code, 0, "{what}: {output}");
+        assert_eq!(snapshot(), before, "{what}: the second removal finished");
+    }
 }
 
 /// A refusal in the program directory names a remedy that cures its reason, in a repair and in a
