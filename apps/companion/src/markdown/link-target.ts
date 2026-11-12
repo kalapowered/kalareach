@@ -8,10 +8,11 @@
  *
  * Among the links of a message, a press belongs to the link whose words are nearest to the point.
  * A press that no link's target holds is no link's. A link's target is the region of its words, grown
- * to the least size, to the room beside them and to the height of its line, and the box the page
- * itself gives the link's button, whole: a link that wraps is one box over all its lines, with its
- * words centred in it, and the page's own hit test gives a press anywhere in it to the link. At an
- * equal distance the earlier link in the message takes the press.
+ * to the least size and to the room beside them, and the box the page itself gives the link's button,
+ * whole. The box is never smaller than the link's own line (so a press in the half-leading above and
+ * below the words is the link's), and a link that wraps is one box over all its lines, with its words
+ * centred in it. The page's own hit test gives a press anywhere in the box to the link. At an equal
+ * distance the earlier link in the message takes the press.
  */
 
 /** A point in the page's coordinates. */
@@ -32,8 +33,6 @@ export interface Rect {
 export interface Link {
   /** The rectangles of the link's words, one for each line its label covers. */
   readonly words: readonly Rect[]
-  /** The height of the lines the label stands on, or 0 when it is not known (a font's own `normal`). */
-  readonly line: number
   /** The rectangles of the link's own button. */
   readonly box: readonly Rect[]
 }
@@ -68,9 +67,9 @@ export function linkAt(point: Point, links: readonly Link[], reach: Reach, bound
   let chosen: number | null = null
   let nearest = Number.POSITIVE_INFINITY
   for (let index = 0; index < links.length; index += 1) {
-    const { words, line, box } = links[index] ?? { words: [], line: 0, box: [] }
+    const { words, box } = links[index] ?? { words: [], box: [] }
     const held =
-      words.some((rect) => holds(within(targetOf(rect, reach, line), room), point)) ||
+      words.some((rect) => holds(within(targetOf(rect, reach), room), point)) ||
       box.some((rect) => holds(within(grown(rect, SNAP), room), point))
     if (!held) continue
     const distance = Math.min(...words.map((rect) => distanceTo(rect, point)))
@@ -82,14 +81,10 @@ export function linkAt(point: Point, links: readonly Link[], reach: Reach, bound
   return chosen
 }
 
-/**
- * The region one rectangle of a link's words is pressable over: at least the least size, and as wide
- * as the words and the reach beside them, and as tall as the words and as the line they stand on, so
- * it is never smaller than the link's own line.
- */
-export function targetOf(words: Rect, reach: Reach, line: number): Rect {
+/** The region one rectangle of a link's words is pressable over: the words grown to the least size and to the reach beside them. */
+export function targetOf(words: Rect, reach: Reach): Rect {
   const wide = Math.max(reach.least, words.right - words.left + 2 * reach.beside)
-  const tall = Math.max(reach.least, words.bottom - words.top, line)
+  const tall = Math.max(reach.least, words.bottom - words.top)
   const x = (words.left + words.right) / 2
   const y = (words.top + words.bottom) / 2
   return { left: x - wide / 2, right: x + wide / 2, top: y - tall / 2, bottom: y + tall / 2 }
