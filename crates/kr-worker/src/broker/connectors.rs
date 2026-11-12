@@ -1891,7 +1891,8 @@ pub mod fixture {
             manifest["sdk_range"] = serde_json::json!(">=0.1.5, <0.2.0");
         }
         if shape.answers {
-            manifest["sdk_range"] = serde_json::json!(">=0.1.6, <0.2.0");
+            // The answering table states `hidden_when`, which arrived in 0.1.7.
+            manifest["sdk_range"] = serde_json::json!(">=0.1.7, <0.2.0");
         }
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
