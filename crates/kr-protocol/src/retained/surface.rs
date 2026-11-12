@@ -492,12 +492,18 @@ fn reference_of(node: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The one non-null schema of a nullable value, when the branches are exactly that and null.
+/// The one non-null schema of a nullable value, when the branches are exactly that and null. A
+/// branch is the null one only when it is `{"type": "null"}` and nothing else: a null branch that
+/// says more (a `not`, a `default`) is compared like any other branch.
 fn nullable(branches: &[Value]) -> Option<&Value> {
     if branches.len() != 2 {
         return None;
     }
-    let is_null = |branch: &Value| branch.get("type").and_then(Value::as_str) == Some("null");
+    let is_null = |branch: &Value| {
+        branch.as_object().is_some_and(|members| {
+            members.len() == 1 && members.get("type").and_then(Value::as_str) == Some("null")
+        })
+    };
     match (is_null(&branches[0]), is_null(&branches[1])) {
         (false, true) => Some(&branches[0]),
         (true, false) => Some(&branches[1]),
