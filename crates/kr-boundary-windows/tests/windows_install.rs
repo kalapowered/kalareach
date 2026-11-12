@@ -2366,19 +2366,28 @@ fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
     assert!(text.contains("more than one name"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
     assert!(text.contains("did not make"), "{text}");
-    // Without it, there is nothing the file could be a record of. The inspection stops earlier,
-    // at the directory that no manifest records and that is not empty, so the refusal names that
-    // directory and not the file's two names.
+    // Without it, nothing is listed and every name is read by its own handle. Only the two
+    // replacements are left, so the first entry read is one of them: its handle shows two names,
+    // so it is moved aside and not removed.
     std::fs::remove_file(&paths.manifest).unwrap();
+    for entry in std::fs::read_dir(&paths.data).unwrap() {
+        let path = entry.unwrap().path();
+        if path != first && path != second {
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+    }
     let text = install::make_data_directory(&paths)
         .expect_err("what is left with no manifest")
         .to_string();
-    assert!(
-        text.contains("no manifest records this directory"),
-        "{text}"
-    );
-    assert!(text.contains("Remove "), "{text}");
-    assert!(!text.contains("Do not remove"), "{text}");
+    assert!(text.contains("more than one name"), "{text}");
+    assert!(text.contains("Move it aside"), "{text}");
+    assert!(text.contains("did not make"), "{text}");
+    assert!(text.contains("out of the data directory"), "{text}");
+    assert!(!text.contains("Remove "), "{text}");
     let _ = std::fs::remove_dir_all(&folder);
 }
 
@@ -3018,6 +3027,16 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         assert!(text.contains("Remove "), "{text}");
         assert!(text.contains("stay where they are"), "{text}");
     };
+    // An entry whose own handle shows that the installation did not make it is moved aside and
+    // never named for removal.
+    let moved_aside_with = |words: &str| {
+        let refused = install::make_data_directory(&paths).expect_err("the directory is refused");
+        let text = refused.to_string();
+        assert!(text.contains(words), "{text}");
+        assert!(text.contains("Move it aside"), "{text}");
+        assert!(text.contains("did not make"), "{text}");
+        assert!(!text.contains("Remove "), "{text}");
+    };
 
     // What an installation's own run leaves is accepted: a policy file made new, and a scratch
     // directory (readable by every account) with a file in it.
@@ -3046,7 +3065,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     give_to(&policy, &name);
     let before = summary_of(&policy);
     let shown = policy.file_name().unwrap().to_string_lossy().into_owned();
-    refused_with(&shown);
+    moved_aside_with(&shown);
     let refused = install::make_data_directory(&paths).expect_err("a file that is owned");
     assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
     assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
@@ -3088,10 +3107,10 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .staging
         .join(format!("policy-{}.xml", "ab".repeat(16)));
     std::fs::hard_link(&policy, &second).unwrap();
-    refused_with("more than one name");
+    moved_aside_with("more than one name");
     std::fs::remove_file(&second).unwrap();
     give_to(&inner, &name);
-    refused_with("unlisted.exe");
+    moved_aside_with("unlisted.exe");
     give_to(&inner, "*S-1-5-32-544");
 
     // A directory in run that no journal names is refused, with the entry to remove. One that a
@@ -3190,7 +3209,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .output()
         .unwrap();
     assert!(linked.status.success(), "{linked:?}");
-    refused_with("it is a link");
+    moved_aside_with("it is a link");
     assert_eq!(summary_of(&target), targets_list);
     std::fs::remove_dir(&junction).unwrap();
     install::make_data_directory(&paths).expect("the link is gone");
@@ -4971,20 +4990,24 @@ fn the_clients_open_asks_for_the_least_rights_its_calls_need() {
         server.join().unwrap();
         table.push((access, outcome));
     }
-    for (access, outcome) in &table {
-        eprintln!("rights {access:#x}: {outcome:?}");
-    }
+    let summary: Vec<String> = table
+        .iter()
+        .map(|(access, outcome)| format!("{access:#x}: {outcome:?}"))
+        .collect();
     assert_eq!(
         table[0].1,
         Ok(()),
-        "the calls with the rights the client asks for"
+        "the calls with the rights the client asks for: {summary:?}"
     );
-    for (access, outcome) in &table[1..] {
-        assert!(
-            outcome.is_err(),
-            "the calls work with {access:#x}, one right fewer than the client asks for: that right is not needed"
-        );
-    }
+    let unneeded: Vec<String> = table[1..]
+        .iter()
+        .filter(|(_, outcome)| outcome.is_ok())
+        .map(|(access, _)| format!("{:#x}", CLIENT & !access))
+        .collect();
+    assert!(
+        unneeded.is_empty(),
+        "rights that no call of the client needs: {unneeded:?}; table {summary:?}"
+    );
 }
 
 /// A listener that cannot make its waiting instance again and again gives up its name in order: the
