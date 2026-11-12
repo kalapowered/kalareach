@@ -169,12 +169,27 @@ impl Settled {
 /// The map and the ended flag are one thing under one synchronous lock. With two, a request could
 /// be registered after the reader stopped and wait for an answer that is never coming; and a
 /// waiter's destructor could not remove its own entry, because a destructor cannot await.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Waiters {
     pending: HashMap<RequestId, oneshot::Sender<Answer>>,
     ended: bool,
     /// What the host refused the connection with, when it did: the session ended with it.
     refusal: Option<kr_protocol::error::ProtocolError>,
+}
+
+impl std::fmt::Debug for Waiters {
+    /// The refusal's code and no more: its words arrived from the host and are not printed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Waiters")
+            .field("pending", &self.pending.len())
+            .field("ended", &self.ended)
+            .field(
+                "refused_with",
+                &self.refusal.as_ref().map(|refusal| refusal.code),
+            )
+            .finish()
+    }
 }
 
 /// One mutation this client sent and has not seen settled.
