@@ -39,6 +39,19 @@ nothing, and neither does an answer with it that succeeds. A client tells a refu
 that code, never by its words: a transient one, such as a host that cannot take another connection
 from this device now, is asked again.
 
+The same refusal answers a call whose own write fails after it arrived: the write fails because the
+host closed the connection, and the call, a read or a mutation, gets the refusal and not the
+transport's failure. A mutation is then not an outcome that is unknown, since the host refused the
+connection and nothing was submitted on it. A caller that must tell the refusal of the connection
+from a refusal of its own request asks the session for it (`Session::connection_refusal`), because
+a request's refusal can carry the same code. A link that wraps the host's and declines to dial for a
+limit of its own answers with `LinkError::Declined`, which is no refusal of the host's.
+
+A local host also answers a second hello, and a frame that is no request or mutation, with an error
+of request identifier zero and leaves the connection open. A session sends neither, so none of these
+reaches a session. A caller that sends such a frame through the transport and reads the answers with
+a session now has its session end at that error, where before it went on.
+
 ## What a failure means
 
 `retry` is one table over every error code section 23 requires. Each code has a step, which is what
