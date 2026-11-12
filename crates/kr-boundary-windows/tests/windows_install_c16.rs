@@ -442,7 +442,10 @@ fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
         text.contains(&real.file_name().unwrap().to_string_lossy().to_string()),
         "the real path is named: {text}"
     );
-    assert!(text.contains("Install on the real path"), "{text}");
+    assert!(
+        text.contains("end the substitution or redirection of that letter"),
+        "{text}"
+    );
     assert!(text.contains("Nothing was changed"), "{text}");
 }
 
