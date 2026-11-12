@@ -941,3 +941,154 @@ test.describe('a press by the links of a message', () => {
     }
   }
 })
+
+/**
+ * Opens the conversation with the messages of the press cases. The pane's own `tabindex` is taken off
+ * unless the case is of the pane as it ships, and the engine is not to hold what lies above a link in
+ * place when a case changes what lies above it.
+ */
+async function pressPage(page: Page, surface: 'ios' | 'android', options: { shipped?: boolean; extra?: readonly string[] } = {}): Promise<void> {
+  await openSession(page, surface)
+  await page.evaluate(
+    ({ messages, session, shipped }) => {
+      for (const message of messages) window.krTestHost?.records.appendEntry(session, 'message', message)
+      document.dispatchEvent(new Event('visibilitychange'))
+      const pane = document.querySelector<HTMLElement>('.m-pane')
+      if (pane) pane.style.overflowAnchor = 'none'
+      if (!shipped) pane?.removeAttribute('tabindex')
+    },
+    { messages: [...PRESS_MESSAGES, ...(options.extra ?? [])], session: SESSION, shipped: options.shipped ?? false }
+  )
+  await page.locator('.m-node .md-link[title="https://example.org/rtl-middle"]').waitFor({ state: 'attached' })
+}
+
+/** Scrolls a link to the middle of the pane and gives the rectangle of its first line of words. */
+async function wordsOf(page: Page, href: string): Promise<{ x: number; y: number; left: number; top: number; right: number; bottom: number }> {
+  return page.evaluate((target) => {
+    const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
+    if (!link) throw new Error(`the page shows no link ${target}`)
+    link.scrollIntoView({ block: 'center' })
+    const range = document.createRange()
+    range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
+    const box = range.getClientRects()[0] ?? range.getBoundingClientRect()
+    return { x: box.left + box.width / 2, y: box.top + box.height / 2, left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+  }, href)
+}
+
+const openedLinks = (page: Page): Promise<string[]> => page.evaluate(() => window.krTestHost?.openedLinks.slice() ?? [])
+const pressedLooks = (page: Page): Promise<number> => page.evaluate(() => document.querySelectorAll('.md-link[data-pressed]').length)
+
+// KR-REQ-13.19: a press is decided where it ends as it was where it began. The press stands where the
+// choice at its release names the same link or control as the choice at its start, and the page
+// moving under a finger at rest cancels nothing by itself: content above a link that grows while
+// the link is pressed, and a wheel scroll away and back, still open the link, where the browser's own
+// click would; a press whose link has gone from under the finger, or another link is under it, opens nothing.
+test.describe('a press that ends on a page that changed during it', () => {
+  for (const surface of ['ios', 'android'] as const) {
+    test(`opens the link that still lies under the press after the content above it grew, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface)
+      const href = 'https://example.org/wrapped'
+      const at = await wordsOf(page, href)
+      await page.mouse.move(at.x, at.y)
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look at the press’s start').toBe(1)
+      // The message above grows by 20 px, which moves the whole link down by as much, farther than the slop.
+      const moved = await page.evaluate((target) => {
+        const node = document.querySelector(`.m-node .md-link[title="${target}"]`)?.closest<HTMLElement>('.m-node')
+        const before = document.querySelector(`.m-node .md-link[title="${target}"]`)?.getBoundingClientRect().top ?? 0
+        if (node) node.style.paddingTop = `${String(parseFloat(getComputedStyle(node).paddingTop) + 20)}px`
+        return (document.querySelector(`.m-node .md-link[title="${target}"]`)?.getBoundingClientRect().top ?? 0) - before
+      }, href)
+      expect(moved, 'how far the link moved under the press').toBeGreaterThan(15)
+      await page.mouse.up()
+      expect(await openedLinks(page), 'links opened by a press whose link moved down but still lies under it').toEqual([href])
+    })
+
+    test(`opens nothing when another link, or none, lies under the press at its end, and opens the link after a scroll away and back, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface)
+      const first = 'https://example.org/table-1'
+      const second = 'https://example.org/table-2'
+      const one = await wordsOf(page, first)
+      const two = await page.evaluate((target) => {
+        const range = document.createRange()
+        range.selectNodeContents(document.querySelector(`.m-node .md-link[title="${target}"] .md-link-label`) ?? document.body)
+        const box = range.getBoundingClientRect()
+        return { y: box.top + box.height / 2 }
+      }, second)
+      const scrollTop = (): Promise<number> => page.evaluate(() => document.querySelector('.m-pane')?.scrollTop ?? 0)
+
+      // The second link comes under the press: the press ends on a link that it did not begin on.
+      await page.mouse.move(one.x, one.y)
+      await page.mouse.down()
+      const start = await scrollTop()
+      await page.evaluate((by) => {
+        const pane = document.querySelector('.m-pane')
+        if (pane) pane.scrollTop += by
+      }, two.y - one.y)
+      expect(await scrollTop(), 'the pane scrolled to bring the second link under the press').toBeGreaterThan(start + 10)
+      await page.mouse.up()
+      expect(await openedLinks(page), 'links opened by a press whose end lies on another link').toEqual([])
+
+      // A wheel scroll away and back: the same link lies under the release, as it does for the browser's own click.
+      const again = await wordsOf(page, first)
+      await page.mouse.move(again.x, again.y)
+      await page.mouse.down()
+      const before = await scrollTop()
+      await page.mouse.wheel(0, 90)
+      await expect.poll(scrollTop).toBeGreaterThan(before + 40)
+      await page.mouse.wheel(0, -90)
+      await expect.poll(scrollTop).toBeLessThan(before + 1)
+      await page.mouse.up()
+      expect(await openedLinks(page), 'links opened by a press after a scroll away and back').toEqual([first])
+    })
+
+    test(`gives a covered control its click after the control moved less than it is tall, and none when it left, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface)
+      await page.evaluate(() => {
+        const counted = window as unknown as { controlClicks: number }
+        counted.controlClicks = 0
+        for (const control of document.querySelectorAll('.m-pane button:not(.md-link)')) {
+          control.addEventListener('click', () => {
+            counted.controlClicks += 1
+          })
+        }
+      })
+      const clicks = (): Promise<number> => page.evaluate(() => (window as unknown as { controlClicks: number }).controlClicks)
+      // A point on a control of a message that a link's box lies over: the browser's own click goes to the link.
+      const covered = async (): Promise<{ x: number; y: number }> =>
+        page.evaluate(() => {
+          for (const control of Array.from(document.querySelectorAll<HTMLElement>('.m-pane button:not(.md-link)'))) {
+            control.scrollIntoView({ block: 'center' })
+            const box = control.getBoundingClientRect()
+            // Not within 14 px of the control's top, so that it still lies under the point after the pane scrolls 12 px.
+            for (let x = box.left + 4; x < box.right - 4; x += 6) {
+              for (let y = box.top + 14; y < box.bottom - 1; y += 1) {
+                if (document.elementFromPoint(x, y)?.closest('.md-link')) return { x, y }
+              }
+            }
+          }
+          throw new Error('no control of a message lies under a link’s box')
+        })
+
+      const first = await covered()
+      await page.mouse.move(first.x, first.y)
+      await page.mouse.down()
+      await page.evaluate(() => {
+        const pane = document.querySelector('.m-pane')
+        if (pane) pane.scrollTop -= 12
+      })
+      await page.mouse.up()
+      expect(await clicks(), 'clicks of the control that moved 12 px and still lies under the press').toBe(1)
+
+      const second = await covered()
+      await page.mouse.move(second.x, second.y)
+      await page.mouse.down()
+      await page.evaluate(() => {
+        const pane = document.querySelector('.m-pane')
+        if (pane) pane.scrollTop -= 300
+      })
+      await page.mouse.up()
+      expect(await clicks(), 'clicks of a control that left from under the press').toBe(1)
+    })
+  }
+})
