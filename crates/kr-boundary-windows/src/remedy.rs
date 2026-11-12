@@ -205,7 +205,7 @@ pub fn ending(
             };
             let next = match kind {
                 EntryKind::Manifest => {
-                    "The directory then holds no manifest, and the next run refuses what else is in it: with no manifest nothing records those entries, and it names each to remove."
+                    "The directory then holds no manifest, and nothing records what else is in it: the next run reads those entries one at a time on their own handles, and for the first it finds says to remove it, when its handle shows the system's class, to move it aside, when its handle shows that the installation did not make it, or to close the program that holds it open."
                 }
                 EntryKind::Prior | EntryKind::Staging | EntryKind::Journal | EntryKind::Run => {
                     "The next run finds the entry absent and makes it new."
