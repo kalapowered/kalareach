@@ -163,7 +163,8 @@ fn names_the_folder_and_the_right(text: &str, folder: &Path, tree: &str) {
         )),
         "{text}"
     );
-    assert!(text.contains("S-1-5-32-545"), "{text}");
+    // The identity by its account name where the system resolves it, with the identifier beside it.
+    assert!(text.contains(" (S-1-5-32-545)"), "{text}");
     assert!(text.contains("delete or rename an entry in it"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
 }
@@ -524,4 +525,36 @@ fn a_staging_directory_made_after_the_inspection_is_left_and_named() {
         "what appeared stays"
     );
     assert!(paths.manifest.exists());
+}
+
+/// An earlier-state record that was not in the data directory at the removal's inspection and is
+/// there when it comes to delete the records is left and named, and the manifest stays with it. The
+/// removal reaches the service, the boot marker and the policy steps: the case first checks that the
+/// guest holds no installation.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_prior_record_made_after_the_inspection_is_left_and_named() {
+    assert!(
+        matches!(install::entry(&Paths::system().unwrap()), Ok(Entry::Fresh)),
+        "the guest holds an installation, or an account, a service or a directory of its names"
+    );
+    let mut clean = Cleanup::default();
+    let (_folder, paths) = data_parent_with_paths(&mut clean);
+    installed_data_directory(&paths);
+    let prior = paths.prior.clone();
+    install::testing::after_the_removal_inspects_the_data_directory(move || {
+        std::fs::write(&prior, b"{}").unwrap();
+    });
+    let text = install::remove(&paths, false)
+        .expect_err("what appeared was not inspected")
+        .to_string();
+    assert!(
+        text.contains(&format!(
+            "{} was not there when the removal looked for it",
+            paths.prior.display()
+        )),
+        "{text}"
+    );
+    assert!(paths.prior.exists(), "what appeared stays");
+    assert!(paths.manifest.exists(), "the manifest stays with it");
 }
