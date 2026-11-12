@@ -38,7 +38,7 @@ use crate::messages;
 use crate::notice::NOTICE;
 use crate::policy::{self, Policy};
 use crate::records::{self, Records, is_hex32, is_manifest_replacement};
-use crate::remedy::{self, Origin, Presence, Remedy};
+use crate::remedy::{self, Origin, ParentCure, Presence, Remedy};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -492,31 +492,11 @@ fn presence_of(path: &Path) -> Presence {
     }
 }
 
-/// What a refusal of the folder above the data directory is cured by, which its reason decides.
-enum ParentCure {
-    /// Another program holds the folder open: closing that program cures it, and a change of owner
-    /// or list does not.
-    Close,
-    /// The handle shows that the installation did not make the folder (a link, not a folder, or an
-    /// owner that is not the system's class): move it aside, and do not correct it into place.
-    MoveAside,
-    /// The system's class owns it and its list is wrong: correct the list. Whether it holds the
-    /// data directory is known only from a lookup, which decides whether removal is offered.
-    Correct(Presence),
-}
-
 /// The refusal of a folder above the data directory: what the folder is, why it is refused and what
 /// to do.
 fn parent_refusal(paths: &Paths, why: &str, cure: ParentCure) -> Error {
     let parent = paths.data_parent();
-    let move_aside = "The installation did not make this folder, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned();
-    let remedy = match cure {
-        ParentCure::Close => "Close the program that holds it open, then run the setup program again: a change of its owner or its list does not close a handle. Do not remove it.".to_owned(),
-        ParentCure::MoveAside => move_aside,
-        ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again."),
-        ParentCure::Correct(Presence::Present) => "Do not remove it: it holds the data directory, with the manifest, the journals and the private roots of an installation, and removing it would destroy what they say. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
-        ParentCure::Correct(Presence::Absent) => "It holds no data directory, so removing it loses nothing: remove the folder, or give it to the Administrators group or the system with a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
-    };
+    let remedy = remedy::parent_advice(&cure);
     Error::Refused(format!(
         "{} is the folder that holds the boundary's data (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns that folder, or can write or delete in it, could put data of their own in its place while the broker runs as the system. {remedy}",
         parent.display()
