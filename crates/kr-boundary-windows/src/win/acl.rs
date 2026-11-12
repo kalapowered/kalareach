@@ -686,9 +686,10 @@ mod tests {
     #[test]
     fn the_default_list_of_a_volumes_root_and_of_program_data_has_no_finding_above_the_trees() {
         assert_eq!(Fixture::from(VOLUME_ROOT).above(), None);
-        // Program Data: the users may add a file and a subdirectory, and the creator-owner
-        // placeholder has every right on what it makes.
-        let data = "O:SYD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FA;;;CO)(A;OICI;0x1200a9;;;BU)(A;CI;0x2;;;BU)(A;CI;0x4;;;BU)";
+        // Program Data: the users may add a file and a subdirectory and write attributes and
+        // extended attributes (0x116 is write data, append data, write extended attributes and write
+        // attributes), and the creator-owner placeholder has every right on what it makes.
+        let data = "O:SYD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FA;;;CO)(A;OICI;0x1200a9;;;BU)(A;CI;0x116;;;BU)";
         assert_eq!(Fixture::from(data).above(), None);
     }
 
@@ -706,7 +707,7 @@ mod tests {
             assert!(finding.contains(said), "{rights}: {finding}");
         }
         // The right the default list gives to add an entry stays allowed.
-        for rights in ["0x2", "0x4", "0x100"] {
+        for rights in ["0x2", "0x4", "0x10", "0x100", "0x116"] {
             assert_eq!(
                 Fixture::from(&format!("{BASE}(A;CI;{rights};;;BU)")).above(),
                 None,
