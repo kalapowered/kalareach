@@ -408,15 +408,26 @@ impl Controller {
             // and for the journal's lock. The admission is asked after it, inside the service's
             // own work, so that answer is the last thing between this mutation and its effect
             // rather than one more thing with waits after it.
-            if let Err(error) = self
+            match self
                 .transfer
                 .check_subject_of_record(actor_id, mutation, method)
                 .await
             {
-                return ControlFrame::Response(Response {
-                    request_id: mutation.request_id,
-                    outcome: Outcome::Error(error),
-                });
+                Ok(None) => {}
+                // What the stored subject says goes back as it is, which is the word this door
+                // gives it without a check.
+                Ok(Some(refused)) => {
+                    return ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Error(refused.copied().into_answer()),
+                    });
+                }
+                Err(error) => {
+                    return ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Error(error),
+                    });
+                }
             }
             let Some(admitted_revision) = admitted else {
                 return error_reply(
@@ -805,8 +816,11 @@ impl Controller {
                     .await
             }
             Method::AgentToolsInstall | Method::AgentToolsRemove => {
+                // A record the installation holds, or cannot read, goes back as the check says: the
+                // refusal of the check is this door's word for it.
                 self.agent_tools_change(actor_id, mutation, method, carried)
                     .await
+                    .into_answer()
             }
             Method::GrantCreate
             | Method::GrantRevoke
@@ -831,9 +845,10 @@ impl Controller {
             // The policy an organisation signed, applied under the registry's guard and kept in the
             // store of applied policies: no action is claimed and no answer is kept, since the same
             // policy again is accepted and puts its list in force again.
-            Method::OrganisationPolicyApply => {
-                self.organisation_policy_apply(mutation, carried).await
-            }
+            Method::OrganisationPolicyApply => self
+                .organisation_policy_apply(mutation, carried)
+                .await
+                .into_answer(),
             // The host presenting the lease its organisation signed for its own local owner, who
             // answers to a membership lease like a member while the host is exclusively
             // organisation-managed. The same function the paired door calls does the work, as the
@@ -859,8 +874,9 @@ impl Controller {
                 // that came over a process bridge has already crossed its one: the helper that made
                 // it refuses to carry a request that would open another, and this is the rule kept
                 // where only the destination can keep it.
-                return self
-                    .claimed_action(
+                return respond(
+                    mutation.request_id,
+                    self.claimed_action(
                         actor_id,
                         mutation,
                         connection_id,
@@ -873,7 +889,9 @@ impl Controller {
                             carried,
                         ),
                     )
-                    .await;
+                    .await
+                    .into_answer(),
+                );
             }
             // The disclosed checks are started once per actor's action: what the start came to is
             // written down for 30 days before it is given, and a retry is answered from that record
@@ -882,7 +900,8 @@ impl Controller {
                 return respond(
                     mutation.request_id,
                     self.start_capability_checks(actor_id, mutation, carried)
-                        .await,
+                        .await
+                        .into_answer(),
                 );
             }
             // Privacy mode and a session's pinned name are this daemon's own, each changed once per
@@ -892,8 +911,9 @@ impl Controller {
             | Method::SessionRename
             | Method::DescriptionConfigure
             | Method::DescriptionDownload => {
-                return self
-                    .claimed_action(actor_id, mutation, connection_id, admitted, async {
+                return respond(
+                    mutation.request_id,
+                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
                         if method == Method::PrivacySet {
                             let outcome = self.privacy_set(mutation, carried).await;
                             // The state is published: the description host looks again, with its
@@ -901,7 +921,7 @@ impl Controller {
                             self.descriptions.wake_host();
                             outcome
                         } else if crate::describe::serves(method) {
-                            self.description_write(method, mutation, carried).await
+                            Given::Fresh(self.description_write(method, mutation, carried).await)
                         } else {
                             let summary = match mutation.target.session_id.as_ref().copied() {
                                 Some(session_id) => self.session_summary(session_id).await,
@@ -909,67 +929,65 @@ impl Controller {
                                     "a rename names the session it renames".to_owned(),
                                 )),
                             };
-                            match summary {
+                            Given::Fresh(match summary {
                                 Ok(summary) => {
                                     self.session_rename(actor_id, mutation, summary, carried)
                                         .await
                                 }
                                 Err(error) => Err(error),
-                            }
+                            })
                         }
                     })
-                    .await;
+                    .await
+                    .into_answer(),
+                );
             }
             // The host's own sign-in to the managed account service is this daemon's, started once
             // per actor's action: the action is claimed first, and what it came to is kept under
             // the claim before it is answered, so a retry is answered from that record.
             Method::AccountSignIn => {
-                return self
-                    .claimed_action(
-                        actor_id,
-                        mutation,
-                        connection_id,
-                        admitted,
-                        self.account_sign_in(mutation),
-                    )
-                    .await;
+                return respond(
+                    mutation.request_id,
+                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                        Given::Fresh(self.account_sign_in(mutation).await)
+                    })
+                    .await
+                    .into_answer(),
+                );
             }
             // Signing out is claimed the same way: a retry of a request whose answer was lost is
             // answered from the first, and does not sign out an account signed in since.
             Method::AccountSignOut => {
-                return self
-                    .claimed_action(
-                        actor_id,
-                        mutation,
-                        connection_id,
-                        admitted,
-                        self.account_sign_out(mutation),
-                    )
-                    .await;
+                return respond(
+                    mutation.request_id,
+                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                        Given::Fresh(self.account_sign_out(mutation).await)
+                    })
+                    .await
+                    .into_answer(),
+                );
             }
             // The sign-in and sign-out of the account at a storage service the person runs are
             // claimed the same way, and act on that account alone.
             Method::AccountStorageSignIn => {
-                return self
-                    .claimed_action(
-                        actor_id,
-                        mutation,
-                        connection_id,
-                        admitted,
-                        self.account_storage_sign_in(mutation),
-                    )
-                    .await;
+                return respond(
+                    mutation.request_id,
+                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                        Given::Fresh(self.account_storage_sign_in(mutation).await)
+                    })
+                    .await
+                    .into_answer(),
+                );
             }
             Method::AccountStorageSignOut => {
-                return self
-                    .claimed_action(
-                        actor_id,
-                        mutation,
-                        connection_id,
-                        admitted,
-                        self.account_storage_sign_out(mutation),
-                    )
-                    .await;
+                return respond(
+                    mutation.request_id,
+                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                        Given::Fresh(self.account_storage_sign_out(mutation).await)
+                    })
+                    .await
+                    .into_answer(),
+                );
             }
             // A machine group step changes this environment's own record under the revision it was
             // admitted at, read before anything waited rather than again here: a revocation of
@@ -1010,15 +1028,14 @@ impl Controller {
                         }),
                     );
                 }
-                return self
-                    .claimed_action(
-                        actor_id,
-                        mutation,
-                        connection_id,
-                        admitted,
-                        self.update_handover(mutation),
-                    )
-                    .await;
+                return respond(
+                    mutation.request_id,
+                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                        Given::Fresh(self.update_handover(mutation).await)
+                    })
+                    .await
+                    .into_answer(),
+                );
             }
             // Setting this host's backups up changes the host's own record and the account's
             // storage at the service, and nothing a session holds. A call is idempotent on its
@@ -1026,7 +1043,7 @@ impl Controller {
             Method::BackupEnable => {
                 match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
                     Some(_) => match self.authorised(connection_id) {
-                        Ok(_) => self.backup_enable(mutation, carried).await,
+                        Ok(_) => self.backup_enable(mutation, carried).await.into_answer(),
                         Err(error) => Err(error),
                     },
                     None => Err(ControllerError::WindowExpired {
@@ -1071,7 +1088,10 @@ impl Controller {
             // request, and the daemon keeps no record of the action: asked again it asks again.
             Method::PrivacyRetainedDelete => {
                 match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
-                    Some(_) => self.privacy_retained_delete(mutation, carried).await,
+                    Some(_) => self
+                        .privacy_retained_delete(mutation, carried)
+                        .await
+                        .into_answer(),
                     None => Err(ControllerError::WindowExpired {
                         detail: "the deadline this action was admitted under passed before it \
                                  could run"

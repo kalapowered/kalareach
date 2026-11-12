@@ -15,6 +15,7 @@ use kr_protocol::session::SessionListResult;
 use super::acting::Acting;
 use super::{RemoteConnection, failure, outcome_not_shown};
 use crate::changeset::{ScopedEnvironments, VersionScope};
+use crate::given::Recorded;
 
 impl RemoteConnection {
     /// Narrows an answer to what this device's grant admits.
@@ -529,11 +530,11 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         method: Method,
         acting: &Acting,
-    ) -> Result<Option<ControlFrame>, ProtocolError> {
+    ) -> Result<Option<Recorded<ControlFrame>>, ProtocolError> {
         let Some(retained) = self
             .controller
             .changesets()
-            .retained(actor_id, mutation, method)
+            .retained_frame(actor_id, mutation, method)
             .await
         else {
             return Ok(None);
@@ -548,7 +549,9 @@ impl RemoteConnection {
         self.check_working_tree_request(method, &mutation.params, acting, earlier)
             .await
             .map_err(|_| outcome_not_shown())?;
-        Ok(Some(shown_working_tree_change(retained, method)))
+        Ok(Some(Recorded::read(shown_working_tree_change(
+            retained, method,
+        ))))
     }
 
     /// Checks the version a device asks to have materialised.
@@ -585,11 +588,11 @@ impl RemoteConnection {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-    ) -> Result<Option<ControlFrame>, ProtocolError> {
+    ) -> Result<Option<Recorded<ControlFrame>>, ProtocolError> {
         let Some(retained) = self
             .controller
             .changesets()
-            .retained(actor_id, mutation, Method::ChangesetMaterialize)
+            .retained_frame(actor_id, mutation, Method::ChangesetMaterialize)
             .await
         else {
             return Ok(None);
@@ -597,7 +600,7 @@ impl RemoteConnection {
         self.check_materialisation(mutation)
             .await
             .map_err(|_| outcome_not_shown())?;
-        Ok(Some(shown_materialisation(retained)))
+        Ok(Some(Recorded::read(shown_materialisation(retained))))
     }
 }
 

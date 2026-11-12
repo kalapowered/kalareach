@@ -45,7 +45,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
 
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 use crate::machine::{Approval, Change, Expected, MachineGroup, MachineStore, Standing};
 use crate::singleton::SingletonLock;
 
@@ -379,7 +379,9 @@ impl Controller {
                 // in hand and the step lock held: a fence that lands while this attempt waited for
                 // the lock, or while it holds it, stops the answer.
                 return self
-                    .retained_under_authority(&carried, origin, async { recorded_answer(record) })
+                    .retained_under_authority(&carried, origin, async {
+                        recorded_machine_answer(record)
+                    })
                     .await;
             }
         };
@@ -558,6 +560,17 @@ impl Controller {
     /// Both doors call this for the three methods, ahead of everything that decides a first
     /// admission: section 9 keeps a receipt readable after the window that admitted it has gone.
     pub(super) async fn machine_retained(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Option<Recorded<ControlFrame>> {
+        self.machine_retained_frame(actor_id, mutation)
+            .await
+            .map(Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    async fn machine_retained_frame(
         self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -976,6 +989,10 @@ fn result_of(
 /// A result that cannot be read back is a record that cannot be read: the step was taken, and what
 /// it came to is not known, so the answer is an outcome this host does not know, never a refusal
 /// the caller would take for a step that changed nothing.
+fn recorded_machine_answer(record: crate::grants::ActionRecord) -> Recorded<Result<ParamsValue>> {
+    Recorded::read(recorded_answer(record))
+}
+
 fn recorded_answer(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
     match record {
         crate::grants::ActionRecord::Answered { result } => {

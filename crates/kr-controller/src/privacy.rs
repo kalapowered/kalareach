@@ -75,6 +75,7 @@ use crate::backup::BackupService;
 use crate::backup::store::FenceRelease;
 use crate::describe::DescribeModule;
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::push::DeliveryModule;
 
 /// The file the environment's privacy record lives in.
@@ -1845,6 +1846,16 @@ fn write_obligation(
 }
 
 impl crate::service::Controller {
+    /// What `privacy.set` answers: the privacy state with the copies earlier exports left, so
+    /// the report is a copy of what those records hold as well as the result of this change.
+    pub(crate) async fn privacy_set(
+        self: &Arc<Self>,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Given<Result<kr_protocol::envelope::ParamsValue>> {
+        Given::Copied(self.privacy_set_answer(mutation, carried).await)
+    }
+
     /// Performs `privacy.set` under the admission it carries, and answers the report.
     ///
     /// The sessions the environment holds content for are every worker the registry records, every
@@ -1857,7 +1868,7 @@ impl crate::service::Controller {
     ///
     /// Returns [`ControllerError::WindowExpired`] for an action that carries no freshness, and
     /// otherwise what [`EnvironmentPrivacy::set`] refuses with.
-    pub(crate) async fn privacy_set(
+    async fn privacy_set_answer(
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
         carried: crate::authority::AdmittedMutation,
@@ -1962,6 +1973,16 @@ impl crate::service::Controller {
         Ok(self.with_viewer_copies(report))
     }
 
+    /// What `privacy.retained.delete` answers: the report of the copies privacy mode lists, which
+    /// includes what earlier exports left, so it is a copy of what those records hold.
+    pub(crate) async fn privacy_retained_delete(
+        self: &Arc<Self>,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Given<Result<kr_protocol::envelope::ParamsValue>> {
+        Given::Copied(self.privacy_retained_delete_answer(mutation, carried).await)
+    }
+
     /// Performs `privacy.retained.delete`: asks the service that holds one copy privacy mode lists
     /// as having left this host to delete it, and answers where that stands.
     ///
@@ -1985,7 +2006,7 @@ impl crate::service::Controller {
     /// reference, [`ControllerError::PermissionDenied`] for a copy the host cannot ask the removal
     /// of, [`ControllerError::NotConfigured`] when the host selects no storage service, and the
     /// store's refusals.
-    pub(crate) async fn privacy_retained_delete(
+    async fn privacy_retained_delete_answer(
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
         carried: crate::authority::AdmittedMutation,

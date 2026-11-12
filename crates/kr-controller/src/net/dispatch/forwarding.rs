@@ -18,6 +18,7 @@ use kr_transport::window::AcceptedDeadline;
 use super::super::arrivals::{Arrival, Arrivals, Carried, request_of};
 use super::super::proxy::{Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
+use crate::given::Recorded;
 use crate::grants::policy::HeldBound;
 use crate::service::FeedStanding;
 
@@ -739,7 +740,7 @@ impl RemoteConnection {
     /// under.
     pub(super) async fn kept_answer(
         &self,
-        kept: ControlFrame,
+        kept: Recorded<ControlFrame>,
         method: Method,
         mutation: &MutationRequest,
         validated: AuthorityRevision,
@@ -751,13 +752,7 @@ impl RemoteConnection {
         // written under the decision of the request, not as an answer kept from an earlier
         // submission: a refusal to write a kept answer is told as an unknown outcome, and nothing
         // was carried out here.
-        let reused = matches!(
-            &kept,
-            ControlFrame::Response(Response {
-                outcome: Outcome::Error(error),
-                ..
-            }) if error.code == ErrorCode::IdConflict
-        );
+        let reused = kept.names_a_reused_identifier();
         *asked = Some(if reused {
             decided.clone()
         } else {
@@ -771,14 +766,14 @@ impl RemoteConnection {
             return Err(outcome_not_shown());
         }
         if reused {
-            return Ok(kept);
+            return Ok(kept.copied().into_answer());
         }
         // The answer is a read of what an earlier submission produced, and is written under the
         // decision that read is ([`Self::read_of_retained`]). A create's answer is a read of the
         // reservation its token holds, whichever way the first attempt ended, and the session that
         // reservation holds is its subject.
         let reserved = if method == Method::SessionCreate {
-            match self.reserved_session(mutation).await {
+            match self.reserved_session(mutation).await.copied().into_answer() {
                 Ok(reserved) => reserved,
                 Err(()) => return Err(outcome_not_shown()),
             }
@@ -790,7 +785,29 @@ impl RemoteConnection {
             Ok(None) => {}
             Err(_) => return Err(outcome_not_shown()),
         }
-        Ok(kept)
+        Ok(kept.copied().into_answer())
+    }
+
+    /// [`Self::kept_answer`] for a copy a service gave when it performed the action, which it read
+    /// from its own record.
+    pub(super) async fn kept_copy(
+        &self,
+        copy: ControlFrame,
+        method: Method,
+        mutation: &MutationRequest,
+        validated: AuthorityRevision,
+        decided: &Asked,
+        asked: &mut Option<Asked>,
+    ) -> std::result::Result<ControlFrame, ProtocolError> {
+        self.kept_answer(
+            Recorded::read(copy),
+            method,
+            mutation,
+            validated,
+            decided,
+            asked,
+        )
+        .await
     }
 
     /// What a device is told of a copy a service withheld: the service read the record of an
@@ -821,16 +838,20 @@ impl RemoteConnection {
     async fn reserved_session(
         &self,
         mutation: &MutationRequest,
-    ) -> std::result::Result<Option<SessionId>, ()> {
+    ) -> Recorded<std::result::Result<Option<SessionId>, ()>> {
         let actor_id = self.device.principal();
-        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id).map_err(|_| ())?;
+        let Ok(digest) = kr_protocol::digest::mutation_digest(mutation, &actor_id) else {
+            return Recorded::read(Err(()));
+        };
         let registry = self.controller.registry.lock().await;
-        let reservation = registry
-            .reservation_for_token(&actor_id, mutation.action_id.get())
-            .ok()
-            .flatten()
-            .ok_or(())?;
-        Ok((reservation.payload_digest == digest).then_some(reservation.session_id))
+        Recorded::read(
+            match registry.reservation_for_token(&actor_id, mutation.action_id.get()) {
+                Ok(Some(reservation)) => {
+                    Ok((reservation.payload_digest == digest).then_some(reservation.session_id))
+                }
+                Ok(None) | Err(_) => Err(()),
+            },
+        )
     }
 
     /// Returns this connection's link to one worker, opening it on first use.
@@ -886,7 +907,12 @@ impl RemoteConnection {
             // A session with no worker is closed where its closure is recorded, and the record is
             // what says so.
             Err(error @ ControllerError::UnknownSession { .. }) => {
-                return Err(self.controller.closed_or(session_id, error).await);
+                return Err(self
+                    .controller
+                    .closed_or(session_id, error)
+                    .await
+                    .copied()
+                    .into_answer());
             }
             Err(error) => return Err(error),
         };
@@ -983,7 +1009,7 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         validated: AuthorityRevision,
         asked: &Asked,
-    ) -> std::result::Result<Option<(ControlFrame, Asked)>, RouteRefusal> {
+    ) -> std::result::Result<Option<(Recorded<ControlFrame>, Asked)>, RouteRefusal> {
         let actor_id = self.device.principal();
         let Some(routed) = self
             .devices
@@ -1125,7 +1151,7 @@ impl RemoteConnection {
                 receipt: read_back.receipt,
             })),
         };
-        Ok(Some((answered, read)))
+        Ok(Some((Recorded::read(answered), read)))
     }
 
     /// Answers a repeated close of a session that has closed from the closure record, when the
@@ -1141,7 +1167,7 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         session_id: SessionId,
         read: Asked,
-    ) -> Option<(ControlFrame, Asked)> {
+    ) -> Option<(Recorded<ControlFrame>, Asked)> {
         if mutation.method != Method::SessionClose.into() {
             return None;
         }
@@ -1149,14 +1175,8 @@ impl RemoteConnection {
             .controller
             .answer_from_the_closure(session_id)
             .await
-            .ok()?;
-        Some((
-            ControlFrame::Response(Response {
-                request_id: mutation.request_id,
-                outcome: Outcome::Ok(closed),
-            }),
-            read,
-        ))
+            .answered(mutation.request_id)?;
+        Some((closed, read))
     }
 
     /// Returns the link to the worker holding one action's receipt.

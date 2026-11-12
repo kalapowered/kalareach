@@ -10,7 +10,7 @@ use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use kr_protocol::voice::{VoiceDelegateResult, VoiceDelegationOutcome};
 
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 
 use super::authority_changes::decoded;
 use super::workers::WorkerLink;
@@ -673,7 +673,7 @@ impl Controller {
         // first attempt is running or ended unrecorded is told so rather than performed.
         // What it finds goes back under the registration the repeat arrived under, a refusal it
         // kept as much as a result.
-        if let Some(found) = self.voice_answered(&actor_id, mutation).await.transpose() {
+        if let Some(found) = self.voice_answered(&actor_id, mutation).await.present() {
             return self
                 .retained_under_authority(&carried, origin, async { found })
                 .await;
@@ -838,6 +838,14 @@ impl Controller {
         self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
+    ) -> Recorded<Result<Option<ParamsValue>>> {
+        Recorded::read(self.voice_on_record(actor_id, mutation).await)
+    }
+
+    async fn voice_on_record(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
     ) -> Result<Option<ParamsValue>> {
         let digest = self.voice_action_digest(actor_id, mutation)?;
         // A store that cannot be read is not one that holds no record: an earlier attempt may have
@@ -850,7 +858,7 @@ impl Controller {
             .map_err(|error| error.found_unreadable("voice changes"))?
         {
             Some(record) => self
-                .voice_recorded(actor_id, mutation, record)
+                .voice_record_answer(actor_id, mutation, record)
                 .await
                 .map(Some),
             None => Ok(None),
@@ -863,6 +871,15 @@ impl Controller {
     /// ([`Self::delegation_again`]). The others name no session and carry no content about one:
     /// what each produced is the grant it wrote, the call it created or the call it ended.
     async fn voice_recorded(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        record: crate::grants::ActionRecord,
+    ) -> Recorded<Result<ParamsValue>> {
+        Recorded::read(self.voice_record_answer(actor_id, mutation, record).await)
+    }
+
+    async fn voice_record_answer(
         self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,

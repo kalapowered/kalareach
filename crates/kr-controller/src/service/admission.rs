@@ -16,6 +16,7 @@ use kr_transport::lease::LeaseRefusal;
 use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::registry::Registry;
 
 use super::authority_changes::{
@@ -552,15 +553,26 @@ impl Controller {
         &self,
         carried: &crate::authority::AdmittedMutation,
         origin: &mut crate::given::Origin,
-        answer: impl std::future::Future<Output = Result<kr_protocol::envelope::ParamsValue>>,
+        answer: impl std::future::Future<
+            Output = crate::given::Recorded<Result<kr_protocol::envelope::ParamsValue>>,
+        >,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
-        let answered = answer.await;
-        origin.note(crate::given::Origin::Copied);
-        if let Err(refusal) = self.check_retained_in_hand(carried).await {
-            origin.note(crate::given::Origin::Withheld);
-            return Err(refusal);
-        }
-        answered
+        let given = self.retained_given(carried, answer.await).await;
+        origin.note(given.origin());
+        given.into_answer()
+    }
+
+    /// What an earlier attempt of an action recorded, given back as a copy under the authority
+    /// `carried` names, asked once the answer is in hand: the answer, or the check's refusal as a
+    /// copy the service withheld.
+    pub(crate) async fn retained_given<T>(
+        &self,
+        carried: &crate::authority::AdmittedMutation,
+        recorded: crate::given::Recorded<Result<T>>,
+    ) -> Given<Result<T>> {
+        #[cfg(feature = "testing")]
+        self.after_the_retained_lookup.wait().await;
+        recorded.checked(|| self.check_retained_under(carried))
     }
 
     /// What a claim or a lookup that found another attempt's record refuses with, given back only
@@ -580,29 +592,39 @@ impl Controller {
         origin: &mut crate::given::Origin,
         found: ControllerError,
     ) -> ControllerError {
-        match found {
-            // The refusal of a share for the subject of one that is still running names that
-            // share's action, which is another attempt's word as the conflict is, and is held to
-            // the check in the same way.
+        let given = self.conflict_given(carried, found).await;
+        origin.note(given.origin());
+        given.into_answer()
+    }
+
+    /// [`Self::conflict_under_authority`], with where the refusal came from in its type.
+    pub(crate) async fn conflict_given(
+        &self,
+        carried: &crate::authority::AdmittedMutation,
+        found: ControllerError,
+    ) -> Given<ControllerError> {
+        let copied = matches!(found, ControllerError::Uncertain { .. });
+        // The refusal of a share for the subject of one that is still running names that share's
+        // action, which is another attempt's word as the conflict is, and is held to the check in
+        // the same way.
+        let reused = matches!(
+            found,
             ControllerError::IdConflict { .. }
-            | ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::DraftConflict,
-                ..
-            } => {
-                if let Err(lapsed) = self.check_retained_in_hand(carried).await {
-                    return lapsed;
+                | ControllerError::Refused {
+                    code: kr_protocol::error::ErrorCode::DraftConflict,
+                    ..
                 }
-            }
-            ControllerError::Uncertain { .. } => {
-                origin.note(crate::given::Origin::Copied);
-                if let Err(lapsed) = self.check_retained_in_hand(carried).await {
-                    origin.note(crate::given::Origin::Withheld);
-                    return lapsed;
-                }
-            }
-            _ => {}
+        );
+        if !copied && !reused {
+            return Given::Fresh(found);
         }
-        found
+        #[cfg(feature = "testing")]
+        self.after_the_retained_lookup.wait().await;
+        match self.check_retained_under(carried) {
+            Ok(()) => Given::of(found, copied),
+            Err(lapsed) if copied => Given::Withheld(lapsed),
+            Err(lapsed) => Given::Fresh(lapsed),
+        }
     }
 
     /// The check a recorded answer is owed, for a service that finds it on a blocking thread:

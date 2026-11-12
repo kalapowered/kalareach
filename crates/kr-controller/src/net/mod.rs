@@ -2312,7 +2312,11 @@ impl Controller {
             // which is the same read the worker's own journal would have been. The caller decides
             // whether this device may be told it.
             *retained = Retained::Record;
-            return self.answer_from_the_closure(session_id).await;
+            return self
+                .answer_from_the_closure(session_id)
+                .await
+                .copied()
+                .into_answer();
         }
         // The accepted deadline as it stands, and no dispatch lease behind it. Section 9 asks for
         // a live lease before a *remote dispatch*, and it exempts stopping owned execution from
@@ -2355,7 +2359,11 @@ impl Controller {
             // was recorded in between, and the record is the answer.
             Err(ControllerError::UnknownSession { .. }) => {
                 *retained = Retained::Record;
-                return self.answer_from_the_closure(session_id).await;
+                return self
+                    .answer_from_the_closure(session_id)
+                    .await
+                    .copied()
+                    .into_answer();
             }
             Err(error) => return Err(error),
         };

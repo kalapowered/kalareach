@@ -51,7 +51,7 @@ use kr_protocol::scalars::Nullable;
 use kr_protocol::test_report::{MAX_REPORTS_PER_ANSWER, TestReportsParams, TestReportsResult};
 
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 
 /// What a change-set call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -229,7 +229,19 @@ impl ChangeSetModule {
     /// carries the window the action was first admitted under and this connection holds a newer
     /// one. Refusing it for that would deny a caller its own completed result.
     #[must_use]
-    pub async fn retained(
+    pub(crate) async fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<Recorded<ControlFrame>> {
+        self.retained_frame(actor_id, mutation, method)
+            .await
+            .map(Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    pub(crate) async fn retained_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

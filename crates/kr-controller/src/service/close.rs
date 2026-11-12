@@ -17,6 +17,7 @@ use kr_protocol::worker::ReservationId;
 use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
+use crate::given::Recorded;
 use crate::supervision::JobRetirement;
 
 use super::admission::remaining_deadline;
@@ -155,7 +156,11 @@ impl Controller {
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         let Some(worker) = worker else {
             // A duplicate close returns the existing state rather than closing anything again.
-            return self.answer_from_the_closure(params.session_id).await;
+            return self
+                .answer_from_the_closure(params.session_id)
+                .await
+                .copied()
+                .into_answer();
         };
         // One budget for the whole exchange, started before the wait for the connection. Section 7
         // gives a closure five seconds to stop its processes and two more to drain them, and this
@@ -176,7 +181,11 @@ impl Controller {
                 // closure was recorded in between, and the record is the answer, as it is to a
                 // close that came after the closure.
                 Ok(Err(ControllerError::UnknownSession { .. })) => {
-                    return self.answer_from_the_closure(params.session_id).await;
+                    return self
+                        .answer_from_the_closure(params.session_id)
+                        .await
+                        .copied()
+                        .into_answer();
                 }
                 Ok(Err(error)) => return Err(error),
                 // Nothing was dispatched: this close never reached the worker, and the link it
@@ -321,7 +330,11 @@ impl Controller {
     pub(super) async fn answer_from_the_closure(
         &self,
         session_id: SessionId,
-    ) -> Result<ParamsValue> {
+    ) -> Recorded<Result<ParamsValue>> {
+        Recorded::read(self.closure_answer(session_id).await)
+    }
+
+    async fn closure_answer(&self, session_id: SessionId) -> Result<ParamsValue> {
         let closure = self.registry.lock().await.closure(session_id)?;
         match closure {
             Some(closure) => encode(&SessionCloseResult {
@@ -346,14 +359,14 @@ impl Controller {
         &self,
         session_id: SessionId,
         error: ControllerError,
-    ) -> ControllerError {
-        match self.registry.lock().await.closure(session_id) {
+    ) -> Recorded<ControllerError> {
+        Recorded::read(match self.registry.lock().await.closure(session_id) {
             Ok(Some(_)) => ControllerError::SessionClosed {
                 session: session_id.to_string(),
             },
             Ok(None) => error,
             Err(failed) => failed,
-        }
+        })
     }
 
     /// Settles a worker's answer to a close of `session_id` that this daemon passes on, whether

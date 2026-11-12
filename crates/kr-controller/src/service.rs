@@ -1423,7 +1423,7 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
 }
 
-fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlFrame {
+pub(crate) fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlFrame {
     match outcome {
         Ok(value) => ControlFrame::Response(Response {
             request_id,
@@ -1436,7 +1436,11 @@ fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlFrame 
     }
 }
 
-fn error_reply(request_id: RequestId, code: ErrorCode, message: impl Into<String>) -> ControlFrame {
+pub(crate) fn error_reply(
+    request_id: RequestId,
+    code: ErrorCode,
+    message: impl Into<String>,
+) -> ControlFrame {
     ControlFrame::Response(Response {
         request_id,
         outcome: Outcome::Error(ProtocolError::new(code, message)),

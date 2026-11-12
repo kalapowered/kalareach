@@ -8,6 +8,7 @@ use kr_protocol::envelope::{MutationRequest, ParamsValue};
 
 use crate::backup::setup::SetupAdmission;
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 use super::{Controller, parse};
 
@@ -127,26 +128,34 @@ impl Controller {
         self: &std::sync::Arc<Self>,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
+    ) -> Given<Result<ParamsValue>> {
         #[cfg(any(test, feature = "testing"))]
         crate::testing::note_backup_enable(self.paths.environment_id(), mutation);
-        let params: BackupEnableParams = parse(&mutation.params)?;
+        let params: BackupEnableParams = match parse(&mutation.params) {
+            Ok(params) => params,
+            Err(refusal) => return Given::Fresh(Err(refusal)),
+        };
         let admission = std::sync::Arc::new(SetupStands {
             controller: std::sync::Arc::clone(self),
             carried,
         });
-        let answer = self.enable_backups(params, admission).await?;
-        ParamsValue::from_typed(&answer)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+        self.enable_backups(params, admission).await.map(|answer| {
+            answer.and_then(|answer| {
+                ParamsValue::from_typed(&answer)
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+            })
+        })
     }
 
     async fn enable_backups(
         &self,
         params: BackupEnableParams,
         admission: std::sync::Arc<dyn SetupAdmission>,
-    ) -> Result<BackupEnableResult> {
-        let setup = self.backup_setup_of()?;
-        setup.enable(params, admission).await
+    ) -> Given<Result<BackupEnableResult>> {
+        match self.backup_setup_of() {
+            Ok(setup) => setup.enable(params, admission).await,
+            Err(refusal) => Given::Fresh(Err(refusal)),
+        }
     }
 
     /// Sets this host's backups up as `backup.enable` does, for a suite that stops waiting for the
@@ -166,6 +175,7 @@ impl Controller {
             std::sync::Arc::new(Unchecked(std::sync::Arc::clone(self))),
         )
         .await
+        .into_answer()
     }
 
     /// Stops the next `backup.status` between its two reads, for a suite that holds a call before

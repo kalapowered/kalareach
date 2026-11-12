@@ -39,7 +39,7 @@ use super::pairing::PairingHost;
 use super::rendezvous::Life;
 use crate::authority::AdmittedMutation;
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 use crate::service::Controller;
 
 /// Returns true for the methods this module serves.
@@ -197,6 +197,18 @@ impl Controller {
     ///
     /// Asked before a first admission's freshness, like every other retained action on this host.
     pub(crate) async fn pairing_retained(
+        self: &Arc<Self>,
+        caller: Caller,
+        method: Method,
+        mutation: &MutationRequest,
+    ) -> Option<Recorded<Result<ParamsValue>>> {
+        self.pairing_retained_answer(caller, method, mutation)
+            .await
+            .map(Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    async fn pairing_retained_answer(
         self: &Arc<Self>,
         caller: Caller,
         method: Method,

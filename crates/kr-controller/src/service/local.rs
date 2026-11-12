@@ -17,8 +17,8 @@ use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_transport::window::MAX_WINDOW_VALIDITY;
 
 use crate::error::{ControllerError, Result};
+use crate::given::{Given, Recorded};
 
-use super::authority_changes::declaration_answer;
 use super::identifiers::Arrival;
 use super::{Controller, error_reply, net, respond};
 
@@ -118,6 +118,15 @@ pub(super) enum DoorReply {
     /// What the mutation produced, or the answer its action already had. A held method's answer is
     /// a result and is written only while the local owner's lease holds.
     Answered(ControlFrame),
+}
+
+/// The reply for an answer a record supplied, once the check it is owed has been asked: written
+/// as an answer when the check passed, and as the check's own refusal when it did not.
+fn door_reply(given: Given<ControlFrame>) -> DoorReply {
+    match given {
+        Given::Fresh(frame) | Given::Copied(frame) => DoorReply::Answered(frame),
+        Given::Withheld(refusal) => DoorReply::Refused(refusal),
+    }
 }
 
 impl DoorReply {
@@ -507,6 +516,11 @@ impl Controller {
     /// whether it is the same action or a reused identifier. Only `session.create` has a retained
     /// record here; a close is retained by the worker that owns the session, which answers its own
     /// duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of the check an installation's lookup asks before it reads, which names
+    /// no record.
     pub(super) async fn retained(
         self: &Arc<Self>,
         actor_id: &ActorId,
@@ -514,12 +528,21 @@ impl Controller {
         method: Method,
         connection_id: ConnectionId,
         admitted: Option<AuthorityRevision>,
-    ) -> Option<ControlFrame> {
+    ) -> Result<Option<Recorded<ControlFrame>>> {
         if matches!(method, Method::AgentToolsInstall | Method::AgentToolsRemove) {
             return self
                 .retained_installation(actor_id, mutation, connection_id, admitted)
                 .await;
         }
+        Ok(self.retained_by_store(actor_id, mutation, method).await)
+    }
+
+    async fn retained_by_store(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<Recorded<ControlFrame>> {
         // An authority change this host already holds a claim on is answered from it, here, before
         // freshness is asked for: its result, its refusal, that it is still running, or what this
         // host's records prove an attempt that ended unrecorded did. Section 9 keeps a receipt
@@ -545,72 +568,24 @@ impl Controller {
         // directory recorded beside the keys: a completion or a refusal alike, so a retry whose
         // reply was lost is told what happened rather than that its window is gone.
         if method == Method::DeviceKeysComplete {
-            let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
-            return match self
-                .devices
-                .recorded_declaration(actor_id, mutation.action_id)
-            {
-                Ok(Some(recorded)) => Some(respond(
-                    mutation.request_id,
-                    declaration_answer(mutation, &digest, recorded),
-                )),
-                Ok(None) => None,
-                // A row that cannot be read, or whose outcome cannot be decoded, is not one that
-                // is absent: the declaration may have been made.
-                Err(error) => Some(respond(
-                    mutation.request_id,
-                    Err(error.found_unreadable("device key declarations")),
-                )),
-            };
+            return self.retained_declaration(actor_id, mutation);
         }
         // A voice change is claimed in the same store and answered the same way: section 9 keeps
         // a receipt readable after the window that admitted it has expired, and a retry that
         // cannot reach its result would otherwise be told its window is gone rather than what
         // happened. A delegation is answered from it too, under the authority it is owed now.
         if crate::voice::VoiceModule::serves(method) {
-            return match self.voice_answered(actor_id, mutation).await {
-                Ok(Some(answered)) => Some(ControlFrame::Response(Response {
-                    request_id: mutation.request_id,
-                    outcome: Outcome::Ok(answered),
-                })),
-                Ok(None) => None,
-                Err(error) => Some(respond(mutation.request_id, Err(error))),
-            };
+            return self
+                .voice_answered(actor_id, mutation)
+                .await
+                .present()
+                .map(|found| found.respond(mutation.request_id));
         }
 
         if method != Method::SessionCreate {
             return None;
         }
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
-        // A reservation that cannot be read is not one that is not there: an earlier copy of this
-        // create may have reserved a session and started it, and this copy is then neither fresh nor
-        // refused for something it did not do.
-        let existing = {
-            let registry = self.registry.lock().await;
-            match registry.reservation_for_token(actor_id, mutation.action_id.get()) {
-                Ok(Some(existing)) => existing,
-                Ok(None) => return None,
-                Err(error) => {
-                    eprintln!("kr-controller: a create's reservation cannot be looked up: {error}");
-                    return Some(respond(
-                        mutation.request_id,
-                        Err(ControllerError::record_unreadable("sessions")),
-                    ));
-                }
-            }
-        };
-        if existing.payload_digest != digest {
-            return Some(respond(
-                mutation.request_id,
-                Err(ControllerError::IdConflict {
-                    token: mutation.action_id.to_string(),
-                }),
-            ));
-        }
-        Some(respond(
-            mutation.request_id,
-            self.replay_create(&existing).await,
-        ))
+        self.retained_create(actor_id, mutation).await
     }
 
     /// Serves the client endpoint.
@@ -1076,9 +1051,19 @@ impl Controller {
         // authority the other door refuses the same mutation under. A retained answer is checked
         // against it, and so is every effect this door performs.
         let admitted = self.admitted_revision(connection_id).ok();
-        let mut retained = self
+        let mut retained = match self
             .retained(actor_id, &mutation, method, connection_id, admitted)
-            .await;
+            .await
+        {
+            Ok(retained) => retained,
+            Err(refusal) => {
+                return DoorReply::Refused(error_reply(
+                    mutation.request_id,
+                    refusal.code(),
+                    refusal.to_string(),
+                ));
+            }
+        };
         if retained.is_none() && crate::transfer::TransferModule::serves(method) {
             retained = self.transfer.retained(actor_id, &mutation, method).await;
         }
@@ -1109,19 +1094,14 @@ impl Controller {
             retained = self
                 .pairing_retained(self.local_caller(actor_id), method, &mutation)
                 .await
-                .map(|outcome| respond(mutation.request_id, outcome));
+                .map(|outcome| outcome.respond(mutation.request_id));
         }
         #[cfg(feature = "testing")]
         self.after_the_retained_lookup.wait().await;
         if let Some(retained) = retained {
-            if let Err(error) = self.check_retained_answer(connection_id, admitted) {
-                return DoorReply::Refused(error_reply(
-                    mutation.request_id,
-                    error.code(),
-                    error.to_string(),
-                ));
-            }
-            return DoorReply::Answered(retained);
+            return door_reply(retained.checked_frame(mutation.request_id, || {
+                self.check_retained_answer(connection_id, admitted)
+            }));
         }
         // A first admission spends an identifier no other method of this actor has spent, and holds
         // it until its effect has ended.
@@ -1189,14 +1169,9 @@ impl Controller {
                     // of the action or by the sweep: what it recorded is the answer, under the
                     // check any retained answer is owed.
                     crate::transfer::Settling::Answered(answer) => {
-                        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
-                            return DoorReply::Refused(error_reply(
-                                mutation.request_id,
-                                error.code(),
-                                error.to_string(),
-                            ));
-                        }
-                        return DoorReply::Answered(answer);
+                        return door_reply(answer.checked_frame(mutation.request_id, || {
+                            self.check_retained_answer(connection_id, admitted)
+                        }));
                     }
                     // No claim, and no arrival that may carry the action out: a first admission,
                     // which has no window.
@@ -1241,14 +1216,9 @@ impl Controller {
                         outcome: Outcome::Error(error.to_protocol_error()),
                     }));
                 };
-                if let Err(error) = self.check_retained_answer(connection_id, admitted) {
-                    return DoorReply::Refused(error_reply(
-                        mutation.request_id,
-                        error.code(),
-                        error.to_string(),
-                    ));
-                }
-                return DoorReply::Answered(held);
+                return door_reply(held.checked_frame(mutation.request_id, || {
+                    self.check_retained_answer(connection_id, admitted)
+                }));
             }
             Err(error) => {
                 return DoorReply::Refused(ControlFrame::Response(Response {
@@ -1325,24 +1295,22 @@ impl Controller {
         mutation: &MutationRequest,
         connection_id: ConnectionId,
         admitted: Option<AuthorityRevision>,
-    ) -> Option<ControlFrame> {
-        let installer = self.installer().ok()?;
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+    ) -> Result<Option<Recorded<ControlFrame>>> {
+        let Ok(installer) = self.installer() else {
+            return Ok(None);
+        };
+        let Ok(digest) = kr_protocol::digest::mutation_digest(mutation, actor_id) else {
+            return Ok(None);
+        };
         let _admission = self.agent_tools.lock().await;
         // Waiting for that lock takes time, and a retained result is a read of somebody's action.
         // Section 9 checks current authority before returning one, so it is checked after the wait
         // rather than before it.
-        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
-            return Some(respond(mutation.request_id, Err(error)));
-        }
-        match installer.retained(actor_id, mutation.action_id, &digest) {
-            Ok(Some(result)) => Some(ControlFrame::Response(Response {
-                request_id: mutation.request_id,
-                outcome: Outcome::Ok(result),
-            })),
-            Ok(None) => None,
-            Err(error) => Some(respond(mutation.request_id, Err(error))),
-        }
+        self.check_retained_answer(connection_id, admitted)?;
+        Ok(installer
+            .retained(actor_id, mutation.action_id, &digest)
+            .present()
+            .map(|found| found.respond(mutation.request_id)))
     }
 }
 

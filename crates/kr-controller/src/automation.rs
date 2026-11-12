@@ -3133,7 +3133,20 @@ impl AutomationModule {
     /// rearm the chain (`caller_grant` is the grant a paired device holds, none at the local
     /// socket).
     #[must_use]
-    pub async fn retained(
+    pub(crate) async fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        caller_grant: Option<GrantId>,
+    ) -> Option<crate::given::Recorded<ControlFrame>> {
+        self.retained_frame(actor_id, mutation, method, caller_grant)
+            .await
+            .map(crate::given::Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    async fn retained_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

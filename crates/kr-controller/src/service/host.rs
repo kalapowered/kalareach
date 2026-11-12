@@ -21,12 +21,21 @@ use kr_protocol::update::{
 };
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 use super::{Controller, encode, parse, wall_clock_ms};
 
 /// How long the doctor gives the reading of the installed packages and of the executables their
 /// commands name: an agent's executable can be a large file.
 const DOCTOR_READS: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What an environment record change answers with, and where the answer came from.
+enum Reading {
+    /// What this request did, or was refused before it could.
+    Own(ParamsValue),
+    /// What the enrolment record says, with nothing this request did.
+    Record(ParamsValue),
+}
 
 impl Controller {
     /// Reports what is installed for one agent.
@@ -51,11 +60,21 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
-        let params: kr_protocol::skill::AgentToolsParams = parse(&mutation.params)?;
-        let installer = self.installer()?;
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    ) -> Given<Result<ParamsValue>> {
+        let params: kr_protocol::skill::AgentToolsParams = match parse(&mutation.params) {
+            Ok(params) => params,
+            Err(refusal) => return Given::Fresh(Err(refusal)),
+        };
+        let installer = match self.installer() {
+            Ok(installer) => installer,
+            Err(refusal) => return Given::Fresh(Err(refusal)),
+        };
+        let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Given::Fresh(Err(ControllerError::InvalidArgument(error.to_string())));
+            }
+        };
         // From here to the recorded outcome is one sequence. Two callers cannot both find no
         // record and both change the same files.
         let _admission = self.agent_tools.lock().await;
@@ -63,7 +82,9 @@ impl Controller {
         // after it, so that a caller whose registration is gone is refused before anything of
         // the agent's files is read. The authority itself is asked where an answer the host
         // holds goes back and where the dispatch marker is written, below.
-        self.authorised(carried.connection_id)?;
+        if let Err(refusal) = self.authorised(carried.connection_id) {
+            return Given::Fresh(Err(refusal));
+        }
         // What the host holds of the action goes back only under the authority this attempt
         // arrived under, asked with it in hand. That is a result, the conflict a reused identifier
         // meets, an outcome that was never recorded, or a record that cannot be read: the
@@ -72,28 +93,57 @@ impl Controller {
         // since then stops it, as it does at that look.
         if let Some(kept) = installer
             .retained(actor_id, mutation.action_id, &digest)
-            .transpose()
+            .present()
         {
-            // This door tells every answer whole, so where the answer came from is not kept.
-            let mut origin = crate::given::Origin::Fresh;
-            return self
-                .retained_under_authority(&carried, &mut origin, async { kept })
-                .await;
+            return self.retained_given(&carried, kept).await;
         }
         // What either change can refuse without touching anything, refused here: the platform, the
         // scope, a file or entry this host did not write, a record it cannot read, a document whose
         // protection it cannot keep. A refusal after the marker below would be reported as a change
         // whose outcome nobody knows, for a change that never began.
-        match method {
-            Method::AgentToolsInstall => installer.check(&params)?,
-            Method::AgentToolsRemove => installer.check_removal(&params)?,
+        let declined = match method {
+            Method::AgentToolsInstall => installer.declined_before_writing(&params, false),
+            Method::AgentToolsRemove => installer.declined_before_writing(&params, true),
             _ => {
-                return Err(ControllerError::InvalidArgument(format!(
+                return Given::Fresh(Err(ControllerError::InvalidArgument(format!(
                     "{} is not an installation this daemon serves",
                     method.as_str()
-                )));
+                ))));
+            }
+        };
+        match declined {
+            Ok(()) => {}
+            Err(crate::agent_tools::Declined::ByTheRequest(refusal)) => {
+                return Given::Fresh(Err(refusal));
+            }
+            // A record this host cannot read says that a record exists.
+            Err(crate::agent_tools::Declined::ByARecord(record)) => {
+                return record.copied().map(Err);
             }
         }
+        Given::Fresh(
+            self.install_or_remove(
+                actor_id, mutation, method, carried, &params, &installer, &digest,
+            )
+            .await,
+        )
+    }
+
+    /// The change of the agent's tree, once the checks that need no marker have passed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an installation is the actor, the request, its admission and what the checks read"
+    )]
+    async fn install_or_remove(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+        params: &kr_protocol::skill::AgentToolsParams,
+        installer: &crate::agent_tools::Installer,
+        digest: &kr_protocol::scalars::Digest256,
+    ) -> Result<ParamsValue> {
         // A change carrying no freshness at all is refused. This path answers its own retained
         // actions above, so anything still travelling is a first admission, and a first admission
         // needs a deadline it was admitted under.
@@ -138,11 +188,11 @@ impl Controller {
         // inside its work: a fence this host owes and could not raise, the connection's
         // registration under the revision it was admitted at, then the deadline.
         self.under_registration(&carried, || {
-            installer.mark_dispatching(actor_id, mutation.action_id, &digest)
+            installer.mark_dispatching(actor_id, mutation.action_id, digest)
         })??;
         let result = match method {
-            Method::AgentToolsInstall => encode(&installer.install(&params)?)?,
-            Method::AgentToolsRemove => encode(&installer.remove(&params)?)?,
+            Method::AgentToolsInstall => encode(&installer.install(params)?)?,
+            Method::AgentToolsRemove => encode(&installer.remove(params)?)?,
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not an installation this daemon serves",
@@ -150,7 +200,7 @@ impl Controller {
                 )));
             }
         };
-        installer.settle(actor_id, mutation.action_id, &digest, &result)?;
+        installer.settle(actor_id, mutation.action_id, digest, &result)?;
         Ok(result)
     }
 
@@ -280,8 +330,8 @@ impl Controller {
         mutation: &MutationRequest,
         connection_id: ConnectionId,
         admitted: Option<AuthorityRevision>,
-        perform: impl std::future::Future<Output = Result<ParamsValue>>,
-    ) -> kr_protocol::envelope::ControlFrame {
+        perform: impl std::future::Future<Output = Given<Result<ParamsValue>>>,
+    ) -> Given<Result<ParamsValue>> {
         let claimed = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
             .and_then(|digest| {
@@ -294,15 +344,17 @@ impl Controller {
             });
         match claimed {
             Ok(crate::grants::ActionClaim::Claimed { hold }) => {
-                let outcome = perform.await;
+                let given = perform.await;
+                let (Given::Fresh(outcome) | Given::Copied(outcome) | Given::Withheld(outcome)) =
+                    &given;
                 // A receipt that cannot be kept does not change what the action did, and the caller
                 // is told that, not that the registry failed: the claim stays unfinished, and a
                 // retry is answered as an outcome this host does not know, never performed again.
-                if let Err(unrecorded) = self.settle_claim(&hold, &outcome) {
+                if let Err(unrecorded) = self.settle_claim(&hold, outcome) {
                     eprintln!("kr-controller: an action's receipt could not be kept: {unrecorded}");
                 }
                 drop(hold);
-                super::respond(mutation.request_id, outcome)
+                given
             }
             Ok(crate::grants::ActionClaim::Recorded(record)) => {
                 let answered = self
@@ -310,14 +362,7 @@ impl Controller {
                     .await;
                 #[cfg(feature = "testing")]
                 self.after_the_retained_lookup.wait().await;
-                if let Err(error) = self.check_retained_answer(connection_id, admitted) {
-                    return super::error_reply(
-                        mutation.request_id,
-                        error.code(),
-                        error.to_string(),
-                    );
-                }
-                super::respond(mutation.request_id, answered)
+                answered.checked(|| self.check_retained_answer(connection_id, admitted))
             }
             // Another attempt claimed the action for another payload while this one waited, or its
             // record cannot be read (a refusal kept under a code this build cannot read among
@@ -328,19 +373,18 @@ impl Controller {
             // authority is gone, which is a definite word. Any other refusal names nothing of
             // another attempt's record.
             Err(error) => {
-                if matches!(
-                    error,
-                    ControllerError::IdConflict { .. } | ControllerError::Uncertain { .. }
-                ) && let Err(lapsed) = self.check_retained_answer(connection_id, admitted)
-                {
-                    let told = if matches!(error, ControllerError::Uncertain { .. }) {
-                        ControllerError::outcome_not_shown()
-                    } else {
-                        lapsed
-                    };
-                    return super::error_reply(mutation.request_id, told.code(), told.to_string());
-                }
-                super::respond(mutation.request_id, Err(error))
+                let uncertain = matches!(error, ControllerError::Uncertain { .. });
+                let reused = matches!(error, ControllerError::IdConflict { .. });
+                Given::checked(Err(error), uncertain, reused, || {
+                    self.check_retained_answer(connection_id, admitted)
+                        .map_err(|lapsed| {
+                            if uncertain {
+                                ControllerError::outcome_not_shown()
+                            } else {
+                                lapsed
+                            }
+                        })
+                })
             }
         }
     }
@@ -367,7 +411,25 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
+    ) -> Given<Result<ParamsValue>> {
+        match self
+            .environment_change(actor, bridged, mutation, method, carried)
+            .await
+        {
+            Ok(Reading::Own(answer)) => Given::Fresh(Ok(answer)),
+            Ok(Reading::Record(answer)) => Given::Copied(Ok(answer)),
+            Err(refusal) => Given::Fresh(Err(refusal)),
+        }
+    }
+
+    async fn environment_change(
+        self: &Arc<Self>,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        bridged: bool,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<Reading> {
         use kr_protocol::identity::{
             EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentForgetParams,
             EnvironmentForgetResult, EnvironmentRefreshParams, EnvironmentRefreshResult,
@@ -397,7 +459,7 @@ impl Controller {
                 })
                 .await
                 .map_err(|error| ControllerError::supervision(error.to_string()))??;
-                encode(&EnvironmentEnrolResult { row })
+                encode(&EnvironmentEnrolResult { row }).map(Reading::Own)
             }
             Method::EnvironmentForget => {
                 let params: EnvironmentForgetParams = parse(&mutation.params)?;
@@ -411,7 +473,7 @@ impl Controller {
                 })
                 .await
                 .map_err(|error| ControllerError::supervision(error.to_string()))??;
-                encode(&EnvironmentForgetResult { forgotten })
+                encode(&EnvironmentForgetResult { forgotten }).map(Reading::Own)
             }
             Method::EnvironmentRefresh => {
                 // Before anything is asked of the platform, and before the record is touched: a
@@ -456,19 +518,22 @@ impl Controller {
                     self.check_registration(&carried)?;
                     return self
                         .register_ssh(actor, bridged, cached, approved, carried, now_ms)
-                        .await;
+                        .await
+                        .map(Reading::Own);
                 }
                 if !cached.enrolment.access.is_process_bridge() {
                     let connection = format!(
                         "{} is not reached by a process bridge, so none was opened",
                         cached.enrolment.access.as_str()
                     );
+                    // What the enrolment record says, and nothing this request did.
                     return encode(&EnvironmentRefreshResult {
                         row: cached,
                         started: false,
                         verification: Nullable::null(),
                         connection,
-                    });
+                    })
+                    .map(Reading::Record);
                 }
 
                 let observing = state_dir.clone();
@@ -632,6 +697,7 @@ impl Controller {
                     verification,
                     connection,
                 })
+                .map(Reading::Own)
             }
             other => Err(ControllerError::InvalidArgument(format!(
                 "{} is not an environment record this daemon changes",

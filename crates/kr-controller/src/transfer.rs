@@ -47,7 +47,7 @@ use kr_transfer::service::{Action, RetainedOutcome, Subject};
 use kr_transfer::{Sweep, TransferService};
 
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 use crate::service::Controller;
 
 /// How often the daemon sweeps expired transfers.
@@ -130,11 +130,11 @@ pub fn carries(kind: StreamKind, method: Option<Method>) -> bool {
 
 /// What an exact repeat that arrived with no usable window is owed ([`TransferModule::settles`]).
 #[derive(Debug)]
-pub enum Settling {
+pub(crate) enum Settling {
     /// Its action claimed an effect that is not finished: the service finishes it.
     Open,
     /// Its action's claim was settled, and this is the answer it was settled with.
-    Answered(ControlFrame),
+    Answered(Recorded<ControlFrame>),
     /// Its action claimed nothing here, so the repeat is a first admission and has no window,
     /// unless another arrival holds the action and has not reached its claim, which the door
     /// knows and this service does not.
@@ -905,7 +905,19 @@ impl TransferModule {
     /// one. Refusing it for that would deny a caller its own completed result, which is the one
     /// thing an action identifier exists to prevent.
     #[must_use]
-    pub async fn retained(
+    pub(crate) async fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<Recorded<ControlFrame>> {
+        self.retained_frame(actor_id, mutation, method)
+            .await
+            .map(Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    async fn retained_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -935,7 +947,7 @@ impl TransferModule {
     ///
     /// A claim moves from open to settled and never back, so a claim that is no longer open is read
     /// once more for the answer it was settled with.
-    pub async fn settles(
+    pub(crate) async fn settles(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -965,7 +977,9 @@ impl TransferModule {
             // A claim that cannot be read is not one that is not open: the second look for the
             // record gives nothing for an open claim, and the repeat would be refused for its
             // window, which says nothing was done.
-            Err(error) => return Settling::Answered(frame(mutation.request_id, Err(error))),
+            Err(error) => {
+                return Settling::Answered(Recorded::read(frame(mutation.request_id, Err(error))));
+            }
         }
         match self.retained(actor_id, mutation, method).await {
             Some(answer) => Settling::Answered(answer),
@@ -1207,58 +1221,65 @@ impl TransferModule {
     /// This is a read, and it waits: for a blocking thread and for the journal's lock. So the
     /// caller runs it *before* the admission check, and the admission check is the last thing
     /// between a mutation and its effect.
-    pub async fn check_subject_of_record(
+    pub(crate) async fn check_subject_of_record(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> Answer<()> {
+    ) -> Answer<Option<Recorded<ProtocolError>>> {
         let Some(subject) = subject_of(&mutation.params, method)? else {
             // `upload.begin` and `draft.create` allocate their subject, so there is nothing stored
             // to compare with; `check_subject` compares their parameters instead.
-            return Ok(());
+            return Ok(None);
         };
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
-        let stored = blocking(move || match service.stored_subject(&actor, subject) {
-            Ok(stored) => Ok(Some(stored)),
-            // A draft that is gone is not refused here: a draft can be ended while a copy of an
-            // action that wrote it is on its way, and the service answers an action it performed
-            // from its record, and refuses any other as unknown in the words it uses for every
-            // draft the caller does not hold.
-            Err(kr_transfer::TransferError::UnknownDraft { .. })
-                if matches!(subject, Subject::Draft(_)) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error.into()),
+        let stored = blocking(move || {
+            Ok(match service.stored_subject(&actor, subject) {
+                Ok(stored) => Ok(Some(stored)),
+                // A draft that is gone is not refused here: a draft can be ended while a copy of
+                // an action that wrote it is on its way, and the service answers an action it
+                // performed from its record, and refuses any other as unknown in the words it
+                // uses for every draft the caller does not hold.
+                Err(kr_transfer::TransferError::UnknownDraft { .. })
+                    if matches!(subject, Subject::Draft(_)) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(ProtocolError::from(error)),
+            })
         })
         .await?;
+        // A stored subject that cannot be read says that a record exists.
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(unreadable) => return Ok(Some(Recorded::read(unreadable))),
+        };
         let Some(stored) = stored else {
-            return Ok(());
+            return Ok(None);
         };
         if stored.environment_id != mutation.target.environment_id {
-            return Err(ProtocolError::new(
+            return Ok(Some(Recorded::read(ProtocolError::new(
                 ErrorCode::EnvironmentUnavailable,
                 "this object belongs to another environment",
-            ));
+            ))));
         }
         // An object bound to a session is acted on by a request that names that session. A
         // target that names none would otherwise produce a receipt against the environment for an
         // effect on a session, and one that names another session would name the wrong one.
         if stored.session_id.is_some() && mutation.target.session_id.0 != stored.session_id {
-            return Err(ProtocolError::new(
+            return Ok(Some(Recorded::read(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 "this object belongs to a session, and the request's target does not name it",
-            ));
+            ))));
         }
         if mutation.target.session_id.0.is_some()
             && mutation.target.session_id.0 != stored.session_id
         {
-            return Err(ProtocolError::new(
+            return Ok(Some(Recorded::read(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 "the request's target and the object it acts on name different sessions",
-            ));
+            ))));
         }
         // The application is held as the session is: a draft made for one is written by a request
         // whose target names it, and a draft made for none by a request that names none. A target
@@ -1267,20 +1288,20 @@ impl TransferModule {
         if stored.application_instance_id.is_some()
             && mutation.target.application_instance_id.0 != stored.application_instance_id
         {
-            return Err(ProtocolError::new(
+            return Ok(Some(Recorded::read(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 "this object belongs to an application, and the request's target does not name it",
-            ));
+            ))));
         }
         if mutation.target.application_instance_id.0.is_some()
             && mutation.target.application_instance_id.0 != stored.application_instance_id
         {
-            return Err(ProtocolError::new(
+            return Ok(Some(Recorded::read(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 "the request's target and the object it acts on name different applications",
-            ));
+            ))));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Serves one transfer read.

@@ -774,7 +774,8 @@ impl RemoteConnection {
                 self.connection_id,
                 Some(validated),
             )
-            .await;
+            .await
+            .map_err(|refusal| refusal.to_protocol_error())?;
         if held.is_none() && crate::project::ProjectModule::serves(entry.method) {
             held = self
                 .controller
@@ -862,13 +863,7 @@ impl RemoteConnection {
                     mutation,
                 )
                 .await
-                .map(|outcome| match outcome {
-                    Ok(value) => ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Ok(value),
-                    }),
-                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
-                });
+                .map(|outcome| outcome.respond(mutation.request_id));
         }
         if let Some(retained) = held {
             return self
@@ -886,7 +881,7 @@ impl RemoteConnection {
                 #[cfg(feature = "testing")]
                 self.controller.after_the_retained_lookup.wait().await;
                 return match self.admitted_to_answer(validated) {
-                    Ok(()) => Ok(answered),
+                    Ok(()) => Ok(answered.copied().into_answer()),
                     Err(_) => Err(outcome_not_shown()),
                 };
             }
@@ -1886,7 +1881,7 @@ impl RemoteConnection {
         match origin {
             Origin::Fresh => Ok(answer),
             Origin::Copied => {
-                self.kept_answer(answer, entry.method, mutation, validated, &decided, asked)
+                self.kept_copy(answer, entry.method, mutation, validated, &decided, asked)
                     .await
             }
             Origin::Withheld => Err(self.withheld_answer(&decided, asked)),
@@ -1946,7 +1941,7 @@ impl RemoteConnection {
                 match origin {
                     Origin::Fresh => Ok(Some(answer)),
                     Origin::Copied => self
-                        .kept_answer(answer, method, mutation, validated, decided, asked)
+                        .kept_copy(answer, method, mutation, validated, decided, asked)
                         .await
                         .map(Some),
                     Origin::Withheld => Err(self.withheld_answer(decided, asked)),

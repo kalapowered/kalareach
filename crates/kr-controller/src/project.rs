@@ -49,7 +49,7 @@ use kr_protocol::pairing::{
 use kr_protocol::scalars::Nullable;
 
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 use crate::service::net::owner::Resolved;
 use crate::service::net::pairing::PairingHost;
 
@@ -467,7 +467,19 @@ impl ProjectModule {
     /// one. Refusing it for that would deny a caller its own completed result, which is the one
     /// thing an action identifier exists to prevent.
     #[must_use]
-    pub async fn retained(
+    pub(crate) async fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<Recorded<ControlFrame>> {
+        self.retained_frame(actor_id, mutation, method)
+            .await
+            .map(Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    async fn retained_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -501,7 +513,19 @@ impl ProjectModule {
     /// admission, which has no window to be admitted under, or a copy that arrived before the first
     /// attempt wrote its claim. The door tells the two apart by whether another arrival holds the
     /// action, which the service cannot see.
-    pub async fn held_answer(
+    pub(crate) async fn held_answer(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<Recorded<ControlFrame>> {
+        self.held_frame(actor_id, mutation, method)
+            .await
+            .map(Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    async fn held_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

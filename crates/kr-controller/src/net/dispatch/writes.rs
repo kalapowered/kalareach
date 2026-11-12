@@ -178,10 +178,16 @@ impl RemoteConnection {
         own_claim: &OwnClaim,
         arrival: Arrival<'_>,
     ) -> std::result::Result<Given<ControlFrame>, ProtocolError> {
-        self.controller
+        // What the stored subject says goes back as it is, which is the word this door gives it
+        // without a check.
+        if let Some(refused) = self
+            .controller
             .transfer
             .check_subject_of_record(&actor_id, mutation, method)
-            .await?;
+            .await?
+        {
+            return Err(refused.copied().into_answer());
+        }
         if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
             return Err(refusal.into_error());
         }

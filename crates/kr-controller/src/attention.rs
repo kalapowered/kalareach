@@ -92,7 +92,7 @@ use kr_worker::history_filter::{HistoryFilter, Surface, ViewerScope};
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 
 mod change_sets;
 
@@ -2119,7 +2119,19 @@ impl AttentionModule {
     /// Answers an action this store has already performed for this caller, if it has.
     ///
     /// It runs before the freshness window is considered, like every other retained action.
-    pub fn retained(
+    pub(crate) fn retained(
+        &self,
+        caller: &Caller,
+        actor: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<Recorded<ControlFrame>> {
+        self.retained_frame(caller, actor, mutation, method)
+            .map(Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    fn retained_frame(
         &self,
         caller: &Caller,
         actor: &ActorId,

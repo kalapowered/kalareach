@@ -137,8 +137,10 @@ impl Controller {
                 Some(launch),
                 &|registry| admit(registry).map(|_| ()),
             )
-            .await
-            .into_answer()?;
+            .await;
+        // The answer goes to the workflow runner inside the daemon, which acts for the node under
+        // the node's own admission, so it takes the answer whole whatever its origin.
+        let created = crate::given::host_context::whole(created)?;
         parse(&created)
     }
 

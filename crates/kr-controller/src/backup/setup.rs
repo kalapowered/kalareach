@@ -78,6 +78,7 @@ use crate::backup::runtime::{HostKeySigner, TokenState, describe_token, managed_
 use crate::backup::store::{Setup, SetupRecord};
 use crate::backup::uploader::Hold;
 use crate::error::{ControllerError, Result};
+use crate::given::{Given, Recorded};
 use crate::quiet::Quiet;
 
 /// How long a status read waits for the service before it says nothing was read.
@@ -302,8 +303,9 @@ impl AccountTokenSource for Admitted {
 
 /// Where the steps of a call that did not end leave it.
 enum Step {
-    /// The call has its answer and records nothing: a repeat of a setup already recorded.
-    Answer(BackupEnableResult),
+    /// The call has its answer and records nothing: what the setup already recorded says, given as
+    /// a copy, or the check's refusal of it.
+    Held(Given<Result<BackupEnableResult>>),
     /// The service holds the bundle, the enrolment and the retention switch, and this setup is
     /// what remains to be recorded.
     Record(SetupRecord),
@@ -587,11 +589,11 @@ impl BackupSetup {
         &self,
         params: BackupEnableParams,
         admission: Arc<dyn SetupAdmission>,
-    ) -> Result<BackupEnableResult> {
+    ) -> Given<Result<BackupEnableResult>> {
         if params.kit_fingerprint != kit_fingerprint(&params.recovery_public_key) {
-            return Err(ControllerError::InvalidArgument(
+            return Given::Fresh(Err(ControllerError::InvalidArgument(
                 "the kit fingerprint is not the recovery public key's".to_owned(),
-            ));
+            )));
         }
         // The account the call begins under is the one it was admitted under, and not the one that
         // is signed in when it gets its turn: a call that waits behind another must not start its
@@ -616,7 +618,8 @@ impl BackupSetup {
         drop(serial);
         // A call the admission stopped ended with no answer of its own, and what `backup.status`
         // last said about an attempt stays as it was.
-        if let Ok(answer) = &ended {
+        let (Given::Fresh(result) | Given::Copied(result) | Given::Withheld(result)) = &ended;
+        if let Ok(answer) = result {
             let mut calls = self.calls();
             calls.last = match answer {
                 BackupEnableResult::Enabled { .. } => None,
@@ -640,11 +643,12 @@ impl BackupSetup {
         params: &BackupEnableParams,
         mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
         admission: Arc<dyn SetupAdmission>,
-    ) -> Result<BackupEnableResult> {
+    ) -> Given<Result<BackupEnableResult>> {
         match self.steps(params, mark, &admission).await {
-            Ok(Step::Answer(done)) | Err(done) => Ok(done),
-            Ok(Step::Record(record)) => self.record(record, params, admission).await,
-            Ok(Step::Stopped(refusal)) => Err(refusal),
+            Ok(Step::Held(given)) => given,
+            Err(done) => Given::Fresh(Ok(done)),
+            Ok(Step::Record(record)) => Given::Fresh(self.record(record, params, admission).await),
+            Ok(Step::Stopped(refusal)) => Given::Fresh(Err(refusal)),
         }
     }
 
@@ -666,17 +670,17 @@ impl BackupSetup {
             if record.archive_id == params.archive_id {
                 // A repeat of a call that finished is answered from what it left, to a caller
                 // whose registration still stands.
-                return if same_setup(record, params) {
-                    Ok(match admission.retained() {
-                        Ok(()) => Step::Answer(enabled(record)),
-                        Err(refusal) => Step::Stopped(refusal),
-                    })
+                return Ok(Step::Held(if same_setup(record, params) {
+                    Recorded::read(Ok(enabled(record))).checked(|| admission.retained())
                 } else {
-                    Err(declined(BackupEnableCause::AlreadySetUp {}))
-                };
+                    // What the saved setup says, told with no check at the base.
+                    Recorded::read(Ok(declined(BackupEnableCause::AlreadySetUp {}))).copied()
+                }));
             }
             if !params.replace {
-                return Err(declined(BackupEnableCause::AlreadySetUp {}));
+                return Ok(Step::Held(
+                    Recorded::read(Ok(declined(BackupEnableCause::AlreadySetUp {}))).copied(),
+                ));
             }
         }
         if self.writer.key_id() != params.writer_key_id

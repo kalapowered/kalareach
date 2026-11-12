@@ -8,6 +8,8 @@
 //! otherwise tell a result from a refusal by the word it is given. So every service says which of
 //! the three an answer is, in the type it returns, and the door asks.
 
+use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
 /// A service's answer to one action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the door tells a copy of a recorded answer differently from a fresh one"]
@@ -155,5 +157,197 @@ impl<T, E> Given<Result<T, E>> {
             };
         }
         Self::of(answer, copied)
+    }
+}
+
+/// What a lookup read from a record an earlier request, event or attempt left.
+///
+/// A value read from a record says what that record held, and the door that tells it to a caller
+/// must ask the authority the caller still has before it does, whatever the record holds: an
+/// answer, a refusal, an identifier another request spent, or a row that could not be read. So a
+/// lookup returns its read in this type, whose field is private and which has no operation that
+/// hands the value back. Each way out is a named operation that ends in a copy given back or a
+/// copy withheld, and none takes a closure over the value.
+#[derive(Debug)]
+#[must_use = "a record that was read is told only through the operation that asks its check"]
+pub(crate) struct Recorded<T>(T);
+
+impl<T> Recorded<T> {
+    /// What a lookup read, as the lookup's own return.
+    pub(crate) const fn read(value: T) -> Self {
+        Self(value)
+    }
+
+    /// An answer a record supplied, given back as a copy.
+    pub(crate) fn copied(self) -> Given<T> {
+        Given::Copied(self.0)
+    }
+
+    /// The check refused the record: `refusal` stands in its place, as a copy the service
+    /// withheld. The record itself is dropped.
+    pub(crate) fn refused_by(self, refusal: T) -> Given<T> {
+        drop(self.0);
+        Given::Withheld(refusal)
+    }
+}
+
+impl<T, E> Recorded<Result<T, E>> {
+    /// The answer a record supplied, given back as a copy unless the authority `check` stops it:
+    /// then the check's refusal, as a copy the service withheld. The check takes no value, so it
+    /// cannot ask about what the record says.
+    pub(crate) fn checked(self, check: impl FnOnce() -> Result<(), E>) -> Given<Result<T, E>> {
+        Given::checked(self.0, true, false, check)
+    }
+}
+
+impl<T, E> Recorded<Result<Option<T>, E>> {
+    /// The read, when a record was found. `Ok(None)` is the one exit that names no record: a read
+    /// that failed stays inside the type, as the record that could not be read.
+    pub(crate) fn present(self) -> Option<Recorded<Result<T, E>>> {
+        match self.0 {
+            Ok(None) => None,
+            Ok(Some(found)) => Some(Recorded(Ok(found))),
+            Err(error) => Some(Recorded(Err(error))),
+        }
+    }
+}
+
+impl Recorded<Result<kr_protocol::envelope::ParamsValue, crate::error::ControllerError>> {
+    /// The read, framed as the answer to the request `id`.
+    pub(crate) fn respond(self, id: kr_protocol::ids::RequestId) -> Recorded<ControlFrame> {
+        Recorded(crate::service::respond(id, self.0))
+    }
+
+    /// The read framed as the answer to the request `id`, when it is an answer: a read that is a
+    /// refusal gives nothing a door may go on with.
+    pub(crate) fn answered(
+        self,
+        id: kr_protocol::ids::RequestId,
+    ) -> Option<Recorded<ControlFrame>> {
+        self.0
+            .ok()
+            .map(|answer| Recorded(crate::service::respond(id, Ok(answer))))
+    }
+}
+
+impl Recorded<ControlFrame> {
+    /// The frame, given back as a copy unless the authority `check` stops it: then the check's
+    /// refusal, as a frame for `id` that replaces the record's, as a copy the service withheld.
+    pub(crate) fn checked_frame(
+        self,
+        id: kr_protocol::ids::RequestId,
+        check: impl FnOnce() -> Result<(), crate::error::ControllerError>,
+    ) -> Given<ControlFrame> {
+        match check() {
+            Ok(()) => Given::Copied(self.0),
+            Err(refusal) => self.refused_by(crate::service::error_reply(
+                id,
+                refusal.code(),
+                refusal.to_string(),
+            )),
+        }
+    }
+
+    /// Whether the record says another request spent the identifier of this one. That is this
+    /// host's word about the identifier and names no result.
+    pub(crate) const fn names_a_reused_identifier(&self) -> bool {
+        matches!(
+            &self.0,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(error),
+                ..
+            }) if matches!(error.code, kr_protocol::error::ErrorCode::IdConflict)
+        )
+    }
+}
+
+/// The boundary of a caller inside the daemon, which is told every answer whole.
+pub(crate) mod host_context {
+    use super::Given;
+
+    /// The answer of the host's own workflow, which goes to no caller outside the daemon: it acts
+    /// for its node under the node's own admission, so what it is given is the answer whatever
+    /// its origin.
+    pub(crate) fn whole<T>(given: Given<T>) -> T {
+        given.into_answer()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::RequestId;
+
+    use super::Recorded;
+    use crate::error::ControllerError;
+
+    fn refusal() -> ControllerError {
+        ControllerError::PermissionDenied {
+            detail: "the authority has been withdrawn".to_owned(),
+        }
+    }
+
+    /// A record that was read is given back as a copy when the check passes, and is replaced by
+    /// the check's refusal, withheld, when it does not.
+    #[test]
+    fn a_record_is_given_back_only_through_its_check() {
+        let given = Recorded::read(Ok::<_, ControllerError>(7)).checked(|| Ok(()));
+        assert!(given.is_copied());
+        assert_eq!(given.into_answer().ok(), Some(7));
+
+        let given = Recorded::read(Ok::<_, ControllerError>(7)).checked(|| Err(refusal()));
+        assert!(given.is_withheld());
+        assert!(matches!(
+            given.into_answer(),
+            Err(ControllerError::PermissionDenied { .. })
+        ));
+    }
+
+    /// A read that found nothing names no record; a read that failed does, and stays inside.
+    #[test]
+    fn only_a_read_that_found_nothing_leaves_the_type_empty() {
+        assert!(
+            Recorded::read(Ok::<Option<u8>, ControllerError>(None))
+                .present()
+                .is_none()
+        );
+        let failed = Recorded::read(Err::<Option<u8>, _>(refusal()))
+            .present()
+            .expect("a read that failed names a record that could not be read");
+        assert!(failed.checked(|| Ok(())).into_answer().is_err());
+    }
+
+    /// A frame the check stops is replaced by a refusal frame for the request, and a record that
+    /// names a reused identifier says so.
+    #[test]
+    fn a_frame_the_check_stops_is_replaced_by_the_refusal() {
+        let id = RequestId::new(3);
+        let conflict = Recorded::read(ControlFrame::Response(Response {
+            request_id: id,
+            outcome: Outcome::Error(refusal_of(ErrorCode::IdConflict)),
+        }));
+        assert!(conflict.names_a_reused_identifier());
+        let given = conflict.checked_frame(id, || Err(refusal()));
+        assert!(given.is_withheld());
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(told),
+            ..
+        }) = given.into_answer()
+        else {
+            panic!("the refusal is an error frame");
+        };
+        assert_eq!(told.code, ErrorCode::PermissionDenied);
+        assert!(
+            !Recorded::read(ControlFrame::Response(Response {
+                request_id: id,
+                outcome: Outcome::Error(refusal_of(ErrorCode::PermissionDenied)),
+            }))
+            .names_a_reused_identifier()
+        );
+    }
+
+    fn refusal_of(code: ErrorCode) -> kr_protocol::error::ProtocolError {
+        kr_protocol::error::ProtocolError::new(code, "refused")
     }
 }

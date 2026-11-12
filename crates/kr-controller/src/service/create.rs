@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kr_protocol::envelope::{MutationRequest, ParamsValue};
+use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{ActorId, SessionId};
@@ -16,7 +16,7 @@ use kr_protocol::worker::{EnvironmentOrigin, ReservationId, WorkerReady};
 use tokio::sync::oneshot;
 
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 use crate::registry::LaunchPhase;
 use crate::supervision::{LaunchOutcome, WorkerLaunch};
 
@@ -333,6 +333,14 @@ impl Drop for CreateHold {
     }
 }
 
+/// How a create ended inside the reservation, apart from a refusal.
+enum Created {
+    /// The session this create made, described.
+    Made(ParamsValue),
+    /// What a reservation of the token already holds, or the refusal that record meets.
+    Held(Given<Result<ParamsValue>>),
+}
+
 impl Controller {
     /// Accepts the configuration document again when this host holds one it cannot use, as every
     /// `kr doctor` does, so one put right since the last acceptance lifts the refusal of a new
@@ -495,11 +503,14 @@ impl Controller {
         launch: Option<HeldLaunch>,
         admit: &(dyn Fn(&crate::registry::Registry) -> Result<()> + Sync),
     ) -> Given<Result<ParamsValue>> {
-        let mut origin = crate::given::Origin::Fresh;
-        let answer = self
-            .create_reserving(under_way, who, create, launch, admit, &mut origin)
-            .await;
-        Given::from_origin(answer, origin)
+        match self
+            .create_reserving(under_way, who, create, launch, admit)
+            .await
+        {
+            Ok(Created::Made(answer)) => Given::Fresh(Ok(answer)),
+            Ok(Created::Held(given)) => given,
+            Err(refusal) => Given::Fresh(Err(refusal)),
+        }
     }
 
     /// What a create is told when its token's reservation cannot be read, or another request holds
@@ -510,17 +521,16 @@ impl Controller {
     async fn found_by_a_create(
         &self,
         carried: Option<crate::authority::AdmittedMutation>,
-        origin: &mut crate::given::Origin,
         found: ControllerError,
-    ) -> ControllerError {
+    ) -> Given<Result<ParamsValue>> {
         match carried {
-            Some(carried) => self.conflict_under_authority(&carried, origin, found).await,
-            None => found,
+            Some(carried) => self.conflict_given(&carried, found).await.map(Err),
+            None => Given::Fresh(Err(found)),
         }
     }
 
-    /// [`Self::create_under`], noting in `provenance` when the token already held a reservation and
-    /// the answer is read from it.
+    /// [`Self::create_under`], with the answer a reservation of the token holds kept apart from
+    /// the one this create made.
     ///
     /// # Errors
     ///
@@ -532,8 +542,7 @@ impl Controller {
         mut create: SessionCreateParams,
         launch: Option<HeldLaunch>,
         admit: &(dyn Fn(&crate::registry::Registry) -> Result<()> + Sync),
-        provenance: &mut crate::given::Origin,
-    ) -> Result<ParamsValue> {
+    ) -> Result<Created> {
         let CreateFor {
             actor_id,
             token,
@@ -642,7 +651,7 @@ impl Controller {
                 Err(error) => {
                     drop(registry);
                     let found = error.found_unreadable("sessions");
-                    return Err(self.found_by_a_create(carried, provenance, found).await);
+                    return Ok(Created::Held(self.found_by_a_create(carried, found).await));
                 }
             };
             // A host that cannot use its configuration document creates no new session: the
@@ -680,7 +689,7 @@ impl Controller {
                     } else {
                         error
                     };
-                    return Err(self.found_by_a_create(carried, provenance, found).await);
+                    return Ok(Created::Held(self.found_by_a_create(carried, found).await));
                 }
             }
         };
@@ -704,20 +713,13 @@ impl Controller {
             // it arrived under, asked once the answer is in hand: the reservation was found after
             // the door's own look, and waiting for the registry and for the session's worker can
             // outlast a fence this host owes or the registration the repeat arrived on.
-            return match carried {
+            return Ok(Created::Held(match carried {
                 Some(carried) => {
-                    self.retained_under_authority(
-                        &carried,
-                        provenance,
-                        self.replay_create(&reservation),
-                    )
-                    .await
+                    self.retained_given(&carried, self.replay_create(&reservation).await)
+                        .await
                 }
-                None => {
-                    provenance.note(crate::given::Origin::Copied);
-                    self.replay_create(&reservation).await
-                }
-            };
+                None => self.replay_create(&reservation).await.copied(),
+            }));
         }
 
         // A desktop-bound session needs a desktop, and this host does not manufacture one: an SSH
@@ -1055,6 +1057,7 @@ impl Controller {
 
         self.answer_a_created_session(&create, &reservation, ready.endpoint)
             .await
+            .map(Created::Made)
     }
 
     /// The answer to a create whose worker has reported itself: the session as the worker describes
@@ -1349,10 +1352,54 @@ impl Controller {
     pub(super) async fn replay_create(
         self: &Arc<Self>,
         reservation: &crate::registry::Reservation,
-    ) -> Result<ParamsValue> {
-        self.replayed_create(reservation)
-            .await
-            .map_err(|error| error.found_unreadable("sessions"))
+    ) -> Recorded<Result<ParamsValue>> {
+        Recorded::read(
+            self.replayed_create(reservation)
+                .await
+                .map_err(|error| error.found_unreadable("sessions")),
+        )
+    }
+
+    /// Answers a create whose token already holds a reservation of this actor's, if it does.
+    ///
+    /// Only `session.create` has a retained record here; a close is retained by the worker that
+    /// owns the session, which answers its own duplicates.
+    pub(super) async fn retained_create(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Option<Recorded<ControlFrame>> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        // A reservation that cannot be read is not one that is not there: an earlier copy of this
+        // create may have reserved a session and started it, and this copy is then neither fresh nor
+        // refused for something it did not do.
+        let existing = {
+            let registry = self.registry.lock().await;
+            match registry.reservation_for_token(actor_id, mutation.action_id.get()) {
+                Ok(Some(existing)) => existing,
+                Ok(None) => return None,
+                Err(error) => {
+                    eprintln!("kr-controller: a create's reservation cannot be looked up: {error}");
+                    return Some(
+                        Recorded::read(Err(ControllerError::record_unreadable("sessions")))
+                            .respond(mutation.request_id),
+                    );
+                }
+            }
+        };
+        if existing.payload_digest != digest {
+            return Some(
+                Recorded::read(Err(ControllerError::IdConflict {
+                    token: mutation.action_id.to_string(),
+                }))
+                .respond(mutation.request_id),
+            );
+        }
+        Some(
+            self.replay_create(&existing)
+                .await
+                .respond(mutation.request_id),
+        )
     }
 
     async fn replayed_create(

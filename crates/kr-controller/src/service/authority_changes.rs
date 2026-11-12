@@ -21,11 +21,11 @@ use kr_protocol::sharing::{
 };
 
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 
 use super::organisation::OrganisationIntent;
 use super::revocation::Audience;
-use super::{Controller, encode, net, parse, respond};
+use super::{Controller, encode, net, parse};
 
 /// Who an authority change is made for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,23 +48,23 @@ impl Controller {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-    ) -> Option<ControlFrame> {
+    ) -> Option<Recorded<ControlFrame>> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
         match self
             .sharing
             .grants()
             .recorded_action(actor_id, mutation.action_id, &digest)
         {
-            Ok(Some(record)) => Some(respond(
-                mutation.request_id,
+            Ok(Some(record)) => Some(
                 self.recorded_authority_change(actor_id, mutation, record)
-                    .await,
-            )),
+                    .await
+                    .respond(mutation.request_id),
+            ),
             Ok(None) => None,
-            Err(error) => Some(respond(
-                mutation.request_id,
-                Err(error.found_unreadable("authority changes")),
-            )),
+            Err(error) => Some(
+                Recorded::read(Err(error.found_unreadable("authority changes")))
+                    .respond(mutation.request_id),
+            ),
         }
     }
 
@@ -76,7 +76,7 @@ impl Controller {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-    ) -> Option<ControlFrame> {
+    ) -> Option<Recorded<ControlFrame>> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
         match self
             .sharing
@@ -85,12 +85,38 @@ impl Controller {
         {
             Ok(Some(record)) => self
                 .answer_without_fence(actor_id, mutation, &record)
-                .map(|answer| respond(mutation.request_id, answer)),
+                .map(|answer| Recorded::read(answer).respond(mutation.request_id)),
             Ok(None) => None,
-            Err(error) => Some(respond(
-                mutation.request_id,
-                Err(error.found_unreadable("authority changes")),
-            )),
+            Err(error) => Some(
+                Recorded::read(Err(error.found_unreadable("authority changes")))
+                    .respond(mutation.request_id),
+            ),
+        }
+    }
+
+    /// What this host recorded of a declaration of a device's keys under this action, from the
+    /// outcome the device directory recorded beside the keys: a completion or a refusal alike. A
+    /// row that cannot be read, or whose outcome cannot be decoded, is not one that is absent: the
+    /// declaration may have been made.
+    pub(super) fn retained_declaration(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Option<Recorded<ControlFrame>> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        match self
+            .devices
+            .recorded_declaration(actor_id, mutation.action_id)
+        {
+            Ok(Some(recorded)) => Some(
+                Recorded::read(declaration_answer(mutation, &digest, recorded))
+                    .respond(mutation.request_id),
+            ),
+            Ok(None) => None,
+            Err(error) => Some(
+                Recorded::read(Err(error.found_unreadable("device key declarations")))
+                    .respond(mutation.request_id),
+            ),
         }
     }
 
@@ -166,6 +192,19 @@ impl Controller {
     /// what this host's own records prove the change did ([`Self::answer_without_fence`],
     /// [`Self::revocation_on_record`]), and otherwise as an outcome this host does not know.
     pub(super) async fn recorded_authority_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        record: crate::grants::ActionRecord,
+    ) -> Recorded<Result<ParamsValue>> {
+        Recorded::read(
+            self.authority_change_on_record(actor_id, mutation, record)
+                .await,
+        )
+    }
+
+    /// What `record` says an authority change came to.
+    async fn authority_change_on_record(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -1157,23 +1196,6 @@ impl Controller {
         method: Method,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<ParamsValue>> {
-        let mut origin = crate::given::Origin::Fresh;
-        let answer = self
-            .change_authority(actor_id, caller, mutation, method, carried, &mut origin)
-            .await;
-        Given::from_origin(answer, origin)
-    }
-
-    /// [`Self::authority_change`], noting in `origin` when the answer is the record's.
-    async fn change_authority(
-        &self,
-        actor_id: &ActorId,
-        caller: AuthorityCaller,
-        mutation: &MutationRequest,
-        method: Method,
-        carried: crate::authority::AdmittedMutation,
-        origin: &mut crate::given::Origin,
-    ) -> Result<ParamsValue> {
         // A device makes three of these: a share, its revocation and a redemption. The others are
         // the owner's at this machine, and their answers are written for the owner: a device is
         // refused before anything is claimed, whatever route sent it here.
@@ -1183,21 +1205,25 @@ impl Controller {
                 Method::GrantCreate | Method::GrantRevoke | Method::GrantRedeem
             )
         {
-            return Err(ControllerError::PermissionDenied {
+            return Given::Fresh(Err(ControllerError::PermissionDenied {
                 detail: format!("{} is made by the owner at this machine", method.as_str()),
-            });
+            }));
         }
         // An enrolment is confirmed by the owner for exactly one chain, so the confirmation is
         // spent before the action is claimed. A request that finds none is refused here, with
         // nothing written under its action, and an owner's client may ask again with a new
         // identifier for each poll.
         let intent = match method {
-            Method::OrganisationEnrol => Some(OrganisationIntent::Enrol(Box::new(
-                self.organisation_enrol_intent(mutation)?,
-            ))),
-            Method::OrganisationExclusiveSet => Some(OrganisationIntent::Exclusive(
-                self.organisation_exclusive_intent(mutation)?,
-            )),
+            Method::OrganisationEnrol => match self.organisation_enrol_intent(mutation) {
+                Ok(intent) => Some(OrganisationIntent::Enrol(Box::new(intent))),
+                Err(refusal) => return Given::Fresh(Err(refusal)),
+            },
+            Method::OrganisationExclusiveSet => {
+                match self.organisation_exclusive_intent(mutation) {
+                    Ok(intent) => Some(OrganisationIntent::Exclusive(intent)),
+                    Err(refusal) => return Given::Fresh(Err(refusal)),
+                }
+            }
             _ => None,
         };
         let claimed_at_ms = kr_ipc::now_ms().get();
@@ -1206,9 +1232,7 @@ impl Controller {
             // Another attempt claimed the action for another payload between the lookup that found
             // nothing and this claim: what that says of its record goes back only under this
             // attempt's authority, as its answer does.
-            Err(error) => {
-                return Err(self.conflict_under_authority(&carried, origin, error).await);
-            }
+            Err(error) => return self.conflict_given(&carried, error).await.map(Err),
         };
         let hold = match claimed {
             crate::grants::ActionClaim::Claimed { hold } => hold,
@@ -1216,10 +1240,10 @@ impl Controller {
                 // An earlier attempt recorded this action between the lookup that found nothing
                 // and this claim.
                 return self
-                    .retained_under_authority(
+                    .retained_given(
                         &carried,
-                        origin,
-                        self.recorded_authority_change(actor_id, mutation, record),
+                        self.recorded_authority_change(actor_id, mutation, record)
+                            .await,
                     )
                     .await;
             }
@@ -1285,10 +1309,10 @@ impl Controller {
             if method == Method::GrantCreate {
                 hold.doubt();
             }
-            return Err(unrecorded);
+            return Given::Fresh(Err(unrecorded));
         }
         drop(hold);
-        outcome
+        Given::Fresh(outcome)
     }
 
     /// Keeps the credential an external notification destination sends with.

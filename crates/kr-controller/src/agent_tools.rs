@@ -40,6 +40,7 @@ use crate::catalogue::files::{
 };
 use crate::catalogue::native_bridge::json;
 use crate::error::{ControllerError, Result};
+use crate::given::Recorded;
 
 /// The skill instructions, compiled in.
 pub const SKILL_MD: &str = include_str!("../../../skills/kalareach-contact/SKILL.md");
@@ -1551,6 +1552,15 @@ impl ActionRecord {
     }
 }
 
+/// Why an installation or a removal is refused before anything is written.
+#[derive(Debug)]
+pub(crate) enum Declined {
+    /// The request asks for something this host may not do.
+    ByTheRequest(ControllerError),
+    /// A record this host holds cannot be read, so it cannot rule out what the record may say.
+    ByARecord(Recorded<ControllerError>),
+}
+
 impl Installer {
     /// Returns the answer a retained installation action is owed.
     ///
@@ -1559,7 +1569,16 @@ impl Installer {
     /// Returns [`ControllerError::IdConflict`] when the identifier carries a different payload,
     /// and [`ControllerError::Uncertain`] when a marker was written and no outcome was recorded:
     /// the files may have changed, and doing it again is exactly what section 9 forbids.
-    pub fn retained(
+    pub(crate) fn retained(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        digest: &Digest256,
+    ) -> Recorded<Result<Option<kr_protocol::envelope::ParamsValue>>> {
+        Recorded::read(self.action_on_record(actor_id, action_id, digest))
+    }
+
+    fn action_on_record(
         &self,
         actor_id: &kr_protocol::ids::ActorId,
         action_id: kr_protocol::ids::ActionId,
@@ -1600,6 +1619,31 @@ impl Installer {
                      again"
                 ),
             }),
+        }
+    }
+
+    /// What an installation or a removal is refused for before anything is written, with a refusal
+    /// that a record this host cannot read causes kept apart from the ones about the request
+    /// itself: the first says that a record exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::check`] or [`Self::check_removal`] refuses with.
+    pub(crate) fn declined_before_writing(
+        &self,
+        params: &AgentToolsParams,
+        removal: bool,
+    ) -> std::result::Result<(), Declined> {
+        match if removal {
+            self.check_removal(params)
+        } else {
+            self.check(params)
+        } {
+            Ok(()) => Ok(()),
+            Err(error @ ControllerError::Storage { .. }) => {
+                Err(Declined::ByARecord(Recorded::read(error)))
+            }
+            Err(error) => Err(Declined::ByTheRequest(error)),
         }
     }
 

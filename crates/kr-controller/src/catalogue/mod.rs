@@ -62,7 +62,7 @@ use kr_protocol::receipt::ReceiptState;
 use kr_protocol::scalars::{Digest256, Nullable, U64};
 use tokio::sync::Mutex;
 
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 use crate::sharing::{ConfirmedAction, OwnerConfirmations};
 
 /// What a catalogue call answers with: the method's result, or the refusal the service decided.
@@ -1392,7 +1392,19 @@ impl CatalogueModule {
 
     /// Returns the answer a retained catalogue or plugin mutation is owed.
     #[must_use]
-    pub async fn retained(
+    pub(crate) async fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        _method: Method,
+    ) -> Option<Recorded<ControlFrame>> {
+        self.retained_frame(actor_id, mutation, _method)
+            .await
+            .map(Recorded::read)
+    }
+
+    /// The frame the record gives, before it is marked as read from a record.
+    async fn retained_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

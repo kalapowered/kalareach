@@ -33,6 +33,7 @@ use kr_worker::desktop::probe::{Fingerprint, stale};
 use crate::authority::AdmittedMutation;
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
+use crate::given::{Given, Recorded};
 
 use super::{Controller, parse};
 
@@ -339,6 +340,17 @@ pub(super) fn worker_for(workers: Vec<KnownWorker>, profile: WorkerProfile) -> O
         .max_by_key(|worker| worker.descriptor.published_at_ms)
 }
 
+/// How the start of the checks ended, inside the hold on the registration.
+enum Begun {
+    /// This request started the checks, and this is where they stand.
+    Started(CapabilityChecks),
+    /// The record answered, and the answer waits for the check the cleanup leaves to be asked.
+    Answer(Recorded<Result<CapabilityChecks>>),
+    /// An answer that needs no further check: another request's identifier, which the fence was
+    /// asked about under the hold, or a record that cannot be read.
+    Given(Given<Result<CapabilityChecks>>),
+}
+
 impl Controller {
     /// Answers a retry of a request for the checks from the record of what this host answered,
     /// when it holds one.
@@ -351,7 +363,7 @@ impl Controller {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-    ) -> Option<ControlFrame> {
+    ) -> Option<Recorded<ControlFrame>> {
         let digest = mutation_digest(mutation, actor_id).ok()?;
         let held = self.capability_answers.recall(actor_id, mutation.action_id);
         let outcome = match held {
@@ -363,7 +375,7 @@ impl Controller {
             }),
             Err(error) => Err(error.found_unreadable(ANSWERS)),
         };
-        Some(super::respond(mutation.request_id, outcome))
+        Some(Recorded::read(outcome).respond(mutation.request_id))
     }
 
     /// Starts the disclosed checks in a session's worker, once the admission it carries still
@@ -388,13 +400,16 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
         carried: AdmittedMutation,
-    ) -> Result<ParamsValue> {
-        let params: EnvironmentCapabilitiesCheckParams = parse(&mutation.params)?;
+    ) -> Given<Result<ParamsValue>> {
+        let params: EnvironmentCapabilitiesCheckParams = match parse(&mutation.params) {
+            Ok(params) => params,
+            Err(refusal) => return Given::Fresh(Err(refusal)),
+        };
         if params.environment_id != self.paths.environment_id() {
-            return Err(ControllerError::InvalidArgument(format!(
+            return Given::Fresh(Err(ControllerError::InvalidArgument(format!(
                 "this daemon owns environment {}",
                 self.paths.environment_id()
-            )));
+            ))));
         }
         let (evidence, _) = self.desktop_evidence().await;
         // A session that has a closure recorded has a worker on its way out, which the directory
@@ -402,17 +417,21 @@ impl Controller {
         let workers = {
             let registry = self.registry.lock().await;
             let directory = self.directory_workers().await;
-            Self::without_a_closure(&registry, directory)?
+            match Self::without_a_closure(&registry, directory) {
+                Ok(workers) => workers,
+                Err(refusal) => return Given::Fresh(Err(refusal)),
+            }
         };
         let worker = worker_for(workers, evidence.worker_profile);
         let now_ms = kr_ipc::now_ms();
         let taken = fingerprint_of(&evidence, worker.as_ref());
-        let digest = mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        // Set when the answer is the record's, which the cleanup below waits behind: it goes back
-        // only under the authority this call arrived under, asked once the cleanup has ended.
-        let copied = std::sync::atomic::AtomicBool::new(false);
-        let begun = self.under_registration_until_it_begins(&carried, |begin| {
+        let digest = match mutation_digest(mutation, actor_id) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Given::Fresh(Err(ControllerError::InvalidArgument(error.to_string())));
+            }
+        };
+        let begun = self.under_registration_until_it_begins(&carried, |begin| -> Result<Begun> {
             let mut checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
             #[cfg(test)]
             self.before_a_capability_check_looks.wait();
@@ -427,19 +446,22 @@ impl Controller {
             match self.capability_answers.recall(actor_id, mutation.action_id) {
                 Ok(Some(held)) if held.digest == digest => {
                     self.check_fence()?;
-                    copied.store(true, std::sync::atomic::Ordering::Release);
-                    return Ok(held.answer);
+                    return Ok(Begun::Answer(Recorded::read(Ok(held.answer))));
                 }
                 Ok(Some(_)) => {
                     self.check_fence()?;
-                    return Err(ControllerError::IdConflict {
-                        token: mutation.action_id.to_string(),
-                    });
+                    return Ok(Begun::Given(Given::Fresh(Err(
+                        ControllerError::IdConflict {
+                            token: mutation.action_id.to_string(),
+                        },
+                    ))));
                 }
                 Ok(None) => {}
                 Err(error) => {
                     self.check_fence()?;
-                    return Err(error.found_unreadable(ANSWERS));
+                    return Ok(Begun::Given(
+                        Recorded::read(Err(error.found_unreadable(ANSWERS))).copied(),
+                    ));
                 }
             }
             // No record: this is a first start, which needs the window it was admitted under. A
@@ -474,17 +496,27 @@ impl Controller {
                 };
                 tokio::spawn(perform(self.me.clone(), worker, request));
             }
-            Ok(view)
-        })??;
+            Ok(Begun::Started(view))
+        });
+        let begun = match begun {
+            Ok(Ok(begun)) => begun,
+            Ok(Err(refusal)) | Err(refusal) => return Given::Fresh(Err(refusal)),
+        };
         self.forget_old_capability_answers();
         // The hold ended before the cleanup, which waits for locks and for storage, and nothing in
         // it keeps a fence this host owes, or a registration withdrawn, from landing. The record's
         // answer is checked again with it in hand.
-        if copied.load(std::sync::atomic::Ordering::Acquire) {
-            self.check_retained_in_hand(&carried).await?;
-        }
-        ParamsValue::from_typed(&begun)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+        let given = match begun {
+            Begun::Started(view) => Given::Fresh(Ok(view)),
+            Begun::Answer(recorded) => self.retained_given(&carried, recorded).await,
+            Begun::Given(given) => given,
+        };
+        given.map(|view| {
+            view.and_then(|view| {
+                ParamsValue::from_typed(&view)
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+            })
+        })
     }
 
     /// Lets go of the answers older than the retention section 9 gives a de-duplication record,

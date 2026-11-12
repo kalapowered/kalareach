@@ -86,9 +86,11 @@ impl Controller {
             // Wherever the daemon finds no worker for the session, at the look before the prompt
             // is sent or at the check taking the link makes, a session whose closure is recorded
             // is closed, and the record is what says so.
-            Err(error @ ControllerError::UnknownSession { .. }) => {
-                Err(self.closed_or(session_id, error).await)
-            }
+            Err(error @ ControllerError::UnknownSession { .. }) => Err(self
+                .closed_or(session_id, error)
+                .await
+                .copied()
+                .into_answer()),
             answered => answered,
         }
     }
@@ -130,7 +132,13 @@ impl Controller {
         // the worker. If the session's closure was recorded meanwhile, the record is the answer.
         let mut link = match tokio::time::timeout_at(budget, self.worker_client(&worker)).await {
             Ok(Ok(link)) => link,
-            Ok(Err(error)) => return Err(self.closed_or(session_id, error).await),
+            Ok(Err(error)) => {
+                return Err(self
+                    .closed_or(session_id, error)
+                    .await
+                    .copied()
+                    .into_answer());
+            }
             Err(_) => {
                 return Err(self
                     .closed_or(
@@ -142,7 +150,9 @@ impl Controller {
                                 .to_owned(),
                         },
                     )
-                    .await);
+                    .await
+                    .copied()
+                    .into_answer());
             }
         };
         let actor = local_actor(actor_id.clone(), connection_id, self.generation);

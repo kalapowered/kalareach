@@ -29,6 +29,7 @@ use kr_protocol::pairing::{ConfirmationChannel, KeyPurpose, SensitiveAction, key
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, TimestampMs};
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::grants::organisation::{ChainRefused, LeaseInstalled};
 use crate::grants::{CLOCK_DISTRUSTED, FLOOR_UNRECORDED};
 use crate::grants::{LeaseRefused, PolicyRefused};
@@ -402,6 +403,16 @@ impl Controller {
         encode(&answer)
     }
 
+    /// What `organisation.policy.apply` answers: the adapter list in force across every policy
+    /// held, and a refusal from the policy state, which derive from policies applied earlier.
+    pub(super) async fn organisation_policy_apply(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Given<Result<ParamsValue>> {
+        Given::Copied(self.organisation_policy_answer(mutation, carried).await)
+    }
+
     /// `organisation.policy.apply`: applies the policy an organisation signed, and puts the
     /// adapters it allows in force.
     ///
@@ -435,7 +446,7 @@ impl Controller {
     /// with, `STORAGE_UNAVAILABLE` when the chain is recorded and the policy could not be written
     /// down, and `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE` when the policy is recorded and
     /// its list is not yet in force.
-    pub(super) async fn organisation_policy_apply(
+    async fn organisation_policy_answer(
         &self,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
