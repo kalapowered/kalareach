@@ -297,7 +297,8 @@ impl SdkVersion {
     /// When the text is not that.
     pub fn parse(text: &str) -> Result<Self, String> {
         let number = |part: &str| -> Result<u64, String> {
-            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            let plain = part == "0" || !part.starts_with('0');
+            if part.is_empty() || !plain || !part.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(format!(
                     "{text} is not three whole numbers with dots between"
                 ));
@@ -442,9 +443,14 @@ fn is_a_listed_arrival(
     if definition.contains(['.', '#', '[', '{']) || member.contains(['.', '#', '[', '{']) {
         return None;
     }
-    let has_no_member = old["$defs"][definition]["properties"]
-        .as_object()
-        .is_some_and(|members| !members.contains_key(member));
+    // The earlier definition exists, and has no such member: a definition that has no members at all
+    // has no `properties` either.
+    let has_no_member = old["$defs"].get(definition).is_some_and(|earlier| {
+        earlier
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_none_or(|members| !members.contains_key(member))
+    });
     let has_member = new["$defs"][definition]["properties"]
         .as_object()
         .is_some_and(|members| members.contains_key(member));
@@ -469,12 +475,63 @@ fn is_a_listed_arrival(
         })
 }
 
+/// Every `$ref` under `node`, each with the path that leads to it.
+fn references(node: &Value, path: &str, found: &mut Vec<(String, String)>) {
+    match node {
+        Value::Object(members) => {
+            for (key, member) in members {
+                match (key.as_str(), member.as_str()) {
+                    ("$ref", Some(target)) => found.push((path.to_owned(), target.to_owned())),
+                    _ => references(member, &format!("{path}/{key}"), found),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (position, item) in items.iter().enumerate() {
+                references(item, &format!("{path}/{position}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The first definition both schemas have that refers to other definitions than it did, leaving
+/// out the members of the head's that are arrivals.
+fn moved_reference(old: &Value, new: &Value, arrived: &[PassedMember]) -> Option<String> {
+    for (name, before) in old["$defs"].as_object()? {
+        let Some(after) = new["$defs"].get(name) else {
+            continue;
+        };
+        let mut after = after.clone();
+        for member in arrived {
+            if let Some((definition, member)) = member.member.split_once('.')
+                && definition == name
+                && let Some(members) = after.get_mut("properties").and_then(Value::as_object_mut)
+            {
+                members.remove(member);
+            }
+        }
+        let (mut was, mut is) = (Vec::new(), Vec::new());
+        references(before, "", &mut was);
+        references(&after, "", &mut is);
+        was.sort();
+        is.sort();
+        if was != is {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
 /// As [`compare_for_a_level`], for the plugin SDK's schema, which has its own function so that the
 /// protocol's comparison does not change. A difference passes only when the SDK's own arrival
 /// table lists it ([`is_a_listed_arrival`]); every other difference fails, as it does for the
 /// protocol schema, and so does an entry of the earlier release's table that the head's table
-/// changed or lacks, since a member that passed once is not one the table may take back. Each
-/// member that passes is added to `passed`.
+/// changed or lacks, since a member that passed once is not one the table may take back. A head
+/// whose SDK version is below the release's fails, and so does a head in which a definition refers
+/// to another definition than it did (the comparison goes by where a definition is used and not by
+/// its name, so a member could otherwise be taken for an arrival of a definition that is not the
+/// one it was added to). Each member that passes is added to `passed`.
 ///
 /// `old` and `new` are the SDK schemas of the earlier release and the head, `protocols` the
 /// protocol schemas of the two, and `earlier` and `head` what their contracts say.
@@ -491,11 +548,30 @@ pub fn compare_sdk_for_a_level(
     passed: &mut Vec<PassedMember>,
 ) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
+    let mut arrived = Vec::new();
     for difference in rejected(old, new)? {
         match is_a_listed_arrival(old, new, protocols, earlier, head, &difference) {
-            Some(member) => passed.push(member),
+            Some(member) => arrived.push(member),
             None => lines.push(difference.to_string()),
         }
+    }
+    if let Some(definition) = moved_reference(old, new, &arrived) {
+        lines.push(format!(
+            "{definition} refers to other definitions than it did there, so a member listed in \
+             the arrival table cannot be told from one added to another definition"
+        ));
+        lines.extend(
+            arrived
+                .drain(..)
+                .map(|member| format!("{} added: a member", member.member)),
+        );
+    }
+    passed.extend(arrived);
+    if head.version < earlier.version {
+        lines.push(format!(
+            "the SDK version is {} there and {} here, which is lower",
+            earlier.version, head.version
+        ));
     }
     for listed in &earlier.arrivals {
         let (definition, member) = (&listed.definition, &listed.member);
