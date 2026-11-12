@@ -2406,16 +2406,23 @@ async fn kr_req_19_08_an_opening_that_replaces_another_ends_it_at_once() {
     };
     assert_eq!(links(), 0, "the first's link is let go at once");
 
-    // The host refuses the second at admission, and nothing of the first comes back.
+    // The host refuses the second at admission. A refusal that is not for now is told only once a
+    // second ask agrees, so the second stands, and then it ends with the host's words when the next
+    // ask is refused too. Nothing of the first comes back.
     control.refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
     control.stop_holding();
     control.release_all();
-    let refused = second
+    let standing = second
         .await
         .expect("the call ran")
-        .expect_err("the second is refused");
-    assert_eq!(code(&refused), "PERMISSION_DENIED", "{refused}");
-    assert_eq!(links(), 0);
+        .expect("the second stands while the host is asked again");
+    assert_eq!(standing["state"], "reconnecting", "{standing}");
+    let told = heard(companion, "second", |standing| {
+        standing["state"] == "refused"
+    })
+    .await;
+    assert_eq!(told["standing"]["code"], "PERMISSION_DENIED", "{told}");
+    assert_eq!(links(), 1, "only the second opening, which holds no link, remains");
     let gone = read("first").expect_err("the first stays over");
     assert_eq!(code(&gone), "STALE_SESSION", "{gone}");
     adopted.stop().await;
@@ -3027,6 +3034,55 @@ async fn kr_req_19_08_a_view_whose_connection_cannot_be_made_is_recovered() {
     companion
         .state_where(65, |state| state["state"] == "showing")
         .await;
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a host that refuses the connection a raw view opens, because it holds as many from
+/// this computer as it allows, is told to the view as that: the refusal the host sent, from the view's
+/// own wire, whether the request's write failed or not. The same code on a refusal of the connection
+/// for another reason is not the host's bound, and the view says that refusal's words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_view_whose_connection_the_host_refuses_says_why() {
+    use kr_protocol::error::ErrorCode;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::TerminalInput]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "refused-screen").expect("opens");
+
+    control.refuse_the_connection(Some(ErrorCode::ResourceUnavailable));
+    open_view(companion, session, "refused-screen", 66).expect("a handle comes back");
+    let ended = companion
+        .state_where(66, |state| state["state"] == "ended")
+        .await;
+    let reason = ended["reason"]
+        .as_str()
+        .expect("the view says why")
+        .to_owned();
+    assert!(
+        reason.contains("cannot take another connection"),
+        "the host's bound, and not the connection having ended: {reason}"
+    );
+
+    control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
+    open_view(companion, session, "refused-screen", 67).expect("a handle comes back");
+    let ended = companion
+        .state_where(67, |state| state["state"] == "ended")
+        .await;
+    let reason = ended["reason"]
+        .as_str()
+        .expect("the view says why")
+        .to_owned();
+    assert!(
+        !reason.contains("cannot take another connection") && !reason.contains("connection ended"),
+        "a refusal of the connection for another reason says its own words: {reason}"
+    );
+    control.refuse_the_connection(None);
     adopted.stop().await;
 }
 

@@ -706,11 +706,7 @@ impl PairedLinks {
                     }
                     _ => None,
                 };
-                let unable = first_refusal.is_some()
-                    || match &failure {
-                        Unopened::Unreached(_) | Unopened::HostFull | Unopened::BudgetFull => true,
-                        Unopened::Refused(_, refusal) => transient(refusal.code),
-                    };
+                let unable = first_refusal.is_some() || failure.for_now();
                 if !unable {
                     inner.current.remove(&session_id);
                     return Err(failure.into_error());

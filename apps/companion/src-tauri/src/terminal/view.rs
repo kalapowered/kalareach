@@ -45,7 +45,7 @@ use kr_protocol::session::{
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::connection::Unopened;
+use crate::connection::{Asked, Unopened};
 use crate::error::CommandError;
 use crate::launch::{LaunchSurfaceAnswer, Press};
 
@@ -384,6 +384,44 @@ async fn open_local(
     Ok((Wire::Local(Box::new(client)), target, Some(serves)))
 }
 
+/// What a view's opening says of a connection that was not opened, by the cause and not by the code
+/// of an error: the cause says whether the host was reached, had no room or refused, and whether
+/// that is for now ([`Unopened::for_now`]), in which case the view is lost and the opening's link
+/// asks the host again, and a refusal that is not is the host's decision about this view.
+fn not_opened(unopened: Unopened) -> OpenFailure {
+    let for_now = unopened.for_now();
+    match unopened {
+        Unopened::Unreached(error) => OpenFailure {
+            reason: format!(
+                "The host could not be reached for this view: {}",
+                error.message
+            ),
+            lost: true,
+        },
+        Unopened::BudgetFull | Unopened::HostFull => OpenFailure {
+            reason: format!(
+                "No connection was made for this view: {}",
+                unopened.into_error().message
+            ),
+            lost: true,
+        },
+        Unopened::Refused(asked, refusal) => {
+            let reason = match asked.request() {
+                Some(request) => format!(
+                    "The host refused to {request} for this view: {}",
+                    refusal.message
+                ),
+                None => format!("No connection was made for this view: {}", refusal.message),
+            };
+            if for_now {
+                OpenFailure { reason, lost: true }
+            } else {
+                OpenFailure::refused(reason)
+            }
+        }
+    }
+}
+
 /// Reaches a paired host on a connection of the view's own and has it open the session for the
 /// view, under the share the screen runs under.
 async fn open_paired(
@@ -393,37 +431,7 @@ async fn open_paired(
 ) -> Result<(Wire, ActionTarget), OpenFailure> {
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 
-    let transport = dial.transport().await.map_err(|unopened| match unopened {
-        // The host could not be reached for this view's connection: the connection is what was
-        // lost, and the host is asked again on the opening's link.
-        Unopened::Unreached(error) => OpenFailure {
-            reason: format!(
-                "The host could not be reached for this view: {}",
-                error.message
-            ),
-            lost: true,
-        },
-        // No connection was made for want of room, and the host was not asked: the opening's link
-        // asks again.
-        Unopened::BudgetFull | Unopened::HostFull => OpenFailure {
-            reason: format!(
-                "No connection was made for this view: {}",
-                unopened.into_error().message
-            ),
-            lost: true,
-        },
-        // A host that cannot answer now has not refused the view: the opening's link asks again.
-        Unopened::Refused(_, refusal) if crate::standing::transient(refusal.code) => OpenFailure {
-            reason: format!(
-                "The host could not answer for this view now: {}",
-                refusal.message
-            ),
-            lost: true,
-        },
-        Unopened::Refused(_, refusal) => {
-            OpenFailure::refused(format!("The host refused: {}", refusal.message))
-        }
-    })?;
+    let transport = dial.transport().await.map_err(not_opened)?;
     let mut wire =
         Wire::Paired(Paired::over(transport, grant_id).map_err(|lost| OpenFailure::lost(&lost))?);
     let opened = wire
@@ -437,18 +445,13 @@ async fn open_paired(
         .await
         .map_err(|lost| OpenFailure::lost(&lost))?
         .map_err(|refusal| {
-            // A host that cannot answer now has not refused the view: the opening's link asks again.
-            if crate::standing::transient(refusal.code) {
-                OpenFailure {
-                    reason: format!(
-                        "The host could not answer for this view now: {}",
-                        refusal.message
-                    ),
-                    lost: true,
-                }
-            } else {
-                OpenFailure::refused(format!("The host refused this view: {}", refusal.message))
-            }
+            // The refusal the wire kept as the host's answer to the connection is told by its
+            // cause, as a refusal of a first call on any connection is; any other is the refusal of
+            // this request.
+            not_opened(match wire.connection_refusal() {
+                Some(kept) if kept == refusal => Unopened::of_refused_connection(kept),
+                _ => Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal)),
+            })
         })?;
     let opened: SessionOpenResult = opened.to_typed().map_err(|error| {
         OpenFailure::refused(format!(
@@ -1477,7 +1480,7 @@ impl View {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchReadStage, Step, build_name, launch_read_step};
+    use super::{LaunchReadStage, Step, build_name, launch_read_step, not_opened};
     use crate::launch::LaunchSurfaceAnswer;
     use kr_protocol::envelope::{Outcome, ParamsValue};
     use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -1652,5 +1655,64 @@ mod tests {
                 "{stage:?}, serves {serves:?}"
             );
         }
+    }
+
+    /// KR-REQ-19.08: what a view says of a connection that was not opened follows from the cause, and
+    /// not from the code of the refusal: a refusal of the connection with the code the host's bound
+    /// has says the same as one with another code, a refusal that is for now leaves the view lost
+    /// and the others end it, and a refusal of a request names the request.
+    #[test]
+    fn a_view_tells_a_connection_that_was_not_opened_by_its_cause() {
+        use crate::connection::{Asked, Unopened};
+        use crate::error::CommandError;
+
+        let refused = |asked, code| {
+            not_opened(Unopened::Refused(
+                asked,
+                CommandError::new(code, "its words"),
+            ))
+        };
+
+        // The host's bound and this computer's budget leave the view lost, and say so.
+        for full in [Unopened::HostFull, Unopened::BudgetFull] {
+            let failure = not_opened(full);
+            assert!(failure.lost, "{}", failure.reason);
+            assert!(
+                failure.reason.starts_with("No connection was made"),
+                "{}",
+                failure.reason
+            );
+        }
+        // A refusal of the connection says its words and not the host's bound, whatever its code.
+        for code in [ErrorCode::ResourceUnavailable, ErrorCode::PermissionDenied] {
+            let failure = refused(Asked::Connection, code);
+            assert!(
+                failure.reason.contains("its words"),
+                "{code:?}: {}",
+                failure.reason
+            );
+            assert!(
+                !failure.reason.contains("cannot take another"),
+                "{code:?}: {}",
+                failure.reason
+            );
+        }
+        // For now, the view is lost and asked again; otherwise the host refused it.
+        assert!(refused(Asked::SessionOpen, ErrorCode::ResourceUnavailable).lost);
+        assert!(!refused(Asked::SessionOpen, ErrorCode::PermissionDenied).lost);
+        // A refusal of a request names the request that was refused.
+        let failure = refused(Asked::SessionOpen, ErrorCode::PermissionDenied);
+        assert!(
+            failure.reason.contains("open the session"),
+            "{}",
+            failure.reason
+        );
+        // A host that was not reached is not one that refused.
+        let failure = not_opened(Unopened::unreached("it is asleep"));
+        assert!(
+            failure.lost && failure.reason.contains("could not be reached"),
+            "{}",
+            failure.reason
+        );
     }
 }

@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kr_client::shown::Shown;
 use kr_client::transport::ControlTransport;
@@ -31,6 +32,10 @@ pub(super) struct Lost(pub(super) String);
 
 /// What a call answered with: the host's refusal, or the value.
 pub(super) type Answer = std::result::Result<ParamsValue, ProtocolError>;
+
+/// How long a call whose write failed waits for the host's refusal of the connection, which the host
+/// sends before it ends the connection and which the reader may not have queued yet.
+const REFUSAL_WAIT: Duration = Duration::from_secs(2);
 
 /// The request number before the first one the wire's own calls use. A paired connection numbers
 /// its requests in sequence, as a session of the client library does, and the wire's calls and the
@@ -60,6 +65,10 @@ pub(super) struct Paired {
     /// The share the view acts under, which every mutation names.
     grant_id: Option<GrantId>,
     next: u64,
+    /// The first error the host answered with request identifier zero: its refusal of the
+    /// connection itself, which a call that it answered is told apart from a refusal of its own
+    /// request by ([`Wire::connection_refusal`]).
+    refusal: Option<ProtocolError>,
 }
 
 impl Paired {
@@ -105,6 +114,7 @@ impl Paired {
             held: VecDeque::new(),
             grant_id,
             next: OWN_REQUESTS,
+            refusal: None,
         })
     }
 }
@@ -126,6 +136,17 @@ impl Wire {
                 .transport
                 .ended_by_this_device()
                 .map(|refusal| refusal.message),
+        }
+    }
+
+    /// The host's refusal of the connection, when this wire has read it: the first error the host
+    /// answered with request identifier zero, which no request of the view carries. A call that the
+    /// host answered with an error equal to it was refused with the connection, whatever its code,
+    /// since a request's refusal can carry the same code.
+    pub(super) fn connection_refusal(&self) -> Option<ProtocolError> {
+        match self {
+            Self::Local(_) => None,
+            Self::Paired(paired) => paired.refusal.clone(),
         }
     }
 
@@ -269,7 +290,13 @@ impl Wire {
             return Err(Lost("a local wire answers its own calls".to_owned()));
         };
         if !self.send(frame).await {
-            return Err(Lost("the connection ended".to_owned()));
+            // A host that refuses the connection answers with that refusal and ends it, so the
+            // write can fail after the refusal was read and queued, or while it is on its way: the
+            // call is answered with it, as it is when the refusal arrives while the call waits.
+            return match self.refusal_before_the_end().await {
+                Some(refusal) => Ok(Err(refusal)),
+                None => Err(Lost("the connection ended".to_owned())),
+            };
         }
         let mut waiting = Vec::new();
         let answer = loop {
@@ -285,7 +312,10 @@ impl Wire {
                         && matches!(response.outcome, Outcome::Error(_)) =>
                 {
                     break match response.outcome {
-                        Outcome::Error(error) => Err(error),
+                        Outcome::Error(error) => {
+                            self.keep_refusal(&error);
+                            Err(error)
+                        }
                         Outcome::Ok(value) => Ok(value),
                     };
                 }
@@ -304,5 +334,158 @@ impl Wire {
             }
         }
         Ok(answer)
+    }
+
+    /// Keeps the host's refusal of the connection, the first one, for [`Self::connection_refusal`].
+    fn keep_refusal(&mut self, refusal: &ProtocolError) {
+        if let Self::Paired(paired) = self {
+            paired.refusal.get_or_insert_with(|| refusal.clone());
+        }
+    }
+
+    /// The host's refusal of the connection, when it is already read or arrives within
+    /// [`REFUSAL_WAIT`], and none when the connection ended without one. What arrives before it is
+    /// of no use to a call whose write failed, since the connection is over.
+    async fn refusal_before_the_end(&mut self) -> Option<ProtocolError> {
+        let Self::Paired(paired) = self else {
+            return None;
+        };
+        if paired.refusal.is_some() {
+            return paired.refusal.clone();
+        }
+        let waited = tokio::time::timeout(REFUSAL_WAIT, async {
+            loop {
+                let frame = match paired.held.pop_front() {
+                    Some(frame) => frame,
+                    None => match paired.frames.recv().await {
+                        Some(Ok(frame)) => frame,
+                        Some(Err(_)) | None => return None,
+                    },
+                };
+                if let ControlFrame::Response(response) = frame
+                    && response.request_id == RequestId::new(0)
+                    && let Outcome::Error(error) = response.outcome
+                {
+                    return Some(error);
+                }
+            }
+        })
+        .await;
+        let refusal = waited.ok().flatten()?;
+        paired.refusal.get_or_insert_with(|| refusal.clone());
+        Some(refusal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use kr_client::error::Result as ClientResult;
+    use kr_client::transport::TransportFuture;
+    use kr_protocol::envelope::Response;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::hello::ReceiveLimits;
+    use kr_protocol::ids::{ActionWindowId, BootEpoch, ConnectionId};
+    use kr_protocol::scalars::{TimestampMs, Uuid};
+    use kr_protocol::session::SessionOpenParams;
+
+    use super::*;
+
+    /// A connection that the host refused and ended: every write fails, and the host's refusal, sent
+    /// before it ended the connection, is what is read from it, once, if `refusal` holds one.
+    #[derive(Debug)]
+    struct Refused {
+        refusal: Mutex<Option<ProtocolError>>,
+    }
+
+    impl ControlTransport for Refused {
+        fn connection_id(&self) -> ConnectionId {
+            ConnectionId::new(Uuid::from_bytes([7; 16]))
+        }
+
+        fn limits(&self) -> ReceiveLimits {
+            ReceiveLimits::default()
+        }
+
+        fn initial_action_window(&self) -> ActionWindow {
+            ActionWindow {
+                action_window_id: ActionWindowId::new("window-1").expect("a window"),
+                connection_id: self.connection_id(),
+                boot_epoch: BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(1),
+                valid_for_ms: DurationMs::new(60_000),
+            }
+        }
+
+        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+            None
+        }
+
+        fn send<'a>(&'a self, _: &'a ControlFrame) -> TransportFuture<'a, ()> {
+            Box::pin(async { Err(kr_client::ClientError::ConnectionEnded) })
+        }
+
+        fn claim_receiver(&self) -> ClientResult<()> {
+            Ok(())
+        }
+
+        fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+            let refusal = self.refusal.lock().expect("the refusal").take();
+            Box::pin(async move {
+                Ok(refusal.map(|error| {
+                    ControlFrame::Response(Response {
+                        request_id: RequestId::new(0),
+                        outcome: Outcome::Error(error),
+                    })
+                }))
+            })
+        }
+
+        fn revoke_streams(&self) {}
+
+        fn close(&self) {}
+    }
+
+    fn wire_over(refusal: Option<ProtocolError>) -> Wire {
+        let transport = Arc::new(Refused {
+            refusal: Mutex::new(refusal),
+        });
+        Wire::Paired(Paired::over(transport, None).expect("a wire"))
+    }
+
+    fn open_params() -> SessionOpenParams {
+        SessionOpenParams {
+            session_id: Nullable::null(),
+            grant_id: Nullable::null(),
+        }
+    }
+
+    /// KR-REQ-19.08: a call whose write fails because the host refused the connection and ended it
+    /// is answered with the host's refusal, which the reader has queued or is about to, and not with
+    /// the connection having ended; the wire keeps it as the refusal of the connection.
+    #[tokio::test]
+    async fn a_call_whose_write_fails_after_the_hosts_refusal_is_answered_with_it() {
+        let refusal = ProtocolError::new(ErrorCode::ResourceUnavailable, "no more connections");
+        let mut wire = wire_over(Some(refusal.clone()));
+        let answered = wire
+            .request(Method::SessionOpen, &open_params())
+            .await
+            .expect("the call is answered with the host's refusal, not with the connection ended");
+        assert_eq!(answered.expect_err("the host refused"), refusal);
+        assert_eq!(wire.connection_refusal(), Some(refusal));
+    }
+
+    /// KR-REQ-19.08: a call whose write fails on a connection that ended with no refusal is told
+    /// that the connection ended, and the wire holds no refusal of the connection.
+    #[tokio::test]
+    async fn a_call_whose_write_fails_on_a_connection_that_ended_with_no_refusal_says_so() {
+        let mut wire = wire_over(None);
+        let lost = wire
+            .request(Method::SessionOpen, &open_params())
+            .await
+            .expect_err("nothing answered the call");
+        assert_eq!(lost.0, "the connection ended");
+        assert_eq!(wire.connection_refusal(), None);
     }
 }

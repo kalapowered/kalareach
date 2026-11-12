@@ -398,6 +398,21 @@ pub enum Asked {
     AttentionRead,
 }
 
+impl Asked {
+    /// What the host was asked to do, as the words that follow "the host refused to", for a
+    /// refusal of a request; none for a refusal of the connection itself, which asked the host
+    /// nothing yet.
+    #[must_use]
+    pub const fn request(self) -> Option<&'static str> {
+        match self {
+            Self::Connection => None,
+            Self::HostInfo => Some("say who it is"),
+            Self::SessionOpen => Some("open the session"),
+            Self::AttentionRead => Some("read its inbox"),
+        }
+    }
+}
+
 /// Why a dial or a call did not get its connection to a paired host.
 ///
 /// The cause is made where it is known and carried on unchanged: no text for a person is chosen
@@ -498,6 +513,18 @@ impl Unopened {
             Self::HostFull
         } else {
             Self::Refused(Asked::Connection, CommandError::from(refusal))
+        }
+    }
+
+    /// Whether the cause is one that time or another connection may mend, so that a caller that
+    /// waits asks again: a host that was not reached or has no room for this computer's connection,
+    /// this computer's own budget used, or a refusal whose code is for now. Any other refusal is
+    /// the host's decision.
+    #[must_use]
+    pub fn for_now(&self) -> bool {
+        match self {
+            Self::Unreached(_) | Self::HostFull | Self::BudgetFull => true,
+            Self::Refused(_, refusal) => crate::standing::transient(refusal.code),
         }
     }
 
