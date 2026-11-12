@@ -513,10 +513,16 @@ fn the_protocols_read_only_marker_means_nothing_in_the_sdk_schema() {
         &contract("0.1.6", None),
         &contract("0.1.7", Some(&[("Marked", "extra", "0.1.7")])),
     );
-    assert_eq!(listed.lines, Vec::<String>::new());
-    assert_eq!(
-        listed.passed,
-        vec!["Marked.extra arrived at 0.1.7, earlier release at 0.1.6".to_owned()]
+    // Listed, with a rise, the member still fails: the marker is a key a plain closed object does
+    // not have, and the message names it.
+    assert!(listed.passed.is_empty(), "{:?}", listed.passed);
+    assert!(
+        listed
+            .lines
+            .iter()
+            .any(|line| line.contains("x-kalareach-read-only-metadata at its top")),
+        "{:?}",
+        listed.lines
     );
 }
 
@@ -538,10 +544,143 @@ fn a_listed_member_passes_only_in_an_object_definition() {
         &contract("0.1.7", Some(&[("Label", "extra", "0.1.7")])),
     );
     assert!(outcome.passed.is_empty(), "{:?}", outcome.passed);
-    assert_eq!(
-        outcome.lines,
-        vec!["Label.extra added: a member".to_owned()]
+    assert_eq!(outcome.lines.len(), 1, "{:?}", outcome.lines);
+    assert!(
+        outcome.lines[0].starts_with("Label.extra added: a member; ")
+            && outcome.lines[0].contains("Label is not an object"),
+        "{:?}",
+        outcome.lines
     );
+}
+
+/// A listed member passes only in a plain closed object. A definition that composes another can
+/// gain the name of a member it has another way and restrict it, so it is refused by the key that
+/// composes it; a definition that is open, or that has `anyOf` at its top, is refused too, and the
+/// message names what it found.
+#[test]
+fn a_listed_member_passes_only_in_a_plain_closed_object() {
+    let protocol = protocol_schema();
+    let table = Some(&[("Route", "hidden", "0.1.7")][..]);
+    let outcome_of = |old: &Value, new: &Value| {
+        compare(
+            old,
+            new,
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", table),
+        )
+    };
+
+    // A required member inherited through `allOf` gains a bound under its own name.
+    let mut old = sdk_schema();
+    old["$defs"]["Base"] = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "hidden": { "type": "string" } },
+        "required": ["hidden"],
+    });
+    old["$defs"]["Route"] = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "allOf": [{ "$ref": "#/$defs/Base" }],
+    });
+    let mut new = old.clone();
+    new["$defs"]["Route"]["properties"] = json!({ "hidden": { "type": "string", "maxLength": 1 } });
+    let outcome = outcome_of(&old, &new);
+    assert!(outcome.passed.is_empty(), "{:?}", outcome.passed);
+    assert!(
+        outcome
+            .lines
+            .iter()
+            .any(|line| line.contains("has allOf at its top")),
+        "{:?}",
+        outcome.lines
+    );
+
+    // An open object.
+    let mut old = sdk_schema();
+    old["$defs"]["Route"]
+        .as_object_mut()
+        .expect("an object")
+        .remove("additionalProperties");
+    let new = with_hidden(&old);
+    let outcome = outcome_of(&old, &new);
+    assert!(outcome.passed.is_empty(), "{:?}", outcome.passed);
+    assert!(
+        outcome
+            .lines
+            .iter()
+            .any(|line| line.contains("is not closed")),
+        "{:?}",
+        outcome.lines
+    );
+
+    // `anyOf` at its top.
+    let mut old = sdk_schema();
+    old["$defs"]["Route"]["anyOf"] = json!([{ "required": ["method"] }]);
+    let new = with_hidden(&old);
+    let outcome = outcome_of(&old, &new);
+    assert!(outcome.passed.is_empty(), "{:?}", outcome.passed);
+    assert!(
+        outcome
+            .lines
+            .iter()
+            .any(|line| line.contains("has anyOf at its top")),
+        "{:?}",
+        outcome.lines
+    );
+
+    // A plain closed object with the annotations the generator writes passes.
+    let mut old = sdk_schema();
+    old["$defs"]["Route"]["description"] = json!("A route.");
+    old["$defs"]["Route"]["title"] = json!("Route");
+    let new = with_hidden(&old);
+    let outcome = outcome_of(&old, &new);
+    assert_eq!(outcome.lines, Vec::<String>::new());
+    assert_eq!(outcome.passed.len(), 1);
+}
+
+/// A null branch that says more than `{"type": "null"}` is compared like any other branch, for the
+/// protocol's comparison and for the SDK's, beside a member that passes too: a changed `not` or
+/// `default` in it is a difference.
+#[test]
+fn a_changed_null_branch_is_a_difference_for_both_comparisons() {
+    let protocol = protocol_schema();
+    let mut old = sdk_schema();
+    old["$defs"]["Opt"] = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "x": { "anyOf": [{ "$ref": "#/$defs/Both" }, { "type": "null" }] } },
+    });
+    old["$defs"]["ConnectorManifest"]["properties"]["opt"] = json!({ "$ref": "#/$defs/Opt" });
+    for change in [
+        json!({ "type": "null", "not": {} }),
+        json!({ "type": "null", "default": null }),
+    ] {
+        let mut new = old.clone();
+        new["$defs"]["Opt"]["properties"]["x"]["anyOf"][1] = change.clone();
+        let lines = crate::public_contract::compare(&old, &new).expect("compares");
+        assert!(
+            lines.iter().any(|line| line.starts_with("Opt.x")),
+            "the protocol's comparison: {change}: {lines:?}"
+        );
+        let outcome = compare(
+            &old,
+            &with_hidden(&new),
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", Some(LISTED)),
+        );
+        assert_eq!(outcome.passed.len(), 1, "{change}");
+        assert!(
+            outcome.lines.iter().any(|line| line.starts_with("Opt.x")),
+            "the SDK's comparison: {change}: {:?}",
+            outcome.lines
+        );
+    }
+    // Annotations of the null branch's definition stay as they were: the plain form is equal.
+    let same = crate::public_contract::compare(&old, &old).expect("compares");
+    assert!(same.is_empty(), "{same:?}");
 }
 
 /// A member of a definition that the protocol schema has stays under the protocol's rule: the
@@ -551,6 +690,7 @@ fn a_member_of_a_definition_the_protocol_schema_shares_fails() {
     let old = json!({ "$defs": {
         "Frame": {
             "type": "object",
+            "additionalProperties": false,
             "properties": { "id": { "type": "string" } },
             "required": ["id"],
         },

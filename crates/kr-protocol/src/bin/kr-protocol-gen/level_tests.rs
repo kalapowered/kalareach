@@ -38,6 +38,7 @@ fn sdk_schema(description: &str, extra_member: bool) -> Value {
     let mut manifest = json!({
         "description": description,
         "type": "object",
+        "additionalProperties": false,
         "properties": { "name": { "type": "string" } },
         "required": ["name"],
     });
@@ -754,6 +755,45 @@ fn a_failed_run_still_names_the_members_that_passed() {
     let error = run(&level, &broken).expect_err("a changed member fails");
     assert!(
         error.contains("the plugin SDK schema: Manifest.name changed"),
+        "{error}"
+    );
+    assert!(
+        error.contains("note: the plugin SDK member Manifest.added")
+            && error.contains("SDK 0.1.7")
+            && error.contains("SDK 0.1.6"),
+        "{error}"
+    );
+}
+
+/// A release that cannot be read stops the run, and the members that passed against the releases
+/// before it are said with its error.
+#[test]
+fn a_later_read_error_keeps_the_notes_of_members_that_already_passed() {
+    let before = Tree::the_level();
+    let repo = Repo::new("sdk-arrival-then-unread");
+    let first = repo.commit(&before, "the first release");
+    repo.release("0.76.0", &first);
+    let broken = Tree {
+        version: "0.76.1",
+        contract: Some(json!({ "arrivals": [] })),
+        ..before.clone()
+    };
+    let second = repo.commit(&broken, "a release whose contract does not read");
+    let tag = repo.release("0.76.1", &second);
+    let listed = Tree {
+        sdk: Some(sdk_schema("The manifest.", true)),
+        contract: Some(sdk_contract(
+            "0.1.7",
+            Some(&[("Manifest", "added", "0.1.7")]),
+        )),
+        ..before
+    };
+    let head = repo.commit(&listed, "after");
+    let releases = inventory(&repo.directory).expect("an inventory");
+    let error = check(&repo.directory, &repo.head(&listed, &head), &releases)
+        .expect_err("the second release's contract does not read");
+    assert!(
+        error.contains(&tag) && error.contains("no sdk_version"),
         "{error}"
     );
     assert!(

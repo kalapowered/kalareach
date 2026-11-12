@@ -361,29 +361,39 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
     // Each member of the plugin SDK's schema that passed because the SDK lists it, with the release
     // it is new to.
     let mut arrivals: Vec<(String, PassedMember)> = Vec::new();
+    // A release that cannot be read stops the run, and the members that passed against the
+    // releases before it are said with its error.
+    let mut unread: Option<String> = None;
     for release in &peers {
-        let stated = package_version_at(repository, &release.commit)?;
-        if stated != release.version {
-            return Err(format!(
-                "{} states {} and its commit's package is {stated}",
-                release.tag, release.version
-            ));
-        }
-        let found = compare(
-            repository,
-            head,
-            release,
-            &mut notes,
-            &mut sections,
-            &mut arrivals,
-        )?;
-        if !found.is_empty() {
-            problems.push(format!(
-                "{} speaks another surface than this commit at level {}:\n  {}",
-                release.tag,
-                head.level,
-                found.join("\n  ")
-            ));
+        let mut step = || -> Result<(), String> {
+            let stated = package_version_at(repository, &release.commit)?;
+            if stated != release.version {
+                return Err(format!(
+                    "{} states {} and its commit's package is {stated}",
+                    release.tag, release.version
+                ));
+            }
+            let found = compare(
+                repository,
+                head,
+                release,
+                &mut notes,
+                &mut sections,
+                &mut arrivals,
+            )?;
+            if !found.is_empty() {
+                problems.push(format!(
+                    "{} speaks another surface than this commit at level {}:\n  {}",
+                    release.tag,
+                    head.level,
+                    found.join("\n  ")
+                ));
+            }
+            Ok(())
+        };
+        if let Err(error) = step() {
+            unread = Some(error);
+            break;
         }
     }
     // The comparison cannot tell a member whose absence keeps the earlier meaning from one
@@ -411,6 +421,15 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
              changes the meaning, and the review of the change that lists it must \
              (docs/releases/packages.md, \"A level is one surface\")",
             tags.join(", ")
+        ));
+    }
+    if let Some(error) = unread {
+        return Err(format!(
+            "{error}{}",
+            arrival_notes
+                .iter()
+                .map(|note| format!("\nnote: {note}"))
+                .collect::<String>()
         ));
     }
     if problems.is_empty() {

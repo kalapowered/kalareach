@@ -427,8 +427,9 @@ pub struct PassedMember {
 ///
 /// * it is a member added to a definition, with no nesting: not a member of a variant, an item or
 ///   a value, and not a variant;
-/// * both SDK schemas have the definition as an object, the earlier one without the member and the
-///   head's with it, and the head's does not require it;
+/// * both SDK schemas have the definition, the earlier one without the member and the head's with
+///   it, and the head's does not require it;
+/// * the definition is a plain closed object in both ([`plain_closed_object`]);
 /// * neither release's protocol schema has a definition of that name, because the protocol's own
 ///   rule holds what a client of the protocol reads;
 /// * the head's table lists the member at an SDK version above the earlier release's;
@@ -468,8 +469,6 @@ fn is_a_listed_arrival(
     let has_member = new["$defs"][definition]["properties"]
         .as_object()
         .is_some_and(|members| members.contains_key(member));
-    let is_an_object =
-        |schema: &Value| schema["$defs"][definition]["type"].as_str() == Some("object");
     let required = new["$defs"][definition]
         .get("required")
         .and_then(Value::as_array)
@@ -483,8 +482,6 @@ fn is_a_listed_arrival(
     let arrived = listed.version;
     if !(has_no_member
         && has_member
-        && is_an_object(old)
-        && is_an_object(new)
         && !required
         && !shared
         && arrived > earlier.version
@@ -514,12 +511,59 @@ fn is_a_listed_arrival(
                  arrival table cannot be in it"
             ));
         }
+        plain_closed_object(definition, schema, name)?;
     }
     Ok(Some(PassedMember {
         member: format!("{definition}.{member}"),
         arrived,
         earlier: earlier.version,
     }))
+}
+
+/// The keys a plain closed object's definition may have at its top, as the generator writes them:
+/// the shape (`type`, `properties`, `required`, `additionalProperties`) and the annotations the
+/// comparison ignores (`description`, `title`).
+const PLAIN_OBJECT_KEYS: [&str; 6] = [
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "description",
+    "title",
+];
+
+/// Fails unless the definition is a plain closed object in `schema`: `type` is `object`,
+/// `additionalProperties` is `false`, and the definition's own keys are from
+/// [`PLAIN_OBJECT_KEYS`]. Any other key at its top (`allOf`, `anyOf`, `oneOf`, `not`, `if`, `$ref`,
+/// `patternProperties`, `unevaluatedProperties`, a marker of the protocol) composes or loosens the
+/// object, so a name that appears in its `properties` may restrict a member the definition has
+/// another way, and a member added to it is not one an earlier reader meets as a new member.
+fn plain_closed_object(definition: &str, schema: &Value, name: &str) -> Result<(), String> {
+    let node = &schema["$defs"][definition];
+    if node.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(format!(
+            "{definition} is not an object in {name} SDK schema, and a member listed in the \
+             arrival table has to be a member of a plain closed object"
+        ));
+    }
+    if let Some(key) = node
+        .as_object()
+        .into_iter()
+        .flat_map(|members| members.keys())
+        .find(|key| !PLAIN_OBJECT_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "{definition} has {key} at its top in {name} SDK schema, and a member listed in the \
+             arrival table has to be a member of a plain closed object"
+        ));
+    }
+    if node.get("additionalProperties") != Some(&Value::Bool(false)) {
+        return Err(format!(
+            "{definition} is not closed in {name} SDK schema (additionalProperties is not false), \
+             and a member listed in the arrival table has to be a member of a plain closed object"
+        ));
+    }
+    Ok(())
 }
 
 /// The root of the connector table in the SDK's schema: a host reads `connector.json` after it
