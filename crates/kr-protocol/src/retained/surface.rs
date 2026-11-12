@@ -184,20 +184,51 @@ impl Surface {
     }
 }
 
+/// The keywords whose value is literal data and not a schema: it is compared as it stands, since a
+/// `description` key inside a default or a constant is a value, not an annotation.
+const LITERAL: [&str; 4] = ["default", "const", "enum", "examples"];
+
+/// The keywords whose value maps names to schemas: a name in it is not a keyword, so a member
+/// named `default` has a schema for its value, which is stripped like any other.
+const NAMED: [&str; 4] = [
+    "properties",
+    "$defs",
+    "patternProperties",
+    "dependentSchemas",
+];
+
 /// A schema without its descriptions and titles, which decide nothing and make a surface large.
 ///
 /// Only a keyword whose value is text is an annotation: a member that happens to be named
-/// `description` has a schema for its value.
+/// `description` has a schema for its value. The values of `default`, `const`, `enum` and
+/// `examples` are literal data and are kept whole.
 fn without_annotations(node: &Value) -> Value {
+    strip(node, false)
+}
+
+/// As [`without_annotations`]; `names` says `node` maps names to schemas, so its keys are names.
+fn strip(node: &Value, names: bool) -> Value {
     match node {
+        Value::Object(members) if names => Value::Object(
+            members
+                .iter()
+                .map(|(key, value)| (key.clone(), strip(value, false)))
+                .collect(),
+        ),
         Value::Object(members) => Value::Object(
             members
                 .iter()
                 .filter(|(key, value)| !(IGNORED.contains(&key.as_str()) && value.is_string()))
-                .map(|(key, value)| (key.clone(), without_annotations(value)))
+                .map(|(key, value)| {
+                    if LITERAL.contains(&key.as_str()) {
+                        (key.clone(), value.clone())
+                    } else {
+                        (key.clone(), strip(value, NAMED.contains(&key.as_str())))
+                    }
+                })
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(without_annotations).collect()),
+        Value::Array(items) => Value::Array(items.iter().map(|item| strip(item, false)).collect()),
         other => other.clone(),
     }
 }
