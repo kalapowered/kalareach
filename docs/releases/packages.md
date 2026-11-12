@@ -234,13 +234,34 @@ definition a root, and the plugin SDK schema
 (`packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json`, read from the committed file of the
 commit and of each release) with the same rule as the public contract below, and fails on each
 difference except a new method, a definition that is new, an optional member added to an object
-the earlier release marked read-only metadata, and a new section of the configuration document. A
+the earlier release marked read-only metadata, a new section of the configuration document and, in
+the plugin SDK schema only, an optional member that the SDK's arrival table lists. A
 new method is a variant added to `Method` that is one plain string constant, whose name no variant
 of the earlier release had and no other variant has. Descriptions and titles are ignored. A
 release from before `worker-surface.json` has no table to compare, so its tables are left out and
-its schema, plugin host protocol and table of public majors are compared. A release of the level without the SDK schema file, or whose file does not
-read, fails the check. When no release is at the commit's level, the commit moves it, and the check
+its schema, plugin host protocol and table of public majors are compared. A release of the level without the SDK schema file or the SDK's
+`package-contract.json`, or whose file does not read, fails the check. When no release is at the commit's level, the commit moves it, and the check
 runs `scripts/check-retained-release.sh` in the same run.
+
+The plugin SDK schema has one more exception, for a member that the SDK's own arrival table lists.
+The table is `arrivals` in `packages/plugin-sdk/schema/package-contract.json`, generated from
+`crates/kr-plugin-sdk/src/arrivals.rs`: for each member, its definition, its name and the SDK
+version it arrived at. The check passes an optional member added to a definition, and says each one
+it passes with both versions, when all of these hold: the definition is one that neither release's
+protocol schema has, that the connector table's root (`ConnectorManifest`) reaches and that the
+package manifest's root (`PluginManifest`) does not, in the earlier release's SDK schema and in the
+commit's; the commit's table lists the member at an SDK version above the `sdk_version` that the
+earlier release's contract states; and the commit's own `sdk_version` is above that version too. A
+required member, a member the table does not list, a member listed with no rise, a member of a
+definition the protocol schema shares or the package manifest reaches, a nested member, a new
+variant, a changed type, default or bound, a removal, a lower SDK version, and an entry of an
+earlier release's table that the commit's table changes or lacks all still fail. A release from
+before the table has an empty one, and a release whose contract file is missing, states no SDK
+version or has a table that does not read fails the check with a message of its own. The table
+lists a member only where a package that lacks it means what it meant before, and an earlier host
+refuses a package that uses it, because the package states an `sdk_range` that starts at the version
+the member arrived at. The comparison sees neither, and the review of the change that lists a member
+must.
 
 The check fails when it cannot list origin's tags, when this checkout's tags are not origin's, when
 a release's tree cannot be read and when a source is in a form it does not read, and it never leaves
@@ -251,7 +272,8 @@ checkout has with `git tag -d`.
 
 The check does not see the frames of `kr-plugin-host/3`, which have no schema, the types a
 daemon-served method names only in its description, rules that live in code, the hand-written
-TypeScript exports, `package-contract.json` and the component interface. A difference it fails on
+TypeScript exports, the rest of `package-contract.json` (it reads the SDK version and the table of
+arrivals) and the component interface. A difference it fails on
 that is harmless, such as a tighter bound in an answer, a read-only marker added to an object, a
 renamed type or a new generated form of the schema, takes a cut, or a reviewed change of the
 comparison in `crates/kr-protocol/src/bin/kr-protocol-gen/public_contract.rs` in a commit of its
