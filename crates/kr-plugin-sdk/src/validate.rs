@@ -1020,9 +1020,31 @@ fn check_arrivals(range: &VersionRange, table: &serde_json::Value, report: &mut 
             continue;
         }
         let Ok(arrived) = crate::version::PackageVersion::parse(arrival.sdk_version) else {
+            // The table is constants and its own test refuses such an entry; a package that carries
+            // the member is refused here as well, so that no entry is skipped.
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!(
+                    "the table carries {}.{}, and the arrival table lists it at {}, which is not \
+                     a version, so the sdk_range cannot be held to it",
+                    arrival.definition, arrival.member, arrival.sdk_version
+                ),
+            ));
             continue;
         };
-        if range.admits_a_version_below(&arrived) {
+        if range.has_a_prerelease() {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!(
+                    "the table carries {}.{}, which arrived at SDK {}, and the sdk_range {range} \
+                     has a prerelease part, which cannot be told from a range that admits an SDK \
+                     version below it",
+                    arrival.definition, arrival.member, arrival.sdk_version
+                ),
+            ));
+        } else if range.admits_a_version_below(&arrived) {
             report.push(Finding::at(
                 FindingCode::ConnectorTableInvalid,
                 CONNECTOR_FILE,

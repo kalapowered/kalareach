@@ -126,6 +126,17 @@ impl VersionRange {
         self.0.matches(version.get())
     }
 
+    /// Returns true when any comparator of the range has a prerelease part (`>=0.1.7-alpha`). The
+    /// probes of [`Self::admits_a_version_below`] are release versions, so a range with a
+    /// prerelease part is one that test cannot decide.
+    #[must_use]
+    pub fn has_a_prerelease(&self) -> bool {
+        self.0
+            .comparators
+            .iter()
+            .any(|comparator| !comparator.pre.is_empty())
+    }
+
     /// Returns true when the range admits some version below `limit`.
     ///
     /// The lowest version a range admits is a lower bound of one of its comparators, or the first
@@ -267,6 +278,19 @@ mod tests {
         ] {
             let range = VersionRange::parse(range).expect("valid range");
             assert_eq!(range.admits_a_version_below(&limit), below, "{range}");
+        }
+    }
+
+    #[test]
+    fn a_prerelease_part_in_any_comparator_is_told() {
+        for (range, pre) in [
+            (">=0.1.7-alpha, <0.2.0", true),
+            (">=0.1.7, <0.2.0-rc.1", true),
+            (">=0.1.7, <0.2.0", false),
+            ("^0.1.7", false),
+        ] {
+            let range = VersionRange::parse(range).expect("valid range");
+            assert_eq!(range.has_a_prerelease(), pre, "{range}");
         }
     }
 
