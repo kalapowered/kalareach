@@ -324,6 +324,9 @@ fn privileges_in(text: &str) -> Vec<String> {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn installation_lays_down_and_removal_restores() {
+    if needs_the_system() {
+        return;
+    }
     let case = Case::new();
     let paths = Paths::system().expect("the system's folders are read");
     let before = snapshot();
@@ -679,6 +682,14 @@ fn removal_keeps_an_administrators_later_rule_and_the_rule_that_lets_others_run(
         "the start type is back"
     );
 
+    // The rest needs the system: an ordinary account's token is made through the logon service,
+    // which only the system may register with.
+    if !runs_as_the_system() {
+        eprintln!(
+            "SKIPPED the rest: not run under this token: only the system may register with the logon service"
+        );
+        return;
+    }
     // A program of an ordinary account, outside the administrator's rule, still runs.
     let folder =
         PathBuf::from(r"C:\Users\Public").join(format!("krcase-{}", uuid::Uuid::new_v4().simple()));
@@ -3443,6 +3454,9 @@ fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_nothing_changed() {
+    if needs_the_system() {
+        return;
+    }
     use kr_boundary_windows::journal::rows::Row;
     use kr_boundary_windows::win::journal::Journal;
     use kr_boundary_windows::win::launch::InvocationId;

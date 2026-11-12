@@ -97,6 +97,9 @@ fn moved_aside(text: &str) {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn with_no_manifest_a_record_takes_its_remedy_from_its_own_handle() {
+    if needs_the_system() {
+        return;
+    }
     let folder = inherited_folder();
     parent_of(&folder);
     let paths = paths_in(&folder);
@@ -145,6 +148,9 @@ fn with_no_manifest_a_record_takes_its_remedy_from_its_own_handle() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_private_root_that_no_journal_names_takes_its_remedy_from_its_own_handle() {
+    if needs_the_system() {
+        return;
+    }
     let folder = inherited_folder();
     parent_of(&folder);
     let paths = paths_in(&folder);
@@ -170,6 +176,9 @@ fn a_private_root_that_no_journal_names_takes_its_remedy_from_its_own_handle() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn an_empty_data_directory_that_an_earlier_removal_left_is_finished_by_the_next_removal() {
+    if needs_the_system() {
+        return;
+    }
     use std::os::windows::fs::OpenOptionsExt;
     let folder = inherited_folder();
     parent_of(&folder);
@@ -198,4 +207,19 @@ fn an_empty_data_directory_that_an_earlier_removal_left_is_finished_by_the_next_
     install::remove(&paths, false).expect("the next removal finishes it");
     assert!(!paths.data.exists());
     let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// The cases that make their folders under the temporary folder run as the system: under another
+/// token the temporary folder lies in the account's profile, whose folders the account itself may
+/// delete in, and the check of the folders above the trees refuses them, as it should.
+fn needs_the_system() -> bool {
+    if kr_boundary_windows::win::token::current_user()
+        .is_ok_and(|user| user.to_text() == "S-1-5-18")
+    {
+        return false;
+    }
+    eprintln!(
+        "SKIPPED: not run under this token: the case makes its folders in the system's temporary folder"
+    );
+    true
 }

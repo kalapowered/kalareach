@@ -567,6 +567,10 @@ fn open_thread_as(token: &Handle, thread_id: u32, access: u32) -> Result<(), u32
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_is_in_its_job_and_has_run_nothing_until_it_is_resumed() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     assert_eq!(job.state(), State::Fresh);
@@ -609,6 +613,10 @@ fn a_child_is_in_its_job_and_has_run_nothing_until_it_is_resumed() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn exactly_the_three_standard_handles_reach_a_child_whatever_else_is_open_or_launching() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     // Handles that a careless launch would pass on: inheritable, open in the broker, in no list.
     let decoys: Vec<Handle> = (0..16).map(|_| inheritable_event()).collect();
@@ -688,6 +696,10 @@ fn exactly_the_three_standard_handles_reach_a_child_whatever_else_is_open_or_lau
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_process_and_thread_name_the_group_and_the_system_and_the_group_cannot_change_them() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let (suspended, output) = fixture.start(&job, &["spawn-hold"]);
@@ -764,6 +776,10 @@ fn the_process_and_thread_name_the_group_and_the_system_and_the_group_cannot_cha
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_job_holds_the_whole_tree_with_the_limits_asked_for_and_ends_every_process() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     assert_eq!(
@@ -814,6 +830,10 @@ fn the_job_holds_the_whole_tree_with_the_limits_asked_for_and_ends_every_process
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_that_asks_to_break_away_from_the_job_is_refused_or_stays_in() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let (suspended, output) = fixture.start(&job, &["breakaway"]);
@@ -854,6 +874,10 @@ fn a_child_that_asks_to_break_away_from_the_job_is_refused_or_stays_in() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_suspended_child_that_is_dropped_is_ended_and_leaves_no_process() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let job = Job::new(Limits::INVOCATION).unwrap();
     let (suspended, _output) = fixture.start(&job, &["sleep", "600000"]);
@@ -890,6 +914,10 @@ fn a_suspended_child_that_is_dropped_is_ended_and_leaves_no_process() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_runs_only_with_the_permit_made_for_it() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let job = Job::new(Limits::INVOCATION).unwrap();
     let marker = fixture.scratch.join("permit.txt");
@@ -950,6 +978,10 @@ fn copy_of(process: &Handle) -> Handle {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_permit_is_compared_on_the_invocation_the_process_number_and_the_creation_time_each_alone() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let other = InvocationId([8; 16]);
@@ -1000,6 +1032,10 @@ fn a_permit_is_compared_on_the_invocation_the_process_number_and_the_creation_ti
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocation() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let (child, _output) = fixture.start(&job, &["sleep", "600000"]);
@@ -1045,6 +1081,10 @@ fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocat
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let job = Job::new(Limits::INVOCATION).unwrap();
     let (child, _output) = fixture.start(&job, &["sleep", "600000"]);
@@ -1078,6 +1118,10 @@ fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_uncertain_end() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     use kr_boundary_windows::win::proof::run_captured;
     let fixture = Fixture::new();
     let uncertain = |failed: &LaunchError, words: &str| matches!(failed, LaunchError::EndUncertain(text) if text.contains(words));
@@ -1193,6 +1237,10 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_suspended_child_that_is_dropped_is_waited_for_only_to_the_callers_deadline() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     for (left, shortest, longest) in [
         // The wait is the deadline's, and at most the floor of 100 ms more, with room for the
@@ -1354,6 +1402,10 @@ fn proof_run_with<'a>(
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_launch_that_fails_after_the_process_was_made_is_an_uncertain_end_for_the_proofs_runner() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     // The control: a program that runs and ends is a success, with its pipes ended.
     let control = kr_boundary_windows::win::proof::run_captured(
@@ -1403,6 +1455,10 @@ fn a_launch_that_fails_after_the_process_was_made_is_an_uncertain_end_for_the_pr
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_program_that_outlasts_the_deadline_is_ended_and_the_call_returns_within_it() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let bound = Duration::from_secs(8);
     let begun = Instant::now();
@@ -1699,6 +1755,10 @@ fn pipe_name_length(pipe: &Handle) -> usize {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_capture_pipe_has_a_descriptor_for_the_system_and_the_administrators_alone() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let (read, _write) = pipe().unwrap();
     let found = security_of(read.raw());
@@ -1918,6 +1978,10 @@ fn open_the_brokers_pipe() -> Result<(), u32> {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_boundary_account_cannot_open_the_brokers_pipe_that_the_system_opens() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     use kr_boundary_windows::win::pipe::{Kind, Listener, Stop};
     let fixture = Fixture::new();
     assert!(
@@ -2059,6 +2123,10 @@ fn the_logs_last_words_are_read_well_inside_their_reserve_for_the_system_and_for
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_launch_that_cannot_use_the_job_attribute_starts_nothing() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let job = Job::new(Limits::INVOCATION).unwrap();
     // A handle to the job that may only query it: the platform cannot make a process in that job.
@@ -2092,6 +2160,10 @@ fn a_launch_that_cannot_use_the_job_attribute_starts_nothing() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_job_that_has_ended_takes_no_new_child() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     job.end(&[], Instant::now() + Duration::from_secs(10));
@@ -2118,6 +2190,10 @@ fn a_job_that_has_ended_takes_no_new_child() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_sees_exactly_the_environment_it_was_given() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let (suspended, output) = fixture.start(&job, &["environment"]);
@@ -2188,6 +2264,10 @@ const AWKWARD: &[&str] = &[
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_quoted_command_line_is_split_back_by_the_system_and_by_a_real_child() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let program = r"C:\Program Files\Git\mingw64\bin\git.exe";
     for argument in AWKWARD {
@@ -2459,6 +2539,10 @@ fn git_with_helper(fixture: &Fixture, job: &Job) -> (String, String, Option<u32>
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_a_grandchild_and_a_child_of_git_inherit_the_brokers_error_mode() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mode = own_error_mode();
     assert_eq!(
@@ -2509,6 +2593,10 @@ fn dump_within(dumps: &Dumps, pid: u32, bound: Duration) -> Option<Duration> {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_crash_of_a_child_a_grandchild_or_git_s_child_leaves_no_dump_where_the_default_mode_does() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let dumps = Dumps::new(&["kr-launch-stand-in.exe"], &fixture.dir.join("dumps"));
     let default_mode = Start {
@@ -2688,6 +2776,10 @@ fn the_brokers_own_crash_leaves_no_dump_where_the_default_mode_does() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_four_ways_to_start_a_program_outside_the_job_start_nothing_from_a_launched_child() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let program = fixture.stand_in.display().to_string();
