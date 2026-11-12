@@ -3736,8 +3736,8 @@ fn a_stopped_application_identity_service_is_started_once_and_its_first_event_co
 }
 
 /// Whether this process's token is the system's own: whose entry in the pipe's list is `GA`, so
-/// that a request for more than the grant is not refused to it.
-#[cfg(feature = "testing")]
+/// that a request for more than the grant is not refused to it, and that it may make a second
+/// instance of the pipe.
 fn runs_as_the_system() -> bool {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
@@ -4281,6 +4281,14 @@ fn after_a_restart_the_brokers_proof_passes_inside_its_bound() {
 fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_the_listener() {
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     require_clean_machine();
+    // The listener makes its second instance here, which only the system's entry of the pipe's list
+    // allows: under another token the case has nothing to show, and says so.
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     drop(pipe::connect(std::process::id()).expect("the first client opens the pipe"));
@@ -4308,6 +4316,14 @@ fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_t
 fn the_listener_keeps_the_pipes_name_with_every_client_gone_and_no_accept_pending() {
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     require_clean_machine();
+    // The listener makes its second instance here, which only the system's entry of the pipe's list
+    // allows: under another token the case has nothing to show, and says so.
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     let client = pipe::connect(std::process::id()).expect("the client opens the pipe");
