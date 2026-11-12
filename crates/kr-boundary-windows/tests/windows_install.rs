@@ -63,7 +63,7 @@ struct Snapshot {
 }
 
 fn snapshot() -> Snapshot {
-    let paths = Paths::system();
+    let paths = Paths::system().expect("the system's folders are read");
     let manager = service::manager().unwrap();
     let appid = manager
         .open("AppIDSvc")
@@ -193,7 +193,7 @@ fn privileges_in(text: &str) -> Vec<String> {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn installation_lays_down_and_removal_restores() {
     let case = Case::new();
-    let paths = Paths::system();
+    let paths = Paths::system().expect("the system's folders are read");
     let before = snapshot();
     assert!(
         before.policy.is_unconfigured(),
@@ -690,7 +690,12 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
         &[],
     );
     assert_eq!(code, 0, "{output}");
-    let manifest = Manifest::load(&Paths::system().manifest).unwrap();
+    let manifest = Manifest::load(
+        &Paths::system()
+            .expect("the system's folders are read")
+            .manifest,
+    )
+    .unwrap();
     assert_eq!(manifest.persons, [case.person.to_text(), other.to_text()]);
     assert!(sc(&["sdshow", SERVICE]).contains(&format!("(A;;CCLCLORC;;;{})", other.to_text())));
 
@@ -741,7 +746,7 @@ fn give_to(path: &Path, who: &str) {
 fn paths_under(folder: &Path) -> Paths {
     Paths {
         data: folder.join("Boundary"),
-        ..Paths::system()
+        ..Paths::system().expect("the system's folders are read")
     }
 }
 
@@ -1325,7 +1330,9 @@ fn a_removal_that_could_not_delete_a_record_is_run_again_whole_and_finishes() {
     let before = snapshot();
     let (code, output) = case.install();
     assert_eq!(code, 0, "{output}");
-    let manifest = Paths::system().manifest;
+    let manifest = Paths::system()
+        .expect("the system's folders are read")
+        .manifest;
     // Shared for reading and writing and not for deleting: the removal reads the manifest, and the
     // call that deletes it fails.
     let held = std::fs::OpenOptions::new()
@@ -1359,7 +1366,7 @@ fn a_removal_that_could_not_delete_the_earlier_state_record_a_replacement_or_sta
     use std::os::windows::fs::OpenOptionsExt;
     let case = Case::new();
     let before = snapshot();
-    let paths = Paths::system();
+    let paths = Paths::system().expect("the system's folders are read");
     let hex = "ab".repeat(16);
     let held_in_turn = [
         ("the earlier-state record", paths.prior.clone()),
@@ -1683,7 +1690,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
     let folder = inherited_folder();
     let unreadable = Paths {
         data: folder.join("a".repeat(300)),
-        ..Paths::system()
+        ..Paths::system().expect("the system's folders are read")
     };
     let text = install::check_data_parent(&unreadable)
         .unwrap_err()
@@ -2109,7 +2116,7 @@ fn the_installation_takes_the_system_folders_from_the_system_and_not_from_the_en
         "SystemDrive",
         "ALLUSERSPROFILE",
     ];
-    let before = Paths::system();
+    let before = Paths::system().expect("the system's folders are read");
     let saved: Vec<_> = names
         .iter()
         .map(|name| (*name, std::env::var_os(name)))
@@ -2118,7 +2125,7 @@ fn the_installation_takes_the_system_folders_from_the_system_and_not_from_the_en
         // SAFETY: the guest's cases run on one test thread, and the variables are put back below.
         unsafe { std::env::set_var(name, r"C:\Planted") };
     }
-    let after = Paths::system();
+    let after = Paths::system().expect("the system's folders are read");
     let root = ffi::system_windows_directory();
     for (name, value) in saved {
         match value {
@@ -3190,7 +3197,10 @@ fn the_proofs_program_and_the_program_files_give_their_readers_read_and_run_and_
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is_not_its_own() {
     let case = Case::new();
-    let parent = Paths::system().data_parent().to_path_buf();
+    let parent = Paths::system()
+        .expect("the system's folders are read")
+        .data_parent()
+        .to_path_buf();
     assert!(
         !parent.exists(),
         "the guest has no such folder to begin with"
@@ -3214,7 +3224,7 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     let case = Case::new();
     let (code, output) = case.install();
     assert_eq!(code, 0, "{output}");
-    let paths = Paths::system();
+    let paths = Paths::system().expect("the system's folders are read");
     let installed = snapshot();
     // What only the removal's first check can show: it refuses before the broker is touched. A
     // removal that went on would put the broker in its maintenance state first, and a later step

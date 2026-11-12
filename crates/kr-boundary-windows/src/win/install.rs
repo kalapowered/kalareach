@@ -285,16 +285,18 @@ impl Paths {
         self.data.parent().unwrap_or(&self.data)
     }
 
-    /// The installation's places on this computer.
-    #[must_use]
-    pub fn system() -> Paths {
-        let program_files = ffi::known_folder(ffi::KnownFolder::ProgramFiles)
-            .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files"));
-        let program_data = ffi::known_folder(ffi::KnownFolder::ProgramData)
-            .unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"));
+    /// The installation's places on this computer, from the system's own known folders.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when a known folder cannot be read: no fixed folder takes its
+    /// place, since a computer's system can be on another drive.
+    pub fn system() -> Result<Paths, Error> {
+        let program_files = ffi::known_folder(ffi::KnownFolder::ProgramFiles)?;
+        let program_data = ffi::known_folder(ffi::KnownFolder::ProgramData)?;
         let data = program_data.join("KalaReach").join("Boundary");
         let program = program_files.join("KalaReach").join("Boundary");
-        Paths {
+        Ok(Paths {
             git: program.join("git"),
             program_top: program_files,
             program,
@@ -304,7 +306,7 @@ impl Paths {
             manifest: data.join("manifest.json"),
             prior: data.join("prior.json"),
             data,
-        }
+        })
     }
 }
 
