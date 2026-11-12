@@ -491,6 +491,67 @@ fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
     assert!(text.contains("Nothing was changed"), "{text}");
 }
 
+/// A root that is not there is a volume that does not answer, and it is refused before anything is
+/// changed, in both walks: a folder that is not there ends a walk, but the root is the first folder
+/// of it, and a tree on a drive that is gone must not let the installation make records on another
+/// volume first.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_root_that_is_not_there_is_refused_for_its_volume_before_anything_is_changed() {
+    if needs_the_system() {
+        return;
+    }
+    require_clean_guest();
+    let mut clean = Cleanup::default();
+    let letter = ('D'..='Z')
+        .rev()
+        .map(|letter| format!("{letter}:"))
+        .find(|letter| !Path::new(&format!("{letter}\\")).exists())
+        .expect("a free drive letter");
+    // The data walk: the data parent is on the drive that is not there.
+    let parent = PathBuf::from(format!("{letter}\\ProgramData\\KalaReach"));
+    let paths = paths_with(&parent, &parent.join("Program"), &parent);
+    let text = install::check_data_parent(&paths)
+        .expect_err("a data parent on a drive that is not there")
+        .to_string();
+    for needle in [
+        format!("{letter}\\ is a folder above the boundary's data directory"),
+        "its volume did not answer".to_owned(),
+        "Nothing was changed".to_owned(),
+    ] {
+        assert!(text.contains(&needle), "{needle}: {text}");
+    }
+    assert!(!text.contains("holds it open"), "{text}");
+    // The program walk: the data parent is a folder of the guest's own volume, the program
+    // directory's top is on the drive that is not there, and nothing is made on the way.
+    let (local, mut paths) = data_parent_with_paths(&mut clean);
+    paths.program_top = PathBuf::from(format!("{letter}\\Program Files\\KalaReach"));
+    paths.program = paths.program_top.join("Program");
+    paths.git = paths.program.join("git");
+    let entry = install::entry(&paths)
+        .err()
+        .expect("a program directory on a drive that is not there")
+        .to_string();
+    let removal = install::remove(&paths, true)
+        .expect_err("a program directory on a drive that is not there")
+        .to_string();
+    for text in [entry, removal] {
+        assert!(
+            text.contains(&format!(
+                "{letter}\\ is a folder above the boundary's program directory"
+            )),
+            "{text}"
+        );
+        assert!(text.contains("its volume did not answer"), "{text}");
+        assert!(!text.contains("holds it open"), "{text}");
+    }
+    assert!(
+        !paths.data.exists(),
+        "no data directory was made under {}",
+        local.display()
+    );
+}
+
 /// A link that points nowhere at the program directory's name is a link, and gets the link's own
 /// remedy. The look that follows a link found nothing there, so the check let it pass, and the
 /// removal then said that the directory "was not there when the removal looked for it" and kept its

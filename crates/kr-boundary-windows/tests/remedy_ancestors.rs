@@ -243,6 +243,57 @@ fn the_refusal_of_what_is_not_a_folder_or_cannot_be_read_says_what_to_do() {
     );
 }
 
+/// A volume that does not answer, or a root that is not there, is refused for its volume and not for
+/// a program that holds a folder open: no program holds a volume that is going away, and closing one
+/// cures nothing. The words say that the volume did not answer, with the platform's error, and tell
+/// no one to move or change a folder that other programs share.
+#[test]
+fn a_volume_that_does_not_answer_is_refused_for_its_volume_and_not_for_an_open_program() {
+    for (tree, own) in [
+        (Tree::Program, "program directory"),
+        (Tree::Data, "data directory"),
+    ] {
+        let text = ancestor_refusal(
+            r"Z:\",
+            tree,
+            &AncestorFault::VolumeUnanswered("Windows error 3"),
+            Stage::Before,
+        );
+        assert!(
+            text.contains(&format!(r"Z:\ is a folder above the boundary's {own}")),
+            "{text}"
+        );
+        assert!(
+            text.contains("its volume did not answer (Windows error 3)"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was changed"), "{text}");
+        assert!(text.contains("run the setup program again"), "{text}");
+        assert!(!text.contains("Close the program"), "{text}");
+        assert!(!text.contains("holds it open"), "{text}");
+        assert!(!text.contains("Move "), "{text}");
+        assert!(!text.contains("Make the Administrators group"), "{text}");
+        assert!(!text.to_lowercase().contains("remove the link"), "{text}");
+        let after = ancestor_refusal(
+            r"Z:\",
+            tree,
+            &AncestorFault::VolumeUnanswered("Windows error 3"),
+            Stage::AfterRepair,
+        );
+        assert!(!after.contains("Nothing was changed"), "{after}");
+    }
+    let program = ancestor_refusal(
+        r"Z:\",
+        Tree::Program,
+        &AncestorFault::VolumeUnanswered("Windows error 3"),
+        Stage::Before,
+    );
+    assert!(
+        program.contains("Do not remove the program directory"),
+        "{program}"
+    );
+}
+
 #[test]
 fn a_drive_letter_that_is_no_volumes_root_is_refused_with_the_letter_and_the_real_path() {
     for tree in [Tree::Data, Tree::Program] {

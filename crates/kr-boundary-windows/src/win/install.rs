@@ -1703,13 +1703,15 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
     use remedy::AncestorFault as Fault;
     let mut chain: Vec<&Path> = top.ancestors().skip(1).collect();
     chain.reverse();
-    for folder in chain {
+    for (index, folder) in chain.into_iter().enumerate() {
         let shown = folder.display().to_string();
         let refuse = |fault: Fault<'_>| {
             Error::Refused(remedy::ancestor_refusal(&shown, tree, &fault, stage))
         };
         let unreadable =
             |error: &dyn std::fmt::Display| refuse(Fault::Unreadable(&error.to_string()));
+        let unanswered =
+            |error: &dyn std::fmt::Display| refuse(Fault::VolumeUnanswered(&error.to_string()));
         let wide = ffi::wide_path(folder);
         // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
         let raw = unsafe {
@@ -1728,13 +1730,19 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
             Err(failure)
                 if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
             {
+                // A folder that is not there ends the walk, but the root of the volume is the
+                // first folder of it: a root that is not there is a volume that does not answer,
+                // and the installation changes nothing on it.
+                if index == 0 {
+                    return Err(unanswered(&failure));
+                }
                 return Ok(());
             }
             Err(failure) => return Err(unreadable(&failure)),
         };
         // The volume first, as the program directory's own open does: a file system that is not
         // NTFS, or a volume on another computer, does not answer the attribute query that follows.
-        if let Some(reason) = volume_refused(&handle).map_err(|error| unreadable(&error))? {
+        if let Some(reason) = volume_refused(&handle).map_err(|error| unanswered(&error))? {
             return Err(refuse(Fault::Volume(&reason)));
         }
         let attributes = attributes_of(&handle, "a folder above the installation")
@@ -1791,6 +1799,8 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
         };
         let unreadable =
             |error: &dyn std::fmt::Display| refuse(Fault::Unreadable(&error.to_string()));
+        let unanswered =
+            |error: &dyn std::fmt::Display| refuse(Fault::VolumeUnanswered(&error.to_string()));
         let wide = ffi::wide_path(folder);
         // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
         let raw = unsafe {
@@ -1815,7 +1825,7 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
             // is told what can be done about that.
             Err(failure) => return Err(unreadable(&failure)),
         };
-        if let Some(reason) = volume_refused(&handle).map_err(|error| unreadable(&error))? {
+        if let Some(reason) = volume_refused(&handle).map_err(|error| unanswered(&error))? {
             return Err(refuse(Fault::Volume(&reason)));
         }
         let attributes = attributes_of(&handle, "a folder above the program directory")
