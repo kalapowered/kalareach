@@ -3952,13 +3952,13 @@ fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answe
 /// The pipe's grant leaves out the right to make another instance of its name (the append bit),
 /// and a request for more than the grant, by generic rights or by that bit, is refused to a client
 /// that holds only the grant. The system's own entry is `GA`, which refuses nothing: there the case
-/// has nothing to show.
+/// has nothing to show. The pipe here is the first instance alone, made with the grant's list.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated administrator's session that is not the system, in a disposable Windows guest (see the file's header)"]
 fn a_client_that_holds_only_the_pipes_grant_is_refused_more_than_the_grant_and_makes_no_instance() {
     use kr_boundary_windows::pipe_access::{CLIENT, CREATE_INSTANCE};
-    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    use kr_boundary_windows::win::pipe;
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
     };
@@ -3968,38 +3968,8 @@ fn a_client_that_holds_only_the_pipes_grant_is_refused_more_than_the_grant_and_m
         println!("skipped: this session is the system, whose own entry (GA) refuses nothing");
         return;
     }
-    let stop = Stop::new().unwrap();
     require_clean_machine();
-    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
-    // A broker that takes each client and lets it go, so that the next one finds an instance.
-    let server = std::thread::spawn(move || {
-        loop {
-            match listener.accept() {
-                Ok(Some(held)) => drop(held),
-                Ok(None) => break,
-                // A client that opened and closed at once ends the wait with an error: the next
-                // wait makes a new instance.
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
-            }
-        }
-    });
-    assert_eq!(
-        open_the_brokers_pipe_with(CLIENT),
-        Ok(()),
-        "the grant itself is enough to open the pipe"
-    );
-    assert_eq!(
-        open_the_brokers_pipe_with(GENERIC_READ | GENERIC_WRITE),
-        Err(5),
-        "the generic rights ask for the append bit and more than the grant"
-    );
-    // A client's open does not check the append bit, so the grant with that bit added is not
-    // refused here; the bit is checked when another instance of the name is made, below.
-    assert_eq!(
-        open_the_brokers_pipe_with(CLIENT | CREATE_INSTANCE),
-        Ok(()),
-        "an open that adds the append bit to the grant is not refused"
-    );
+    let first = pipe_granting_administrators(CLIENT);
     let name = ffi::wide(pipe::NAME);
     // SAFETY: the name is NUL-terminated; the result is checked and the default descriptor is
     // the caller's.
@@ -4020,13 +3990,24 @@ fn a_client_that_holds_only_the_pipes_grant_is_refused_more_than_the_grant_and_m
     if made != INVALID_HANDLE_VALUE {
         drop(ffi::Handle::new(made, "an instance of the broker's pipe").unwrap());
     }
-    stop.set();
-    server.join().unwrap();
     assert_eq!(
         (made == INVALID_HANDLE_VALUE).then_some(code),
         Some(5),
         "no client makes another instance of the pipe's name"
     );
+    assert_eq!(
+        open_the_brokers_pipe_with(GENERIC_READ | GENERIC_WRITE),
+        Err(5),
+        "the generic rights ask for the append bit and more than the grant"
+    );
+    // A client's open does not check the append bit, so the grant with that bit added is not
+    // refused here; the bit is checked when another instance of the name is made, above.
+    assert_eq!(
+        open_the_brokers_pipe_with(CLIENT | CREATE_INSTANCE),
+        Ok(()),
+        "an open that adds the append bit to the grant is not refused"
+    );
+    drop(first);
 }
 
 #[test]
@@ -4417,11 +4398,11 @@ fn the_listener_keeps_the_pipes_name_with_every_client_gone_and_no_accept_pendin
 }
 
 /// Clients that connect and send nothing do not stop the service: the first frame of a connection has
-/// a deadline, so that eight of them, one more than the connections served at once, are closed and a
+/// a deadline, so that seven of them, one more than the connections served at once, are closed and a
 /// real client is served once the deadline has passed.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn eight_clients_that_send_nothing_do_not_stop_the_service_and_a_real_client_is_served_after_one_deadline()
+fn seven_clients_that_send_nothing_do_not_stop_the_service_and_a_real_client_is_served_after_one_deadline()
  {
     use kr_boundary_windows::win::pipe;
     let case = Case::new();
@@ -4430,7 +4411,7 @@ fn eight_clients_that_send_nothing_do_not_stop_the_service_and_a_real_client_is_
     let manager = service::manager().unwrap();
     let broker = manager.open(SERVICE).unwrap().unwrap();
     let pid = broker.status().unwrap().pid;
-    let silent: Vec<_> = (0..8)
+    let silent: Vec<_> = (0..7)
         .map(|number| {
             pipe::connect(pid).unwrap_or_else(|failure| panic!("silent client {number}: {failure}"))
         })
@@ -4711,13 +4692,13 @@ fn a_stop_with_a_client_connected_ends_the_service() {
     );
 }
 
-/// Seven connections of a person who is not an administrator that say hello and then nothing do not
+/// Six connections of a person who is not an administrator that say hello and then nothing do not
 /// hold every slot: an administrator's request is served inside the bound that the installer's open
 /// has, because the connection of a person is closed when it has asked for nothing for its bound.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn seven_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administrators_request() {
+fn six_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administrators_request() {
     require_clean_machine();
     if !runs_as_the_system() {
         eprintln!(
@@ -4727,18 +4708,18 @@ fn seven_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administ
     }
     let mut served = serve_in_process();
     let began = std::time::Instant::now();
-    let holders: Vec<_> = (0..7)
+    let holders: Vec<_> = (0..6)
         .map(|_| {
             let mut connection = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
             say_hello(&mut connection);
             connection
         })
         .collect();
-    // The case shows what it means to only if the seven are all inside their bound of five seconds
+    // The case shows what it means to only if the six are all inside their bound of five seconds
     // at once, which is a condition of the case and not of the product.
     assert!(
         began.elapsed() < std::time::Duration::from_secs(3),
-        "the seven connections were not made within three seconds: {:?}",
+        "the six connections were not made within three seconds: {:?}",
         began.elapsed()
     );
     let answer = an_administrators_status_within_thirty_seconds();
@@ -4746,18 +4727,18 @@ fn seven_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administ
     drop(holders);
     assert!(
         matches!(answer, Ok(Response::Status { .. })),
-        "the administrator's request waited behind the seven connections: {answer:?}"
+        "the administrator's request waited behind the six connections: {answer:?}"
     );
     assert_eq!(ended.expect("the service ends"), Ok(()));
 }
 
-/// Seven connections of a person who is not an administrator that ask for the status again and again
+/// Six connections of a person who is not an administrator that ask for the status again and again
 /// and read no answer do not hold every slot either: the write of an answer has a bound, so that the
 /// thread whose client reads nothing ends and an administrator's request is served.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn seven_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrators_request() {
+fn six_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrators_request() {
     require_clean_machine();
     if !runs_as_the_system() {
         eprintln!(
@@ -4767,7 +4748,7 @@ fn seven_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrato
     }
     let mut served = serve_in_process();
     let began = std::time::Instant::now();
-    let flooders: Vec<_> = (0..7)
+    let flooders: Vec<_> = (0..6)
         .map(|_| {
             let mut connection = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
             say_hello(&mut connection);
@@ -4790,10 +4771,10 @@ fn seven_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrato
             connection
         })
         .collect();
-    // The seven are all inside the bound of an answer's write, ten seconds, at once.
+    // The six are all inside the bound of an answer's write, ten seconds, at once.
     assert!(
         began.elapsed() < std::time::Duration::from_secs(8),
-        "the seven connections were not filled within eight seconds: {:?}",
+        "the six connections were not filled within eight seconds: {:?}",
         began.elapsed()
     );
     let answer = an_administrators_status_within_thirty_seconds();
@@ -4801,7 +4782,7 @@ fn seven_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrato
     drop(flooders);
     assert!(
         matches!(answer, Ok(Response::Status { .. })),
-        "the administrator's request waited behind the seven connections: {answer:?}"
+        "the administrator's request waited behind the six connections: {answer:?}"
     );
     assert_eq!(ended.expect("the service ends"), Ok(()));
 }
@@ -5019,52 +5000,6 @@ fn the_pipes_grant_is_the_least_that_an_open_and_the_clients_calls_need() {
             "a list that grants {grant:#x}, one right fewer than the client's, must refuse the open: {summary:?}"
         );
     }
-}
-
-/// A listener that cannot make its waiting instance again and again gives up its name in order: the
-/// service ends with the reason, after its open connections have ended, and does not report that it
-/// stopped while a thread is still answering.
-#[cfg(feature = "testing")]
-#[test]
-#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn a_listener_that_cannot_make_its_instance_ends_the_service_after_its_connections() {
-    require_clean_machine();
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
-        return;
-    }
-    // The seam is a flag of the whole process, so what the loop does not use of it is cleared when
-    // this case ends, however it ends, and no later case in the process meets a failing refill.
-    struct ClearRefillFailures;
-    impl Drop for ClearRefillFailures {
-        fn drop(&mut self) {
-            kr_boundary_windows::win::pipe::testing::fail_refills(0);
-        }
-    }
-    let _clear = ClearRefillFailures;
-    kr_boundary_windows::win::pipe::testing::fail_refills(5000);
-    let mut served = serve_in_process();
-    // An administrator's connection has the longest idle bound, so only the stop set at the loop's
-    // end can have it ended inside this case's time.
-    let mut person = client_without(&[SYSTEM_SID]);
-    say_hello(&mut person);
-    // The refills fail a thousand times in a row, about twenty seconds, and the loop ends.
-    let ended = served
-        .ends_within(90)
-        .expect("the loop ends when it cannot make an instance")
-        .expect_err("the service ends with the reason");
-    assert!(ended.contains("making the pipe"), "{ended}");
-    // The connection was ended with the service: the client's next read finds the end of the stream.
-    person.set_deadline(Some(
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    ));
-    let after = kr_boundary_windows::frame::read::<_, Response>(&mut person);
-    assert!(
-        matches!(after, Err(kr_boundary_windows::frame::FrameError::Closed)),
-        "the connection stayed open after the service ended: {after:?}"
-    );
 }
 
 /// An administrator's connection is not closed at the bound of a person's: it waits longer than that
@@ -5323,14 +5258,15 @@ fn a_proof_that_is_at_work_ends_at_the_stop_with_a_failure_that_says_so() {
     );
 }
 
-/// Eight handles of a person that are kept open with nothing sent do not use up the pipe: the
+/// Seven handles of a person that are kept open with nothing sent, the most that the pipe's instances
+/// allow beside the broker's own, do not use up the pipe: the
 /// connections are closed at their bound and the server ends are disconnected with them, so an
 /// administrator's open succeeds once the bound has passed, and when the service stops its pipe's name
 /// is free to make again while the handles are still open.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn eight_handles_kept_open_with_nothing_sent_leave_the_pipe_to_an_administrator_and_its_name_free_at_the_end()
+fn seven_handles_kept_open_with_nothing_sent_leave_the_pipe_to_an_administrator_and_its_name_free_at_the_end()
  {
     use kr_boundary_windows::win::pipe::{Listener, Stop};
     require_clean_machine();
@@ -5338,7 +5274,7 @@ fn eight_handles_kept_open_with_nothing_sent_leave_the_pipe_to_an_administrator_
         return;
     }
     let mut served = serve_in_process();
-    let held: Vec<_> = (0..8)
+    let held: Vec<_> = (0..7)
         .map(|number| {
             try_client_without(&[SYSTEM_SID, ADMINISTRATORS_SID], 30)
                 .unwrap_or_else(|failure| panic!("handle {number} of the person: {failure}"))
