@@ -96,6 +96,7 @@ fn each_state_of_the_parent_folder_is_told_one_remedy() {
     let cases = [
         (ParentCure::Close, "Close the program"),
         (ParentCure::MoveAside, "Move the folder aside"),
+        (ParentCure::Unreadable, "Move the folder aside"),
         (ParentCure::Correct(Presence::Present), "Correct it instead"),
         (
             ParentCure::Correct(Presence::Unknown("Windows error 5".to_owned())),
@@ -118,6 +119,7 @@ fn a_folder_that_holds_the_data_directory_or_may_is_never_told_to_be_removed() {
     for cure in [
         ParentCure::Close,
         ParentCure::MoveAside,
+        ParentCure::Unreadable,
         ParentCure::Correct(Presence::Present),
         ParentCure::Correct(Presence::Unknown("Windows error 5".to_owned())),
     ] {
