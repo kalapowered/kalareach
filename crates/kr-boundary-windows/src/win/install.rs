@@ -190,31 +190,30 @@ pub mod testing {
     static RAN_AFTER: Mutex<Option<&'static str>> = Mutex::new(None);
 
     /// Runs the function once, right after the first of the two reads that decide which private
-    /// roots are in use: the listing of `run`, and not the listing of `staging` or of `journal`,
-    /// which the installation reads before it. A broker that begins an invocation then writes its
-    /// intent row and makes its root between the two reads, the listing and the read of the journal.
+    /// roots are in use, whichever of them comes first: the listing of `run`, and the read of the
+    /// journal. A broker that begins an invocation then writes its intent row and makes its root
+    /// between the two reads. With the roots listed first and the journal read after, as the
+    /// installation does, the function runs after the listing; read the other way round, it runs
+    /// after the journal's read, and [`listing_the_function_ran_after`] tells which.
     pub fn after_the_first_of_the_two_reads(hook: impl FnOnce() + Send + 'static) {
         *RAN_AFTER.lock().unwrap_or_else(PoisonError::into_inner) = None;
         *AFTER_A_READ.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
-    /// The listing the function ran after (`run`, when it ran where it is meant to), or none while
-    /// it has not run.
+    /// The read the function ran after (`run` for the listing of the roots, `journal` for the read
+    /// of the journal), or none while it has not run.
     pub fn listing_the_function_ran_after() -> Option<&'static str> {
         *RAN_AFTER.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(super) fn after_a_listing(listed: &'static str) {
-        if listed != "run" {
-            return;
-        }
+    pub(super) fn after_a_read(read: &'static str) {
         let hook = AFTER_A_READ
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(hook) = hook {
             hook();
-            *RAN_AFTER.lock().unwrap_or_else(PoisonError::into_inner) = Some(listed);
+            *RAN_AFTER.lock().unwrap_or_else(PoisonError::into_inner) = Some(read);
         }
     }
 }
@@ -1381,18 +1380,19 @@ fn inspect_layout(
     };
     let children = held.children()?;
     #[cfg(feature = "testing")]
-    testing::after_a_listing(match layout {
-        Layout::Staging => "staging",
-        Layout::Journal => "journal",
-        Layout::Run => "run",
-    });
+    if layout == Layout::Run {
+        testing::after_a_read("run");
+    }
     // The roots are listed first and the journal is read after: the broker writes the intent row
     // before it makes a root, so a root that the listing shows is named by the journal read next,
     // also when the broker began its invocation between the two reads. Read the other way round, a
     // root made between the two reads would be listed and not named, and a root in use would be
     // refused.
     let named_roots = if layout == Layout::Run && !children.is_empty() {
-        roots_named_by_the_journal(paths)?
+        let named = roots_named_by_the_journal(paths)?;
+        #[cfg(feature = "testing")]
+        testing::after_a_read("journal");
+        named
     } else {
         BTreeSet::new()
     };
