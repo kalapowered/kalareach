@@ -167,8 +167,8 @@ pub(crate) enum Listing {
     /// nothing. That says nothing of the host, and the host has room: it is no host that cannot
     /// take another connection, and it is not one that failed to answer.
     BudgetFull,
-    /// It did not answer in time, could not be reached, or refused for a reason that says nothing
-    /// of its devices.
+    /// It did not answer in time, could not be reached, refused the connection at its admission, or
+    /// refused for a reason that says nothing of its devices: the list that is held stays.
     Silent,
     /// The connection it was asked over has ended, which says nothing of the host: a connection
     /// that was replaced while a caller still held a copy of it.
@@ -193,18 +193,27 @@ impl Listing {
     /// What a failed connection to a host says. A host that does not find this computer paired
     /// answers the hello as it would an unpaired peer, which this computer ends itself, so it
     /// reads as a connection lost, as a host that is asleep does. A dial that this computer's own
-    /// budget of connections declined asked the host nothing, and the host has room.
+    /// budget of connections declined asked the host nothing, and the host has room. A refusal at
+    /// the handshake is the host's answer about this computer, by its code; every other failure is
+    /// told by the cause ([`Unopened::of_link`]).
     pub(crate) fn of_link(error: &LinkError) -> Self {
         match error {
             LinkError::Refused(refusal) => Self::of_refusal(refusal.code),
-            LinkError::ConnectionRefused(refusal) => {
-                match Unopened::of_refused_connection(refusal.clone()) {
-                    Unopened::HostFull => Self::HostFull,
-                    _ => Self::of_refusal(refusal.code),
-                }
+            other => Self::of_unopened(&Unopened::of_link(other.clone())),
+        }
+    }
+
+    /// What a connection that was not opened says of the host's devices: only the host's bound and
+    /// this computer's own budget say anything, and neither is an answer about them. A connection
+    /// that the host refused at its admission is lost, and a host that cannot be reached, or that
+    /// could not be given the lease it needs, is not answering: the list the screen holds stays.
+    fn of_unopened(unopened: &Unopened) -> Self {
+        match unopened {
+            Unopened::HostFull => Self::HostFull,
+            Unopened::BudgetFull => Self::BudgetFull,
+            Unopened::NotAdmitted(_) | Unopened::Unreached(_) | Unopened::Refused(..) => {
+                Self::Silent
             }
-            LinkError::Declined(_) => Self::BudgetFull,
-            _ => Self::Silent,
         }
     }
 }
@@ -248,19 +257,16 @@ fn listing_of(
 ) -> Listing {
     match asked {
         Ok(Ok(list)) => Listing::Listed(list),
-        // The host refused the connection, and not the question, because it cannot take another
-        // from this computer for now.
-        Ok(Err(error))
-            if matches!(
-                Unopened::of_connection(session, &error),
-                Some(Unopened::HostFull)
-            ) =>
-        {
-            Listing::HostFull
-        }
-        Ok(Err(ClientError::Host(refused))) => Listing::of_refusal(refused.code),
-        Ok(Err(ClientError::ConnectionEnded)) => Listing::Ended,
-        Ok(Err(_)) | Err(_) => Listing::Silent,
+        // A refusal of the connection, and not of the question: the cause says what it is.
+        Ok(Err(error)) => match Unopened::of_connection(session, &error) {
+            Some(unopened) => Listing::of_unopened(&unopened),
+            None => match error {
+                ClientError::Host(refused) => Listing::of_refusal(refused.code),
+                ClientError::ConnectionEnded => Listing::Ended,
+                _ => Listing::Silent,
+            },
+        },
+        Err(_) => Listing::Silent,
     }
 }
 
