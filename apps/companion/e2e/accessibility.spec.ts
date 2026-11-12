@@ -720,13 +720,9 @@ test.describe('a press by the links of a message', () => {
                     .filter((rect) => rect.width > 0 && rect.height > 0)
                     .map((rect) => ({ left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom }))
                 }
-                const lineOf = (each: HTMLElement): number => {
-                  const height = parseFloat(getComputedStyle(each).lineHeight)
-                  return Number.isFinite(height) ? height : 0
-                }
-                const areaOf = (words: Area, line: number): Area => {
+                const areaOf = (words: Area): Area => {
                   const wide = Math.max(finger, words.right - words.left + 2 * beside)
-                  const tall = Math.max(finger, words.bottom - words.top, line)
+                  const tall = Math.max(finger, words.bottom - words.top)
                   const x = (words.left + words.right) / 2
                   const y = (words.top + words.bottom) / 2
                   return {
@@ -749,7 +745,7 @@ test.describe('a press by the links of a message', () => {
                     top: Math.max(rect.top, room.top),
                     bottom: Math.min(rect.bottom, room.bottom)
                   }))
-                const all = links.map((each) => ({ title: each.title, words: wordsOf(each), line: lineOf(each), boxes: boxesOf(each) }))
+                const all = links.map((each) => ({ title: each.title, words: wordsOf(each), boxes: boxesOf(each) }))
                 // The message's other controls: a point on one is the control's, whichever link's area holds it.
                 const controls = Array.from(pane.querySelectorAll<HTMLElement>('button:not(.md-link)'), (each): Area => {
                   const box = each.getBoundingClientRect()
@@ -762,9 +758,9 @@ test.describe('a press by the links of a message', () => {
                   const held = all
                     .map((each) => ({
                       title: each.title,
-                      reached: each.words.some((words) => depth(areaOf(words, each.line), x, y) >= 0) || each.boxes.some((box) => depth(box, x, y) >= 0),
+                      reached: each.words.some((words) => depth(areaOf(words), x, y) >= 0) || each.boxes.some((box) => depth(box, x, y) >= 0),
                       near:
-                        each.words.some((words) => Math.abs(depth(areaOf(words, each.line), x, y)) < edge) ||
+                        each.words.some((words) => Math.abs(depth(areaOf(words), x, y)) < edge) ||
                         each.boxes.some((box) => Math.abs(depth(box, x, y)) < edge),
                       distance: Math.min(...each.words.map((words) => gap(words, x, y)))
                     }))
@@ -836,7 +832,7 @@ test.describe('a press by the links of a message', () => {
                 // Along the edges of every control that this link's area overlaps, on both sides of each edge.
                 const overlapped = controls.filter((box) =>
                   wordsOf(link).some((words) => {
-                    const area = areaOf(words, lineOf(link))
+                    const area = areaOf(words)
                     return area.left <= box.right + 6 && area.right >= box.left - 6 && area.top <= box.bottom + 6 && area.bottom >= box.top - 6
                   })
                 )
@@ -867,7 +863,7 @@ test.describe('a press by the links of a message', () => {
                   }
                 }
                 for (const words of wordsOf(link)) {
-                  const area = areaOf(words, lineOf(link))
+                  const area = areaOf(words)
                   const x0 = (words.left + words.right) / 2
                   const y0 = (words.top + words.bottom) / 2
                   const reachX = Math.max(area.right - x0, x0 - area.left) + 6
@@ -1003,6 +999,16 @@ async function wordsOf(page: Page, href: string): Promise<{ x: number; y: number
     range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
     const box = range.getClientRects()[0] ?? range.getBoundingClientRect()
     return { x: box.left + box.width / 2, y: box.top + box.height / 2, left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+  }, href)
+}
+
+/** The middle of a link's words where they lie now, with no scrolling. */
+async function centreOf(page: Page, href: string): Promise<{ x: number; y: number }> {
+  return page.evaluate((target) => {
+    const range = document.createRange()
+    range.selectNodeContents(document.querySelector(`.m-node .md-link[title="${target}"] .md-link-label`) ?? document.body)
+    const box = range.getBoundingClientRect()
+    return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
   }, href)
 }
 
@@ -1166,12 +1172,7 @@ test.describe('the edges of a press on a link', () => {
     test(`leaves a press that moved away cancelled when a keyboard clicks while the pointer is down, on ${surface}`, async ({ page }) => {
       await pressPage(page, surface)
       const one = await wordsOf(page, 'https://example.org/table-1')
-      const two = await page.evaluate(() => {
-        const range = document.createRange()
-        range.selectNodeContents(document.querySelector('.m-node .md-link[title="https://example.org/table-2"] .md-link-label') ?? document.body)
-        const box = range.getBoundingClientRect()
-        return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
-      })
+      const two = await centreOf(page, 'https://example.org/table-2')
       await page.mouse.move(one.x, one.y)
       await page.mouse.down()
       await page.mouse.move(two.x, two.y, { steps: 4 })
@@ -1182,6 +1183,26 @@ test.describe('the edges of a press on a link', () => {
       await page.keyboard.press('Enter')
       await page.mouse.up()
       expect(await openedLinks(page), 'links opened: the keyboard’s, and not the press that moved away').toEqual(['https://example.org/list-1'])
+    })
+
+    test(`leaves a press that moved away cancelled when its click comes long after its end, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface)
+      const one = await wordsOf(page, 'https://example.org/table-1')
+      const two = await centreOf(page, 'https://example.org/table-2')
+      await page.evaluate(() => {
+        window.addEventListener('pointerup', () => {
+          const end = performance.now() + 1700
+          while (performance.now() < end) {
+            // Busy.
+          }
+        })
+      })
+      // The press ends on another link, which is no press of that link: the click that comes late opens nothing.
+      await page.mouse.move(one.x, one.y)
+      await page.mouse.down()
+      await page.mouse.move(two.x, two.y, { steps: 4 })
+      await page.mouse.up()
+      expect(await openedLinks(page), 'links opened by a click of a cancelled press that came after its record was stale').toEqual([])
     })
 
     test(`ignores a second pointer that comes down while a press is held, on ${surface}`, async ({ page }) => {
