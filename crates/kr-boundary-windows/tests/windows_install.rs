@@ -564,56 +564,66 @@ fn installation_lays_down_and_removal_restores() {
     assert_eq!(prior.appid_start_type, before.appid_start);
     assert!(Policy::parse(&prior.policy_xml).unwrap().is_unconfigured());
 
-    // A proof whose deadline has passed fails and takes no success.
-    let manifest = Manifest::load(&paths.manifest).unwrap();
-    let stop = kr_boundary_windows::win::pipe::Stop::new().unwrap();
-    let late = kr_boundary_windows::win::proof::prove(
-        &manifest,
-        Class::Checkout,
-        &paths.staging,
-        std::time::Instant::now(),
-        &stop,
-    );
-    assert!(!late.ready, "{}", late.detail);
-    assert!(late.detail.contains("deadline"), "{}", late.detail);
+    // The two proofs below are the broker's own code, which the case runs in its own process: they
+    // make the boundary account's token through the logon service, which only the system may
+    // register with. Under another token the installation above and the removal below are what the
+    // administrator does; the proofs are asked of the service, as the cases through its pipes do.
+    if runs_as_the_system() {
+        // A proof whose deadline has passed fails and takes no success.
+        let manifest = Manifest::load(&paths.manifest).unwrap();
+        let stop = kr_boundary_windows::win::pipe::Stop::new().unwrap();
+        let late = kr_boundary_windows::win::proof::prove(
+            &manifest,
+            Class::Checkout,
+            &paths.staging,
+            std::time::Instant::now(),
+            &stop,
+        );
+        assert!(!late.ready, "{}", late.detail);
+        assert!(late.detail.contains("deadline"), "{}", late.detail);
 
-    // A search that ends at its own deadline still reads the log's last words, from the time kept
-    // for them, and ends inside the proof's deadline: the manifest names the wrong identifier for
-    // the account, so no event of the log ever matches and the search has to give up.
-    let mut wrong = Manifest::load(&paths.manifest).unwrap();
-    wrong
-        .objects
-        .iter_mut()
-        .find(|object| object.kind == ObjectKind::Account && object.id == CHECKOUT)
-        .expect("the checkout account is recorded")
-        .detail = Some("S-1-5-21-1-2-3-1999".to_owned());
-    let bound = std::time::Duration::from_secs(30);
-    let began = std::time::Instant::now();
-    let gave_up = kr_boundary_windows::win::proof::prove(
-        &wrong,
-        Class::Checkout,
-        &paths.staging,
-        began + bound,
-        &stop,
-    );
-    let took = began.elapsed();
-    assert!(!gave_up.ready, "{}", gave_up.detail);
-    assert!(
-        gave_up
-            .detail
-            .contains("the application-control log last said"),
-        "the log's last words are read from the reserved time: {}",
-        gave_up.detail
-    );
-    assert!(
-        gave_up.detail.contains("launches in"),
-        "the search made its launches: {}",
-        gave_up.detail
-    );
-    assert!(
-        took <= bound,
-        "the proof ended inside its deadline: {took:?}"
-    );
+        // A search that ends at its own deadline still reads the log's last words, from the time kept
+        // for them, and ends inside the proof's deadline: the manifest names the wrong identifier for
+        // the account, so no event of the log ever matches and the search has to give up.
+        let mut wrong = Manifest::load(&paths.manifest).unwrap();
+        wrong
+            .objects
+            .iter_mut()
+            .find(|object| object.kind == ObjectKind::Account && object.id == CHECKOUT)
+            .expect("the checkout account is recorded")
+            .detail = Some("S-1-5-21-1-2-3-1999".to_owned());
+        let bound = std::time::Duration::from_secs(30);
+        let began = std::time::Instant::now();
+        let gave_up = kr_boundary_windows::win::proof::prove(
+            &wrong,
+            Class::Checkout,
+            &paths.staging,
+            began + bound,
+            &stop,
+        );
+        let took = began.elapsed();
+        assert!(!gave_up.ready, "{}", gave_up.detail);
+        assert!(
+            gave_up
+                .detail
+                .contains("the application-control log last said"),
+            "the log's last words are read from the reserved time: {}",
+            gave_up.detail
+        );
+        assert!(
+            gave_up.detail.contains("launches in"),
+            "the search made its launches: {}",
+            gave_up.detail
+        );
+        assert!(
+            took <= bound,
+            "the proof ended inside its deadline: {took:?}"
+        );
+    } else {
+        eprintln!(
+            "SKIPPED the in-process proofs: not run under this token: only the system may register with the logon service"
+        );
+    }
 
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_eq!(code, 0, "the removal succeeds: {output}");
