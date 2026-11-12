@@ -3150,7 +3150,8 @@ fn check_observation(
 /// that states one is refused, not read as though it stated none, which would make every request
 /// of the route a selection. A place is read in the request's parameters, so one that does not
 /// begin with the table's `params` member is refused: a place in the reply never matches a request,
-/// and one in the request's own `method` member would hide every request of the route.
+/// and one in the request's own `method` member would hide every request of the route. So is the
+/// `params` member alone, which holds an object that no string, boolean or integer equals.
 fn check_hidden_when(
     method: &crate::ids::MethodName,
     conditions: &[RequestCondition],
@@ -3180,6 +3181,13 @@ fn check_hidden_when(
                 format!(
                     "the condition for the requests of {method} reads {}, which is not inside the table's {params} member of the request",
                     dotted(&condition.place)
+                ),
+            );
+        } else if condition.place.segments.len() == 1 {
+            table_invalid(
+                report,
+                format!(
+                    "the condition for the requests of {method} reads the whole {params} member, which holds an object and no string, boolean or integer, so it can never be met"
                 ),
             );
         }

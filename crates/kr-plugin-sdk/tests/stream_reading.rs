@@ -477,6 +477,10 @@ fn kr_req_12_06_the_conditions_of_a_hidden_request_are_checked_when_the_table_is
         "not inside the table's params member of the request",
     );
 
+    // A place of the parameters alone holds an object, which no string, boolean or integer equals.
+    let whole = with(vec![condition(&["params"], vec![text("system")])]);
+    refused(&whole, "reads the whole params member");
+
     let nowhere = with(vec![condition(&[], vec![text("system")])]);
     refused(&nowhere, "a field path with 0 segments");
 
