@@ -3445,8 +3445,10 @@ door's check writes nothing and is refused as withdrawn. A repeat of a draft wri
 connection is answered from the service's record, under the check any recorded answer is owed: a
 device that may not read the session's receipts is told `OUTCOME_UNKNOWN`.
 
-A device holds at most 64 open drafts: its drafts whose session has not closed and that no prompt
-has sent. A device's draft names the session it is for, and the paired door refuses a
+A device holds at most 64 open drafts: its drafts that no prompt has sent, whose session has not
+closed and whose files the agent has not all taken. A draft that has at least one attachment, every
+one of them `accepted_by_agent`, is spent: it does not count while it stays so, and the bound does
+not limit how many spent drafts a device holds. A device's draft names the session it is for, and the paired door refuses a
 `draft.create` that names none, `INVALID_ARGUMENT`, before it counts or writes anything. The person
 at this machine may make a draft with no session and has no bound. A draft is open until a prompt
 sends it to a session or the
@@ -3461,14 +3463,18 @@ refused `QUOTA_EXCEEDED` with the bound in the message only after the closed ses
 once more and the create is tried again, and only after the service has asked the admission again,
 so a device whose authority has gone learns no count. An `agent.draft.add_attachment` that would
 bring a draft back into the count, because the agent took all its files and the binding adds
-another, is refused in the same way when the device already holds the bound; a binding to a draft
-that already counts is not asked. Two things remain possible. A settle that fails in both passes leaves the drafts of closed sessions
+another, is refused `QUOTA_EXCEEDED` in the same way when the device already holds the bound, and
+only after the same second settle, the same second try and the same second ask of the admission; a
+binding to a draft that already counts is not asked. Two things remain possible. A settle that fails in both passes leaves the drafts of closed sessions
 counting, and the host writes a line to its log for each pass that fails. And a create can be
 refused for a draft that was not open when it began: another create of the device reads the
 registry, a session it names then closes, the create at the bound settles without a draft to point
 it at that session, and the other create inserts its draft; the second settle ends that session,
 and a third create, for a second session that closed in the same way, fills the place again. That
-takes three creates of one device on separate connections and two closures. The host keeps a refusal
+takes three creates of one device on separate connections and two closures. A binding that brings a
+draft back into the count is refused for such a draft in the same way, with the binding in the place
+of the first create: it takes two creates beside it, on separate connections, and two closures. The
+host keeps a refusal
 at the bound as the action's outcome, as it keeps every refusal of a service, so the same action asked
 again is given the same refusal even when a place is free, and a device that has freed a place takes a new
 action for its new attempt. The bound is one constant of this host, which an owner cannot change,
@@ -3477,7 +3483,8 @@ draft, its session ends, the agent takes every file bound to it, or the device e
 `draft.discard`. A draft whose attachments are all `accepted_by_agent`, and that has at least one,
 stops counting until a file is bound to it again; a draft with an attachment `inserting` or
 `unknown` goes on counting, because a retry or a report may still come for it. The bound's refusal names the ways that are the device's to
-take or wait for. Sent and orphaned drafts stay in the journal, and each `draft.update` adds one row
+take or wait for. Sent, orphaned and spent drafts stay in the journal and the bound does not limit them, so a device
+can hold more than 64 drafts in all, and a spent draft counts again when a file is bound to it. Each `draft.update` adds one row
 to the journal's events and a receipt that holds the updated draft for the de-duplication window.
 
 `draft.discard` ends a draft of the device's own that it no longer uses. It names the draft and no
