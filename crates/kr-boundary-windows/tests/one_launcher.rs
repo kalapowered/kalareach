@@ -132,3 +132,43 @@ fn a_permit_to_resume_is_made_only_where_it_is_allowed() {
     assert_eq!(proof, 1, "the proof makes its permit in one place");
     assert_eq!(journal, 1, "the journal makes its permit in one place");
 }
+
+/// The setup program starts a program in one way, through the one function that gives the command
+/// an emptied environment and the system's own working directory. The function is defined once, and
+/// each start of a program through it is listed by file and by count, so a start anywhere else fails
+/// the case even though it would get the emptied environment: PowerShell's channel in one file, the
+/// installer's two checks in the other.
+#[test]
+fn every_start_through_the_trusted_command_is_listed_by_file_and_by_count() {
+    let mut files = Vec::new();
+    sources(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let defined = [("applocker.rs", 1_usize)];
+    let started = [("applocker.rs", 1_usize), ("install.rs", 2_usize)];
+    for path in &files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = code(path);
+        let definitions = count(&text, "fn trusted_command(");
+        let starts = count(&text, "trusted_command(") - definitions;
+        let listed = |table: &[(&str, usize)]| {
+            table
+                .iter()
+                .find(|entry| entry.0 == name)
+                .map_or(0, |entry| entry.1)
+        };
+        assert_eq!(
+            definitions,
+            listed(&defined),
+            "the trusted command is defined in {}",
+            path.display()
+        );
+        assert_eq!(
+            starts,
+            listed(&started),
+            "starts through the trusted command in {}",
+            path.display()
+        );
+    }
+}
