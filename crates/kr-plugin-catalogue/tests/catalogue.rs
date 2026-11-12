@@ -3461,6 +3461,105 @@ async fn a_release_for_a_newer_sdk_leaves_the_installed_release_in_place() {
     ));
 }
 
+/// A package that a host of a later SDK extracted into the same store is not installed by its
+/// digest here: the installation is refused for its range, nothing is fetched, and the release
+/// that is installed stays. This is what a rollback meets.
+#[tokio::test]
+async fn a_package_extracted_for_a_newer_sdk_is_refused_by_its_range_and_the_installed_release_stays()
+ {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let newer = home.path().join("newer-package");
+    std::fs::create_dir_all(&newer).expect("a directory");
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/plugins/valid/example-declarative");
+    for name in ["plugin.json", "presentation.json"] {
+        std::fs::copy(example.join(name), newer.join(name)).expect("copies");
+    }
+    let manifest_path = newer.join("plugin.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("reads")).expect("JSON");
+    document["version"] = serde_json::json!("0.2.0");
+    document["sdk_range"] = serde_json::json!(">=0.1.99, <0.2.0");
+    let manifest_bytes = serde_json::to_vec_pretty(&document).expect("writes");
+    std::fs::write(&manifest_path, &manifest_bytes).expect("writes");
+    let manifest: kr_plugin_sdk::plugin::PluginManifest =
+        serde_json::from_slice(&manifest_bytes).expect("a manifest");
+    let entry = kr_plugin_sdk::catalogue::IndexEntry::from_manifest(
+        &manifest,
+        PayloadDigest::of(&manifest_bytes),
+        manifest_bytes.len() as u64,
+    );
+
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            listed_only: vec![entry.clone()],
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a generation that lists a release for a newer SDK is taken");
+    let metered = Metered::default();
+    catalogue.set_transport(Arc::new(metered.clone()));
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("the release this host implements the SDK of installs");
+    let fetched = metered.fetches("/packages/");
+
+    // The other host's extraction: the files are where an activation puts them, whole.
+    let store = catalogue.store(&repository()).expect("enrolled");
+    let directory = store.package_dir(entry.manifest_digest);
+    std::fs::create_dir_all(&directory).expect("a directory");
+    for name in ["plugin.json", "presentation.json"] {
+        std::fs::copy(newer.join(name), directory.join(name)).expect("copies");
+    }
+    assert!(
+        complete(&store, entry.manifest_digest),
+        "the extracted package checks out as a package held here"
+    );
+
+    let refusal = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &entry.version,
+            entry.manifest_digest,
+            InstallationGrant::none(),
+        )
+        .await
+        .expect_err("the extracted package needs a newer SDK");
+    let CatalogueError::UnsafePackage { detail } = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert!(detail.contains("sdk_range >=0.1.99, <0.2.0"), "{detail}");
+    assert_eq!(metered.fetches("/packages/"), fetched, "nothing is fetched");
+    let installed = catalogue
+        .installation(environment(), &plugin())
+        .expect("readable")
+        .expect("still installed");
+    assert_eq!(installed.version, version());
+    assert_eq!(installed.package_digest, generation.manifest_digest());
+}
+
 /// Reads the local repository, and records every address fetched with the bytes its answer
 /// delivered.
 #[derive(Clone, Debug, Default)]

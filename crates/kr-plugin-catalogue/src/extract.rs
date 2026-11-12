@@ -110,13 +110,31 @@ pub fn check_declared(entry: &IndexEntry, ledger: &BudgetLedger) -> CatalogueRes
 /// Returns [`CatalogueError::UnsafePackage`] with the finding the package check gives for the
 /// range, and nothing else.
 pub fn check_sdk_range(entry: &IndexEntry) -> CatalogueResult<()> {
-    match sdk_range_refusal(&entry.sdk_range) {
+    check_range(
+        &entry.sdk_range,
+        &format!(
+            "{}/{} {}",
+            entry.publisher_id, entry.plugin_name, entry.version
+        ),
+    )
+}
+
+/// As [`check_sdk_range`], for a package that is already extracted here: the range its own manifest
+/// states. A host of a later SDK on the same store may have extracted a package this host cannot
+/// run, and it is not installed by its digest for that reason either.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::UnsafePackage`] as [`check_sdk_range`] does.
+pub fn check_extracted_sdk_range(manifest: &PluginManifest, subject: &str) -> CatalogueResult<()> {
+    check_range(&manifest.sdk_range, subject)
+}
+
+fn check_range(range: &kr_plugin_sdk::version::VersionRange, subject: &str) -> CatalogueResult<()> {
+    match sdk_range_refusal(range) {
         None => Ok(()),
         Some(finding) => Err(CatalogueError::UnsafePackage {
-            detail: format!(
-                "{}/{} {} is not a package this host will install: {finding}",
-                entry.publisher_id, entry.plugin_name, entry.version
-            ),
+            detail: format!("{subject} is not a package this host will install: {finding}"),
         }),
     }
 }

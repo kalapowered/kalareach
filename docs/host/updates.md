@@ -527,7 +527,7 @@ Each release implements one version of the plugin SDK, and each package states t
 
 A refused package stays installed and is not activated, and sessions start without the integration it carries. For the Codex package that means Codex runs as typed, with no gateway, until a package that the release admits is active again: a version of the package whose range admits the release's SDK, or an update of the host to a release whose SDK the package admits. A release's bundle does not put an older package back, because the seed installs a bundled package once and never replaces an installation.
 
-The same holds wherever an older release meets the package: a worker that outlives an update of the controller, a second host of an older release on the same store, and a package installed by hand. Installing a package for a newer SDK is refused before any of it is fetched, and the refusal leaves the installed release in place.
+The same holds wherever an older release meets the package: a worker that outlives an update of the controller, a second host of an older release on the same store, and a package installed by hand. A build released before the check of the range fetches and stages a package for a newer SDK and then refuses it, and the refusal leaves the installed release in place. A build from this one on refuses such a package before anything is fetched, and also when a host of a later SDK extracted it into the same store, which would otherwise be installed by its digest; it keeps the installed release in both cases.
 
 ### What is kept, and what does not go back
 
