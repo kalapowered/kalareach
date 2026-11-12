@@ -1607,6 +1607,8 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
     for text in both("a link") {
         assert!(text.contains("it is a link"), "{text}");
         assert!(text.contains("Remove "), "{text}");
+        assert!(text.contains("itself"), "{text}");
+        assert!(text.contains("not what it points to"), "{text}");
         assert!(!text.contains("Make the Administrators group"), "{text}");
     }
     std::fs::remove_dir(&junction).unwrap();
@@ -2136,7 +2138,11 @@ fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link
     paths.program_top = link.clone();
     paths.git = paths.program.join("git");
     for text in refused(&paths, "a link above the program directory") {
-        assert!(text.contains("it is a link or not a folder"), "{text}");
+        assert!(text.contains("it is a link or a mounted folder"), "{text}");
+        assert!(
+            text.contains("does not go through a link or a mounted folder at or above its trees"),
+            "{text}"
+        );
         assert!(text.contains(&link.display().to_string()), "{text}");
     }
     std::fs::remove_dir(&link).unwrap();
@@ -2180,8 +2186,15 @@ fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of
     let refused = both(&paths, "a parent that cannot be opened");
     drop(held);
     for text in refused {
-        assert!(text.contains("could not be opened to be checked"), "{text}");
-        assert!(text.contains("close that program"), "{text}");
+        assert!(
+            text.contains("could not be opened or read to be checked"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Close the program that holds it open"),
+            "{text}"
+        );
+        assert!(text.contains("program directory"), "{text}");
         assert!(text.contains(&above.display().to_string()), "{text}");
         assert!(!text.contains("Make the Administrators group"), "{text}");
     }
