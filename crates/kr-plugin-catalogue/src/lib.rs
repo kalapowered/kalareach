@@ -1918,7 +1918,15 @@ impl Catalogue {
         // rather than letting a kept copy through.
         if let Some(hash) = package_hash {
             match store.check_package(hash, limits)? {
-                PackageCheck::Complete(package) => return Ok(*package),
+                PackageCheck::Complete(package) => {
+                    // A package a host of a later SDK extracted into this store is not installed by
+                    // its digest for a host that cannot run it.
+                    extract::check_extracted_sdk_range(
+                        package.manifest(),
+                        &format!("{plugin_id} {version}"),
+                    )?;
+                    return Ok(*package);
+                }
                 PackageCheck::PastALimit(limit) => return Err(limit.into()),
                 PackageCheck::Missing { .. } | PackageCheck::Corrupt { .. } => {}
             }
@@ -1950,6 +1958,9 @@ impl Catalogue {
         // hash, and it has to agree with the manifest the hash names before anything relies on it.
         let ledger = ledger_of(store, enrolled, limits)?;
         extract::check_declared(&entry, &ledger)?;
+        // A package that needs another SDK than this host implements is refused before it is read
+        // from the store or fetched.
+        extract::check_sdk_range(&entry)?;
         match store.check_package(entry.manifest_digest, limits)? {
             PackageCheck::Complete(package) => {
                 extract::reconcile(&entry, package.manifest(), &subject)?;
@@ -1958,9 +1969,6 @@ impl Catalogue {
             PackageCheck::PastALimit(limit) => return Err(limit.into()),
             PackageCheck::Missing { .. } | PackageCheck::Corrupt { .. } => {}
         }
-        // A package that needs another SDK than this host implements is refused before anything is
-        // made room for or fetched.
-        extract::check_sdk_range(&entry)?;
 
         // The package is staged whole, beside everything the cache and the packages already here
         // hold, and what it still has to fetch is cached on the way. Room for both is made before
