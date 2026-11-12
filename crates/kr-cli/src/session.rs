@@ -2203,6 +2203,12 @@ struct ConsoleMouse {
     /// screen the session drew for this terminal, and only an output event that is decoded and read
     /// uses it up.
     awaiting_first: bool,
+    /// Whether the stream has a hole in it that no screen has closed: the bridge shed a frame and
+    /// queued a marker in its place, or a frame could not be decoded. What the reader holds of the
+    /// mouse may then differ from what the session holds, so the output that follows is read as
+    /// drawn, with nothing written after it to put a terminal in an encoding the session may have
+    /// left, until the first frame of the screen that follows.
+    hole: bool,
     /// Whether the console has been asked to report the mouse.
     given: bool,
 }
@@ -2239,11 +2245,26 @@ impl ConsoleMouse {
         self.awaiting_first = output;
     }
 
+    /// The stream has a hole in it: output of the subscription that is being replaced, or output
+    /// that cannot be decoded, says nothing of what was lost.
+    fn hole_in_the_stream(&mut self) {
+        self.hole = true;
+    }
+
     /// How an output event of the session is read: as part of a restoration, or as what the
-    /// application wrote.
+    /// application wrote, which is read as drawn while there is a hole in the stream.
     fn reading_of(&mut self, cursor: u64, length: usize) -> crate::mouse::Reading {
         let first = std::mem::take(&mut self.awaiting_first);
-        self.restoration.reading(first, cursor, length)
+        let reading = self.restoration.reading(first, cursor, length);
+        // The first frame of a new subscription is its screen, which says the state again.
+        if first {
+            self.hole = false;
+        }
+        if self.hole && reading == crate::mouse::Reading::Live {
+            crate::mouse::Reading::Painted
+        } else {
+            reading
+        }
     }
 
     /// Gives the mouse to the application or back to the console to match what the application has
@@ -2593,6 +2614,10 @@ async fn drive(
                                 return AttachOutcome::Disconnected;
                             }
                             let _ = handle.flush();
+                        } else if notification.event_type.as_str() == "session.output" {
+                            // Output that cannot be decoded is not drawn, and what it carried is
+                            // lost to the reader.
+                            console_mouse.hole_in_the_stream();
                         }
                         // A projected attachment is sent the canonical grid as state and draws it
                         // itself. The renderer is shared with the client library, so this terminal
@@ -2689,6 +2714,10 @@ async fn drive(
                             // It is discarded before the fresh one is asked for, so nothing is
                             // drawn from it in between.
                             display.discard();
+                            // The frames the bridge shed to queue this marker are not the reader's
+                            // to know, and the output of this subscription that follows is read
+                            // without them.
+                            console_mouse.hole_in_the_stream();
                             if closing || !subscriptions.replace() {
                                 continue;
                             }
@@ -4628,6 +4657,89 @@ mod tests {
         assert_eq!(
             shown(&ran.written),
             shown(&[SCREEN, SCREEN, &follow, SCREEN, SCREEN, &follow].concat())
+        );
+    }
+
+    /// After a hole in the stream, the state the reader holds is not trusted: a frame the bridge shed
+    /// may have carried a reset or a set, so the output of the old subscription that follows the
+    /// marker is read as drawn, with nothing written after it, until the first frame of the new
+    /// subscription's screen. A terminal that returns the default at a reset of either encoding is
+    /// not put in an encoding the session may no longer hold. The screen's own modes arrive, and what
+    /// the application writes after it is read as live again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_of_the_old_subscription_after_a_hole_is_written_no_follow_up() {
+        let follow_1006 = crate::mouse::Follow {
+            at: 0,
+            encoding: 1006,
+        }
+        .bytes();
+
+        // A reset of 1006 is shed, and the output that follows it resets 1005.
+        let ran = wire::run_switched(true, true, |case| async move {
+            case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1006h");
+            case.says_resync(2);
+            case.says_output_bytes(3, b"\x1b[?1005l");
+            case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1005;1006l");
+            case.says_output_bytes(1, b"\x1b[?1006h\x1b[?1005l");
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            shown(&ran.written),
+            shown(
+                &[
+                    &b"\x1b[?1000h\x1b[?1006h"[..],
+                    b"\x1b[?1005l",
+                    b"\x1b[?1000h\x1b[?1005;1006l",
+                    // The new subscription's output is read as live again.
+                    b"\x1b[?1006h\x1b[?1005l",
+                    &follow_1006,
+                ]
+                .concat()
+            )
+        );
+
+        // A set of 1006 is shed while 1005 is held, and the output that follows it resets 1006.
+        let follow_1005 = crate::mouse::Follow {
+            at: 0,
+            encoding: 1005,
+        }
+        .bytes();
+        let ran = wire::run_switched(true, true, |case| async move {
+            case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1005h");
+            case.says_resync(2);
+            case.says_output_bytes(3, b"\x1b[?1006l");
+            case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1005;1006l\x1b[?1006h");
+            case.says_output_bytes(1, b"\x1b[?1005h\x1b[?1006l");
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            shown(&ran.written),
+            shown(
+                &[
+                    &b"\x1b[?1000h\x1b[?1005h"[..],
+                    b"\x1b[?1006l",
+                    b"\x1b[?1000h\x1b[?1005;1006l\x1b[?1006h",
+                    b"\x1b[?1005h\x1b[?1006l",
+                    &follow_1005,
+                ]
+                .concat()
+            )
+        );
+
+        // A frame that cannot be decoded is a hole too, and nothing closes it but a screen.
+        let ran = wire::run_switched(true, true, |case| async move {
+            case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1006h");
+            case.says_output_it_cannot_decode(1);
+            case.says_output_bytes(2, b"\x1b[?1005l");
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            shown(&ran.written),
+            shown(b"\x1b[?1000h\x1b[?1006h\x1b[?1005l")
         );
     }
 

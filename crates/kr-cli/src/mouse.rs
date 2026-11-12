@@ -91,7 +91,9 @@ pub enum Reading {
     /// application sets or resets a mouse encoding, or the next restoration, as it did.
     Restoration,
     /// What this command drew from the session's screen: read as a terminal reads it, and nothing
-    /// is written after it.
+    /// is written after it. Output of the session that follows a hole in the stream (a frame the
+    /// bridge shed, or one that could not be decoded) is read the same way until the next screen,
+    /// because the state the reader holds may no longer be the session's.
     Painted,
 }
 
