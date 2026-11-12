@@ -146,14 +146,6 @@ interface LinkReading {
   /** How far the words after the link moved because of its reach, and the most the room it has lets them move. */
   readonly moved: number
   readonly mostMoved: number
-  /** The points inside the link's own words that another link took the press at. */
-  readonly stolen: readonly string[]
-  /** The points just inside the link's box, over the plain text around it, that did not reach it. */
-  readonly lost: readonly string[]
-  /** The points just above and below the link's words, in its own line, that went to another link or to none. */
-  readonly nearby: readonly string[]
-  /** The points in the reach beside the link's words, low in its line, that went to another link or to none. */
-  readonly beside: readonly string[]
   /** How far the link's own words and the words before it moved sideways because of its reach. */
   readonly wordsMoved: number
   readonly beforeMoved: number
@@ -177,12 +169,9 @@ interface LinksReading {
 // moves nothing, and a narrower one moves the words after it by the difference and no more, whether
 // it is one character, four narrow ones or one in bold. What is not held, and is not asserted: a line
 // with less room than that difference to spare breaks one word earlier.
-// Links on the next line, one directly under the other, and beside it show that a press on a link's
-// words, just above and below them, and in the reach beside them, is that link's. Plain lines above and
-// below a link, and plain words after it, show that a press anywhere in the box is the link's too. A
-// link at the start of a line, at its end and alone on a line shows the box is whole at the pane's
+// A link at the start of a line, at its end and alone on a line shows the box is whole at the pane's
 // edges and the conversation does not scroll sideways for it, and a link on the last line shows the
-// pane holds its box at the end.
+// pane holds its box at the end. Which link a press at a point belongs to is the next case's.
 test.describe('a link inside a message', () => {
   for (const surface of ['ios', 'android'] as const) {
     test(`is a full touch target on ${surface} and moves the words after it only as far as a narrow label needs`, async ({ page }) => {
@@ -319,78 +308,13 @@ test.describe('a link inside a message', () => {
             Math.abs((before[name]?.height ?? 0) - (without[name]?.height ?? 0)) > 0.5
         )
 
-        const inPlainText = new Set([framedLink])
         const paneBox = pane.getBoundingClientRect()
         const room = Math.min(finger / 2, gutter)
         const readings = links.map((link, index): LinkReading => {
           link.scrollIntoView({ block: 'center' })
           const box = link.getBoundingClientRect()
-          const words = wordsOf(link).getClientRects()
           const name = `"${link.textContent ?? ''}" (${String(index + 1)})`
           const wordsWidth = without[`the words of ${name}`]?.width ?? 0
-          const stolen: string[] = []
-          for (const rect of [words[0], words[words.length - 1]]) {
-            if (!rect) continue
-            const points: [string, number, number][] = [
-              ['the top', rect.left + rect.width / 2, rect.top + 2],
-              ['the bottom', rect.left + rect.width / 2, rect.bottom - 2],
-              ['the start', rect.left + 1, rect.top + rect.height / 2],
-              ['the end', rect.right - 1, rect.top + rect.height / 2]
-            ]
-            for (const [where, x, y] of points) {
-              if (document.elementFromPoint(x, y)?.closest('.md-link') !== link) stolen.push(where)
-            }
-          }
-          const lost: string[] = []
-          if (inPlainText.has(link)) {
-            const middle = box.top + box.height / 2
-            const points: [string, number, number][] = [
-              ['the top', box.left + box.width / 2, box.top + 3],
-              ['the bottom', box.left + box.width / 2, box.bottom - 3],
-              ['the start', box.left + 3, middle],
-              ['the end', box.right - 3, middle]
-            ]
-            for (const [where, x, y] of points) {
-              const found = document.elementFromPoint(x, y)
-              if (found?.closest('.md-link') !== link) lost.push(`${where}: ${found ? `${found.tagName} ${found.className}` : 'nothing'}`)
-            }
-          }
-          // Just above and just below the words, inside the link's own line: whoever has a box there, the
-          // press is this link's, since its words are the nearer.
-          const nearby: string[] = []
-          const wordsAt = wordsOf(link).getClientRects()
-          const top = wordsAt[0]
-          const bottom = wordsAt[wordsAt.length - 1]
-          const around: [string, DOMRect | undefined, number][] = [
-            ['above the words', top, (top?.top ?? 0) - 1.5],
-            ['below the words', bottom, (bottom?.bottom ?? 0) + 1.5]
-          ]
-          for (const [where, rect, y] of around) {
-            if (!rect) continue
-            const found = document.elementFromPoint(rect.left + rect.width / 2, y)
-            if (found?.closest('.md-link') !== link) nearby.push(`${where}: ${found ? `${found.tagName} ${found.className}` : 'nothing'}`)
-          }
-          // In the reach beside the words, low in the line, where a link on the next line has its box: the
-          // press is this link's. Where another link follows on the same line, the later link's area is
-          // the one above between their words, so that side is left out.
-          const beside: string[] = []
-          const lowest = wordsAt[wordsAt.length - 1]
-          const first = wordsAt[0]
-          if (lowest && first) {
-            const y = lowest.bottom + 1.5
-            const sides: [string, number][] = [
-              ['at the start of the box', box.left + 4],
-              ['by the start of the words', first.left - 3],
-              ['by the end of the words', lowest.right + 3],
-              ['at the end of the box', box.right - 4]
-            ]
-            for (const [where, x] of sides) {
-              if (link === second && where.includes('end')) continue
-              if (link === third && where.includes('start')) continue
-              const found = document.elementFromPoint(x, y)
-              if (found?.closest('.md-link') !== link) beside.push(`${where}: ${found ? `${found.tagName} ${found.className}` : 'nothing'}`)
-            }
-          }
           const was = without[`what follows ${name}`]
           const is = before[`what follows ${name}`]
           const wordsWas = without[`the words of ${name}`]
@@ -404,10 +328,6 @@ test.describe('a link inside a message', () => {
             wordsMoved: wordsWas && wordsIs ? Math.abs(wordsIs.left - wordsWas.left) : 0,
             beforeMoved: ahead[0] && ahead[1] ? Math.abs(ahead[1].left - ahead[0].left) : 0,
             mostMoved: Math.max(0, finger - 2 * room - wordsWidth),
-            stolen,
-            lost,
-            nearby,
-            beside
           }
         })
 
@@ -429,10 +349,6 @@ test.describe('a link inside a message', () => {
         expect.soft(link.height, `the height of "${link.label}" where it can be pressed`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
         // Within a pixel: layout rounds a button's width to a fraction of a pixel, and the same label differs by that.
         expect.soft(link.moved, `how far the words after "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved + 1)
-        expect.soft(link.stolen, `where a press on the words of "${link.label}" went to another link`).toEqual([])
-        expect.soft(link.lost, `where a press inside the box of "${link.label}" did not reach it`).toEqual([])
-        expect.soft(link.nearby, `where a press by the words of "${link.label}" went elsewhere`).toEqual([])
-        expect.soft(link.beside, `where a press in the reach beside "${link.label}" went elsewhere`).toEqual([])
         // The label is centred in the box, so a widened box moves it by half of the difference.
         expect.soft(link.wordsMoved, `how far "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved / 2 + 1)
         expect.soft(link.beforeMoved, `how far the words before "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved + 1)

@@ -185,8 +185,8 @@ function renderToken(token: Token, context: MarkdownContext, key: string): React
           }}
           title={link.href}
         >
-          {/* The words are a layer of their own, so a phone can give the button a press area
-              larger than the line without a neighbouring link's area covering these words. */}
+          {/* The words are an element of their own: a phone measures them to decide which link a
+              press belongs to, and the focus ring follows them. */}
           <span className="md-link-label">{label}</span>
         </button>
       )
