@@ -59,6 +59,9 @@ pub enum AttachOutcome {
     /// The session refused what was typed here, from one write on, because the application in it
     /// asked for a keyboard encoding that console keys cannot be sent in.
     InputRefused(Shown),
+    /// The screens the session sent could not be read, as many times in a row as the retry policy
+    /// asks for them.
+    OutputUnreadable,
 }
 
 impl std::fmt::Debug for AttachOutcome {
@@ -88,6 +91,7 @@ impl std::fmt::Debug for AttachOutcome {
             Self::InputRefused(detail) => {
                 formatter.debug_tuple("InputRefused").field(detail).finish()
             }
+            Self::OutputUnreadable => formatter.write_str("OutputUnreadable"),
         }
     }
 }
@@ -128,6 +132,9 @@ impl AttachOutcome {
                  `kr attach --no-probe` watches it without typing: {}",
                 *detail
             ),
+            Self::OutputUnreadable => Shown::said(
+                "the session's output cannot be read by this `kr`, so the attachment ended",
+            ),
         }
     }
 
@@ -153,7 +160,8 @@ impl AttachOutcome {
             | Self::LeaseLost
             | Self::Disconnected
             | Self::DeliveryUncertain(_)
-            | Self::InputRefused(_) => true,
+            | Self::InputRefused(_)
+            | Self::OutputUnreadable => true,
         }
     }
 
@@ -170,7 +178,9 @@ impl AttachOutcome {
                 ErrorCode::LeaseLost,
                 self.detail(),
             ))),
-            Self::Disconnected => Some(CliError::HostUnavailable(self.detail())),
+            Self::Disconnected | Self::OutputUnreadable => {
+                Some(CliError::HostUnavailable(self.detail()))
+            }
             Self::DeliveryUncertain(_) => Some(CliError::Refused(refusal(
                 ErrorCode::OutcomeUnknown,
                 self.detail(),
@@ -1527,6 +1537,21 @@ struct Subscriptions {
     attempts: Attempts,
     /// When the subscription the session refused for now is asked for again.
     retry_at: Option<tokio::time::Instant>,
+    /// How many screens in a row could not be read, whatever the session answered to the requests
+    /// that asked for them: only a screen that is read ends the count.
+    unreadable: u32,
+    /// What the retry policy has left for asking again after screens that could not be read.
+    unreadable_attempts: Attempts,
+}
+
+/// What to do after a screen that could not be read.
+enum Unreadable {
+    /// Ask for a new subscription now.
+    Now,
+    /// It is asked for when the retry policy's pause is over.
+    After,
+    /// The policy has no more to give.
+    GiveUp,
 }
 
 impl Subscriptions {
@@ -1537,7 +1562,36 @@ impl Subscriptions {
             opening: true,
             attempts: Attempts::new(),
             retry_at: None,
+            unreadable: 0,
+            unreadable_attempts: Attempts::new(),
         }
+    }
+
+    /// A screen could not be read, and a new one is to be asked for: now for the first, and then
+    /// after the pauses the retry policy gives, for as many times as it gives. Two clocks are not
+    /// kept: the pause is the policy's, and the request is sent by the same timer that sends a
+    /// subscription the session refused for now.
+    fn screen_unreadable(&mut self) -> Unreadable {
+        self.unreadable += 1;
+        if self.unreadable == 1 {
+            return Unreadable::Now;
+        }
+        // The policy is asked about a condition it waits out, as it is for a refusal for now.
+        let decision = self.unreadable_attempts.decide(
+            Failure::new(ErrorCode::ResourceUnavailable),
+            RequestClass::IdempotentRead,
+        );
+        let Recovery::Retry { delay } = decision.recovery else {
+            return Unreadable::GiveUp;
+        };
+        self.retry_at = Some(tokio::time::Instant::now() + delay);
+        Unreadable::After
+    }
+
+    /// A screen was read: the first frame of a subscription was decoded.
+    fn screen_readable(&mut self) {
+        self.unreadable = 0;
+        self.unreadable_attempts = Attempts::new();
     }
 
     /// The session refused the new subscription under `code`, for now. Says whether it is asked for
@@ -2199,10 +2253,6 @@ struct ConsoleMouse {
     speller: crate::mouse::MouseSpeller,
     /// Which of the output events are a restoration.
     restoration: crate::mouse::Restoration,
-    /// Whether the first delivery of the subscription is output that has yet to be read: it is the
-    /// screen the session drew for this terminal, and only an output event that is decoded and read
-    /// uses it up.
-    awaiting_first: bool,
     /// Whether the stream has a hole in it that no screen has closed: the bridge shed a frame and
     /// queued a marker in its place, or a frame could not be decoded. What the reader holds of the
     /// mouse may then differ from what the session holds, so the output that follows is read as
@@ -2239,25 +2289,18 @@ impl ConsoleMouse {
         let _ = self.shown(output, terminal, may_type, crate::mouse::Reading::Painted);
     }
 
-    /// A subscription has delivered its first notification, which is output or something else: a
-    /// stream that begins with something else, a projected one, has no screen of output to read.
-    fn first_delivery_is(&mut self, output: bool) {
-        self.awaiting_first = output;
-    }
-
     /// The stream has a hole in it: output of the subscription that is being replaced, or output
-    /// that cannot be decoded, says nothing of what was lost. A first delivery that could not be
-    /// decoded was not the screen, and no later frame is taken for it: only the first delivery of a
-    /// subscription that is asked for after the hole can close it.
+    /// that cannot be decoded, says nothing of what was lost. Only the first delivery of a
+    /// subscription that is asked for after the hole, once it is decoded, can close it.
     fn hole_in_the_stream(&mut self) {
         self.hole = true;
-        self.awaiting_first = false;
     }
 
     /// How an output event of the session is read: as part of a restoration, or as what the
-    /// application wrote, which is read as drawn while there is a hole in the stream.
-    fn reading_of(&mut self, cursor: u64, length: usize) -> crate::mouse::Reading {
-        let first = std::mem::take(&mut self.awaiting_first);
+    /// application wrote, which is read as drawn while there is a hole in the stream. `first` says
+    /// the event is the first delivery of its subscription, which is the screen the session drew
+    /// for this terminal.
+    fn reading_of(&mut self, first: bool, cursor: u64, length: usize) -> crate::mouse::Reading {
         let reading = self.restoration.reading(first, cursor, length);
         // The first frame of a new subscription is its screen, which says the state again.
         if first {
@@ -2564,18 +2607,17 @@ async fn drive(
                         {
                             window.streamed();
                         }
-                        // The same delivery is the screen the session drew for this terminal. A
-                        // payload that cannot be decoded below is not drawn and does not use that
-                        // up: the next output that decodes is the screen.
-                        if heard == Heard::First {
-                            console_mouse
-                                .first_delivery_is(notification.event_type.as_str() == "session.output");
-                        }
                         if notification.event_type.as_str() == "session.output"
                             && let Ok(event) = notification
                                 .payload
                                 .to_typed::<kr_protocol::recovery::OutputEvent>()
                         {
+                            // The first delivery of a subscription is the screen the session drew
+                            // for this terminal, and a screen that is read ends the count of those
+                            // that were not.
+                            if heard == Heard::First {
+                                subscriptions.screen_readable();
+                            }
                             // Bytes drawn while this terminal holds no projection are its own
                             // stream or its restoration, and both are the live screen: what it is
                             // showing from here is not somebody's history. A bell routed to the
@@ -2588,8 +2630,11 @@ async fn drive(
                             // The console is given the mouse before it is shown that the
                             // application asked for it, so that nothing it is shown can be
                             // answered by a mouse the console still kept.
-                            let reading = console_mouse
-                                .reading_of(event.cursor.get(), event.bytes.as_slice().len());
+                            let reading = console_mouse.reading_of(
+                                heard == Heard::First,
+                                event.cursor.get(),
+                                event.bytes.as_slice().len(),
+                            );
                             let follows = console_mouse.shown(
                                 event.bytes.as_slice(),
                                 terminal,
@@ -2626,12 +2671,21 @@ async fn drive(
                                 continue;
                             }
                             window.recovering();
-                            let request_id = kr_protocol::ids::RequestId::new(next_request);
-                            next_request += 1;
-                            if !resubscribe(client, attaching, request_id, attachment_id).await {
-                                return AttachOutcome::Disconnected;
+                            match subscriptions.screen_unreadable() {
+                                Unreadable::Now => {
+                                    let request_id =
+                                        kr_protocol::ids::RequestId::new(next_request);
+                                    next_request += 1;
+                                    if !resubscribe(client, attaching, request_id, attachment_id)
+                                        .await
+                                    {
+                                        return AttachOutcome::Disconnected;
+                                    }
+                                    outstanding.insert(request_id, Outstanding::Resubscribe);
+                                }
+                                Unreadable::After => {}
+                                Unreadable::GiveUp => return AttachOutcome::OutputUnreadable,
                             }
-                            outstanding.insert(request_id, Outstanding::Resubscribe);
                             continue;
                         }
                         // A projected attachment is sent the canonical grid as state and draws it
@@ -2652,15 +2706,31 @@ async fn drive(
                                     continue;
                                 }
                                 window.recovering();
-                                let request_id = kr_protocol::ids::RequestId::new(next_request);
-                                next_request += 1;
-                                if !resubscribe(client, attaching, request_id, attachment_id).await
-                                {
-                                    return AttachOutcome::Disconnected;
+                                match subscriptions.screen_unreadable() {
+                                    Unreadable::Now => {
+                                        let request_id =
+                                            kr_protocol::ids::RequestId::new(next_request);
+                                        next_request += 1;
+                                        if !resubscribe(
+                                            client,
+                                            attaching,
+                                            request_id,
+                                            attachment_id,
+                                        )
+                                        .await
+                                        {
+                                            return AttachOutcome::Disconnected;
+                                        }
+                                        outstanding.insert(request_id, Outstanding::Resubscribe);
+                                    }
+                                    Unreadable::After => {}
+                                    Unreadable::GiveUp => return AttachOutcome::OutputUnreadable,
                                 }
-                                outstanding.insert(request_id, Outstanding::Resubscribe);
                                 continue;
                             };
+                            if heard == Heard::First {
+                                subscriptions.screen_readable();
+                            }
                             let drawn = display.apply(event);
                             // What counts as the session writing is the session's output cursor
                             // moving, which is the one thing a screen this terminal asked for
@@ -4815,6 +4885,102 @@ mod tests {
             })
             .count();
         assert_eq!(requests, 2, "a request for a new subscription at each");
+    }
+
+    /// A session whose every screen cannot be read is asked for a new one at the retry policy's
+    /// pace and not for ever: the first at once, the next after the pauses the policy gives, and
+    /// when it has no more to give the attachment ends and says what is wrong. The session took
+    /// every request, which does not end the count: only a screen that is read does. The clock is
+    /// stopped, so the pauses cost nothing and the case reads the time that passed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn screens_that_cannot_be_read_in_a_row_are_asked_for_at_the_policys_pace_and_then_end_it()
+     {
+        use kr_client::retry::RETRY_BACKOFF_MIN;
+        use kr_protocol::envelope::{Outcome, ParamsValue};
+
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            wire::run_switched(true, true, |mut case| async move {
+                case.says_output_it_cannot_decode(0);
+                for asked in 1..=4 {
+                    let sent_at = tokio::time::Instant::now();
+                    let request = case.next_request_asked(Method::EventsSubscribe).await;
+                    let waited = sent_at.elapsed();
+                    if asked == 1 {
+                        assert!(waited < RETRY_BACKOFF_MIN, "the first is asked for at once");
+                    } else {
+                        assert!(
+                            waited >= RETRY_BACKOFF_MIN,
+                            "request {asked} waits for the policy's pause: {waited:?}"
+                        );
+                    }
+                    case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                    case.says_output_it_cannot_decode(0);
+                }
+            }),
+        )
+        .await
+        .expect("the attachment ended");
+        assert!(
+            matches!(ran.outcome, AttachOutcome::OutputUnreadable),
+            "{:?}",
+            ran.outcome
+        );
+        assert!(ran.outcome.is_failure());
+        assert!(
+            ran.outcome.detail().as_str().contains("cannot be read"),
+            "{}",
+            ran.outcome.detail().as_str()
+        );
+        let asked = ran
+            .sent
+            .iter()
+            .filter(|frame| {
+                matches!(frame, kr_protocol::envelope::ControlFrame::Request(request)
+                    if request.method == Method::EventsSubscribe.into())
+            })
+            .count();
+        assert_eq!(asked, 4, "four requests, and then it ends");
+    }
+
+    /// A screen that is read ends the count: two that cannot be read and then one that can leave the
+    /// next failure at the first again, which is asked for at once.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_screen_that_is_read_ends_the_count_of_screens_that_could_not_be() {
+        use kr_client::retry::RETRY_BACKOFF_MIN;
+        use kr_protocol::envelope::{Outcome, ParamsValue};
+
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            wire::run_switched(true, true, |mut case| async move {
+                case.says_output_it_cannot_decode(0);
+                for _ in 0..2 {
+                    let request = case.next_request_asked(Method::EventsSubscribe).await;
+                    case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                    case.says_output_it_cannot_decode(0);
+                }
+                // The third subscription's screen is read.
+                let request = case.next_request_asked(Method::EventsSubscribe).await;
+                case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                case.says_output_bytes(0, b"\x1b[?1000h");
+                // The next failure is the first of a new count, and is asked for at once.
+                case.says_output_it_cannot_decode(1);
+                let failed_at = tokio::time::Instant::now();
+                let request = case.next_request_asked(Method::EventsSubscribe).await;
+                assert!(failed_at.elapsed() < RETRY_BACKOFF_MIN, "at once");
+                case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                case.closes();
+            }),
+        )
+        .await
+        .expect("the attachment ended");
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Closed { .. }),
+            "{:?}",
+            ran.outcome
+        );
     }
 
     /// The report of a click that is sent behind console keys the session refuses is no more read
