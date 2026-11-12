@@ -14,12 +14,60 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kr_plugin_sdk::connector::{ConnectorManifest, FieldPath, TemplateHole};
+use kr_plugin_sdk::connector::{
+    ConditionValue, ConnectorManifest, FieldPath, RequestCondition, TemplateHole,
+};
 use kr_protocol::broker::{ActionProvenance, OfferedDecision};
 use kr_protocol::gateway::{NativeMethodClass, RichMethodEntry, RichOperation};
 use kr_protocol::ids::UpstreamMethod;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
+
+use crate::broker::gateway::member_at;
+
+/// What the core reads of a request of the terminal's that selects a conversation: where the
+/// success reply names the thread, and when the request starts a thread the terminal never shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionPlaces {
+    /// Where the success reply names the thread.
+    pub thread: FieldPath,
+    /// The conditions that make a request one the terminal never shows. A request that meets every
+    /// one of them selects nothing. None: every request of the method selects.
+    pub hidden_when: Vec<RequestCondition>,
+}
+
+impl SelectionPlaces {
+    /// Returns true when `request` is one the terminal does not select a conversation by: the
+    /// route states conditions and the request's message meets every one.
+    ///
+    /// A condition is met when the message holds, at its place, a value of the same kind and equal
+    /// to one of its values. A place the message does not have, a value of another kind (the text
+    /// `"true"` is not the boolean) and a number with a fraction do not meet it, so a request
+    /// whose place is absent or of another type selects, as a request of a route with no
+    /// conditions does.
+    #[must_use]
+    pub fn hides(&self, request: &serde_json::Value) -> bool {
+        !self.hidden_when.is_empty()
+            && self
+                .hidden_when
+                .iter()
+                .all(|condition| condition_met(condition, request))
+    }
+}
+
+fn condition_met(condition: &RequestCondition, request: &serde_json::Value) -> bool {
+    let Some(held) = member_at(request, &condition.place) else {
+        return false;
+    };
+    condition.values.iter().any(|value| match (value, held) {
+        (ConditionValue::Text(wanted), serde_json::Value::String(held)) => wanted == held,
+        (ConditionValue::Boolean(wanted), serde_json::Value::Bool(held)) => wanted == held,
+        (ConditionValue::Integer(wanted), serde_json::Value::Number(held)) => {
+            held.as_i64() == Some(wanted.get())
+        }
+        _ => false,
+    })
+}
 
 /// The places a notification names a thread and a turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,8 +160,9 @@ fn fill_in(value: &serde_json::Value, fill: Fill<'_>) -> Result<serde_json::Valu
 /// writes its own operations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reading {
-    /// The terminal's requests whose success reply names the thread it selected, and where.
-    pub selections: BTreeMap<UpstreamMethod, FieldPath>,
+    /// The terminal's requests whose success reply names the thread it selected, where, and when
+    /// such a request selects nothing.
+    pub selections: BTreeMap<UpstreamMethod, SelectionPlaces>,
     /// The messages after which the terminal has no thread selected, and where they name it.
     pub leaves: BTreeMap<UpstreamMethod, FieldPath>,
     /// The notification that a turn started.
@@ -146,7 +195,13 @@ impl Reading {
         if let Some(observation) = table.observation.as_ref() {
             for selection in &observation.selections {
                 if let Some(method) = wire(&selection.method) {
-                    reading.selections.insert(method, selection.thread.clone());
+                    reading.selections.insert(
+                        method,
+                        SelectionPlaces {
+                            thread: selection.thread.clone(),
+                            hidden_when: selection.hidden_when.clone(),
+                        },
+                    );
                 }
             }
             for leave in &observation.leaves {

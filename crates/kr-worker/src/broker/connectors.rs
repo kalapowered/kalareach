@@ -1649,7 +1649,14 @@ pub mod fixture {
         });
         table["observation"] = serde_json::json!({
             "selections": [
-                { "method": "thread.start", "thread": path(&["result", "thread", "id"]) },
+                {
+                    "method": "thread.start",
+                    "thread": path(&["result", "thread", "id"]),
+                    "hidden_when": [
+                        { "place": path(&["params", "ephemeral"]), "values": [true] },
+                        { "place": path(&["params", "threadSource"]), "values": ["system"] }
+                    ]
+                },
                 { "method": "thread.resume", "thread": path(&["result", "thread", "id"]) }
             ],
             "leaves": [
