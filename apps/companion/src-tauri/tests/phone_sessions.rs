@@ -3328,8 +3328,7 @@ async fn kr_req_19_08_the_main_links_dial_does_not_wait_behind_other_dials() {
     let turned_away = waiting
         .await
         .expect("the dial ran")
-        .err()
-        .expect("the other dial is refused");
+        .expect_err("the other dial is refused");
     assert_eq!(
         code_of(&turned_away),
         ErrorCode::ResourceUnavailable,
@@ -3351,15 +3350,14 @@ async fn kr_req_19_08_the_main_links_dial_does_not_wait_behind_other_dials() {
     let reached = main
         .await
         .expect("the dial ran")
-        .err()
-        .expect("the governed link refuses");
+        .expect_err("the governed link refuses");
     assert_eq!(
         code_of(&reached),
         ErrorCode::PermissionDenied,
         "the main link's dial was given its place and reached the link"
     );
     for filler in fillers {
-        filler.await.expect("the dial ran").err().expect("refused");
+        filler.await.expect("the dial ran").expect_err("refused");
     }
     assert_eq!(
         places.held_on(elsewhere.host_device_id),
@@ -3417,8 +3415,7 @@ async fn kr_req_19_08_holders_that_ask_for_another_connection_are_refused_and_ev
     for ask in futures_util::future::join_all(asks).await {
         let error = ask
             .expect("each holder is answered inside its own time limit")
-            .err()
-            .expect("and refused");
+            .expect_err("and refused");
         assert_eq!(code_of(&error), ErrorCode::ResourceUnavailable);
         assert_eq!(error.retry, kr_protocol::error::RetryCategory::Transient);
     }
@@ -3427,7 +3424,7 @@ async fn kr_req_19_08_holders_that_ask_for_another_connection_are_refused_and_ev
     control.stop_holding();
     control.release_all();
     for filler in fillers {
-        filler.await.expect("the dial ran").err().expect("refused");
+        filler.await.expect("the dial ran").expect_err("refused");
     }
     drop(holders);
     places_held(host, main_only).await;
@@ -3492,7 +3489,7 @@ async fn kr_req_19_08_the_main_link_reconnects_while_other_dials_hold_every_othe
     control.refuse(Some(ErrorCode::PermissionDenied));
     control.release_all();
     for filler in fillers {
-        filler.await.expect("the dial ran").err().expect("refused");
+        filler.await.expect("the dial ran").expect_err("refused");
     }
     adopted.stop().await;
 }
