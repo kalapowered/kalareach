@@ -355,30 +355,43 @@ fn ask_with(
     inputs: &[(&str, &str)],
     allowed: std::time::Duration,
 ) -> Option<String> {
-    ask_given(
-        program,
-        arguments,
-        inputs,
-        allowed,
-        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
-    )
+    #[cfg(unix)]
+    let inherited = std::env::var_os(RUNTIME_DIRECTORY_VARIABLE);
+    #[cfg(not(unix))]
+    let inherited: Option<std::ffi::OsString> = None;
+    ask_given(program, arguments, inputs, allowed, inherited.as_deref())
 }
 
-/// Whether the variables a shell is started with name a per-user runtime directory: the value that
-/// the program's own variables give it, or else the one this process has, and not empty.
+/// The variable that names the per-user directory where the .NET runtime keeps the files of its
+/// named mutexes and shared memory: `TMPDIR` on macOS, `XDG_RUNTIME_DIR` on the other Unix systems.
+/// Where it is unset the runtime keeps them in a `.dotnet` directory of the home.
+#[cfg(unix)]
+const RUNTIME_DIRECTORY_VARIABLE: &str = if cfg!(target_os = "macos") {
+    "TMPDIR"
+} else {
+    "XDG_RUNTIME_DIR"
+};
+
+/// Whether the variables a shell is started with name a per-user runtime directory
+/// ([`RUNTIME_DIRECTORY_VARIABLE`]): the value that the program's own variables give it, or else the
+/// one this process has, and not empty.
 #[cfg(unix)]
 fn names_a_runtime_directory(
     own: &[(String, String)],
     inherited: Option<&std::ffi::OsStr>,
 ) -> bool {
-    match own.iter().rev().find(|(name, _)| name == "XDG_RUNTIME_DIR") {
+    match own
+        .iter()
+        .rev()
+        .find(|(name, _)| name == RUNTIME_DIRECTORY_VARIABLE)
+    {
         Some((_, value)) => !value.is_empty(),
         None => inherited.is_some_and(|value| !value.is_empty()),
     }
 }
 
-/// [`ask_with`], told the `XDG_RUNTIME_DIR` of this process rather than reading it, so that a test
-/// can ask with the variable unset.
+/// [`ask_with`], told the runtime directory this process has rather than reading it, so that a
+/// test can ask with none.
 fn ask_given(
     program: &PowerShell,
     arguments: &[&str],
@@ -443,12 +456,12 @@ fn ask_given(
     command
         .env("XDG_CACHE_HOME", directory.join("cache"))
         .env("XDG_DATA_HOME", directory.join("data"));
-    // The .NET 11 runtime of PowerShell keeps its shared memory under the per-user runtime
-    // directory and, where none is set, in a `.dotnet` directory of the home. A session on most
-    // Linux systems has one and a macOS session has none, so a question asked there would leave
-    // that directory in the person's home. A runtime directory that is set is passed on as it
-    // stands; where there is none, this call's own directory has one, owner-only, which leaves with
-    // it. The answer does not depend on it.
+    // The .NET 11 runtime of PowerShell keeps the files of its named mutexes and shared memory
+    // under the per-user directory that `RUNTIME_DIRECTORY_VARIABLE` names and, where that is
+    // unset, in a `.dotnet` directory of the home. A session usually has one, and a bare
+    // environment has none, so a question asked there would leave that directory in the person's
+    // home. A directory that is set is passed on as it stands; where there is none, this call's own
+    // directory has one, owner-only, which leaves with it. The answer does not depend on it.
     #[cfg(unix)]
     {
         if !names_a_runtime_directory(&program.environment, inherited_runtime_directory) {
@@ -457,7 +470,7 @@ fn ask_given(
                 let _ = std::fs::remove_dir_all(&directory);
                 return None;
             }
-            command.env("XDG_RUNTIME_DIR", own);
+            command.env(RUNTIME_DIRECTORY_VARIABLE, own);
         }
     }
     #[cfg(not(unix))]
@@ -2837,26 +2850,35 @@ mod tests {
         );
     }
 
-    /// What a question puts at its program's `XDG_RUNTIME_DIR`: a program that prints the variable
-    /// and the permissions of the directory it names.
+    /// A program that prints the per-user runtime directory it is started with and the permissions
+    /// of the directory that names. Its text is written beside it and placed by a process of its
+    /// own, so this process never holds it open for writing while another test starts a child.
+    #[cfg(unix)]
+    fn program_that_prints_its_runtime_directory(root: &Path) -> PathBuf {
+        let program = root.join("shell");
+        let text = root.join("shell.text");
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${variable}\"\nls -ld \"${variable}\" | cut -c1-10\n",
+                variable = RUNTIME_DIRECTORY_VARIABLE
+            ),
+        )
+        .expect("writes the program's text");
+        kr_ipc::testing::place_and_start_once(&text, &program, &["--version"]);
+        std::fs::remove_file(&text).expect("the program's text goes once it is in place");
+        program
+    }
+
+    /// What a question puts at its program's runtime directory variable.
     #[cfg(unix)]
     fn what_a_question_gives_its_runtime_directory(
+        program: &Path,
         own: &[(&str, &str)],
         inherited: Option<&str>,
     ) -> (String, String, bool) {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let root = tempfile::tempdir().expect("a directory");
-        let program = root.path().join("shell");
-        std::fs::write(
-            &program,
-            "#!/bin/sh\nprintf '%s\\n' \"$XDG_RUNTIME_DIR\"\nls -ld \"$XDG_RUNTIME_DIR\" | cut -c1-10\n",
-        )
-        .expect("writes");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("an executable");
         let shell = PowerShell {
-            executable: program,
+            executable: program.to_owned(),
             environment: own
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -2883,13 +2905,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_question_is_given_a_runtime_directory_only_where_none_is_set() {
+        let root = tempfile::tempdir().expect("a directory");
+        let program = program_that_prints_its_runtime_directory(root.path());
         for (own, inherited) in [
             (vec![], None),
             (vec![], Some("")),
-            (vec![("XDG_RUNTIME_DIR", "")], Some("/run/user/1000")),
+            (
+                vec![(RUNTIME_DIRECTORY_VARIABLE, "")],
+                Some("/run/user/1000"),
+            ),
         ] {
             let (directory, mode, remains) =
-                what_a_question_gives_its_runtime_directory(&own, inherited);
+                what_a_question_gives_its_runtime_directory(&program, &own, inherited);
             assert!(
                 Path::new(&directory).starts_with(std::env::temp_dir()),
                 "{own:?} {inherited:?}: {directory} is not under the temporary area"
@@ -2903,7 +2930,8 @@ mod tests {
         // One the program's own variables set is passed on as it stands, whatever this process has.
         for inherited in [None, Some(""), Some("/run/user/1000")] {
             let (directory, _, _) = what_a_question_gives_its_runtime_directory(
-                &[("XDG_RUNTIME_DIR", "/run/user/7")],
+                &program,
+                &[(RUNTIME_DIRECTORY_VARIABLE, "/run/user/7")],
                 inherited,
             );
             assert_eq!(directory, "/run/user/7", "{inherited:?}");
@@ -2935,27 +2963,28 @@ mod tests {
             std::fs::create_dir(&runtime).expect("a runtime directory");
             std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
                 .expect("owner-only");
+            let mut environment = vec![
+                ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+                (
+                    "XDG_CONFIG_HOME".to_owned(),
+                    home.join(".config").to_string_lossy().into_owned(),
+                ),
+            ];
+            // Not given, the shell has what this process has: none, when this case is run in a bare
+            // environment (`env -i`), which is where the fault shows.
+            if given {
+                environment.push((
+                    RUNTIME_DIRECTORY_VARIABLE.to_owned(),
+                    runtime.to_string_lossy().into_owned(),
+                ));
+            }
             let layout = HomeLayout {
                 home: home.clone(),
                 zdotdir: None,
                 xdg_config_home: Some(home.join(".config")),
                 powershell: Some(PowerShell {
                     executable: shell.executable.clone(),
-                    environment: vec![
-                        ("HOME".to_owned(), home.to_string_lossy().into_owned()),
-                        (
-                            "XDG_CONFIG_HOME".to_owned(),
-                            home.join(".config").to_string_lossy().into_owned(),
-                        ),
-                        (
-                            "XDG_RUNTIME_DIR".to_owned(),
-                            if given {
-                                runtime.to_string_lossy().into_owned()
-                            } else {
-                                String::new()
-                            },
-                        ),
-                    ],
+                    environment,
                 }),
             };
             let (all_hosts, current_host) = layout
