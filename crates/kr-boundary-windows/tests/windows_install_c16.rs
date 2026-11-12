@@ -109,8 +109,12 @@ fn names_the_folder_and_the_right(text: &str, folder: &Path, tree: &str) {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_folder_above_the_data_parent_that_an_ordinary_account_may_delete_in_is_refused() {
+    // `above` is two folders over the data parent, so that a check that read only the nearest folder
+    // above would pass.
     let above = inherited_folder();
-    let parent = above.join("KalaReach");
+    let middle = above.join("Middle");
+    owned_dir(&middle);
+    let parent = middle.join("KalaReach");
     owned_dir(&parent);
     parent_of(&parent);
     let paths = paths_at(&parent, &parent);
@@ -158,7 +162,9 @@ fn a_folder_above_the_data_parent_that_an_ordinary_account_may_delete_in_is_refu
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_folder_above_the_program_top_that_an_ordinary_account_may_delete_in_is_refused() {
     let above = inherited_folder();
-    let top = above.join("Top");
+    let middle = above.join("Middle");
+    owned_dir(&middle);
+    let top = middle.join("Top");
     owned_dir(&top);
     let data_parent = inherited_folder();
     parent_of(&data_parent);
