@@ -15,7 +15,8 @@
 //! button was released. A position the original report has no room for is not reported, as
 //! [`kr_keys::mouse`] has it, rather than reported as another cell. The encoding is one choice: mode
 //! 1005 asks for UTF-8 coordinates, which are spelled as the original report, and setting either
-//! mode replaces the one in force, while resetting either returns the original report.
+//! mode replaces the one in force, while resetting the one in force returns the original report
+//! and resetting the other changes nothing, as xterm has it.
 
 use kr_keys::{Modifiers, MouseAction, MouseButton, MouseEncoding, MouseEvent, WheelDirection};
 use kr_term::classify::CsiView;
