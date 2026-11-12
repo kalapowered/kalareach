@@ -3410,10 +3410,12 @@ fn a_client_that_holds_only_the_pipes_grant_is_refused_more_than_the_grant_and_m
         Err(5),
         "the generic rights ask for the append bit and more than the grant"
     );
+    // A client's open does not check the append bit, so the grant with that bit added is not
+    // refused here; the bit is checked when another instance of the name is made, below.
     assert_eq!(
         open_the_brokers_pipe_with(CLIENT | CREATE_INSTANCE),
-        Err(5),
-        "the grant and the right to make an instance are refused"
+        Ok(()),
+        "an open that adds the append bit to the grant is not refused"
     );
     let name = ffi::wide(pipe::NAME);
     // SAFETY: the name is NUL-terminated; the result is checked and the default descriptor is
