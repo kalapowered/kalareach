@@ -2422,7 +2422,11 @@ async fn kr_req_19_08_an_opening_that_replaces_another_ends_it_at_once() {
     })
     .await;
     assert_eq!(told["standing"]["code"], "PERMISSION_DENIED", "{told}");
-    assert_eq!(links(), 1, "only the second opening, which holds no link, remains");
+    assert_eq!(
+        links(),
+        1,
+        "only the second opening, which holds no link, remains"
+    );
     let gone = read("first").expect_err("the first stays over");
     assert_eq!(code(&gone), "STALE_SESSION", "{gone}");
     adopted.stop().await;
