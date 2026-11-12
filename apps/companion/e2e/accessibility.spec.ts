@@ -169,14 +169,16 @@ interface LinksReading {
 // from the page, which is what the platforms' trees are built from, and cut to what the pane and the
 // screen show of it. Taking the reach away shows nothing moves up or down, and the words after a link
 // move sideways only by what the room beside the link cannot give it: a label as wide as the box needs
-// is not moved at all. Links on the next line, one directly under the other, and beside it show that a
+// does not move them at all, and a narrower one moves them by the difference and no more, whether it is
+// one character, four narrow ones or one in bold. What is held is the line's height and where it
+// breaks; what is not held is a few pixels of width after a label narrower than the box. Links on the next line, one directly under the other, and beside it show that a
 // press on a link's words, and just above and below them in their own line, is that link's; plain lines above and below a link and plain words after it show that a press anywhere
 // in the box is the link's too; a link at the start of a line, at its end and alone on a line show the
 // box is whole at the pane's edges and the conversation does not scroll sideways for it; and a link on
 // the last line shows the pane holds its box at the end.
 test.describe('a link inside a message', () => {
   for (const surface of ['ios', 'android'] as const) {
-    test(`is a full touch target on ${surface} and keeps the text where it was`, async ({ page }) => {
+    test(`is a full touch target on ${surface} and moves the words after it only as far as a narrow label needs`, async ({ page }) => {
       await openSession(page, surface)
       await page.getByRole('button', { name: 'the reconnect notes' }).scrollIntoViewIfNeeded()
       const reading = await page.evaluate((finger: number): LinksReading | null => {
@@ -206,12 +208,20 @@ test.describe('a link inside a message', () => {
 
         // More links of the kinds a message can carry, each a copy of the first with other words: on
         // the next line, beside another with one space between, a single character, one in plain
-        // lines, one as long as the line, one that ends the conversation, and a single character at
-        // the start of a line, at its end and alone on a line, at the end and at the start.
-        const another = (text: string): HTMLElement => {
+        // lines, one as long as the line, one that ends the conversation, a single character at the
+        // start of a line, at its end and alone on a line, one character drawn in bold, four narrow
+        // characters, and two one directly under the other.
+        const another = (text: string, bold = false): HTMLElement => {
           const link = first.cloneNode(true) as HTMLElement
           const label = link.querySelector('.md-link-label') ?? link
-          label.textContent = text
+          if (bold) {
+            // As `[**1**](...)` is drawn: the words are one character in an element of their own.
+            const strong = document.createElement('strong')
+            strong.textContent = text
+            label.replaceChildren(strong)
+          } else {
+            label.textContent = text
+          }
           return link
         }
         const row = (align: 'left' | 'right', ...parts: (string | HTMLElement)[]): HTMLElement => {
@@ -229,6 +239,8 @@ test.describe('a link inside a message', () => {
         const atEnd = another('1')
         const aloneAtStart = another('1')
         const aloneAtEnd = another('1')
+        const formatted = another('1', true)
+        const narrow = another('iiii')
         const pairAbove = another('the first of two links')
         const pairBelow = another('the second of two links')
         paragraph.append(document.createElement('br'), second, ' ', third, ', and plain words after it.')
@@ -245,14 +257,16 @@ test.describe('a link inside a message', () => {
           row('left', atStart, ', then plain words after the link at the start of the line.'),
           row('right', 'Plain words before the link at the end of the line, ', atEnd),
           row('left', aloneAtStart),
-          row('right', aloneAtEnd)
+          row('right', aloneAtEnd),
+          row('left', formatted, ', formatted words after a link of one character.'),
+          row('left', narrow, ', four narrow characters after a link.')
         ]
         const pair = row('left', pairAbove, document.createElement('br'), pairBelow)
         const longer = row('left', wide)
         const ending = row('left', 'The last line of the conversation ends in ', closing)
         paragraph.after(framed, ...edges, pair, longer)
         lastNode.append(ending)
-        const links = [...originals, second, third, framedLink, atStart, atEnd, aloneAtStart, aloneAtEnd, pairAbove, pairBelow, wide, closing]
+        const links = [...originals, second, third, framedLink, atStart, atEnd, aloneAtStart, aloneAtEnd, formatted, narrow, pairAbove, pairBelow, wide, closing]
 
         // The control: the same page with the links' reach taken away.
         const gutter = parseFloat(getComputedStyle(main).paddingLeft)
