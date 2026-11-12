@@ -3433,3 +3433,57 @@ async fn kr_req_19_08_holders_that_ask_for_another_connection_are_refused_and_ev
         .expect("the next dial is made");
     adopted.stop().await;
 }
+
+/// KR-REQ-19.08: the phone's main connection is reached again while dials of other kinds hold every
+/// place they may take. The main link is the one connection without which the phone cannot reach the
+/// host, so its reconnection is never held back by the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_the_main_link_reconnects_while_other_dials_hold_every_other_place() {
+    use kr_protocol::error::ErrorCode;
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let device = companion.device();
+    let paired = device.host_in_use().expect("a host in use");
+    let host = paired.host_device_id;
+    let places = companion_tauri::places::budget();
+
+    // Every place the other kinds may take is held by a dial that is still being made.
+    control.hold();
+    let mut fillers = Vec::new();
+    while places.held_on(host) < companion_tauri::places::HOST_CONNECTIONS {
+        let (device, paired) = (Arc::clone(&device), paired.clone());
+        fillers.push(tokio::spawn(async move {
+            Connection::paired(&device, &paired).await
+        }));
+        held(&control, fillers.len()).await;
+    }
+    control.stop_holding();
+
+    // The main connection is lost; its place goes back, and the phone reconnects on it.
+    let asked = control.asked();
+    companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("connected")
+        .session()
+        .close();
+    tokio::time::timeout(WATCHDOG, async {
+        while control.asked() == asked {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the main link is dialled again though every other place is held");
+    connected(companion).await;
+
+    control.refuse(Some(ErrorCode::PermissionDenied));
+    control.release_all();
+    for filler in fillers {
+        filler.await.expect("the dial ran").err().expect("refused");
+    }
+    adopted.stop().await;
+}
