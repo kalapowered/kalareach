@@ -450,7 +450,7 @@ fn the_parenthesis_about_a_new_name_beside_an_entry_does_not_promise_its_removal
 #[test]
 fn in_the_program_directory_a_link_is_removed_as_the_link_itself_and_not_what_it_leads_to() {
     let entry = r"D:\Program Files\KalaReach\Boundary\link";
-    let link = program_removal_advice(entry, true);
+    let link = program_removal_advice(entry, true, true);
     assert!(
         link.starts_with(&format!("Remove the link {entry} itself")),
         "{link}"
@@ -464,7 +464,7 @@ fn in_the_program_directory_a_link_is_removed_as_the_link_itself_and_not_what_it
     );
     assert!(link.contains("run the setup program again"), "{link}");
 
-    let other = program_removal_advice(entry, false);
+    let other = program_removal_advice(entry, false, true);
     assert!(
         other.starts_with(&format!("Remove {entry}, and nothing else")),
         "{other}"

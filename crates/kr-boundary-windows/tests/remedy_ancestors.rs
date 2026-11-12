@@ -3,8 +3,8 @@
 //! that is no volume's root. They run on every platform.
 
 use kr_boundary_windows::remedy::{
-    AncestorFault, Tree, ancestor_refusal, identity_text, is_the_volumes_own_root, rights_finding,
-    rights_in_words,
+    AncestorFault, Tree, ancestor_refusal, dos_path_of, identity_text, is_the_volumes_own_root,
+    program_removal_advice, rights_finding, rights_in_words,
 };
 
 const DELETE_CHILD: u32 = 0x0000_0040;
@@ -82,7 +82,8 @@ fn the_refusal_of_a_list_names_the_real_sentence_and_every_right_that_the_check_
     assert!(text.contains("It is refused because"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
     for named in [
-        "take away from every other identity the right to delete the folder, to delete or rename an entry in it, to change its list and to take its ownership",
+        "remove or narrow the entry that allows it, an inherited entry too (a denying entry does not cancel an allowing one for this check)",
+        "no other identity has the right to delete the folder, to delete or rename an entry in it, to change its list or to take its ownership",
         "delete the folder",
         "delete or rename an entry in it",
         "change its list",
@@ -120,7 +121,7 @@ fn the_refusal_of_a_link_or_a_mounted_folder_never_tells_an_administrator_to_rem
         assert!(text.contains(r"C:\ProgramData"), "{text}");
         assert!(text.contains("it is a link or a mounted folder"), "{text}");
         assert!(
-            text.contains("does not go through a link or a mounted folder above its trees"),
+            text.contains("does not go through a link or a mounted folder at or above its trees"),
             "{text}"
         );
         assert!(text.contains("Nothing was changed"), "{text}");
@@ -128,7 +129,13 @@ fn the_refusal_of_a_link_or_a_mounted_folder_never_tells_an_administrator_to_rem
             text.contains("The system's default places have none"),
             "{text}"
         );
-        assert!(text.contains("install on the real path"), "{text}");
+        // What the setup program can do in that state: it installs only in the system's known
+        // folders and cannot be pointed at another path.
+        assert!(
+            text.contains("installs only in the system's own known folders"),
+            "{text}"
+        );
+        assert!(!text.contains("install on the real path"), "{text}");
         let lower = text.to_lowercase();
         assert!(!lower.contains("remove the link"), "{text}");
         assert!(!lower.contains("rmdir"), "{text}");
@@ -169,9 +176,10 @@ fn a_drive_letter_that_is_no_volumes_root_is_refused_with_the_letter_and_the_rea
         assert!(text.contains(r"it leads to C:\Shared\Backing"), "{text}");
         assert!(text.contains("Nothing was changed"), "{text}");
         assert!(
-            text.contains(r"Install on the real path, which is C:\Shared\Backing"),
+            text.contains("end the substitution or redirection of that letter"),
             "{text}"
         );
+        assert!(!text.contains("Install on the real path"), "{text}");
     }
 }
 
@@ -188,4 +196,60 @@ fn a_drives_root_is_the_volumes_own_only_where_its_final_path_is_the_one_supplie
     assert!(!is_the_volumes_own_root(r"X:\", r"\\?\C:\Shared\Backing\"));
     assert!(!is_the_volumes_own_root(r"X:\", r"D:\"));
     assert!(!is_the_volumes_own_root(r"C:\", r"C:\Windows"));
+}
+
+/// The walk from the program directory's top down reads a folder that must also refuse the right to
+/// add to it, and its words say that, and never to remove a link (a moved `Program Files` is the
+/// administrator's own, and the link at its top gets the words of any link above the trees).
+#[test]
+fn the_program_trees_own_walk_has_its_own_list_words_and_the_same_link_words() {
+    let text = ancestor_refusal(
+        r"C:\Program Files",
+        Tree::Program,
+        &AncestorFault::Writable("S-1-5-32-545 is allowed to add"),
+    );
+    assert!(
+        text.contains(r"C:\Program Files is a folder above the boundary's program directory"),
+        "{text}"
+    );
+    assert!(text.contains("S-1-5-32-545 is allowed to add"), "{text}");
+    assert!(text.contains("Whoever owns it, or can add to it"), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(!text.to_lowercase().contains("remove the link"), "{text}");
+    let link = ancestor_refusal(r"C:\Program Files", Tree::Program, &AncestorFault::Link);
+    assert!(link.contains("it is a link or a mounted folder"), "{link}");
+    assert!(!link.to_lowercase().contains("remove the link"), "{link}");
+}
+
+/// What the setup program can do after a link at the program directory's name: a repair makes the
+/// program files again only where an installation is recorded.
+#[test]
+fn a_repair_is_promised_only_where_an_installation_is_recorded() {
+    let entry = r"C:\Program Files\KalaReach\Boundary";
+    for link in [false, true] {
+        let recorded = program_removal_advice(entry, link, true);
+        assert!(
+            recorded.contains("A repair makes the program files again"),
+            "{recorded}"
+        );
+        let fresh = program_removal_advice(entry, link, false);
+        assert!(!fresh.contains("repair"), "{fresh}");
+        assert!(
+            fresh.ends_with("Then run the setup program again."),
+            "{fresh}"
+        );
+    }
+}
+
+/// A folder's final path is printed in a form that a person can use: the extended prefix goes, and a
+/// network path is the network path.
+#[test]
+fn a_final_path_is_printed_as_a_person_can_use_it() {
+    assert_eq!(dos_path_of(r"\\?\C:\Windows"), r"C:\Windows");
+    assert_eq!(
+        dos_path_of(r"\\?\UNC\server\share\dir"),
+        r"\\server\share\dir"
+    );
+    assert_eq!(dos_path_of(r"C:\Windows"), r"C:\Windows");
+    assert_eq!(dos_path_of(r"\\?\C:\"), r"C:\");
 }
