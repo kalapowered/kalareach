@@ -451,6 +451,13 @@ interface PressPoint {
   readonly scroll: number
   /** Whether the point lies on another control of the message, which then takes the press. */
   readonly control: boolean
+  /**
+   * The link whose button the browser's own hit test names at the point (not on another control of the
+   * message), or null. Where there is one, a link opens at the press: the one named, or one whose words
+   * are as near or nearer, which `acceptable` lists.
+   */
+  readonly hit: string | null
+  readonly acceptable: readonly string[]
 }
 
 interface PressMark {
@@ -682,9 +689,13 @@ test.describe('a press by the links of a message', () => {
                     .filter((rect) => rect.width > 0 && rect.height > 0)
                     .map((rect) => ({ left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom }))
                 }
-                const areaOf = (words: Area): Area => {
+                const lineOf = (each: HTMLElement): number => {
+                  const height = parseFloat(getComputedStyle(each).lineHeight)
+                  return Number.isFinite(height) ? height : 0
+                }
+                const areaOf = (words: Area, line: number): Area => {
                   const wide = Math.max(finger, words.right - words.left + 2 * beside)
-                  const tall = Math.max(finger, words.bottom - words.top)
+                  const tall = Math.max(finger, words.bottom - words.top, line)
                   const x = (words.left + words.right) / 2
                   const y = (words.top + words.bottom) / 2
                   return {
@@ -699,7 +710,15 @@ test.describe('a press by the links of a message', () => {
                 // How far inside an area a point is: negative outside it.
                 const depth = (area: Area, x: number, y: number): number =>
                   Math.min(x - area.left, area.right - x, y - area.top, area.bottom - y)
-                const all = links.map((each) => ({ title: each.title, words: wordsOf(each) }))
+                // The page's own box of a link, held to the pane: the browser gives a press anywhere in it to the link.
+                const boxesOf = (each: HTMLElement): Area[] =>
+                  Array.from(each.getClientRects(), (rect) => ({
+                    left: Math.max(rect.left, room.left),
+                    right: Math.min(rect.right, room.right),
+                    top: Math.max(rect.top, room.top),
+                    bottom: Math.min(rect.bottom, room.bottom)
+                  }))
+                const all = links.map((each) => ({ title: each.title, words: wordsOf(each), line: lineOf(each), boxes: boxesOf(each) }))
                 // The message's other controls: a point on one is the control's, whichever link's area holds it.
                 const controls = Array.from(pane.querySelectorAll<HTMLElement>('button:not(.md-link)'), (each): Area => {
                   const box = each.getBoundingClientRect()
@@ -712,8 +731,10 @@ test.describe('a press by the links of a message', () => {
                   const held = all
                     .map((each) => ({
                       title: each.title,
-                      reached: each.words.some((words) => depth(areaOf(words), x, y) >= 0),
-                      near: each.words.some((words) => Math.abs(depth(areaOf(words), x, y)) < edge),
+                      reached: each.words.some((words) => depth(areaOf(words, each.line), x, y) >= 0) || each.boxes.some((box) => depth(box, x, y) >= 0),
+                      near:
+                        each.words.some((words) => Math.abs(depth(areaOf(words, each.line), x, y)) < edge) ||
+                        each.boxes.some((box) => Math.abs(depth(box, x, y)) < edge),
                       distance: Math.min(...each.words.map((words) => gap(words, x, y)))
                     }))
                     .filter((each) => each.reached || each.near)
@@ -730,8 +751,29 @@ test.describe('a press by the links of a message', () => {
                   return found !== null && pane.contains(found)
                 }
                 const seen = new Set<string>()
-                const points: { x: number; y: number; expected: string | null; scroll: number; control: boolean }[] = []
+                const points: {
+                  x: number
+                  y: number
+                  expected: string | null
+                  scroll: number
+                  control: boolean
+                  hit: string | null
+                  acceptable: string[]
+                }[] = []
                 let unclear = 0
+                let judged = 0
+                // What the browser's own hit test names at a point, away from the message's other controls:
+                // the link whose button is there, and the links whose words are as near to the point as its words.
+                const hitAt = (x: number, y: number): { hit: string | null; acceptable: string[] } => {
+                  const found = document.elementFromPoint(x, y)?.closest<HTMLElement>('.m-node .md-link')
+                  if (!found || controls.some((box) => depth(box, x, y) > -edge)) return { hit: null, acceptable: [] }
+                  const distanceOf = (words: Area[]): number => Math.min(...words.map((each) => gap(each, x, y)))
+                  const away = distanceOf(wordsOf(found))
+                  return {
+                    hit: found.title,
+                    acceptable: all.filter((each) => distanceOf(each.words) <= away + 0.01).map((each) => each.title)
+                  }
+                }
                 const consider = (x: number, y: number, always: boolean): void => {
                   const px = Math.round(x)
                   const py = Math.round(y)
@@ -739,18 +781,31 @@ test.describe('a press by the links of a message', () => {
                   if (seen.has(key) || !inRoom(px, py)) return
                   seen.add(key)
                   const verdict = decide(px, py)
+                  const named = hitAt(px, py)
                   if (!verdict.clear) {
                     unclear += 1
+                    // The rule above is unsure here, but the browser's hit test is not: a link must open.
+                    if (named.hit !== null) {
+                      judged += 1
+                      points.push({ x: px, y: py, expected: null, scroll: pane.scrollTop, control: false, ...named })
+                    }
                     return
                   }
                   // In the open, away from every edge, one point in three says as much as all of them.
                   if (!always && verdict.expected !== null && (px + py) % 3 !== 0) return
-                  points.push({ x: px, y: py, expected: verdict.expected, scroll: pane.scrollTop, control: verdict.control })
+                  points.push({
+                    x: px,
+                    y: py,
+                    expected: verdict.expected,
+                    scroll: pane.scrollTop,
+                    control: verdict.control,
+                    ...named
+                  })
                 }
                 // Along the edges of every control that this link's area overlaps, on both sides of each edge.
                 const overlapped = controls.filter((box) =>
                   wordsOf(link).some((words) => {
-                    const area = areaOf(words)
+                    const area = areaOf(words, lineOf(link))
                     return area.left <= box.right + 6 && area.right >= box.left - 6 && area.top <= box.bottom + 6 && area.bottom >= box.top - 6
                   })
                 )
@@ -766,8 +821,22 @@ test.describe('a press by the links of a message', () => {
                     }
                   }
                 }
+                // The browser's own box of the link, whole: a press anywhere in it is the link's on a page without the pane's rule.
+                for (const box of Array.from(link.getClientRects())) {
+                  for (let x = box.left - 6; x <= box.right + 6; x += grid) {
+                    for (let y = box.top - 6; y <= box.bottom + 6; y += grid) consider(x, y, false)
+                  }
+                  for (const d of [-3, -1, 1, 3]) {
+                    for (const across of [0.1, 0.5, 0.9]) {
+                      consider(box.left + (box.right - box.left) * across, box.top + d, true)
+                      consider(box.left + (box.right - box.left) * across, box.bottom + d, true)
+                      consider(box.left + d, box.top + (box.bottom - box.top) * across, true)
+                      consider(box.right + d, box.top + (box.bottom - box.top) * across, true)
+                    }
+                  }
+                }
                 for (const words of wordsOf(link)) {
-                  const area = areaOf(words)
+                  const area = areaOf(words, lineOf(link))
                   const x0 = (words.left + words.right) / 2
                   const y0 = (words.top + words.bottom) / 2
                   const reachX = Math.max(area.right - x0, x0 - area.left) + 6
@@ -788,7 +857,7 @@ test.describe('a press by the links of a message', () => {
                   }
                   consider(x0, y0, true)
                 }
-                return { points, unclear }
+                return { points, unclear: unclear - judged }
               },
               // Desktop WebKit's overlay scrollbar takes the presses on the pane's last 16 px, and makes no click of them.
               { href, finger: FINGER[surface], grid: GRID, edge: EDGE, scrollbar: test.info().project.name === 'webkit' ? 17 : 0 }
@@ -813,6 +882,7 @@ test.describe('a press by the links of a message', () => {
           console.log(`link presses on ${surface}, ${String(width)} px, ${size} text size: ${counts}`)
           expect(done.marks.length, 'the presses the page saw, one for each point pressed').toBe(planned.length)
           const wrong: string[] = []
+          const held: string[] = []
           const unlit: string[] = []
           const drifted: string[] = []
           const unclicked: string[] = []
@@ -829,6 +899,17 @@ test.describe('a press by the links of a message', () => {
             if (clicks !== (point.control ? 1 : 0)) {
               unclicked.push(`${at} clicked ${String(clicks)} other controls, expected ${point.control ? '1' : '0'}`)
             }
+            if (point.expected === null && point.hit !== null) {
+              // The browser's own hit test names a link here: a link opens, the one named or one whose words are nearer.
+              const [only] = opened
+              if (opened.length !== 1 || only === undefined || !point.acceptable.includes(only)) {
+                held.push(`${at} the browser names ${point.hit}, opened ${opened.join(' ') || 'nothing'}, acceptable ${point.acceptable.join(' ')}`)
+              }
+              if ((mark?.pressed ?? []).join(' ') !== opened.join(' ')) {
+                unlit.push(`${at} looked pressed on ${(mark?.pressed ?? []).join(' ') || 'nothing'}, opened ${opened.join(' ') || 'nothing'}`)
+              }
+              return
+            }
             const expected = point.expected === null ? [] : [point.expected]
             if (opened.join(' ') !== expected.join(' ')) {
               wrong.push(`${at} opened ${opened.join(' ') || 'nothing'}, expected ${expected.join(' ') || 'nothing'}`)
@@ -840,6 +921,10 @@ test.describe('a press by the links of a message', () => {
           expect.soft(drifted.slice(0, 12), 'presses made after the pane had moved from where the point was read').toEqual([])
           expect.soft(unclicked.slice(0, 12), `${String(unclicked.length)} of ${String(planned.length)} presses gave the click to another control or to none`).toEqual([])
           expect.soft(wrong.slice(0, 12), `${String(wrong.length)} of ${String(planned.length)} presses opened another link or none, or one that was not named`).toEqual([])
+          expect.soft(
+            held.slice(0, 12),
+            `${String(held.length)} of ${String(planned.length)} presses where the browser's own hit test names a link opened no link, or one whose words are farther`
+          ).toEqual([])
           expect.soft(unlit.slice(0, 12), `${String(unlit.length)} of ${String(planned.length)} presses showed the pressed look on another link or none`).toEqual([])
           expect.soft(done.left, 'links still looking pressed after the last press').toBe(0)
           expect.soft(
