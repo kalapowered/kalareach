@@ -255,7 +255,8 @@ fn an_empty_data_directory_that_a_stopped_removal_left_is_removed_by_the_next_on
 
 /// A directory that cannot be deleted is named, and the words that follow say what is true of the
 /// state: the manifest stays, or an empty directory is accepted by a new installation and finished
-/// by the next removal, or something else is in it for the person to remove.
+/// by the next removal, or something else is in it that no handle has checked, so the next removal
+/// reads each entry and says what to do about it, and nothing says to remove an entry unread.
 #[test]
 fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
     assert!(next_step(true, false).contains("run the removal again"));
@@ -265,5 +266,11 @@ fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
     assert!(!empty.contains("refuses"), "{empty}");
     let full = next_step(false, false);
     assert!(full.contains("refuses until they are gone"), "{full}");
+    assert!(full.contains("run the removal again"), "{full}");
+    assert!(
+        full.contains("reads each entry on its own handle"),
+        "{full}"
+    );
+    assert!(!full.contains("remove them"), "{full}");
     assert!(!full.contains("accepts"), "{full}");
 }
