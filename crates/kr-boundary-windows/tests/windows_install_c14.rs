@@ -107,11 +107,12 @@ fn moved_aside(text: &str) {
     assert!(!text.contains("Correct what the reason names"), "{text}");
 }
 
-/// A directory with files in it, standing for what a link at a name would let a deletion reach.
+/// A directory with files in it, standing for what a link at a name would let a deletion reach. It
+/// holds no manifest: a manifest that does not parse stops the removal before it deletes anything,
+/// so with one the old code would pass these cases without having been tested on the deletion.
 fn bait() -> PathBuf {
     let target = inherited_folder();
     owned_file(target.join("prior.json"), b"{}");
-    owned_file(target.join("manifest.json"), b"{}");
     owned_dir(target.join("staging"));
     owned_file(target.join("staging").join("keep.txt"), b"x");
     target
@@ -119,13 +120,14 @@ fn bait() -> PathBuf {
 
 fn bait_is_whole(target: &Path) {
     assert!(target.join("prior.json").exists());
-    assert!(target.join("manifest.json").exists());
     assert!(target.join("staging").join("keep.txt").exists());
 }
 
 /// Where the data directory's parent was found absent, anything that is at the data directory's name
 /// by the time the removal looks again was made by nobody it checked: the removal refuses, says so,
-/// and deletes none of the recognised files, nor `staging` and what is under it, in either mode.
+/// and deletes none of the recognised files, nor `staging` and what is under it, in either mode. The
+/// directory that appears holds `prior.json` and `staging\keep.txt` and no manifest, so that code
+/// which deletes by name would delete both: the case fails on such code at the files' survival.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
@@ -138,7 +140,6 @@ fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
         install::testing::after_the_removal_inspects_the_data_directory(move || {
             std::fs::create_dir_all(data.join("staging")).unwrap();
             std::fs::write(data.join("prior.json"), b"{}").unwrap();
-            std::fs::write(data.join("manifest.json"), b"{}").unwrap();
             std::fs::write(data.join("staging").join("keep.txt"), b"x").unwrap();
         });
         let text = install::remove(&paths, quiet)
@@ -150,7 +151,6 @@ fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
         );
         assert!(text.contains("nothing was removed"), "{text}");
         assert!(paths.prior.exists(), "quiet {quiet}");
-        assert!(paths.manifest.exists(), "quiet {quiet}");
         assert!(paths.staging.join("keep.txt").exists(), "quiet {quiet}");
         std::fs::remove_dir_all(&top).unwrap();
     }
@@ -158,7 +158,9 @@ fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
 }
 
 /// A junction at the data directory's name, made after the parent was checked and the directory was
-/// found absent, is refused the same way, and what it leads to is untouched.
+/// found absent, is refused the same way, and what it leads to is untouched: `prior.json` and
+/// `staging\keep.txt` in the bait are the files that code which deletes by name would delete
+/// through the junction.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_junction_at_the_data_directorys_name_made_after_the_inspection_is_not_followed() {
@@ -203,6 +205,14 @@ fn what_is_put_in_an_approved_empty_directory_after_the_inspection_is_not_delete
         .expect_err("the directory holds something now")
         .to_string();
     assert!(text.contains("the data directory stays because"), "{text}");
+    // Nothing has checked what was put in the directory, so the words say that the next removal reads
+    // each entry, and never to remove them unread.
+    assert!(text.contains("run the removal again"), "{text}");
+    assert!(
+        text.contains("reads each entry on its own handle"),
+        "{text}"
+    );
+    assert!(!text.contains("remove them"), "{text}");
     assert!(paths.prior.exists());
     bait_is_whole(&target);
     std::fs::remove_dir(&paths.staging).unwrap();
