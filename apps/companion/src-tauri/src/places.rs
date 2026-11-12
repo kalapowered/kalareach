@@ -11,8 +11,11 @@
 //! that the link without which the application cannot reach the host is never made to wait behind
 //! the others. It belongs to the main link that is current: a main link that a newer one replaces
 //! gives the reservation up at once and is counted as any other connection for as long as
-//! something still holds it, so a link that lingers cannot keep the new one waiting. A dial that finds no place waits for one, for no longer than [`PLACE_WAIT`], and is
-//! then declined ([`LinkError::Declined`], which [`crate::connection::Unopened`] carries as its own
+//! something still holds it, so a link that lingers cannot keep the new one waiting. Such a link
+//! is held beside the total, which the host's bound of twice the total has room for.
+//!
+//! A dial that finds no place waits for one, for no longer than [`PLACE_WAIT`], and is then
+//! declined ([`LinkError::Declined`], which [`crate::connection::Unopened`] carries as its own
 //! cause): the host is asked nothing, and the refusal is this application's.
 
 use std::collections::BTreeMap;
