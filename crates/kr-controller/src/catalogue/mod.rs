@@ -1392,7 +1392,7 @@ impl CatalogueModule {
 
     /// Returns the answer a retained catalogue or plugin mutation is owed.
     #[must_use]
-    pub(crate) async fn retained(
+    pub async fn retained(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

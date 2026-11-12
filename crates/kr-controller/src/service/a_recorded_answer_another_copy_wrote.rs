@@ -1358,7 +1358,7 @@ async fn a_late_capability_copy_at_the_record(
     release.send(()).expect("the late copy goes on");
     let answered = late.await.expect("the late copy finishes");
     controller.hold_fence(false);
-    answered
+    answered.into_answer()
 }
 
 /// KR-REQ-09.09, the disclosed checks: a request for them that another copy answered is read back
@@ -1376,6 +1376,7 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_after_a_fenc
     let first = controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
+        .into_answer()
         .expect("the first copy is answered");
 
     let control =
@@ -1405,11 +1406,13 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_once_its_hol
     let first = controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
+        .into_answer()
         .expect("the first copy is answered");
 
     let control = controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
+        .into_answer()
         .expect("with nothing owed the late copy is answered from the record");
     assert_eq!(control, first, "it is given what the first copy was told");
 
@@ -1418,6 +1421,7 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_once_its_hol
         controller.start_capability_checks(&actor_id, &mutation, admission),
     )
     .await
+    .into_answer()
     .expect_err("a fence that landed once the hold had ended stops the answer");
     refused_for_a_fence(&refused.to_protocol_error());
 }
@@ -1438,6 +1442,7 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_when_its_fen
     controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
+        .into_answer()
         .expect("the first copy is answered");
 
     let (arrived, release) = controller.before_a_capability_check_looks.arm();
@@ -1476,6 +1481,7 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_when_its_fen
     };
     controller.hold_fence(false);
     let refused = answered
+        .into_answer()
         .expect_err("a fence that stood while the answer was in hand stops it, though it is gone");
     refused_for_a_fence(&refused.to_protocol_error());
 }
@@ -1494,6 +1500,7 @@ async fn a_reused_capability_check_identifier_is_not_refused_as_a_conflict_after
     controller
         .start_capability_checks(&actor_id, &first, admission)
         .await
+        .into_answer()
         .expect("the first copy is answered");
     let reused = capability_request(&temp, Some(first.action_id), Some("/authorised.txt"));
 
@@ -1528,6 +1535,7 @@ async fn a_capability_check_answer_that_cannot_be_read_is_not_told_after_a_fence
     controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
+        .into_answer()
         .expect("the first copy is answered");
     let record = rusqlite::Connection::open(
         temp.environment()

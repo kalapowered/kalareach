@@ -1569,7 +1569,7 @@ impl Installer {
     /// Returns [`ControllerError::IdConflict`] when the identifier carries a different payload,
     /// and [`ControllerError::Uncertain`] when a marker was written and no outcome was recorded:
     /// the files may have changed, and doing it again is exactly what section 9 forbids.
-    pub(crate) fn retained(
+    pub fn retained(
         &self,
         actor_id: &kr_protocol::ids::ActorId,
         action_id: kr_protocol::ids::ActionId,
@@ -2764,6 +2764,8 @@ mod tests {
         assert!(
             installer
                 .retained(&actor, action, &digest)
+                .copied()
+                .into_answer()
                 .expect("reads")
                 .is_none()
         );
@@ -2774,6 +2776,8 @@ mod tests {
         // change is what section 9 forbids.
         let error = installer
             .retained(&actor, action, &digest)
+            .copied()
+            .into_answer()
             .expect_err("uncertain");
         assert_eq!(
             error.to_protocol_error().code,
@@ -2791,11 +2795,17 @@ mod tests {
             .settle(&actor, action, &digest, &result)
             .expect("settles");
         assert_eq!(
-            installer.retained(&actor, action, &digest).expect("reads"),
+            installer
+                .retained(&actor, action, &digest)
+                .copied()
+                .into_answer()
+                .expect("reads"),
             Some(result)
         );
         let error = installer
             .retained(&actor, action, &other)
+            .copied()
+            .into_answer()
             .expect_err("conflict");
         assert_eq!(
             error.to_protocol_error().code,
@@ -3108,6 +3118,8 @@ mod tests {
 
         let answer = installer
             .retained(&actor, action, &digest)
+            .copied()
+            .into_answer()
             .expect("reads")
             .expect("an answer");
 
@@ -3157,6 +3169,8 @@ mod tests {
         std::fs::write(&path, older.to_string()).expect("rewritten");
         let answered = installer
             .retained(&actor, action, &digest)
+            .copied()
+            .into_answer()
             .expect_err("a marker with no outcome is uncertain");
         assert!(matches!(answered, ControllerError::Uncertain { .. }));
         assert_eq!(read(&path)["version"], ACTION_RECORD_VERSION);
@@ -3166,7 +3180,10 @@ mod tests {
         std::fs::write(&path, later.to_string()).expect("rewritten");
         assert!(
             matches!(
-                installer.retained(&actor, action, &digest),
+                installer
+                    .retained(&actor, action, &digest)
+                    .copied()
+                    .into_answer(),
                 Err(ControllerError::InvalidArgument(_))
             ),
             "a record of a later format is refused"

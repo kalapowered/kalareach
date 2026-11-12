@@ -130,7 +130,7 @@ pub fn carries(kind: StreamKind, method: Option<Method>) -> bool {
 
 /// What an exact repeat that arrived with no usable window is owed ([`TransferModule::settles`]).
 #[derive(Debug)]
-pub(crate) enum Settling {
+pub enum Settling {
     /// Its action claimed an effect that is not finished: the service finishes it.
     Open,
     /// Its action's claim was settled, and this is the answer it was settled with.
@@ -905,7 +905,7 @@ impl TransferModule {
     /// one. Refusing it for that would deny a caller its own completed result, which is the one
     /// thing an action identifier exists to prevent.
     #[must_use]
-    pub(crate) async fn retained(
+    pub async fn retained(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -947,7 +947,7 @@ impl TransferModule {
     ///
     /// A claim moves from open to settled and never back, so a claim that is no longer open is read
     /// once more for the answer it was settled with.
-    pub(crate) async fn settles(
+    pub async fn settles(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -1221,7 +1221,7 @@ impl TransferModule {
     /// This is a read, and it waits: for a blocking thread and for the journal's lock. So the
     /// caller runs it *before* the admission check, and the admission check is the last thing
     /// between a mutation and its effect.
-    pub(crate) async fn check_subject_of_record(
+    pub async fn check_subject_of_record(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

@@ -1147,6 +1147,8 @@ async fn a_stop_the_connection_stopped_waiting_for_is_recorded_and_given_again()
         call.controller
             .voice_answered(&actor, &stop)
             .await
+            .copied()
+            .into_answer()
             .is_ok_and(|recorded| recorded.is_some())
     })
     .await;

@@ -190,6 +190,8 @@ async fn a_retry_of_an_unfinished_revocation_is_told_what_its_actor_may_know() {
             .retained_authority_answer(&actor_id, &mutation)
             .await
             .expect("this host holds the claim")
+            .copied()
+            .into_answer()
         else {
             panic!("a retry is answered with a response");
         };

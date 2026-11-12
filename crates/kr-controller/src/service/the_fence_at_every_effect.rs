@@ -1561,9 +1561,9 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
 
     // The control: nothing owed, so the changes are made. A refresh asks the platform, which this
     // machine may not have, and what it must not be is a refusal for a fence.
-    enrol(1).await.expect("enrolled");
+    enrol(1).await.into_answer().expect("enrolled");
     assert!(recorded(1));
-    if let Err(error) = refresh(1).await {
+    if let Err(error) = refresh(1).await.into_answer() {
         assert!(!error.to_string().contains("fence"), "{error}");
     }
 
@@ -1574,6 +1574,7 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
+            .into_answer()
             .expect_err("an enrolment is stopped")
             .to_protocol_error(),
     );
@@ -1583,6 +1584,7 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
+            .into_answer()
             .expect_err("a forgetting is stopped")
             .to_protocol_error(),
     );
@@ -1592,11 +1594,15 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
+            .into_answer()
             .expect_err("a refresh is stopped")
             .to_protocol_error(),
     );
 
-    forget(1).await.expect("forgotten once nothing is owed");
+    forget(1)
+        .await
+        .into_answer()
+        .expect("forgotten once nothing is owed");
     assert!(!recorded(1));
 }
 
@@ -1755,6 +1761,7 @@ impl Refreshing {
             controller
                 .environment_record(&actor, false, &mutation, method, carried)
                 .await
+                .into_answer()
         }
     }
 
@@ -2723,6 +2730,7 @@ async fn a_fence_this_host_owes_stops_an_ssh_hosts_refresh_before_its_helper_is_
             carried,
         )
         .await
+        .into_answer()
         .expect("the ssh host is enrolled");
 
     controller.hold_fence(true);
@@ -2743,6 +2751,7 @@ async fn a_fence_this_host_owes_stops_an_ssh_hosts_refresh_before_its_helper_is_
             carried,
         )
         .await
+        .into_answer()
         .expect_err("a refresh is stopped while a fence is owed");
     refused_for_a_fence(&refused.to_protocol_error());
 }
@@ -2784,6 +2793,7 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
             carried,
         )
         .await
+        .into_answer()
         .expect("the ssh host is enrolled");
     actor.ingress = kr_protocol::actor::ActorIngress::PairedDevice;
 
@@ -2842,6 +2852,7 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
     assert!(scoped(), "the channel is established");
     refresh()
         .await
+        .into_answer()
         .expect("with nothing owed the refresh is answered");
     assert!(
         !scoped(),
@@ -2857,6 +2868,7 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
+            .into_answer()
             .expect_err("a fence that landed after the answer stops its write")
             .to_protocol_error(),
     );

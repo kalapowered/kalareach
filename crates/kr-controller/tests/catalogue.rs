@@ -1414,7 +1414,8 @@ async fn an_admission_refusal_keeps_the_class_the_daemon_decided() {
             host.module
                 .retained(&actor, &mutation, Method::CatalogueSync)
                 .await
-                .expect("a receipt"),
+                .expect("a receipt")
+                .into_answer_for_test(),
         );
         assert_eq!(retained, refused);
         let read = host
@@ -1715,7 +1716,8 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
         .module
         .retained(&actor, &req, Method::CatalogueAdd)
         .await
-        .expect("retained frame exists");
+        .expect("retained frame exists")
+        .into_answer_for_test();
     let added3: wire::CatalogueAddResult = ok(retained);
     assert_eq!(added3.catalogue.catalogue_id, "development");
 

@@ -229,7 +229,7 @@ impl ChangeSetModule {
     /// carries the window the action was first admitted under and this connection holds a newer
     /// one. Refusing it for that would deny a caller its own completed result.
     #[must_use]
-    pub(crate) async fn retained(
+    pub async fn retained(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

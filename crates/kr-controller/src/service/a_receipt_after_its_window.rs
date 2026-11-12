@@ -225,6 +225,7 @@ async fn a_capability_check_another_copy_answered_is_given_back_after_its_window
     let first = controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
+        .into_answer()
         .expect("the first copy is answered");
 
     the_window_passes(&clock);
@@ -232,11 +233,13 @@ async fn a_capability_check_another_copy_answered_is_given_back_after_its_window
         let given = controller
             .start_capability_checks(&actor_id, &mutation, late)
             .await
+            .into_answer()
             .expect("the late copy is given the record");
         assert_eq!(given, first, "it is given what the first copy was told");
         let refused = controller
             .start_capability_checks(&actor_id, &capability_request(&temp, None, None), late)
             .await
+            .into_answer()
             .expect_err("a first start is refused for its window");
         refused_for_its_window(&refused.to_protocol_error());
     }

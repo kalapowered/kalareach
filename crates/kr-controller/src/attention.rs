@@ -2119,7 +2119,7 @@ impl AttentionModule {
     /// Answers an action this store has already performed for this caller, if it has.
     ///
     /// It runs before the freshness window is considered, like every other retained action.
-    pub(crate) fn retained(
+    pub fn retained(
         &self,
         caller: &Caller,
         actor: &ActorId,
@@ -5860,6 +5860,8 @@ pub(crate) mod tests {
                 .module
                 .retained(caller, actor, mutation, Method::VisitAcknowledge)
                 .expect("the store holds the action")
+                .copied()
+                .into_answer()
             else {
                 panic!("the repeat is answered");
             };
@@ -5920,7 +5922,9 @@ pub(crate) mod tests {
                 &visit_acknowledgement(&world, 11, U64::new(0)),
                 Method::VisitAcknowledge,
             )
-            .expect("a repeat the store cannot be asked about is answered");
+            .expect("a repeat the store cannot be asked about is answered")
+            .copied()
+            .into_answer();
         let ControlFrame::Response(Response {
             outcome: Outcome::Error(error),
             ..

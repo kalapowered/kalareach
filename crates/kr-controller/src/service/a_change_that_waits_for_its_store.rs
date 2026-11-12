@@ -447,6 +447,7 @@ async fn a_privacy_change_whose_admission_lapses_while_it_waits(lapse: Lapse) {
     let refused = changing
         .await
         .expect("the change finishes")
+        .into_answer()
         .expect_err("a change whose admission lapsed while it waited changes nothing");
     assert!(lapse.is_refused_by(&refused), "{lapse:?}: {refused}");
     let report = controller.privacy.status(kr_ipc::now_ms());
@@ -479,6 +480,7 @@ async fn a_privacy_change_whose_admission_lapses_while_it_waits(lapse: Lapse) {
     controller
         .privacy_set(&mutation, carried)
         .await
+        .into_answer()
         .expect("a change under a standing admission is recorded");
     assert!(controller.privacy.state().is_private());
 }
@@ -882,6 +884,7 @@ async fn enabling_privacy_mode_after_the_tick_slept_owes_nothing_for_a_session_t
     controller
         .privacy_set(&mutation, carried)
         .await
+        .into_answer()
         .expect("privacy mode is turned on");
     let report = controller.privacy.status(kr_ipc::now_ms());
     assert!(report.enabled);
@@ -1303,6 +1306,7 @@ async fn privacy_mode_turned_on_obliges_every_launch_a_worker_may_still_come_of(
             carried,
         )
         .await
+        .into_answer()
         .expect("privacy mode is turned on");
     let report: kr_protocol::privacy::PrivacyReport = report.to_typed().expect("decodes");
     let mut owing: Vec<SessionId> = report.sessions.iter().map(|owed| owed.session_id).collect();

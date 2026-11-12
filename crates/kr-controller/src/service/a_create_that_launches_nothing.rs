@@ -453,6 +453,8 @@ async fn a_create_asked_again_whose_launch_failed_is_told_so_though_the_host_can
     let told = controller
         .replay_create(&reservation)
         .await
+        .copied()
+        .into_answer()
         .expect_err("a launch that failed leaves no session to answer with");
     assert_eq!(
         told.code(),
@@ -2167,6 +2169,8 @@ async fn a_repeat_that_read_the_reservation_before_it_was_settled_is_told_the_la
         let told = controller
             .replay_create(&stale)
             .await
+            .copied()
+            .into_answer()
             .expect_err("a create that started nothing leaves no session to answer with");
         assert_eq!(
             told.code(),

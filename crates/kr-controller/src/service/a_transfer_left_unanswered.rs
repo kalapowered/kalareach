@@ -291,6 +291,8 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
         .retained_authority_answer(&actor_id, &mutation)
         .await
         .expect("this host holds a claim on the action")
+        .copied()
+        .into_answer()
     else {
         panic!("a retry is answered with a response");
     };
@@ -333,6 +335,8 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
         .retained_authority_answer(&actor_id, &nothing)
         .await
         .expect("this host holds a claim on the action")
+        .copied()
+        .into_answer()
     else {
         panic!("a retry is answered with a response");
     };

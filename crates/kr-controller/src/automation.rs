@@ -3133,7 +3133,7 @@ impl AutomationModule {
     /// rearm the chain (`caller_grant` is the grant a paired device holds, none at the local
     /// socket).
     #[must_use]
-    pub(crate) async fn retained(
+    pub async fn retained(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

@@ -467,7 +467,7 @@ impl ProjectModule {
     /// one. Refusing it for that would deny a caller its own completed result, which is the one
     /// thing an action identifier exists to prevent.
     #[must_use]
-    pub(crate) async fn retained(
+    pub async fn retained(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -513,7 +513,7 @@ impl ProjectModule {
     /// admission, which has no window to be admitted under, or a copy that arrived before the first
     /// attempt wrote its claim. The door tells the two apart by whether another arrival holds the
     /// action, which the service cannot see.
-    pub(crate) async fn held_answer(
+    pub async fn held_answer(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,

@@ -22,6 +22,7 @@ use kr_protocol::scalars::{DurationMs, Nullable};
 
 use super::decision::Answered;
 use super::write_boundary::{Recording, paired_connection};
+use crate::given::Recorded;
 use crate::service::Controller;
 use crate::service::a_close_a_worker_never_answers as fake;
 
@@ -840,7 +841,7 @@ async fn a_reused_identifier_is_shown_to_a_device_that_may_not_read_the_record()
     let mut asked = None;
     let answer = connection
         .kept_answer(
-            kept.clone(),
+            Recorded::read(kept.clone()),
             Method::SessionRename,
             &mutation,
             validated,
@@ -911,7 +912,7 @@ async fn a_kept_answer_is_shown_only_to_a_device_that_may_read_it() {
         let mut asked = None;
         let answer = connection
             .kept_answer(
-                kept.clone(),
+                Recorded::read(kept.clone()),
                 Method::SessionRename,
                 &mutation,
                 validated,

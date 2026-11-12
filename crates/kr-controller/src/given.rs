@@ -170,7 +170,7 @@ impl<T, E> Given<Result<T, E>> {
 /// copy withheld, and none takes a closure over the value.
 #[derive(Debug)]
 #[must_use = "a record that was read is told only through the operation that asks its check"]
-pub(crate) struct Recorded<T>(T);
+pub struct Recorded<T>(T);
 
 impl<T> Recorded<T> {
     /// What a lookup read, as the lookup's own return.
@@ -181,6 +181,13 @@ impl<T> Recorded<T> {
     /// An answer a record supplied, given back as a copy.
     pub(crate) fn copied(self) -> Given<T> {
         Given::Copied(self.0)
+    }
+
+    /// What the lookup read, for a test in another crate that asks a lookup directly. A test
+    /// inside this crate collapses the read as the door does, with `copied`.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn into_answer_for_test(self) -> T {
+        self.0
     }
 
     /// The check refused the record: `refusal` stands in its place, as a copy the service

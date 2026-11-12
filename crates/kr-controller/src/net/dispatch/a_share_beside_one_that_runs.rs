@@ -28,7 +28,7 @@ use super::a_share_that_names_a_current_decision::{
     share, world,
 };
 use crate::error::ControllerError;
-use crate::given::Given;
+use crate::given::{Given, Recorded};
 use crate::grants::ActionRecord;
 use crate::service::a_close_a_worker_never_answers as fake;
 use crate::service::a_read_that_meets_a_worker_on_its_way_out as scripted;
@@ -151,7 +151,8 @@ fn refused(answer: &Answer) -> &ControllerError {
 }
 
 /// The error a frame carries, or a panic naming what it carried.
-fn refusal_in(frame: Option<ControlFrame>) -> ProtocolError {
+fn refusal_in(frame: Option<Recorded<ControlFrame>>) -> ProtocolError {
+    let frame = frame.map(|recorded| recorded.copied().into_answer());
     let Some(ControlFrame::Response(response)) = frame else {
         panic!("a repeat of an action this host claimed is answered: {frame:?}");
     };
@@ -162,7 +163,8 @@ fn refusal_in(frame: Option<ControlFrame>) -> ProtocolError {
 }
 
 /// The share a frame carries, or a panic naming what it carried.
-fn share_in(frame: Option<ControlFrame>) -> GrantCreateResult {
+fn share_in(frame: Option<Recorded<ControlFrame>>) -> GrantCreateResult {
+    let frame = frame.map(|recorded| recorded.copied().into_answer());
     let Some(ControlFrame::Response(response)) = frame else {
         panic!("a repeat of an action this host claimed is answered: {frame:?}");
     };

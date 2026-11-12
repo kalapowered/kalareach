@@ -14,6 +14,7 @@ use kr_protocol::scalars::{DurationMs, Nullable};
 use kr_protocol::sharing::GrantRevokeParams;
 
 use super::a_transfer_left_unanswered::daemon;
+use crate::given::Recorded;
 
 /// A `grant.revoke` under a fresh action.
 fn revoke_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
@@ -35,7 +36,8 @@ fn revoke_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
 }
 
 /// The error a frame carries.
-fn told(frame: Option<ControlFrame>) -> kr_protocol::error::ProtocolError {
+fn told(frame: Option<Recorded<ControlFrame>>) -> kr_protocol::error::ProtocolError {
+    let frame = frame.map(|recorded| recorded.copied().into_answer());
     let Some(ControlFrame::Response(response)) = frame else {
         panic!("a repeat the registry cannot be asked about is answered: {frame:?}");
     };
@@ -120,6 +122,8 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
     let unread = controller
         .voice_answered(&actor_id, &mutation)
         .await
+        .copied()
+        .into_answer()
         .expect_err("a claim that cannot be read does not answer the repeat");
     registry
         .execute_batch("ALTER TABLE authority_receipts_aside RENAME TO authority_receipts;")
@@ -144,6 +148,8 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
     let undecoded = controller
         .voice_answered(&actor_id, &mutation)
         .await
+        .copied()
+        .into_answer()
         .expect_err("a result that cannot be read back does not answer the repeat");
     assert_eq!(undecoded.code(), ErrorCode::OutcomeUnknown, "{undecoded}");
 
@@ -158,6 +164,8 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
     let unknown_code = controller
         .voice_answered(&actor_id, &mutation)
         .await
+        .copied()
+        .into_answer()
         .expect_err("a refusal that cannot be read back does not answer the repeat");
     assert_eq!(
         unknown_code.code(),

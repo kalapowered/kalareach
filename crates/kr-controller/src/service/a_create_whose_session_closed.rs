@@ -315,6 +315,8 @@ async fn a_create_asked_again_whose_worker_cannot_be_reached_is_told_the_outcome
         .controller
         .replay_create(&gone.reservation)
         .await
+        .copied()
+        .into_answer()
         .expect_err("a worker that cannot be reached leaves no answer");
     assert!(
         matches!(told, ControllerError::Uncertain { .. }),
@@ -374,6 +376,8 @@ async fn a_create_asked_again_whose_worker_ended_before_it_was_described_is_answ
         gone.controller
             .replay_create(&gone.reservation)
             .await
+            .copied()
+            .into_answer()
             .expect("the create asked again is answered"),
     );
     assert_a_closed_session(&replayed, gone.reservation.session_id);
@@ -456,10 +460,13 @@ async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_
     let held = HeldSession::of(world.service());
     let endpoint = world.worker.endpoint.as_text();
     let (created, replayed) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        tokio::join!(
-            answer(controller, &reservation, endpoint),
-            controller.replay_create(&reservation)
-        )
+        tokio::join!(answer(controller, &reservation, endpoint), async {
+            controller
+                .replay_create(&reservation)
+                .await
+                .copied()
+                .into_answer()
+        })
     })
     .await
     .expect("a create waits for ever on a worker that does not describe its session");
@@ -491,6 +498,8 @@ async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_
         controller
             .replay_create(&reservation)
             .await
+            .copied()
+            .into_answer()
             .expect("the worker describes its session"),
     );
     assert_ne!(described.session.state, SessionState::Closed);
@@ -629,6 +638,8 @@ async fn a_create_whose_worker_still_says_its_session_closed_is_given_no_endpoin
             controller
                 .replay_create(&reservation)
                 .await
+                .copied()
+                .into_answer()
                 .expect("the create asked again is answered"),
         )
     };

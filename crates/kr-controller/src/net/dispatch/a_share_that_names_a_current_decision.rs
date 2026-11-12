@@ -770,6 +770,8 @@ async fn two_actors_that_send_one_action_identifier_write_two_shares() {
         .retained_authority_answer(&third, &mutation)
         .await
         .expect("this host holds the claim")
+        .copied()
+        .into_answer()
     else {
         panic!("a retry is answered with a response");
     };
