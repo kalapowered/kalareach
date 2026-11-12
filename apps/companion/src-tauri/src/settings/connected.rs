@@ -159,11 +159,14 @@ pub(crate) enum Listing {
     /// gave the right has run out or been revoked. Such a host is not this computer's to ask, and
     /// is not one that failed to answer.
     Refused,
-    /// It answered that it cannot take another connection from this computer for now, or this
-    /// computer's own budget of connections to it declined the dial and the host was asked nothing.
-    /// That says nothing of its devices, as a host that did not answer says nothing; it is not one
-    /// that failed to answer.
-    Busy,
+    /// It answered that it cannot take another connection from this computer for now. That says
+    /// nothing of its devices, as a host that did not answer says nothing; it is not one that
+    /// failed to answer.
+    HostFull,
+    /// This computer's own budget of connections to it declined the dial, and the host was asked
+    /// nothing. That says nothing of the host, and the host has room: it is no host that cannot
+    /// take another connection, and it is not one that failed to answer.
+    BudgetFull,
     /// It did not answer in time, could not be reached, or refused for a reason that says nothing
     /// of its devices.
     Silent,
@@ -177,7 +180,7 @@ impl Listing {
     /// devices to this computer is an answer about them. A host that refuses for another reason,
     /// such as a protocol this computer does not speak or a limit it has reached, may be the one
     /// that lists a device, so it counts as one that did not answer. A host that cannot take
-    /// another connection is no refusal of the question, and is [`Self::Busy`] by the cause the
+    /// another connection is no refusal of the question, and is [`Self::HostFull`] by the cause the
     /// connection's refusal gives ([`Unopened::of_connection`]), never by this code.
     fn of_refusal(code: ErrorCode) -> Self {
         if code == ErrorCode::PermissionDenied {
@@ -190,11 +193,17 @@ impl Listing {
     /// What a failed connection to a host says. A host that does not find this computer paired
     /// answers the hello as it would an unpaired peer, which this computer ends itself, so it
     /// reads as a connection lost, as a host that is asleep does. A dial that this computer's own
-    /// budget of connections declined asked the host nothing: the host is busy.
+    /// budget of connections declined asked the host nothing, and the host has room.
     pub(crate) fn of_link(error: &LinkError) -> Self {
         match error {
             LinkError::Refused(refusal) => Self::of_refusal(refusal.code),
-            LinkError::Declined(_) => Self::Busy,
+            LinkError::ConnectionRefused(refusal) => {
+                match Unopened::of_refused_connection(refusal.clone()) {
+                    Unopened::HostFull => Self::HostFull,
+                    _ => Self::of_refusal(refusal.code),
+                }
+            }
+            LinkError::Declined(_) => Self::BudgetFull,
             _ => Self::Silent,
         }
     }
@@ -247,7 +256,7 @@ fn listing_of(
                 Some(Unopened::HostFull)
             ) =>
         {
-            Listing::Busy
+            Listing::HostFull
         }
         Ok(Err(ClientError::Host(refused))) => Listing::of_refusal(refused.code),
         Ok(Err(ClientError::ConnectionEnded)) => Listing::Ended,
@@ -307,7 +316,10 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                     match listed_replacing(&connection, &state.replacer()).await {
                         Listing::Listed(list) => found.lists.push(list),
                         Listing::Refused => found.refused = true,
-                        Listing::Silent | Listing::Busy | Listing::Ended => found.silent = true,
+                        Listing::Silent
+                        | Listing::HostFull
+                        | Listing::BudgetFull
+                        | Listing::Ended => found.silent = true,
                     }
                 }
                 if let Standing::Paired { host, .. } = connection.standing() {
@@ -346,7 +358,10 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                 match visit.await {
                     Ok(Listing::Listed(list)) => found.lists.push(list),
                     Ok(Listing::Refused) => found.refused = true,
-                    Ok(Listing::Silent | Listing::Busy | Listing::Ended) | Err(_) => {
+                    Ok(
+                        Listing::Silent | Listing::HostFull | Listing::BudgetFull | Listing::Ended,
+                    )
+                    | Err(_) => {
                         found.silent = true;
                     }
                 }
@@ -533,12 +548,27 @@ mod tests {
             Listing::of_link(&refused(ErrorCode::PermissionDenied)),
             Listing::Refused
         ));
-        // A dial this computer's own budget declined asked the host nothing: the host is busy.
+        // A dial this computer's own budget declined asked the host nothing: the host has room, and
+        // is not one that cannot take another connection.
         assert!(matches!(
             Listing::of_link(&LinkError::Declined(
                 kr_protocol::error::ProtocolError::new(ErrorCode::ResourceUnavailable, "no place")
             )),
-            Listing::Busy
+            Listing::BudgetFull
+        ));
+        // The host's refusal of the connection for its bound is the host's, and not this
+        // computer's budget; a refusal of the connection for another reason is read as a refusal.
+        assert!(matches!(
+            Listing::of_link(&LinkError::ConnectionRefused(
+                kr_protocol::error::ProtocolError::new(ErrorCode::ResourceUnavailable, "full")
+            )),
+            Listing::HostFull
+        ));
+        assert!(matches!(
+            Listing::of_link(&LinkError::ConnectionRefused(
+                kr_protocol::error::ProtocolError::new(ErrorCode::PermissionDenied, "no")
+            )),
+            Listing::Refused
         ));
         for code in [
             // The code a host answers a request with for several causes is none of them by itself:

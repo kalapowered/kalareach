@@ -340,7 +340,7 @@ describe('revoking a device', () => {
   })
 
   it('says a host that cannot take another connection answered, and lists it from the list it gave last', async () => {
-    screenOf(view([host({ contact: 'busy' })]))
+    screenOf(view([host({ contact: 'host_full' })]))
     const row = await rowOf('the-phone')
     expect(
       screen.getByText(
@@ -349,6 +349,21 @@ describe('revoking a device', () => {
     ).toBeVisible()
     expect(screen.queryByText(/not answering/i)).not.toBeInTheDocument()
     expect(screen.getByText('Busy')).toBeVisible()
+    // A revocation is still sent through the feed.
+    expect(within(row).getByRole('button', { name: /^Revoke with Touch ID/ })).toBeEnabled()
+  })
+
+  it("says this computer's own budget of connections was used, and not that the host cannot take another", async () => {
+    screenOf(view([host({ contact: 'budget_full' })]))
+    const row = await rowOf('the-phone')
+    expect(
+      screen.getByText(
+        /This computer already holds as many connections to the-studio as it keeps at once, so it did not ask the-studio for its devices\. These are the devices it listed/
+      )
+    ).toBeVisible()
+    expect(screen.queryByText(/cannot take another connection/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/not answering/i)).not.toBeInTheDocument()
+    expect(screen.getByText('Not asked')).toBeVisible()
     // A revocation is still sent through the feed.
     expect(within(row).getByRole('button', { name: /^Revoke with Touch ID/ })).toBeEnabled()
   })

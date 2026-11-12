@@ -37,7 +37,7 @@ use kr_protocol::sharing::{DeviceListResult, DeviceSummary};
 use kr_service_stand_in::{Moment, Served, serve};
 use net_support::{Device, Host, pair_with, proposal};
 use serde_json::{Value, json};
-use support::{Companion, StubIntake};
+use support::{Companion, LinkControl, StubIntake, govern};
 use tauri::Manager as _;
 
 const AUTHORITY: &str = "/api/authority/sync";
@@ -250,6 +250,8 @@ struct Rig {
     /// The host's own keys, for a host started to read its mailbox: a test seals as the host with
     /// them.
     host_keys: Option<DeviceKeys>,
+    /// What a case does to this computer's connections to the host.
+    control: Arc<LinkControl>,
 }
 
 impl Rig {
@@ -293,9 +295,12 @@ impl Rig {
         store_device_keys(&*secrets, "device", &owner).expect("the owner's keys are kept");
         let data = tempfile::tempdir().expect("a directory");
         let ceremony = Scripted::new(CeremonyOutcome::Confirmed);
+        let control = LinkControl::new();
+        let mut governed = support::parts(Arc::clone(&secrets), Arc::new(host.room.clone()));
+        govern(&mut governed, &control);
         let app = Companion::start(
             data.path(),
-            support::parts(Arc::clone(&secrets), Arc::new(host.room.clone())),
+            governed,
             Arc::clone(&ceremony) as Arc<dyn Ceremony>,
             StubIntake::holding("", false),
         );
@@ -313,6 +318,7 @@ impl Rig {
             phone,
             timer,
             host_keys,
+            control,
         };
         rig.sync_service_is(rig.served.origin());
         // The passes the start and the pairing asked for end before anything connects: a
@@ -337,11 +343,14 @@ impl Rig {
             phone,
             timer,
             host_keys,
+            control,
         } = self;
         drop(app);
+        let mut governed = support::parts(Arc::clone(&secrets), Arc::new(host.room.clone()));
+        govern(&mut governed, &control);
         let app = Companion::start(
             data.path(),
-            support::parts(Arc::clone(&secrets), Arc::new(host.room.clone())),
+            governed,
             Arc::clone(&ceremony) as Arc<dyn Ceremony>,
             StubIntake::holding("", false),
         );
@@ -358,6 +367,7 @@ impl Rig {
             phone,
             timer,
             host_keys,
+            control,
         }
     }
 
@@ -1501,10 +1511,12 @@ async fn a_computer_that_owns_no_host_to_read_a_feed_of_asks_the_mailbox_nothing
 }
 
 /// KR-REQ-10.46: a host that this computer already holds as many connections to as it keeps at
-/// once is not shown as one that does not answer: the screen says it answered that it cannot take
-/// another connection, and asks it again once a place is free.
+/// once is not shown as one that does not answer, nor as one that cannot take another connection:
+/// the screen says this computer's own budget declined the dial, and asks again once a place is
+/// free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_this_computer_holds_every_connection_to_that_it_may_is_busy_and_not_silent() {
+async fn a_host_this_computer_holds_every_connection_to_that_it_may_is_told_as_the_budget_and_not_silent()
+ {
     let rig = Rig::start().await;
     let host_id = rig
         .app
@@ -1521,10 +1533,26 @@ async fn a_host_this_computer_holds_every_connection_to_that_it_may_is_busy_and_
             .collect();
     assert!(!held.is_empty(), "this computer holds the places");
 
-    let busy = host_by(&rig.view().await, "feed");
-    assert_eq!(busy["contact"], "busy", "{busy}");
+    let full = host_by(&rig.view().await, "feed");
+    assert_eq!(full["contact"], "budget_full", "{full}");
 
     drop(held);
+    assert_eq!(host_by(&rig.view().await, "feed")["contact"], "answered");
+}
+
+/// KR-REQ-10.46: a host that refuses this computer's connection because it holds as many from it as
+/// it allows is not shown as one that does not answer, nor as this computer's own budget being
+/// used: the screen says the host cannot take another connection, and asks again later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_cannot_take_another_connection_is_told_as_full_and_not_as_the_budget() {
+    let rig = Rig::start().await;
+    rig.control
+        .refuse_the_connection(Some(kr_protocol::error::ErrorCode::ResourceUnavailable));
+
+    let full = host_by(&rig.view().await, "feed");
+    assert_eq!(full["contact"], "host_full", "{full}");
+
+    rig.control.refuse_the_connection(None);
     assert_eq!(host_by(&rig.view().await, "feed")["contact"], "answered");
 }
 
@@ -1548,6 +1576,7 @@ async fn a_host_that_does_not_answer_is_revoked_on_through_its_feed_from_the_lis
         secrets: _,
         timer: _,
         host_keys: _,
+        control: _,
     } = rig;
     daemon.stop().await;
 

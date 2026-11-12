@@ -132,7 +132,10 @@ pub enum Contact {
     /// has run out or been revoked.
     Refused,
     /// It cannot take another connection from this computer for now.
-    Busy,
+    HostFull,
+    /// This computer's own budget of connections to it is used, so the host was not asked. The host
+    /// has room.
+    BudgetFull,
     /// It did not answer in time or could not be reached.
     Silent,
 }
@@ -1553,7 +1556,8 @@ async fn visit(
     let (contact, list) = match listing {
         Listing::Listed(list) => (Contact::Answered, Some(list)),
         Listing::Refused => (Contact::Refused, None),
-        Listing::Busy => (Contact::Busy, None),
+        Listing::HostFull => (Contact::HostFull, None),
+        Listing::BudgetFull => (Contact::BudgetFull, None),
         Listing::Silent | Listing::Ended => (Contact::Silent, None),
     };
     Reading {

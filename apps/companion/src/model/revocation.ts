@@ -208,10 +208,14 @@ export function describeContact(host: RevocationHost, now: number = Date.now()):
       return null
     case 'refused':
       return `${name} will not list its devices to this computer.`
-    case 'busy':
+    case 'host_full':
       return host.listed_at_ms === null
         ? `${name} cannot take another connection from this computer just now, and this computer has no list of its devices yet.`
         : `${name} cannot take another connection from this computer just now. These are the devices it listed ${whenOf(host.listed_at_ms, now)}.`
+    case 'budget_full':
+      return host.listed_at_ms === null
+        ? `This computer already holds as many connections to ${name} as it keeps at once, so it did not ask ${name} for its devices, and has no list of them yet.`
+        : `This computer already holds as many connections to ${name} as it keeps at once, so it did not ask ${name} for its devices. These are the devices it listed ${whenOf(host.listed_at_ms, now)}.`
     case 'silent':
       return host.listed_at_ms === null
         ? `${name} is not answering, and this computer has no list of its devices yet.`

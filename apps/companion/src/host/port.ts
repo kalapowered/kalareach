@@ -890,9 +890,11 @@ export type RevocationRoute = 'direct' | 'feed'
 
 /**
  * Whether a host listed its devices when asked just now: it did, it would not list them to this
- * computer, it could not take another connection from this computer, or it did not answer.
+ * computer, it could not take another connection from this computer (`host_full`), this computer's
+ * own budget of connections to it was used so the host was not asked (`budget_full`), or it did
+ * not answer.
  */
-export type RevocationContact = 'answered' | 'refused' | 'busy' | 'silent'
+export type RevocationContact = 'answered' | 'refused' | 'host_full' | 'budget_full' | 'silent'
 
 /** Why a host refused a request. */
 export type RevocationRefusal = 'no_owner_authority' | 'unknown_target' | 'superseded'
