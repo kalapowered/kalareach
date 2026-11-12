@@ -47,7 +47,7 @@ use crate::plugin::{
 use crate::presentation::{
     Control, MAX_CONTROLS, MAX_DOCUMENT_NODES, NodeBody, PresentationManifest,
 };
-use crate::version::{sdk_version, wit_version};
+use crate::version::{VersionRange, sdk_version, wit_version};
 
 /// A stable code for one kind of finding.
 ///
@@ -378,6 +378,16 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
             report,
         };
     };
+    // A package that needs another SDK than this one is refused for that alone. Its presentation
+    // and its connector table may be written for a version that has members this one lacks, so
+    // neither is read, and nothing that would only follow from the unread tables is reported.
+    if let Some(finding) = sdk_range_refusal(&manifest.sdk_range) {
+        report.push(finding);
+        return Validated {
+            package: None,
+            report,
+        };
+    }
     let presentation =
         read_manifest::<PresentationManifest>(&manifests, PRESENTATION_FILE, &mut report);
     let connector_present = manifests.contains_key(CONNECTOR_FILE);
@@ -990,6 +1000,26 @@ fn check_closed_vocabularies(value: &serde_json::Value, report: &mut Report) {
     }
 }
 
+/// The finding for a package whose `sdk_range` excludes the SDK version this build implements, or
+/// none when the range admits it. A range that admits every version is another finding
+/// ([`FindingCode::UnboundedVersionRange`]), and is not refused here.
+///
+/// The package check makes this test before it reads anything else of the package, and the
+/// catalogue makes it on what an index declares before it fetches the package.
+#[must_use]
+pub fn sdk_range_refusal(range: &VersionRange) -> Option<Finding> {
+    (!range.is_unbounded() && !range.admits(&sdk_version())).then(|| {
+        Finding::at(
+            FindingCode::VersionRangeExcludesHost,
+            MANIFEST_FILE,
+            format!(
+                "sdk_range {range} excludes the SDK version {}",
+                sdk_version()
+            ),
+        )
+    })
+}
+
 fn check_manifest(
     manifest: &PluginManifest,
     connector: Option<&ConnectorManifest>,
@@ -1011,16 +1041,6 @@ fn check_manifest(
             FindingCode::UnboundedVersionRange,
             MANIFEST_FILE,
             "sdk_range admits every version, including releases nobody qualified this against",
-        ));
-    } else if !manifest.sdk_range.admits(&sdk_version()) {
-        report.push(Finding::at(
-            FindingCode::VersionRangeExcludesHost,
-            MANIFEST_FILE,
-            format!(
-                "sdk_range {} excludes the SDK version {}",
-                manifest.sdk_range,
-                sdk_version()
-            ),
         ));
     }
     if manifest.wit_range.is_unbounded() {
