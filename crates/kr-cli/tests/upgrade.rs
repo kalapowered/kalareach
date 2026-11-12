@@ -16,8 +16,8 @@
 //! the release they chose, or that they have none, so run them with `--nocapture` to see it.
 //! The suite is behind the `upgrade-suite` feature, because building a second tree takes minutes
 //! and a network. A tree and its build take about 12 GB, and `KR_UPGRADE_CACHE` names another
-//! absolute folder to keep them in. The suite removes from it only the folders it made, which are
-//! named by a commit, and only when no case selects them.
+//! absolute folder to keep them in. The suite removes from it only folders that are named by a
+//! commit, so a person's own folders there stay.
 
 #![cfg(unix)]
 #![allow(dead_code, unused_imports)]
@@ -141,9 +141,9 @@ fn recorded(record: &str, name: &str) -> String {
 }
 
 /// The variable that names the folder trees of the release before are built and kept in, in place
-/// of the one under the person's home. Only the build (cargo, rustc and git), the copy of each
-/// program and this test process read that folder: every program a case starts is copied out of
-/// it first (see [`Previous::built`]). A macOS debug build's debug map names the object files in
+/// of the one under the person's home. Only the build (cargo and the tools it starts), the copy of
+/// each program and this test process read that folder: every program a case starts is copied out
+/// of it first (see [`Previous::built`]). A macOS debug build's debug map names the object files in
 /// its target folder, and only a backtrace's symbols read them, so a build made under this
 /// variable carries no debug information and a copy never refers back to the folder.
 const CACHE_ROOT: &str = "KR_UPGRADE_CACHE";

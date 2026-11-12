@@ -523,7 +523,7 @@ build_tests() {
     mkdir -p "$KR_IOS_PACKAGES" || die "the folder of the Swift packages could not be made: $KR_IOS_PACKAGES"
     # The resolved path names the folder and its lock, so every spelling of the path takes the same lock.
     local folder
-    folder=$(cd "$KR_IOS_PACKAGES" && pwd -P) || die "the folder of the Swift packages is not there: $KR_IOS_PACKAGES"
+    folder=$(cd -P "$KR_IOS_PACKAGES" && pwd -P) || die "the folder of the Swift packages is not there: $KR_IOS_PACKAGES"
     packages=(-clonedSourcePackagesDirPath "$folder" -onlyUsePackageVersionsFromResolvedFile)
     # Builds that fetch into one empty folder at the same time break each other, so one runs at a
     # time; one that waits more than half an hour fails.
@@ -1064,5 +1064,5 @@ case $command in
   build-tests) require_target; build_tests ;;
   session) session "$@" ;;
   cleanup) cleanup ;;
-  *) sed -n '2,38p' "$0"; exit 2 ;;
+  *) sed -n '2,41p' "$0"; exit 2 ;;
 esac

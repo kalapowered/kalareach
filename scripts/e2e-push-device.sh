@@ -44,7 +44,7 @@
 # that builds share one copy instead of fetching one each (see scripts/lib/xcode.sh).
 # The driving test's result bundle is written to driving-test.xcresult in the artefacts folder,
 # which has to stay on the internal disk. A run that passes removes it; a run that fails keeps it,
-# and the next run replaces it. KR_KEEP_XCRESULT=1 keeps it after a pass too.
+# and the next run that drives the test replaces it. KR_KEEP_XCRESULT=1 keeps it after a pass too.
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail

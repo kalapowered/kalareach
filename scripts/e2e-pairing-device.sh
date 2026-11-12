@@ -69,7 +69,7 @@
 # that builds share one copy instead of fetching one each (see scripts/lib/xcode.sh).
 # The driving test's result bundle is written to driving-test.xcresult in the artefacts folder,
 # which has to stay on the internal disk. A run that passes removes it; a run that fails keeps it,
-# and the next run replaces it. KR_KEEP_XCRESULT=1 keeps it after a pass too.
+# and the next run that drives the test replaces it. KR_KEEP_XCRESULT=1 keeps it after a pass too.
 #
 # The phone's logs are searched for every form of an invitation's text and secret. The folders this run
 # writes into (the output folder and the screenshots) are for the account that runs it alone, made before

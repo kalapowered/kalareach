@@ -15,8 +15,8 @@
 # folder never moves a pin. Only the build and the tools it starts, which are children of the
 # terminal, read the folder, as long as the scheme's test run loads no package product: the UI-test
 # scheme the device scripts build links none. A scheme whose tests load a package (the native unit
-# tests link WebRTC) keeps its own folder, since the simulator's test agent then reads the package
-# from it, and from an external volume that is an access the person would be asked about.
+# tests link WebRTC) keeps its own folder: one run of those tests with the packages in a folder on
+# an external volume logged an access query for that volume from the simulator's test agent.
 #
 # `kr_with_packages_lock <command...>` runs the command, and while KR_IOS_PACKAGES names a folder it
 # holds that folder's lock, named from its resolved path, for the whole command, and waits for it
@@ -38,7 +38,7 @@ kr_shared_packages() {
     esac
     mkdir -p "$KR_IOS_PACKAGES" || return 2
     local folder
-    folder="$(cd "$KR_IOS_PACKAGES" && pwd -P)" || return 2
+    folder="$(cd -P "$KR_IOS_PACKAGES" && pwd -P)" || return 2
     # shellcheck disable=SC2034 # read by the scripts that source this file
     kr_package_options=(-clonedSourcePackagesDirPath "$folder" -onlyUsePackageVersionsFromResolvedFile)
 }
@@ -49,7 +49,7 @@ kr_with_packages_lock() {
         return
     fi
     local folder
-    folder="$(cd "$KR_IOS_PACKAGES" && pwd -P)" || { echo "the folder KR_IOS_PACKAGES names is not there" >&2; return 2; }
+    folder="$(cd -P "$KR_IOS_PACKAGES" && pwd -P)" || { echo "the folder KR_IOS_PACKAGES names is not there" >&2; return 2; }
     /usr/bin/lockf -k -t 1800 "$folder.lock" "$@"
 }
 
