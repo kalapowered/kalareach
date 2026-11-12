@@ -57,6 +57,17 @@ enum SceneProbe {
                 log("\(name.rawValue) scene=\(identifier(of: note.object as? UIScene)) \(summary())")
             }
         }
+        // The application's own notifications, which the native watchers listen to: they are still
+        // posted when the application runs under scenes.
+        let application: [Notification.Name] = [
+            UIApplication.willResignActiveNotification, UIApplication.didEnterBackgroundNotification,
+            UIApplication.willEnterForegroundNotification, UIApplication.didBecomeActiveNotification,
+        ]
+        for name in application {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+                log("\(name.rawValue) \(summary())")
+            }
+        }
         for name in requests.keys {
             let center = CFNotificationCenterGetDarwinNotifyCenter()
             CFNotificationCenterAddObserver(

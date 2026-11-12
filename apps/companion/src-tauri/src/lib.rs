@@ -451,6 +451,10 @@ fn watch_suspension(app: &tauri::AppHandle) {
 
     let handle = app.clone();
     let watching = companion_platform::scan::on_background(app, move || {
+        // A debug build says so on its error stream, for a device run that shows the entry into
+        // the background still reaches the device after the window was made again.
+        #[cfg(debug_assertions)]
+        eprintln!("KalaReach scene probe (rust): the background entry reached the device");
         if let Ok(device) = handle.state::<AppState>().device() {
             device.suspend();
         }
