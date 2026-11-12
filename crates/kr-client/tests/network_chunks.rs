@@ -29,8 +29,8 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind};
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::ids::{
-    ActionWindowId, BootEpoch, BuildId, ClockEpoch, ConnectionId, DeviceId, DeviceKeyRevision,
-    EnvironmentId, RequestId, TransferId,
+    ActionId, ActionWindowId, BootEpoch, BuildId, ClockEpoch, ConnectionId, DeviceId,
+    DeviceKeyRevision, EnvironmentId, RequestId, TransferId,
 };
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::method::{Method, MethodName};
@@ -214,6 +214,8 @@ struct Seen {
     stored: BTreeSet<u64>,
     begins: u64,
     finishes: u64,
+    /// The action identifier of the last `upload.finish` the host read.
+    finish_action: Option<ActionId>,
     status_reads: u64,
     /// The request identifiers of every request and mutation read on the control stream.
     control_ids: Vec<RequestId>,
@@ -235,6 +237,8 @@ struct Script {
     refuses_streams: AtomicBool,
     /// Answers the next `upload.finish` that the outcome is not known, though it publishes: once.
     finish_unknown_once: AtomicBool,
+    /// Reads every `upload.finish` and never answers it.
+    finish_unanswered: AtomicBool,
     chunks: Mutex<VecDeque<Chunk>>,
     /// A chunk under this window is refused as one that has expired.
     ended_window: Mutex<Option<ActionWindowId>>,
@@ -255,6 +259,7 @@ impl Script {
             state: Mutex::new(UploadState::Receiving),
             refuses_streams: AtomicBool::new(false),
             finish_unknown_once: AtomicBool::new(false),
+            finish_unanswered: AtomicBool::new(false),
             chunks: Mutex::new(VecDeque::new()),
             ended_window: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
@@ -510,7 +515,13 @@ fn control_reply(script: &Arc<Script>, frame: ControlFrame) -> Option<ControlFra
                 Some(Method::UploadFinish) => {
                     let params: UploadFinishParams = mutation.params.to_typed().ok()?;
                     let transfer_id = script.seen(|seen| seen.transfer)?;
-                    script.record(|seen| seen.finishes += 1);
+                    script.record(|seen| {
+                        seen.finishes += 1;
+                        seen.finish_action = Some(mutation.action_id);
+                    });
+                    if script.finish_unanswered.load(Ordering::Acquire) {
+                        return None;
+                    }
                     if script.finish_unknown_once.swap(false, Ordering::AcqRel) {
                         return Some(answer(
                             mutation.request_id,
@@ -2001,9 +2012,10 @@ async fn a_finish_the_status_does_not_show_published_ends_the_send_with_the_host
     });
 }
 
-/// A finish that was sent and not answered, because the account signed out as it went, is
-/// `SubmissionUncertain` with its action and not the sign-out's refusal: the host may have
-/// published, and nothing is read on a connection that has gone.
+/// A finish whose write the sign-out interrupts is `SubmissionUncertain` with its action and not the
+/// sign-out's refusal, and nothing is read on a connection that has gone. The frame never leaves the
+/// client here (the transport refuses it), so this is the write-failure branch of the session's
+/// submission; the branch where the host has the frame is the case at the end of this file.
 #[tokio::test]
 async fn a_finish_that_a_sign_out_leaves_unanswered_is_submission_uncertain() {
     let script = Script::new(true);
@@ -2054,9 +2066,9 @@ async fn a_finish_that_a_sign_out_leaves_unanswered_is_submission_uncertain() {
     serving.abort();
 }
 
-/// A finish that was sent and not answered, because the network ended the connection as it went, is
-/// `SubmissionUncertain` with its action and not a connection that ended: it is the same call
-/// whatever ended the connection.
+/// A finish whose write fails because the network ended the connection is `SubmissionUncertain` with
+/// its action and not a connection that ended: it is the same call whatever ended the connection. As
+/// in the case before, the frame never leaves the client: this is the write-failure branch.
 #[tokio::test]
 async fn a_finish_that_a_lost_connection_leaves_unanswered_is_submission_uncertain() {
     let script = Script::new(true);
@@ -2157,4 +2169,42 @@ async fn a_status_read_that_a_sign_out_stops_after_an_unknown_finish_leaves_the_
     );
     session.close();
     serving.abort();
+}
+
+/// A finish that the host took and did not answer before the connection ended is
+/// `SubmissionUncertain` with the identifier of the action the host read, which is the path on which
+/// the host can have published; and the host is asked nothing more. The host reads the finish and
+/// says nothing, and the case ends the session once the host has read it. The session has ended, so a
+/// status read could not leave in any case: that the host saw none is what the case can show.
+#[tokio::test]
+async fn a_finish_the_host_took_and_did_not_answer_before_the_connection_ended_is_submission_uncertain()
+ {
+    let script = Script::new(true);
+    script.finish_unanswered.store(true, Ordering::Release);
+    let pair = pair(Arc::clone(&script)).await;
+    let route = ChunkRoute::network(&pair.session, environment())
+        .await
+        .expect("a route");
+    let mut upload = plan(THREE_CHUNKS);
+    let at = target();
+    let progress = unwatched();
+    let sending = uploads::send(&pair.session, &route, &at, &mut upload, TTL, &progress);
+    let ending = async {
+        script.until("the finish", |seen| seen.finishes == 1).await;
+        pair.session.close();
+    };
+    let (told, ()) = within(async { tokio::join!(sending, ending) }).await;
+    let told =
+        told.expect_err("the host read the finish and the connection ended before its answer");
+    let ClientError::SubmissionUncertain { action_id } = told else {
+        panic!("the caller is told the finish's outcome is unknown, with its action: {told:?}");
+    };
+    script.seen(|seen| {
+        assert_eq!(
+            Some(action_id),
+            seen.finish_action,
+            "the action is the one the host read"
+        );
+        assert_eq!(seen.status_reads, 0, "the host was asked nothing more");
+    });
 }

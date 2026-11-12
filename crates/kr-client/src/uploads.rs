@@ -682,13 +682,17 @@ struct Unconditional {}
 ///   the network ended the connection is given as the reason, as it is at the lane's check.
 /// * A reservation or a finish that was sent and not answered when the connection ended is
 ///   [`ClientError::SubmissionUncertain`] with its action, whatever ended the connection, and
-///   nothing is read after it: the caller asks the transport for the reason as well. A sign-out
-///   that closes the connection while a call is being written gives the transport's error for
-///   that write, not the reason.
+///   nothing is read after it: the caller asks the transport for the reason as well. The
+///   transport's own error, and not the reason, is what a sign-out gives when it closes the
+///   connection while a status read is being written, and only then: the first status read of a
+///   plan that holds a transfer, and the one after a chunk's failure. During a chunk's write it
+///   gives the reason, and during a finish's write [`ClientError::SubmissionUncertain`].
 /// * A finish the host answers `OUTCOME_UNKNOWN`, as it does a device that may not view the session
 ///   of a session-bound upload though the upload is published, is read from `upload.status` once.
-///   When that says published, the send returns the handle, and no second finish is sent;
-///   otherwise, and when the read itself fails, it returns the host's answer.
+///   When that says published, the send returns the handle, and no second finish is sent. When it
+///   says the upload was cancelled, invalidated or expired, the send returns the plan's refusal.
+///   When it shows no handle otherwise, and when the read itself fails, the send returns the host's
+///   answer ([`ClientError::OutcomeUnknown`], with its action).
 /// * The plan records a reservation as asked for before `upload.begin` leaves
 ///   ([`Upload::reserving`]), and only a definite answer clears that: the host's result, or its
 ///   refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt with no

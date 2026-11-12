@@ -418,11 +418,14 @@ each chunk and on every way out of a call or a wait, and stops with the reason t
 recorded. `uploads::send` gives that reason in place of `ConnectionEnded` when a call finds the
 connection ended. A reservation or a finish that was sent and not answered when the connection ended
 stays `SubmissionUncertain` with its action, whatever ended the connection, and the caller asks the
-transport for the reason as well; so does a finish the host answered unknown whose status read then
-fails, which ends the send with the host's answer. A sign-out that closes the connection while a call
-is being written gives the transport's error for that write and not the reason. The reason is what
-the transport records when it is asked, so a sign-out that comes just after the network ended the
-connection is given as the reason, here as at the lane's check.
+transport for the reason as well. A finish the host answered unknown whose status read then fails ends
+the send with the host's answer, `OutcomeUnknown` with its action. A sign-out that closes the
+connection while a status read is being written gives the transport's error for that write and not the
+reason; that is so of the first status read of a plan that holds a transfer and of the one after a
+chunk's failure, and of no other call: during a chunk's write the sign-out gives the reason, and
+during a finish's write `SubmissionUncertain`. The reason is what the transport records when it is
+asked, so a sign-out that comes just after the network ended the connection is given as the reason,
+here as at the lane's check.
 
 The client bounds every wait on the host, because its stream registry holds no deadlines. The open
 of the stream, which waits for the host's stream credit while it holds one of the connection's four
