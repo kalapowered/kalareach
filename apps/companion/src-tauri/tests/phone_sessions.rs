@@ -3234,6 +3234,70 @@ async fn places_held(host: kr_protocol::ids::DeviceId, count: usize) {
     });
 }
 
+/// KR-REQ-19.08: an opening whose link is lost, while every place of this computer's budget on the
+/// host is held by others, tells the page the budget's own cause while its watch waits for a place,
+/// and not that contact was lost for as long as the wait lasts; it reaches the host when a place is
+/// free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_watch_that_waits_on_the_budget_tells_the_budget_while_it_waits() {
+    use companion_tauri::places::Kind;
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, _control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let host = host_of(companion);
+    open(companion, session, None, "waiting-screen").expect("the session opens");
+    let places = companion_tauri::places::budget();
+
+    // Every place the other kinds may take is held but the opening's own, and the place that the
+    // opening's link gives back when it is lost goes to a taker that is already waiting, so the
+    // watch finds none free when it looks.
+    let mut held: Vec<_> = std::iter::from_fn(|| places.try_take(host, Kind::Other)).collect();
+    let mut taker = Box::pin(places.take(host, Kind::Other, WATCHDOG));
+    tokio::select! {
+        biased;
+        _ = &mut taker => panic!("no place is free yet"),
+        () = std::future::ready(()) => {}
+    }
+    companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_links()
+        .lose_connection(session);
+    held.push(taker.await.expect("the link's place goes to the taker"));
+
+    let told = heard(companion, "waiting-screen", |standing| {
+        standing["state"] == "reconnecting" && standing["capacity"] == true
+    })
+    .await;
+    assert!(
+        told["standing"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("already holds as many connections")),
+        "the budget's own cause while the watch waits: {told}"
+    );
+
+    // A place frees, and the watch reaches the host: the opening is served on a link again.
+    drop(held);
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let read = companion.call(
+                "session_agents",
+                json!({ "sessionId": session.to_string(), "opening": "waiting-screen" }),
+            );
+            if read.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the opening is served again once a place is free");
+    adopted.stop().await;
+}
+
 /// KR-REQ-19.08: a link the person left keeps its place on the host's bound while a mutation it
 /// carries is in flight, and gives it back once the mutation is answered and the link closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

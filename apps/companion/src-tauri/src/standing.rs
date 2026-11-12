@@ -1312,6 +1312,16 @@ impl PairedLinks {
                         dial.host_device_id(),
                         crate::places::Kind::Other,
                         || self.is_current(session_id, &opening),
+                        // The wait is for this computer's own budget, and the screen says so while
+                        // it lasts, and not that contact was lost.
+                        || {
+                            self.tell_standing(
+                                &emit,
+                                session_id,
+                                &opening,
+                                SessionStanding::reconnecting(&Unopened::BudgetFull),
+                            );
+                        },
                         dial.open(session_id, grant_id),
                     )
                     .await

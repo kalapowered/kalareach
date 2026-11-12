@@ -248,29 +248,36 @@ impl Places {
     /// Runs `dial` once a place on `host` is free for `kind`, however long that takes, and only if
     /// `wanted` still says so then: a task that keeps trying in the background has no caller to give
     /// up for it, and what it waited for may have ended while it waited. The dial starts when the
-    /// place frees, not at a later step of the caller's own schedule.
+    /// place frees, not at a later step of the caller's own schedule. `waiting` is called once,
+    /// before the wait, when no place is free, so that the caller can say why nothing is dialled.
     pub async fn dial_when_free<T>(
         &self,
         host: DeviceId,
         kind: Kind,
         wanted: impl Fn() -> bool,
+        waiting: impl FnOnce(),
         dial: impl std::future::Future<Output = T>,
     ) -> Option<T> {
-        self.until_free(host, kind).await;
+        self.until_free(host, kind, waiting).await;
         if !wanted() {
             return None;
         }
         Some(dial.await)
     }
 
-    /// Waits until a place on `host` is free for `kind`, however long that is.
-    async fn until_free(&self, host: DeviceId, kind: Kind) {
+    /// Waits until a place on `host` is free for `kind`, however long that is, and calls `waiting`
+    /// once if it has to wait.
+    async fn until_free(&self, host: DeviceId, kind: Kind, waiting: impl FnOnce()) {
+        let mut waiting = Some(waiting);
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
             if self.is_free(host, kind) {
                 return;
+            }
+            if let Some(waiting) = waiting.take() {
+                waiting();
             }
             freed.await;
         }
@@ -686,7 +693,7 @@ mod tests {
             let (places, started) = (Arc::clone(&places), Arc::clone(&started));
             async move {
                 places
-                    .dial_when_free(host(1), Kind::Other, || true, async move {
+                    .dial_when_free(host(1), Kind::Other, || true, || {}, async move {
                         started.store(true, Ordering::SeqCst);
                     })
                     .await
@@ -707,6 +714,46 @@ mod tests {
             .expect("the dial started");
         assert!(started.load(Ordering::SeqCst));
         assert_eq!(tokio::time::Instant::now(), at_release);
+    }
+
+    /// KR-REQ-19.08: a dial that finds the budget full says so once before it waits, and a dial that
+    /// finds a place free says nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_says_it_is_waiting_only_when_no_place_is_free() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let places = Places::new(2);
+        let said = Arc::new(AtomicUsize::new(0));
+        let say = || {
+            let said = Arc::clone(&said);
+            move || {
+                said.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        places
+            .dial_when_free(host(1), Kind::Other, || true, say(), async {})
+            .await
+            .expect("a free place starts the dial");
+        assert_eq!(said.load(Ordering::SeqCst), 0, "no place was waited for");
+
+        let held = places.try_take(host(1), Kind::Other).expect("a place");
+        let waiting = tokio::spawn({
+            let (places, said) = (Arc::clone(&places), say());
+            async move {
+                places
+                    .dial_when_free(host(1), Kind::Other, || true, said, async {})
+                    .await
+            }
+        });
+        tokio::time::advance(PLACE_WAIT * 3).await;
+        tokio::task::yield_now().await;
+        assert_eq!(said.load(Ordering::SeqCst), 1, "the wait was said once");
+        drop(held);
+        waiting
+            .await
+            .expect("the dial ran")
+            .expect("the dial started");
+        assert_eq!(said.load(Ordering::SeqCst), 1, "and not again");
     }
 
     /// KR-REQ-19.08: a dial whose opening ended while it waited for the budget takes nothing when a
@@ -733,6 +780,7 @@ mod tests {
                         host(1),
                         Kind::Other,
                         move || wanted.load(Ordering::SeqCst),
+                        || {},
                         async move {
                             started.store(true, Ordering::SeqCst);
                         },
