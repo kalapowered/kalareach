@@ -245,6 +245,31 @@ pub mod testing {
             })
             .is_ok()
     }
+
+    /// What a bind does between making the pipe's first instance and opening the broker's own client
+    /// end on it.
+    pub type Hook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+    static BEFORE_THE_KEEPERS_OPEN: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+    /// Sets, or with none clears, what a bind does after it has made the first instance and before the
+    /// broker's own client end is opened on it, so that a case can pause the bind in that window. The
+    /// hook is a flag of the whole process.
+    pub fn before_the_keepers_open(hook: Option<Hook>) {
+        *BEFORE_THE_KEEPERS_OPEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    pub(super) fn keepers_open_is_next() {
+        let hook = BEFORE_THE_KEEPERS_OPEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// One transfer, in storage that the process keeps until the transfer ends: the platform writes the
@@ -632,6 +657,8 @@ impl Listener {
         }
         let descriptor = Descriptor::from_text(&list)?;
         let server = instance(kind, &Descriptor::from_text(KEEPER_LIST)?, true)?;
+        #[cfg(feature = "testing")]
+        testing::keepers_open_is_next();
         let client = open_client(kind)?;
         // SAFETY: the handle was made with the right to change the list, and the descriptor is
         // valid for the call.

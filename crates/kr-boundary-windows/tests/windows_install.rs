@@ -5614,16 +5614,17 @@ fn a_thousand_and_one_failed_refills_do_not_end_the_loop_and_it_still_serves() {
 }
 
 /// An ordinary account that opens the persons' pipe in a tight loop while the service makes the pipe
-/// again and again never gets a handle on the instance that the broker keeps for itself: the first
-/// instance shows the system's entry alone until the broker's own client end is connected to it, so
-/// no bind finds that end taken, and the account's opens are refused or find no pipe until the pipe's
-/// real list is set and only the waiting instance is there to open.
+/// again and again never gets a handle on the instance that the broker keeps for itself. The bind is
+/// paused after it has made the first instance and before the broker's own client end is on it, and
+/// every open that the account makes in that pause is refused, and at least one is made; the binds
+/// all succeed, which they would not if the account had taken the first instance.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keeper_is_connected() {
-    use kr_boundary_windows::win::pipe::{Listener, Stop};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use kr_boundary_windows::win::pipe::{Listener, Stop, testing};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use windows_sys::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE,
     };
@@ -5631,48 +5632,60 @@ fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keep
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
         SECURITY_SQOS_PRESENT,
     };
-    /// What the account's opens gave, by the platform's answer.
-    #[derive(Debug, Default)]
-    struct Tally {
-        opened: u32,
-        refused: u32,
-        not_found: u32,
-        busy: u32,
-        other: u32,
+    /// What the account's opens gave, by the platform's answer: in all, and in the pause of the bind.
+    #[derive(Default)]
+    struct Counts {
+        paused: AtomicBool,
+        opened: AtomicU32,
+        refused: AtomicU32,
+        not_found: AtomicU32,
+        busy: AtomicU32,
+        other: AtomicU32,
+        opened_in_the_pause: AtomicU32,
+        refused_in_the_pause: AtomicU32,
+        other_in_the_pause: AtomicU32,
     }
     /// The account's loop: ends when the case does, on every path.
     struct Opener {
-        done: std::sync::Arc<AtomicBool>,
-        thread: Option<std::thread::JoinHandle<Tally>>,
+        done: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
     }
     impl Opener {
-        fn finish(&mut self) -> Tally {
+        fn finish(&mut self) {
             self.done.store(true, Ordering::Release);
-            self.thread
-                .take()
-                .map(|thread| thread.join().unwrap())
-                .unwrap_or_default()
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
         }
     }
     impl Drop for Opener {
         fn drop(&mut self) {
-            let _ = self.finish();
+            self.finish();
+        }
+    }
+    /// Clears the pause's hook however the case ends: it is a flag of the whole process.
+    struct HookCleared;
+    impl Drop for HookCleared {
+        fn drop(&mut self) {
+            testing::before_the_keepers_open(None);
         }
     }
     require_clean_machine();
     if needs_the_system() {
         return;
     }
-    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let counts = Arc::new(Counts::default());
+    let done = Arc::new(AtomicBool::new(false));
     let (first_try, first_tried) = std::sync::mpsc::channel::<()>();
     let thread = std::thread::spawn({
-        let done = std::sync::Arc::clone(&done);
+        let done = Arc::clone(&done);
+        let counts = Arc::clone(&counts);
         move || {
             let name = ffi::wide(persons_pipe_name());
             with_token_without(&[SYSTEM_SID, ADMINISTRATORS_SID], || {
-                let mut tally = Tally::default();
                 let mut told = false;
                 while !done.load(Ordering::Acquire) {
+                    let paused_before = counts.paused.load(Ordering::Acquire);
                     // SAFETY: the name is NUL-terminated; the result is checked.
                     let opened = unsafe {
                         CreateFileW(
@@ -5685,26 +5698,44 @@ fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keep
                             std::ptr::null_mut(),
                         )
                     };
-                    if opened == INVALID_HANDLE_VALUE {
-                        // SAFETY: reads this thread's last error, set by the call above.
-                        match unsafe { GetLastError() } {
-                            5 => tally.refused += 1,
-                            ERROR_FILE_NOT_FOUND => tally.not_found += 1,
-                            ERROR_PIPE_BUSY => tally.busy += 1,
-                            _ => tally.other += 1,
+                    // SAFETY: reads this thread's last error, set by the call above.
+                    let code = (opened == INVALID_HANDLE_VALUE).then(|| unsafe { GetLastError() });
+                    // An open counts for the pause only if the pause held before and after it.
+                    let in_the_pause = paused_before && counts.paused.load(Ordering::Acquire);
+                    match code {
+                        Some(5) => {
+                            counts.refused.fetch_add(1, Ordering::SeqCst);
+                            if in_the_pause {
+                                counts.refused_in_the_pause.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
-                    } else {
-                        tally.opened += 1;
-                        // Closed at once, which is what a client that goes does.
-                        drop(ffi::Handle::new(opened, "the persons' pipe").unwrap());
+                        Some(ERROR_FILE_NOT_FOUND) => {
+                            counts.not_found.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Some(ERROR_PIPE_BUSY) => {
+                            counts.busy.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Some(_) => {
+                            counts.other.fetch_add(1, Ordering::SeqCst);
+                            if in_the_pause {
+                                counts.other_in_the_pause.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        None => {
+                            counts.opened.fetch_add(1, Ordering::SeqCst);
+                            if in_the_pause {
+                                counts.opened_in_the_pause.fetch_add(1, Ordering::SeqCst);
+                            }
+                            // Closed at once, which is what a client that goes does.
+                            drop(ffi::Handle::new(opened, "the persons' pipe").unwrap());
+                        }
                     }
                     if !told {
                         told = true;
                         let _ = first_try.send(());
                     }
                 }
-                tally
-            })
+            });
         }
     });
     let mut opener = Opener {
@@ -5714,24 +5745,66 @@ fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keep
     first_tried
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("the account's loop made its first open");
+    let _cleared = HookCleared;
+    testing::before_the_keepers_open(Some(Arc::new({
+        let counts = Arc::clone(&counts);
+        move || {
+            // The bind waits here until the account has been refused enough times to show that it
+            // is at work, and for no longer than ten seconds.
+            counts.paused.store(true, Ordering::Release);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while counts.refused_in_the_pause.load(Ordering::SeqCst) < 20
+                && std::time::Instant::now() < until
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            counts.paused.store(false, Ordering::Release);
+        }
+    })));
     let everyone = Sid::parse("S-1-1-0").unwrap();
     let mut failures = Vec::new();
-    for number in 0..300 {
+    for number in 0..100 {
         let stop = Stop::new().unwrap();
         match Listener::bind(Pipe::Persons, std::slice::from_ref(&everyone), stop) {
             Ok(listener) => drop(listener),
             Err(failure) => failures.push(format!("bind {number}: {failure}")),
         }
     }
-    let tally = opener.finish();
-    eprintln!("EVIDENCE: the account's opens while the pipe was made 300 times: {tally:?}");
+    opener.finish();
+    let get = |count: &AtomicU32| count.load(Ordering::SeqCst);
+    eprintln!(
+        "EVIDENCE: the account's opens over 100 binds: opened {}, refused {}, not found {}, busy {}, other {}; in the pause of the bind: opened {}, refused {}, other {}",
+        get(&counts.opened),
+        get(&counts.refused),
+        get(&counts.not_found),
+        get(&counts.busy),
+        get(&counts.other),
+        get(&counts.opened_in_the_pause),
+        get(&counts.refused_in_the_pause),
+        get(&counts.other_in_the_pause)
+    );
     assert!(
         failures.is_empty(),
         "an open of the account took the first instance before the broker's own end was on it: {failures:?}"
     );
+    assert!(
+        get(&counts.refused_in_the_pause) >= 1,
+        "the account made no open in the pause of the bind"
+    );
     assert_eq!(
-        tally.other, 0,
-        "an open ended with an answer that is neither a refusal, no pipe nor a busy pipe: {tally:?}"
+        get(&counts.opened_in_the_pause),
+        0,
+        "the account opened the pipe in the pause of the bind"
+    );
+    assert_eq!(
+        get(&counts.other_in_the_pause),
+        0,
+        "an open in the pause of the bind ended with an answer that is not a refusal"
+    );
+    assert_eq!(
+        get(&counts.other),
+        0,
+        "an open ended with an answer that is neither a refusal, no pipe nor a busy pipe"
     );
 }
 
