@@ -13,12 +13,30 @@ use kr_boundary_windows::manifest::{Manifest, ObjectKind};
 use kr_boundary_windows::win::install::{self, DataChild, Paths};
 use kr_boundary_windows::win::{acl, sd};
 
-fn inherited_folder() -> PathBuf {
-    let folder = std::env::temp_dir().join(format!(
+/// A folder that a case made. It is removed with everything in it, a junction in it removed and
+/// not followed, when the case ends, whether it ends by passing or by a failed assertion.
+struct Folder(PathBuf);
+
+impl std::ops::Deref for Folder {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn inherited_folder() -> Folder {
+    let folder = Folder(std::env::temp_dir().join(format!(
         "krparent-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
-    owned_dir(&folder);
+    )));
+    owned_dir(&folder.0);
     folder
 }
 
@@ -110,7 +128,7 @@ fn moved_aside(text: &str) {
 /// A directory with files in it, standing for what a link at a name would let a deletion reach. It
 /// holds no manifest: a manifest that does not parse stops the removal before it deletes anything,
 /// so with one the old code would pass these cases without having been tested on the deletion.
-fn bait() -> PathBuf {
+fn bait() -> Folder {
     let target = inherited_folder();
     owned_file(target.join("prior.json"), b"{}");
     owned_dir(target.join("staging"));
@@ -154,7 +172,6 @@ fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
         assert!(paths.staging.join("keep.txt").exists(), "quiet {quiet}");
         std::fs::remove_dir_all(&top).unwrap();
     }
-    let _ = std::fs::remove_dir_all(&folder);
 }
 
 /// A junction at the data directory's name, made after the parent was checked and the directory was
@@ -181,8 +198,6 @@ fn a_junction_at_the_data_directorys_name_made_after_the_inspection_is_not_follo
     );
     bait_is_whole(&target);
     std::fs::remove_dir(&paths.data).unwrap();
-    let _ = std::fs::remove_dir_all(&target);
-    let _ = std::fs::remove_dir_all(&folder);
 }
 
 /// An empty directory that the inspection approved is removed as it is. What is put in it after the
@@ -206,18 +221,16 @@ fn what_is_put_in_an_approved_empty_directory_after_the_inspection_is_not_delete
         .to_string();
     assert!(text.contains("the data directory stays because"), "{text}");
     // Nothing has checked what was put in the directory, so the words say that the next removal reads
-    // each entry, and never to remove them unread.
+    // the first entry that it finds, and never to remove them unread.
     assert!(text.contains("run the removal again"), "{text}");
     assert!(
-        text.contains("reads each entry on its own handle"),
+        text.contains("reads the first entry that it finds on its own handle"),
         "{text}"
     );
     assert!(!text.contains("remove them"), "{text}");
     assert!(paths.prior.exists());
     bait_is_whole(&target);
     std::fs::remove_dir(&paths.staging).unwrap();
-    let _ = std::fs::remove_dir_all(&target);
-    let _ = std::fs::remove_dir_all(&folder);
 }
 
 /// A name that the layout does not give is read on its own handle before any remedy: a junction, and
@@ -266,9 +279,6 @@ fn a_name_that_the_layout_does_not_give_takes_its_remedy_from_its_own_handle() {
     moved_aside(&refusal(&bare_paths));
     std::fs::remove_dir(bare_paths.data.join("stray")).unwrap();
     bait_is_whole(&target);
-    let _ = std::fs::remove_dir_all(&target);
-    let _ = std::fs::remove_dir_all(&bare);
-    let _ = std::fs::remove_dir_all(&folder);
 }
 
 /// What the layout gives at a name is compared with what the handle shows: a directory at the
@@ -286,7 +296,6 @@ fn an_object_of_another_kind_than_the_layout_gives_at_a_name_is_moved_aside() {
     assert!(text.contains("prior.json"), "{text}");
     moved_aside(&text);
     std::fs::remove_dir(&paths.prior).unwrap();
-    let _ = std::fs::remove_dir_all(&folder);
 
     let folder = inherited_folder();
     parent_of(&folder);
@@ -294,5 +303,4 @@ fn an_object_of_another_kind_than_the_layout_gives_at_a_name_is_moved_aside() {
     installed_data_directory(&paths);
     owned_file(paths.run.join("ab".repeat(16)), b"x");
     moved_aside(&refusal(&paths));
-    let _ = std::fs::remove_dir_all(&folder);
 }
