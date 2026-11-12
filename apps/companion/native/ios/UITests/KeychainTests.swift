@@ -5,14 +5,16 @@
 //  is decided by the entitlements the signed build carries, which a simulator does not enforce the
 //  same way. These run the application's own device checks in the signed process and decide from
 //  what they report. A session starts by counting what the two groups hold, by attributes alone,
-//  and goes on only if that is nothing.
+//  and goes on only if that is nothing. The test runner takes the cases of a class in alphabetical
+//  order, and the second case makes keys of its own, so the names carry the order: the count first,
+//  then the keychain case, then the sweep.
 //
 
 import XCTest
 
 final class KeychainTests: DeviceTestCase {
     /// The baseline: nothing of this application is in either group, and every query was answered.
-    func testTheGroupsHoldNothingBeforeASessionStarts() throws {
+    func testStep1TheGroupsHoldNothingBeforeASessionStarts() throws {
         launch(probe: "count")
         let facts = try XCTUnwrap(probeFacts("count"), "the count check did not report")
         sayFacts("count", facts)
@@ -23,7 +25,7 @@ final class KeychainTests: DeviceTestCase {
 
     /// The application files a key in each group and reads it back, and is refused a group that is
     /// not its own.
-    func testTheApplicationCanUseItsOwnGroupsAndNoOtherUnderTheTeamsPrefix() throws {
+    func testStep2TheApplicationCanUseItsOwnGroupsAndNoOtherUnderTheTeamsPrefix() throws {
         launch(probe: "keychain")
         let facts = try XCTUnwrap(probeFacts("keychain"), "the keychain check did not report")
         sayFacts("keychain", facts)
@@ -39,7 +41,7 @@ final class KeychainTests: DeviceTestCase {
     }
 
     /// Everything the application and Firebase wrote is removed, and the groups are empty again.
-    func testASweepLeavesBothGroupsEmpty() throws {
+    func testStep3ASweepLeavesBothGroupsEmpty() throws {
         launch(probe: "sweep")
         let facts = try XCTUnwrap(probeFacts("sweep"), "the sweep did not report")
         sayFacts("sweep", facts)
