@@ -2197,6 +2197,8 @@ fn resizes_not_owed(
 struct ConsoleMouse {
     reporting: crate::mouse::MouseReporting,
     speller: crate::mouse::MouseSpeller,
+    /// Which of the output events are a restoration.
+    restoration: crate::mouse::Restoration,
     /// Whether the console has been asked to report the mouse.
     given: bool,
 }
@@ -2205,9 +2207,25 @@ impl ConsoleMouse {
     /// Reads output that is about to be shown on the console, and gives the mouse to the
     /// application or back to the console as what it asked for changes. `may_type` says whether
     /// this terminal may send input to the session, which is what the mouse would be.
-    fn shown(&mut self, output: &[u8], terminal: &ControllingTerminal, may_type: bool) {
-        self.reporting.observe(output);
+    ///
+    /// Says what the terminal is to be written after the output, so that it ends in the state the
+    /// session holds.
+    fn shown(
+        &mut self,
+        output: &[u8],
+        terminal: &ControllingTerminal,
+        may_type: bool,
+        reading: crate::mouse::Reading,
+    ) -> Vec<crate::mouse::Follow> {
+        let follows = self.reporting.read(output, reading);
         self.update(terminal, may_type);
+        follows
+    }
+
+    /// How an output event of the session is read: as part of a restoration, or as what the
+    /// application wrote.
+    fn reading_of(&mut self, first: bool, cursor: u64, length: usize) -> crate::mouse::Reading {
+        self.restoration.reading(first, cursor, length)
     }
 
     /// Gives the mouse to the application or back to the console to match what the application has
@@ -2521,13 +2539,35 @@ async fn drive(
                             // The console is given the mouse before it is shown that the
                             // application asked for it, so that nothing it is shown can be
                             // answered by a mouse the console still kept.
-                            console_mouse.shown(
+                            let reading = console_mouse.reading_of(
+                                heard == Heard::First,
+                                event.cursor.get(),
+                                event.bytes.as_slice().len(),
+                            );
+                            let follows = console_mouse.shown(
                                 event.bytes.as_slice(),
                                 terminal,
                                 epoch.is_some(),
+                                reading,
                             );
+                            // What the terminal is written after a sequence that would leave it
+                            // in another state than the session goes in the middle of the event.
                             let mut handle = output.as_ref();
-                            if handle.write_all(event.bytes.as_slice()).is_err() {
+                            let mut written = 0;
+                            let mut failed = false;
+                            for follow in &follows {
+                                failed = failed
+                                    || handle
+                                        .write_all(&event.bytes.as_slice()[written..follow.at])
+                                        .is_err()
+                                    || handle.write_all(&follow.bytes).is_err();
+                                written = follow.at;
+                            }
+                            if failed
+                                || handle
+                                    .write_all(&event.bytes.as_slice()[written..])
+                                    .is_err()
+                            {
                                 return AttachOutcome::Disconnected;
                             }
                             let _ = handle.flush();
@@ -2598,7 +2638,12 @@ async fn drive(
                                 window.return_to_live();
                             }
                             if !drawn.bytes.is_empty() {
-                                console_mouse.shown(&drawn.bytes, terminal, epoch.is_some());
+                                console_mouse.shown(
+                                    &drawn.bytes,
+                                    terminal,
+                                    epoch.is_some(),
+                                    crate::mouse::Reading::Painted,
+                                );
                                 let mut handle = output.as_ref();
                                 if handle.write_all(&drawn.bytes).is_err() {
                                     return AttachOutcome::Disconnected;
@@ -4548,17 +4593,22 @@ mod tests {
         };
         let mut mouse = super::ConsoleMouse::default();
 
-        mouse.shown(b"\x1b[?1000h\x1b[?1006h", &terminal, true);
+        mouse.shown(
+            b"\x1b[?1000h\x1b[?1006h",
+            &terminal,
+            true,
+            crate::mouse::Reading::Live,
+        );
         assert_eq!(
             mouse.spelled(press, &terminal, true),
             b"\x1b[<0;2;2M".to_vec()
         );
-        mouse.shown(b"\x1b[?1000l", &terminal, true);
+        mouse.shown(b"\x1b[?1000l", &terminal, true, crate::mouse::Reading::Live);
         assert!(
             mouse.spelled(press, &terminal, true).is_empty(),
             "a record after the application stopped asking is told to nobody"
         );
-        mouse.shown(b"\x1b[?1000h", &terminal, true);
+        mouse.shown(b"\x1b[?1000h", &terminal, true, crate::mouse::Reading::Live);
         assert_eq!(
             mouse.spelled(press, &terminal, true),
             b"\x1b[<0;2;2M".to_vec(),

@@ -425,18 +425,23 @@ The mouse is a virtual-terminal operation on this path too. It is not a record t
 The command reads what the session writes to learn whether the application asked for mouse
 reporting: DEC mode 1000 for presses and the wheel, 1002 for a move with a button held, 1003 for
 every move, and 1006 for the SGR encoding. The tracking is one setting, as it is on a terminal and
-in the session's screen: setting one of the three modes replaces the one in force, and resetting
-the one in force turns tracking off. A reset of a tracking mode that is not on changes nothing,
-because a session started before an upgrade draws its screen with every tracking mode, the ones that
-are off among them, and that screen is read as what the application asked for. A screen the command
-draws resets the three first and then sets the one that is on.
+in the session's screen: setting one of the three modes replaces the one in force, and resetting any
+of them turns tracking off. The one exception is the screen a session started before an upgrade
+draws when the command attaches or reconnects: it writes every tracking mode, the ones that are off
+among them, so a reset of a tracking mode that is not on changes nothing there, and that screen is
+read as what the application asked for. What the application writes itself is read as a terminal
+reads it. A screen the command draws resets the three first and then sets the one that is on.
 
-The encoding is one setting too: setting 1005 (UTF-8 coordinates) or 1006 replaces the one in force,
-and resetting either returns the original report, also when it names the one that is not in force.
-The command spells the SGR report while 1006 is the one in force and the original report otherwise,
-which is what it also spells for 1005. A screen the command draws resets both modes (1005 and 1006)
-and then sets the one that is on. A screen of a session
-started before an upgrade that holds both 1005 and 1006 is read as 1006.
+The encoding is one setting too, as xterm documents it: setting 1005 (UTF-8 coordinates) or 1006
+replaces the one in force, and resetting the one in force returns the original report, where
+resetting the other changes nothing. The command spells the SGR report while 1006 is the one in
+force and the original report otherwise, which is what it also spells for 1005. Terminal.app and
+iTerm return the original report at a reset of either mode, so after a sequence the application
+wrote that resets the mode that is not in force, the command writes the reset of both modes and the
+set of the one in force, and the terminal ends in the state the session holds; so does a sequence
+that names several modes or that arrives in two parts. A screen the command draws resets both modes
+(1005 and 1006) and then sets the one that is on. A screen of a session started before an upgrade
+that holds both 1005 and 1006 is read as 1006.
 
 While the application asks and this attachment may send input, the command asks the console for
 mouse records, which takes the mouse away from the console's text selection. It gives the mouse back

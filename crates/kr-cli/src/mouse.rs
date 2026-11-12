@@ -74,6 +74,70 @@ pub enum Tracking {
     Motion,
 }
 
+/// How a stretch of output is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// What the application wrote, which the terminal is shown as it is. It is read as a terminal
+    /// reads it, and a terminal that keeps its mouse state by another rule than the session's is
+    /// written what puts it in the session's state.
+    Live,
+    /// A screen the session drew for this terminal when it attached or reconnected. A worker of an
+    /// earlier build draws a screen's tracking modes one by one in numeric order, the ones that are
+    /// off among them (`?1000h ?1002l ?1003l`), and that screen has to be read as what its
+    /// application asked for, the widest that is on: a reset of a tracking mode that is not on
+    /// changes nothing. Nothing is written after it, because a screen resets before it sets.
+    Restoration,
+    /// What this command drew from the session's screen: read as a terminal reads it, and nothing
+    /// is written after it.
+    Painted,
+}
+
+/// Bytes to write to the terminal after the first `at` bytes of the output it has just been shown,
+/// so that the terminal ends in the state the session holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Follow {
+    /// How many bytes of the output come before these.
+    pub at: usize,
+    /// What to write.
+    pub bytes: Vec<u8>,
+}
+
+/// The most bytes one frame of a restoration carries.
+///
+/// The worker cuts the screen it draws at an attach or a reconnection in frames of at most this
+/// many bytes (`MAX_OUTPUT_EVENT_BYTES`, in `kr-worker`'s `service`), and every frame of that
+/// screen carries the cursor the live output resumes at. A case in this crate holds the two equal.
+pub const RESTORATION_CHUNK: usize = 256 * 1024;
+
+/// Tells the frames of a restoration from live output, by where they arrive.
+///
+/// A restoration begins with the first delivery of a subscription, and goes on while the frames are
+/// full: all of its frames but the last are [`RESTORATION_CHUNK`] bytes long, and all of them carry
+/// the cursor the first one carried. A frame that is shorter ends it, and so does one at another
+/// cursor.
+///
+/// A named limit: the first live frame can carry the same cursor as the restoration's, so when the
+/// restoration is a whole number of chunks long, that one live frame is read as part of it.
+#[derive(Debug, Default)]
+pub struct Restoration {
+    /// The cursor the next frame carries if it continues the restoration.
+    open_at: Option<u64>,
+}
+
+impl Restoration {
+    /// How an output event is read: `first` says it is the first delivery of its subscription, and
+    /// the rest is what the event carries.
+    pub fn reading(&mut self, first: bool, cursor: u64, length: usize) -> Reading {
+        let restoring = first || self.open_at == Some(cursor);
+        self.open_at = (restoring && length >= RESTORATION_CHUNK).then_some(cursor);
+        if restoring {
+            Reading::Restoration
+        } else {
+            Reading::Live
+        }
+    }
+}
+
 /// What the session's application has asked for of the mouse, learned from what the session wrote.
 ///
 /// It reads the output as a terminal reads it, a byte at a time, so a mode setting cut in two
@@ -81,16 +145,20 @@ pub enum Tracking {
 ///
 /// The tracking is one setting, as a terminal and the session's screen keep it: setting one of the
 /// three tracking modes replaces the one in force, and resetting any of them turns tracking off. A
-/// frame drawn from the screen resets the three and then sets the one that is on. A full reset of
-/// the terminal (`ESC c`) turns tracking off. The encoding is one setting in the same way: a set of
-/// 1005 or 1006 replaces the one in force and a reset of either returns the default, and a frame
-/// resets both before it sets the one that is on.
+/// full reset of the terminal (`ESC c`) turns tracking off. The encoding is one setting too, as
+/// xterm documents it: a set of 1005 or 1006 replaces the one in force, and a reset returns the
+/// default only when it names the one in force. Terminal.app and iTerm return the default at a reset
+/// of either, so after a sequence that leaves them elsewhere than the session, live output is
+/// followed by the resets of both modes and the set of the one in force.
 #[derive(Debug, Default)]
 pub struct MouseReporting {
     clicks: bool,
     drag: bool,
     motion: bool,
-    sgr: bool,
+    /// The encoding in force: 1005, 1006 or the default.
+    encoding: Option<u32>,
+    /// The encoding a terminal holds that returns the default at a reset of either mode.
+    reset_by_either: Option<u32>,
     scan: Scan,
 }
 
@@ -134,11 +202,41 @@ impl Control {
 }
 
 impl MouseReporting {
-    /// Reads output the session wrote, which is what the console is shown.
+    /// Reads output as a terminal reads it, and writes nothing after it.
     pub fn observe(&mut self, output: &[u8]) {
-        for &byte in output {
-            self.step(byte);
+        let _ = self.read(output, Reading::Painted);
+    }
+
+    /// Reads output the session wrote, which is what the console is shown, and says what the
+    /// terminal is to be written after it so that it holds the state the session holds.
+    pub fn read(&mut self, output: &[u8], reading: Reading) -> Vec<Follow> {
+        let mut follows = Vec::new();
+        for (at, &byte) in output.iter().enumerate() {
+            if self.step(byte, reading) && reading == Reading::Live && self.differs() {
+                follows.push(Follow {
+                    at: at + 1,
+                    bytes: self.put_right(),
+                });
+            }
         }
+        follows
+    }
+
+    /// Whether a terminal that returns the default at any reset holds another encoding than the
+    /// session.
+    fn differs(&self) -> bool {
+        self.encoding != self.reset_by_either
+    }
+
+    /// The bytes that put every terminal in the encoding in force: the reset of both modes, and the
+    /// set of the one in force.
+    fn put_right(&mut self) -> Vec<u8> {
+        self.reset_by_either = self.encoding;
+        let mut bytes = b"\x1b[?1005;1006l".to_vec();
+        if let Some(mode) = self.encoding {
+            bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
+        }
+        bytes
     }
 
     /// What the application asked to be told of the mouse.
@@ -157,8 +255,8 @@ impl MouseReporting {
 
     /// The encoding the application asked for.
     #[must_use]
-    pub const fn encoding(&self) -> MouseEncoding {
-        if self.sgr {
+    pub fn encoding(&self) -> MouseEncoding {
+        if self.encoding == Some(1006) {
             MouseEncoding::Sgr
         } else {
             MouseEncoding::X10
@@ -170,10 +268,13 @@ impl MouseReporting {
         self.clicks = false;
         self.drag = false;
         self.motion = false;
-        self.sgr = false;
+        self.encoding = None;
+        self.reset_by_either = None;
     }
 
-    fn step(&mut self, byte: u8) {
+    /// Reads one byte, and says whether it finished a sequence that set or reset an encoding.
+    fn step(&mut self, byte: u8, reading: Reading) -> bool {
+        let mut touched = false;
         self.scan = match std::mem::take(&mut self.scan) {
             Scan::Ground => {
                 if byte == 0x1b {
@@ -230,36 +331,36 @@ impl MouseReporting {
                     if control.number.is_some() || control.started {
                         control.close_number();
                     }
-                    self.apply(&control, byte);
+                    touched = self.apply(&control, byte, reading);
                     Scan::Ground
                 }
                 _ => Scan::Ground,
             },
         };
+        touched
     }
 
     /// Applies a finished control sequence: the setting and resetting of the modes that ask for the
-    /// mouse, and nothing else.
-    fn apply(&mut self, control: &Control, last: u8) {
+    /// mouse, and nothing else. Says whether it set or reset an encoding.
+    fn apply(&mut self, control: &Control, last: u8, reading: Reading) -> bool {
+        let mut touched = false;
         if !control.private || control.other || !matches!(last, b'h' | b'l') {
-            return;
+            return false;
         }
         let set = last == b'h';
         for &mode in &control.parameters {
             match mode {
-                // One tracking state: a set of one of the three replaces the one in force, and a reset
-                // of the one in force turns tracking off. A reset of a tracking mode that is not the
-                // one in force is left alone: a terminal would turn tracking off, but a worker of an
-                // earlier build draws a screen with every tracking mode it holds, one by one, the
-                // ones that are off among them (`?1000h ?1002l ?1003l`), and that frame has to be
-                // read as what its application asked for, the widest that is on. The bytes carry no
-                // sign of which build wrote them, so every frame is read this way, and a reset of a
-                // tracking mode that is not on, written by an application itself, is read as a
-                // frame's would be.
+                // One tracking state: a set of one of the three replaces the one in force, and a
+                // reset of any of them turns tracking off, as a terminal does. A screen drawn by a
+                // worker of an earlier build is the exception, and only while it is being drawn: it
+                // writes every tracking mode it holds, one by one, the ones that are off among them
+                // (`?1000h ?1002l ?1003l`), so a reset of a mode that is not on changes nothing
+                // there, and the screen is read as what its application asked for, the widest that
+                // is on. A current worker draws a screen that resets the three before it sets the
+                // one that is on, which reads the same under both rules.
                 // Remove the exception when no worker of an earlier build can still be running: when
                 // the lowest package version `check_build` accepts in `attach.rs` is at or above the
-                // first release that holds the one-state tracking in `kr-term`'s `ModeState`. A reset
-                // of any of the three then turns tracking off, as on a terminal.
+                // first release that holds the one-state tracking in `kr-term`'s `ModeState`.
                 1000 | 1002 | 1003 => {
                     let in_force = if self.motion {
                         Some(1003)
@@ -270,23 +371,33 @@ impl MouseReporting {
                     } else {
                         None
                     };
-                    if set || in_force == Some(mode) {
+                    if set || reading != Reading::Restoration || in_force == Some(mode) {
                         self.clicks = set && mode == 1000;
                         self.drag = set && mode == 1002;
                         self.motion = set && mode == 1003;
                     }
                 }
-                // One encoding state, as Terminal.app and iTerm keep it: a set of 1005 or 1006
-                // replaces the encoding in force, and a reset of either returns the default, also
-                // when it names the one that is not in force. Only the SGR report is spelled, so
-                // the console is spelled it while 1006 is the one in force, and the original
-                // report otherwise, which is also what UTF-8 coordinates (1005) are spelled as. A
-                // frame of a worker of an earlier build that holds both flags on draws
-                // `?1005h ?1006h`, which reads as 1006, the later number.
-                1005 | 1006 => self.sgr = set && mode == 1006,
+                // One encoding state, as xterm documents it: a set of 1005 or 1006 replaces the
+                // one in force, and a reset returns the default only when it names the one in
+                // force. A terminal that returns the default at a reset of either mode ends
+                // elsewhere after a reset of the mode that is not in force. Only the SGR report is
+                // spelled, so the console is spelled it while 1006 is the one in force, and the
+                // original report otherwise, which is also what UTF-8 coordinates (1005) are
+                // spelled as. A screen of a worker of an earlier build that holds both flags on
+                // draws `?1005h ?1006h`, which reads as 1006, the later number.
+                1005 | 1006 => {
+                    touched = true;
+                    if set {
+                        self.encoding = Some(mode);
+                    } else if self.encoding == Some(mode) {
+                        self.encoding = None;
+                    }
+                    self.reset_by_either = if set { Some(mode) } else { None };
+                }
                 _ => {}
             }
         }
+        touched
     }
 }
 
@@ -559,8 +670,9 @@ mod tests {
     use super::{
         ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
         ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
-        ENABLE_WINDOW_INPUT, LEFT, MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord, MouseReporting,
-        MouseSpeller, RIGHT, Tracking, Window, mouse_input_mode, record_input_mode,
+        ENABLE_WINDOW_INPUT, Follow, LEFT, MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord,
+        MouseReporting, MouseSpeller, RESTORATION_CHUNK, RIGHT, Reading, Restoration, Tracking,
+        Window, mouse_input_mode, record_input_mode,
     };
 
     /// A record at `column` and `row` with the buttons and flags the console reported it with.
@@ -607,7 +719,7 @@ mod tests {
             (&b"\x1b[?1002h"[..], Tracking::Drag),
             (b"\x1b[?1003h", Tracking::Motion),
             (b"\x1b[?1000h", Tracking::Clicks),
-            (b"\x1b[?1003l", Tracking::Clicks),
+            (b"\x1b[?1003l", Tracking::Off),
             (b"\x1b[?1002h", Tracking::Drag),
             (b"\x1b[?1002l", Tracking::Off),
         ] {
@@ -642,19 +754,19 @@ mod tests {
         }
     }
 
-    /// The encoding is one state: a set of 1005 or 1006 replaces the one in force, and a reset of
-    /// either returns the default, also when it names the one that is not in force. The console is
+    /// The encoding is one state, as xterm documents it: a set of 1005 or 1006 replaces the one in
+    /// force, and a reset returns the default only when it names the one in force. The console is
     /// spelled the SGR report only while 1006 is the one in force; UTF-8 coordinates are spelled
     /// as the original report, as they always were. A frame drawn from the session's screen resets
     /// both modes and sets the one that is on, and a frame of a worker of an earlier build that holds
     /// both flags on reads as 1006.
     #[test]
-    fn the_encoding_is_one_state_and_a_reset_of_either_mode_returns_the_default() {
+    fn the_encoding_is_one_state_and_a_reset_returns_the_default_when_it_names_the_one_in_force() {
         for (output, encoding) in [
             (&b"\x1b[?1006h\x1b[?1005h"[..], kr_keys::MouseEncoding::X10),
             (b"\x1b[?1005h\x1b[?1006h", kr_keys::MouseEncoding::Sgr),
             (b"\x1b[?1005h\x1b[?1006l", kr_keys::MouseEncoding::X10),
-            (b"\x1b[?1006h\x1b[?1005l", kr_keys::MouseEncoding::X10),
+            (b"\x1b[?1006h\x1b[?1005l", kr_keys::MouseEncoding::Sgr),
             (b"\x1b[?1006h\x1b[?1006l", kr_keys::MouseEncoding::X10),
             (
                 b"\x1b[?1006h\x1b[?1005l\x1b[?1006l",
@@ -679,10 +791,29 @@ mod tests {
         }
     }
 
-    /// A worker of an earlier build draws a screen with each tracking mode it holds, one by one and
-    /// the ones that are off among them, and that frame is read as what the application asked for.
+    /// With a current worker, a reset of a tracking mode that is not the one on turns tracking off,
+    /// as it does on a terminal: the application is not told of a mouse it turned off, and the
+    /// person can select text.
     #[test]
-    fn a_frame_of_an_earlier_worker_is_read_as_the_widest_tracking_that_is_on() {
+    fn a_reset_of_a_tracking_mode_that_is_not_on_turns_tracking_off_in_live_output() {
+        for output in [&b"\x1b[?1002h\x1b[?1000l"[..], b"\x1b[?1003h\x1b[?1002l"] {
+            for reading in [Reading::Live, Reading::Painted] {
+                let mut reporting = MouseReporting::default();
+                let _ = reporting.read(output, reading);
+                assert_eq!(
+                    reporting.tracking(),
+                    Tracking::Off,
+                    "{output:?} {reading:?}"
+                );
+            }
+        }
+    }
+
+    /// A worker of an earlier build draws a screen with each tracking mode it holds, one by one and
+    /// the ones that are off among them, and that screen is read as what the application asked for.
+    /// The same bytes in live output are what the application wrote, and turn tracking off.
+    #[test]
+    fn a_restoration_of_an_earlier_worker_is_read_as_the_widest_tracking_that_is_on() {
         for (frame, tracking) in [
             (
                 &b"\x1b[?1000h\x1b[?1002l\x1b[?1003l\x1b[?1006h"[..],
@@ -694,9 +825,117 @@ mod tests {
             (b"\x1b[?1000l\x1b[?1002l\x1b[?1003l", Tracking::Off),
         ] {
             let mut reporting = MouseReporting::default();
-            reporting.observe(frame);
+            let _ = reporting.read(frame, Reading::Restoration);
             assert_eq!(reporting.tracking(), tracking, "{frame:?}");
         }
+        for reading in [Reading::Live, Reading::Painted] {
+            let mut reporting = MouseReporting::default();
+            let _ = reporting.read(b"\x1b[?1000h\x1b[?1002l\x1b[?1003l", reading);
+            assert_eq!(reporting.tracking(), Tracking::Off, "{reading:?}");
+        }
+    }
+
+    /// A terminal that returns the default at a reset of either encoding mode is written what puts
+    /// it in the state the session holds, after the sequence that left it elsewhere: the resets of
+    /// both modes and the set of the one in force. That includes a sequence that names several
+    /// modes, and one that is cut between two writes.
+    #[test]
+    fn live_output_that_resets_the_encoding_not_in_force_is_followed_by_what_restores_it() {
+        let restore_1006 = b"\x1b[?1005;1006l\x1b[?1006h".to_vec();
+        let restore_1005 = b"\x1b[?1005;1006l\x1b[?1005h".to_vec();
+        let follows = |output: &[u8]| MouseReporting::default().read(output, Reading::Live);
+        let at_the_end = |output: &[u8], bytes: &[u8]| {
+            vec![Follow {
+                at: output.len(),
+                bytes: bytes.to_vec(),
+            }]
+        };
+        for (output, bytes) in [
+            (&b"\x1b[?1006h\x1b[?1005l"[..], &restore_1006),
+            (b"\x1b[?1005h\x1b[?1006l", &restore_1005),
+            (b"\x1b[?1005h\x1b[?1006;1000l", &restore_1005),
+            (b"\x1b[?1005h\x1b[?1000;1006l", &restore_1005),
+        ] {
+            assert_eq!(follows(output), at_the_end(output, bytes), "{output:?}");
+        }
+        // The sequences that leave every terminal where the session is write nothing.
+        for output in [
+            &b"\x1b[?1006h"[..],
+            b"\x1b[?1006h\x1b[?1006l",
+            b"\x1b[?1005h\x1b[?1006h",
+            b"\x1b[?1006h\x1b[?1006l\x1b[?1005l",
+            b"\x1b[?1000h\x1b[?1002l",
+            b"\x1b[?1005l",
+        ] {
+            assert_eq!(follows(output), Vec::new(), "{output:?}");
+        }
+        // The follow-up goes after the sequence, wherever the write ends.
+        let mut reporting = MouseReporting::default();
+        assert_eq!(
+            reporting.read(b"ab\x1b[?1005h\x1b[?100", Reading::Live),
+            Vec::new()
+        );
+        assert_eq!(
+            reporting.read(b"6lcd\x1b[?1000h", Reading::Live),
+            vec![Follow {
+                at: 2,
+                bytes: restore_1005.clone()
+            }]
+        );
+        // A screen drawn for the terminal and one this command drew write nothing after them.
+        for reading in [Reading::Restoration, Reading::Painted] {
+            let mut reporting = MouseReporting::default();
+            let _ = reporting.read(b"\x1b[?1006h", reading);
+            assert_eq!(reporting.read(b"\x1b[?1005l", reading), Vec::new());
+        }
+    }
+
+    /// Output is told from a restoration by where it arrives: the first delivery of a subscription
+    /// begins one, and it goes on while its frames are full-sized and at the cursor the first one
+    /// carried.
+    #[test]
+    fn a_restoration_ends_at_the_first_frame_that_is_short_or_at_another_cursor() {
+        use Reading::{Live, Restoration as Screen};
+        let chunk = RESTORATION_CHUNK;
+        let mut frames = Restoration::default();
+        // Less than one chunk: the one frame; the live frame at the same cursor is live.
+        assert_eq!(frames.reading(true, 40, 900), Screen);
+        assert_eq!(frames.reading(false, 40, 5), Live);
+        // One chunk and one byte: two frames at the cursor.
+        let mut frames = Restoration::default();
+        assert_eq!(frames.reading(true, 40, chunk), Screen);
+        assert_eq!(frames.reading(false, 40, 1), Screen);
+        assert_eq!(frames.reading(false, 40, 5), Live);
+        // Exactly one chunk: the live frame at the same cursor is read as part of it once, and the
+        // next is live; a live frame that is a chunk long after that does not begin another one.
+        let mut frames = Restoration::default();
+        assert_eq!(frames.reading(true, 40, chunk), Screen);
+        assert_eq!(frames.reading(false, 40, 5), Screen);
+        assert_eq!(frames.reading(false, 45, chunk), Live);
+        assert_eq!(frames.reading(false, 45 + chunk as u64, 5), Live);
+        // Exactly two chunks.
+        let mut frames = Restoration::default();
+        assert_eq!(frames.reading(true, 40, chunk), Screen);
+        assert_eq!(frames.reading(false, 40, chunk), Screen);
+        assert_eq!(frames.reading(false, 40, 5), Screen);
+        assert_eq!(frames.reading(false, 45, 5), Live);
+        // A live frame at another cursor ends it, and a frame at the first cursor after that is
+        // live.
+        let mut frames = Restoration::default();
+        assert_eq!(frames.reading(true, 40, chunk), Screen);
+        assert_eq!(frames.reading(false, 52, 5), Live);
+        assert_eq!(frames.reading(false, 40, 5), Live);
+        // The next subscription's first delivery begins a restoration again.
+        assert_eq!(frames.reading(true, 90, 12), Screen);
+    }
+
+    /// The bound a restoration's frames are cut at is the worker's own.
+    #[test]
+    fn the_restoration_chunk_is_the_size_the_worker_cuts_its_frames_at() {
+        assert_eq!(
+            RESTORATION_CHUNK,
+            kr_worker::service::MAX_OUTPUT_EVENT_BYTES
+        );
     }
 
     /// A full reset of the terminal turns the mouse's modes off, however the write is cut, and what

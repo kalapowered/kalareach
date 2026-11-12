@@ -89,11 +89,12 @@ pub const MOUSE_TRACKING_MODES: &[u16] = &[1000, 1002, 1003];
 /// The DEC modes that choose how a mouse report spells a position, and that the session tracks:
 /// UTF-8 coordinates (1005) and SGR coordinates (1006).
 ///
-/// They are one state, as Terminal.app and iTerm keep it: setting one makes it the encoding in
-/// force and replaces the other, and resetting either returns the default encoding, also when it
-/// names the one that is not in force. So at most one of the two is set at any time, in the
-/// session's state as in the terminal. xterm differs in one case: there a reset changes the
-/// encoding only when it names the one in force.
+/// They are one state, as xterm documents it: setting one makes it the encoding in force and
+/// replaces the other, and resetting the one in force returns the default encoding. A reset of the
+/// other one changes nothing. So at most one of the two is set at any time, in the session's state
+/// as in the terminal. Terminal.app and iTerm differ in one case: there a reset of either returns
+/// the default, also when it names the one that is not in force, so the attachment writes what puts
+/// them in the session's state.
 ///
 /// URXVT coordinates (1015) and SGR coordinates in pixels (1016) are outside the profile: the engine
 /// consumes them and never forwards them, so a session cannot put a terminal into either, and a
@@ -193,10 +194,17 @@ impl ModeState {
                 }
                 // The mouse tracking is one state, as xterm and Terminal.app keep it: a set of one
                 // of the three replaces the one in force, and a reset of any of them turns tracking
-                // off, whichever of them had set it. The mouse encoding is one state in the same
-                // way: a set of 1005 or 1006 replaces the encoding in force, and a reset of either
-                // returns the default encoding.
+                // off, whichever of them had set it. The mouse encoding is one state too, and
+                // xterm's rule decides it: a set of 1005 or 1006 replaces the encoding in force, and
+                // a reset returns the default only when it names the encoding in force; a reset of
+                // the other mode changes nothing.
                 if let Some(group) = mouse_state_group(mode) {
+                    if !enabled
+                        && group == MOUSE_ENCODING_MODES
+                        && !self.dec.get(&mode).copied().unwrap_or(false)
+                    {
+                        return true;
+                    }
                     for member in group {
                         if let Some(slot) = self.dec.get_mut(member) {
                             *slot = enabled && *member == mode;

@@ -921,6 +921,40 @@ fn mouse_encoding(stream: &[u8]) -> Option<u16> {
     encoding
 }
 
+/// The mouse encoding a stream leaves a terminal in, in a model of xterm: a set of `1005` or `1006`
+/// replaces the one in force, and a reset returns the default only when it names the one in force.
+fn mouse_encoding_by_xterm(stream: &[u8]) -> Option<u16> {
+    let mut encoding = None;
+    let mut rest = stream;
+    while let Some(at) = rest.windows(3).position(|window| window == b"\x1b[?") {
+        rest = &rest[at + 3..];
+        // The parameters, which may be several, and the letter that ends them.
+        let length = rest
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b';')
+            .count();
+        let Some(last) = rest
+            .get(length)
+            .copied()
+            .filter(|last| matches!(last, b'h' | b'l'))
+        else {
+            continue;
+        };
+        for mode in String::from_utf8_lossy(&rest[..length])
+            .split(';')
+            .filter_map(|text| text.parse::<u16>().ok())
+            .filter(|mode| matches!(mode, 1005 | 1006))
+        {
+            if last == b'h' {
+                encoding = Some(mode);
+            } else if encoding == Some(mode) {
+                encoding = None;
+            }
+        }
+    }
+    encoding
+}
+
 /// The last position a sequence appears at in a stream.
 fn last_index(stream: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || stream.len() < needle.len() {
@@ -1335,8 +1369,8 @@ async fn an_application_that_chose_a_mouse_encoding_before_the_attachment_is_sen
     for (history, expected) in [
         ("\\033[?1006h\\033[?1005h", Some(1005)),
         ("\\033[?1005h\\033[?1006h", Some(1006)),
-        ("\\033[?1005h\\033[?1006l", None),
-        ("\\033[?1006h\\033[?1005l", None),
+        ("\\033[?1005h\\033[?1006l", Some(1005)),
+        ("\\033[?1006h\\033[?1005l", Some(1006)),
         ("\\033[?1006h\\033[?1006l", None),
     ] {
         let drawn = drawn_after(&format!("\\033[?1000h{history}")).await;
@@ -1347,6 +1381,97 @@ async fn an_application_that_chose_a_mouse_encoding_before_the_attachment_is_sen
             String::from_utf8_lossy(&drawn).escape_debug()
         );
     }
+}
+
+/// KR-REQ-01.11: an application that resets a mouse encoding it is not in, while it is attached,
+/// leaves the terminal in the encoding the session holds, and a reattachment draws the same one.
+///
+/// xterm keeps the encoding in force at a reset of the other mode, and Terminal.app and iTerm return
+/// the default at it, so the bytes the application wrote leave them in different states. What the
+/// attachment writes after them is what puts every terminal where the session is, which is where a
+/// reattachment puts it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_application_that_resets_a_mouse_encoding_it_is_not_in_leaves_the_terminal_in_the_one_it_is_in()
+ {
+    let hosted = hosted(
+        "printf 'ready\\r\\n'; IFS= read -r go; printf '\\033[?1000h\\033[?1006h\\033[?1005l'; \
+         printf 'live-done\\r\\n'; exec cat",
+    )
+    .await;
+    let display = hosted.display.get().to_string();
+    let attach_in_a_terminal = || {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("opens a terminal");
+        let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+        let (queries, keys) =
+            answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
+        let shell = pty
+            .slave
+            .spawn_command(shell_running(
+                &hosted,
+                &format!("{} attach {display}", kr().display()),
+            ))
+            .expect("starts the shell");
+        (pty, output, queries, keys, shell)
+    };
+
+    // While attached: the application resets 1005 after it set 1006.
+    let (_pty, output, queries, keys, mut shell) = attach_in_a_terminal();
+    output.expect_within(
+        b"ready",
+        LIVENESS_DEADLINE,
+        "the session's screen reached the terminal",
+    );
+    answered(&output, queries);
+    {
+        let mut writer = keys.lock().expect("the writer is not poisoned");
+        writer.write_all(b"go\r").expect("types into the terminal");
+        writer.flush().expect("and it reaches the command");
+    }
+    output.expect_within(
+        b"live-done",
+        LIVENESS_DEADLINE,
+        "the application's output reached the terminal",
+    );
+    let live = output.bytes();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    for (model, held) in [
+        ("Terminal.app and iTerm", mouse_encoding(&live)),
+        ("xterm", mouse_encoding_by_xterm(&live)),
+    ] {
+        assert_eq!(
+            held,
+            Some(1006),
+            "{model} holds the encoding the session holds after the application's own bytes: {}",
+            String::from_utf8_lossy(&live).escape_debug()
+        );
+    }
+
+    // A reattachment draws the same encoding.
+    session_retained(&hosted, b"live-done", LIVENESS_DEADLINE).await;
+    let (_pty, output, queries, _keys, mut shell) = attach_in_a_terminal();
+    output.expect_within(
+        b"live-done",
+        LIVENESS_DEADLINE,
+        "the session's screen reached the terminal again",
+    );
+    answered(&output, queries);
+    let drawn = output.bytes();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    assert_eq!(
+        (mouse_encoding(&drawn), mouse_encoding_by_xterm(&drawn)),
+        (Some(1006), Some(1006)),
+        "the reattachment leaves the encoding the live output left: {}",
+        String::from_utf8_lossy(&drawn).escape_debug()
+    );
 }
 
 /// KR-REQ-08.84: an attach that fails after the handshake still leaves the terminal its own modes.
