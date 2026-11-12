@@ -510,6 +510,11 @@ async fn a_binding_at_the_bound_settles_the_closures_the_registry_holds_before_i
         ErrorCode::QuotaExceeded,
         "no closure is recorded: the bound holds"
     );
+    assert_eq!(
+        controller.transfer().second_tries(),
+        1,
+        "the refusal was given after one second try and no more"
+    );
 
     controller
         .registry
@@ -542,6 +547,119 @@ async fn a_binding_at_the_bound_settles_the_closures_the_registry_holds_before_i
         service.open_drafts(&device).expect("counts"),
         DEVICE_OPEN_DRAFTS,
         "the draft of the closed session stopped counting and the spent draft took its place"
+    );
+    world.serving.abort();
+}
+
+/// How long a case waits for a call to reach the place it is stopped at.
+const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits until the call stopped at the pause `arrived` belongs to has reached it, and fails the case
+/// if `answered` ends first.
+async fn until_it_stops<T: std::fmt::Debug>(
+    arrived: std::sync::mpsc::Receiver<()>,
+    answered: &mut (impl std::future::Future<Output = T> + Unpin),
+) {
+    let waiting = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT_BOUND));
+    tokio::pin!(waiting);
+    tokio::select! {
+        arrived = &mut waiting => {
+            arrived
+                .expect("the waiting thread finishes")
+                .expect("the call reaches the service");
+        }
+        early = &mut *answered => panic!("the call was answered before the service: {early:?}"),
+    }
+}
+
+/// KR-REQ-23.41: a binding's refusal at the bound is kept as the action's outcome, so, as for a
+/// create, it is not given on a count that a draft for a closed session, inserted after the door
+/// settled, filled. A device holds the bound less one and a spent draft. A create for a session that
+/// is still live, on one connection, and a binding to the spent draft, on another, each pass the
+/// door's settle and stop before the service, when the create's draft is not yet in the store. The
+/// session closes in the registry. The create inserts its draft, which fills the last place, and the
+/// binding is then counted against it: it is tried again after the closed sessions are settled once
+/// more, and is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_binding_is_tried_again_after_a_second_settle_before_a_refusal_at_the_bound_is_kept() {
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    controller.transfer().until_a_sweep_has_ended().await;
+    let service = controller.transfer().service();
+    let (creating, _) = paired_connection(controller, 63, EVERY_RIGHT);
+    let binding_connection = super::RemoteConnection::for_test(controller, creating.device.clone());
+    let device = creating.device.principal();
+    let (spent, transfer_id) = a_draft_with_a_file(&world, &device);
+    the_agent_takes(&world, &device, spent.draft_id, transfer_id);
+    for _ in 1..DEVICE_OPEN_DRAFTS {
+        a_draft_for(&world, &device, None);
+    }
+    assert_eq!(
+        service.open_drafts(&device).expect("counts"),
+        DEVICE_OPEN_DRAFTS - 1,
+        "the device holds one place fewer than its bound"
+    );
+    let second = super::tests::a_published_attachment_for(
+        controller,
+        world.environment_id,
+        &device,
+        "second.bin",
+        Some(world.session_id),
+    );
+    let closing = SessionId::new(kr_ipc::new_uuid());
+
+    let (create_arrived, create_release) = controller.transfer().pause_after_the_outer_check();
+    let create = creating.answer_now(ControlFrame::Mutation(Box::new(write_naming(
+        &world,
+        &creating,
+        Method::DraftCreate,
+        1,
+        &create_params(&world, Some(closing), None, "for a session about to close"),
+        Some(closing),
+    ))));
+    tokio::pin!(create);
+    until_it_stops(create_arrived, &mut create).await;
+
+    let (binding_arrived, binding_release) = controller.transfer().pause_after_the_outer_check();
+    let binding = binding_connection.answer_now(ControlFrame::Mutation(Box::new(a_binding(
+        &world,
+        &binding_connection,
+        2,
+        &device,
+        spent.draft_id,
+        &second,
+    ))));
+    tokio::pin!(binding);
+    until_it_stops(binding_arrived, &mut binding).await;
+
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(closing))
+        .expect("the registry records the closure");
+    create_release.send(()).expect("the create goes on");
+    let _: DraftCreateResult = result_of(create.await.expect("the create is answered").frame());
+    assert_eq!(
+        service.open_drafts(&device).expect("counts"),
+        DEVICE_OPEN_DRAFTS,
+        "the create's draft fills the last place: the service was not told of the closure"
+    );
+
+    binding_release.send(()).expect("the binding goes on");
+    let _: AgentDraftAddAttachmentResult =
+        result_of(binding.await.expect("the binding is answered").frame());
+    assert_eq!(
+        controller.transfer().second_tries(),
+        1,
+        "the binding was served by its second try"
+    );
+    assert_eq!(
+        service.open_drafts(&device).expect("counts"),
+        DEVICE_OPEN_DRAFTS,
+        "the closed session's draft stopped counting and the spent draft took its place"
     );
     world.serving.abort();
 }

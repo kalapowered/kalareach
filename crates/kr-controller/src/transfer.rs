@@ -155,8 +155,8 @@ pub struct TransferModule {
     /// is what refuses it. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
     after_the_outer_check: Arc<crate::attention::Pause>,
-    /// Where this host's own tests stop a device's create between its first try, which the bound
-    /// refused, and its second, and how many second tries have been made. Compiled only with the
+    /// Where this host's own tests stop a device's create or binding between its first try, which
+    /// the bound refused, and its second, and how many second tries have been made. Compiled only with the
     /// `testing` feature.
     #[cfg(feature = "testing")]
     between_the_tries: Arc<crate::attention::Pause>,
@@ -610,8 +610,9 @@ impl TransferModule {
         self.after_the_outer_check.arm()
     }
 
-    /// Arms the pause a device's create stops at between its first try, which the bound refused,
-    /// and its second. It fires once; the ends are as for [`Self::pause_after_the_outer_check`].
+    /// Arms the pause a device's create or binding stops at between its first try, which the bound
+    /// refused, and its second. It fires once; the ends are as for
+    /// [`Self::pause_after_the_outer_check`].
     #[cfg(feature = "testing")]
     pub fn pause_between_the_tries(
         &self,
@@ -622,7 +623,8 @@ impl TransferModule {
         self.between_the_tries.arm()
     }
 
-    /// How many times a device's create has been tried a second time, after a refusal at the bound.
+    /// How many times a device's create or binding has been tried a second time, after a refusal at
+    /// the bound.
     #[cfg(feature = "testing")]
     pub fn second_tries(&self) -> u64 {
         self.second_tries.load(Ordering::Acquire)
@@ -981,15 +983,18 @@ impl TransferModule {
     /// target and the one it names, whatever the count is: a draft of a session recorded closed
     /// before then stops counting without a second try, and a create that names one is refused as
     /// the service refuses any draft for an ended session, unless the bound speaks first. A create's
-    /// refusal at the bound is kept only after a second settle and a second count
+    /// or a binding's refusal at the bound is kept only after a second settle and a second count
     /// ([`Self::write`]). What remains possible is a refusal for a draft whose session another
     /// create's own registry read missed and then closed, at the first settle and again at the
     /// second, or one after a settle that failed in both passes. The registry is read once for each
-    /// of those sessions in a pass, at most 65 key reads under its lock (the principal's open
-    /// drafts at the bound, and the write's own session); a create at the bound makes two passes,
-    /// so up to 130 key reads and two scans of the drafts, besides the store's other reads and
-    /// writes, which are as they are for any such write. A pass that cannot be made leaves a line
-    /// in the log and does not stop the write: the service counts what it holds.
+    /// session in a pass: each distinct session that the principal's drafts target that no prompt
+    /// has sent and that are not orphaned, spent drafts among them, and the write's own session.
+    /// That is the number of those sessions, plus one, under the registry's lock, and the bound
+    /// does not limit it, because a spent draft does not count against the bound. A create or a
+    /// binding at the bound makes two passes, so twice as many key reads and two scans of the
+    /// drafts, besides the store's other reads and writes, which are as they are for any such
+    /// write. A pass that cannot be made leaves a line in the log and does not stop the write: the
+    /// service counts what it holds.
     pub(crate) async fn settle_closures_of_open_drafts(
         &self,
         owner: &Arc<Controller>,
@@ -1323,7 +1328,9 @@ impl TransferModule {
     /// how many uploads it may keep staged, and the bytes its own principal has staged where the
     /// environment's total is shown to anyone else. `None` is the person at this machine, whose
     /// drafts and uploads have no bound. A create asks the open-drafts bound, and so does a binding
-    /// that brings a draft the agent has taken every file of back into the count.
+    /// that brings a draft the agent has taken every file of back into the count. The bound's
+    /// refusal of either is kept as the action's outcome only after the closed sessions are settled
+    /// once more and the call is made once more ([`tried_again_at_the_bound`]).
     ///
     /// The answer says whether the service read it from the record of an earlier submission of the
     /// action. A copy goes back only under the authority this attempt arrived under, asked once the
@@ -1366,6 +1373,8 @@ impl TransferModule {
         let between_the_tries = Arc::clone(&self.between_the_tries);
         #[cfg(feature = "testing")]
         let second_tries = Arc::clone(&self.second_tries);
+        // The session the door settled for this write: the one the request's target names.
+        let target_session = mutation.target.session_id.0;
         let answer = blocking(move || {
             // The transfer's gate is held by this call until it ends, and not by the stream's task,
             // which is aborted when its connection ends while this call goes on.
@@ -1440,6 +1449,14 @@ impl TransferModule {
                 by_the_request.set(error.is_decided_by_the_request());
                 ProtocolError::from(error)
             };
+            // What a second try of a create or a binding does first, for the host's own tests.
+            let at_the_second_try = || {
+                #[cfg(feature = "testing")]
+                {
+                    second_tries.fetch_add(1, Ordering::AcqRel);
+                    between_the_tries.wait();
+                }
+            };
             // Every arm runs inside a closure, so a refusal the service decided reaches the
             // retention below instead of returning from the task. An action whose failure was not
             // retained could be performed again under the same identifier and succeed.
@@ -1475,37 +1492,20 @@ impl TransferModule {
                     Method::DraftCreate => {
                         let params: kr_protocol::transfer::DraftCreateParams = typed(&params)?;
                         let draft_limit = device.map(|bounds| bounds.open_drafts);
-                        let mut made =
-                            service.draft_create(&actor, &params, Some(&performed), draft_limit);
-                        // The refusal at a device's bound is kept as the action's outcome, so it
-                        // is not given on a count that a draft inserted for a closed session since
-                        // the door settled could have filled: the closed sessions are settled once
-                        // more, outside the count and its holds, and the create is tried once more.
-                        if draft_limit.is_some()
-                            && matches!(made, Err(kr_transfer::TransferError::QuotaExceeded { .. }))
-                        {
-                            settle_closures(
-                                &admission.controller,
-                                &service,
-                                &actor,
-                                params.session_id.0,
-                            );
-                            // The second call can be answered from a record another copy of this
-                            // action wrote since the first, without asking the admission: what it
-                            // finds is then a copy's, so the first try's mark is cleared.
-                            admission.reached.store(false, Ordering::Release);
-                            #[cfg(feature = "testing")]
-                            {
-                                second_tries.fetch_add(1, Ordering::AcqRel);
-                                between_the_tries.wait();
-                            }
-                            made = service.draft_create(
-                                &actor,
-                                &params,
-                                Some(&performed),
-                                draft_limit,
-                            );
-                        }
+                        let create =
+                            || service.draft_create(&actor, &params, Some(&performed), draft_limit);
+                        let made = tried_again_at_the_bound(
+                            create(),
+                            draft_limit,
+                            &admission,
+                            &service,
+                            &actor,
+                            params.session_id.0,
+                            || {
+                                at_the_second_try();
+                                create()
+                            },
+                        );
                         encode(&made.map_err(&told)?)
                     }
                     Method::DraftUpdate => encode(
@@ -1523,16 +1523,27 @@ impl TransferModule {
                             typed(&params)?;
                         require_declared_path(params.contribution.insertion_method)?;
                         let draft_limit = device.map(|bounds| bounds.open_drafts);
-                        encode(
-                            &service
-                                .draft_add_attachment(
-                                    &actor,
-                                    &params,
-                                    Some(&performed),
-                                    draft_limit,
-                                )
-                                .map_err(&told)?,
-                        )
+                        let bind = || {
+                            service.draft_add_attachment(
+                                &actor,
+                                &params,
+                                Some(&performed),
+                                draft_limit,
+                            )
+                        };
+                        let bound = tried_again_at_the_bound(
+                            bind(),
+                            draft_limit,
+                            &admission,
+                            &service,
+                            &actor,
+                            target_session,
+                            || {
+                                at_the_second_try();
+                                bind()
+                            },
+                        );
+                        encode(&bound.map_err(&told)?)
                     }
                     _ => Err(ProtocolError::new(
                         ErrorCode::InvalidArgument,
@@ -1609,8 +1620,9 @@ impl TransferModule {
                 // (the record for a create, a discard, a reservation and a chunk, the draft's
                 // revision for the other two draft writes, which an earlier attempt's success has
                 // moved on) to that commit, so once that call has reached the place it begins an
-                // effect, a record that it finds after its own success is its own. A create's
-                // second try is a call of its own, and the mark is cleared before it. A finish and
+                // effect, a record that it finds after its own success is its own. The second try
+                // of a create or a binding is a call of its own, and the mark is cleared before it.
+                // A finish and
                 // a cancel let go of the lock between their claim and its completion, so another
                 // copy can record in between: any record read for them, and for every other
                 // method, is a copy.
@@ -1848,6 +1860,37 @@ fn say_closures_unsettled() {
         "kr-controller: the closed sessions of a device's open drafts could not all be settled \
          before its create was counted; the next sweep or start settles them"
     );
+}
+
+/// The answer to a create or a binding at a device's bound: `made`, the first try's, or, when the
+/// bound refused it, the answer of one second try.
+///
+/// The refusal at a device's bound is kept as the action's outcome, so it is not given on a count
+/// that a draft inserted for a closed session since the door settled could have filled. The closed
+/// sessions are settled once more, outside the count and its holds, and `try_again` makes the call
+/// once more. A refused call wrote nothing: the service's transaction and the action's claim end
+/// with the refusal, so a second call starts from the same state as the first. There is no third
+/// try, and a refusal of the second is the answer.
+fn tried_again_at_the_bound<T>(
+    made: kr_transfer::Result<T>,
+    draft_limit: Option<u64>,
+    admission: &TransferAdmission,
+    service: &TransferService,
+    actor: &ActorId,
+    target: Option<SessionId>,
+    try_again: impl FnOnce() -> kr_transfer::Result<T>,
+) -> kr_transfer::Result<T> {
+    if draft_limit.is_none()
+        || !matches!(made, Err(kr_transfer::TransferError::QuotaExceeded { .. }))
+    {
+        return made;
+    }
+    settle_closures(&admission.controller, service, actor, target);
+    // The second call can be answered from a record another copy of this action wrote since the
+    // first, without asking the admission: what it finds is then a copy's, so the first try's mark
+    // is cleared.
+    admission.reached.store(false, Ordering::Release);
+    try_again()
 }
 
 /// Records as ended each session among those `actor`'s open drafts target, and `target`, that the
