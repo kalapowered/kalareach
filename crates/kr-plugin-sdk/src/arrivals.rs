@@ -30,7 +30,7 @@
 use serde_json::{Value, json};
 
 /// One member that arrived in a definition of the schema inside a level.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Arrival {
     /// The definition of the SDK's schema the member is in.
     pub definition: &'static str,
@@ -38,6 +38,10 @@ pub struct Arrival {
     pub member: &'static str,
     /// The SDK version the member arrived at: the first release that has it.
     pub sdk_version: &'static str,
+    /// Whether a connector table, as the JSON a package carries, holds the member anywhere. The
+    /// package check uses it to refuse a package whose `sdk_range` admits an SDK that predates the
+    /// member.
+    pub carried_by: fn(&Value) -> bool,
 }
 
 /// Every member that arrived inside a level, in the order it did.
@@ -45,6 +49,15 @@ pub const ARRIVALS: &[Arrival] = &[Arrival {
     definition: "SelectionRoute",
     member: "hidden_when",
     sdk_version: "0.1.7",
+    carried_by: |table| {
+        table["observation"]["selections"]
+            .as_array()
+            .is_some_and(|routes| {
+                routes
+                    .iter()
+                    .any(|route| route.get("hidden_when").is_some())
+            })
+    },
 }];
 
 /// The table as the package contract carries it.

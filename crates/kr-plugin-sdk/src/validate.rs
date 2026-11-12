@@ -19,6 +19,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::arrivals::ARRIVALS;
 use crate::capability::PluginCapability;
 use crate::connector::{
     BrokerTransport, ConnectorManifest, DecisionDestination, DecisionResponse, FieldPath,
@@ -423,6 +424,14 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
                 ConnectorManifest::CURRENT_VERSION
             ),
         ));
+    }
+
+    if connector.is_some()
+        && let Some(table) = manifests
+            .get(CONNECTOR_FILE)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+    {
+        check_arrivals(&manifest.sdk_range, &table, &mut report);
     }
 
     check_manifest(&manifest, connector.as_ref(), &mut report);
@@ -996,6 +1005,32 @@ fn check_closed_vocabularies(value: &serde_json::Value, report: &mut Report) {
                 FindingCode::UnknownCapability,
                 MANIFEST_FILE,
                 format!("{capability} is not a capability a package may request"),
+            ));
+        }
+    }
+}
+
+/// Refuses a connector table that carries a member that arrived at an SDK version when the package's
+/// `sdk_range` admits an SDK version below it: a host of that earlier SDK would try to run the
+/// package, and would refuse it only for a table it cannot read, where the range should have said
+/// so first.
+fn check_arrivals(range: &VersionRange, table: &serde_json::Value, report: &mut Report) {
+    for arrival in ARRIVALS {
+        if !(arrival.carried_by)(table) {
+            continue;
+        }
+        let Ok(arrived) = crate::version::PackageVersion::parse(arrival.sdk_version) else {
+            continue;
+        };
+        if range.admits_a_version_below(&arrived) {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!(
+                    "the table carries {}.{}, which arrived at SDK {}, and the sdk_range {range} \
+                     admits an SDK version below it",
+                    arrival.definition, arrival.member, arrival.sdk_version
+                ),
             ));
         }
     }

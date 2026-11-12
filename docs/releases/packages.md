@@ -262,10 +262,11 @@ it did, since the comparison goes by where a definition is used and not by its n
 a reference to an equal definition and for `oneOf` branches in a new order too. A release from
 before the table has an empty one, and a release whose contract file is missing, states no SDK
 version or has a table that does not read fails the check with a message of its own. The table
-lists a member only where a package that lacks it means what it meant before, and an earlier host
-refuses a package that uses it, because the package states an `sdk_range` that starts at the version
-the member arrived at. The comparison sees neither, and the review of the change that lists a member
-must.
+lists a member only where a package that lacks it means what it meant before. The package check
+refuses a connector table that carries a listed member under an `sdk_range` that admits an SDK
+version below the member's arrival, so a package that uses the member states a range that an
+earlier host does not admit. The comparison sees neither, and the review of the change that lists a
+member must.
 
 The check fails when it cannot list origin's tags, when this checkout's tags are not origin's, when
 a release's tree cannot be read and when a source is in a form it does not read, and it never leaves
