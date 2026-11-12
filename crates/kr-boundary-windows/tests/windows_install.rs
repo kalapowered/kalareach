@@ -4665,7 +4665,6 @@ impl Drop for ServedLoop {
 
 /// Connects to the broker's pipe that this process itself serves, holding its own process while the
 /// pipe's server is checked.
-#[cfg(feature = "testing")]
 fn connect_here(kind: Pipe) -> ffi::Result<kr_boundary_windows::win::pipe::Connection> {
     use kr_boundary_windows::win::pipe;
     let me = pipe::ServerProcess::open(std::process::id())?;
