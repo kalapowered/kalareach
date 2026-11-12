@@ -1331,6 +1331,13 @@ fn proof_run<'a>(fixture: &'a Fixture, mode: &str) -> kr_boundary_windows::win::
     } else {
         &["report"]
     };
+    proof_run_with(fixture, arguments)
+}
+
+fn proof_run_with<'a>(
+    fixture: &'a Fixture,
+    arguments: &[&str],
+) -> kr_boundary_windows::win::proof::Run<'a> {
     let name = fixture.stand_in.display().to_string();
     let mut parts = vec![name.as_str()];
     parts.extend_from_slice(arguments);
@@ -1426,20 +1433,16 @@ fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
         return;
     }
     let fixture = Fixture::new();
-    let before = pids_named("kr-launch-stand-in");
+    let running = fixture.scratch.join("running");
     let stop = Stop::new().unwrap();
     let setter = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
+        let running = running.clone();
         move || {
-            // The stop comes once the program's process exists; the wait for it ends at thirty
-            // seconds, so that the thread ends on every path.
+            // The stop comes once the program says that it is running; the wait for that ends at
+            // thirty seconds, so that the thread ends on every path.
             let until = Instant::now() + Duration::from_secs(30);
-            while pids_named("kr-launch-stand-in")
-                .difference(&before)
-                .next()
-                .is_none()
-                && Instant::now() < until
-            {
+            while !running.exists() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(10));
             }
             stop.set();
@@ -1447,7 +1450,10 @@ fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
     });
     let begun = Instant::now();
     let ran = kr_boundary_windows::win::proof::run_captured_until(
-        proof_run(&fixture, "sleep"),
+        proof_run_with(
+            &fixture,
+            &["sleep", "600000", &running.display().to_string()],
+        ),
         begun + Duration::from_secs(60),
         Some(&stop),
     );
