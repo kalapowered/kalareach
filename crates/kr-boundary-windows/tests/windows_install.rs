@@ -2383,7 +2383,7 @@ fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
     let text = install::make_data_directory(&paths)
         .expect_err("what is left with no manifest")
         .to_string();
-    assert!(text.contains("more than one name"), "{text}");
+    assert!(text.contains("manifest-"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
     assert!(text.contains("did not make"), "{text}");
     assert!(text.contains("out of the data directory"), "{text}");
@@ -5024,6 +5024,15 @@ fn a_listener_that_cannot_make_its_instance_ends_the_service_after_its_connectio
         );
         return;
     }
+    // The seam is a flag of the whole process, so what the loop does not use of it is cleared when
+    // this case ends, however it ends, and no later case in the process meets a failing refill.
+    struct ClearRefillFailures;
+    impl Drop for ClearRefillFailures {
+        fn drop(&mut self) {
+            kr_boundary_windows::win::pipe::testing::fail_refills(0);
+        }
+    }
+    let _clear = ClearRefillFailures;
     kr_boundary_windows::win::pipe::testing::fail_refills(5000);
     let (_stop, served) = serve_in_process();
     // An administrator's connection has the longest idle bound, so only the stop set at the loop's
