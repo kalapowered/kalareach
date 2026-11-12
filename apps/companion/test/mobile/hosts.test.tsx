@@ -400,6 +400,22 @@ describe('the voice entry of a phone', () => {
   })
 })
 
+describe('a page that is loaded while the device holds a call', () => {
+  // The window is made again when the system gives the scene back, with the call still going: the
+  // call's state and its controls are the first thing the person sees, with no press.
+  it('opens on the call, with its mute and end controls', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdAVoiceCall()
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" />
+      </AppProvider>
+    )
+    expect(await screen.findByRole('button', { name: 'Mute microphone' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
+  })
+})
+
 describe('the pairing entry on a phone', () => {
   // KR-REQ-13.04: opening the Hosts tab raises no keyboard. The code field is there to be tapped,
   // and the screen is a place among four, not a form the person came to fill.

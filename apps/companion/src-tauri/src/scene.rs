@@ -8,6 +8,14 @@
 //! application asks for carries a code and passes) and opens the main window again when the system
 //! returns a scene.
 //!
+//! What a simulator shows of this is limited. The system's own disconnect of the only scene in a
+//! live process happens under memory pressure and cannot be caused: a request to destroy the scene
+//! is refused when the application turns multiple scenes off, and where the last scene of an
+//! application that allows them is destroyed, the system ends the process. A debug build's probe
+//! therefore calls the runtime's scene delegate with the disconnect and the connect, on the real
+//! scene, and shows what this module does with the events that follow. The real form needs a phone
+//! under memory pressure.
+//!
 //! The runtime hands every event to the application on the thread that runs the platform's loop, one
 //! after the other, so the check for a window and the opening of one cannot interleave: two returns
 //! in a row open one window. Nothing else is started again. The state, the services and the pairing

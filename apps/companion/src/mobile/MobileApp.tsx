@@ -142,6 +142,30 @@ export function MobileApp({
     }
   }, [port, lifecycle.resumed])
 
+  // A page that is loaded while the device holds a call opens on the call. The window can be made
+  // again while the call goes on (the system took the scene away and gave one back), and the call's
+  // state with its mute and end controls is on the voice screen, so the person is not left to look
+  // for it. The voice screen takes up a call it did not start. Only a page still where the address
+  // put it is moved, and not one that a notification's tap already sent to the attention screen.
+  const firstPlace = useRef(place)
+  useEffect(() => {
+    let watching = true
+    port
+      .voiceCallState()
+      .then((call) => {
+        if (!watching || !(call.running || call.setting_up)) return
+        setPlace((current) =>
+          current === firstPlace.current && current.tab === 'attention'
+            ? { tab: 'sessions', voice: true }
+            : current
+        )
+      })
+      .catch(() => undefined)
+    return () => {
+      watching = false
+    }
+  }, [port])
+
   // A look at where notifications stand each time the application is in front, whichever screen it
   // is on: a token the system changed is registered again, a try that stopped for the person is
   // tried again once they have had time to act, and a registration whose outcome nobody knows is

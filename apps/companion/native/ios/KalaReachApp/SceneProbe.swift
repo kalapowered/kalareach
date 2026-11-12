@@ -1,20 +1,31 @@
 //
 //  A device run's way of making the system take the application's scene away.
 //
-//  The system disconnects a scene on its own when it reclaims one, and connects one again when the
-//  person comes back, in the same process. A run cannot wait for that, so a debug build started with
-//  `-KRSceneProbe watch` answers four requests a run posts as Darwin notifications, and writes
-//  every scene event and every answer to the log and to a file in the application's own container:
+//  The system disconnects a scene on its own when it reclaims one under memory pressure, and
+//  connects one again when the person comes back, in the same process. A run cannot cause that. Asking
+//  the system to destroy the scene does not do it either: an application that turns multiple scenes
+//  off is refused, and where the last scene of an application that allows them is destroyed, the
+//  system ends the process, as it does when a person closes the application in the switcher.
+//
+//  So a debug build started with `-KRSceneProbe watch` answers requests that a run posts as Darwin
+//  notifications, and writes every scene event and every answer to the log and to a file in the
+//  application's own container:
 //
 //    to.kala.reach.scene-probe.report    the process, each scene with its windows and web views, the
 //                                        anchor a sign-in would use, and what the page answers
-//    to.kala.reach.scene-probe.destroy   asks the system to destroy each scene session
+//    to.kala.reach.scene-probe.cycle     calls the runtime's scene delegate with what the system calls
+//                                        it with when it takes the scene away (`sceneDidDisconnect:`)
+//                                        and, after a pause, gives it back
+//                                        (`scene:willConnectToSession:options:`), on the real scene
 //    to.kala.reach.scene-probe.draft     keeps a draft through the page's own command
 //    to.kala.reach.scene-probe.picker    asks for the system's picker through the page's own command
 //                                        and says which view controller it is shown on
+//    to.kala.reach.scene-probe.destroy   asks the system to destroy each scene session
 //
-//  A launch of the application after a destroy brings it forward, and the log tells the same process
-//  from a new one. Compiled into debug builds only.
+//  The limit: the system's own disconnect and reconnect of the scene in a live process is shown only
+//  by these calls to the runtime's delegate. The scene stays the same UIScene with the same session
+//  identifier, and the system takes no part. Its real form needs a phone under memory pressure.
+//  Compiled into debug builds only.
 //
 
 #if DEBUG
@@ -28,6 +39,7 @@ enum SceneProbe {
     /// What each request does, by the name it is posted under.
     private static let requests: [String: () -> Void] = [
         "report": { report("report") },
+        "cycle": { cycle() },
         "destroy": { destroy() },
         "draft": { keepDraft() },
         "picker": { showPicker() },
@@ -59,6 +71,28 @@ enum SceneProbe {
     }
 
     // MARK: Requests
+
+    /// Gives the runtime's scene delegate the two calls the system makes when it takes the scene away
+    /// and gives it back, and says what the application holds after each. The delegate is the
+    /// scene's own, so the runtime sees what it would see from the system.
+    private static func cycle() {
+        guard let scene = scenes().first, let delegate = scene.delegate else {
+            log("cycle: no scene with a delegate")
+            return
+        }
+        log("cycle: sceneDidDisconnect \(summary())")
+        delegate.sceneDidDisconnect?(scene)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            log("cycle: after the disconnect \(summary())")
+            // The connection options have no public initialiser; an empty set is what a scene that
+            // the system connects again without a link or an activity is given.
+            let options = (UIScene.ConnectionOptions.self as NSObject.Type).init() as! UIScene.ConnectionOptions
+            delegate.scene?(scene, willConnectTo: scene.session, options: options)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                log("cycle: after the connect \(summary())")
+            }
+        }
+    }
 
     private static func destroy() {
         for session in UIApplication.shared.openSessions {
