@@ -3,7 +3,7 @@
 //! be another account's is moved out, one that could not be read is neither corrected nor removed,
 //! and only the system's class is ever corrected into place.
 
-use kr_boundary_windows::remedy::{Origin, Presence, Remedy, choose};
+use kr_boundary_windows::remedy::{Origin, ParentCure, Presence, Remedy, choose, parent_advice};
 
 fn unreadable() -> Origin {
     Origin::Unknown("Windows error 5".to_owned())
@@ -71,5 +71,59 @@ fn a_name_that_the_layout_does_not_give_is_removed_whatever_its_handle_showed() 
                 "{origin:?} {manifest:?}"
             );
         }
+    }
+}
+
+/// The one remedy each state of a refused folder above the data directory is told: a held folder is
+/// cured by closing the program, another account's by moving it aside, the system's own by
+/// correcting its list, and one that holds no data directory by removing it. A text never offers a
+/// second remedy beside its own.
+#[test]
+fn each_state_of_the_parent_folder_is_told_one_remedy() {
+    const REMEDIES: [&str; 4] = [
+        "Close the program",
+        "Move the folder aside",
+        "Correct it instead",
+        "Remove the folder",
+    ];
+    let said = |text: &str| -> Vec<&str> {
+        REMEDIES
+            .iter()
+            .copied()
+            .filter(|remedy| text.contains(remedy))
+            .collect()
+    };
+    let cases = [
+        (ParentCure::Close, "Close the program"),
+        (ParentCure::MoveAside, "Move the folder aside"),
+        (ParentCure::Correct(Presence::Present), "Correct it instead"),
+        (
+            ParentCure::Correct(Presence::Unknown("Windows error 5".to_owned())),
+            "Correct it instead",
+        ),
+        (ParentCure::Correct(Presence::Absent), "Remove the folder"),
+    ];
+    for (cure, remedy) in cases {
+        let text = parent_advice(&cure);
+        assert_eq!(said(&text), vec![remedy], "{cure:?}: {text}");
+    }
+    // A folder that holds nothing is removed, and the text does not add that its list could be
+    // corrected instead.
+    let text = parent_advice(&ParentCure::Correct(Presence::Absent));
+    assert!(!text.contains("give it to"), "{text}");
+}
+
+#[test]
+fn a_folder_that_holds_the_data_directory_or_may_is_never_told_to_be_removed() {
+    for cure in [
+        ParentCure::Close,
+        ParentCure::MoveAside,
+        ParentCure::Correct(Presence::Present),
+        ParentCure::Correct(Presence::Unknown("Windows error 5".to_owned())),
+    ] {
+        let text = parent_advice(&cure);
+        assert!(!text.contains("Remove the folder"), "{cure:?}: {text}");
+        assert!(!text.contains("remove the folder"), "{cure:?}: {text}");
+        assert!(!text.contains("loses nothing"), "{cure:?}: {text}");
     }
 }

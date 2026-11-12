@@ -71,3 +71,30 @@ pub fn choose(is_record: bool, origin: &Origin, manifest: &Presence) -> Remedy {
         Origin::System => Remedy::Correct,
     }
 }
+
+/// What a refusal of the folder above the data directory is cured by, which its reason decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParentCure {
+    /// Another program holds the folder open: closing that program cures it, and a change of owner
+    /// or list does not.
+    Close,
+    /// The handle shows that the installation did not make the folder (a link, not a folder, or an
+    /// owner that is not the system's class): move it aside, and do not correct it into place.
+    MoveAside,
+    /// The system's class owns it and its list is wrong: correct the list. Whether it holds the
+    /// data directory is known only from a lookup, which decides whether removal is offered.
+    Correct(Presence),
+}
+
+/// The words that tell the person what to do about a refused folder above the data directory, one
+/// remedy for the state its handle and a lookup showed.
+#[must_use]
+pub fn parent_advice(cure: &ParentCure) -> String {
+    match cure {
+        ParentCure::Close => "Close the program that holds it open, then run the setup program again: a change of its owner or its list does not close a handle. Do not remove it.".to_owned(),
+        ParentCure::MoveAside => "The installation did not make this folder, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned(),
+        ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again."),
+        ParentCure::Correct(Presence::Present) => "Do not remove it: it holds the data directory, with the manifest, the journals and the private roots of an installation, and removing it would destroy what they say. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
+        ParentCure::Correct(Presence::Absent) => "It holds no data directory, so removing it loses nothing. Remove the folder, then run the setup program again.".to_owned(),
+    }
+}
