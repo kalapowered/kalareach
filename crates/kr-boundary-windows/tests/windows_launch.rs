@@ -1255,12 +1255,12 @@ fn a_reader_of_a_pipe_that_a_process_still_holds_open_stops_at_its_deadline() {
     };
     assert_ne!(ok, 0);
     // A writer that never closes: the reader returns at its deadline with what the pipe held.
-    let held = read_pipe(&read, Instant::now() + Duration::from_millis(300));
+    let held = read_pipe(&read, Instant::now() + Duration::from_millis(300), None);
     assert_eq!(held.bytes, b"abc");
     assert!(!held.ended, "the end of a held pipe is not proved");
     // Once every writer has closed, the end is the pipe's own.
     drop(write);
-    let closed = read_pipe(&read, Instant::now() + Duration::from_secs(60));
+    let closed = read_pipe(&read, Instant::now() + Duration::from_secs(60), None);
     assert!(closed.bytes.is_empty());
     assert!(closed.ended);
 }
@@ -1302,13 +1302,13 @@ fn a_reader_of_a_pipe_that_a_writer_keeps_supplying_stops_at_its_deadline() {
         // Let the writers fill the pipe before the reader begins.
         std::thread::sleep(Duration::from_millis(100));
         let begun = Instant::now();
-        let piped = read_pipe(&read, begun + bound);
+        let piped = read_pipe(&read, begun + bound, None);
         let elapsed = begun.elapsed();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         // Writes that are blocked on a full pipe are released by draining it, until each writer
         // has seen the stop.
         while writers.iter().any(|writer| !writer.is_finished()) {
-            let _ = read_pipe(&read, Instant::now() + Duration::from_millis(50));
+            let _ = read_pipe(&read, Instant::now() + Duration::from_millis(50), None);
         }
         (piped, elapsed)
     });
@@ -1421,12 +1421,93 @@ fn a_program_that_outlasts_the_deadline_is_ended_and_the_call_returns_within_it(
     );
 }
 
-/// A stop that comes while a program of the proof runs ends the program with its job at once: the call
-/// returns at the stop, long before the program's own ten minutes and the deadline it was given, and
-/// the end of the job is proved.
+/// A stop that comes while a program of the proof runs ends the program, and a process that the
+/// program started, with its job at once: the call returns at the stop, long before the program's own
+/// ten minutes and the deadline it was given, and the end of the job is proved.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
+    use kr_boundary_windows::win::pipe::Stop;
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
+    let fixture = Fixture::new();
+    let before = pids_named("kr-launch-stand-in");
+    let stop = Stop::new().unwrap();
+    let setter = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        let before = before.clone();
+        move || {
+            // The stop comes once the program and the process that it started both exist; the wait
+            // for them ends at thirty seconds, so that the thread ends on every path.
+            let until = Instant::now() + Duration::from_secs(30);
+            while pids_named("kr-launch-stand-in").difference(&before).count() < 2
+                && Instant::now() < until
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            stop.set();
+        }
+    });
+    let begun = Instant::now();
+    let ran = kr_boundary_windows::win::proof::run_captured_until(
+        proof_run_with(&fixture, &["spawn-hold"]),
+        begun + Duration::from_secs(60),
+        Some(&stop),
+    );
+    let elapsed = begun.elapsed();
+    setter.join().unwrap();
+    let ran = ran.expect("a program that the stop reached is ended and proved ended");
+    assert_eq!(ran.outcome, Outcome::TimedOut);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the call did not return at the stop: {elapsed:?}"
+    );
+    let started: BTreeSet<u32> = pids_named("kr-launch-stand-in")
+        .difference(&before)
+        .copied()
+        .collect();
+    assert!(
+        started.is_empty(),
+        "a process that the program started was still there after the stop: {started:?}"
+    );
+}
+
+/// A stop that is already set when the first program of a proof is to be started starts nothing.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_stop_that_is_already_set_starts_no_program() {
+    use kr_boundary_windows::win::pipe::Stop;
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
+    let fixture = Fixture::new();
+    let marker = fixture.scratch.join("started");
+    let stop = Stop::new().unwrap();
+    stop.set();
+    let ran = kr_boundary_windows::win::proof::run_captured_until(
+        proof_run_with(&fixture, &["marker", &marker.display().to_string()]),
+        Instant::now() + Duration::from_secs(30),
+        Some(&stop),
+    );
+    assert!(
+        ran.is_err(),
+        "a program was made under a stop that was already set"
+    );
+    assert!(
+        !marker.exists(),
+        "a program ran under a stop that was already set"
+    );
+}
+
+/// A stop ends the readers of a program's output and the end of its job within a short bound of their
+/// own, though a writer outside the job keeps a pipe open and the run's deadline is a minute away.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_stop_ends_the_readers_and_the_jobs_end_within_a_short_bound_though_a_writer_outside_the_job_holds_a_pipe()
+ {
     use kr_boundary_windows::win::pipe::Stop;
     if !runs_as_the_system() {
         eprintln!("SKIPPED: the fixture of this case needs the system's token");
@@ -1448,6 +1529,7 @@ fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
             stop.set();
         }
     });
+    testing::hold_next_pipe_writer();
     let begun = Instant::now();
     let ran = kr_boundary_windows::win::proof::run_captured_until(
         proof_run_with(
@@ -1457,13 +1539,16 @@ fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
         begun + Duration::from_secs(60),
         Some(&stop),
     );
-    let elapsed = begun.elapsed();
+    let took = begun.elapsed();
+    testing::release_held_pipe_writers();
     setter.join().unwrap();
-    let ran = ran.expect("a program that the stop reached is ended and proved ended");
-    assert_eq!(ran.outcome, Outcome::TimedOut);
     assert!(
-        elapsed < Duration::from_secs(10),
-        "the call did not return at the stop: {elapsed:?}"
+        matches!(&ran, Err(LaunchError::EndUncertain(text)) if text.contains("still open after the end of its job")),
+        "the pipe that a writer outside the job held is an end that is not proved"
+    );
+    assert!(
+        took < Duration::from_secs(10),
+        "the stop did not end the readers inside their short bound: {took:?}"
     );
 }
 
@@ -1549,7 +1634,7 @@ fn a_capture_pipe_is_made_and_carries_bytes_for_the_system_and_for_an_elevated_a
     assert_ne!(ok, 0, "one write goes in");
     assert_eq!(written, 7);
     drop(write);
-    let held = read_pipe(&read, Instant::now() + Duration::from_secs(10));
+    let held = read_pipe(&read, Instant::now() + Duration::from_secs(10), None);
     assert_eq!(held.bytes, b"through", "the same bytes come out");
     assert!(
         held.ended,

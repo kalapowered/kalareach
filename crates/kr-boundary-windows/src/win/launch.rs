@@ -85,6 +85,9 @@ pub enum LaunchError {
     /// The deadline had passed before the program was started. Nothing was started.
     #[error("the deadline passed before the program was started")]
     DeadlinePassed,
+    /// The service was stopping before the program was started. Nothing was started.
+    #[error("the service was stopping before the program was started")]
+    Stopped,
     /// The process was made but is not in the job. It was ended.
     #[error("the new process was not in its job and was ended")]
     NotInJob,
@@ -314,9 +317,22 @@ pub struct Child {
 #[cfg(feature = "testing")]
 pub mod testing {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use crate::win::ffi::Handle;
+
+    static LAUNCHES: AtomicU32 = AtomicU32::new(0);
+
+    /// How many programs this process has started so far, counted at the call that makes the
+    /// process: a case compares two readings to show that nothing started between them.
+    #[must_use]
+    pub fn launches() -> u32 {
+        LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn count_launch() {
+        LAUNCHES.fetch_add(1, Ordering::SeqCst);
+    }
 
     static SKIP_NEXT_TERMINATION: AtomicBool = AtomicBool::new(false);
     static FAIL_NEXT_LAUNCH_AFTER_CREATION: AtomicBool = AtomicBool::new(false);
@@ -803,6 +819,8 @@ fn time_of(process: &Handle) -> Result<u64, ffi::Error> {
 /// created, which is how application control's refusal shows. Any other error leaves nothing
 /// started, or a child that was ended.
 pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
+    #[cfg(feature = "testing")]
+    testing::count_launch();
     // A job that has been ended is closed to new children: the platform would still take one.
     if spec.job.state() == State::Ended {
         return Err(LaunchError::Job(ffi::error(
@@ -916,6 +934,12 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
 const CAPTURE_LIMIT: usize = 8 << 20;
 
 /// How often [`read_pipe`] looks again at a pipe that holds nothing yet.
+/// How long the readers of a program's output and the end of its job are given once the service's
+/// stop has come. The job's processes end within milliseconds, so this only keeps a writer outside
+/// the job, which holds a pipe open, from holding a service that is stopping until the run's own
+/// deadline of thirty or sixty seconds.
+pub const STOP_BOUND: Duration = Duration::from_secs(3);
+
 const PIPE_POLL: Duration = Duration::from_millis(10);
 
 /// What [`read_pipe`] read.
@@ -934,11 +958,19 @@ pub struct Piped {
 /// before it reads, so no call waits on a writer that never closes, and it looks at the clock on
 /// every pass, so a writer that keeps the pipe supplied does not keep the reader past the deadline.
 #[must_use]
-pub fn read_pipe(pipe: &Handle, deadline: Instant) -> Piped {
+pub fn read_pipe(pipe: &Handle, deadline: Instant, stop: Option<&Stop>) -> Piped {
     let mut kept = Vec::new();
     let mut chunk = vec![0_u8; 64 * 1024];
+    // The deadline, or the stop's bound from the moment the stop is first seen: a writer outside the
+    // job that keeps the pipe open must not hold a service that is stopping until the run's deadline.
+    let mut limit = deadline;
+    let mut stop_seen = false;
     loop {
-        if Instant::now() >= deadline {
+        if !stop_seen && stop.is_some_and(Stop::is_set) {
+            stop_seen = true;
+            limit = limit.min(Instant::now() + STOP_BOUND);
+        }
+        if Instant::now() >= limit {
             return Piped {
                 bytes: kept,
                 ended: false,
@@ -965,7 +997,7 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant) -> Piped {
             return Piped { bytes: kept, ended };
         }
         if available == 0 {
-            std::thread::sleep(PIPE_POLL.min(deadline.saturating_duration_since(Instant::now())));
+            std::thread::sleep(PIPE_POLL.min(limit.saturating_duration_since(Instant::now())));
             continue;
         }
         let mut read = 0_u32;
