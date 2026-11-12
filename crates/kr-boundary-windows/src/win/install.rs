@@ -445,7 +445,15 @@ pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
                 ParentCure::Close,
             ));
         }
-        Err(failure) => return Err(failure.into()),
+        // Nothing shows who made a folder that cannot be opened: it is moved aside, never corrected
+        // into place and never removed.
+        Err(failure) => {
+            return Err(parent_refusal(
+                paths,
+                &format!("it could not be opened to be checked ({failure})"),
+                ParentCure::Unreadable,
+            ));
+        }
     };
     let mut tag = FILE_ATTRIBUTE_TAG_INFO {
         FileAttributes: 0,
