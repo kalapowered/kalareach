@@ -37,8 +37,8 @@ use super::fresh;
 use super::install::Paths;
 use super::job::{Ended, Job, Limits};
 use super::launch::{
-    ChildSpec, LaunchError, Outcome, REFUSED_BY_POLICY, ResumePermit, Std, TokenSpec, VerifiedPath,
-    launch, pipe, read_pipe,
+    ChildSpec, LaunchError, Outcome, REFUSED_BY_POLICY, ResumePermit, STOP_BOUND, Std, TokenSpec,
+    VerifiedPath, launch, pipe, read_pipe,
 };
 use super::pipe::Stop;
 use super::sd::{Principals, SdKind, descriptor};
@@ -172,6 +172,10 @@ pub fn run_captured_until(
     deadline: Instant,
     stop: Option<&Stop>,
 ) -> Result<Captured, LaunchError> {
+    // A stop that is already set starts nothing, not even the first program of a proof.
+    if stop.is_some_and(Stop::is_set) {
+        return Err(LaunchError::Stopped);
+    }
     if Instant::now() >= deadline {
         return Err(LaunchError::DeadlinePassed);
     }
@@ -208,8 +212,8 @@ pub fn run_captured_until(
         // job's end is not waited for: the end is then not proved and the call says so. They read
         // after a launch that failed too: the launch may have made a process, and a writer outside
         // the job may hold a pipe whatever became of it.
-        let out = scope.spawn(|| read_pipe(&out_read, deadline));
-        let err = scope.spawn(|| read_pipe(&err_read, deadline));
+        let out = scope.spawn(|| read_pipe(&out_read, deadline, stop));
+        let err = scope.spawn(|| read_pipe(&err_read, deadline, stop));
         let result = match launched.and_then(|suspended| {
             let permit = ResumePermit::for_proof(&suspended);
             suspended.resume(permit)
@@ -222,7 +226,13 @@ pub fn run_captured_until(
                 };
                 // Anything the program started ends with the job, which also lets the pipes
                 // reach their end. A program still running at the bound is ended the same way.
-                let ended = job.end(&[&child], deadline);
+                // After a stop the end is given its short bound, not the run's deadline.
+                let end_by = if stop.is_some_and(Stop::is_set) {
+                    deadline.min(Instant::now() + STOP_BOUND)
+                } else {
+                    deadline
+                };
+                let ended = job.end(&[&child], end_by);
                 match settled(&job, ended) {
                     Ok(()) => match waited {
                         Ok(Some(code)) => Ok(Outcome::Ran(code)),
