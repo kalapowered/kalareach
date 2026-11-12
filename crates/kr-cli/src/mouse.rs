@@ -163,6 +163,9 @@ impl Restoration {
     }
 }
 
+/// How many events of the lexer are held at once while a write is read.
+const EVENTS_PER_BATCH: usize = 256;
+
 /// What the session's application has asked for of the mouse, learned from what the session wrote.
 ///
 /// The output is cut into sequences by the lexer the worker cuts it with, under the worker's
@@ -226,24 +229,36 @@ impl MouseReporting {
         let mut follows = Vec::new();
         let origin = self.lexer.offset();
         let mut events = std::mem::take(&mut self.events);
-        events.clear();
-        self.lexer.feed(output, &mut events);
-        for event in &events {
-            if self.apply(event, reading) && reading == Reading::Live && self.differs() {
-                self.reset_by_either = self.encoding_in_force();
-                // A difference after a sequence that set or reset an encoding is the encoding in
-                // force, which the terminal that returned the default is put back to.
-                if let Some(encoding) = self.encoding_in_force() {
-                    // The sequence ended at its final byte, which is in this stretch.
-                    let end = event.span.end().saturating_sub(origin);
-                    follows.push(Follow {
-                        at: usize::try_from(end).map_or(output.len(), |end| end.min(output.len())),
-                        encoding,
-                    });
+        let mut index = 0;
+        // A batch at a time, as the worker's engine reads, so that a large write of short
+        // sequences is not held as one event each.
+        loop {
+            events.clear();
+            let finished = self
+                .lexer
+                .feed_until(output, &mut index, &mut events, EVENTS_PER_BATCH);
+            for event in &events {
+                if self.apply(event, reading) && reading == Reading::Live && self.differs() {
+                    self.reset_by_either = self.encoding_in_force();
+                    // A difference after a sequence that set or reset an encoding is the encoding
+                    // in force, which the terminal that returned the default is put back to.
+                    if let Some(encoding) = self.encoding_in_force() {
+                        // The sequence ended at its final byte, which is in this stretch.
+                        let end = event.span.end().saturating_sub(origin);
+                        follows.push(Follow {
+                            at: usize::try_from(end)
+                                .map_or(output.len(), |end| end.min(output.len())),
+                            encoding,
+                        });
+                    }
                 }
+            }
+            if finished {
+                break;
             }
         }
         events.clear();
+        events.shrink_to(EVENTS_PER_BATCH);
         self.events = events;
         follows
     }
