@@ -22,7 +22,7 @@ function words(left: number, top: number, width: number, height = 17): Rect {
 }
 
 function link(id: Id, rect: Rect, destination = `https://example.org/${id}`): PaneLink<Id> {
-  return { id, destination, words: [rect], box: [] }
+  return { id, destination, words: [rect] }
 }
 
 /** Two links, one above the other, 40 px apart: the click's point decides between them. */

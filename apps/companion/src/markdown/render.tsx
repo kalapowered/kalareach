@@ -186,7 +186,7 @@ function renderToken(token: Token, context: MarkdownContext, key: string): React
           title={link.href}
         >
           {/* The words are an element of their own: a phone measures them to decide which link a
-              press belongs to, and the focus ring follows them. */}
+              tap on the text near them belongs to, and shows the pressed look on them. */}
           <span className="md-link-label">{label}</span>
         </button>
       )

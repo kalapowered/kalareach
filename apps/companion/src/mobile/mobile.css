@@ -22,14 +22,6 @@
 
 :root[data-surface='ios'],
 :root[data-surface='android'] {
-  /*
-   * How far a link in a message is pressable beyond its words, on each side: half of `--target`, or
-   * the screen's gutter where that is less (`--gap-4`, and `--gap-5` from 40rem, as `.m-main`'s
-   * padding is). The conversation's pane keeps this much room on each side, taken from the gutter,
-   * so a link at the edge of a line has its whole box on the screen and the pane has nothing past
-   * its edge to scroll.
-   */
-  --reach-inline: min(calc(var(--target) / 2), var(--gap-4));
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
@@ -641,21 +633,6 @@
   grid-template-rows: auto minmax(var(--stream-floor), 1fr) auto;
 }
 
-/*
- * A link's press area reaches past its words, so the area the conversation scrolls holds that reach:
- * the pane does not scroll sideways for a link as wide as the line, and does not cut the area of a
- * link at the line's edge. The margin takes the room back, so the messages stay where they were.
- */
-.m-session[data-pane='semantic'] > .m-pane {
-  padding-inline: var(--reach-inline);
-  margin-inline: calc(-1 * var(--reach-inline));
-}
-
-/* The pane's own focus ring lies inside its edge, as the main area's does, not 4px outside the room kept for the reach. */
-.m-session[data-pane='semantic'] > .m-pane:focus-visible {
-  outline-offset: -2px;
-}
-
 /* The terminal fills its pane, under the words of a view that has ended. */
 .m-session[data-pane='terminal'] > .m-pane {
   display: flex;
@@ -719,53 +696,16 @@
 }
 
 /*
- * A link inside a message is as tall as its line, which is less than a finger needs. The button's
- * box grows by a reach on each side and its margin takes the same amount back, so the line's height
- * and the paragraph's lines stay where they were, while the box that TalkBack and VoiceOver find is
- * `--target` in both directions. The block reach is what the line lacks. The inline reach is as much
- * as the pane has room for on each side (see `--reach-inline`): more would go past the pane at the
- * edge of a line, where the conversation would scroll sideways or the screen would cut the box.
- *
- * What this does not hold: a label narrower than `--target` less two reaches (16 px at the default
- * text size on Android, 12 on iOS, none at the largest sizes) is widened to `--target`, and the
- * words after it move sideways by the difference: up to about 12 px for one narrow character, 9 for
- * a digit. A line that had less room than that to spare then breaks one word earlier.
- *
- * Which link a press belongs to is not decided here. The boxes of neighbouring links overlap, and a
- * stylesheet can say which box is on top but not which link is nearer. The pane decides, from the
- * rectangles of the words (`useLinkPress`): the link whose words are nearest to the press, over the
- * area these boxes give, and it shows the pressed look below on that link from the press's start.
+ * The pressed look: on the words of the link that a press starts on or near, from the press's start
+ * to its end. The link's box and the lines around it are the page's own, so nothing moves. Which
+ * link a tap on plain text near its words opens is decided by `useLinkPress`, not here.
  */
-.m-node .md-link {
-  --reach-block: 16px;
-  padding: var(--reach-block) var(--reach-inline);
-  margin: calc(-1 * var(--reach-block)) calc(-1 * var(--reach-inline));
-  min-inline-size: var(--target);
-}
-
-@supports (height: 1lh) {
-  .m-node .md-link {
-    --reach-block: max(0px, calc((var(--target) - 1lh) / 2));
-  }
-}
-
-/* The pressed look: on the words of the link the press belongs to, from the press's start. Nothing moves. */
 .m-node .md-link[data-pressed] .md-link-label {
   border-radius: 2px;
   background: var(--subtle);
   box-shadow: 0 0 0 3px var(--subtle);
   /* In forced colours the background is dropped, and a transparent outline is drawn in a system colour. */
   outline: 2px solid transparent;
-}
-
-/* The ring follows the words, not the larger box a finger has. */
-.m-node .md-link:focus-visible {
-  outline: none;
-}
-
-.m-node .md-link:focus-visible .md-link-label {
-  outline: 2px solid var(--accent);
-  outline-offset: 4px;
 }
 
 .m-terminal {
@@ -1176,11 +1116,6 @@
 /* ---- Landscape and larger screens ------------------------------------------------------------ */
 
 @media (min-width: 40rem) {
-  :root[data-surface='ios'],
-  :root[data-surface='android'] {
-    --reach-inline: min(calc(var(--target) / 2), var(--gap-5));
-  }
-
   .m-main {
     padding-inline: calc(var(--safe-left) + var(--gap-5)) calc(var(--safe-right) + var(--gap-5));
   }
