@@ -3378,7 +3378,7 @@ A client takes that response as the host's refusal of the connection and asks ag
 its own backoff, which with a copy that turns silent 15 seconds after the first refusal takes about
 22 seconds at the median and up to about 45. A connection heard from inside the last 15 seconds is
 never withdrawn, and a device that connects again after a withdrawal starts no chain. A connection
-is heard from when the transport receives an authenticated packet from the device on it,
+is heard from when the transport counts a frame received from the device on it,
 keepalives included, and a device whose path works sends one at least every 10 seconds. The host
 dates a packet when it reads the transport's counters, once a second and again when it chooses,
 never earlier than the packet. What the rule protects is a connection heard from lately, not the

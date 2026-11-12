@@ -1,7 +1,7 @@
 //! When the host last heard from each connection of a paired device.
 //!
 //! The host chooses the connection of a device to withdraw at its bound by this time, so it is
-//! the time of the last authenticated packet the transport received on the connection, keepalives
+//! the time of the last frame the transport counted as received on the connection, keepalives
 //! included, and not the last request the host served: a connection that is idle at the
 //! application sends keepalives and is heard from.
 //!
@@ -179,7 +179,8 @@ fn widen<T: Into<u64>>(counter: T) -> u64 {
 macro_rules! received_counters {
     ($($field:ident),* $(,)?) => {
         /// How many frames the transport has received on a connection in all, which only grows:
-        /// every counter of its received frames, each of which an authenticated packet moves.
+        /// every counter of its received frames. A frame the transport counts moves one; a packet
+        /// with no frame in it, padding alone, moves none.
         fn received_frames(stats: &ConnectionStats) -> u64 {
             [$(widen(stats.frame_rx.$field)),*]
                 .into_iter()
@@ -440,6 +441,8 @@ mod tests {
     /// The sum names every counter the transport's received frames have. Its debug form lists
     /// each one by name, and the transport's own implementation names them all, so a counter it
     /// gains changes the number of fields in that form and fails this case until the sum takes it.
+    /// The count rests on that implementation, which the transport writes by hand: a counter that
+    /// formatter left out would not be seen here.
     #[test]
     fn the_sum_takes_every_counter_the_transport_keeps() {
         let counters = format!("{:?}", ConnectionStats::default().frame_rx)

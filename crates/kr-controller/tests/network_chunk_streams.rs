@@ -1253,12 +1253,12 @@ async fn has_ended(raw: &RawDevice) -> bool {
         == Some(false)
 }
 
-/// KR-REQ-23.21: a connection is dated by the packets its device sends on it, requests or not. A
-/// device that has made a request on a connection has sent frames the host's transport received,
-/// and the host dates the connection to the time it read them, which is later than the time it
-/// counted it. A device that then sends nothing still sends the transport's keepalive, and the
-/// acknowledgements of the host's own, which date it again: the acknowledgement of the host's reply
-/// can date it once more, so the case waits for a change after that one. Each wait is for the
+/// KR-REQ-23.21: a connection is dated by the frames the transport counts from its device, requests
+/// or not. A device that has made a request on a connection has sent frames the host's transport
+/// received, and the host dates the connection to the time it read them, which is later than the
+/// time it counted it. A device that then sends nothing still sends the transport's keepalive, and
+/// the acknowledgements of the host's own, which date it again: the acknowledgement of the host's
+/// reply can date it once more, so the case waits for a change after that one. Each wait is for the
 /// host's reading, which it makes a second after the packets arrive at the latest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_is_dated_by_the_packets_its_device_sends_on_it() {

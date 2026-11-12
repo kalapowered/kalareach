@@ -7975,7 +7975,7 @@ const SOON: Duration = Duration::from_secs(5);
 /// at the new connection's count; the waiting connection's device sends a request, and the host
 /// dates it during the wait; and when the waiting connection is the least recent, the next
 /// connection above the bound closes it while the feed is held, and not when its wait for the feed
-/// ends.
+/// ends; the reading that dated it ends with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() {
     let rig = Rig::start().await;
@@ -8002,9 +8002,10 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         assert!(is_served(raw).await, "the others answer");
     }
 
-    // The feed holds its next read, and a connection waits for a synchronisation for a minute.
+    // The feed holds its next read until the case lets it go, and a connection waits for a
+    // synchronisation for far longer than the case lasts: nothing but the case ends the wait.
     rig.runtime()
-        .wait_for_a_synchronisation_at_most(Duration::from_secs(60));
+        .wait_for_a_synchronisation_at_most(Duration::from_secs(3600));
     rig.served
         .web()
         .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
@@ -8034,11 +8035,16 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         "the waiting connection is counted"
     );
     let before = counted[DEVICE_LIVE_CONNECTIONS - 1];
-    let _ = tokio::time::timeout(
+    let request = tokio::time::timeout(
         Duration::from_millis(200),
         waiting.try_read(Method::HostInfo, &NoParams {}),
     )
     .await;
+    assert!(
+        request.is_err(),
+        "the waiting connection's request stays unanswered"
+    );
+    let readings = rig.host.readings_running();
     until_it_holds(SOON, || {
         rig.host.heard_from_of(&record)[DEVICE_LIVE_CONNECTIONS - 1] > before
     })
@@ -8056,7 +8062,8 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         assert!(is_served(raw).await, "the others answer");
     }
     let second = connected_again(&rig, &phone, &record).await;
-    // A connection closed at once ends long before the held read does.
+    // A connection closed at once ends long before the held read does, and its request was never
+    // answered.
     assert_eq!(
         waiting
             .answered_before_closing(RequestId::new(u64::MAX), SOON)
@@ -8064,6 +8071,9 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         Some(false),
         "the waiting connection ends while the feed is held, not when its wait ends"
     );
+    // The reading that dated the waiting connection ended with it: the connection above the bound
+    // took its place, and no reading is left over.
+    until_it_holds(SOON, || rig.host.readings_running() == readings).await;
 
     // The feed answers: the connection that waited last is served, and no other was withdrawn.
     rig.served.web().release_held();

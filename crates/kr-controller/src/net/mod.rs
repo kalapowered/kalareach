@@ -630,8 +630,8 @@ pub const DEVICE_CONNECTIONS_IN_USE: usize = 32;
 /// never withdrawn, and a device that connects again after one was withdrawn starts no chain of
 /// withdrawals.
 ///
-/// A connection is heard from when the transport receives an authenticated packet from the device
-/// on it, keepalives included, and a device whose path works sends one at least every
+/// A connection is heard from when the transport counts a frame received from the device on it,
+/// keepalives included, and a device whose path works sends one at least every
 /// [`kr_protocol::limits::KEEPALIVE_INTERVAL`]. The host dates a packet when it reads the
 /// transport's counters, once a second and again when it chooses, never earlier than the packet, so
 /// the silence it measures is never longer than the true one. What the rule protects is a
@@ -933,11 +933,19 @@ impl NetworkHost {
             });
             withdrawn
         };
-        let sampler = tokio::spawn(heard::follow_the_device(
-            heard,
-            Arc::clone(&self.device_connections),
-        ))
-        .abort_handle();
+        // The reading has its owner from the moment it starts: if anything below panics, dropping
+        // `counted` ends the reading and takes the connection out of the table.
+        let counted = Counted {
+            table: Arc::clone(&self.device_connections),
+            device_id,
+            connection_id,
+            withdrawn_for_the_bound,
+            sampler: tokio::spawn(heard::follow_the_device(
+                heard,
+                Arc::clone(&self.device_connections),
+            ))
+            .abort_handle(),
+        };
         if let Some(withdrawn) = withdrawn {
             withdrawn
                 .withdrawn_for_the_bound
@@ -965,13 +973,7 @@ impl NetworkHost {
                 );
             }
         }
-        Ok(Counted {
-            table: Arc::clone(&self.device_connections),
-            device_id,
-            connection_id,
-            withdrawn_for_the_bound,
-            sampler,
-        })
+        Ok(counted)
     }
 
     /// Serves one authorised connection until it ends.
