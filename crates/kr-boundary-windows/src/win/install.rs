@@ -440,6 +440,7 @@ fn install_program_file(source: &Path, target: &Path) -> io::Result<()> {
 /// Returns [`Error::Refused`] naming the reason, or the failure of the call that looked.
 pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
     let parent = paths.data_parent();
+    check_ancestors(parent, remedy::Tree::Data)?;
     let wide = ffi::wide_path(parent);
     // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
     let raw = unsafe {
@@ -1606,6 +1607,62 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
     ))
 }
 
+/// Reads every existing folder above `top`, from the volume's root down to its parent, part by
+/// part: each opened on its own handle with no link followed, a plain folder, owned by the system,
+/// the Administrators group or the installer service, with no entry that lets another account
+/// delete or rename an entry in it, delete it, write its list or take it. The folder that holds a
+/// tree is read on its own handle with the rules of its kind; what is above it is read here, since
+/// an account that could rename a folder above could put a link in the place of the folder below it
+/// after the installation has read that one, and the system's default lists do not give that right
+/// but nothing here rests on a default. A folder that is not there ends the walk: nothing below it
+/// is there either.
+fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
+    let mut chain: Vec<&Path> = top.ancestors().skip(1).collect();
+    chain.reverse();
+    for folder in chain {
+        let wide = ffi::wide_path(folder);
+        // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        let handle = match ffi::Handle::new(raw, "opening a folder above the installation") {
+            Ok(handle) => handle,
+            Err(failure)
+                if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+            {
+                return Ok(());
+            }
+            Err(failure) => {
+                return Err(Error::Refused(remedy::ancestor_refusal(
+                    &folder.display().to_string(),
+                    tree,
+                    &format!("it could not be opened to be checked ({failure})"),
+                )));
+            }
+        };
+        let why = match not_a_plain_directory(&handle, "a folder above the installation")? {
+            Some(why) => Some(why.to_owned()),
+            None => acl::replaceable_by_others_on(&handle)?,
+        };
+        if let Some(why) = why {
+            return Err(Error::Refused(remedy::ancestor_refusal(
+                &folder.display().to_string(),
+                tree,
+                &why,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reads every existing folder from [`Paths::program_top`] down to the program directory's parent,
 /// part by part: each opened on its own handle with no link followed, a plain folder at the place
 /// that was asked for (its final path is the expected one), owned by the system, the Administrators
@@ -1613,6 +1670,7 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
 /// delete in it, write its list or take it. The paths that the service control manager runs the
 /// broker by rest on these lists. A folder that is not there is the installation's to make.
 fn check_program_parents(paths: &Paths) -> Result<(), Error> {
+    check_ancestors(&paths.program_top, remedy::Tree::Program)?;
     let Some(parent) = paths.program.parent() else {
         return Ok(());
     };

@@ -262,3 +262,58 @@ pub fn parent_advice(cure: &ParentCure) -> String {
         ParentCure::Correct(Presence::Absent) => "It holds no data directory, so removing it loses nothing. Remove the folder, then run the setup program again.".to_owned(),
     }
 }
+
+/// Which of the installation's two trees a refused folder above it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tree {
+    /// The data directory: the manifest, the journal and the roots of the operations.
+    Data,
+    /// The program directory: the program that the service runs as the system.
+    Program,
+}
+
+/// The rights of a permission-list entry that let an account replace a folder or what is in it,
+/// said in words. A right that replaces nothing (read, add a file, add a subdirectory) is not said.
+#[must_use]
+pub fn rights_in_words(mask: u32) -> String {
+    const DELETE_CHILD: u32 = 0x0000_0040;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    let mut parts = Vec::new();
+    if mask & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0 {
+        parts.push("every right");
+    } else if mask & GENERIC_WRITE != 0 {
+        parts.push("change it");
+    }
+    if mask & DELETE_CHILD != 0 {
+        parts.push("delete or rename an entry in it");
+    }
+    if mask & DELETE != 0 {
+        parts.push("delete it");
+    }
+    if mask & WRITE_DAC != 0 {
+        parts.push("change its list");
+    }
+    if mask & WRITE_OWNER != 0 {
+        parts.push("take its ownership");
+    }
+    parts.join(", ")
+}
+
+/// The refusal of a folder above the data directory or the program directory, up to the volume's
+/// root: the folder, the tree below it, why it is refused (`why` names what its list gives and to
+/// which identity) and what to correct. Nothing is removed or moved: the folder holds other things.
+#[must_use]
+pub fn ancestor_refusal(folder: &str, tree: Tree, why: &str) -> String {
+    let below = match tree {
+        Tree::Data => "data directory (its manifest, its journal and the roots of its operations)",
+        Tree::Program => "program directory (the program that the service runs as the system)",
+    };
+    format!(
+        "{folder} is a folder above the boundary's {below}. It is refused because {why}. An account that may delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on another place. Nothing was changed. If the reason names an owner or a right, make the system, the Administrators group or the installer service its owner, and take the rights to delete or rename an entry in it, to change its list and to take its ownership away from every other account (the right to add an entry is what the system gives by default, and it stays allowed). If it could not be opened, close the program that holds it open or correct who may open it. If it is a link, remove the link itself and not what it points to. Then run the setup program again. Do not remove or move it otherwise: it holds other things."
+    )
+}

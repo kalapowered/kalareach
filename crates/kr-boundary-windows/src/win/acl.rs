@@ -302,6 +302,48 @@ pub fn changeable_by_others_on(
     handle: &super::ffi::Handle,
     replacement_only: bool,
 ) -> Result<Option<String>> {
+    judged(
+        handle,
+        if replacement_only {
+            Counts::Replacement
+        } else {
+            Counts::Content
+        },
+    )
+}
+
+/// As [`changeable_by_others_on`], for a folder above the installation's trees, up to the volume's
+/// root: what counts is only what lets an account swap a folder below it for a link after the folder
+/// below was read. The owner must be in the system's own class, and no entry that applies to the
+/// folder itself may allow an identity outside that class to delete or rename an entry in it, to
+/// delete it, to change its list or to take its ownership (generic write, generic all and maximum
+/// allowed count as well). The rights to add a file or a subdirectory do not count: they are what
+/// the system's own default lists give, and an added sibling changes nothing that was read. An entry
+/// that is for inheritance alone applies to the folder's children and not to the folder, so it does
+/// not count either: the system's default list of a volume's root has one that gives the
+/// authenticated users the right to modify what they make there.
+///
+/// # Errors
+///
+/// Returns the platform's error when the permissions cannot be read or an entry cannot be read; the
+/// caller treats that as a refusal.
+pub fn replaceable_by_others_on(handle: &super::ffi::Handle) -> Result<Option<String>> {
+    judged(handle, Counts::Above)
+}
+
+/// Which rights, and which entries, count in [`finding_in`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Counts {
+    /// Every right that changes a file or what a directory holds.
+    Content,
+    /// The rights that delete or take over the object, and the entries that only a child inherits.
+    Replacement,
+    /// The rights that delete or take over a folder above the object, and only the entries that
+    /// apply to the folder itself.
+    Above,
+}
+
+fn judged(handle: &super::ffi::Handle, counts: Counts) -> Result<Option<String>> {
     use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
     let mut descriptor: *mut c_void = null_mut();
     let mut owner: *mut c_void = null_mut();
@@ -326,7 +368,7 @@ pub fn changeable_by_others_on(
     }
     // SAFETY: the call returned a valid descriptor with the owner and the list inside it, and
     // nothing borrowed from it outlives the call below.
-    let outcome = unsafe { finding_in(owner, dacl, replacement_only) };
+    let outcome = unsafe { finding_in(owner, dacl, counts) };
     // SAFETY: the descriptor came from the platform's allocator and is freed once, after the last
     // read.
     unsafe {
@@ -340,11 +382,7 @@ pub fn changeable_by_others_on(
 /// # Safety
 ///
 /// `owner` and `dacl` are each null or point into a descriptor that lives through the call.
-unsafe fn finding_in(
-    owner: *mut c_void,
-    dacl: *mut ACL,
-    replacement_only: bool,
-) -> Result<Option<String>> {
+unsafe fn finding_in(owner: *mut c_void, dacl: *mut ACL, counts: Counts) -> Result<Option<String>> {
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
     if owner.is_null() {
         return Ok(Some("it has no owner".to_owned()));
@@ -376,12 +414,11 @@ unsafe fn finding_in(
     {
         return Err(last("reading the size of a permission list"));
     }
-    let mask_of_interest = ATTRIBUTE_WRITES
-        | if replacement_only {
-            REPLACES
-        } else {
-            CHANGES_CONTENT
-        };
+    let mask_of_interest = match counts {
+        Counts::Content => ATTRIBUTE_WRITES | CHANGES_CONTENT,
+        Counts::Replacement => ATTRIBUTE_WRITES | REPLACES,
+        Counts::Above => REPLACES,
+    };
     for index in 0..information.AceCount {
         let mut entry: *mut c_void = null_mut();
         // SAFETY: the index is below the entry count the list reported.
@@ -409,9 +446,11 @@ unsafe fn finding_in(
             continue;
         }
         // An entry for inheritance alone gives no right on this object, but what it inherits is
-        // given on the objects made in it.
+        // given on the objects made in it. A folder above the object is judged on its own rights:
+        // what its children inherit is read on the children.
         if header.AceFlags & INHERIT_ONLY_ACE != 0
-            && header.AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) == 0
+            && (counts == Counts::Above
+                || header.AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) == 0)
         {
             continue;
         }
@@ -423,6 +462,14 @@ unsafe fn finding_in(
             )
         };
         if mask & mask_of_interest != 0 && !system_class(&sid) {
+            if counts == Counts::Above {
+                return Ok(Some(format!(
+                    "{} is allowed to {} on it (rights 0x{:x})",
+                    sid.to_text(),
+                    crate::remedy::rights_in_words(mask & mask_of_interest),
+                    mask & mask_of_interest
+                )));
+            }
             return Ok(Some(format!(
                 "{} is allowed rights 0x{:x} on it",
                 sid.to_text(),
@@ -547,11 +594,21 @@ mod tests {
         }
 
         fn finding(&mut self, replacement_only: bool) -> Option<String> {
+            self.judge(if replacement_only {
+                Counts::Replacement
+            } else {
+                Counts::Content
+            })
+        }
+
+        fn above(&mut self) -> Option<String> {
+            self.judge(Counts::Above)
+        }
+
+        fn judge(&mut self, counts: Counts) -> Option<String> {
             // SAFETY: the owner lives in the descriptor the fixture keeps, and the list is a copy
             // of a valid one, damaged only in an entry's size or identifier.
-            unsafe {
-                finding_in(self.owner, self.list.as_mut_ptr().cast(), replacement_only).unwrap()
-            }
+            unsafe { finding_in(self.owner, self.list.as_mut_ptr().cast(), counts).unwrap() }
         }
     }
 
@@ -618,6 +675,73 @@ mod tests {
         assert!(
             fixture
                 .finding(false)
+                .unwrap_or_default()
+                .contains("does not hold its identifier")
+        );
+    }
+
+    /// The system's default list of a volume's root, as `icacls` shows it: the administrators and
+    /// the system with every right, the users with read and execute, the authenticated users with
+    /// the right to add a subdirectory and, for what is made below, to modify it.
+    const VOLUME_ROOT: &str = "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)(A;OICIIO;0x1301bf;;;AU)(A;;0x4;;;AU)";
+
+    #[test]
+    fn the_default_list_of_a_volumes_root_and_of_program_data_has_no_finding_above_the_trees() {
+        assert_eq!(Fixture::from(VOLUME_ROOT).above(), None);
+        // Program Data: the users may add a file and a subdirectory, and the creator-owner
+        // placeholder has every right on what it makes.
+        let data = "O:SYD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FA;;;CO)(A;OICI;0x1200a9;;;BU)(A;CI;0x2;;;BU)(A;CI;0x4;;;BU)";
+        assert_eq!(Fixture::from(data).above(), None);
+    }
+
+    #[test]
+    fn a_right_to_delete_rename_change_the_list_or_take_the_folder_is_a_finding_above_the_trees() {
+        for (rights, said) in [
+            ("0x40", "delete or rename an entry in it"),
+            ("0x10000", "delete it"),
+            ("0x40000", "change its list"),
+            ("0x80000", "take its ownership"),
+        ] {
+            let mut fixture = Fixture::from(&format!("{BASE}(A;CI;{rights};;;BU)"));
+            let finding = fixture.above().expect(rights);
+            assert!(finding.contains("S-1-5-32-545"), "{finding}");
+            assert!(finding.contains(said), "{rights}: {finding}");
+        }
+        // The right the default list gives to add an entry stays allowed.
+        for rights in ["0x2", "0x4", "0x100"] {
+            assert_eq!(
+                Fixture::from(&format!("{BASE}(A;CI;{rights};;;BU)")).above(),
+                None,
+                "{rights}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_for_inheritance_alone_is_no_finding_above_the_trees_and_one_that_applies_is() {
+        let inherit_only = format!("{BASE}(A;OICIIO;0x40;;;BU)");
+        assert_eq!(Fixture::from(&inherit_only).above(), None);
+        // The same entry counts for the folder that the installation holds, whose children inherit it.
+        assert!(Fixture::from(&inherit_only).finding(true).is_some());
+        assert!(
+            Fixture::from(&format!("{BASE}(A;OICI;0x40;;;BU)"))
+                .above()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_owner_outside_the_system_class_and_an_entry_this_check_does_not_read_are_findings_above()
+    {
+        let finding = Fixture::from("O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+            .above()
+            .expect("owned by the users");
+        assert!(finding.contains("is owned by S-1-5-32-545"), "{finding}");
+        let mut fixture = Fixture::from(&format!("{BASE}(D;;FA;;;BU)"));
+        fixture.set_size(2, 12);
+        assert!(
+            fixture
+                .above()
                 .unwrap_or_default()
                 .contains("does not hold its identifier")
         );
