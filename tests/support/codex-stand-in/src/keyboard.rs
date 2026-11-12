@@ -208,9 +208,17 @@ fn write(text: &str) {
 }
 
 impl Screen {
+    /// A screen that reads no keys and draws no composer: every line is written as it is.
+    pub fn plain() -> Self {
+        Self::with(None)
+    }
+
     /// The screen of this terminal: with a composer where standard input is a terminal.
     pub fn open() -> Self {
-        let raw = Raw::enter();
+        Self::with(Raw::enter())
+    }
+
+    fn with(raw: Option<Raw>) -> Self {
         let columns = raw
             .as_ref()
             .and_then(|_| termios::tcgetwinsize(std::io::stdin()).ok())
