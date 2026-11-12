@@ -70,6 +70,7 @@ impl Approved {
     /// Approves every record that is in the data directory now, for a case that inspected nothing:
     /// the earlier-state record, `staging` and each replacement of the manifest. It exists for the
     /// tests alone; the removal approves only what its own inspection opened.
+    #[cfg(feature = "testing")]
     #[must_use]
     pub fn all_that_are_there(data: &Path) -> Approved {
         let replacements = fs::read_dir(data)
@@ -329,7 +330,7 @@ fn unlisted(error: &io::Error) -> io::Error {
 #[must_use]
 pub fn next_step(manifest_stays: bool, data_is_empty: bool) -> &'static str {
     if manifest_stays {
-        "The manifest stays with them: close what holds them, then run the removal again, which reads the manifest and finishes"
+        "The manifest stays with them: close what holds them, then run the removal again, which reads the manifest and says what remains"
     } else if data_is_empty {
         "The directory is empty, and a new installation accepts an empty data directory: close what holds it (a console that has it as its current directory, for one), then run the removal again, which removes it"
     } else {

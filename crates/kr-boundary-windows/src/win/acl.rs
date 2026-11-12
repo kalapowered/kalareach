@@ -390,7 +390,10 @@ unsafe fn finding_in(owner: *mut c_void, dacl: *mut ACL, counts: Counts) -> Resu
     // SAFETY: the owner points at an identifier inside the descriptor.
     let owner_sid = unsafe { Sid::from_ptr(owner) };
     if !system_class(&owner_sid) {
-        return Ok(Some(format!("it is owned by {}", owner_sid.to_text())));
+        return Ok(Some(format!(
+            "it is owned by {}",
+            crate::remedy::identity_text(owner_sid.account_name().as_deref(), &owner_sid.to_text())
+        )));
     }
     if dacl.is_null() {
         return Ok(Some(
@@ -735,7 +738,8 @@ mod tests {
         let finding = Fixture::from("O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
             .above()
             .expect("owned by the users");
-        assert!(finding.contains("is owned by S-1-5-32-545"), "{finding}");
+        assert!(finding.contains("is owned by "), "{finding}");
+        assert!(finding.contains("(S-1-5-32-545)"), "{finding}");
         let mut fixture = Fixture::from(&format!("{BASE}(D;;FA;;;BU)"));
         fixture.set_size(2, 12);
         assert!(

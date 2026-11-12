@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kr_boundary_windows::records::{Approved, Records, remove};
+use kr_boundary_windows::records::{Approved, Records, is_manifest_replacement, remove};
 
 struct Data {
     _root: tempfile::TempDir,
@@ -58,7 +58,7 @@ impl Data {
             manifest: &self.manifest(),
             prior: &self.prior(),
             staging: &self.staging(),
-            approved: &Approved::all_that_are_there(&self.data),
+            approved: &everything_there(&self.data),
         })
     }
 
@@ -71,6 +71,22 @@ impl Data {
             staging: &self.staging(),
             approved,
         })
+    }
+}
+
+/// What an inspection that saw everything in the directory would have approved: the earlier-state
+/// record, `staging` and each replacement of the manifest.
+fn everything_there(data: &Path) -> Approved {
+    Approved {
+        prior: true,
+        staging: true,
+        replacements: fs::read_dir(data)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| is_manifest_replacement(&name.to_string_lossy()))
+            .collect(),
     }
 }
 
@@ -210,7 +226,7 @@ impl Data {
                 manifest: &self.manifest(),
                 prior: &self.prior(),
                 staging: &self.staging(),
-                approved: &Approved::all_that_are_there(&self.data),
+                approved: &everything_there(&self.data),
             },
             names,
         )
@@ -297,7 +313,7 @@ fn a_record_that_the_inspection_did_not_see_is_left_and_named() {
     let case = Data::installed();
     let stayed = case.remove_approving(&Approved {
         prior: false,
-        ..Approved::all_that_are_there(&case.data)
+        ..everything_there(&case.data)
     });
     assert!(
         stayed.iter().any(|text| text.contains("prior.json")
@@ -312,7 +328,7 @@ fn a_record_that_the_inspection_did_not_see_is_left_and_named() {
     let case = Data::installed();
     let stayed = case.remove_approving(&Approved {
         replacements: Vec::new(),
-        ..Approved::all_that_are_there(&case.data)
+        ..everything_there(&case.data)
     });
     assert!(
         stayed
@@ -330,7 +346,7 @@ fn a_staging_directory_that_the_inspection_did_not_see_is_not_deleted() {
     let case = Data::installed();
     let stayed = case.remove_approving(&Approved {
         staging: false,
-        ..Approved::all_that_are_there(&case.data)
+        ..everything_there(&case.data)
     });
     assert!(
         stayed.iter().any(|text| text.contains("staging")

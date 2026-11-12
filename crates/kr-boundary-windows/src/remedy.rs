@@ -353,6 +353,9 @@ pub enum AncestorFault<'a> {
     /// The owner or the list is refused: the check's own sentence, which names the identity and the
     /// rights.
     List(&'a str),
+    /// The owner or the list of a folder from the program directory's top down to its parent is
+    /// refused: the folders on the way to the program also refuse the right to add to them.
+    Writable(&'a str),
 }
 
 /// The refusal of a folder above the data directory or the program directory, up to the volume's
@@ -368,10 +371,10 @@ pub fn ancestor_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>) -> 
     let keep = "Do not remove or move it: it holds other things.";
     match fault {
         AncestorFault::Alias(found) => format!(
-            "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread. Nothing was changed. Install on the real path, which is {found}, and not through the drive letter, then run the setup program again."
+            "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread. Nothing was changed. The setup program installs only in the system's own known folders, and one of them is reached through {folder}: end the substitution or redirection of that letter, or give the known folder a place on a volume's own root, then run the setup program again."
         ),
         AncestorFault::Link => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder above its trees: the folders above the place that the link leads to are not the ones that it read. Nothing was changed. The system's default places have none. If this folder was moved or a volume was mounted on it, install on the real path, then run the setup program again. {keep}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. Nothing was changed. The system's default places have none. The setup program installs only in the system's own known folders and cannot be pointed at another path: where a known folder was moved or a volume was mounted on it, give the known folder a plain folder again, then run the setup program again. {keep}"
         ),
         AncestorFault::NotAFolder => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder. The system's default places are folders. Nothing was changed. Correct the path, then run the setup program again. {keep}"
@@ -380,7 +383,10 @@ pub fn ancestor_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>) -> 
             "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). Nothing was changed. Close the program that holds it open or correct who may open it, then run the setup program again. {keep}"
         ),
         AncestorFault::List(why) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because {why}. An identity that may delete the folder, delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on another place. Nothing was changed. If the reason names an owner, make the system, the Administrators group or the installer service its owner. If it names a right, take away from every other identity the right to delete the folder, to delete or rename an entry in it, to change its list and to take its ownership, and the generic forms that hold them (generic write, generic all and maximum allowed); the right to add an entry is what the system gives by default, and it stays allowed. Then run the setup program again. {keep}"
+            "{folder} is a folder above the boundary's {below}. It is refused because {why}. An identity that may delete the folder, delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on another place. Nothing was changed. If the reason names an owner, make the system, the Administrators group or the installer service its owner. If it names a right, remove or narrow the entry that allows it, an inherited entry too (a denying entry does not cancel an allowing one for this check), so that no other identity has the right to delete the folder, to delete or rename an entry in it, to change its list or to take its ownership, nor the generic forms that hold them (generic write, generic all and maximum allowed); the right to add an entry is what the system gives by default, and it stays allowed. If it names a missing list or an entry of a kind that the check does not read, give the folder a list of plain allowing entries. Then run the setup program again. {keep}"
+        ),
+        AncestorFault::Writable(why) => format!(
+            "{folder} is a folder above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program. Nothing was changed. Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. {keep}"
         ),
     }
 }
@@ -388,16 +394,35 @@ pub fn ancestor_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>) -> 
 /// What to do about an entry of the program directory that the installation does not make there.
 /// Only the system's class can write in that directory, so the entry is removed, whichever owner it
 /// shows. A link is removed as the link itself: the shell's recursive removal follows a junction
-/// into what it leads to, so the words name the removals that do not.
+/// into what it leads to, so the words name the removals that do not. `repair` says whether a
+/// repair can make the program files again, which it can only where an installation is recorded.
 #[must_use]
-pub fn program_removal_advice(entry: &str, link: bool) -> String {
+pub fn program_removal_advice(entry: &str, link: bool, repair: bool) -> String {
+    let after = if repair {
+        "A repair makes the program files again. Then run the setup program again."
+    } else {
+        "Then run the setup program again."
+    };
     if link {
         format!(
-            "Remove the link {entry} itself, and not what it points to (`rmdir` without `/s` removes a link to a folder, and `del` a link to a file), and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again."
+            "Remove the link {entry} itself, and not what it points to (`rmdir` without `/s` removes a link to a folder, and `del` a link to a file), and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. {after}"
         )
     } else {
         format!(
-            "Remove {entry}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again."
+            "Remove {entry}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. {after}"
         )
+    }
+}
+
+/// A folder's final path as a person can use it: without the `\\?\` prefix of the extended form, and
+/// with the form of a network path (`\\?\UNC\server\share`) as `\\server\share`.
+#[must_use]
+pub fn dos_path_of(final_path: &str) -> String {
+    match final_path.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(network) => format!(r"\\{network}"),
+            None => rest.to_owned(),
+        },
+        None => final_path.to_owned(),
     }
 }
