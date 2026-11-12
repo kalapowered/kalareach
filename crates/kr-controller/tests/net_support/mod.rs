@@ -1926,6 +1926,77 @@ impl PairedDial {
     }
 }
 
+/// A connection to the host that its device made and then leaves unread, and the endpoint it was
+/// made over.
+pub struct Unread {
+    /// The device's endpoint, held so that its connection stays up.
+    pub endpoint: Endpoint,
+    /// The connection itself.
+    pub connection: iroh::endpoint::Connection,
+    /// The handshake's result, whose control stream the device never reads.
+    pub authorised: kr_transport::handshake::AuthorisedConnection,
+}
+
+/// One connection of `device`'s to `host`, authorised as the device, over an endpoint of its own
+/// that lets the host send no more than `window` bytes on a stream before the device has read
+/// some. The device reads the handshake, which gives the host the credit it needs for that, and
+/// then reads nothing, so a word of the host's that is longer than `window` waits for credit that
+/// never comes.
+///
+/// # Panics
+///
+/// Panics when the device cannot bind an endpoint, reach the host or be authorised.
+pub async fn dial_unread(
+    host: &Host,
+    device: &Device,
+    record: &DeviceRecord,
+    window: u32,
+) -> Unread {
+    use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
+
+    let dial = paired_dial(host, device, record);
+    let seed = device.keys().transport.export_endpoint_seed();
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(iroh::SecretKey::from_bytes(seed.expose()))
+        .transport_config(
+            QuicTransportConfig::builder()
+                .stream_receive_window(VarInt::from_u32(window))
+                .max_concurrent_uni_streams(VarInt::from_u32(0))
+                .max_concurrent_bidi_streams(VarInt::from_u32(0))
+                .build(),
+        )
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .expect("a loopback address")
+        .bind()
+        .await
+        .expect("an endpoint that dials");
+    // The host admits a burst of new connections and returns a place at a fixed rate, so an
+    // attempt it turned away for that is made again.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let connection = loop {
+        match kr_transport::endpoint::connect(&endpoint, dial.addr.clone(), kr_protocol::hello::ALPN)
+            .await
+        {
+            Ok(connection) => break connection,
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                panic!("the host is reachable: {error:?}")
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    };
+    let authorised =
+        kr_transport::handshake::connect(&connection, &dial.identity, &dial.host_record)
+            .await
+            .expect("the paired device is authorised");
+    Unread {
+        endpoint,
+        connection,
+        authorised,
+    }
+}
+
 /// How `device`, paired as `record`, dials `host`.
 pub fn paired_dial(host: &Host, device: &Device, record: &DeviceRecord) -> PairedDial {
     paired_dial_receiving(

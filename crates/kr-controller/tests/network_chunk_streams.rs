@@ -1606,7 +1606,8 @@ async fn an_idle_main_link_is_not_withdrawn_for_the_copies_that_followed_its_las
 /// KR-REQ-23.21: a connection the host refuses costs the device none of its connections. The grant
 /// of a device that holds a bound's worth has run out by the wall clock, which the connections it
 /// holds were not admitted under, so the host refuses the connection above the bound after it
-/// admitted it, and no connection of the device is withdrawn for it.
+/// admitted it, and no connection of the device is withdrawn for it; nothing of the refused
+/// connection stays in the host's table of admitted connections or in its readings.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_the_host_refuses_above_the_bound_withdraws_none() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -1615,6 +1616,8 @@ async fn a_connection_the_host_refuses_above_the_bound_withdraws_none() {
     let device = paired(&host, &owner, &[ActionRight::SessionView]).await;
     let _more = up_to_the_bound(&device, &host).await;
     let bound = u32::try_from(DEVICE_LIVE_CONNECTIONS).expect("a small bound");
+    let admitted = host.controller().admitted_connections();
+    let readings = host.readings_running();
     moved.past_the_grant_by_utc();
 
     // The connection is made, and the host ends it once it has read the grant's deadline. A place
@@ -1648,6 +1651,43 @@ async fn a_connection_the_host_refuses_above_the_bound_withdraws_none() {
         "the oldest connection was not withdrawn for a connection that was refused"
     );
     assert_eq!(host.connections_of(&device.record), bound);
+    until(|| host.controller().admitted_connections() == admitted).await;
+    until(|| host.readings_running() == readings).await;
+    host.stop().await;
+}
+
+/// KR-REQ-23.21: a device that takes the handshake and then reads nothing leaves nothing of the
+/// connection the host refuses once the host's time to tell it why has run out. The device lets the
+/// host send fewer bytes on its stream than the refusal is long and reads none, so the host cannot
+/// finish the write: it gives the write up, and the connection ends with no entry of it in the
+/// host's table of admitted connections and no reading of its packets, and nothing of the device's
+/// other connections was withdrawn for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_reads_none_of_its_refusal_leaves_nothing_of_the_connection() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::SessionView]).await;
+    let more = up_to_the_bound(&device, &host).await;
+    let bound = u32::try_from(DEVICE_LIVE_CONNECTIONS).expect("a small bound");
+    let admitted = host.controller().admitted_connections();
+    let readings = host.readings_running();
+    // Every connection answers, so the one above the bound is refused.
+    for raw in std::iter::once(&device.raw).chain(&more) {
+        assert!(
+            is_served(raw).await,
+            "a connection within the bound is served"
+        );
+    }
+
+    let unread = net_support::dial_unread(&host, &device.device, &device.record, 32).await;
+    until(|| unread.connection.close_reason().is_some()).await;
+    until(|| host.controller().admitted_connections() == admitted).await;
+    until(|| host.readings_running() == readings).await;
+    assert_eq!(host.connections_of(&device.record), bound);
+    for raw in std::iter::once(&device.raw).chain(&more) {
+        assert!(is_served(raw).await, "no connection in use was withdrawn");
+    }
+    drop(unread);
     host.stop().await;
 }
 
