@@ -24,9 +24,10 @@
 :root[data-surface='android'] {
   /*
    * How far a link in a message is pressable beyond its words, on each side: half of `--target`, or
-   * the screen's gutter where that is less. The conversation's pane keeps this much room on each
-   * side, taken from the gutter, so a link at the edge of a line has its whole box on the screen and
-   * the pane has nothing past its edge to scroll.
+   * the screen's gutter where that is less (`--gap-4`, and `--gap-5` from 40rem, as `.m-main`'s
+   * padding is). The conversation's pane keeps this much room on each side, taken from the gutter,
+   * so a link at the edge of a line has its whole box on the screen and the pane has nothing past
+   * its edge to scroll.
    */
   --reach-inline: min(calc(var(--target) / 2), var(--gap-4));
   --safe-top: env(safe-area-inset-top, 0px);
@@ -652,9 +653,9 @@
   isolation: isolate;
 }
 
-/* The pane's own focus ring stays 4px outside the messages, not outside the room kept for the reach. */
+/* The pane's own focus ring lies inside its edge, as the main area's does, not 4px outside the room kept for the reach. */
 .m-session[data-pane='semantic'] > .m-pane:focus-visible {
-  outline-offset: calc(4px - var(--reach-inline));
+  outline-offset: -2px;
 }
 
 /* The terminal fills its pane, under the words of a view that has ended. */
@@ -721,24 +722,27 @@
 
 /*
  * A link inside a message is as tall as its line, which is less than a finger needs. The button's
- * box grows by a reach on each side and its margin takes the same amount back, so the line, the
- * paragraph and the words around the link stay where they were, while the box that a finger, TalkBack
- * and VoiceOver find is `--target` in both directions. The block reach is what the line lacks. The
+ * box grows by a reach on each side and its margin takes the same amount back, so the line's height
+ * and the paragraph's lines stay where they were, while the box that a finger, TalkBack and
+ * VoiceOver find is `--target` in both directions. The block reach is what the line lacks. The
  * inline reach is as much as the pane has room for on each side (see `--reach-inline`): more would
  * go past the pane at the edge of a line, where the conversation would scroll sideways or the screen
- * would cut the box. The width that a short label then lacks is taken in the link's own width, not
- * in more reach: a label narrower than `--target` less two reaches (16 px at the default text size on
- * Android, 12 on iOS, none at the largest sizes) is widened to `--target`, which moves the words
- * after it by the difference, up to about half a reach for a single narrow character.
+ * would cut the box.
+ *
+ * What this does not hold: a label narrower than `--target` less two reaches (16 px at the default
+ * text size on Android, 12 on iOS, none at the largest sizes) is widened to `--target`, and the
+ * words after it move sideways by the difference: up to about 12 px for one narrow character, 9 for
+ * a digit. A line that had less room than that to spare then breaks one word earlier.
  *
  * The area reaches half a line into the lines above and below, as a target this tall must, and over
  * plain words after the link. Each button is above plain text, so a press anywhere in its box is its
- * own. The words of each link are a layer above every button, and the layer is the link's whole
- * lines, not only the glyphs: a press anywhere in a link's own line is that link's, whichever
- * neighbour's area lies under it. Between two links one above the other, the press goes to the link
- * whose line it is in, which is the link whose words are nearer: the middle between them is the
- * boundary of their lines. Two links with one plain line between them share the reach that overlaps
- * in that line at its middle, to within a pixel and a half. On one line, between the words of two
+ * own. Among links, two layers above every button decide who owns a press: the area of a link's own
+ * line, over the whole width of its box (a rule `::before`, as tall as the line's content), and its
+ * words above that. So a press in a link's own line, beside its words as well, is that link's
+ * whichever neighbour's box lies under it, and between two links one above the other the boundary is
+ * the line boundary, the middle between their words. Two links with one plain line between them
+ * share the overlap in that line at its middle (it is `--target` less two line heights: about 1.6 px
+ * at the default size, up to about 9 px at the smallest text). On one line, between the words of two
  * links, the later link's area is the one that is above.
  */
 .m-node .md-link {
@@ -755,10 +759,17 @@
   }
 }
 
-.m-node .md-link-label {
-  display: block;
-  position: relative;
+.m-node .md-link::before {
+  content: '';
+  position: absolute;
+  inset-block: var(--reach-block);
+  inset-inline: 0;
   z-index: 1;
+}
+
+.m-node .md-link-label {
+  position: relative;
+  z-index: 2;
 }
 
 /* The ring follows the words, not the larger box a finger has. */
@@ -1179,6 +1190,11 @@
 /* ---- Landscape and larger screens ------------------------------------------------------------ */
 
 @media (min-width: 40rem) {
+  :root[data-surface='ios'],
+  :root[data-surface='android'] {
+    --reach-inline: min(calc(var(--target) / 2), var(--gap-5));
+  }
+
   .m-main {
     padding-inline: calc(var(--safe-left) + var(--gap-5)) calc(var(--safe-right) + var(--gap-5));
   }
