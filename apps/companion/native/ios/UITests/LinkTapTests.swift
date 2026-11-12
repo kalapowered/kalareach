@@ -360,7 +360,7 @@ final class LinkTapTests: HarnessTestCase {
         // a line with no other link near. The area is what the page gives the words: grown by half the least size beside
         // them and to the least size in height (so, from the words' frame, 22 points beside the words and a height of 44
         // about their middle), and the link's own button box, which is the page's. A tap 2 points inside an edge opens the
-        // link once; a tap 4 points outside it opens nothing.
+        // link once; a tap just outside it (4 points, or 16 where the edge is the button's own box) opens nothing.
         let middle = scroll(to: "middle")
         let middleShift = offset(of: middle)
         let around = middle.words[0]
@@ -370,15 +370,22 @@ final class LinkTapTests: HarnessTestCase {
         let areaRight = max(around.maxX + least / 2, middle.box.maxX)
         let areaTop = min(around.midY - halfTall, middle.box.minY)
         let areaBottom = max(around.midY + halfTall, middle.box.maxY)
-        let edges: [(String, CGPoint, CGPoint)] = [
-            ("left", CGPoint(x: areaLeft + 2, y: around.midY), CGPoint(x: areaLeft - 4, y: around.midY)),
-            ("right", CGPoint(x: areaRight - 2, y: around.midY), CGPoint(x: areaRight + 4, y: around.midY)),
-            ("top", CGPoint(x: around.midX, y: areaTop + 2), CGPoint(x: around.midX, y: areaTop - 4)),
-            ("bottom", CGPoint(x: around.midX, y: areaBottom - 2), CGPoint(x: around.midX, y: areaBottom + 4)),
+        // Where the page's own button box is the edge (a tall line at the largest size), the system's own adjustment of a tap
+        // to a button reaches a little beyond it, so the tap outside is made past that reach: 16 points. Where the edge is
+        // the page's area for the words, it is 4 points.
+        let leftGap: CGFloat = middle.box.minX <= around.minX - least / 2 ? 16 : 4
+        let rightGap: CGFloat = middle.box.maxX >= around.maxX + least / 2 ? 16 : 4
+        let topGap: CGFloat = middle.box.minY <= around.midY - halfTall ? 16 : 4
+        let bottomGap: CGFloat = middle.box.maxY >= around.midY + halfTall ? 16 : 4
+        let edges: [(String, CGPoint, CGPoint, CGFloat)] = [
+            ("left", CGPoint(x: areaLeft + 2, y: around.midY), CGPoint(x: areaLeft - leftGap, y: around.midY), leftGap),
+            ("right", CGPoint(x: areaRight - 2, y: around.midY), CGPoint(x: areaRight + rightGap, y: around.midY), rightGap),
+            ("top", CGPoint(x: around.midX, y: areaTop + 2), CGPoint(x: around.midX, y: areaTop - topGap), topGap),
+            ("bottom", CGPoint(x: around.midX, y: areaBottom - 2), CGPoint(x: around.midX, y: areaBottom + bottomGap), bottomGap),
         ]
-        for (edge, inside, outside) in edges {
+        for (edge, inside, outside, gap) in edges {
             expectOpened(tap("\(named): the \(edge) edge of the area, 2 points inside", at: inside, shift: middleShift), "middle")
-            let beyond = tap("\(named): the \(edge) edge of the area, 4 points outside", at: outside, shift: middleShift)
+            let beyond = tap("\(named): the \(edge) edge of the area, \(Int(gap)) points outside", at: outside, shift: middleShift)
             XCTAssertTrue(beyond.opened.isEmpty, "\(beyond.label): opened \(beyond.opened)")
         }
 
