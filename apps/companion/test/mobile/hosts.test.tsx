@@ -414,6 +414,49 @@ describe('a page that is loaded while the device holds a call', () => {
     expect(await screen.findByRole('button', { name: 'Mute microphone' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
   })
+
+  // A tap on a notification already chose the attention screen, so the call does not take the page
+  // from it.
+  it('stays on the attention screen that a notification tap opened', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdAVoiceCall()
+    controls.routeNextTapTo('attention')
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" />
+      </AppProvider>
+    )
+    expect(await screen.findByRole('heading', { name: 'Attention' })).toBeInTheDocument()
+    await act(async () => {
+      await port.voiceCallState()
+    })
+    expect(screen.queryByRole('button', { name: 'Mute microphone' })).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Attention' })).toBeInTheDocument()
+  })
+
+  // The person pressed a tab before the call's state came back, and the page stays where they went.
+  it('keeps the tab that was pressed before the call state answered', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdAVoiceCall()
+    let answer: () => void = () => undefined
+    const late = new Promise<void>((resolve) => {
+      answer = resolve
+    })
+    const slow = { ...port, voiceCallState: () => late.then(() => port.voiceCallState()) }
+    render(
+      <AppProvider port={slow}>
+        <MobileApp surface="ios" />
+      </AppProvider>
+    )
+    await openTab('Hosts')
+    expect(await screen.findByRole('heading', { name: 'Hosts' })).toBeInTheDocument()
+    await act(async () => {
+      answer()
+      await late
+    })
+    expect(screen.queryByRole('button', { name: 'Mute microphone' })).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Hosts' })).toBeInTheDocument()
+  })
 })
 
 describe('the pairing entry on a phone', () => {
