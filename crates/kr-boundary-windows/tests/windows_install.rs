@@ -1237,8 +1237,21 @@ fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_
         .output()
         .unwrap();
     assert!(made.status.success(), "{made:?}");
-    let refused = install::make_data_directory(&paths).unwrap_err();
-    assert!(refused.to_string().contains("is a link"), "{refused}");
+    // A link at the directory's own name is refused with the remedy of a directory that the
+    // installation did not make: moved aside, and neither corrected into place nor removed.
+    for refused in [
+        install::make_data_directory(&paths).unwrap_err(),
+        install::entry(&paths)
+            .err()
+            .expect("a link at the data directory"),
+    ] {
+        let text = refused.to_string();
+        assert!(text.contains("it is a link"), "{text}");
+        assert!(text.contains("did not make"), "{text}");
+        assert!(text.contains("Move it aside"), "{text}");
+        assert!(text.contains("do not remove it"), "{text}");
+        assert!(!text.contains("Make the Administrators group"), "{text}");
+    }
     let _ = std::fs::remove_dir(&paths.data);
     let _ = std::fs::remove_dir_all(&target);
     owned_file(&paths.data, b"not a directory");
@@ -1682,6 +1695,162 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
 
     let _ = account::delete(&name);
     let _ = std::fs::remove_dir_all(&foreign);
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A record's remedy comes from what its own handle shows, never from the words of the reason that
+/// refused it. A manifest that another account owns and that has a second name is moved out and is
+/// not corrected into place, since correcting it would make another account's file the
+/// installation's record; a directory that cannot be opened to be checked shows nothing of who made
+/// it, so it is neither corrected nor removed.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_records_remedy_comes_from_what_its_handle_shows_and_what_cannot_be_read_is_neither_corrected_nor_removed()
+ {
+    use std::os::windows::fs::OpenOptionsExt;
+    const ADMINISTRATORS: &str = "*S-1-5-32-544";
+    const USERS: &str = "*S-1-5-32-545";
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let refusal = || {
+        install::make_data_directory(&paths)
+            .expect_err("a refused record")
+            .to_string()
+    };
+    let set_owner = |path: &Path, who: &str| {
+        let done = Command::new("icacls")
+            .arg(path)
+            .args(["/setowner", who])
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{done:?}");
+    };
+
+    let second_name = folder.join("second-name.json");
+    std::fs::hard_link(&paths.manifest, &second_name).unwrap();
+    set_owner(&paths.manifest, USERS);
+    let text = refusal();
+    assert!(text.contains("more than one name"), "{text}");
+    assert!(text.contains("did not make"), "{text}");
+    assert!(text.contains("Move it aside"), "{text}");
+    assert!(text.contains("do not remove it"), "{text}");
+    for other in ["Correct what the reason names", "Remove "] {
+        assert!(!text.contains(other), "{text}");
+    }
+    set_owner(&paths.manifest, ADMINISTRATORS);
+    std::fs::remove_file(&second_name).unwrap();
+    install::make_data_directory(&paths).expect("the manifest is the installation's own again");
+
+    // Another program holds the journal's directory open and shares it with nobody, so it cannot
+    // be opened to be checked.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(0x0200_0000)
+        .open(&paths.journal)
+        .unwrap();
+    let text = refusal();
+    drop(held);
+    assert!(text.contains("could not be opened to be checked"), "{text}");
+    assert!(text.contains("Nothing shows who made"), "{text}");
+    assert!(
+        text.contains("Close the program that holds it open"),
+        "{text}"
+    );
+    for other in [
+        "Correct what the reason names",
+        "Remove ",
+        "Do not remove",
+        "Move it aside",
+    ] {
+        assert!(!text.contains(other), "{text}");
+    }
+    install::make_data_directory(&paths).expect("the directory can be opened again");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// The move-aside remedy holds at the next run. A record that the person moves out of the data
+/// directory, as the text says, is absent at the next run and is made new; a record's name beside
+/// the original would be a name that the layout does not give. A manifest that is moved out leaves
+/// a directory with no manifest, which the next run refuses, naming what else is in it and never the
+/// manifest that was moved out.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_record_moved_out_of_the_data_directory_as_the_text_says_is_not_met_again_as_something_to_remove()
+ {
+    use install::DataChild;
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let saved = folder.join("saved");
+    std::fs::create_dir(&saved).unwrap();
+
+    // A link at the journal's name: the text says to move it out of the data directory.
+    let target = inherited_folder();
+    std::fs::write(target.join("kept.txt"), b"x").unwrap();
+    std::fs::remove_dir(&paths.journal).unwrap();
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&paths.journal)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let text = install::make_data_directory(&paths)
+        .expect_err("a link at the journal's name")
+        .to_string();
+    assert!(text.contains("Move it aside"), "{text}");
+    assert!(text.contains("out of the data directory"), "{text}");
+    std::fs::rename(&paths.journal, saved.join("journal")).unwrap();
+    let mut holds = install::make_data_directory(&paths)
+        .expect("the next run finds no journal and does not refuse");
+    holds.directory(DataChild::Journal).unwrap();
+    assert!(paths.journal.is_dir(), "the journal is made new");
+    assert!(summary_of(&paths.journal).protected);
+    assert!(
+        target.join("kept.txt").is_file(),
+        "what the link led to is untouched"
+    );
+    drop(holds);
+
+    // A link at the manifest's name: the text says what the next run finds once it is moved out.
+    let copy = folder.join("copy.json");
+    std::fs::copy(&paths.manifest, &copy).unwrap();
+    std::fs::remove_file(&paths.manifest).unwrap();
+    let linked = Command::new("cmd")
+        .args(["/c", "mklink"])
+        .arg(&paths.manifest)
+        .arg(&copy)
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "{linked:?}");
+    let text = install::make_data_directory(&paths)
+        .expect_err("a link at the manifest's name")
+        .to_string();
+    assert!(text.contains("Move it aside"), "{text}");
+    assert!(
+        text.contains("The directory then holds no manifest"),
+        "{text}"
+    );
+    std::fs::rename(&paths.manifest, saved.join("manifest.json")).unwrap();
+    let next = install::make_data_directory(&paths)
+        .expect_err("a directory with content and no manifest")
+        .to_string();
+    assert!(
+        next.contains("no manifest records this directory"),
+        "{next}"
+    );
+    assert!(
+        !next.contains(&saved.join("manifest.json").display().to_string()),
+        "{next}"
+    );
+    assert!(!next.contains("Do not remove"), "{next}");
     let _ = std::fs::remove_dir_all(&target);
     let _ = std::fs::remove_dir_all(&folder);
 }
@@ -2360,12 +2529,28 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     removal_with("notes.txt");
     std::fs::remove_file(paths.journal.join("notes.txt")).unwrap();
 
-    // A journal file of the system's class with a second name is a record to correct, and is never
-    // removed.
+    // A journal file with a second name is not the installation's: its handle shows that, whoever
+    // owns it, so it is moved out and neither corrected into place nor removed.
     let second_name = paths.journal.join(format!("{}.journal", "cd".repeat(16)));
     std::fs::hard_link(&journal_file, &second_name).unwrap();
-    correction_with("more than one name");
+    moved_aside_with("more than one name");
     std::fs::remove_file(&second_name).unwrap();
+
+    // A journal file that the system's class owns, with another account's entry in its list, is a
+    // record to correct, and is never removed.
+    let granted = Command::new("icacls")
+        .arg(&journal_file)
+        .args(["/grant", "*S-1-5-32-545:(R)"])
+        .output()
+        .unwrap();
+    assert!(granted.status.success(), "{granted:?}");
+    correction_with("its permission list has an entry for");
+    let revoked = Command::new("icacls")
+        .arg(&journal_file)
+        .args(["/remove:g", "*S-1-5-32-545"])
+        .output()
+        .unwrap();
+    assert!(revoked.status.success(), "{revoked:?}");
 
     // A link at a child's name is refused, and the tree it leads to keeps its list.
     let target = inherited_folder();
@@ -2464,7 +2649,17 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         flagged.status.success(),
         "the guest cannot make a directory case-sensitive: {flagged:?}"
     );
-    refused_with("differ only by case");
+    let text = refusal("differ only by case");
+    assert!(text.contains("Turn the flag off"), "{text}");
+    for other in [
+        "Remove ",
+        "Do not remove",
+        "Move it aside",
+        "emptied",
+        "removed",
+    ] {
+        assert!(!text.contains(other), "one remedy: {text}");
+    }
     let _ = Command::new("fsutil")
         .args(["file", "setCaseSensitiveInfo"])
         .arg(&paths.data)

@@ -22,6 +22,7 @@
 //! | [`journal`] | The journal's records: their framing (a length, the bytes and a checksum, with a torn tail dropped), their rows and the order the rows may come in |
 //! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes, its configuration listing and the output of the five readers it runs |
 //! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
+//! | [`remedy`] | What a refusal of an entry of the data directory tells the person to do, chosen from what the entry's own handle showed |
 //! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
 //! | [`messages`] | The product's own messages whose exact words are fixed: the installer's wait for application control, and the broker's answer while its proof has not passed |
 //! | [`operation`] | The eight commands a request may name: their argument tables, the settings every command runs with, the one rule for line endings, and the checks of the repository's state |
@@ -63,6 +64,7 @@ pub mod pipe_access;
 pub mod policy;
 pub mod quote;
 pub mod refusal;
+pub mod remedy;
 pub mod repository;
 pub mod state;
 pub mod window;
