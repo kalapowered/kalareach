@@ -322,15 +322,29 @@ fn unlisted(error: &io::Error) -> io::Error {
     ))
 }
 
+/// What a removal adds to its last words where the earlier-state record is there and its inspection
+/// did not approve it: the record was not read, so the Application Identity service keeps the start
+/// value and the running state that the installation gave it. The next removal inspects the record
+/// and puts them back. The text starts with a full stop, to follow last words that have none, and
+/// is empty where the record was read or is not there.
+#[must_use]
+pub fn unread_prior(approved: bool, there: bool) -> &'static str {
+    if there && !approved {
+        ". The earlier-state record was not read, so the Application Identity service's start value and running state were not put back: the next removal reads the record and does it"
+    } else {
+        ""
+    }
+}
+
 /// What the person does about a data directory that stayed after the records went: while the
-/// manifest stays, the removal is run again and reads it; an empty directory with no manifest is a
+/// manifest stays, the removal is run again and inspects it again; an empty directory with no manifest is a
 /// state that a new installation accepts and the next removal finishes; anything else in it was
 /// checked by no handle in this run, and a new installation refuses until it is gone: the removal
 /// is run again, reads the first entry that it finds on its own handle and says what to do about it.
 #[must_use]
 pub fn next_step(manifest_stays: bool, data_is_empty: bool) -> &'static str {
     if manifest_stays {
-        "The manifest stays with them: close what holds them, then run the removal again, which reads the manifest and says what remains"
+        "The manifest stays with them: close what holds them, then run the removal again, which inspects the data directory again and says what remains"
     } else if data_is_empty {
         "The directory is empty, and a new installation accepts an empty data directory: close what holds it (a console that has it as its current directory, for one), then run the removal again, which removes it"
     } else {

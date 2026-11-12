@@ -152,12 +152,18 @@ fn parent_of(folder: &Path) {
 
 /// A data directory with its manifest and its three directories, as an installation leaves it.
 fn installed_data_directory(paths: &Paths) {
+    installed_data_directory_with(paths, |_| {});
+}
+
+/// [`installed_data_directory`] with what `more` records in the manifest besides the directories.
+fn installed_data_directory_with(paths: &Paths, more: impl FnOnce(&mut Manifest)) {
     let mut holds = install::make_data_directory(paths).unwrap();
     holds.protect().unwrap();
     let mut manifest = Manifest::begin();
     for path in [&paths.data, &paths.staging, &paths.journal, &paths.run] {
         manifest.record(ObjectKind::Directory, &path.display().to_string(), None);
     }
+    more(&mut manifest);
     manifest.save(&paths.manifest).unwrap();
     for which in [DataChild::Staging, DataChild::Journal, DataChild::Run] {
         holds.directory(which).unwrap();
@@ -592,24 +598,65 @@ fn a_staging_directory_made_after_the_inspection_is_left_and_named() {
 
 /// An earlier-state record that was not in the data directory at the removal's inspection and is
 /// there when it comes to use and delete the records is not used and not deleted: it is left and
-/// named, and the manifest stays with it. The record parses and says what would change the outcome
-/// if the removal acted on it: the Application Identity service was not running before the
-/// installation (the removal would stop it on this word where it runs), and the earlier policy had
-/// a rule that the machine does not have (the residue check would then report that the earlier
-/// state is not back). The removal reaches the service, the boot marker and the policy steps: the
-/// case first checks that the guest holds no installation.
+/// named, and the manifest stays with it. The manifest records the Application Identity service
+/// with the start value that the installation is said to have set, and the record parses and says
+/// what would change the outcome if the removal acted on it: another start value, which the removal
+/// would put back, the service not running before the installation (the removal would stop it on
+/// this word where it runs), and an earlier policy with a rule that the machine does not have (the
+/// residue check would then report that the earlier state is not back). The case reads the
+/// service's start value and whether it runs before and after the removal, and the last words say
+/// that neither was put back. The removal reaches the service, the boot marker and the policy
+/// steps: the case first checks that the guest holds no installation.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_prior_record_made_after_the_inspection_is_left_and_named() {
     use kr_boundary_windows::manifest::{Prior, STORE_VERSION};
+    use kr_boundary_windows::win::service;
+    /// The Application Identity service's start value and whether it runs, as the system reports.
+    fn appid_state() -> (u32, bool) {
+        let appid = service::manager()
+            .unwrap()
+            .open("AppIDSvc")
+            .unwrap()
+            .expect("the guest has the Application Identity service");
+        (
+            appid.configuration().unwrap().0,
+            appid.status().unwrap().running(),
+        )
+    }
     require_clean_guest();
     let mut clean = Cleanup::default();
+    let (start, running) = appid_state();
+    // The start value goes back to what it was however the case ends: a removal that used the
+    // record would have changed it.
+    clean.undo(move || {
+        let _ = Command::new("reg")
+            .args([
+                "add",
+                r"HKLM\SYSTEM\CurrentControlSet\Services\AppIDSvc",
+                "/v",
+                "Start",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                &start.to_string(),
+                "/f",
+            ])
+            .output();
+    });
     let (_folder, paths) = data_parent_with_paths(&mut clean);
-    installed_data_directory(&paths);
+    installed_data_directory_with(&paths, |manifest| {
+        manifest.record(
+            ObjectKind::AppIdentity,
+            "AppIDSvc",
+            Some(&format!("start={start}")),
+        );
+    });
     let record = Prior {
         store: STORE_VERSION,
-        // Disabled: a start value that the removal would put back.
-        appid_start_type: 4,
+        // Another start value than the service has, so that a removal that acted on the record
+        // would put it back.
+        appid_start_type: if start == 4 { 3 } else { 4 },
         appid_running: false,
         policy_xml: concat!(
             r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="Enabled">"#,
@@ -639,4 +686,135 @@ fn a_prior_record_made_after_the_inspection_is_left_and_named() {
     assert!(!text.contains("checking the earlier state"), "{text}");
     assert!(paths.prior.exists(), "what appeared stays");
     assert!(paths.manifest.exists(), "the manifest stays with it");
+    // The service was not touched, and the last words say that it was not put back and that the next
+    // removal does it.
+    assert_eq!(
+        appid_state(),
+        (start, running),
+        "the Application Identity service's start value or running state changed on a record that was not approved"
+    );
+    assert!(
+        text.contains("start value and running state were not put back"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the next removal reads the record and does it"),
+        "{text}"
+    );
+}
+
+/// A removal where nothing is installed promises no repair and names no manifest: the program
+/// directory's refusals say what to remove and nothing about a repair that makes the program files
+/// again, which a repair can do only where an installation is recorded. A link that points nowhere
+/// at the directory's name, and a file in it with a second name, get their remedies without those
+/// words.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_removal_where_nothing_is_installed_promises_no_repair() {
+    use kr_boundary_windows::win::fresh;
+    use kr_boundary_windows::win::sd::{Principals, SdKind};
+    require_clean_guest();
+    let mut clean = Cleanup::default();
+    let (_folder, paths) = data_parent_with_paths(&mut clean);
+    // A link that points nowhere at the program directory's name.
+    let target = inherited_folder(&mut clean);
+    junction(&paths.program, &target);
+    clean.junction(&paths.program);
+    std::fs::remove_dir_all(&target).unwrap();
+    let text = install::remove(&paths, false)
+        .expect_err("a link at the program directory's name")
+        .to_string();
+    assert!(text.contains("it is a link"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Remove the link {} itself",
+            paths.program.display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("repair"), "{text}");
+    std::fs::remove_dir(&paths.program).unwrap();
+    // A file with a second name inside a program directory that is otherwise the installation's.
+    fresh::directory_all(
+        &paths.program,
+        SdKind::AdminDir,
+        &Principals {
+            users_may_read: true,
+            ..Principals::default()
+        },
+    )
+    .unwrap();
+    let first = paths.program.join("first.exe");
+    std::fs::write(&first, b"x").unwrap();
+    icacls(&first, &["/setowner", "*S-1-5-32-544"]);
+    std::fs::hard_link(&first, paths.program.join("second.exe")).unwrap();
+    let text = install::remove(&paths, false)
+        .expect_err("a file with a second name")
+        .to_string();
+    assert!(text.contains("more than one name"), "{text}");
+    assert!(text.contains("Remove "), "{text}");
+    assert!(!text.contains("repair"), "{text}");
+    assert!(!text.contains("the manifest records it"), "{text}");
+}
+
+/// A known folder that an administrator gave a network path is refused in both walks, as the
+/// installation does not go through a place that its checks did not read, and the folder above a
+/// share is the server's. The data walk refuses the share's root, and the program walk, which begins
+/// at the share's root as the program directory's top, says that it is a link or a mounted folder.
+/// The printing of a network path as a person can use it is for the words alone: a comparison that
+/// took it would accept the share.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_known_folder_on_a_network_share_is_refused_in_both_walks() {
+    require_clean_guest();
+    let mut clean = Cleanup::default();
+    let folder = inherited_folder(&mut clean);
+    // The share's root is read over the network by the system's computer account.
+    icacls(&folder, &["/grant", "*S-1-1-0:(OI)(CI)RX"]);
+    let name = format!("krshare{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let made = Command::new("net")
+        .args([
+            "share",
+            &format!("{name}={}", folder.display()),
+            "/grant:Everyone,READ",
+        ])
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let share = name.clone();
+    clean.undo(move || {
+        let _ = Command::new("net")
+            .args(["share", &share, "/delete", "/y"])
+            .output();
+    });
+    let root = PathBuf::from(format!(r"\\localhost\{name}\"));
+    assert!(root.exists(), "the share's root opens: {}", root.display());
+
+    // The data walk: the data parent is a folder of the share.
+    let parent = root.join("Parent");
+    let paths = paths_with(&parent, &parent.join("Program"), &parent);
+    let text = install::check_data_parent(&paths)
+        .expect_err("a data parent on a network share")
+        .to_string();
+    assert!(text.contains("not the root of its volume"), "{text}");
+    assert!(text.contains(&format!(r"\\localhost\{name}\")), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+
+    // The program walk: the share's root is the program directory's top.
+    let (_local, mut paths) = data_parent_with_paths(&mut clean);
+    paths.program_top = root.clone();
+    paths.program = root.join("Program");
+    paths.git = paths.program.join("git");
+    let entry = install::entry(&paths)
+        .err()
+        .expect("a program directory on a network share")
+        .to_string();
+    let removal = install::remove(&paths, true)
+        .expect_err("a program directory on a network share")
+        .to_string();
+    for text in [entry, removal] {
+        assert!(text.contains("it is a link or a mounted folder"), "{text}");
+        assert!(text.contains(&format!(r"\\localhost\{name}\")), "{text}");
+        assert!(text.contains("This layout is not supported"), "{text}");
+    }
 }

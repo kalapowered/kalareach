@@ -373,7 +373,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     // an empty one, which a new installation takes as it is.
     let data_accepted = inspected.is_some();
     if let Some(manifest) = inspected.and_then(|inspected| inspected.manifest) {
-        check_program_directory(paths)?;
+        check_program_directory(paths, true)?;
         return Ok(match manifest.state {
             InstallState::Installed => Entry::Installed(manifest),
             InstallState::InProgress => Entry::Partial(manifest),
@@ -382,11 +382,11 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     // The folders above the program tree are read here, before anything is made, written or
     // stopped, as the folders above the data tree were by the check above; a link at the program
     // directory's name, one that points nowhere included, gets the link's own remedy.
-    check_program_parents(paths)?;
+    check_program_parents(paths, remedy::Stage::Before)?;
     if records::entry_exists(&paths.program)
         && let Err(refusal) = DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)?
     {
-        return Err(anchor_refusal(paths, &refusal, true));
+        return Err(anchor_refusal(paths, &refusal, false));
     }
     for name in [CHECKOUT, CONNECT] {
         if account::find(name).is_some() {
@@ -456,7 +456,7 @@ fn install_program_file(source: &Path, target: &Path) -> io::Result<()> {
 /// Returns [`Error::Refused`] naming the reason, or the failure of the call that looked.
 pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
     let parent = paths.data_parent();
-    check_ancestors(parent, remedy::Tree::Data)?;
+    check_ancestors(parent, remedy::Tree::Data, remedy::Stage::Before)?;
     let wide = ffi::wide_path(parent);
     // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
     let raw = unsafe {
@@ -1576,8 +1576,10 @@ fn inspect_layout(
 enum Scope {
     /// A directory of `staging`: a refusal takes its remedy from the entry's own handle.
     Staging,
-    /// The program directory: a refusal names the owner and the list to correct.
-    Program,
+    /// The program directory: a refusal names the owner and the list to correct. `recorded` says
+    /// whether a manifest records the installation, which decides whether the words promise a repair
+    /// or say that the manifest records the directory.
+    Program { recorded: bool },
 }
 
 /// What cures a refusal of an entry in the program directory: each reason has a remedy that a
@@ -1592,11 +1594,6 @@ enum Cure {
     RemoveEntry,
     /// The entry is a link: remove the link itself and not what it points to.
     RemoveLink,
-    /// [`Cure::RemoveEntry`] where nothing is installed, so that a repair cannot make the files
-    /// again.
-    RemoveEntryFresh,
-    /// [`Cure::RemoveLink`] where nothing is installed.
-    RemoveLinkFresh,
     /// The configuration file that the installation makes empty holds settings: remove it, and a
     /// repair makes it again, empty. It is a name the installation gives there, so the text of
     /// [`Cure::RemoveEntry`] does not fit it.
@@ -1611,31 +1608,53 @@ enum Cure {
 }
 
 /// The refusal of an entry in the program directory: the owner and the list to correct, or the entry
-/// to remove, whichever its reason shows.
-fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cure) -> Error {
+/// to remove, whichever its reason shows. `recorded` says whether a manifest records the
+/// installation: a repair makes the program files again, and the manifest records the directory,
+/// only where one does.
+fn program_refusal(
+    paths: &Paths,
+    dir: &Path,
+    name: &OsStr,
+    why: &str,
+    cure: Cure,
+    recorded: bool,
+) -> Error {
     let entry = dir.join(name);
+    let kept = if recorded {
+        "Do not remove it: the manifest records it and stays where it is."
+    } else {
+        "Do not remove it."
+    };
+    let kept_directory = if recorded {
+        "Do not remove the program directory: the manifest records it and stays where it is."
+    } else {
+        "Do not remove the program directory."
+    };
     let remedy = match cure {
-        Cure::OwnerAndList => "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.".to_owned(),
+        Cure::OwnerAndList => format!(
+            "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. {kept}"
+        ),
         Cure::RemoveEntry => {
-            remedy::program_removal_advice(&entry.display().to_string(), false, true)
+            remedy::program_removal_advice(&entry.display().to_string(), false, recorded)
         }
-        Cure::RemoveLink => remedy::program_removal_advice(&entry.display().to_string(), true, true),
-        Cure::RemoveEntryFresh => {
-            remedy::program_removal_advice(&entry.display().to_string(), false, false)
-        }
-        Cure::RemoveLinkFresh => {
-            remedy::program_removal_advice(&entry.display().to_string(), true, false)
+        Cure::RemoveLink => {
+            remedy::program_removal_advice(&entry.display().to_string(), true, recorded)
         }
         Cure::EmptyConfig => format!(
-            "Remove {}, and nothing else: the installation makes it empty, and a configuration that holds settings would be read by the Git that the boundary's accounts run, and a change of its owner or its list does not cure that. A repair makes it again, empty. Then run the setup program again.",
-            entry.display()
+            "Remove {}, and nothing else: the installation makes it empty, and a configuration that holds settings would be read by the Git that the boundary's accounts run, and a change of its owner or its list does not cure that. {}Then run the setup program again.",
+            entry.display(),
+            if recorded {
+                "A repair makes it again, empty. "
+            } else {
+                ""
+            }
         ),
         Cure::Volume => format!(
-            "{} is on a volume that the installation does not use: it keeps its program directory on a fixed, local NTFS volume, and nothing in it can be corrected to make another volume one. Do not remove the program directory: the manifest records it and stays where it is. Move the system's Program Files folder to such a volume, or install on a computer where it is on one, then run the setup program again.",
+            "{} is on a volume that the installation does not use: it keeps its program directory on a fixed, local NTFS volume, and nothing in it can be corrected to make another volume one. {kept_directory} Move the system's Program Files folder to such a volume, or install on a computer where it is on one, then run the setup program again.",
             entry.display()
         ),
         Cure::Open => format!(
-            "Close the program that holds {} open, or correct who may open it, and if it is a link remove the link itself and not what it points to, or if it is not a folder remove that entry and nothing else, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is.",
+            "Close the program that holds {} open, or correct who may open it, and if it is a link remove the link itself and not what it points to, or if it is not a folder remove that entry and nothing else, then run the setup program again. {kept_directory}",
             entry.display()
         ),
     };
@@ -1648,13 +1667,11 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
 
 /// The refusal of the program directory's own name: a link or a file there is removed, the volume is
 /// a refusal that no change of owner, list or open handle cures.
-fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, nothing_installed: bool) -> Error {
-    let (why, cure) = match (refusal, nothing_installed) {
-        (AnchorRefusal::Volume(_), _) => (refusal.to_string(), Cure::Volume),
-        (AnchorRefusal::ReparsePoint, false) => ("it is a link".to_owned(), Cure::RemoveLink),
-        (AnchorRefusal::ReparsePoint, true) => ("it is a link".to_owned(), Cure::RemoveLinkFresh),
-        (AnchorRefusal::NotADirectory, false) => (refusal.to_string(), Cure::RemoveEntry),
-        (AnchorRefusal::NotADirectory, true) => (refusal.to_string(), Cure::RemoveEntryFresh),
+fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, recorded: bool) -> Error {
+    let (why, cure) = match refusal {
+        AnchorRefusal::Volume(_) => (refusal.to_string(), Cure::Volume),
+        AnchorRefusal::ReparsePoint => ("it is a link".to_owned(), Cure::RemoveLink),
+        AnchorRefusal::NotADirectory => (refusal.to_string(), Cure::RemoveEntry),
     };
     program_refusal(
         paths,
@@ -1662,6 +1679,7 @@ fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, nothing_installed: boo
         paths.program.file_name().unwrap_or_default(),
         &why,
         cure,
+        recorded,
     )
 }
 
@@ -1674,14 +1692,15 @@ fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, nothing_installed: boo
 /// after the installation has read that one, and the system's default lists do not give that right
 /// but nothing here rests on a default. A folder that is not there ends the walk: nothing below it
 /// is there either.
-fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
+fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Result<(), Error> {
     use remedy::AncestorFault as Fault;
     let mut chain: Vec<&Path> = top.ancestors().skip(1).collect();
     chain.reverse();
     for folder in chain {
         let shown = folder.display().to_string();
-        let refuse =
-            |fault: Fault<'_>| Error::Refused(remedy::ancestor_refusal(&shown, tree, &fault));
+        let refuse = |fault: Fault<'_>| {
+            Error::Refused(remedy::ancestor_refusal(&shown, tree, &fault, stage))
+        };
         let unreadable =
             |error: &dyn std::fmt::Display| refuse(Fault::Unreadable(&error.to_string()));
         let wide = ffi::wide_path(folder);
@@ -1717,9 +1736,9 @@ fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
         // A drive letter that is substituted or redirected opens as a folder of another volume: the
         // folders above its target would be left unread, so the tree is not called checked.
         if folder.parent().is_none() {
-            let found = final_dos_path(&handle).map_err(|error| unreadable(&error))?;
+            let found = final_path_of(&handle).map_err(|error| unreadable(&error))?;
             if !remedy::is_the_volumes_own_root(&shown, &found) {
-                return Err(refuse(Fault::Alias(&found)));
+                return Err(refuse(Fault::Alias(&remedy::dos_path_of(&found))));
             }
         }
         if let Some(why) =
@@ -1737,9 +1756,9 @@ fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
 /// group or the installer service, with no entry that lets another account add to it, rename or
 /// delete in it, write its list or take it. The paths that the service control manager runs the
 /// broker by rest on these lists. A folder that is not there is the installation's to make.
-fn check_program_parents(paths: &Paths) -> Result<(), Error> {
+fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Error> {
     use remedy::AncestorFault as Fault;
-    check_ancestors(&paths.program_top, remedy::Tree::Program)?;
+    check_ancestors(&paths.program_top, remedy::Tree::Program, stage)?;
     let Some(parent) = paths.program.parent() else {
         return Ok(());
     };
@@ -1755,6 +1774,7 @@ fn check_program_parents(paths: &Paths) -> Result<(), Error> {
                 &shown,
                 remedy::Tree::Program,
                 &fault,
+                stage,
             ))
         };
         let unreadable =
@@ -1793,8 +1813,8 @@ fn check_program_parents(paths: &Paths) -> Result<(), Error> {
         }
         // The folder that the path leads to is the one that was asked for: a link, a mounted
         // folder or an alias above it would lead somewhere else.
-        let found = final_dos_path(&handle).map_err(|error| unreadable(&error))?;
-        if !found.eq_ignore_ascii_case(&shown) {
+        let found = final_path_of(&handle).map_err(|error| unreadable(&error))?;
+        if !remedy::is_the_place_asked_for(&shown, &found) {
             return Err(refuse(Fault::Link));
         }
         if let Some(why) =
@@ -1806,8 +1826,11 @@ fn check_program_parents(paths: &Paths) -> Result<(), Error> {
     Ok(())
 }
 
-/// A folder's final path as the system gives it, without the `\\?\` prefix of its extended form.
-fn final_dos_path(handle: &ffi::Handle) -> Result<String, Error> {
+/// A folder's final path as the system gives it, with the `\\?\` prefix of its extended form. The
+/// checks compare it with the path that was supplied ([`remedy::is_the_place_asked_for`],
+/// [`remedy::is_the_volumes_own_root`]); [`remedy::dos_path_of`] prints it for a person, in a
+/// refusal's words alone.
+fn final_path_of(handle: &ffi::Handle) -> Result<String, Error> {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
     };
@@ -1831,15 +1854,15 @@ fn final_dos_path(handle: &ffi::Handle) -> Result<String, Error> {
         }
         buffer.resize(length as usize + 1, 0);
     }
-    Ok(remedy::dos_path_of(&String::from_utf16_lossy(&buffer)))
+    Ok(String::from_utf16_lossy(&buffer))
 }
 
 /// Reads the program directory on a handle that is held, and everything in it on its own handle:
 /// no link, one name for a file, the installation's own owner, and no right for another account to
 /// change it. Nothing is done to the directory before this has passed. Returns whether the
 /// directory was there to be opened and approved: a removal deletes the directory only when it was.
-fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
-    check_program_parents(paths)?;
+fn check_program_directory(paths: &Paths, recorded: bool) -> Result<bool, Error> {
+    check_program_parents(paths, remedy::Stage::Before)?;
     // The look follows no link: a link that points nowhere is there, and gets the link's own remedy
     // from the open below.
     if !records::entry_exists(&paths.program) {
@@ -1848,7 +1871,7 @@ fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
     let program = paths.program.file_name().unwrap_or_default().to_owned();
     let held = match DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)? {
         Ok(held) => held,
-        Err(refusal) => return Err(anchor_refusal(paths, &refusal, false)),
+        Err(refusal) => return Err(anchor_refusal(paths, &refusal, recorded)),
     };
     if let Some(why) = check_readable_object(held.handle())? {
         return Err(program_refusal(
@@ -1857,9 +1880,10 @@ fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
             &program,
             &why,
             Cure::OwnerAndList,
+            recorded,
         ));
     }
-    inspect_within(paths, Scope::Program, &paths.program, &held, 1)?;
+    inspect_within(paths, Scope::Program { recorded }, &paths.program, &held, 1)?;
     Ok(true)
 }
 
@@ -2027,7 +2051,7 @@ fn inspect_within(
         // the reason decides what is corrected or removed.
         let refuse = |why: &str, cure: Cure, origin: &Origin| match scope {
             Scope::Staging => removal_refusal(paths, dir, &shown, why, origin),
-            Scope::Program => program_refusal(paths, dir, &shown, why, cure),
+            Scope::Program { recorded } => program_refusal(paths, dir, &shown, why, cure, recorded),
         };
         let opened = match held.open_child(&child, LIST | READ_CONTROL)? {
             Ok(opened) => opened,
@@ -2058,7 +2082,7 @@ fn inspect_within(
                 &Origin::Foreign,
             ));
         }
-        if matches!(scope, Scope::Program) {
+        if let Scope::Program { recorded } = scope {
             let name = shown.to_string_lossy();
             let reason = match program_kind(paths, dir, &name) {
                 None => Some("the installation does not give that name there"),
@@ -2081,7 +2105,7 @@ fn inspect_within(
                 } else {
                     Cure::RemoveEntry
                 };
-                return Err(program_refusal(paths, dir, &shown, why, cure));
+                return Err(program_refusal(paths, dir, &shown, why, cure, recorded));
             }
         }
         if let Some(why) = check_readable_object(&opened.handle)? {
@@ -2724,7 +2748,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         users_may_read: true,
         ..Principals::default()
     };
-    check_program_parents(&paths)?;
+    check_program_parents(&paths, remedy::Stage::After)?;
     fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)
         .map_err(io_error("making the program directory"))?;
     // What the broker points Git's global file, hooks path and template directory at: empty, and
@@ -3099,17 +3123,13 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
     }
     let mut connection = pipe::connect_held(pipe::Kind::Administrators, &held)?;
     connection.set_deadline(Some(Instant::now() + HELLO_BOUND));
-    let said = ask(
+    let said = ask_frames(
         &mut connection,
         &Request::Hello {
             version: frame::VERSION,
         },
     )
-    .map_err(|failure| {
-        Error::Failed(format!(
-            "{failure}. Other elevated sessions may hold the administrators' pipe."
-        ))
-    })?;
+    .map_err(|failure| Error::Failed(remedy::hello_failure(&failure)))?;
     match said {
         Response::Hello { .. } => {
             // The caller sets the deadline of what it asks next.
@@ -3128,8 +3148,16 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
 ///
 /// Returns an error when the connection fails or the deadline passes before the answer.
 pub fn ask(connection: &mut pipe::Connection, request: &Request) -> Result<Response, Error> {
-    frame::write(connection, request).map_err(|error| Error::Failed(error.to_string()))?;
-    frame::read(connection).map_err(|error| Error::Failed(error.to_string()))
+    ask_frames(connection, request).map_err(|error| Error::Failed(error.to_string()))
+}
+
+/// [`ask`] with the frame's own error, for a caller that tells a deadline from another failure.
+fn ask_frames(
+    connection: &mut pipe::Connection,
+    request: &Request,
+) -> Result<Response, frame::FrameError> {
+    frame::write(connection, request)?;
+    frame::read(connection)
 }
 
 /// Removes the installation and checks the computer against the earlier-state record.
@@ -3175,7 +3203,8 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     #[cfg(feature = "testing")]
     testing::after_the_removal_inspection();
     // The program directory is read on a held handle before the removal deletes anything in it.
-    let program_checked = check_program_directory(paths)?;
+    let program_checked =
+        check_program_directory(paths, matches!(found, records::Inspection::Recorded(_)))?;
     if matches!(found, records::Inspection::Recorded(_)) {
         refuse_while_unfinished(paths)?;
     }
@@ -3449,6 +3478,9 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             Err(error) => failures.push(format!("checking the earlier state: {error}")),
         }
     }
+    // A record that the inspection did not approve was not used: the Application Identity service
+    // keeps what the installation gave it, and the last words say so.
+    let unread_prior = records::unread_prior(approved.prior, records::entry_exists(&paths.prior));
     if failures.is_empty() {
         // The records go last: a failed removal can be run again from them.
         let stayed = remove_approved_records(paths, &approved);
@@ -3461,13 +3493,13 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             // the person to remove.
             let next = records::next_step(paths.manifest.exists(), data_is_empty(paths));
             Err(Error::Failed(format!(
-                "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}",
+                "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}{unread_prior}",
                 stayed.join("; ")
             )))
         }
     } else {
         Err(Error::Failed(format!(
-            "the removal did not finish and its records are kept: {}",
+            "the removal did not finish and its records are kept: {}{unread_prior}",
             failures.join("; ")
         )))
     }

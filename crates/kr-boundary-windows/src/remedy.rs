@@ -324,10 +324,19 @@ pub fn rights_finding(identity: &str, mask: u32) -> String {
     )
 }
 
+/// Whether a folder's final path, as the system gives it, is on a network share
+/// (`\\?\UNC\server\share`). The folders above a share are the server's, not the ones that the
+/// installation read, so no check that compares a final path with a supplied path accepts one.
+#[must_use]
+pub fn is_on_a_network_share(final_path: &str) -> bool {
+    final_path.to_ascii_lowercase().starts_with(r"\\?\unc\")
+}
+
 /// Whether a drive's root, as the path that was supplied names it, is the root of the volume itself:
-/// the final path of the opened root has no other drive letter and no folder after it. A substituted
-/// or redirected letter opens as a folder of another volume, and its final path says which. The
-/// comparison ignores case, a trailing backslash and the `\\?\` prefix of the extended form.
+/// the final path of the opened root, as the system gives it, has no other drive letter and no folder
+/// after it, and is not on a network share. A substituted or redirected letter opens as a folder of
+/// another volume, and its final path says which. The comparison ignores case, a trailing backslash
+/// and the `\\?\` prefix of the extended form.
 #[must_use]
 pub fn is_the_volumes_own_root(supplied: &str, final_path: &str) -> bool {
     let plain = |text: &str| {
@@ -336,7 +345,20 @@ pub fn is_the_volumes_own_root(supplied: &str, final_path: &str) -> bool {
             .trim_end_matches('\\')
             .to_ascii_lowercase()
     };
-    plain(supplied) == plain(final_path)
+    !is_on_a_network_share(final_path) && plain(supplied) == plain(final_path)
+}
+
+/// Whether the folder that a path leads to is the one that was asked for: its final path, as the
+/// system gives it, is the supplied path, ignoring case and the `\\?\` prefix of the extended form,
+/// and is not on a network share. A link, a mounted folder or an alias above the folder leads
+/// somewhere else.
+#[must_use]
+pub fn is_the_place_asked_for(supplied: &str, final_path: &str) -> bool {
+    !is_on_a_network_share(final_path)
+        && final_path
+            .strip_prefix(r"\\?\")
+            .unwrap_or(final_path)
+            .eq_ignore_ascii_case(supplied)
 }
 
 /// Why a folder above the installation's trees is refused.
@@ -358,35 +380,99 @@ pub enum AncestorFault<'a> {
     Writable(&'a str),
 }
 
+/// What the installer says when the broker's hello fails. Only a failure that the read's deadline
+/// ended can mean that other elevated sessions hold the administrators' pipe: they keep the broker's
+/// connections, so it does not answer in time. Any other failure (a write that failed, a frame that
+/// is malformed, a pipe that the broker closed at its stop) has another cause, and the words do not
+/// send the person looking for sessions.
+#[must_use]
+pub fn hello_failure(failure: &crate::frame::FrameError) -> String {
+    use crate::frame::FrameError;
+    let deadline = matches!(
+        failure,
+        FrameError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
+    );
+    if deadline {
+        format!("{failure}. Other elevated sessions may hold the administrators' pipe.")
+    } else {
+        failure.to_string()
+    }
+}
+
+/// The words of an open of the broker's pipe that found every instance busy for `seconds`. The
+/// platform's error follows them after a colon, so they end with no full stop. Only the
+/// administrators' pipe says that other elevated sessions may hold it: the persons' pipe is held by
+/// persons, which the words do not claim.
+#[must_use]
+pub fn busy_pipe(seconds: u64, administrators: bool) -> String {
+    let held_by = if administrators {
+        " (other elevated sessions may hold the administrators' pipe)"
+    } else {
+        ""
+    };
+    format!(
+        "the broker's pipe stayed busy: every connection the broker serves was in use for {seconds} seconds{held_by}"
+    )
+}
+
+/// When in a run a folder above the trees is refused, so that the words claim only what is so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// The run has changed nothing yet: the folder is read before anything is made, written or
+    /// stopped.
+    Before,
+    /// The run had already made changes, which the manifest records, when the folder was read again.
+    After,
+}
+
+impl Stage {
+    /// What the refusal says of the run's changes.
+    fn changes(self) -> &'static str {
+        match self {
+            Stage::Before => "Nothing was changed.",
+            Stage::After => {
+                "This run had already made changes before it read the folder again, and the manifest records them."
+            }
+        }
+    }
+}
+
 /// The refusal of a folder above the data directory or the program directory, up to the volume's
 /// root: the folder, the tree below it, why it is refused and what to do. Nothing is removed or
-/// moved: the folder holds other things, and a link or a mounted folder above the trees is the
-/// administrator's own, so it is never said to be removed.
+/// moved: a folder with other things in it is not the installation's to remove, and a link or a
+/// mounted folder above the trees is the administrator's own layout, which the installation does
+/// not support and tells no one to change. `stage` says whether the run had changed anything.
 #[must_use]
-pub fn ancestor_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>) -> String {
+pub fn ancestor_refusal(
+    folder: &str,
+    tree: Tree,
+    fault: &AncestorFault<'_>,
+    stage: Stage,
+) -> String {
     let below = match tree {
         Tree::Data => "data directory (its manifest, its journal and the roots of its operations)",
         Tree::Program => "program directory (the program that the service runs as the system)",
     };
     let keep = "Do not remove or move it: it holds other things.";
+    let changes = stage.changes();
     match fault {
         AncestorFault::Alias(found) => format!(
-            "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread. Nothing was changed. The setup program installs only in the system's own known folders, and one of them is reached through {folder}: end the substitution or redirection of that letter, or give the known folder a place on a volume's own root, then run the setup program again."
+            "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread. {changes} The setup program installs only in the system's own known folders, and one of them is reached through {folder}: end the substitution or redirection of that letter, or give the known folder a place on a volume's own root, then run the setup program again."
         ),
         AncestorFault::Link => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. Nothing was changed. The system's default places have none. The setup program installs only in the system's own known folders and cannot be pointed at another path: where a known folder was moved or a volume was mounted on it, give the known folder a plain folder again, then run the setup program again. {keep}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The system's default places have none. The setup program installs only in the system's own known folders and cannot be pointed at another path, and it directs no change to a folder that other programs share: run it on a computer where its known folders are plain folders."
         ),
         AncestorFault::NotAFolder => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder. The system's default places are folders. Nothing was changed. Correct the path, then run the setup program again. {keep}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder. The system's default places are folders. {changes} Correct the path, then run the setup program again. {keep}"
         ),
         AncestorFault::Unreadable(error) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). Nothing was changed. Close the program that holds it open or correct who may open it, then run the setup program again. {keep}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} Close the program that holds it open or correct who may open it, then run the setup program again. {keep}"
         ),
         AncestorFault::List(why) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because {why}. An identity that may delete the folder, delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on another place. Nothing was changed. If the reason names an owner, make the system, the Administrators group or the installer service its owner. If it names a right, remove or narrow the entry that allows it, an inherited entry too (a denying entry does not cancel an allowing one for this check), so that no other identity has the right to delete the folder, to delete or rename an entry in it, to change its list or to take its ownership, nor the generic forms that hold them (generic write, generic all and maximum allowed); the right to add an entry is what the system gives by default, and it stays allowed. If it names a missing list or an entry of a kind that the check does not read, give the folder a list of plain allowing entries. Then run the setup program again. {keep}"
+            "{folder} is a folder above the boundary's {below}. It is refused because {why}. An identity that may delete the folder, delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on another place. {changes} If the reason names an owner, make the system, the Administrators group or the installer service its owner. If it names a right, remove or narrow the entry that allows it, an inherited entry too (a denying entry does not cancel an allowing one for this check), so that no other identity has the right to delete the folder, to delete or rename an entry in it, to change its list or to take its ownership, nor the generic forms that hold them (generic write, generic all and maximum allowed); the right to add an entry is what the system gives by default, and it stays allowed. If it names a missing list, give the folder a list of plain entries that the check reads. If it names an entry of a kind that the check does not read, replace that one entry with plain entries that the check reads, and keep every entry that denies something. Then run the setup program again. {keep}"
         ),
         AncestorFault::Writable(why) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program. Nothing was changed. Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is. Do not move this folder: it holds other things."
+            "{folder} is a folder above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program. {changes} Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. Do not remove the program directory. Do not move this folder: it holds other things."
         ),
     }
 }

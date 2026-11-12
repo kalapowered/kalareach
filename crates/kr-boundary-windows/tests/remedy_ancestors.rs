@@ -3,8 +3,9 @@
 //! that is no volume's root. They run on every platform.
 
 use kr_boundary_windows::remedy::{
-    AncestorFault, Tree, ancestor_refusal, dos_path_of, identity_text, is_the_volumes_own_root,
-    program_removal_advice, rights_finding, rights_in_words,
+    AncestorFault, Stage, Tree, ancestor_refusal, dos_path_of, identity_text,
+    is_on_a_network_share, is_the_place_asked_for, is_the_volumes_own_root, program_removal_advice,
+    rights_finding, rights_in_words,
 };
 
 const DELETE_CHILD: u32 = 0x0000_0040;
@@ -72,6 +73,7 @@ fn the_refusal_of_a_list_names_the_real_sentence_and_every_right_that_the_check_
         r"D:\ProgramData",
         Tree::Data,
         &AncestorFault::List(&finding),
+        Stage::Before,
     );
     assert!(text.contains(r"D:\ProgramData"), "{text}");
     assert!(
@@ -93,16 +95,25 @@ fn the_refusal_of_a_list_names_the_real_sentence_and_every_right_that_the_check_
         "maximum allowed",
         "make the system, the Administrators group or the installer service its owner",
         "the right to add an entry is what the system gives by default",
+        "If it names an entry of a kind that the check does not read, replace that one entry with plain entries that the check reads, and keep every entry that denies something",
     ] {
         assert!(text.contains(named), "{named}: {text}");
     }
+    // The advice never has the folder given a list of allowing entries only, which drops what the
+    // list denies.
+    assert!(!text.contains("plain allowing entries"), "{text}");
     assert!(text.contains("Do not remove or move it"), "{text}");
     assert!(!text.contains("program directory"), "{text}");
 }
 
 #[test]
 fn the_refusal_of_a_folder_above_the_program_directory_names_that_tree() {
-    let text = ancestor_refusal(r"C:\", Tree::Program, &AncestorFault::List("a reason"));
+    let text = ancestor_refusal(
+        r"C:\",
+        Tree::Program,
+        &AncestorFault::List("a reason"),
+        Stage::Before,
+    );
     assert!(
         text.contains("a folder above the boundary's program directory"),
         "{text}"
@@ -111,13 +122,15 @@ fn the_refusal_of_a_folder_above_the_program_directory_names_that_tree() {
 }
 
 /// A link or a mounted folder above the trees is the administrator's own: a moved `ProgramData`, a
-/// mounted volume. The words say that the installation does not go through one, that nothing was
-/// changed and that the default places have none, and never tell to remove the link, which would
-/// remove the folder that the link replaced for every program.
+/// mounted volume. The words say that the installation does not go through one, that the layout is
+/// not supported, that nothing was changed and that the default places have none. They never tell to
+/// remove the link, which would remove the folder that the link replaced for every program, and they
+/// direct no change of a folder that others share and claim nothing about what the folder holds,
+/// which they do not know.
 #[test]
 fn the_refusal_of_a_link_or_a_mounted_folder_never_tells_an_administrator_to_remove_it() {
     for tree in [Tree::Data, Tree::Program] {
-        let text = ancestor_refusal(r"C:\ProgramData", tree, &AncestorFault::Link);
+        let text = ancestor_refusal(r"C:\ProgramData", tree, &AncestorFault::Link, Stage::Before);
         assert!(text.contains(r"C:\ProgramData"), "{text}");
         assert!(text.contains("it is a link or a mounted folder"), "{text}");
         assert!(
@@ -139,19 +152,62 @@ fn the_refusal_of_a_link_or_a_mounted_folder_never_tells_an_administrator_to_rem
         let lower = text.to_lowercase();
         assert!(!lower.contains("remove the link"), "{text}");
         assert!(!lower.contains("rmdir"), "{text}");
-        assert!(text.contains("Do not remove or move it"), "{text}");
+        assert!(text.contains("This layout is not supported"), "{text}");
+        assert!(
+            text.contains("directs no change to a folder that other programs share"),
+            "{text}"
+        );
+        assert!(!text.contains("give the known folder"), "{text}");
+        assert!(!lower.contains("holds other things"), "{text}");
+        assert!(!lower.contains("do not remove or move it"), "{text}");
+    }
+}
+
+/// A folder that is read again after the run has made its first changes is refused without the claim
+/// that nothing was changed, whatever the reason; read before any change it makes the claim.
+#[test]
+fn a_refusal_after_the_runs_changes_does_not_say_that_nothing_was_changed() {
+    for fault in [
+        AncestorFault::Link,
+        AncestorFault::NotAFolder,
+        AncestorFault::Alias(r"C:\Shared\Backing"),
+        AncestorFault::Unreadable("Windows error 32"),
+        AncestorFault::List("a reason"),
+        AncestorFault::Writable("a reason"),
+    ] {
+        let before = ancestor_refusal(r"C:\x", Tree::Program, &fault, Stage::Before);
+        assert!(
+            before.contains("Nothing was changed"),
+            "{fault:?}: {before}"
+        );
+        let after = ancestor_refusal(r"C:\x", Tree::Program, &fault, Stage::After);
+        assert!(!after.contains("Nothing was changed"), "{fault:?}: {after}");
+        assert!(
+            after.contains("had already made changes"),
+            "{fault:?}: {after}"
+        );
+        assert!(
+            after.contains("the manifest records them"),
+            "{fault:?}: {after}"
+        );
     }
 }
 
 #[test]
 fn the_refusal_of_what_is_not_a_folder_or_cannot_be_read_says_what_to_do() {
-    let text = ancestor_refusal(r"C:\x", Tree::Data, &AncestorFault::NotAFolder);
+    let text = ancestor_refusal(
+        r"C:\x",
+        Tree::Data,
+        &AncestorFault::NotAFolder,
+        Stage::Before,
+    );
     assert!(text.contains("it is not a folder"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
     let text = ancestor_refusal(
         r"C:\x",
         Tree::Program,
         &AncestorFault::Unreadable("Windows error 5"),
+        Stage::Before,
     );
     assert!(text.contains(r"C:\x"), "{text}");
     assert!(
@@ -168,7 +224,12 @@ fn the_refusal_of_what_is_not_a_folder_or_cannot_be_read_says_what_to_do() {
 #[test]
 fn a_drive_letter_that_is_no_volumes_root_is_refused_with_the_letter_and_the_real_path() {
     for tree in [Tree::Data, Tree::Program] {
-        let text = ancestor_refusal(r"X:\", tree, &AncestorFault::Alias(r"C:\Shared\Backing"));
+        let text = ancestor_refusal(
+            r"X:\",
+            tree,
+            &AncestorFault::Alias(r"C:\Shared\Backing"),
+            Stage::Before,
+        );
         assert!(
             text.contains(r"X:\ is a drive letter that is not the root of its volume"),
             "{text}"
@@ -198,6 +259,58 @@ fn a_drives_root_is_the_volumes_own_only_where_its_final_path_is_the_one_supplie
     assert!(!is_the_volumes_own_root(r"C:\", r"C:\Windows"));
 }
 
+/// A known folder that an administrator gave a network path has the final path
+/// `\\?\UNC\server\share\...`. Printing it for a person as `\\server\share\...` is for the text
+/// alone: no comparison that decides a refusal takes that form, so a final path on a network share is
+/// never a volume's root and never the place that was asked for, as the folders above a share are the
+/// server's and not the ones that the installation read.
+#[test]
+fn a_final_path_on_a_network_share_is_never_the_place_that_was_asked_for() {
+    assert!(is_on_a_network_share(r"\\?\UNC\server\share\"));
+    assert!(is_on_a_network_share(r"\\?\unc\server\share\dir"));
+    assert!(!is_on_a_network_share(r"\\?\C:\"));
+    assert!(!is_on_a_network_share(r"C:\Unc\x"));
+    // The root check refuses the share's root, whichever way the root was supplied.
+    assert!(!is_the_volumes_own_root(
+        r"\\server\share\",
+        r"\\?\UNC\server\share\"
+    ));
+    assert!(!is_the_volumes_own_root(
+        r"\\server\share",
+        r"\\?\UNC\server\share\"
+    ));
+    assert!(!is_the_volumes_own_root(
+        r"\\?\UNC\server\share\",
+        r"\\?\UNC\server\share\"
+    ));
+    // The program walk's comparison refuses a folder on a share, and still accepts a local one.
+    assert!(!is_the_place_asked_for(
+        r"\\server\share\Top",
+        r"\\?\UNC\server\share\Top"
+    ));
+    assert!(is_the_place_asked_for(
+        r"C:\Program Files",
+        r"\\?\C:\Program Files"
+    ));
+    assert!(is_the_place_asked_for(
+        r"c:\program files",
+        r"\\?\C:\Program Files"
+    ));
+    assert!(!is_the_place_asked_for(
+        r"C:\Program Files",
+        r"\\?\D:\Program Files"
+    ));
+    assert!(!is_the_place_asked_for(
+        r"C:\Program Files\KalaReach",
+        r"\\?\C:\Elsewhere\KalaReach"
+    ));
+    // What a person reads is the usable form, and it is the form that would have matched.
+    assert_eq!(
+        dos_path_of(r"\\?\UNC\server\share\Top"),
+        r"\\server\share\Top"
+    );
+}
+
 /// The walk from the program directory's top down reads a folder that must also refuse the right to
 /// add to it, and its words say that, and never to remove a link (a moved `Program Files` is the
 /// administrator's own, and the link at its top gets the words of any link above the trees).
@@ -207,6 +320,7 @@ fn the_program_trees_own_walk_has_its_own_list_words_and_the_same_link_words() {
         r"C:\Program Files",
         Tree::Program,
         &AncestorFault::Writable("S-1-5-32-545 is allowed to add"),
+        Stage::Before,
     );
     assert!(
         text.contains(r"C:\Program Files is a folder above the boundary's program directory"),
@@ -218,9 +332,16 @@ fn the_program_trees_own_walk_has_its_own_list_words_and_the_same_link_words() {
         text.contains("Do not remove the program directory"),
         "{text}"
     );
+    // A fresh installation has no manifest, so the words never say that the manifest records it.
+    assert!(!text.contains("the manifest records it"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
     assert!(!text.to_lowercase().contains("remove the link"), "{text}");
-    let link = ancestor_refusal(r"C:\Program Files", Tree::Program, &AncestorFault::Link);
+    let link = ancestor_refusal(
+        r"C:\Program Files",
+        Tree::Program,
+        &AncestorFault::Link,
+        Stage::Before,
+    );
     assert!(link.contains("it is a link or a mounted folder"), "{link}");
     assert!(!link.to_lowercase().contains("remove the link"), "{link}");
 }
