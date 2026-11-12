@@ -10,6 +10,7 @@ use kr_protocol::hello::PackageVersion;
 use kr_protocol::update::CompatibilityLevel;
 
 use crate::in_level::{Head, Outcome, WorkerSurface, check};
+use crate::public_contract::SdkContract;
 use crate::releases::{agree_with_origin, inventory, kept};
 
 /// What one commit of the fixture repository holds: the files the checks read.
@@ -24,6 +25,8 @@ struct Tree {
     roots: Vec<&'static str>,
     /// The plugin SDK schema the release committed, when it had one.
     sdk: Option<Value>,
+    /// The plugin SDK's package contract the release committed, when it had one.
+    contract: Option<Value>,
     /// The stored-format lock the release committed, when it had one.
     lock: Option<String>,
     /// The sections of the configuration document that arrived with a level, as the build that is
@@ -42,6 +45,21 @@ fn sdk_schema(description: &str, extra_member: bool) -> Value {
         manifest["properties"]["added"] = json!({ "type": "string" });
     }
     json!({ "$defs": { "Manifest": manifest } })
+}
+
+/// A package contract as a release commits it: the SDK version and, from the release that has the
+/// table, the members that arrived inside a level.
+fn sdk_contract(version: &str, arrivals: Option<&[(&str, &str, &str)]>) -> Value {
+    let mut contract = json!({ "sdk_version": version, "wit_version": "0.1.0" });
+    if let Some(arrivals) = arrivals {
+        contract["arrivals"] = arrivals
+            .iter()
+            .map(|(definition, member, at)| {
+                json!({ "definition": definition, "member": member, "sdk_version": at })
+            })
+            .collect();
+    }
+    contract
 }
 
 fn schema(lease: bool, peer_member: &str, outside_member: &str) -> Value {
@@ -95,6 +113,7 @@ impl Tree {
             majors: "major=1 versions=1.0 replaced=- supported_until=- retired=false\n",
             roots: vec!["ControlFrame"],
             sdk: Some(sdk_schema("The manifest.", false)),
+            contract: Some(sdk_contract("0.1.6", None)),
             lock: None,
             sections: Vec::new(),
         }
@@ -190,6 +209,16 @@ impl Repo {
                 let _ = std::fs::remove_file(self.directory.join(sdk));
             }
         }
+        let contract = "packages/plugin-sdk/schema/package-contract.json";
+        match &tree.contract {
+            Some(document) => self.write(
+                contract,
+                &serde_json::to_string_pretty(document).expect("text"),
+            ),
+            None => {
+                let _ = std::fs::remove_file(self.directory.join(contract));
+            }
+        }
         let lock = "stored-formats.lock";
         match &tree.lock {
             Some(text) => self.write(lock, text),
@@ -251,6 +280,14 @@ impl Repo {
                 .sdk
                 .clone()
                 .unwrap_or_else(|| sdk_schema("The manifest.", false)),
+            sdk_contract: SdkContract::parse(
+                &tree
+                    .contract
+                    .clone()
+                    .unwrap_or_else(|| sdk_contract("0.1.6", None))
+                    .to_string(),
+            )
+            .expect("a contract"),
             worker: WorkerSurface::parse(
                 &tree
                     .worker
@@ -560,6 +597,135 @@ fn the_plugin_sdk_schema_is_held_and_a_description_is_not() {
         error.contains(&tag) && error.contains("plugin SDK schema"),
         "{error}"
     );
+}
+
+/// The member the SDK's table lists passes the check of a level, and the run says which member
+/// and both versions. The same member with a table that does not list it, with no rise of the SDK
+/// version, or against a release whose table is already past it, fails.
+#[test]
+fn a_member_the_sdk_table_lists_passes_a_level_and_the_run_names_it() {
+    let before = Tree::the_level();
+    let level = whole_level("sdk-arrival", &before);
+    let listed = Tree {
+        sdk: Some(sdk_schema("The manifest.", true)),
+        contract: Some(sdk_contract(
+            "0.1.7",
+            Some(&[("Manifest", "added", "0.1.7")]),
+        )),
+        ..before.clone()
+    };
+    let Outcome::Held { notes, .. } = run(&level, &listed).expect("a listed member passes") else {
+        panic!("the level is held");
+    };
+    let note = notes
+        .iter()
+        .find(|note| note.contains("Manifest.added"))
+        .unwrap_or_else(|| panic!("the run names the member: {notes:?}"));
+    assert!(
+        note.contains("SDK 0.1.7") && note.contains("SDK 0.1.6"),
+        "both versions: {note}"
+    );
+    for tag in [&level.first.0, &level.second.0, &level.last.0] {
+        assert!(note.contains(tag.as_str()), "{tag} is named: {note}");
+    }
+
+    let unlisted = Tree {
+        contract: Some(sdk_contract("0.1.7", Some(&[]))),
+        ..listed.clone()
+    };
+    let error = run(&level, &unlisted).expect_err("the table does not list it");
+    assert!(
+        error.contains("the plugin SDK schema: Manifest.added added"),
+        "{error}"
+    );
+
+    let not_risen = Tree {
+        contract: Some(sdk_contract(
+            "0.1.6",
+            Some(&[("Manifest", "added", "0.1.7")]),
+        )),
+        ..listed.clone()
+    };
+    let error = run(&level, &not_risen).expect_err("the SDK version did not rise");
+    assert!(
+        error.contains("the plugin SDK schema: Manifest.added added"),
+        "{error}"
+    );
+
+    // A release that already had the table, at the version the member arrived at, is not one it
+    // is new to.
+    let repo = Repo::new("sdk-arrival-late");
+    let late = Tree {
+        contract: Some(sdk_contract("0.1.7", Some(&[]))),
+        ..before.clone()
+    };
+    let commit = repo.commit(&late, "a release at the version the member arrives at");
+    repo.release("0.76.0", &commit);
+    let head = repo.commit(&listed, "after");
+    let releases = inventory(&repo.directory).expect("an inventory");
+    let error = check(&repo.directory, &repo.head(&listed, &head), &releases)
+        .expect_err("no rise over this release");
+    assert!(
+        error.contains("the plugin SDK schema: Manifest.added added"),
+        "{error}"
+    );
+}
+
+/// A release of the level whose contract is missing, or does not say its SDK version, or whose
+/// table does not read, cannot be compared with and fails the check with a message of its own. A
+/// release from before the table is one that has no `arrivals` at all, and that is read as empty.
+#[test]
+fn a_release_whose_contract_cannot_be_read_fails_with_its_own_message() {
+    let now = Tree::the_level();
+    for (name, contract, expected) in [
+        (
+            "absent",
+            None,
+            "has no packages/plugin-sdk/schema/package-contract.json",
+        ),
+        (
+            "no-version",
+            Some(json!({ "arrivals": [] })),
+            "no sdk_version",
+        ),
+        (
+            "bad-version",
+            Some(json!({ "sdk_version": "0.1" })),
+            "sdk_version",
+        ),
+        (
+            "bad-table",
+            Some(json!({ "sdk_version": "0.1.6", "arrivals": "all" })),
+            "arrivals is not a list",
+        ),
+    ] {
+        let repo = Repo::new(&format!("sdk-contract-{name}"));
+        let early = Tree {
+            contract,
+            ..now.clone()
+        };
+        let commit = repo.commit(&early, "a release with a contract that does not read");
+        let tag = repo.release("0.76.0", &commit);
+        let head = repo.commit(&now, "after");
+        let releases = inventory(&repo.directory).expect("an inventory");
+        let error = check(&repo.directory, &repo.head(&now, &head), &releases)
+            .expect_err("the contract of the release is not one the check reads");
+        assert!(
+            error.contains(&tag) && error.contains(expected),
+            "{name}: {error}"
+        );
+    }
+    let repo = Repo::new("sdk-contract-before-the-table");
+    let early = Tree {
+        contract: Some(json!({ "sdk_version": "0.1.6" })),
+        ..now.clone()
+    };
+    let commit = repo.commit(&early, "a release from before the table");
+    repo.release("0.76.0", &commit);
+    let head = repo.commit(&now, "after");
+    let releases = inventory(&repo.directory).expect("an inventory");
+    check(&repo.directory, &repo.head(&now, &head), &releases)
+        .expect("a release with no table has an empty one");
 }
 
 /// A root the head no longer has cannot hide the difference: the release's own list is cut too, and

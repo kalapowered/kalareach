@@ -32,15 +32,27 @@
 //!   a method that is new asks the host a method its level has before it takes the refusal for a
 //!   lack of rights);
 //! * the plugin SDK schema, from the committed file of each release and of this commit, held to
-//!   the same rule. The file is generated, and `kr-plugin-sdk-gen --check` holds the committed
-//!   one equal to the generated one. A release of the level without the file, or a file that does
-//!   not read, fails the check.
+//!   the same rule but for one kind of member. The files are generated, and `kr-plugin-sdk-gen
+//!   --check` holds the committed ones equal to the generated ones. A release of the level without
+//!   the schema or without `package-contract.json`, or a file that does not read, fails the
+//!   check. The one kind of member that passes is an optional member of a definition that no
+//!   protocol schema has, which this commit's arrival table (in its `package-contract.json`)
+//!   lists at an SDK version above the release's own `sdk_version`, in a commit whose SDK version
+//!   is above that version too (`compare_sdk_for_a_level`). The table lists a member only where a
+//!   package that lacks it means what it meant before, and a host of an earlier SDK refuses a
+//!   package that uses it, because it tests the package's `sdk_range` first; the comparison sees
+//!   neither, and the review of the change that lists a member must. The run says each member it
+//!   passes, with both versions. Everything else fails: a required member, a member the table
+//!   does not list, one listed with no rise of the SDK version, a member of a definition the
+//!   protocol schema has, a nested member, a variant, a change or a removal, a lower SDK version,
+//!   and an entry of a release's table that this commit's table changes or lacks. A release from
+//!   before the table has an empty one.
 //!
 //! What it does not see: the `kr-plugin-host/3` frames, which have no schema; the types a
 //! daemon-served method names only in its description; rules that live in code; the hand-written
-//! TypeScript exports; `package-contract.json` and the component interface. A difference it
-//! fails on that is harmless takes a cut or a reviewed change of the comparison in
-//! `public_contract.rs`.
+//! TypeScript exports; the rest of `package-contract.json` (its limits and tables) and the
+//! component interface. A difference it fails on that is harmless takes a cut or a reviewed
+//! change of the comparison in `public_contract.rs`.
 //!
 //! It fails closed. It cannot list origin's tags, this checkout's tags are not origin's, a release's
 //! tree cannot be read, or a source is in a form it does not read: each is a failure with its own
@@ -56,7 +68,9 @@ use kr_protocol::update::CompatibilityLevel;
 use kr_protocol::worker_surface;
 use serde_json::Value;
 
-use crate::public_contract::compare_for_a_level;
+use crate::public_contract::{
+    PassedMember, SdkContract, compare_for_a_level, compare_sdk_for_a_level,
+};
 use crate::releases::{
     Release, agree_with_origin, file_at, git_in, inventory, kept, package_version_at,
     surface_roots_at,
@@ -74,6 +88,10 @@ pub const SCHEMA_PATH: &str = "packages/protocol/schema/kalareach-protocol.schem
 
 /// Where a release keeps the schema of the plugin SDK, from the root of the repository.
 pub const SDK_SCHEMA_PATH: &str = "packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json";
+
+/// Where a release keeps the plugin SDK's package contract, which states the SDK's version and the
+/// table of members that arrived inside a level.
+pub const SDK_CONTRACT_PATH: &str = "packages/plugin-sdk/schema/package-contract.json";
 
 /// The tables of what a worker serves, as a release committed them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +169,8 @@ pub struct Head {
     pub schema: Value,
     /// The plugin SDK schema it committed.
     pub sdk_schema: Value,
+    /// The SDK version and the table of arrivals its package contract states.
+    pub sdk_contract: SdkContract,
     /// What it serves.
     pub worker: WorkerSurface,
     /// The protocol its plugin host speaks.
@@ -184,11 +204,19 @@ impl Head {
                 serde_json::from_str(&text)
                     .map_err(|error| format!("{SDK_SCHEMA_PATH} at {commit}: {error}"))
             })?;
+        let sdk_contract = file_at(repository, commit, SDK_CONTRACT_PATH)
+            .map_err(|error| format!("{SDK_CONTRACT_PATH} at {commit} cannot be read: {error}"))?
+            .ok_or_else(|| format!("{commit} has no {SDK_CONTRACT_PATH}"))
+            .and_then(|text| {
+                SdkContract::parse(&text)
+                    .map_err(|error| format!("{SDK_CONTRACT_PATH} at {commit}: {error}"))
+            })?;
         Ok(Self {
             commit: commit.to_owned(),
             level: CompatibilityLevel::of(PACKAGE_VERSION),
             schema: kr_protocol::schema::protocol_schema(),
             sdk_schema,
+            sdk_contract,
             worker: WorkerSurface::parse(&worker_surface::document())?,
             plugin_host: PLUGIN_HOST_PROTOCOL.to_owned(),
             public_majors: expected_public_majors_in(repository, commit)?,
@@ -323,6 +351,9 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
     let mut notes = Vec::new();
     // Each section of the configuration document that passed, with the releases it is new to.
     let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Each member of the plugin SDK's schema that passed because the SDK lists it, with the release
+    // it is new to.
+    let mut arrivals: Vec<(String, PassedMember)> = Vec::new();
     for release in &peers {
         let stated = package_version_at(repository, &release.commit)?;
         if stated != release.version {
@@ -331,7 +362,14 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
                 release.tag, release.version
             ));
         }
-        let found = compare(repository, head, release, &mut notes, &mut sections)?;
+        let found = compare(
+            repository,
+            head,
+            release,
+            &mut notes,
+            &mut sections,
+            &mut arrivals,
+        )?;
         if !found.is_empty() {
             problems.push(format!(
                 "{} speaks another surface than this commit at level {}:\n  {}",
@@ -359,6 +397,31 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
                 releases.join(", ")
             ));
         }
+        // The comparison cannot tell a member whose absence keeps the earlier meaning from one
+        // whose absence does not, so each member it passes is said once, with the version it
+        // arrived at and the version of the releases it is new to, for the review of the change
+        // that lists it.
+        let mut grouped: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+        for (tag, passed) in arrivals {
+            grouped
+                .entry((
+                    passed.member,
+                    passed.arrived.to_string(),
+                    passed.earlier.to_string(),
+                ))
+                .or_default()
+                .push(tag);
+        }
+        for ((member, arrived, earlier), tags) in grouped {
+            notes.push(format!(
+                "the plugin SDK member {member}, listed in the arrival table at SDK {arrived}, is \
+                 new to {} (SDK {earlier}) and passes as an optional member of a definition that \
+                 no protocol schema has; the comparison cannot tell it from a member whose absence \
+                 changes the meaning, and the review of the change that lists it must \
+                 (docs/releases/packages.md, \"A level is one surface\")",
+                tags.join(", ")
+            ));
+        }
         return Ok(Outcome::Held {
             releases: peers.into_iter().map(|release| release.tag).collect(),
             notes,
@@ -380,6 +443,7 @@ fn compare(
     release: &Release,
     notes: &mut Vec<String>,
     sections_passed: &mut BTreeMap<String, Vec<String>>,
+    arrivals_passed: &mut Vec<(String, PassedMember)>,
 ) -> Result<Vec<String>, String> {
     let tag = &release.tag;
     let schema_text = git_in(
@@ -457,17 +521,31 @@ fn compare(
         })?;
     let sdk: Value = serde_json::from_str(&sdk_text)
         .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag}: {error}"))?;
+    let contract_text = file_at(repository, &release.commit, SDK_CONTRACT_PATH)
+        .map_err(|error| format!("{SDK_CONTRACT_PATH} of {tag} cannot be read: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "{tag} has no {SDK_CONTRACT_PATH}, so the plugin SDK's version and table of \
+                 arrivals cannot be compared with it"
+            )
+        })?;
+    let earlier = SdkContract::parse(&contract_text)
+        .map_err(|error| format!("{SDK_CONTRACT_PATH} of {tag}: {error}"))?;
+    let mut passed = Vec::new();
     found.extend(
-        compare_for_a_level(
+        compare_sdk_for_a_level(
             &sdk,
             &head.sdk_schema,
-            &|| Ok(BTreeSet::new()),
-            &mut Vec::new(),
+            (&schema, &head.schema),
+            &earlier,
+            &head.sdk_contract,
+            &mut passed,
         )
         .map_err(|error| format!("the plugin SDK schema of {tag}: {error}"))?
         .into_iter()
         .map(|line| format!("the plugin SDK schema: {line}")),
     );
+    arrivals_passed.extend(passed.into_iter().map(|member| (tag.clone(), member)));
     let host = plugin_host_in(repository, &release.commit)?;
     if host != head.plugin_host {
         found.push(format!(
