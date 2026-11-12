@@ -2900,17 +2900,20 @@ mod tests {
                 "{own:?} {inherited:?}: {directory} is left behind"
             );
         }
-        for (own, inherited) in [
-            (vec![], Some("/run/user/1000")),
-            (vec![("XDG_RUNTIME_DIR", "/run/user/7")], None),
-            (vec![("XDG_RUNTIME_DIR", "/run/user/7")], Some("")),
-        ] {
-            let (directory, _, _) = what_a_question_gives_its_runtime_directory(&own, inherited);
-            let named = own
-                .first()
-                .map_or_else(|| inherited.unwrap(), |(_, value)| value);
-            assert_eq!(directory, named, "{own:?} {inherited:?}");
+        // One the program's own variables set is passed on as it stands, whatever this process has.
+        for inherited in [None, Some(""), Some("/run/user/1000")] {
+            let (directory, _, _) = what_a_question_gives_its_runtime_directory(
+                &[("XDG_RUNTIME_DIR", "/run/user/7")],
+                inherited,
+            );
+            assert_eq!(directory, "/run/user/7", "{inherited:?}");
         }
+        // One this process has is the program's own, so the question gives none of its own.
+        assert!(names_a_runtime_directory(
+            &[],
+            Some(std::ffi::OsStr::new("/run/user/1000"))
+        ));
+        assert!(!names_a_runtime_directory(&[], None));
     }
 
     /// The question that names a profile is answered from the home and `XDG_CONFIG_HOME`, whatever
