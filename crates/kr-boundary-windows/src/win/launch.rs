@@ -46,13 +46,15 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use crate::env::EnvBlock;
 
 use super::ffi::{self, Handle, last, wide, wide_path};
 use super::job::{Job, Reports, State};
+use super::pipe::Stop;
 use super::sd::{OwnedSd, Principals, SdKind, descriptor};
 
 /// How a program that was started ended.
@@ -528,6 +530,30 @@ impl Child {
         if waited != WAIT_OBJECT_0 {
             return Ok(None);
         }
+        self.exit_code()
+    }
+
+    /// Waits for the child to end, up to a bound and until the stop is set.
+    ///
+    /// Returns the exit code, or `None` when the bound ran out first or the stop came first; the
+    /// caller looks at the stop to tell the two apart. The stop's event is the first handle, so a
+    /// child that ended at the same moment does not win over a stop that is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the wait or the exit code fails.
+    pub fn wait_or_stop(&self, bound: Duration, stop: &Stop) -> Result<Option<u32>, ffi::Error> {
+        let milliseconds = u32::try_from(bound.as_millis()).unwrap_or(u32::MAX);
+        let handles = [stop.event(), self.process.raw()];
+        // SAFETY: both handles are open for the length of the wait.
+        let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
+        if waited != WAIT_OBJECT_0 + 1 {
+            return Ok(None);
+        }
+        self.exit_code()
+    }
+
+    fn exit_code(&self) -> Result<Option<u32>, ffi::Error> {
         let mut code = 0_u32;
         #[cfg(feature = "testing")]
         if testing::take_fail_exit_code() {

@@ -156,6 +156,22 @@ pub struct Captured {
 /// after a launch that failed: a writer outside the job may still hold the pipe, and the error then
 /// says both).
 pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchError> {
+    run_captured_until(run, deadline, None)
+}
+
+/// [`run_captured`] for a request of the broker's service: the wait for the program ends at the
+/// stop as well, and the program is then ended with its job like one that ran out of time. The
+/// outcome of such a run is [`Outcome::TimedOut`] and the caller, which looks at the stop, tells it
+/// from a program that ran out of its time.
+///
+/// # Errors
+///
+/// As for [`run_captured`].
+pub fn run_captured_until(
+    run: Run<'_>,
+    deadline: Instant,
+    stop: Option<&Stop>,
+) -> Result<Captured, LaunchError> {
     if Instant::now() >= deadline {
         return Err(LaunchError::DeadlinePassed);
     }
@@ -199,7 +215,11 @@ pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchE
             suspended.resume(permit)
         }) {
             Ok(child) => {
-                let waited = child.wait(wait_until.saturating_duration_since(Instant::now()));
+                let bound = wait_until.saturating_duration_since(Instant::now());
+                let waited = match stop {
+                    Some(stop) => child.wait_or_stop(bound, stop),
+                    None => child.wait(bound),
+                };
                 // Anything the program started ends with the job, which also lets the pipes
                 // reach their end. A program still running at the bound is ended the same way.
                 let ended = job.end(&[&child], deadline);
@@ -318,12 +338,12 @@ fn run_program(
     arguments: &[&str],
     cwd: &Path,
     env: &EnvBlock,
-    deadline: Instant,
+    limit: Limit<'_>,
 ) -> Result<Captured, LaunchError> {
     let name = program.display().to_string();
     let mut parts = vec![name.as_str()];
     parts.extend_from_slice(arguments);
-    run_captured(
+    run_captured_until(
         Run {
             token,
             group,
@@ -332,8 +352,23 @@ fn run_program(
             cwd,
             env,
         },
-        deadline,
+        limit.by,
+        Some(limit.stop),
     )
+}
+
+/// What ends one program of the proof: its deadline, and the service's stop.
+#[derive(Clone, Copy)]
+struct Limit<'a> {
+    by: Instant,
+    stop: &'a Stop,
+}
+
+/// The failure of a proof that the service's stop reached, or none. A proof looks at the stop after
+/// each query and before and after each program, so that a stop does not wait for the proof's own
+/// deadline.
+fn stopped(stop: &Stop) -> Option<Proof> {
+    stop.is_set().then(|| fail("the service is stopping"))
 }
 
 fn same_path(left: &str, right: &Path) -> bool {
@@ -507,7 +542,11 @@ pub fn prove(
         Ok(environment) => environment,
         Err(reason) => return fail(reason),
     };
-    let record = match applocker::newest_record(&scratch.0, &environment, deadline) {
+    let record = applocker::newest_record_until(&scratch.0, &environment, deadline, Some(stop));
+    if let Some(failed) = stopped(stop) {
+        return failed;
+    }
+    let record = match record {
         Ok(record) => record,
         Err(error) => return fail(error.to_string()),
     };
@@ -532,8 +571,11 @@ pub fn prove(
         if over || Instant::now() >= search_until {
             // The log's last words come from the time kept for them, and the query stays within the
             // deadline like everything else.
-            let log = applocker::latest(&scratch.0, &environment, deadline)
+            let log = applocker::latest(&scratch.0, &environment, deadline, Some(stop))
                 .unwrap_or_else(|error| format!("unreadable: {error}"));
+            if let Some(failed) = stopped(stop) {
+                return failed;
+            }
             let seen = match (refused, cut_launch) {
                 (true, true) => {
                     "refused earlier; the launch that the search's end cut had started, and was not refused"
@@ -559,8 +601,11 @@ pub fn prove(
             &[],
             &scratch.0,
             &environment,
-            bound.by,
+            Limit { by: bound.by, stop },
         );
+        if let Some(failed) = stopped(stop) {
+            return failed;
+        }
         // A launch that the search's own end kept from starting is the end of the search, not a
         // failure of the proof: the log is read next, from the reserve.
         if matches!(launched, Err(LaunchError::DeadlinePassed)) && search_is_over(true, bound) {
@@ -596,7 +641,16 @@ pub fn prove(
             // that follows says what it saw and what the log last said.
             over = true;
         } else if refused {
-            let answer = applocker::blocked_after(record, &scratch.0, &environment, search_until);
+            let answer = applocker::blocked_after(
+                record,
+                &scratch.0,
+                &environment,
+                search_until,
+                Some(stop),
+            );
+            if let Some(failed) = stopped(stop) {
+                return failed;
+            }
             let result = match &answer {
                 Ok(events) => QueryResult::Answered {
                     refusal_found: events.iter().any(|event| {
@@ -634,9 +688,11 @@ pub fn prove(
         if over {
             continue;
         }
-        std::thread::sleep(
-            LAUNCH_EVERY.min(search_until.saturating_duration_since(Instant::now())),
-        );
+        // The pause ends at the stop, and the next pass of the loop sees it.
+        let _ = stop.wait(LAUNCH_EVERY.min(search_until.saturating_duration_since(Instant::now())));
+    }
+    if let Some(failed) = stopped(stop) {
+        return failed;
     }
     let git_exe = Path::new(&git.dir)
         .join("mingw64")
@@ -653,8 +709,9 @@ pub fn prove(
         &["--version"],
         &scratch.0,
         &environment,
-        by,
+        Limit { by, stop },
     ) {
+        _ if stop.is_set() => return fail("the service is stopping"),
         Ok(Captured {
             outcome: Outcome::Ran(0),
             ..
@@ -667,6 +724,9 @@ pub fn prove(
         }
         Err(error) => return fail(error.to_string()),
     }
+    if let Some(failed) = stopped(stop) {
+        return failed;
+    }
     let by = match program_deadline(deadline, deadline) {
         Ok(by) => by,
         Err(failed) => return failed,
@@ -678,8 +738,9 @@ pub fn prove(
         &[],
         &scratch.0,
         &environment,
-        by,
+        Limit { by, stop },
     ) {
+        _ if stop.is_set() => return fail("the service is stopping"),
         Ok(Captured {
             outcome: Outcome::Ran(0),
             ..
@@ -696,7 +757,10 @@ pub fn prove(
             ));
         }
     }
-    // A success is taken only before the deadline.
+    // A success is taken only before the deadline, and not after a stop.
+    if let Some(failed) = stopped(stop) {
+        return failed;
+    }
     if let Err(failed) = left_before(deadline) {
         return failed;
     }
@@ -755,8 +819,9 @@ pub fn release(
             &["/c", "exit", "0"],
             staging,
             &environment,
-            by,
+            Limit { by, stop },
         ) {
+            _ if stop.is_set() => return fail("the service is stopping"),
             Ok(Captured {
                 outcome: Outcome::Ran(0),
                 ..
@@ -782,8 +847,7 @@ pub fn release(
                 started.elapsed().as_secs_f32()
             ));
         }
-        std::thread::sleep(
-            Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())),
-        );
+        let _ = stop
+            .wait(Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())));
     }
 }

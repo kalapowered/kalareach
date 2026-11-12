@@ -23,7 +23,8 @@ use crate::quote::quote_command_line;
 use crate::window::QueryEnd;
 
 use super::launch::{LaunchError, Outcome, TokenSpec, VerifiedPath};
-use super::proof::{Run, run_captured};
+use super::pipe::Stop;
+use super::proof::{Run, run_captured_until};
 
 /// The application-control log that holds the executable collection's events.
 const LOG: &str = "Microsoft-Windows-AppLocker/EXE and DLL";
@@ -348,6 +349,7 @@ fn wevtutil(
     scratch: &Path,
     env: &EnvBlock,
     deadline: Instant,
+    stop: Option<&Stop>,
 ) -> Result<String, Error> {
     let what = "the event log query";
     if Instant::now() >= deadline {
@@ -367,7 +369,7 @@ fn wevtutil(
         by_the_deadline: bound.by_the_window,
     };
     let program = VerifiedPath::new(&program).map_err(launch_error)?;
-    let captured = run_captured(
+    let captured = run_captured_until(
         Run {
             token: TokenSpec::Own,
             group: None,
@@ -377,6 +379,7 @@ fn wevtutil(
             env,
         },
         bound.by,
+        stop,
     )
     .map_err(launch_error)?;
     let text = String::from_utf8_lossy(&captured.stdout).into_owned();
@@ -403,10 +406,11 @@ fn query(
     scratch: &Path,
     env: &EnvBlock,
     deadline: Instant,
+    stop: Option<&Stop>,
 ) -> Result<Vec<LogEvent>, Error> {
     let mut arguments = vec!["qe", LOG, "/f:xml", "/e:Events"];
     arguments.extend_from_slice(extra);
-    let text = wevtutil(&arguments, scratch, env, deadline)?;
+    let text = wevtutil(&arguments, scratch, env, deadline, stop)?;
     events::parse(&text).map_err(|error| Error::Unreadable(error.to_string()))
 }
 
@@ -415,12 +419,18 @@ fn query(
 /// # Errors
 ///
 /// Returns an error when the query fails.
-pub fn latest(scratch: &Path, env: &EnvBlock, deadline: Instant) -> Result<String, Error> {
+pub fn latest(
+    scratch: &Path,
+    env: &EnvBlock,
+    deadline: Instant,
+    stop: Option<&Stop>,
+) -> Result<String, Error> {
     let text = wevtutil(
         &["qe", LOG, "/c:3", "/rd:true", "/f:text"],
         scratch,
         env,
         deadline,
+        stop,
     )?;
     let words: Vec<&str> = text.split_whitespace().collect();
     let flat = words.join(" ");
@@ -438,7 +448,22 @@ pub fn latest(scratch: &Path, env: &EnvBlock, deadline: Instant) -> Result<Strin
 ///
 /// Returns an error when the query fails or its answer cannot be read.
 pub fn newest_record(scratch: &Path, env: &EnvBlock, deadline: Instant) -> Result<u64, Error> {
-    let events = query(&["/c:1", "/rd:true"], scratch, env, deadline)?;
+    newest_record_until(scratch, env, deadline, None)
+}
+
+/// [`newest_record`] for a request of the broker's service: the query ends at the stop, with the
+/// error of a query that ran out of time, and the caller looks at the stop to tell the two apart.
+///
+/// # Errors
+///
+/// As for [`newest_record`].
+pub fn newest_record_until(
+    scratch: &Path,
+    env: &EnvBlock,
+    deadline: Instant,
+    stop: Option<&Stop>,
+) -> Result<u64, Error> {
+    let events = query(&["/c:1", "/rd:true"], scratch, env, deadline, stop)?;
     Ok(events.iter().map(|event| event.record).max().unwrap_or(0))
 }
 
@@ -458,7 +483,7 @@ pub fn policy_applied_after(
         "/q:*[System[(EventID={}) and (EventRecordID>{record})]]",
         events::APPLIED
     );
-    Ok(query(&[&filter, "/c:1"], scratch, env, deadline)?
+    Ok(query(&[&filter, "/c:1"], scratch, env, deadline, None)?
         .first()
         .map(|event| event.record))
 }
@@ -473,10 +498,11 @@ pub fn blocked_after(
     scratch: &Path,
     env: &EnvBlock,
     deadline: Instant,
+    stop: Option<&Stop>,
 ) -> Result<Vec<LogEvent>, Error> {
     let filter = format!(
         "/q:*[System[(EventID={}) and (EventRecordID>{record})]]",
         events::BLOCKED
     );
-    query(&[&filter], scratch, env, deadline)
+    query(&[&filter], scratch, env, deadline, stop)
 }
