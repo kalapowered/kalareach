@@ -723,9 +723,11 @@ fn child_refusal(paths: &Paths, name: &OsStr, why: &str, origin: &Origin) -> Err
 
 /// The refusal of an entry that the layout never gives as a record (a name it does not give, what is
 /// in `staging`, a directory that no manifest records): it holds nothing the manifest and the
-/// journal say, so it is named to remove, whatever its handle shows.
-fn removal_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str) -> Error {
-    refusal_with(paths, dir, name, why, EntryKind::Other, &Origin::System)
+/// journal say, and it takes its remedy from what its own handle showed, like a record: it is named
+/// to remove only when the handle shows the system's class, and moved aside when it shows another
+/// account's, a link or a second name.
+fn removal_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, origin: &Origin) -> Error {
+    refusal_with(paths, dir, name, why, EntryKind::Other, origin)
 }
 
 /// What the layout makes of the name in the directory: the manifest, the earlier-state record, a
@@ -1145,36 +1147,34 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
         .iter()
         .any(|child| same_name(&child.name, expected_manifest))
     {
-        // With no manifest, the first entry is read on its own handle like every other record: a
-        // name that the layout does not give is removed; one that it gives takes its remedy from
-        // what the handle shows.
-        let first = &listed[0];
-        let shown = OsString::from_wide(&first.name);
-        let kind = kind_of(paths, &paths.data, &shown, true);
-        let origin = match kind {
-            EntryKind::Other => Origin::System,
-            _ => {
-                let access = if matches!(
-                    kind,
-                    EntryKind::Staging | EntryKind::Journal | EntryKind::Run
-                ) {
-                    LIST | READ_CONTROL
-                } else {
-                    READ_CONTROL
-                };
-                match data.open_child(first, access)? {
-                    Ok(opened) => origin_of_opened(&opened, kind),
-                    Err(lost) => origin_of_lost(&lost),
-                }
-            }
-        };
-        return Err(entry_refusal(
-            paths,
-            &paths.data,
-            &shown,
-            "no manifest records this directory, and a directory that no manifest records must be empty",
-            &origin,
-        ));
+        // With no manifest, the first entry that is still there is read on its own handle, whatever
+        // its name: it takes its remedy from what the handle shows. An entry that is gone since the
+        // listing is absent, and a directory whose entries are all gone is empty.
+        for first in &listed {
+            let shown = OsString::from_wide(&first.name);
+            let kind = kind_of(paths, &paths.data, &shown, true);
+            let access = if matches!(
+                kind,
+                EntryKind::Staging | EntryKind::Journal | EntryKind::Run
+            ) {
+                LIST | READ_CONTROL
+            } else {
+                READ_CONTROL
+            };
+            let origin = match data.open_child(first, access)? {
+                Ok(opened) => origin_of_opened(&opened, kind),
+                Err(Lost::Gone) => continue,
+                Err(lost) => origin_of_lost(&lost),
+            };
+            return Err(entry_refusal(
+                paths,
+                &paths.data,
+                &shown,
+                "no manifest records this directory, and a directory that no manifest records must be empty",
+                &origin,
+            ));
+        }
+        return Ok(inspected);
     }
     for child in &listed {
         let shown = OsString::from_wide(&child.name);
@@ -1183,11 +1183,18 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             // A manifest that was being replaced when a run stopped.
             None if is_manifest_replacement(&shown.to_string_lossy()) => &Kind::File,
             None => {
+                let origin = match data.open_child(child, READ_CONTROL)? {
+                    Ok(opened) => origin_of_opened(&opened, EntryKind::Other),
+                    // An entry that is gone since the listing is absent.
+                    Err(Lost::Gone) => continue,
+                    Err(lost) => origin_of_lost(&lost),
+                };
                 return Err(removal_refusal(
                     paths,
                     &paths.data,
                     &shown,
                     "the installation did not make it",
+                    &origin,
                 ));
             }
         };
@@ -1425,11 +1432,18 @@ fn inspect_layout(
         let shown = OsString::from_wide(&child.name);
         let text = shown.to_string_lossy().into_owned();
         let Some(expected) = layout_kind(layout, &text) else {
+            let origin = match held.open_child(&child, READ_CONTROL)? {
+                Ok(opened) => origin_of_opened(&opened, EntryKind::Other),
+                // An entry that is gone since the listing is absent.
+                Err(Lost::Gone) => continue,
+                Err(lost) => origin_of_lost(&lost),
+            };
             return Err(removal_refusal(
                 paths,
                 dir,
                 &shown,
                 "the installation does not give that name there",
+                &origin,
             ));
         };
         if layout == Layout::Run && !named_roots.contains(&text) {
@@ -1533,7 +1547,7 @@ fn inspect_layout(
 /// Which tree a check below the data directory or the program directory reads.
 #[derive(Clone, Copy)]
 enum Scope {
-    /// A directory of `staging`: a refusal names the entry to remove.
+    /// A directory of `staging`: a refusal takes its remedy from the entry's own handle.
     Staging,
     /// The program directory: a refusal names the owner and the list to correct.
     Program,
@@ -1562,45 +1576,34 @@ enum Cure {
     Volume,
 }
 
-/// The refusal of an entry below a directory of a scope.
-fn within_refusal(
-    paths: &Paths,
-    scope: Scope,
-    dir: &Path,
-    name: &OsStr,
-    why: &str,
-    cure: Cure,
-) -> Error {
-    match scope {
-        Scope::Staging => removal_refusal(paths, dir, name, why),
-        Scope::Program => {
-            let entry = dir.join(name);
-            let remedy = match cure {
-                Cure::OwnerAndList => "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.".to_owned(),
-                Cure::RemoveEntry => format!(
-                    "Remove {}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again.",
-                    entry.display()
-                ),
-                Cure::EmptyConfig => format!(
-                    "Remove {}, and nothing else: the installation makes it empty, and a configuration that holds settings would be read by the Git that the boundary's accounts run, and a change of its owner or its list does not cure that. A repair makes it again, empty. Then run the setup program again.",
-                    entry.display()
-                ),
-                Cure::Volume => format!(
-                    "{} is on a volume that the installation does not use: it keeps its program directory on a fixed, local NTFS volume, and nothing in it can be corrected to make another volume one. Do not remove the program directory: the manifest records it and stays where it is. Move the system's Program Files folder to such a volume, or install on a computer where it is on one, then run the setup program again.",
-                    entry.display()
-                ),
-                Cure::Open => format!(
-                    "Close the program that holds {} open, or correct who may open it, and if it is a link or not a folder remove that link or entry and nothing else, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is.",
-                    entry.display()
-                ),
-            };
-            Error::Refused(format!(
-                "{} is the boundary's program directory (the program that the service runs as the system). It is refused because of {}: {why}. Whoever owns it, or can change its list, could replace that program. {remedy}",
-                paths.program.display(),
-                entry.display(),
-            ))
-        }
-    }
+/// The refusal of an entry in the program directory: the owner and the list to correct, or the entry
+/// to remove, whichever its reason shows.
+fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cure) -> Error {
+    let entry = dir.join(name);
+    let remedy = match cure {
+        Cure::OwnerAndList => "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.".to_owned(),
+        Cure::RemoveEntry => format!(
+            "Remove {}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again.",
+            entry.display()
+        ),
+        Cure::EmptyConfig => format!(
+            "Remove {}, and nothing else: the installation makes it empty, and a configuration that holds settings would be read by the Git that the boundary's accounts run, and a change of its owner or its list does not cure that. A repair makes it again, empty. Then run the setup program again.",
+            entry.display()
+        ),
+        Cure::Volume => format!(
+            "{} is on a volume that the installation does not use: it keeps its program directory on a fixed, local NTFS volume, and nothing in it can be corrected to make another volume one. Do not remove the program directory: the manifest records it and stays where it is. Move the system's Program Files folder to such a volume, or install on a computer where it is on one, then run the setup program again.",
+            entry.display()
+        ),
+        Cure::Open => format!(
+            "Close the program that holds {} open, or correct who may open it, and if it is a link or not a folder remove that link or entry and nothing else, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is.",
+            entry.display()
+        ),
+    };
+    Error::Refused(format!(
+        "{} is the boundary's program directory (the program that the service runs as the system). It is refused because of {}: {why}. Whoever owns it, or can change its list, could replace that program. {remedy}",
+        paths.program.display(),
+        entry.display(),
+    ))
 }
 
 /// Reads every existing folder from [`Paths::program_top`] down to the program directory's parent,
@@ -1734,9 +1737,8 @@ fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
                 AnchorRefusal::Volume(_) => Cure::Volume,
                 AnchorRefusal::ReparsePoint | AnchorRefusal::NotADirectory => Cure::RemoveEntry,
             };
-            return Err(within_refusal(
+            return Err(program_refusal(
                 paths,
-                Scope::Program,
                 paths.program.parent().unwrap_or(&paths.program),
                 &program,
                 &refusal.to_string(),
@@ -1745,9 +1747,8 @@ fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
         }
     };
     if let Some(why) = check_readable_object(held.handle())? {
-        return Err(within_refusal(
+        return Err(program_refusal(
             paths,
-            Scope::Program,
             paths.program.parent().unwrap_or(&paths.program),
             &program,
             &why,
@@ -1775,25 +1776,29 @@ const PROOF_PROGRAM: &str = "unlisted.exe";
 fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Result<(), Error> {
     for child in held.children()? {
         let shown = OsString::from_wide(&child.name);
-        if !shown.to_string_lossy().eq_ignore_ascii_case(PROOF_PROGRAM) {
-            return Err(removal_refusal(
-                paths,
-                dir,
-                &shown,
-                "the installation puts nothing but the unlisted program in a proof directory",
-            ));
-        }
         let opened = match held.open_child(&child, READ_CONTROL)? {
             Ok(opened) => opened,
+            // An entry that is gone since the listing is absent.
+            Err(Lost::Gone) => continue,
             Err(lost) => {
                 return Err(removal_refusal(
                     paths,
                     dir,
                     &shown,
                     &format!("it could not be opened to be checked ({lost})"),
+                    &origin_of_lost(&lost),
                 ));
             }
         };
+        if !shown.to_string_lossy().eq_ignore_ascii_case(PROOF_PROGRAM) {
+            return Err(removal_refusal(
+                paths,
+                dir,
+                &shown,
+                "the installation puts nothing but the unlisted program in a proof directory",
+                &origin_of_opened(&opened, EntryKind::Other),
+            ));
+        }
         match opened.kind {
             Kind::File if opened.links == 1 => {}
             Kind::File => {
@@ -1802,20 +1807,36 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
                     dir,
                     &shown,
                     "it has more than one name",
+                    &Origin::Foreign,
                 ));
             }
-            Kind::ReparsePoint => return Err(removal_refusal(paths, dir, &shown, "it is a link")),
+            Kind::ReparsePoint => {
+                return Err(removal_refusal(
+                    paths,
+                    dir,
+                    &shown,
+                    "it is a link",
+                    &Origin::Foreign,
+                ));
+            }
             Kind::Directory => {
                 return Err(removal_refusal(
                     paths,
                     dir,
                     &shown,
                     "it is a directory, not a file",
+                    &Origin::Foreign,
                 ));
             }
         }
         if let Some(why) = check_readable_object(&opened.handle)? {
-            return Err(removal_refusal(paths, dir, &shown, &why));
+            return Err(removal_refusal(
+                paths,
+                dir,
+                &shown,
+                &why,
+                &origin_of(&opened.handle),
+            ));
         }
     }
     Ok(())
@@ -1904,47 +1925,39 @@ fn inspect_within(
 ) -> Result<(), Error> {
     for child in held.children()? {
         let shown = OsString::from_wide(&child.name);
-        if depth > WITHIN_DEPTH {
-            return Err(within_refusal(
-                paths,
-                scope,
-                dir,
-                &shown,
-                "it is nested deeper than the installation makes anything",
-                Cure::RemoveEntry,
-            ));
-        }
+        // Below `staging` an entry takes its remedy from its own handle; in the program directory
+        // the reason decides what is corrected or removed.
+        let refuse = |why: &str, cure: Cure, origin: &Origin| match scope {
+            Scope::Staging => removal_refusal(paths, dir, &shown, why, origin),
+            Scope::Program => program_refusal(paths, dir, &shown, why, cure),
+        };
         let opened = match held.open_child(&child, LIST | READ_CONTROL)? {
             Ok(opened) => opened,
+            // An entry that is gone since the listing is absent, and nothing of it is left to check.
+            Err(Lost::Gone) => continue,
             Err(lost) => {
-                return Err(within_refusal(
-                    paths,
-                    scope,
-                    dir,
-                    &shown,
+                return Err(refuse(
                     &format!("it could not be opened to be checked ({lost})"),
                     Cure::Open,
+                    &origin_of_lost(&lost),
                 ));
             }
         };
-        if opened.kind == Kind::ReparsePoint {
-            return Err(within_refusal(
-                paths,
-                scope,
-                dir,
-                &shown,
-                "it is a link",
+        if depth > WITHIN_DEPTH {
+            return Err(refuse(
+                "it is nested deeper than the installation makes anything",
                 Cure::RemoveEntry,
+                &origin_of_opened(&opened, EntryKind::Other),
             ));
         }
+        if opened.kind == Kind::ReparsePoint {
+            return Err(refuse("it is a link", Cure::RemoveEntry, &Origin::Foreign));
+        }
         if opened.kind == Kind::File && opened.links > 1 {
-            return Err(within_refusal(
-                paths,
-                scope,
-                dir,
-                &shown,
+            return Err(refuse(
                 "it has more than one name",
                 Cure::RemoveEntry,
+                &Origin::Foreign,
             ));
         }
         if matches!(scope, Scope::Program) {
@@ -1970,18 +1983,11 @@ fn inspect_within(
                 } else {
                     Cure::RemoveEntry
                 };
-                return Err(within_refusal(paths, scope, dir, &shown, why, cure));
+                return Err(program_refusal(paths, dir, &shown, why, cure));
             }
         }
         if let Some(why) = check_readable_object(&opened.handle)? {
-            return Err(within_refusal(
-                paths,
-                scope,
-                dir,
-                &shown,
-                &why,
-                Cure::OwnerAndList,
-            ));
+            return Err(refuse(&why, Cure::OwnerAndList, &origin_of(&opened.handle)));
         }
         if opened.kind == Kind::Directory {
             let inner = DirHandle::from_opened(opened)?;

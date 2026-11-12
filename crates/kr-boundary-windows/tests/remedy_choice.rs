@@ -102,16 +102,33 @@ fn a_record_of_the_systems_class_is_corrected_while_a_manifest_may_be_there_and_
     }
 }
 
+/// A name that the layout does not give is no record, and its own handle decides all the same: only
+/// one that shows the system's class is removed; a link, another account's, a second name or a list
+/// that refuses the check is moved aside, and one that a program holds is closed on.
 #[test]
-fn a_name_that_the_layout_does_not_give_is_removed_whatever_its_handle_showed() {
-    for origin in [Origin::System, Origin::Foreign, unknown(), held()] {
-        for manifest in lookups() {
+fn a_name_that_the_layout_does_not_give_takes_the_four_states_of_its_own_handle() {
+    for manifest in lookups() {
+        assert_eq!(
+            choose(EntryKind::Other, &Origin::System, &manifest),
+            Remedy::Remove,
+            "{manifest:?}"
+        );
+        for origin in [
+            Origin::Foreign,
+            unknown(),
+            Origin::Refused("Windows error 5".to_owned()),
+        ] {
             assert_eq!(
                 choose(EntryKind::Other, &origin, &manifest),
-                Remedy::Remove,
+                Remedy::MoveAside,
                 "{origin:?} {manifest:?}"
             );
         }
+        assert_eq!(
+            choose(EntryKind::Other, &held(), &manifest),
+            Remedy::Unreadable,
+            "{manifest:?}"
+        );
     }
 }
 

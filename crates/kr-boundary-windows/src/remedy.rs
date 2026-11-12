@@ -10,9 +10,10 @@
 //!
 //! An entry that the layout gives as a record is corrected into place only when its handle shows the
 //! system's class and the manifest is not confirmed absent, since correcting what another account
-//! wrote would make it the installation's own record. It is removed only when it is no record of
-//! the layout, or when the manifest is confirmed absent and the handle shows the system's class.
-//! When nothing is known of who made it, neither is offered.
+//! wrote would make it the installation's own record. It is removed only when the handle shows the
+//! system's class and the entry is no record of the layout, or the manifest is confirmed absent. A
+//! name that the layout does not give takes the same four states as a record. When nothing is
+//! known of who made it, neither is offered.
 
 /// Whether something is there, as a lookup shows it: confirmed absent only by an answer of not
 /// found. Any other error leaves it unknown, and nothing that could destroy a record is offered
@@ -138,8 +139,8 @@ pub fn origin_of_shape(kind: EntryKind, shape: Shape, owner: &dyn Fn() -> Origin
 /// What the person is told to do about one refused entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remedy {
-    /// Remove the entry: it is no record of the layout, or the system's class owns it and nothing
-    /// is recorded about it (no manifest, or a root that no journal names).
+    /// Remove the entry: its handle shows the system's class, and it is no record of the layout, or
+    /// nothing is recorded about it (no manifest, or a root that no journal names).
     Remove,
     /// Correct the entry's owner and list: the system's class owns it and a manifest is there.
     Correct,
@@ -153,17 +154,18 @@ pub enum Remedy {
 /// The remedy for a refused entry of the given kind, from what its handle showed (`origin`) and
 /// from the lookup of the manifest. A record is corrected into place only when its handle shows the
 /// system's class and a manifest may be there; it is removed only when its handle shows the system's
-/// class and nothing records it. A name that the layout does not give is removed whatever its
-/// handle showed.
+/// class and nothing records it. A name that the layout does not give is no record, and takes the
+/// same four states: it is removed when its handle shows the system's class, moved aside when it
+/// shows another account's, a link or a second name or when its list refuses the check, and
+/// closed on when a program holds it.
 #[must_use]
 pub fn choose(kind: EntryKind, origin: &Origin, manifest: &Presence) -> Remedy {
-    if kind == EntryKind::Other {
-        return Remedy::Remove;
-    }
     match origin {
         Origin::Foreign | Origin::Refused(_) | Origin::Unknown(_) => Remedy::MoveAside,
         Origin::Held(_) => Remedy::Unreadable,
-        Origin::System if kind == EntryKind::UnnamedRoot => Remedy::Remove,
+        Origin::System if matches!(kind, EntryKind::Other | EntryKind::UnnamedRoot) => {
+            Remedy::Remove
+        }
         Origin::System if matches!(manifest, Presence::Absent) => Remedy::Remove,
         Origin::System => Remedy::Correct,
     }
