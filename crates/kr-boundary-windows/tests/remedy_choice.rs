@@ -7,7 +7,7 @@ use std::path::Path;
 
 use kr_boundary_windows::remedy::{
     EntryKind, Origin, ParentCure, Presence, Remedy, Shape, choose, ending, origin_of_open_error,
-    origin_of_shape, parent_advice,
+    origin_of_shape, parent_advice, program_removal_advice,
 };
 
 const RECORDS: [EntryKind; 9] = [
@@ -390,4 +390,88 @@ fn the_forecast_after_a_foreign_manifest_is_moved_aside_is_the_next_runs_own_rea
         "{text}"
     );
     assert!(!text.contains("names each to remove"), "{text}");
+}
+
+/// The forecast says what the next run does for the state that run finds. After a manifest that
+/// nothing shows the origin of (a handle that could not be read, or that changed while it was read)
+/// is moved aside, the next run reads the first entry it finds and may move that aside too, because
+/// its handle shows nothing either.
+#[test]
+fn the_forecast_after_a_manifest_covers_the_state_that_shows_nothing_of_who_made_an_entry() {
+    let (remedy, text) = said(
+        EntryKind::Manifest,
+        &Origin::Unknown("access".to_owned()),
+        &Presence::Present,
+    );
+    assert_eq!(remedy, Remedy::MoveAside);
+    assert!(text.contains("shows nothing of who made it"), "{text}");
+    assert!(text.contains("could not be read"), "{text}");
+    assert!(
+        text.contains("changed or moved while it was read"),
+        "{text}"
+    );
+}
+
+/// A name beside a moved-aside entry is a name that the layout does not give. The next run reads
+/// it on its own handle like any entry and says what that shows: it does not promise "remove".
+#[test]
+fn the_parenthesis_about_a_new_name_beside_an_entry_does_not_promise_its_removal() {
+    for kind in [
+        EntryKind::Manifest,
+        EntryKind::Prior,
+        EntryKind::Staging,
+        EntryKind::Journal,
+        EntryKind::Run,
+        EntryKind::Replacement,
+        EntryKind::JournalFile,
+        EntryKind::NamedRoot,
+        EntryKind::UnnamedRoot,
+        EntryKind::Other,
+    ] {
+        for origin in [
+            Origin::Foreign,
+            Origin::Refused("5".to_owned()),
+            Origin::Unknown("x".to_owned()),
+        ] {
+            let (remedy, text) = said(kind, &origin, &Presence::Present);
+            assert_eq!(remedy, Remedy::MoveAside, "{kind:?} {origin:?}");
+            assert!(!text.contains("asks you to remove that"), "{text}");
+            assert!(
+                text.contains("the next run reads it on its own handle"),
+                "{kind:?} {origin:?}: {text}"
+            );
+        }
+    }
+}
+
+/// In the program directory only the system's class can write, so an unlisted name, a link and a
+/// second name keep "Remove". For a link the words say to remove the link itself and not what it
+/// points to, because the shell's recursive removal follows a junction into what it leads to.
+#[test]
+fn in_the_program_directory_a_link_is_removed_as_the_link_itself_and_not_what_it_leads_to() {
+    let entry = r"D:\Program Files\KalaReach\Boundary\link";
+    let link = program_removal_advice(entry, true);
+    assert!(
+        link.starts_with(&format!("Remove the link {entry} itself")),
+        "{link}"
+    );
+    assert!(link.contains("not what it points to"), "{link}");
+    assert!(link.contains("rmdir"), "{link}");
+    assert!(link.contains("without `/s`"), "{link}");
+    assert!(
+        link.contains("A repair makes the program files again"),
+        "{link}"
+    );
+    assert!(link.contains("run the setup program again"), "{link}");
+
+    let other = program_removal_advice(entry, false);
+    assert!(
+        other.starts_with(&format!("Remove {entry}, and nothing else")),
+        "{other}"
+    );
+    assert!(!other.contains("points to"), "{other}");
+    assert!(
+        other.contains("A repair makes the program files again"),
+        "{other}"
+    );
 }

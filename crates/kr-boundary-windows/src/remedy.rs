@@ -205,7 +205,7 @@ pub fn ending(
             };
             let next = match kind {
                 EntryKind::Manifest => {
-                    "The directory then holds no manifest, and nothing records what else is in it: the next run reads those entries one at a time on their own handles, and for the first it finds says to remove it, when its handle shows the system's class, to move it aside, when its handle shows that the installation did not make it, or to close the program that holds it open."
+                    "The directory then holds no manifest, and nothing records what else is in it: the next run reads those entries one at a time on their own handles, and for the first it finds says to remove it, when its handle shows the system's class, to move it aside, when its handle shows that the installation did not make it or shows nothing of who made it (its list refuses the check, it could not be read, or it changed or moved while it was read), or to close the program that holds it open."
                 }
                 EntryKind::Prior | EntryKind::Staging | EntryKind::Journal | EntryKind::Run => {
                     "The next run finds the entry absent and makes it new."
@@ -219,7 +219,7 @@ pub fn ending(
                 EntryKind::Other => "The next run finds the entry absent.",
             };
             format!(
-                "{basis} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give, and the next run asks you to remove that), then run the setup program again. {next}"
+                "{basis} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again. {next}"
             )
         }
         Remedy::Unreadable => format!(
@@ -316,4 +316,21 @@ pub fn ancestor_refusal(folder: &str, tree: Tree, why: &str) -> String {
     format!(
         "{folder} is a folder above the boundary's {below}. It is refused because {why}. An account that may delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on another place. Nothing was changed. If the reason names an owner or a right, make the system, the Administrators group or the installer service its owner, and take the rights to delete or rename an entry in it, to change its list and to take its ownership away from every other account (the right to add an entry is what the system gives by default, and it stays allowed). If it could not be opened, close the program that holds it open or correct who may open it. If it is a link, remove the link itself and not what it points to. Then run the setup program again. Do not remove or move it otherwise: it holds other things."
     )
+}
+
+/// What to do about an entry of the program directory that the installation does not make there.
+/// Only the system's class can write in that directory, so the entry is removed, whichever owner it
+/// shows. A link is removed as the link itself: the shell's recursive removal follows a junction
+/// into what it leads to, so the words name the removals that do not.
+#[must_use]
+pub fn program_removal_advice(entry: &str, link: bool) -> String {
+    if link {
+        format!(
+            "Remove the link {entry} itself, and not what it points to (`rmdir` without `/s` removes a link to a folder, and `del` a link to a file), and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again."
+        )
+    } else {
+        format!(
+            "Remove {entry}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again."
+        )
+    }
 }
