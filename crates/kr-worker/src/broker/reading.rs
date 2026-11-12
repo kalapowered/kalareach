@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kr_plugin_sdk::connector::{
-    ConditionValue, ConnectorManifest, FieldPath, RequestCondition, TemplateHole,
+    ConditionValue, ConnectorManifest, FieldPath, FieldSegment, RequestCondition, TemplateHole,
 };
 use kr_protocol::broker::{ActionProvenance, OfferedDecision};
 use kr_protocol::gateway::{NativeMethodClass, RichMethodEntry, RichOperation};
@@ -36,22 +36,62 @@ pub struct SelectionPlaces {
     pub hidden_when: Vec<RequestCondition>,
 }
 
+/// What the reader makes of one request of a selecting method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestReading {
+    /// The request selects the conversation its reply names.
+    Selects,
+    /// The request starts a thread the terminal never shows.
+    Hidden,
+    /// The route states conditions and the request cannot be tested against them: the server may
+    /// read it as a request the terminal never shows or as one it does, so it is neither.
+    Unreadable,
+}
+
 impl SelectionPlaces {
-    /// Returns true when `request` is one the terminal does not select a conversation by: the
-    /// route states conditions and the request's message meets every one.
+    /// Reads one request's message against the route's conditions.
     ///
-    /// A condition is met when the message holds, at its place, a value of the same kind and equal
-    /// to one of its values. A place the message does not have, a value of another kind (the text
-    /// `"true"` is not the boolean) and a number with a fraction do not meet it, so a request
-    /// whose place is absent or of another type selects, as a request of a route with no
-    /// conditions does.
+    /// A route that states none reads every request as a selection, and the message is not
+    /// parsed. On a route that states some, a request is hidden when its message holds, at every
+    /// condition's place, a value of the same kind and equal to one of the condition's values. A
+    /// place the message does not have, a value of another kind (the text `"true"` is not the
+    /// boolean) and a number with a fraction do not meet the condition, so a request whose member
+    /// is absent or of another type inside an object selects.
+    ///
+    /// A request whose message is not one the conditions can be read in is [`Unreadable`]: each
+    /// member a condition's place begins with must be an object. A server may take a positional
+    /// array for the parameters, which names no member, so the marks could be set in it and no
+    /// condition would find them. A member repeated inside an object takes its last occurrence
+    /// here, as it does in the server that reads the same message as a JSON value first.
+    ///
+    /// [`Unreadable`]: RequestReading::Unreadable
     #[must_use]
-    pub fn hides(&self, request: &serde_json::Value) -> bool {
-        !self.hidden_when.is_empty()
-            && self
-                .hidden_when
-                .iter()
-                .all(|condition| condition_met(condition, request))
+    pub fn read(&self, frame: &[u8]) -> RequestReading {
+        if self.hidden_when.is_empty() {
+            return RequestReading::Selects;
+        }
+        let Ok(request) = serde_json::from_slice::<serde_json::Value>(frame) else {
+            return RequestReading::Unreadable;
+        };
+        let readable = self.hidden_when.iter().all(|condition| {
+            matches!(
+                condition.place.segments.first(),
+                Some(FieldSegment::Member { name })
+                    if request.get(name).is_some_and(serde_json::Value::is_object)
+            )
+        });
+        if !readable {
+            return RequestReading::Unreadable;
+        }
+        if self
+            .hidden_when
+            .iter()
+            .all(|condition| condition_met(condition, &request))
+        {
+            RequestReading::Hidden
+        } else {
+            RequestReading::Selects
+        }
     }
 }
 
