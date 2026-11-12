@@ -127,7 +127,8 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
       if (recorded !== null && recorded.endedAt === null) return
       press = null
       let pressed: Choice & { readonly moved: boolean }
-      if (recorded !== null && performance.now() - (recorded.endedAt ?? 0) <= CLICK_WITHIN) {
+      // A cancelled press stays cancelled, however late its click comes.
+      if (recorded !== null && (recorded.moved || performance.now() - (recorded.endedAt ?? 0) <= CLICK_WITHIN)) {
         pressed = recorded
       } else {
         // A click with no press before it that has a place of its own: decided as a press at that place.
