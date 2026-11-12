@@ -429,6 +429,13 @@ test.describe('the links and the controls of a message in the pane', () => {
           expect(browsers(made).map((click) => click.named), `what the click named ${String(inside)} px inside the edge`).toEqual(['control Load this image'])
           expect(handlers(made), `clicks that the page added ${String(inside)} px inside the edge`).toEqual([])
         }
+        // A press that starts on the control gives the pressed look to no link, though a link's words are near.
+        const box = await control.boundingBox()
+        if (!box) throw new Error('the control has no box')
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height - 2)
+        await page.mouse.down()
+        expect(await pressedLooks(page), 'the pressed look of a press that starts on the control').toBe(0)
+        await page.mouse.up()
         expect(await openedLinks(page), 'links opened by presses on the control').toEqual([])
       })
     }
@@ -480,12 +487,24 @@ test.describe('a tap on the plain text near a link of a message', () => {
         // From just past what the engines adjust to the link's button, to the end of the link's reach.
         let added = 0
         for (const beside of [10, 12, 14, 16, 18, 20]) {
+          await page.evaluate(() => {
+            ;(document.activeElement as HTMLElement | null)?.blur()
+          })
           const made = await tapAndRead(page, words.right + beside, words.y)
           expect(made.opened, `links opened by a tap ${String(beside)} px after the words`).toEqual([DOCS])
           // The browser's click names the link (the engine's own adjustment) or the text (the page adds the link's click).
           const named = browsers(made.clicks).map((click) => click.named.split(' ')[0])
           expect(handlers(made.clicks).length, `clicks that the page added, for a browser click that named ${named.join()}`).toBe(named[0] === 'text' ? 1 : 0)
           added += handlers(made.clicks).length
+          if (named[0] === 'text') {
+            // The link's click has the tap's detail and the focus, and the browser's click on the text was stopped by nothing.
+            expect(handlers(made.clicks)[0]?.detail, 'the detail of the link’s click').toBe(1)
+            expect(
+              made.clicks.filter((click) => click.phase === 'bubble' && click.trusted).map((click) => click.named.split(' ')[0]),
+              'the browser’s click on the text reached the page'
+            ).toEqual(['text'])
+            expect(await page.evaluate(() => document.activeElement?.getAttribute('title')), 'the element that has the focus').toBe(DOCS)
+          }
         }
         expect(added, 'taps that the page gave to the link, where the browser named the text').toBeGreaterThan(0)
         if (ratio === 1) {
