@@ -161,3 +161,41 @@ fn a_private_root_that_no_journal_names_takes_its_remedy_from_its_own_handle() {
     assert!(text.contains("stay where they are"), "{text}");
     let _ = std::fs::remove_dir_all(&folder);
 }
+
+/// A removal that was stopped between the manifest's deletion and the directory's, or whose last
+/// deletion failed, leaves an empty data directory that a new installation accepts. The next
+/// removal removes it and ends clean, in both of its modes, and says what is true when a program
+/// still holds the directory: it is empty, a new installation accepts it, and the next removal
+/// finishes it.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn an_empty_data_directory_that_an_earlier_removal_left_is_finished_by_the_next_removal() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let folder = inherited_folder();
+    parent_of(&folder);
+    let paths = paths_in(&folder);
+    for quiet in [true, false] {
+        drop(install::make_data_directory(&paths).unwrap());
+        install::remove(&paths, quiet).expect("the empty directory is finished");
+        assert!(!paths.data.exists(), "quiet {quiet}: the directory is gone");
+    }
+
+    // Held open for reading and writing and not for deleting: it cannot be removed, and the words
+    // are those of an empty directory.
+    drop(install::make_data_directory(&paths).unwrap());
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .custom_flags(0x0200_0000)
+        .open(&paths.data)
+        .unwrap();
+    let text = install::remove(&paths, true)
+        .expect_err("the directory is held")
+        .to_string();
+    drop(held);
+    assert!(text.contains("accepts an empty data directory"), "{text}");
+    assert!(!text.contains("refuses until they are gone"), "{text}");
+    install::remove(&paths, false).expect("the next removal finishes it");
+    assert!(!paths.data.exists());
+    let _ = std::fs::remove_dir_all(&folder);
+}
