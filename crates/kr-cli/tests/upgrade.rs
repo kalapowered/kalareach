@@ -16,8 +16,8 @@
 //! the release they chose, or that they have none, so run them with `--nocapture` to see it.
 //! The suite is behind the `upgrade-suite` feature, because building a second tree takes minutes
 //! and a network. A tree and its build take about 12 GB, and `KR_UPGRADE_CACHE` names another
-//! absolute folder to keep them in, one that holds nothing but this suite's trees, since every
-//! folder in it that no case selects is removed.
+//! absolute folder to keep them in. The suite removes from it only the folders it made, which are
+//! named by a commit, and only when no case selects them.
 
 #![cfg(unix)]
 #![allow(dead_code, unused_imports)]
@@ -141,8 +141,11 @@ fn recorded(record: &str, name: &str) -> String {
 }
 
 /// The variable that names the folder trees of the release before are built and kept in, in place
-/// of the one under the person's home. Only cargo, rustc and this test process read that folder:
-/// every program a case starts is copied out of it first (see [`Previous::built`]).
+/// of the one under the person's home. Only the build (cargo, rustc and git), the copy of each
+/// program and this test process read that folder: every program a case starts is copied out of
+/// it first (see [`Previous::built`]). A macOS debug build's debug map names the object files in
+/// its target folder, and only a backtrace's symbols read them, so a build made under this
+/// variable carries no debug information and a copy never refers back to the folder.
 const CACHE_ROOT: &str = "KR_UPGRADE_CACHE";
 
 /// The folder the variable names, where it is set. It has to be an absolute path, since a relative
@@ -159,6 +162,13 @@ fn configured_cache_root(value: Option<&std::ffi::OsStr>) -> Result<Option<PathB
             "{CACHE_ROOT} has to name an absolute path, and holds {value:?}"
         ))
     }
+}
+
+/// Whether `name` is the name of a folder this suite makes in the cache: a commit's, in 40
+/// hexadecimal digits. The cache may be a folder a person named, so nothing else in it is the
+/// suite's to remove.
+fn is_a_commit_name(name: &str) -> bool {
+    name.len() == 40 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Where trees of the release before are built and kept between runs.
@@ -183,14 +193,31 @@ fn the_cache_folder_variable_takes_an_absolute_path_and_nothing_else() {
     use std::ffi::OsStr;
     assert_eq!(configured_cache_root(None), Ok(None));
     assert_eq!(
-        configured_cache_root(Some(OsStr::new("/Volumes/Storage/upgrade"))),
-        Ok(Some(PathBuf::from("/Volumes/Storage/upgrade")))
+        configured_cache_root(Some(OsStr::new("/srv/upgrade"))),
+        Ok(Some(PathBuf::from("/srv/upgrade")))
     );
     for refused in ["upgrade", "./upgrade", "../upgrade", ""] {
         assert!(
             configured_cache_root(Some(OsStr::new(refused))).is_err(),
             "{refused:?} is not an absolute path"
         );
+    }
+}
+
+#[test]
+fn only_a_commits_folder_in_the_cache_is_the_suites_to_remove() {
+    assert!(is_a_commit_name("94ca81cdd92a093d64008051b253c90c5f757fbb"));
+    for kept in [
+        "",
+        ".lock",
+        "release-work",
+        "ios-packages",
+        "94ca81cdd92a",
+        "94ca81cdd92a093d64008051b253c90c5f757fb",
+        "94ca81cdd92a093d64008051b253c90c5f757fbbb",
+        "94ca81cdd92a093d64008051b253c90c5f757fbz",
+    ] {
+        assert!(!is_a_commit_name(kept), "{kept:?} is not the suite's");
     }
 }
 
@@ -434,15 +461,13 @@ fn build_previous(commit: &str) -> PathBuf {
     let kept = trees_a_run_builds();
     for entry in std::fs::read_dir(&cache).expect("the cache") {
         let path = entry.expect("an entry").path();
-        if !path.is_dir() || path == place {
+        let name = path.file_name().and_then(|name| name.to_str());
+        if !path.is_dir() || path == place || !name.is_some_and(is_a_commit_name) {
             continue;
         }
         // An extraction that did not finish has no stamp.
         let finished = std::fs::metadata(path.join("stamp")).is_ok();
-        let selected = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| kept.iter().any(|commit| commit == name));
+        let selected = name.is_some_and(|name| kept.iter().any(|commit| commit == name));
         if !finished || !selected {
             std::fs::remove_dir_all(&path).expect("an old or unfinished tree goes");
         }
@@ -482,7 +507,8 @@ fn build_previous(commit: &str) -> PathBuf {
         // The packages build every binary they have: the release before is these programs of it.
         // The environment is this process's without what a test run sets for this tree, so the
         // older tree builds with its own settings and the toolchain it pins.
-        let output = Command::new("cargo")
+        let mut build = Command::new("cargo");
+        build
             .current_dir(&tree)
             .env_clear()
             .envs(std::env::vars_os().filter(|(name, _)| {
@@ -491,7 +517,13 @@ fn build_previous(commit: &str) -> PathBuf {
                 (!name.starts_with("CARGO") || carried.iter().any(|kept| name.starts_with(kept)))
                     && !["RUSTFLAGS", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER"].contains(&&*name)
             }))
-            .env("CARGO_TARGET_DIR", place.join("target"))
+            .env("CARGO_TARGET_DIR", place.join("target"));
+        if std::env::var_os(CACHE_ROOT).is_some() {
+            // The programs are copied away from this folder, and a copy that carried a debug map
+            // would still name the folder's object files.
+            build.env("CARGO_PROFILE_DEV_DEBUG", "0");
+        }
+        let output = build
             .args(["build", "--locked", "-p", "kr-cli", "-p", "kr-controller"])
             .args(["-p", "kr-worker", "-p", "kr-hook", "-p", "kr-plugin-host"])
             .output()
