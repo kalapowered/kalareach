@@ -10,7 +10,7 @@
 #   s0   the proofs, the keychain boundary and the application's lifecycle with push started, 20 minutes
 #   s1   push to this phone through Firebase, with the person not touching notifications, 30 minutes
 #   s2a  recovery, the keyboard and rotation, the file pickers and the camera: person at the phone, 30 minutes
-#   s2b  the accessibility audit, target sizes and text size: person at the phone, 15 minutes
+#   s2b  the accessibility audit, target sizes, text size and the taps on a message's links: person at the phone, 30 minutes
 #   s3a  the microphone refused: person at the phone, 10 minutes
 #   s3b  the microphone allowed and a change of route: person at the phone, 15 minutes
 #   s4   the screen locked and unlocked under the audio check: person at the phone, 10 minutes
@@ -80,8 +80,10 @@ require_target() {
 
 # What a build is for: the phone's own platform, or the simulator's.
 sdk() { [ "$target" = device ] && echo iphoneos || echo iphonesimulator; }
+# KR_OS names the simulator's runtime version where the latest one has no such device: xcodebuild reads a
+# destination with no OS as the latest.
 destination() {
-  if [ "$target" = device ]; then echo "platform=iOS,id=$KR_DEVICE"; else echo "platform=iOS Simulator,name=$KR_DEVICE"; fi
+  if [ "$target" = device ]; then echo "platform=iOS,id=$KR_DEVICE"; else echo "platform=iOS Simulator,${KR_OS:+OS=$KR_OS,}name=$KR_DEVICE"; fi
 }
 
 # MARK: One thing at a time on the target
@@ -562,14 +564,14 @@ session_tests() { # <name>
     s0) echo "ProofTests/testWhatATestSaysReachesTheScriptWhileItRuns ProofTests/testHomePressesKeepThePhoneAwake ProofTests/testTheApplicationDrawsItsOwnWindowsForTheScriptToCopy KeychainTests LifecycleTests" ;;
     s1) echo "PushTests/testALegWithTheApplicationTerminated PushTests/testALegWithTheApplicationInTheBackground" ;;
     s2a) echo "RecoveryTests LayoutTests PickerTests" ;;
-    s2b) echo "AccessibilityTests" ;;
+    s2b) echo "AccessibilityTests LinkTapTests" ;;
     s3a) echo "AudioTests/testARefusedMicrophoneIsSaidAndNothingOpens" ;;
     s3b) echo "AudioTests/testAnAllowedMicrophoneOpensTheSessionAndAChangeOfRouteIsCounted" ;;
     s4) echo "AudioTests/testAudioCarriesOnThroughALockedScreen" ;;
     *) return 1 ;;
   esac
 }
-session_minutes() { case $1 in s0) echo 20 ;; s1) echo 30 ;; s2a) echo 30 ;; s2b) echo 15 ;; s3a) echo 10 ;; s3b) echo 15 ;; s4) echo 10 ;; esac; }
+session_minutes() { case $1 in s0) echo 20 ;; s1) echo 30 ;; s2a) echo 30 ;; s2b) echo 30 ;; s3a) echo 10 ;; s3b) echo 15 ;; s4) echo 10 ;; esac; }
 # Which build of the application a session installs: s0 and s1 hold Firebase's configuration, s2a and s2b run the harness page.
 session_app() { case $1 in s0 | s1) echo app ;; s2a | s2b) echo harness-nofirebase ;; *) echo app-nofirebase ;; esac; }
 
