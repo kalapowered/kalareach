@@ -547,6 +547,12 @@ const _: () = {
     let _: PhantomData<PrivGuard> = PhantomData;
 };
 
+/// Whether this process runs as the system. A case that makes objects owned by another account
+/// has nothing to show under any other token, which cannot set that owner.
+fn runs_as_the_system() -> bool {
+    kr_boundary_windows::win::token::current_user().is_ok_and(|user| user.to_text() == "S-1-5-18")
+}
+
 /// Every subset of the three privileges, as a name and a list.
 fn subsets() -> Vec<(String, Vec<Privilege>)> {
     let all = [
@@ -598,6 +604,12 @@ fn root_with_hostile_objects(
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_and_restore() {
+    if !runs_as_the_system() {
+        eprintln!(
+            "SKIPPED: not run under this token: the case makes objects owned by another account, which only the system's token may set"
+        );
+        return;
+    }
     // The service's token holds its privileges and has none of them enabled, and holds no further
     // power that would remove a hostile object by itself: a token that has any of them enabled is
     // not the service's form, and the case would show nothing. The service manager takes away from
