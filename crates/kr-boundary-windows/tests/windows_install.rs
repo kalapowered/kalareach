@@ -148,7 +148,7 @@ fn require_clean_machine() {
             left.push(format!("the account {name}"));
         }
     }
-    let paths = Paths::system();
+    let paths = Paths::system().expect("the system's folders are read");
     if paths.data.exists() {
         left.push("the data directory".to_owned());
     }
