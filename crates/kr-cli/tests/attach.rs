@@ -889,7 +889,8 @@ fn mouse_tracking(stream: &[u8]) -> Option<u16> {
 /// replay was shown in and not of every terminal.
 fn mouse_encoding(stream: &[u8]) -> Option<u16> {
     let mut encoding = None;
-    let mut rest = stream;
+    let stream = without_padding(stream);
+    let mut rest = stream.as_slice();
     while let Some(at) = rest.windows(3).position(|window| window == b"\x1b[?") {
         rest = &rest[at + 3..];
         // The parameters, which may be several, and the letter that ends them.
@@ -915,11 +916,22 @@ fn mouse_encoding(stream: &[u8]) -> Option<u16> {
     encoding
 }
 
+/// What a terminal reads of a stream: NUL and DEL are padding that every terminal discards, inside
+/// a sequence as well as outside one, so `ESC NUL [ ? 1006 l` is the reset `ESC [ ? 1006 l`.
+fn without_padding(stream: &[u8]) -> Vec<u8> {
+    stream
+        .iter()
+        .copied()
+        .filter(|byte| !matches!(byte, 0x00 | 0x7f))
+        .collect()
+}
+
 /// The mouse encoding a stream leaves a terminal in, in a model of xterm: a set of `1005` or `1006`
 /// replaces the one in force, and a reset returns the default only when it names the one in force.
 fn mouse_encoding_by_xterm(stream: &[u8]) -> Option<u16> {
     let mut encoding = None;
-    let mut rest = stream;
+    let stream = without_padding(stream);
+    let mut rest = stream.as_slice();
     while let Some(at) = rest.windows(3).position(|window| window == b"\x1b[?") {
         rest = &rest[at + 3..];
         // The parameters, which may be several, and the letter that ends them.
@@ -1466,6 +1478,75 @@ async fn an_application_that_resets_a_mouse_encoding_it_is_not_in_leaves_the_ter
         "the reattachment leaves the encoding the live output left: {}",
         String::from_utf8_lossy(&drawn).escape_debug()
     );
+}
+
+/// KR-REQ-01.11: a mouse reset with padding inside its escape is read by the attachment as the
+/// session reads it, so the terminal is not written a set of the encoding the application cleared.
+///
+/// NUL and DEL after an `ESC` are padding that every terminal discards, and the session keeps the
+/// sequence across them: `ESC NUL [ ? 1006 l` clears 1006. An attachment that took the padding for
+/// the end of the sequence would still hold 1006 when the application's `?1005l` came, and would
+/// write the set of 1006 that puts Terminal.app and iTerm in an encoding the application had left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mouse_reset_with_padding_inside_its_escape_is_not_followed_by_a_set_of_the_encoding_it_cleared()
+ {
+    for padding in ["\\000", "\\177"] {
+        let hosted = hosted(&format!(
+            "printf 'ready\\r\\n'; IFS= read -r go; \
+             printf '\\033[?1000;1006h\\033{padding}[?1006l\\033[?1005l'; \
+             printf 'live-done\\r\\n'; exec cat"
+        ))
+        .await;
+        let display = hosted.display.get().to_string();
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("opens a terminal");
+        let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+        let (queries, keys) =
+            answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
+        let mut shell = pty
+            .slave
+            .spawn_command(shell_running(
+                &hosted,
+                &format!("{} attach {display}", kr().display()),
+            ))
+            .expect("starts the shell");
+        output.expect_within(
+            b"ready",
+            LIVENESS_DEADLINE,
+            "the session's screen reached the terminal",
+        );
+        answered(&output, queries);
+        {
+            let mut writer = keys.lock().expect("the writer is not poisoned");
+            writer.write_all(b"go\r").expect("types into the terminal");
+            writer.flush().expect("and it reaches the command");
+        }
+        output.expect_within(
+            b"live-done",
+            LIVENESS_DEADLINE,
+            "the application's output reached the terminal",
+        );
+        let live = output.bytes();
+        let _ = shell.kill();
+        let _ = shell.wait();
+        for (model, held) in [
+            ("Terminal.app and iTerm", mouse_encoding(&live)),
+            ("xterm", mouse_encoding_by_xterm(&live)),
+        ] {
+            assert_eq!(
+                held,
+                None,
+                "{model} holds the default encoding the session holds after a reset padded with {padding}: {}",
+                String::from_utf8_lossy(&live).escape_debug()
+            );
+        }
+    }
 }
 
 /// KR-REQ-08.84: an attach that fails after the handshake still leaves the terminal its own modes.
