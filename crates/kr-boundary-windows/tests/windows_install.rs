@@ -4790,3 +4790,173 @@ fn a_stop_does_not_free_the_pipes_name_before_the_listener_ends() {
         "the name was free after the stop while the listener was still alive"
     );
 }
+
+/// What the installer's client does with a pipe it opened, one call after the other, with the rights
+/// the open was given: the open, the server's process number, a write, a read that is answered and a
+/// read that is cancelled. The first call that fails is named.
+#[cfg(feature = "testing")]
+fn the_clients_calls_with(access: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, GetLastError, INVALID_HANDLE_VALUE,
+        WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT, WriteFile,
+    };
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    let name = ffi::wide(kr_boundary_windows::win::pipe::NAME);
+    // SAFETY: the name is NUL-terminated; the result is checked.
+    let opened = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            access,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            std::ptr::null_mut(),
+        )
+    };
+    if opened == INVALID_HANDLE_VALUE {
+        // SAFETY: reads the calling thread's last error.
+        return Err(format!("the open: error {}", unsafe { GetLastError() }));
+    }
+    let pipe = ffi::Handle::new(opened, "the broker's pipe").unwrap();
+    let mut server = 0_u32;
+    // SAFETY: the pipe is a connected client end.
+    if unsafe { GetNamedPipeServerProcessId(pipe.raw(), &raw mut server) } == 0 {
+        // SAFETY: reads the calling thread's last error.
+        return Err(format!("the server's process number: error {}", unsafe {
+            GetLastError()
+        }));
+    }
+    // One transfer: `start` begins it on an event of its own and `done` waits for it, up to five
+    // seconds, and gives the platform's error or the count.
+    let transfer = |label: &str,
+                    cancel: bool,
+                    start: &dyn Fn(*mut OVERLAPPED) -> i32|
+     -> Result<u32, String> {
+        // SAFETY: makes an event that is owned below.
+        let event = ffi::Handle::new(
+            unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) },
+            "an event",
+        )
+        .unwrap();
+        // SAFETY: an all-zero record is how a transfer's record begins.
+        let mut record: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+        record.hEvent = event.raw();
+        if start(&raw mut *record) == 0 {
+            // SAFETY: reads the calling thread's last error.
+            let code = unsafe { GetLastError() };
+            if code != ERROR_IO_PENDING {
+                return Err(format!("{label}: error {code}"));
+            }
+        }
+        if cancel {
+            // SAFETY: the transfer belongs to this handle and its record lives here.
+            unsafe { CancelIoEx(pipe.raw(), &raw mut *record) };
+        }
+        // SAFETY: the event is open.
+        if unsafe { WaitForSingleObject(event.raw(), 5000) } != WAIT_OBJECT_0 {
+            return Err(format!("{label}: the transfer did not end in five seconds"));
+        }
+        let mut count = 0_u32;
+        // SAFETY: the transfer has ended, so the result is read without waiting.
+        if unsafe { GetOverlappedResult(pipe.raw(), &raw mut *record, &raw mut count, 0) } == 0 {
+            // SAFETY: reads the calling thread's last error.
+            let code = unsafe { GetLastError() };
+            return if cancel && code == ERROR_OPERATION_ABORTED {
+                Ok(0)
+            } else {
+                Err(format!("{label}: error {code}"))
+            };
+        }
+        Ok(count)
+    };
+    let mut request = Vec::new();
+    kr_boundary_windows::frame::write(&mut request, &Request::Status {}).unwrap();
+    transfer("the write", false, &|record| {
+        // SAFETY: the buffer outlives the call and the transfer ends before this function does.
+        unsafe {
+            WriteFile(
+                pipe.raw(),
+                request.as_ptr(),
+                request.len() as u32,
+                std::ptr::null_mut(),
+                record,
+            )
+        }
+    })?;
+    let mut answer = vec![0_u8; 512];
+    let buffer = answer.as_mut_ptr();
+    let length = answer.len() as u32;
+    transfer("the read", false, &|record| {
+        // SAFETY: the buffer outlives the call and the transfer ends before this function does.
+        unsafe { ReadFile(pipe.raw(), buffer, length, std::ptr::null_mut(), record) }
+    })?;
+    transfer("the cancelled read", true, &|record| {
+        // SAFETY: as above.
+        unsafe { ReadFile(pipe.raw(), buffer, length, std::ptr::null_mut(), record) }
+    })?;
+    Ok(())
+}
+
+/// The client's open asks for the least rights its calls need: with the rights it asks for every
+/// call of the client works, and with any one of them taken away a call fails. A right that no call
+/// uses would let a client of the pipe do more than the installer ever does, and the same value is
+/// the grant in the pipe's list. Run under each token: the system's own entry of the list refuses
+/// nothing, so the case asks the pipe as it stands and the list is not the reason for a failure.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+fn the_clients_open_asks_for_the_least_rights_its_calls_need() {
+    use kr_boundary_windows::pipe_access::CLIENT;
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
+    require_clean_machine();
+    let mut table = Vec::new();
+    let mut sets = vec![CLIENT];
+    sets.extend(
+        (0..32)
+            .map(|bit| 1_u32 << bit)
+            .filter(|bit| CLIENT & bit != 0)
+            .map(|bit| CLIENT & !bit),
+    );
+    for access in sets {
+        let stop = Stop::new().unwrap();
+        let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+        // A server that takes the client, answers one request and then reads until the client goes.
+        let server = std::thread::spawn(move || {
+            let Ok(Some(mut connection)) = listener.accept() else {
+                return;
+            };
+            if kr_boundary_windows::frame::read::<_, Request>(&mut connection).is_ok() {
+                let _ = kr_boundary_windows::frame::write(
+                    &mut connection,
+                    &Response::Status { maintenance: false },
+                );
+            }
+            let _ = kr_boundary_windows::frame::read::<_, Request>(&mut connection);
+        });
+        let outcome = the_clients_calls_with(access);
+        stop.set();
+        server.join().unwrap();
+        table.push((access, outcome));
+    }
+    for (access, outcome) in &table {
+        eprintln!("rights {access:#x}: {outcome:?}");
+    }
+    assert_eq!(
+        table[0].1,
+        Ok(()),
+        "the calls with the rights the client asks for"
+    );
+    for (access, outcome) in &table[1..] {
+        assert!(
+            outcome.is_err(),
+            "the calls work with {access:#x}, one right fewer than the client asks for: that right is not needed"
+        );
+    }
+}
