@@ -739,8 +739,9 @@ fn a_prior_record_made_after_the_inspection_is_left_and_named() {
     require_clean_guest();
     let mut clean = Cleanup::default();
     let (start, running) = appid_state();
-    // The start value goes back to what it was however the case ends: a removal that used the
-    // record would have changed it.
+    // The start value and the running state go back to what they were however the case ends: a
+    // removal that used the record would have changed them, and one that ended the service would
+    // leave it stopped.
     clean.undo(move || {
         let _ = Command::new("reg")
             .args([
@@ -755,6 +756,9 @@ fn a_prior_record_made_after_the_inspection_is_left_and_named() {
                 "/f",
             ])
             .output();
+        if running {
+            let _ = Command::new("sc").args(["start", "AppIDSvc"]).output();
+        }
     });
     let (_folder, paths) = data_parent_with_paths(&mut clean);
     installed_data_directory_with(&paths, |manifest| {

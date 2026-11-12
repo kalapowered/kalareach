@@ -1585,9 +1585,14 @@ fn a_stop_that_comes_after_a_failed_launch_ends_the_run_with_the_launchs_own_err
     let fixture = Fixture::new();
     let stop = Stop::new().unwrap();
     let _cleared = HookCleared;
+    let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     proof_testing::after_the_launch(Some(Box::new({
         let stop = std::sync::Arc::clone(&stop);
-        move || stop.set()
+        let hook_ran = std::sync::Arc::clone(&hook_ran);
+        move || {
+            hook_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            stop.set();
+        }
     })));
     testing::fail_next_launch_after_creation();
     let resumes = testing::resumes();
@@ -1597,9 +1602,19 @@ fn a_stop_that_comes_after_a_failed_launch_ends_the_run_with_the_launchs_own_err
         begun + Duration::from_secs(60),
         Some(&stop),
     );
+    // The injected failure itself comes back, and the hook that sets the stop ran after the launch
+    // ended: an unrelated early failure of the platform would satisfy neither.
     assert!(
-        matches!(&ran, Err(LaunchError::Platform(_))),
+        matches!(
+            &ran,
+            Err(LaunchError::Platform(failure))
+                if failure.what == "a failure after the process was made, asked for by a case"
+        ),
         "the failed launch's own error comes back, its end proved: {ran:?}"
+    );
+    assert!(
+        hook_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the hook that sets the stop after the launch did not run"
     );
     assert!(
         begun.elapsed() < Duration::from_secs(10),
