@@ -1607,6 +1607,84 @@ fn a_token_that_holds_the_administrators_group_deny_only_gets_no_capture_pipe() 
     );
 }
 
+/// Opens the broker's pipe for the rights of a client, as the thread's own token or the token
+/// this thread impersonates, and closes it at once. A pipe whose instances are all taken is waited
+/// for a few seconds.
+fn open_the_brokers_pipe() -> Result<(), u32> {
+    use kr_boundary_windows::pipe_access::CLIENT;
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+    };
+    let name = kr_boundary_windows::win::ffi::wide(kr_boundary_windows::win::pipe::NAME);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        // SAFETY: the name is NUL-terminated; the result is checked.
+        let opened = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                CLIENT,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_IDENTIFICATION,
+                std::ptr::null_mut(),
+            )
+        };
+        if opened != INVALID_HANDLE_VALUE {
+            drop(Handle::new(opened, "the broker's pipe").unwrap());
+            return Ok(());
+        }
+        // SAFETY: reads the calling thread's last error.
+        let code = unsafe { GetLastError() };
+        if code != ERROR_PIPE_BUSY || Instant::now() >= until {
+            return Err(code);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The broker's pipe lists the system, the Administrators group and the enrolled people. A
+/// boundary account is in none of them, so its token is refused when it opens the pipe for the
+/// rights of a client, where the system opens it.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_boundary_account_cannot_open_the_brokers_pipe_that_the_system_opens() {
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
+    let fixture = Fixture::new();
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    // A broker that takes each client and lets it go, so that the next one finds an instance.
+    let server = std::thread::spawn(move || {
+        while let Ok(Some(held)) = listener.accept() {
+            drop(held);
+        }
+    });
+    assert_eq!(open_the_brokers_pipe(), Ok(()), "the system opens the pipe");
+    let token = fixture.token.raw() as usize;
+    let refused = std::thread::spawn(move || {
+        // SAFETY: the token handle outlives the thread because the caller joins it.
+        unsafe {
+            assert_ne!(
+                ImpersonateLoggedOnUser(token as HANDLE),
+                0,
+                "the token can be impersonated"
+            );
+        }
+        let result = open_the_brokers_pipe();
+        // SAFETY: ends the impersonation this thread began.
+        unsafe {
+            RevertToSelf();
+        }
+        result
+    })
+    .join()
+    .unwrap();
+    stop.set();
+    server.join().unwrap();
+    assert_eq!(refused, Err(5), "access is denied to the boundary account");
+}
+
 /// The installer's own event log queries start a program of its own token through the proof's
 /// runner, with no group on the process or the thread. That runs and is read to its end for the
 /// system and for an elevated administrator whose token's default owner is the administrator's own

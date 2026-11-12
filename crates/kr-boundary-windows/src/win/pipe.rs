@@ -19,8 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
@@ -42,6 +41,8 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+use crate::pipe_access;
+
 use super::ffi::{Handle, Result, Sid, error, last, wide};
 
 /// The name the broker's pipe has.
@@ -49,10 +50,6 @@ pub const NAME: &str = r"\\.\pipe\KalaReachBoundary";
 
 /// The most pipe instances the service keeps open at once.
 pub const MAX_INSTANCES: u32 = 8;
-
-/// The rights a client has on the pipe: read, write and read the attributes. Not the right to
-/// make another instance, which is the same bit as appending.
-const CLIENT_RIGHTS: &str = "0x120183";
 
 /// An event that, once set, ends every wait of every connection that holds it.
 pub struct Stop(Handle);
@@ -430,9 +427,9 @@ impl Listener {
     ///
     /// Returns the platform's error when the name is already in use or the pipe cannot be made.
     pub fn bind(people: &[Sid], stop: Arc<Stop>) -> Result<Listener> {
-        let mut list = format!("D:P(A;;GA;;;SY)(A;;{CLIENT_RIGHTS};;;BA)");
+        let mut list = format!("D:P(A;;GA;;;SY){}", pipe_access::entry("BA"));
         for person in people {
-            list.push_str(&format!("(A;;{CLIENT_RIGHTS};;;{})", person.to_text()));
+            list.push_str(&pipe_access::entry(&person.to_text()));
         }
         let text = wide(&list);
         let mut descriptor: *mut c_void = null_mut();
@@ -547,11 +544,12 @@ impl Listener {
 pub fn connect(expected_server: u32) -> Result<Connection> {
     let name = wide(NAME);
     // SAFETY: the name is NUL-terminated; the client asks for identification only, so the server
-    // learns who is calling and cannot act as the caller.
+    // learns who is calling and cannot act as the caller, and for the rights of a client and no
+    // more, which are what the pipe's list grants it.
     let pipe = unsafe {
         CreateFileW(
             name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            pipe_access::CLIENT,
             0,
             null(),
             OPEN_EXISTING,

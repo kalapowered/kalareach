@@ -25,6 +25,7 @@
 //! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
 //! | [`messages`] | The product's own messages whose exact words are fixed: the installer's wait for application control, and the broker's answer while its proof has not passed |
 //! | [`operation`] | The eight commands a request may name: their argument tables, the settings every command runs with, the one rule for line endings, and the checks of the repository's state |
+//! | [`pipe_access`] | The rights of a client of the broker's pipe, one value for the entry the broker grants and the request the installer makes |
 //! | [`state`] | What the doctor says in each state of the installation |
 //! | [`window`] | When the proof's search for a refusal is over: a run cut by the window's own end ends it, a run that failed does not |
 //!
@@ -58,6 +59,7 @@ pub mod messages;
 pub mod names;
 pub mod notice;
 pub mod operation;
+pub mod pipe_access;
 pub mod policy;
 pub mod quote;
 pub mod refusal;
