@@ -204,19 +204,29 @@ function choose(pane: HTMLElement, x: number, y: number): Choice {
   })
   const index = linkAt(
     { x, y },
-    near.map(wordsOf),
+    near.map((link) => ({ words: wordsOf(link), line: lineOf(link), box: rectsOf(link.getClientRects()) })),
     { least, beside },
-    pane.getBoundingClientRect(),
-    controls.map(({ box }) => box)
+    pane.getBoundingClientRect()
   )
   return { link: index === null ? null : (near[index] ?? null), control: null }
+}
+
+/** The height of the lines a link stands on, which is its box's own height before the reach is added; 0 for `normal`. */
+function lineOf(link: HTMLElement): number {
+  const height = parseFloat(getComputedStyle(link).lineHeight)
+  return Number.isFinite(height) ? height : 0
 }
 
 /** The rectangles of a link's words, one for each line its label covers. */
 function wordsOf(link: HTMLElement): Rect[] {
   const range = document.createRange()
   range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
-  return Array.from(range.getClientRects())
+  return rectsOf(range.getClientRects())
+}
+
+/** The rectangles of a list that have a size. */
+function rectsOf(list: DOMRectList): Rect[] {
+  return Array.from(list)
     .filter((rect) => rect.width > 0 && rect.height > 0)
     .map((rect) => ({ left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom }))
 }
