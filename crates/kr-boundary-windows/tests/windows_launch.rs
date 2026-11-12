@@ -25,9 +25,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
-    GetAce, GetAclInformation, GetSecurityDescriptorControl, ImpersonateLoggedOnUser,
-    OWNER_SECURITY_INFORMATION, RevertToSelf, SECURITY_ATTRIBUTES,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateRestrictedToken,
+    DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+    GetTokenInformation, ImpersonateLoggedOnUser, OWNER_SECURITY_INFORMATION, RevertToSelf,
+    SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode;
@@ -36,8 +38,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetExitCodeProcess, GetThreadId, OpenProcess, OpenThread,
-    WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, GetExitCodeProcess, GetThreadId, OpenProcess,
+    OpenProcessToken, OpenThread, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
@@ -451,6 +453,8 @@ struct Security {
     owner: String,
     protected: bool,
     allowed: Vec<(String, u32)>,
+    /// The flags of each entry, in the list's order: a nonzero value inherits or audits.
+    flags: Vec<u8>,
 }
 
 fn security_of(object: HANDLE) -> Security {
@@ -481,6 +485,7 @@ fn security_of(object: HANDLE) -> Security {
             AclSizeInformation,
         );
         let mut allowed = Vec::new();
+        let mut flags = Vec::new();
         for index in 0..size.AceCount {
             let mut ace: *mut c_void = std::ptr::null_mut();
             GetAce(dacl, index, &raw mut ace);
@@ -488,11 +493,13 @@ fn security_of(object: HANDLE) -> Security {
             assert_eq!((*ace).Header.AceType, 0, "every entry allows");
             let sid = Sid::from_ptr((&raw mut (*ace).SidStart).cast());
             allowed.push((sid.to_text(), (*ace).Mask));
+            flags.push((*ace).Header.AceFlags);
         }
         let found = Security {
             owner: Sid::from_ptr(owner).to_text(),
             protected: control & 0x1000 != 0,
             allowed,
+            flags,
         };
         LocalFree(descriptor);
         found
@@ -1427,7 +1434,7 @@ fn pipe_name_length(pipe: &Handle) -> usize {
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn the_capture_pipe_has_an_explicit_descriptor_that_only_the_system_can_open() {
+fn the_capture_pipe_has_a_descriptor_for_the_system_and_the_administrators_alone() {
     let fixture = Fixture::new();
     let (read, _write) = pipe().unwrap();
     let found = security_of(read.raw());
@@ -1439,9 +1446,16 @@ fn the_capture_pipe_has_an_explicit_descriptor_that_only_the_system_can_open() {
             .iter()
             .map(|(sid, _)| sid.as_str())
             .collect::<Vec<_>>(),
-        [SYSTEM_SID],
-        "the system is the only entry"
+        [SYSTEM_SID, ADMINISTRATORS_SID],
+        "the system and the Administrators are the only entries"
     );
+    assert_eq!(found.flags, [0, 0], "no entry inherits or audits");
+    assert_eq!(
+        found.allowed[0].1, found.allowed[1].1,
+        "the two entries give the same rights, {:#x} and {:#x}",
+        found.allowed[0].1, found.allowed[1].1
+    );
+    assert_ne!(found.allowed[0].1, 0, "the entries give rights");
     // The pipe is anonymous: it has no entry in the pipe namespace, so no account can open it by a
     // name. (Opening the namespace's root, `\\.\pipe\`, succeeds for every account and says nothing
     // of any pipe.) A pipe that has no name is reached only through a handle taken from a process
@@ -1487,6 +1501,109 @@ fn a_capture_pipe_is_made_and_carries_bytes_for_the_system_and_for_an_elevated_a
     assert!(
         held.ended,
         "the end is the pipe's own once the writer closed"
+    );
+}
+
+/// Makes a pipe while this thread impersonates a copy of the process token in which the
+/// Administrators group is deny-only, as an unelevated session of an administrator has it.
+fn pipe_made_with_the_administrators_group_deny_only() -> Result<(), u32> {
+    let mut process_token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the current process pseudo-handle is always valid; the out-parameter is local.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+            &raw mut process_token,
+        )
+    };
+    assert_ne!(opened, 0, "this process's token is opened");
+    let process_token = Handle::new(process_token, "this process's token").unwrap();
+    let administrators = Sid::parse(ADMINISTRATORS_SID).unwrap();
+    let disable = SID_AND_ATTRIBUTES {
+        Sid: administrators.as_ptr(),
+        Attributes: 0,
+    };
+    let mut filtered: HANDLE = std::ptr::null_mut();
+    // SAFETY: the token and the group are open and the out-parameter is local.
+    let made = unsafe {
+        CreateRestrictedToken(
+            process_token.raw(),
+            0,
+            1,
+            &raw const disable,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &raw mut filtered,
+        )
+    };
+    assert_ne!(made, 0, "the token with the group deny-only is made");
+    let filtered = Handle::new(filtered, "the filtered token").unwrap();
+    let token = filtered.raw() as usize;
+    std::thread::spawn(move || {
+        // SAFETY: the token handle outlives the thread because the caller joins it.
+        unsafe {
+            assert_ne!(
+                ImpersonateLoggedOnUser(token as HANDLE),
+                0,
+                "the token can be impersonated"
+            );
+        }
+        let result = pipe().map(|_| ()).map_err(|error| error.code);
+        // SAFETY: ends the impersonation this thread began.
+        unsafe {
+            RevertToSelf();
+        }
+        result
+    })
+    .join()
+    .unwrap()
+}
+
+/// Whether this process runs as the system, whose user entry the descriptor names itself.
+fn runs_as_the_system() -> bool {
+    let mut process_token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the current process pseudo-handle is always valid; the out-parameter is local.
+    let opened =
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut process_token) };
+    assert_ne!(opened, 0, "this process's token is opened");
+    let process_token = Handle::new(process_token, "this process's token").unwrap();
+    let mut buffer = vec![0_u8; 512];
+    let mut length = 0_u32;
+    // SAFETY: the buffer is the length given and the token is open.
+    let read = unsafe {
+        GetTokenInformation(
+            process_token.raw(),
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &raw mut length,
+        )
+    };
+    assert_ne!(read, 0, "the token's user is read");
+    // SAFETY: the buffer holds a TOKEN_USER whose identifier points into the same buffer.
+    let user = unsafe { Sid::from_ptr((*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid) };
+    user.to_text() == SYSTEM_SID
+}
+
+/// The entry that names the Administrators group is for a token that holds the group enabled,
+/// which only an elevated administrator's does: a token of the same account in which the group
+/// is deny-only (an unelevated session of an administrator) is refused. Under the system the
+/// user entry itself names the caller, so the case has nothing to show there.
+#[test]
+#[ignore = "needs an elevated administrator's session that is not the system, in a disposable Windows guest (see the file's header)"]
+fn a_token_that_holds_the_administrators_group_deny_only_gets_no_capture_pipe() {
+    if runs_as_the_system() {
+        println!("skipped: this session is the system, whose own entry the descriptor names");
+        return;
+    }
+    let (_read, _write) = pipe().expect("the pipe is made under the elevated token (the control)");
+    let refused = pipe_made_with_the_administrators_group_deny_only();
+    println!("the pipe under the deny-only group: {refused:?}");
+    assert!(
+        matches!(refused, Err(5 | 1307)),
+        "the platform refuses the token with access denied (5) or an invalid owner (1307), not {refused:?}"
     );
 }
 

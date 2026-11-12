@@ -597,8 +597,8 @@ fn standard(std: Std, access: u32) -> Result<Handle, ffi::Error> {
 }
 
 /// An anonymous pipe: the end the broker reads, which no child can inherit, and the end a child
-/// writes, which it inherits. Its descriptor is explicit: only the system may open the pipe
-/// object, and the child holds its end as an inherited handle.
+/// writes, which it inherits. Its descriptor is explicit: only the system and the Administrators
+/// group may open the pipe object, and the child holds its end as an inherited handle.
 ///
 /// # Errors
 ///
