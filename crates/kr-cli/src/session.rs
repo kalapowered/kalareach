@@ -66,12 +66,16 @@ pub enum AttachOutcome {
     /// What the session sent could not be used, and the terminal has asked for a new subscription
     /// as often as it may in the span it is allowed.
     ///
-    /// Two limits stand. A loop of screens that cannot be used whose cycle is about eight seconds
-    /// or longer is never ended: the requests are bounded to a rate, and the person sees the last
-    /// screen that was painted. And a session that answers every subscription with a
-    /// resynchronisation marker and no screen keeps the attachment open at the last painted
-    /// screen, at one request for each shortest pause of the retry policy at most: a marker is
-    /// raised by sessions that are working, so it ends nothing.
+    /// Three limits stand. A loop of screens that cannot be used whose cycle is about 7.5 seconds
+    /// or longer (the span divided by the number of requests it holds) is never ended: the
+    /// requests are bounded to a rate, and the person sees the last screen that was painted. A
+    /// session that answers every subscription with a resynchronisation marker and no screen keeps
+    /// the attachment open at the last painted screen, at one request for each shortest pause of
+    /// the retry policy at most: a marker is raised by sessions that are working, so it ends
+    /// nothing. And a session that refuses a new subscription for now is asked again by the
+    /// retry policy's own budget of three retries for each request, so four budgeted requests
+    /// with all their retries make sixteen before any of them has left the span; the sixteen
+    /// holds only then, and is not a bound for the life of an attachment.
     OutputUnreadable,
 }
 
@@ -1556,7 +1560,8 @@ const UNUSABLE_SPAN: std::time::Duration =
 /// What the session sends can also be of no use: a frame this build cannot decode, on either path
 /// and wherever in a screen or after it, or a screen the display refuses to install. A new
 /// subscription is asked for then too, and every such request draws on one budget of
-/// [`UNUSABLE_REQUESTS`] in any [`UNUSABLE_SPAN`]. The first goes at once and each other after the
+/// [`UNUSABLE_REQUESTS`] in any [`UNUSABLE_SPAN`]. The first goes at once, unless the shortest
+/// pause after an earlier request, whatever it was for, has not passed, and each other after the
 /// retry policy's pause; the request past the budget is not made, and the attachment ends. A
 /// frame, a screen or an answer does not give the budget back, since the first frame of a screen
 /// that cannot be used is no sign that the screen can: only time does, when a request was sent
@@ -1570,7 +1575,13 @@ const UNUSABLE_SPAN: std::time::Duration =
 /// sooner than the retry policy's shortest pause after the one before it, whatever caused it. A
 /// request that is due sooner is owed to the timer and goes when the pause has passed, one owed at
 /// a time, and the one function that sends (`send_subscription`) records when it went and clears
-/// what was owed.
+/// what was owed. A request that is owed is not replaced by another: it keeps the charge it
+/// carries, whatever asks next, and is not moved to an earlier time. The attachment's first
+/// subscription counts as a request before them.
+///
+/// The retry of a subscription the session refused for now is not put through that pause by code,
+/// and keeps it: the retry policy's shortest delay is the pause, the policy is given no figure of
+/// the host's to take instead, and every send clears the retry that was owed.
 #[derive(Debug, Default)]
 struct Subscriptions {
     /// A new subscription has been asked for, and its stream has not begun.
@@ -1622,8 +1633,9 @@ enum Cause {
 }
 
 impl Subscriptions {
-    /// The first subscription, whose first delivery has not arrived.
-    fn new() -> Self {
+    /// The first subscription, whose first delivery has not arrived, and which was sent at
+    /// `subscribed_at`.
+    fn new(subscribed_at: tokio::time::Instant) -> Self {
         Self {
             replacing: false,
             opening: true,
@@ -1631,15 +1643,16 @@ impl Subscriptions {
             refusal_retry_at: None,
             unusable_sent: VecDeque::new(),
             owed: None,
-            last_sent: None,
+            last_sent: Some(subscribed_at),
         }
     }
 
     /// What the session sent could not be used, and a new subscription is to be asked for: at once
-    /// when no request was sent in the span, and otherwise after the retry policy's pause for as
-    /// many requests in a row as the span holds. Two clocks are not kept: the pause is the
-    /// policy's, and the request is sent by the same timer that sends a subscription the session
-    /// refused for now.
+    /// when no request was sent in the span and the shortest pause after the last request, of any
+    /// kind, has passed, and otherwise after the retry policy's pause for as many requests in a
+    /// row as the span holds (and never sooner than that shortest pause). Two clocks are not kept:
+    /// the pause is the policy's, and the request is sent by the same timer that sends a
+    /// subscription the session refused for now.
     fn unusable(&mut self) -> Resend {
         let now = tokio::time::Instant::now();
         self.unusable_sent
@@ -1679,7 +1692,10 @@ impl Subscriptions {
 
     /// A new subscription is due `pause` from `now`, and never sooner than the retry policy's
     /// shortest pause after the last one that was sent. It is sent now when that time has come,
-    /// and otherwise owed to the timer.
+    /// and otherwise owed to the timer. One that is owed already stays owed: the time is not
+    /// moved earlier and the charge it carries is kept, whichever notification asks next (a
+    /// worker that sends two of sequence zero on one stream does not turn a request that draws on
+    /// the budget into one that does not).
     fn owe(
         &mut self,
         now: tokio::time::Instant,
@@ -1687,7 +1703,12 @@ impl Subscriptions {
         charged: bool,
     ) -> Resend {
         let after_the_last = self.last_sent.map_or(now, |sent| sent + RETRY_BACKOFF_MIN);
-        let at = (now + pause).max(after_the_last);
+        let mut at = (now + pause).max(after_the_last);
+        let mut charged = charged;
+        if let Some(owed) = self.owed {
+            at = at.max(owed.at);
+            charged |= owed.charged;
+        }
         if at <= now {
             return Resend::Now;
         }
@@ -1696,11 +1717,12 @@ impl Subscriptions {
     }
 
     /// A request for a new subscription was sent, charged to the budget or not. The budget and
-    /// the shortest pause count from this moment, and whatever was owed has been answered by it.
+    /// the shortest pause count from this moment, and whatever was owed has been answered by it,
+    /// with the charge it carried.
     fn sent(&mut self, charged: bool) {
         let now = tokio::time::Instant::now();
         self.last_sent = Some(now);
-        if charged {
+        if charged || self.owed_is_charged() {
             self.unusable_sent.push_back(now);
         }
         self.nothing_owed();
@@ -1732,7 +1754,8 @@ impl Subscriptions {
     }
 
     /// The session took the new subscription. What it refused for now is settled, and nothing of
-    /// what is owed after something that could not be used is: that is a request of its own.
+    /// what is owed for a screen (after something that could not be used, or after a marker) is:
+    /// that is a request of its own.
     fn taken(&mut self) {
         self.attempts = Attempts::new();
         self.refusal_retry_at = None;
@@ -1989,6 +2012,7 @@ where
         Some(attachment.result.output_cursor.get()),
     )
     .await?;
+    let subscribed_at = tokio::time::Instant::now();
 
     // Forwarding begins here, and the terminal's keyboard protocols are dealt with at this exact
     // boundary and not before.
@@ -2057,6 +2081,7 @@ where
             lease_epoch: epoch,
             geometry_epoch: geometry.epoch,
             owns_geometry: geometry.owner.as_ref() == Some(&attachment.attachment_id),
+            subscribed_at,
         },
         &mut input,
         &output,
@@ -2133,6 +2158,9 @@ struct Attached {
     geometry_epoch: kr_protocol::ids::GeometryEpoch,
     /// Whether this attachment owns the session's size.
     owns_geometry: bool,
+    /// When the attachment's first subscription was taken, which is the request that the first
+    /// request for a new one follows at the retry policy's shortest pause at the soonest.
+    subscribed_at: tokio::time::Instant,
 }
 
 /// What an attachment says once its console spells its own keys: the session refused the records.
@@ -2560,7 +2588,7 @@ async fn drive(
     // which go one at a time and are settled by the screen each one caused.
     let mut window = WindowReports::new(attached.dimensions);
     // Which subscription each notification belongs to, while a new one replaces the old.
-    let mut subscriptions = Subscriptions::new();
+    let mut subscriptions = Subscriptions::new(attached.subscribed_at);
 
     // The output cursor of the last whole screen this terminal was given, which is how it tells a
     // screen the session had something new to say from one it asked for itself.
@@ -2641,9 +2669,11 @@ async fn drive(
             // sent. What comes before even that is a held prefix whose moment has passed: it is
             // the person's own bytes, and a session that keeps printing must not keep them.
             biased;
-            // A subscription the session refused for now is asked for again when the retry
-            // policy's pause is over, whether or not the session has said anything: a session
-            // that asked for a new subscription has nothing to say until it gets one.
+            // A subscription that is owed is sent when its time comes, whether or not the session
+            // has said anything: one the session refused for now, when the retry policy's pause
+            // is over, and one owed for a screen (after something that could not be used, or a
+            // marker), when the shortest pause after the last request has passed. A session that
+            // was asked for a new subscription has nothing to say until it gets one.
             () = wait_until(subscriptions.retry_at()) => {
                 if closing {
                     subscriptions.nothing_owed();
@@ -4379,6 +4409,28 @@ mod tests {
                     console_will_spell,
                     owns_geometry: false,
                     sized: false,
+                    subscribed_ago: LONG_AGO,
+                },
+                case,
+            )
+            .await
+        }
+
+        /// Runs the loop with a lease held and a console that will spell its keys, the moment the
+        /// attachment's first subscription was taken, so that what the case makes it ask for
+        /// follows that request closely.
+        pub async fn run_just_after_subscribing<F, Fut>(case: F) -> Ran
+        where
+            F: FnOnce(Case) -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            run_with(
+                Setup {
+                    holds_lease: true,
+                    console_will_spell: true,
+                    owns_geometry: false,
+                    sized: false,
+                    subscribed_ago: std::time::Duration::ZERO,
                 },
                 case,
             )
@@ -4398,11 +4450,16 @@ mod tests {
                     console_will_spell: true,
                     owns_geometry,
                     sized: true,
+                    subscribed_ago: LONG_AGO,
                 },
                 case,
             )
             .await
         }
+
+        /// How long before a run began its first subscription was taken, where a case has no
+        /// interest in the pause that follows that request: long enough for it to have passed.
+        const LONG_AGO: std::time::Duration = std::time::Duration::from_secs(1);
 
         /// How a run is set up.
         struct Setup {
@@ -4410,6 +4467,8 @@ mod tests {
             console_will_spell: bool,
             owns_geometry: bool,
             sized: bool,
+            /// How long before the run began the attachment's first subscription was taken.
+            subscribed_ago: std::time::Duration,
         }
 
         async fn run_with<F, Fut>(setup: Setup, case: F) -> Ran
@@ -4422,6 +4481,7 @@ mod tests {
                 console_will_spell,
                 owns_geometry,
                 sized,
+                subscribed_ago,
             } = setup;
             let (sent, written) = mpsc::unbounded_channel();
             let (answers, heard) = mpsc::unbounded_channel();
@@ -4484,6 +4544,7 @@ mod tests {
                 lease_epoch: holds_lease.then(|| InputLeaseEpoch::new(5)),
                 geometry_epoch: kr_protocol::ids::GeometryEpoch::new(1),
                 owns_geometry,
+                subscribed_at: tokio::time::Instant::now() - subscribed_ago,
             };
             let mut owed = UndeliveredTyping::new(0);
             let mut display = crate::render::ProjectedDisplay::new();
@@ -5723,6 +5784,115 @@ mod tests {
             asked,
             2 * super::UNUSABLE_REQUESTS + 2,
             "two spans of the budget's number, and two asked for again"
+        );
+    }
+
+    /// A session that breaks the order of its stream and sends two notifications of sequence zero
+    /// in a row, a screen that cannot be used and a marker, does not turn the request that is owed
+    /// for the screen into one that draws on no budget: the four requests and the end still come.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn two_notifications_of_sequence_zero_do_not_lose_the_charge_of_the_request_that_is_owed()
+    {
+        use kr_protocol::envelope::{Outcome, ParamsValue};
+        use kr_protocol::projection::PROJECTION_RESET_EVENT;
+
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            wire::run_switched(true, true, |mut case| async move {
+                // A marker's request goes first, so that what follows it is owed to the timer.
+                case.says_resync(2);
+                let request = case.next_request_asked(Method::EventsSubscribe).await;
+                case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                for _ in 0..super::UNUSABLE_REQUESTS {
+                    case.says_it_cannot_decode(0, PROJECTION_RESET_EVENT);
+                    case.says_resync(0);
+                    let request = case.next_request_asked(Method::EventsSubscribe).await;
+                    case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                }
+                case.says_it_cannot_decode(0, PROJECTION_RESET_EVENT);
+            }),
+        )
+        .await
+        .expect("the attachment ended");
+        assert!(
+            matches!(ran.outcome, AttachOutcome::OutputUnreadable),
+            "{:?}",
+            ran.outcome
+        );
+    }
+
+    /// The pause holds after the attachment's first subscription as it does after any request: a
+    /// marker that comes ten milliseconds after it is asked for when the pause is over, counted
+    /// from that subscription and not from the marker.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_marker_soon_after_the_first_subscription_is_asked_for_at_the_pause() {
+        use kr_client::retry::RETRY_BACKOFF_MIN;
+        use kr_protocol::envelope::{Outcome, ParamsValue};
+
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            wire::run_just_after_subscribing(|mut case| async move {
+                let started = tokio::time::Instant::now();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                case.says_resync(2);
+                let request = case.next_request_asked(Method::EventsSubscribe).await;
+                let waited = started.elapsed();
+                assert!(
+                    waited >= RETRY_BACKOFF_MIN
+                        && waited < RETRY_BACKOFF_MIN + std::time::Duration::from_millis(10),
+                    "asked for when the pause after the first subscription is over: {waited:?}"
+                );
+                case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                case.closes();
+            }),
+        )
+        .await
+        .expect("the attachment ended");
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Closed { .. }),
+            "{:?}",
+            ran.outcome
+        );
+    }
+
+    /// A request for a screen that cannot be used also waits for the pause after a request that
+    /// drew on no budget, with the span empty: a marker's request goes at t, the first frame of
+    /// the stream it asked for cannot be used ten milliseconds later, and the next request goes at
+    /// t plus the pause.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_screen_that_cannot_be_used_just_after_a_markers_request_waits_for_the_pause() {
+        use kr_client::retry::RETRY_BACKOFF_MIN;
+        use kr_protocol::envelope::{Outcome, ParamsValue};
+
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            wire::run_switched(true, true, |mut case| async move {
+                case.says_resync(2);
+                let request = case.next_request_asked(Method::EventsSubscribe).await;
+                let at = tokio::time::Instant::now();
+                case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                case.says_output_it_cannot_decode(0);
+                let request = case.next_request_asked(Method::EventsSubscribe).await;
+                let waited = at.elapsed();
+                assert!(
+                    waited >= RETRY_BACKOFF_MIN
+                        && waited < RETRY_BACKOFF_MIN + std::time::Duration::from_millis(10),
+                    "asked for the pause after the marker's request: {waited:?}"
+                );
+                case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
+                case.closes();
+            }),
+        )
+        .await
+        .expect("the attachment ended");
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Closed { .. }),
+            "{:?}",
+            ran.outcome
         );
     }
 
@@ -8735,7 +8905,7 @@ mod tests {
     /// the terminal waiting for one that never comes, and everything after it is the old stream's.
     #[test]
     fn a_marker_ahead_of_the_new_streams_opening_does_not_hide_it() {
-        let mut subscriptions = Subscriptions::new();
+        let mut subscriptions = Subscriptions::new(tokio::time::Instant::now());
         assert_eq!(
             subscriptions.heard(0, "session.projection.reset"),
             Heard::First
@@ -8762,7 +8932,7 @@ mod tests {
         assert!(subscriptions.replace(), "and its marker asks again");
 
         // The control: without the opening, nothing is ever the new stream's.
-        let mut lost = Subscriptions::new();
+        let mut lost = Subscriptions::new(tokio::time::Instant::now());
         assert_eq!(lost.heard(0, "session.projection.reset"), Heard::First);
         assert!(lost.replace());
         for sequence in 1..=5 {
@@ -8778,7 +8948,7 @@ mod tests {
     /// apart from the new stream's, whose first delivery other than a gap is its screen.
     #[test]
     fn a_new_subscription_begins_at_its_first_notification_of_sequence_zero() {
-        let mut subscriptions = Subscriptions::new();
+        let mut subscriptions = Subscriptions::new(tokio::time::Instant::now());
         assert_eq!(
             subscriptions.heard(0, "session.projection.reset"),
             Heard::First,
