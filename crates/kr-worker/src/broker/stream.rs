@@ -270,6 +270,10 @@ impl BrokerState {
         let kind = match reading.as_deref() {
             Some(reading) if reading.selections.contains_key(method) => {
                 let places = reading.selections.get(method)?;
+                // The frame is parsed only where the route states conditions. A member repeated
+                // inside `params` takes its last occurrence here and in the server alike, which
+                // keeps `params` as a JSON value first; one repeated at the top of the message is
+                // refused before the request is admitted.
                 match places.read(frame) {
                     // A request the terminal makes for a thread of its own, that it never shows,
                     // selects nothing: its reply and that thread's leave change nothing here.
