@@ -20,9 +20,9 @@
 //! leaves them at the host. The host withdraws a connection only when a later admission needs the
 //! room, and only one it has not heard from for more than 15 seconds; with no such attempt a dead
 //! connection stays until the transport's idle timeout of 30 seconds. Its successor can be refused
-//! `k` more dials meanwhile. It is not bounded because more than the host's bound of twice the total would take as many
-//! shares or calls held at once, each holding a former main link, and as many changes of host and
-//! back, which a person does not reach.
+//! `k` more dials meanwhile. It is not bounded because more than the host's bound of twice the
+//! total would take as many shares or calls held at once, each holding a former main link, and as
+//! many changes of host and back, which a person does not reach.
 //!
 //! A dial that finds no place waits for one, for no longer than [`PLACE_WAIT`], and is then
 //! declined ([`LinkError::Declined`], which [`crate::connection::Unopened`] carries as its own
