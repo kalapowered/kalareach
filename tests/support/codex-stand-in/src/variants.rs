@@ -254,6 +254,22 @@ pub fn sum_asked(turn_request: &serde_json::Value) -> Option<String> {
         })
 }
 
+/// The command a turn's input asks to run, where a text of it says `run exactly this command and
+/// nothing else: ` and then the command: what follows that, to the end of the line.
+#[must_use]
+pub fn command_asked(turn_request: &serde_json::Value) -> Option<String> {
+    const ASKS: &str = "run exactly this command and nothing else: ";
+    let items = turn_request["params"]["input"].as_array()?;
+    items
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .find_map(|text| {
+            let (_, rest) = text.split_once(ASKS)?;
+            let command = rest.lines().next()?.trim();
+            (!command.is_empty()).then(|| command.to_owned())
+        })
+}
+
 /// The variable that names the directory of the agent's own configuration and record.
 pub const CONFIG_VARIABLE: &str = "CODEX_HOME";
 
