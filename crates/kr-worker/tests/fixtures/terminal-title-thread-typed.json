@@ -1,0 +1,561 @@
+[
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "initialize",
+  "id": "initialize",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "initialize",
+  "id": "initialize",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "remoteControl/status/changed",
+  "id": null,
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "notification",
+  "method": "initialized",
+  "id": null,
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "account/read",
+  "id": "#1",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "account/read",
+  "id": "#1",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "model/list",
+  "id": "#2",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "configRequirements/read",
+  "id": "#3",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "collaborationMode/list",
+  "id": "collaboration-mode-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "hooks/list",
+  "id": "hooks-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "model/list",
+  "id": "#2",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "collaborationMode/list",
+  "id": "collaboration-mode-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "configRequirements/read",
+  "id": "#3",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "hooks/list",
+  "id": "hooks-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "config/read",
+  "id": "tui-config-read-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "config/read",
+  "id": "tui-config-read-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "thread/start",
+  "id": "startup-thread-start-\u2026",
+  "marks": [
+   "ephemeral=false",
+   "threadSource=\"user\""
+  ]
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "thread/loaded/list",
+  "id": "\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "thread/list",
+  "id": "\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "thread/list",
+  "id": "\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "skills/list",
+  "id": "startup-skills-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "thread/loaded/list",
+  "id": "\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "thread/list",
+  "id": "\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "thread/list",
+  "id": "\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "skills/list",
+  "id": "startup-skills-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "plugin/list",
+  "id": "plugin-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "thread/start",
+  "id": "startup-thread-start-\u2026",
+  "marks": [
+   "thread=T1",
+   "ephemeral=false",
+   "threadSource=\"user\"",
+   "source=\"vscode\"",
+   "status=\"idle\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "thread/started",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "threadSource=\"user\"",
+   "ephemeral=false",
+   "status=\"idle\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "plugin/list",
+  "id": "plugin-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "plugin/list",
+  "id": "plugin-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "skills/list",
+  "id": "#4",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "plugin/list",
+  "id": "plugin-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "skills/list",
+  "id": "#4",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "plugin/list",
+  "id": "plugin-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "plugin/list",
+  "id": "plugin-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "turn/start",
+  "id": "#5",
+  "marks": [
+   "thread=T1"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "thread/settings/updated",
+  "id": null,
+  "marks": [
+   "thread=T1"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "warning",
+  "id": null,
+  "marks": [
+   "thread=T1"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "turn/start",
+  "id": "#5",
+  "marks": [
+   "turn=U1"
+  ]
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "plugin/list",
+  "id": "plugin-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "plugin/list",
+  "id": "plugin-list-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "thread/status/changed",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "status=\"active\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "turn/started",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "turn=U1",
+   "turn_status=\"inProgress\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "item/started",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "turn=U1",
+   "item=\"userMessage\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "item/completed",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "turn=U1",
+   "item=\"userMessage\""
+  ]
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "config/read",
+  "id": "temporary-config-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "config/read",
+  "id": "temporary-config-\u2026",
+  "marks": []
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "thread/start",
+  "id": "temporary-structured-\u2026",
+  "marks": [
+   "ephemeral=true",
+   "threadSource=\"system\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "error",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "turn=U1"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "thread/start",
+  "id": "temporary-structured-\u2026",
+  "marks": [
+   "thread=T2",
+   "ephemeral=true",
+   "threadSource=\"system\"",
+   "source=\"vscode\"",
+   "status=\"idle\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "thread/started",
+  "id": null,
+  "marks": [
+   "thread=T2",
+   "threadSource=\"system\"",
+   "ephemeral=true",
+   "status=\"idle\""
+  ]
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "turn/start",
+  "id": "temporary-structured-turn-\u2026",
+  "marks": [
+   "thread=T2"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "warning",
+  "id": null,
+  "marks": [
+   "thread=T2"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "turn/start",
+  "id": "temporary-structured-turn-\u2026",
+  "marks": [
+   "turn=U2"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "thread/status/changed",
+  "id": null,
+  "marks": [
+   "thread=T2",
+   "status=\"active\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "turn/started",
+  "id": null,
+  "marks": [
+   "thread=T2",
+   "turn=U2",
+   "turn_status=\"inProgress\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "item/started",
+  "id": null,
+  "marks": [
+   "thread=T2",
+   "turn=U2",
+   "item=\"userMessage\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "item/completed",
+  "id": null,
+  "marks": [
+   "thread=T2",
+   "turn=U2",
+   "item=\"userMessage\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "error",
+  "id": null,
+  "marks": [
+   "thread=T2",
+   "turn=U2"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "error",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "turn=U1"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "error",
+  "id": null,
+  "marks": [
+   "thread=T2",
+   "turn=U2"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "error",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "turn=U1"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "error",
+  "id": null,
+  "marks": [
+   "thread=T2",
+   "turn=U2"
+  ]
+ },
+ {
+  "direction": "C>S",
+  "kind": "request",
+  "method": "thread/unsubscribe",
+  "id": "temporary-structured-unsubscribe-\u2026",
+  "marks": [
+   "thread=T2"
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "reply",
+  "method": "thread/unsubscribe",
+  "id": "temporary-structured-unsubscribe-\u2026",
+  "marks": [
+   "status=\"unsubscribed\""
+  ]
+ },
+ {
+  "direction": "S>C",
+  "kind": "notification",
+  "method": "error",
+  "id": null,
+  "marks": [
+   "thread=T1",
+   "turn=U1"
+  ]
+ }
+]

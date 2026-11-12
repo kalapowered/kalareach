@@ -30,6 +30,30 @@
 //! the conversation such a reply selected, that reply is not applied and the instance waits for
 //! the next selection that is answered.
 //!
+//! # Requests that select nothing
+//!
+//! A terminal also starts threads of its own that it never shows: the one a terminal asks the
+//! server for to title the conversation is started, given a turn and left while the conversation's
+//! own turn runs. The table says by conditions on the request, read here when the request is
+//! admitted, which requests of a selecting method those are. A hidden request is one whose message
+//! holds, at every condition's place, one of the condition's values, each of the same type and
+//! equal; a request whose place is absent or holds a value of another type, and a method whose
+//! route states no condition, are not hidden. A hidden request is not kept open, so nothing waits
+//! for it: its reply selects nothing, clears no hold and drops no turn, the thread it started is
+//! never the binding, a turn in that thread is not the conversation's turn and its end is no
+//! completion of the conversation's, and a leave of that thread changes nothing.
+//!
+//! A leave names the conversation it ends. One that names a conversation other than the bound one
+//! is not kept open either, unless a request that selects is open or the reply to one is kept: that
+//! reply may be the conversation named. A leave of the bound conversation leaves the instance with
+//! none, and no earlier selection is restored: the instance waits for the next reply that names a
+//! conversation.
+//!
+//! What stays unknown to this reader: a switch the terminal makes from its own cache sends no
+//! frame; the terminal's view of a sub-agent's thread sends none either; an approval is not
+//! attributed to a thread; and a turn that is already running when a thread is selected is not
+//! recovered from the selecting reply.
+//!
 //! A permit admitted before any of this happened is checked again when it is taken: see
 //! [`Broker::take_mutation`](crate::broker::Broker::take_mutation).
 
@@ -137,6 +161,18 @@ impl StreamState {
         self.hold.as_ref().map(|hold| hold.reason.as_str())
     }
 
+    /// Returns true while a request that selects a conversation is open, or a success reply to one
+    /// is kept until older requests are answered.
+    fn selection_pending(&self) -> bool {
+        self.open
+            .values()
+            .any(|open| matches!(open.kind, OpenKind::Selection(_)))
+            || self
+                .proven
+                .values()
+                .any(|effect| matches!(effect, Effect::Select { .. }))
+    }
+
     fn take_seq(&mut self) -> u64 {
         self.next_seq = self.next_seq.saturating_add(1);
         self.next_seq
@@ -202,7 +238,8 @@ impl BrokerState {
     /// A request that selects or leaves a conversation takes the next sequence number as the one
     /// whose reply may be adopted, and a request the table does not classify is noted so that the
     /// suspension it caused lifts only when a later selection has named the conversation and every
-    /// such request before it has been answered.
+    /// such request before it has been answered. A hidden request, and a leave of a conversation
+    /// other than the bound one while no selection is pending, are not kept: none is returned.
     pub(super) fn stream_admit(
         &mut self,
         connection: GatewayConnectionId,
@@ -217,18 +254,37 @@ impl BrokerState {
             .connection(connection)
             .and_then(|held| held.reading.clone());
         let instance = self.instances.get_mut(&application_instance_id)?;
+        let body = || {
+            serde_json::from_slice::<serde_json::Value>(frame).unwrap_or(serde_json::Value::Null)
+        };
         let kind = match reading.as_deref() {
-            Some(reading) if reading.selections.contains_key(method) => reading
-                .selections
-                .get(method)
-                .cloned()
-                .map(OpenKind::Selection),
+            Some(reading) if reading.selections.contains_key(method) => {
+                let places = reading.selections.get(method)?;
+                // A request the terminal makes for a thread of its own, that it never shows,
+                // selects nothing: its reply and that thread's leave change nothing here.
+                if places.hides(&body()) {
+                    return None;
+                }
+                Some(OpenKind::Selection(places.thread.clone()))
+            }
             Some(reading) if reading.leaves.contains_key(method) => {
-                let named_by = reading.leaves.get(method).and_then(|path| {
-                    serde_json::from_slice::<serde_json::Value>(frame)
-                        .ok()
-                        .and_then(|body| named(&body, path))
-                });
+                let named_by = reading
+                    .leaves
+                    .get(method)
+                    .and_then(|path| named(&body(), path));
+                // A leave of a conversation other than the bound one changes nothing, unless a
+                // selection is open or its reply waits: that one may be the conversation named.
+                if let Some(left) = named_by.as_deref()
+                    && instance
+                        .thread_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref()
+                        != Some(left)
+                    && !instance.stream.selection_pending()
+                {
+                    return None;
+                }
                 Some(OpenKind::Leave(named_by))
             }
             _ => None,
