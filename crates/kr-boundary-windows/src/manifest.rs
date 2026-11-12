@@ -99,6 +99,21 @@ pub struct GitSet {
     pub images: Vec<Image>,
 }
 
+/// The version Git reported, from what its `--version` run wrote and how it ended: the one line
+/// `git version` and the number, and only when the run ended successfully. A run that failed, or one
+/// that wrote anything else, reports no version, and a version that a failed run happened to print is
+/// not taken for the Git that the policy was written for.
+#[must_use]
+pub fn git_version(success: bool, stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let line = text.trim();
+    let number = line.strip_prefix("git version ")?;
+    (success
+        && !line.contains(['\r', '\n'])
+        && number.starts_with(|first: char| first.is_ascii_digit()))
+    .then(|| line.to_owned())
+}
+
 /// What the installation laid down.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

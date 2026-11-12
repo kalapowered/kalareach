@@ -100,18 +100,26 @@ impl Error {
 
 /// The system's Windows directory from the platform's own call, never from the environment: an
 /// unelevated session of the same account can set its own variables, and this installation runs
-/// the PowerShell found there elevated.
-fn system_root() -> PathBuf {
+/// the PowerShell found there elevated. When the system cannot say, that is the failure: no fixed
+/// folder takes its place.
+fn system_root() -> std::io::Result<PathBuf> {
     super::ffi::system_windows_directory()
-        .map_or_else(|_| PathBuf::from(r"C:\Windows"), PathBuf::from)
+        .map(PathBuf::from)
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "the system's Windows directory could not be read: {error}"
+            ))
+        })
 }
 
-/// The drive the system's Windows directory is on, as the system gives it (`C:`), and not a fixed
-/// text.
-fn system_drive(root: &Path) -> std::ffi::OsString {
+/// The drive the system's Windows directory is on, as the system gives it, and never a fixed text.
+fn system_drive(root: &Path) -> std::io::Result<std::ffi::OsString> {
     match root.components().next() {
-        Some(std::path::Component::Prefix(prefix)) => prefix.as_os_str().to_owned(),
-        _ => std::ffi::OsString::from("C:"),
+        Some(std::path::Component::Prefix(prefix)) => Ok(prefix.as_os_str().to_owned()),
+        _ => Err(std::io::Error::other(format!(
+            "the system's Windows directory {} names no drive",
+            root.display()
+        ))),
     }
 }
 
@@ -121,28 +129,28 @@ fn system_drive(root: &Path) -> std::ffi::OsString {
 /// program the installer runs elevated: a Git trace variable, for one, names a file that the
 /// program would make or append to with the installer's rights. Its working directory is the
 /// system's own program directory, which only the system and the administrators can change.
-pub(super) fn trusted_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let root = system_root();
+pub(super) fn trusted_command(program: impl AsRef<std::ffi::OsStr>) -> std::io::Result<Command> {
+    let root = system_root()?;
     let system32 = root.join("System32");
     let mut command = Command::new(program);
     command
         .env_clear()
         .env("SystemRoot", &root)
         .env("windir", &root)
-        .env("SystemDrive", system_drive(&root))
+        .env("SystemDrive", system_drive(&root)?)
         .env("PATH", &system32)
         .current_dir(&system32);
-    command
+    Ok(command)
 }
 
 /// The directory of the modules that ship with Windows PowerShell, the only place it is told to load
 /// modules from.
-fn powershell_modules() -> PathBuf {
-    system_root()
+fn powershell_modules() -> std::io::Result<PathBuf> {
+    Ok(system_root()?
         .join("System32")
         .join("WindowsPowerShell")
         .join("v1.0")
-        .join("Modules")
+        .join("Modules"))
 }
 
 /// Runs PowerShell, the installation's channel, and returns what it wrote.
@@ -152,12 +160,14 @@ fn run(
     scratch: &Path,
     what: &'static str,
 ) -> Result<String, Error> {
-    let powershell_modules = powershell_modules();
+    let powershell_modules =
+        powershell_modules().map_err(|source| Error::Start { what, source })?;
     // PowerShell's temporary directory and working directory are a new directory of its own, made
     // with its descriptor, and removed when the run ends: nothing it leaves is ever in the staging
     // directory itself.
     let shell = ShellDirectory::new(scratch).map_err(|source| Error::Start { what, source })?;
     let output = trusted_command(program)
+        .map_err(|source| Error::Start { what, source })?
         .args(arguments)
         .env("PSModulePath", &powershell_modules)
         .env("TEMP", &shell.0)
@@ -219,12 +229,17 @@ impl Channel {
     }
 
     fn powershell(&self, command: &str) -> Result<String, Error> {
+        let start = |source| Error::Start {
+            what: "PowerShell",
+            source,
+        };
         let program = system_root()
+            .map_err(start)?
             .join("System32")
             .join("WindowsPowerShell")
             .join("v1.0")
             .join("powershell.exe");
-        let modules = powershell_modules();
+        let modules = powershell_modules().map_err(start)?;
         let module = modules.join("AppLocker").join("AppLocker.psd1");
         // PowerShell can add a module folder of the person's own to the module path when it
         // starts; the path is set again to the system's own before any module is loaded, and the
@@ -335,7 +350,10 @@ fn wevtutil(
         return Err(Error::DeadlinePassed);
     }
     let bound = crate::window::bound(deadline, Instant::now() + QUERY_BOUND);
-    let program = system_root().join("System32").join("wevtutil.exe");
+    let program = system_root()
+        .map_err(|source| Error::Start { what, source })?
+        .join("System32")
+        .join("wevtutil.exe");
     let name = program.display().to_string();
     let mut parts = vec![name.as_str()];
     parts.extend_from_slice(arguments);

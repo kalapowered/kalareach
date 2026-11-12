@@ -32,6 +32,7 @@ use crate::filekey::FileKey;
 use crate::frame::{self, Class, Request, Response};
 use crate::manifest::{
     GitSet, Image, InstallState, Manifest, ObjectKind, Prior, STORE_VERSION, StoreError,
+    git_version,
 };
 use crate::messages;
 use crate::notice::NOTICE;
@@ -307,10 +308,8 @@ impl Paths {
     }
 }
 
-fn git_dir() -> PathBuf {
-    ffi::known_folder(ffi::KnownFolder::ProgramFiles)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files"))
-        .join("Git")
+fn git_dir() -> Result<PathBuf, Error> {
+    Ok(ffi::known_folder(ffi::KnownFolder::ProgramFiles)?.join("Git"))
 }
 
 /// How the installation was found.
@@ -2067,9 +2066,15 @@ fn refuse_smart_app_control() -> Result<(), Error> {
 }
 
 fn refuse_code_integrity() -> Result<(), Error> {
-    let root = ffi::system_windows_directory().unwrap_or_else(|_| r"C:\Windows".to_owned());
+    let listing = |error: &dyn std::fmt::Display| {
+        Error::Refused(format!(
+            "the code-integrity policies could not be listed: {error}"
+        ))
+    };
+    let root = ffi::system_windows_directory().map_err(|error| listing(&error))?;
     let tool = Path::new(&root).join("System32").join("CiTool.exe");
     let output = applocker::trusted_command(&tool)
+        .map_err(|error| listing(&error))?
         .args(["--list-policies", "--json"])
         .stdin(Stdio::null())
         .output()
@@ -2117,7 +2122,7 @@ fn refuse_code_integrity() -> Result<(), Error> {
 /// Returns [`Error::Refused`] when Git is not where the policy expects it, can be changed by
 /// others, or cannot be run.
 pub fn qualify_git() -> Result<GitSet, Error> {
-    let dir = git_dir();
+    let dir = git_dir()?;
     let mut images = Vec::new();
     for relative in policy::git_images() {
         let path = dir.join(relative);
@@ -2152,13 +2157,20 @@ pub fn qualify_git() -> Result<GitSet, Error> {
         });
     }
     let output = applocker::trusted_command(dir.join("mingw64").join("bin").join("git.exe"))
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
+        .and_then(|mut command| command.arg("--version").stdin(Stdio::null()).output())
         .map_err(|error| Error::Refused(format!("Git could not be run: {error}")))?;
+    // What Git reports is the version the policy is written for: a run that failed, or wrote
+    // anything but its one line, is not Git.
+    let version = git_version(output.status.success(), &output.stdout).ok_or_else(|| {
+        Error::Refused(format!(
+            "Git did not report its version: it ended with {} and wrote {:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim()
+        ))
+    })?;
     Ok(GitSet {
         dir: dir.display().to_string(),
-        version: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        version,
         images,
     })
 }
