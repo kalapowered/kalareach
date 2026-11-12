@@ -736,8 +736,12 @@ impl Server {
     }
 
     /// Says that the turn's input was taken as the next message of the thread, as the server does
-    /// when a turn starts.
+    /// when a turn starts, under `write-the-record`.
     async fn user_message(&mut self, thread_id: &str, turn_id: &str) {
+        // Only an agent that keeps a record of its turns, as the pinned one does, writes them.
+        if !self.variants.write_the_record {
+            return;
+        }
         let item = json!({ "type": "userMessage", "id": format!("user-{turn_id}"), "content": [] });
         self.send(json!({
             "method": "item/started",
