@@ -233,6 +233,12 @@ fn installation_lays_down_and_removal_restores() {
         before.policy.is_unconfigured(),
         "the guest starts with no application control"
     );
+    // The order below is the one of a service that the installation starts. A service that already
+    // runs takes the other path, which another case follows, so a run that finds it running is void.
+    assert!(
+        !before.appid_running,
+        "the machine is not clean: the Application Identity service is running"
+    );
 
     let (code, output) = case.install();
     assert_eq!(code, 0, "the installation succeeds: {output}");
@@ -3456,7 +3462,7 @@ fn an_application_identity_service_that_already_runs_is_never_stopped_and_the_ev
     let original = snapshot();
     assert!(
         !original.appid_running,
-        "the guest begins with the service stopped"
+        "the machine is not clean: the Application Identity service is running"
     );
     appid.start().unwrap();
     appid
@@ -3533,7 +3539,7 @@ fn a_stopped_application_identity_service_is_started_once_and_its_first_event_co
     let original = snapshot();
     assert!(
         !original.appid_running,
-        "the guest begins with the service stopped"
+        "the machine is not clean: the Application Identity service is running"
     );
     let log_before_install = newest_log_record();
     let log = call_log();
