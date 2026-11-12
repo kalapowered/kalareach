@@ -73,8 +73,11 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
         const line = parseFloat(getComputedStyle(link).lineHeight)
         return `L ${nameOf(link.title)} box ${[box.left, box.top, box.right, box.bottom].map(round).join(' ')} words ${words} line ${round(Number.isFinite(line) ? line : 0)}`
       })
-      const room = document.querySelector('.m-pane')?.getBoundingClientRect()
-      const pane = room ? `P ${[room.left, room.top, room.right, room.bottom].map(round).join(' ')}` : 'P 0 0 0 0'
+      const scroller = document.querySelector('.m-pane')
+      const room = scroller?.getBoundingClientRect()
+      const pane = room && scroller
+        ? `P ${[room.left, room.top, room.right, room.bottom, scroller.scrollTop, scroller.scrollHeight - scroller.clientHeight].map(round).join(' ')}`
+        : 'P 0 0 0 0 0 0'
       const texts: [HTMLElement, string][] = [
         [log, `TAPLOG ${seen.join(' ; ')}`],
         [places, `TAPLINKS ${[pane, ...rectangles].join(' ; ')}`],
