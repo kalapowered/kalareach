@@ -132,8 +132,42 @@ struct Case {
     person: Sid,
 }
 
+/// A case that installs, or that binds the broker's pipe, starts from a machine with no
+/// installation on it: the service, the two boundary accounts, the data directory, the program
+/// directory and the pipe's name are all absent. A case that failed before its own cleanup, or a
+/// run that was cut short, leaves some of them, and every later case then fails for that and not
+/// for what it shows: this fails first, with one text, so that the run is void and never a verdict
+/// on the product.
+fn require_clean_machine() {
+    let mut left = Vec::new();
+    if service::manager().unwrap().open(SERVICE).unwrap().is_some() {
+        left.push("the broker's service".to_owned());
+    }
+    for name in [CHECKOUT, CONNECT] {
+        if Sid::of_account(name).is_ok() {
+            left.push(format!("the account {name}"));
+        }
+    }
+    let paths = Paths::system();
+    if paths.data.exists() {
+        left.push("the data directory".to_owned());
+    }
+    if paths.program.exists() {
+        left.push("the program directory".to_owned());
+    }
+    if std::fs::metadata(kr_boundary_windows::win::pipe::NAME).is_ok() {
+        left.push("the broker's pipe".to_owned());
+    }
+    assert!(
+        left.is_empty(),
+        "the machine is not clean: {}",
+        left.join(", ")
+    );
+}
+
 impl Case {
     fn new() -> Case {
+        require_clean_machine();
         assert!(
             token::current_is_administrator().unwrap(),
             "the case must run elevated"
@@ -749,6 +783,7 @@ fn paths_under(folder: &Path) -> Paths {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replaced_by_a_link_is_refused()
  {
+    require_clean_machine();
     // Absent: nothing to refuse, and the installation makes it with its own list.
     let absent = PathBuf::from(r"C:\ProgramData").join("krparent-absent");
     assert!(!absent.exists());
@@ -868,6 +903,7 @@ fn open_folder(folder: &Path, access: u32) -> ffi::Handle {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_parent_folder_is_checked_on_one_handle_that_is_held_and_an_entry_of_an_unknown_type_is_refused()
  {
+    require_clean_machine();
     use kr_boundary_windows::win::sd::{self, SdKind};
     const DELETE: u32 = 0x0001_0000;
     const READ_CONTROL: u32 = 0x0002_0000;
@@ -1099,6 +1135,7 @@ fn the_running_services_own_token_holds_the_privileges_the_installer_requires_an
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_is_checked_on_its_handle()
  {
+    require_clean_machine();
     use kr_boundary_windows::win::sd;
     const READ_CONTROL: u32 = 0x0002_0000;
     const SYSTEM: &str = "S-1-5-18";
@@ -1259,6 +1296,7 @@ fn summary_of(path: &Path) -> kr_boundary_windows::win::sd::Summary {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_removal_deletes_a_leftover_replacement_and_names_what_stayed_when_the_data_directory_cannot_go()
  {
+    require_clean_machine();
     use std::os::windows::fs::OpenOptionsExt;
     let folder = inherited_folder();
     acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
@@ -1339,6 +1377,7 @@ fn a_removal_that_could_not_delete_a_record_is_run_again_whole_and_finishes() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_in_a_removal() {
+    require_clean_machine();
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{Principals, SdKind};
     let folder = inherited_folder();
@@ -1418,6 +1457,7 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_program_directory_holds_only_the_names_the_installation_gives_each_of_its_kind_and_an_empty_configuration()
  {
+    require_clean_machine();
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{Principals, SdKind};
     let folder = inherited_folder();
@@ -1536,6 +1576,7 @@ fn the_program_directory_holds_only_the_names_the_installation_gives_each_of_its
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handle_allow() {
+    require_clean_machine();
     use std::os::windows::fs::OpenOptionsExt;
     let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
     let owner = account::create(&name).unwrap();
@@ -1658,6 +1699,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link_is_refused() {
+    require_clean_machine();
     let folder = inherited_folder();
     acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
     let mut paths = paths_in(&folder);
@@ -1720,6 +1762,7 @@ fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of_their_own() {
+    require_clean_machine();
     use std::os::windows::fs::OpenOptionsExt;
     let folder = inherited_folder();
     acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
@@ -1899,6 +1942,7 @@ fn git_started_by_the_installer_sees_no_variable_of_the_session_that_started_it(
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
+    require_clean_machine();
     let folder = inherited_folder();
     acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
     let paths = paths_in(&folder);
@@ -1913,12 +1957,17 @@ fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
         .to_string();
     assert!(text.contains("more than one name"), "{text}");
     assert!(text.contains("Do not remove"), "{text}");
-    // Without it, there is nothing the file could be a record of.
+    // Without it, there is nothing the file could be a record of. The inspection stops earlier,
+    // at the directory that no manifest records and that is not empty, so the refusal names that
+    // directory and not the file's two names.
     std::fs::remove_file(&paths.manifest).unwrap();
     let text = install::make_data_directory(&paths)
-        .expect_err("a file with two names")
+        .expect_err("what is left with no manifest")
         .to_string();
-    assert!(text.contains("more than one name"), "{text}");
+    assert!(
+        text.contains("no manifest records this directory"),
+        "{text}"
+    );
     assert!(text.contains("Remove "), "{text}");
     assert!(!text.contains("Do not remove"), "{text}");
     let _ = std::fs::remove_dir_all(&folder);
@@ -2006,6 +2055,7 @@ fn with_the_users_own_default_owner<T: Send>(work: impl FnOnce() -> T + Send) ->
 #[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
 fn every_object_the_installation_makes_names_the_administrators_as_owner_under_a_token_that_does_not()
  {
+    require_clean_machine();
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{Principals, SdKind};
     const ADMINISTRATORS: &str = "S-1-5-32-544";
@@ -2080,6 +2130,7 @@ fn every_object_the_installation_makes_names_the_administrators_as_owner_under_a
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_channel_hands_the_policy_to_powershell_in_a_new_file_of_the_administrators_and_removes_it() {
+    require_clean_machine();
     use std::collections::BTreeMap;
     const SYSTEM: &str = "S-1-5-18";
     const ADMINISTRATORS: &str = "S-1-5-32-544";
@@ -2166,6 +2217,7 @@ fn the_channel_hands_the_policy_to_powershell_in_a_new_file_of_the_administrator
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_before_any_step_uses_it()
  {
+    require_clean_machine();
     use install::DataChild;
     const SYSTEM: &str = "S-1-5-18";
     const ADMINISTRATORS: &str = "S-1-5-32-544";
@@ -2484,6 +2536,7 @@ fn journal_naming(journals: &Path, root: &str, id: u8, finished: bool) -> PathBu
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_root_that_a_broker_makes_between_the_listing_of_the_roots_and_the_journal_read_is_not_refused()
 {
+    require_clean_machine();
     let folder = inherited_folder();
     acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
     let paths = paths_in(&folder);
@@ -2511,6 +2564,7 @@ fn a_root_that_a_broker_makes_between_the_listing_of_the_roots_and_the_journal_r
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreign_is_not_touched() {
+    require_clean_machine();
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{Principals, SdKind};
     let folder = inherited_folder();
@@ -2710,6 +2764,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_file_that_another_program_reads_by_path_is_made_new_and_owned_by_the_administrators() {
+    require_clean_machine();
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{Principals, SdKind};
     const SYSTEM: &str = "S-1-5-18";
@@ -2787,6 +2842,7 @@ fn a_file_that_another_program_reads_by_path_is_made_new_and_owned_by_the_admini
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_proofs_program_and_the_program_files_give_their_readers_read_and_run_and_nothing_more() {
+    require_clean_machine();
     use kr_boundary_windows::win::ffi::Sid;
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{self, Principals, SdKind};
@@ -3254,6 +3310,7 @@ fn open_the_brokers_pipe_with(access: u32) -> Result<(), u32> {
 fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answer_cross_it() {
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     let stop = Stop::new().unwrap();
+    require_clean_machine();
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     let server = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
@@ -3328,6 +3385,7 @@ fn a_client_that_holds_only_the_pipes_grant_is_refused_more_than_the_grant_and_m
         return;
     }
     let stop = Stop::new().unwrap();
+    require_clean_machine();
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that takes each client and lets it go, so that the next one finds an instance.
     let server = std::thread::spawn(move || {
@@ -3385,6 +3443,7 @@ fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
+    require_clean_machine();
     let mut listener = Listener::bind(&[system], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that accepts and never answers: it holds the connection until it is told to stop.
     let server = std::thread::spawn({
@@ -3423,6 +3482,7 @@ fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and
     use kr_boundary_windows::win::pipe::{self, Listener, Stop, testing};
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
+    require_clean_machine();
     let mut listener = Listener::bind(&[system], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that accepts and never answers, and keeps the connection until told to stop.
     let server = std::thread::spawn({
@@ -3502,6 +3562,7 @@ fn stand_in_broker(
     use std::sync::atomic::Ordering;
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
+    require_clean_machine();
     let mut listener = Listener::bind(&[system], std::sync::Arc::clone(&stop)).unwrap();
     let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let thread = std::thread::spawn({
