@@ -156,8 +156,8 @@ pub struct TransferModule {
     #[cfg(feature = "testing")]
     after_the_outer_check: Arc<crate::attention::Pause>,
     /// Where this host's own tests stop a device's create or binding between its first try, which
-    /// the bound refused, and its second, and how many second tries have been made. Compiled only with the
-    /// `testing` feature.
+    /// the bound refused, and its second, and how many second tries have been made. Compiled only
+    /// with the `testing` feature.
     #[cfg(feature = "testing")]
     between_the_tries: Arc<crate::attention::Pause>,
     #[cfg(feature = "testing")]
@@ -210,7 +210,8 @@ pub struct TransferAdmission {
     /// moved on is refused, or answered from its record, before it asks. Each upload write looks
     /// for its record under the store's lock before it first asks; `upload.finish` and
     /// `upload.cancel` let go of the lock after that look (`upload.finish` to verify the file) and
-    /// ask without looking again. A create's second try clears the mark before its call.
+    /// ask without looking again. The second try of a create or a binding clears the mark before
+    /// its call.
     reached: AtomicBool,
     /// The attachment-chunk stream the mutation arrived on, when it arrived on one. The stream's
     /// revoked state is part of what the service asks where an effect begins: the loss of the
@@ -989,12 +990,13 @@ impl TransferModule {
     /// second, or one after a settle that failed in both passes. The registry is read once for each
     /// session in a pass: each distinct session that the principal's drafts target that no prompt
     /// has sent and that are not orphaned, spent drafts among them, and the write's own session.
-    /// That is the number of those sessions, plus one, under the registry's lock, and the bound
-    /// does not limit it, because a spent draft does not count against the bound. A create or a
-    /// binding at the bound makes two passes, so twice as many key reads and two scans of the
-    /// drafts, besides the store's other reads and writes, which are as they are for any such
-    /// write. A pass that cannot be made leaves a line in the log and does not stop the write: the
-    /// service counts what it holds.
+    /// That is at most one more than the number of those sessions, under the registry's lock, and
+    /// the bound does not limit it, because a spent draft does not count against the bound. A
+    /// create or a binding at the bound makes two passes, each of which reads the sessions as the
+    /// drafts then stand, so up to twice that many key reads and two scans of the drafts, besides
+    /// the store's other reads and writes, which are as they are for any such write. A pass that
+    /// cannot be made leaves a line in the log and does not stop the write: the service counts
+    /// what it holds.
     pub(crate) async fn settle_closures_of_open_drafts(
         &self,
         owner: &Arc<Controller>,
@@ -1622,10 +1624,9 @@ impl TransferModule {
                 // moved on) to that commit, so once that call has reached the place it begins an
                 // effect, a record that it finds after its own success is its own. The second try
                 // of a create or a binding is a call of its own, and the mark is cleared before it.
-                // A finish and
-                // a cancel let go of the lock between their claim and its completion, so another
-                // copy can record in between: any record read for them, and for every other
-                // method, is a copy.
+                // A finish and a cancel let go of the lock between their claim and its
+                // completion, so another copy can record in between: any record read for them,
+                // and for every other method, is a copy.
                 Some(retained) => {
                     let performed_here = outcome.is_ok()
                         && admission.reached()
@@ -1862,15 +1863,16 @@ fn say_closures_unsettled() {
     );
 }
 
-/// The answer to a create or a binding at a device's bound: `made`, the first try's, or, when the
-/// bound refused it, the answer of one second try.
+/// The answer to a create or a binding at a device's bound: `made`, the first try's, or, when it
+/// was refused `QUOTA_EXCEEDED`, the answer of one second try.
 ///
 /// The refusal at a device's bound is kept as the action's outcome, so it is not given on a count
 /// that a draft inserted for a closed session since the door settled could have filled. The closed
 /// sessions are settled once more, outside the count and its holds, and `try_again` makes the call
 /// once more. A refused call wrote nothing: the service's transaction and the action's claim end
 /// with the refusal, so a second call starts from the same state as the first. There is no third
-/// try, and a refusal of the second is the answer.
+/// try, and a refusal of the second is the answer. The other refusal that carries that code, a
+/// reply too large to send, is tried the same way and given the same answer.
 fn tried_again_at_the_bound<T>(
     made: kr_transfer::Result<T>,
     draft_limit: Option<u64>,

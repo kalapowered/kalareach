@@ -3448,15 +3448,16 @@ device that may not read the session's receipts is told `OUTCOME_UNKNOWN`.
 A device holds at most 64 open drafts: its drafts that no prompt has sent, whose session has not
 closed and whose files the agent has not all taken. A draft that has at least one attachment, every
 one of them `accepted_by_agent`, is spent: it does not count while it stays so, and the bound does
-not limit how many spent drafts a device holds. A device's draft names the session it is for, and the paired door refuses a
-`draft.create` that names none, `INVALID_ARGUMENT`, before it counts or writes anything. The person
-at this machine may make a draft with no session and has no bound. A draft is open until a prompt
-sends it to a session or the
-session it targets closes: the closure of a session queues, on a task of its own, the write that
-orphans its drafts, and each `draft.create` first writes the end of the sessions its device's open
-drafts target, and the session it names, that the registry holds closed, and each
-`agent.draft.add_attachment` first writes the end of the sessions its device's open drafts target.
-A draft of a session recorded closed before the write starts then stops counting. A create that names such a session
+not limit how many spent drafts a device holds. A device's draft names the session it is for, and
+the paired door refuses a `draft.create` that names none, `INVALID_ARGUMENT`, before it counts or
+writes anything. The person at this machine may make a draft with no session and has no bound. A
+draft stops being open when a prompt sends it to a session, when the session it targets closes, or
+while it is spent: the closure of a session queues, on a task of its own, the write that orphans its
+drafts, and each `draft.create` first writes the end of the sessions that the device's drafts target
+(the drafts that no prompt has sent and that are not orphaned, spent drafts among them), and the
+session it names, that the registry holds closed, and each `agent.draft.add_attachment` first writes
+the end of the sessions that those drafts target. A draft of a session recorded closed before the
+write starts then stops counting. A create that names such a session
 is refused `SESSION_CLOSED` when that settle succeeded, unless the device already holds its bound,
 where the count comes first and the refusal is `QUOTA_EXCEEDED`. A `draft.create` past the bound is
 refused `QUOTA_EXCEEDED` with the bound in the message only after the closed sessions are settled
@@ -3472,9 +3473,11 @@ registry, a session it names then closes, the create at the bound settles withou
 it at that session, and the other create inserts its draft; the second settle ends that session,
 and a third create, for a second session that closed in the same way, fills the place again. That
 takes three creates of one device on separate connections and two closures. A binding that brings a
-draft back into the count is refused for such a draft in the same way, with the binding in the place
-of the first create: it takes two creates beside it, on separate connections, and two closures. The
-host keeps a refusal
+draft back into the count can be refused for such a draft too: a create of the device, on another
+connection, inserts a draft for a session that closed after that create's own settle read the
+registry, and does so after the binding's second settle has scanned the drafts, and the draft fills
+a place that the second settle, a discard, a prompt or the agent freed between the binding's two
+tries. That takes one create beside the binding and one or two closures. The host keeps a refusal
 at the bound as the action's outcome, as it keeps every refusal of a service, so the same action asked
 again is given the same refusal even when a place is free, and a device that has freed a place takes a new
 action for its new attempt. The bound is one constant of this host, which an owner cannot change,
@@ -3483,8 +3486,8 @@ draft, its session ends, the agent takes every file bound to it, or the device e
 `draft.discard`. A draft whose attachments are all `accepted_by_agent`, and that has at least one,
 stops counting until a file is bound to it again; a draft with an attachment `inserting` or
 `unknown` goes on counting, because a retry or a report may still come for it. The bound's refusal names the ways that are the device's to
-take or wait for. Sent, orphaned and spent drafts stay in the journal and the bound does not limit them, so a device
-can hold more than 64 drafts in all, and a spent draft counts again when a file is bound to it. Each `draft.update` adds one row
+take or wait for. Sent, orphaned and spent drafts stay in the journal and the bound does not limit
+them, so a device can hold more than 64 drafts in all. Each `draft.update` adds one row
 to the journal's events and a receipt that holds the updated draft for the de-duplication window.
 
 `draft.discard` ends a draft of the device's own that it no longer uses. It names the draft and no
