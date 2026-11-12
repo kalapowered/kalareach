@@ -23,15 +23,25 @@ function words(left: number, top: number, width: number, height = 17): Rect {
   return { left, top, right: left + width, bottom: top + height }
 }
 
+/**
+ * A press at a point, over links given by the rectangles of their words, all on lines `line` tall.
+ * `boxes` are the buttons' own rectangles, one list for each link.
+ */
 function press(
   x: number,
   y: number,
   links: readonly (readonly Rect[])[],
   reach: Reach = ANDROID,
   bounds: Rect = PANE,
-  controls: readonly Rect[] = []
+  line = 0,
+  boxes: readonly (readonly Rect[])[] = []
 ): number | null {
-  return linkAt({ x, y }, links, reach, bounds, controls)
+  return linkAt(
+    { x, y },
+    links.map((each, index) => ({ words: each, line, box: boxes[index] ?? [] })),
+    reach,
+    bounds
+  )
 }
 
 describe('a press on a link’s own words', () => {
@@ -218,11 +228,69 @@ describe('the least size', () => {
   })
 })
 
-describe('another control of the message', () => {
-  it('keeps a point on its own box, though a link’s target holds the point', () => {
-    const link = [words(16, 100, 120)]
-    const button: Rect = { left: 20, top: 118, right: 120, bottom: 150 }
-    expect(press(60, 122, [link], ANDROID, PANE, [button])).toBeNull()
-    expect(press(60, 116, [link], ANDROID, PANE, [button])).toBe(0)
+describe('a link on lines taller than its words', () => {
+  // The largest iOS text size: the words are 56 px tall and each line 72.5 px, so 16.5 px of the line
+  // lie between one line's words and the next, and 8.25 px above and below each.
+  const LINE = 72.5
+  const wrapped = [words(16, 100, 300, 56), words(16, 100 + LINE, 200, 56)]
+
+  it('takes a press in the line above and below the words, where the button’s own line is', () => {
+    expect(press(60, 92, [wrapped], IOS, PANE, LINE)).toBe(0)
+    expect(press(60, 91, [wrapped], IOS, PANE, LINE)).toBeNull()
+    // The last line's words end at 228.5, and its line at 236.75.
+    expect(press(60, 236, [wrapped], IOS, PANE, LINE)).toBe(0)
+    expect(press(60, 237, [wrapped], IOS, PANE, LINE)).toBeNull()
+  })
+
+  it('takes a press between the two lines of a wrapped link', () => {
+    for (const y of [157, 160, 164, 168, 171]) {
+      expect(press(60, y, [wrapped], IOS, PANE, LINE), `y ${String(y)}`).toBe(0)
+    }
+  })
+
+  it('leaves the words’ own height when the line is not known or is shorter', () => {
+    expect(press(60, 92, [wrapped], IOS)).toBeNull()
+    expect(press(60, 92, [wrapped], IOS, PANE, 40)).toBeNull()
+    expect(press(60, 100, [wrapped], IOS)).toBe(0)
+  })
+
+  it('gives a press in the line between two links on adjacent lines to the link whose words are nearer', () => {
+    const upper = [words(16, 100, 120, 56)]
+    const lower = [words(16, 100 + LINE, 120, 56)]
+    expect(press(60, 164, [upper, lower], IOS, PANE, LINE)).toBe(0)
+    expect(press(60, 165, [upper, lower], IOS, PANE, LINE)).toBe(1)
+  })
+})
+
+describe('a link that wraps, which the page gives as one box', () => {
+  // The browser's own box of a wrapped link is one rectangle over both lines, as wide as the line,
+  // with each line of words centred in it: a press in the empty part beside the second line's words
+  // is the link's for the browser, so it is the link's here too.
+  const words2 = [words(58, 341, 274, 55), words(140, 413.5, 110, 55)]
+  const box: Rect = { left: 2, top: 333, right: 388, bottom: 478 }
+
+  it('takes a press anywhere in the button’s own box', () => {
+    expect(press(10, 440, [words2], IOS, PANE, 72.5, [[box]])).toBe(0)
+    expect(press(380, 372, [words2], IOS, PANE, 72.5, [[box]])).toBe(0)
+    expect(press(10, 440, [words2], IOS, PANE, 72.5)).toBeNull()
+  })
+
+  it('takes a press within a pixel of the box’s edge, which the page’s own hit test does, and no more', () => {
+    expect(press(10, 332.2, [words2], IOS, PANE, 72.5, [[box]])).toBe(0)
+    expect(press(10, 331.9, [words2], IOS, PANE, 72.5, [[box]])).toBeNull()
+  })
+
+  it('takes nothing outside the box and the words’ own targets', () => {
+    expect(press(10, 490, [words2], IOS, PANE, 72.5, [[box]])).toBeNull()
+  })
+
+  it('leaves a press in the box to the link whose words are nearer', () => {
+    const near = [words(20, 440, 60, 20)]
+    expect(press(30, 445, [words2, near], IOS, PANE, 0, [[box]])).toBe(1)
+  })
+
+  it('is held to the pane', () => {
+    expect(press(1, 440, [words2], IOS, PANE, 72.5, [[{ ...box, left: -20 }]])).toBe(0)
+    expect(press(-5, 440, [words2], IOS, { ...PANE, left: 0 }, 72.5, [[{ ...box, left: -20 }]])).toBeNull()
   })
 })
