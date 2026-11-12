@@ -84,8 +84,10 @@ pub enum SdKind {
     /// administrators alone may do anything with it, and nobody else may even read it.
     BootMarker,
     /// One of the anonymous pipes that carry a child's standard output and error to the broker.
-    /// Only the system may open the pipe object. The child is not given the object to open: it
-    /// receives its end of the pipe as an inherited handle, which is not an access check, and no
+    /// Only the system and the Administrators group may open the pipe object (`CreatePipe` opens the
+    /// second end as a client, which an elevated administrator's own token must be allowed to do).
+    /// The child is not given the object to open: it receives its end of the pipe as an inherited
+    /// handle, which is not an access check, and no
     /// account, the child's own included, can open the pipe by any other route. The Administrators
     /// group owns it, so that it can be made by the system and by an elevated administrator alike: only
     /// the system's own token may name the system as an owner.
@@ -218,7 +220,7 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
             None => format!("O:BAD:P(A;;{ALL_ACCESS};;;SY)"),
         }),
         SdKind::BootMarker => Ok("O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)".to_owned()),
-        SdKind::CapturePipe => Ok("O:BAD:P(A;;GA;;;SY)".to_owned()),
+        SdKind::CapturePipe => Ok("O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)".to_owned()),
         SdKind::DataParent => Ok("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()),
         SdKind::AdminDir => Ok(if principals.users_may_read {
             format!("O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_AND_EXECUTE};;;BU)")
