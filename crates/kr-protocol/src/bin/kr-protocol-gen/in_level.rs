@@ -32,14 +32,17 @@
 //!   a method that is new asks the host a method its level has before it takes the refusal for a
 //!   lack of rights);
 //! * the plugin SDK schema, from the committed file of each release and of this commit, held to
-//!   the same rule but for one kind of member. The files are generated, and `kr-plugin-sdk-gen
-//!   --check` holds the committed ones equal to the generated ones. A release of the level without
-//!   the schema or without `package-contract.json`, or a file that does not read, fails the
-//!   check. The one kind of member that passes is an optional member of a definition that no
-//!   protocol schema has and that the connector table's root reaches and the package manifest's
+//!   the same rule for what fails, and to a narrower one for what passes. The files are
+//!   generated, and `kr-plugin-sdk-gen --check` holds the committed ones equal to the generated
+//!   ones. A release of the level without the schema or without `package-contract.json`, or a
+//!   file that does not read, fails the check. Only a definition that is new passes, and one kind
+//!   of member: an optional member of a definition that is an object in both schemas, that no
+//!   protocol schema has, and that the connector table's root reaches and the package manifest's
 //!   root does not, which this commit's arrival table (in its `package-contract.json`) lists at
 //!   an SDK version above the release's own `sdk_version`, in a commit whose SDK version is above
-//!   that version too (`compare_sdk_for_a_level`). The table lists a member only where a
+//!   that version too (`compare_sdk_for_a_level`). The protocol's read-only metadata marker has
+//!   no meaning in the SDK's schema, so an unlisted member of an SDK definition that carries it
+//!   fails like any other. The table lists a member only where a
 //!   package that lacks it means what it meant before, and a host of an earlier SDK refuses a
 //!   package that uses it, because it tests the package's `sdk_range` first; the comparison sees
 //!   neither, and the review of the change that lists a member must. The run says each member it
@@ -47,7 +50,10 @@
 //!   does not list, one listed with no rise of the SDK version, a member of a definition the
 //!   protocol schema has, a nested member, a variant, a change or a removal, a lower SDK version,
 //!   and an entry of a release's table that this commit's table changes or lacks. A release from
-//!   before the table has an empty one.
+//!   before the table has an empty one. When a member would pass and a definition of both schemas
+//!   points a reference at another definition than it did, every arrival fails, because the
+//!   comparison goes by where a definition is used and not by its name; this holds for a
+//!   reference to an equal definition and for `oneOf` branches in a new order too.
 //!
 //! What it does not see: the `kr-plugin-host/3` frames, which have no schema; the types a
 //! daemon-served method names only in its description; rules that live in code; the hand-written
