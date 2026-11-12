@@ -375,3 +375,19 @@ fn an_entry_of_another_kind_than_the_layout_gives_is_not_the_installations() {
         Origin::System
     );
 }
+
+/// What a foreign manifest's refusal says the next run does is what the next run does with no
+/// manifest: it reads each remaining entry on its own handle, and says remove, move aside or close
+/// the program, never "names each to remove".
+#[test]
+fn the_forecast_after_a_foreign_manifest_is_moved_aside_is_the_next_runs_own_reading() {
+    let (remedy, text) = said(EntryKind::Manifest, &Origin::Foreign, &Presence::Present);
+    assert_eq!(remedy, Remedy::MoveAside);
+    assert!(text.contains("on their own handles"), "{text}");
+    assert!(text.contains("move it aside"), "{text}");
+    assert!(
+        text.contains("close the program that holds it open"),
+        "{text}"
+    );
+    assert!(!text.contains("names each to remove"), "{text}");
+}
