@@ -45,10 +45,13 @@
 //!
 //! A request of a route that states conditions, whose message the conditions cannot be read in (the
 //! parameters are not an object: a server may take a positional array, which names no member), is
-//! neither hidden nor a selection. Its reply is never applied, and from its admission what the
-//! terminal is in is unknown, as for a selection whose outcome is lost: rich mutations wait until
-//! a later selection that can be read is answered. A member repeated inside the parameters takes
-//! its last occurrence here and in the server alike.
+//! neither hidden nor a selection. Its reply is never applied as a selection, and from its
+//! admission what the terminal is in is unknown, as for a selection whose outcome is lost: rich
+//! mutations wait until a later selection that can be read is answered. Only the server's refusal,
+//! or the knowledge that the frame never went, says that no thread was started, and then the
+//! binding is as it was; a success reply, a reply that cannot be read and a lost outcome keep it
+//! unknown. A notification of such a method, which has no reply, changes nothing. A member
+//! repeated inside the parameters takes its last occurrence here and in the server alike.
 //!
 //! A leave names the conversation it ends. One that names a conversation other than the bound one
 //! is not kept open either, unless a request that selects is open or the reply to one is kept: that
@@ -108,6 +111,9 @@ enum OpenKind {
     Leave(Option<String>),
     /// A request the connector's table does not classify, whose effect is unknown.
     Unlisted,
+    /// A request of a selecting method whose message the table's conditions cannot be read in: it
+    /// may have started a thread that no reading of it can name.
+    Unreadable,
 }
 
 /// One request of the terminal's forwarded to the server and not yet answered or given up.
@@ -168,6 +174,15 @@ impl StreamState {
         {
             return Some(SELECTION_IN_FLIGHT);
         }
+        // An unreadable request waits for its reply, which says whether it started a thread. A
+        // selection answered after it names the conversation the terminal is in, so it ends this.
+        if self
+            .open
+            .values()
+            .any(|open| matches!(open.kind, OpenKind::Unreadable) && open.seq > self.adopted)
+        {
+            return Some(SELECTION_UNKNOWN);
+        }
         self.hold.as_ref().map(|hold| hold.reason.as_str())
     }
 
@@ -206,7 +221,9 @@ impl StreamState {
             && unknown
         {
             match open.kind {
-                OpenKind::Selection(_) | OpenKind::Leave(_) => self.hold_unknown(open.seq),
+                OpenKind::Selection(_) | OpenKind::Leave(_) | OpenKind::Unreadable => {
+                    self.hold_unknown(open.seq);
+                }
                 OpenKind::Unlisted => self.unlisted_lost = true,
             }
         }
@@ -278,15 +295,13 @@ impl BrokerState {
                     // A request the terminal makes for a thread of its own, that it never shows,
                     // selects nothing: its reply and that thread's leave change nothing here.
                     RequestReading::Hidden => return None,
-                    // A request the conditions cannot be tested against may have selected the
-                    // thread its reply names or not. Nothing waits for its reply, which is never
-                    // applied, and what the terminal is in is unknown until a later selection
-                    // that can be read is answered.
-                    RequestReading::Unreadable => {
-                        let seq = instance.stream.take_seq();
-                        instance.stream.hold_unknown(seq);
-                        return None;
-                    }
+                    // A request the conditions cannot be tested against may have started a thread
+                    // that no reading of it can name, so what the terminal is in is unknown while
+                    // it waits for its reply, and stays unknown when the reply succeeds, cannot be
+                    // read or never comes. The server's refusal, or a frame that never went, says
+                    // nothing was started: the binding is as it was. Its success reply is never
+                    // applied as a selection. A notification, which has no reply, changes nothing.
+                    RequestReading::Unreadable => Some(OpenKind::Unreadable),
                     RequestReading::Selects => Some(OpenKind::Selection(places.thread.clone())),
                 }
             }
@@ -482,6 +497,7 @@ impl BrokerState {
         application_instance_id: ApplicationInstanceId,
         open: &OpenRequest,
         succeeded: bool,
+        refused: bool,
         body: &serde_json::Value,
         now: TimestampMs,
     ) {
@@ -492,7 +508,14 @@ impl BrokerState {
         // A reply older than one already applied changes nothing: it never restores a conversation
         // the terminal has left. An error reply is a refusal the server proved, and the terminal
         // changes its conversation only on a success reply that names it, so nothing changed.
-        if succeeded && open.seq > stream.adopted {
+        if matches!(open.kind, OpenKind::Unreadable) {
+            // Only a refusal says no thread was started. A success, which this host cannot read a
+            // thread out of, and a reply that is neither leave what the terminal is in unknown,
+            // unless a selection answered after the request has named it.
+            if !refused {
+                stream.hold_unknown(open.seq);
+            }
+        } else if succeeded && open.seq > stream.adopted {
             match &open.kind {
                 OpenKind::Selection(path) => {
                     match named(body, path).and_then(|thread| AgentThreadId::new(thread).ok()) {
@@ -511,7 +534,7 @@ impl BrokerState {
                 OpenKind::Leave(left) => {
                     stream.proven.insert(open.seq, Effect::Leave(left.clone()));
                 }
-                OpenKind::Unlisted => {}
+                OpenKind::Unlisted | OpenKind::Unreadable => {}
             }
         }
         self.apply_stream(application_instance_id, now);
@@ -734,18 +757,30 @@ impl Broker {
         else {
             return;
         };
-        let (succeeded, body) = state.gateway.connection(connection).map_or_else(
-            || (false, serde_json::Value::Null),
+        let (succeeded, refused, body) = state.gateway.connection(connection).map_or_else(
+            || (false, false, serde_json::Value::Null),
             |held| {
                 let body: serde_json::Value =
                     serde_json::from_slice(frame).unwrap_or(serde_json::Value::Null);
                 let succeeded = body
                     .as_object()
                     .is_some_and(|members| members.contains_key(&held.table.result_field));
-                (succeeded, body)
+                // A refusal is a reply that names an error and no result.
+                let refused = !succeeded
+                    && body
+                        .as_object()
+                        .is_some_and(|members| members.contains_key(&held.table.error_field));
+                (succeeded, refused, body)
             },
         );
-        state.stream_replied(application_instance_id, &open, succeeded, &body, now);
+        state.stream_replied(
+            application_instance_id,
+            &open,
+            succeeded,
+            refused,
+            &body,
+            now,
+        );
     }
 
     /// Records that a request of the terminal's will not be answered: it was given up at its

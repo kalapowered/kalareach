@@ -3352,9 +3352,17 @@ async fn kr_req_11_36_a_devices_prompt_at_each_boundary_of_the_title_flow_never_
 /// `threadSource` "system" at position 19.
 const ARRAY_START: &str = r#"{"id":"array-1","method":"thread/start","params":[null,null,false,null,null,null,null,null,null,null,null,null,null,null,null,null,true,null,null,"system",null,null,null,null,null,false]}"#;
 
-/// Why rich work waits while what the terminal is in is unknown.
+/// Whether rich work waits because a request of the terminal's that changes its conversation has
+/// not been answered.
+fn in_flight(waiting: Option<String>) -> bool {
+    waiting.is_some_and(|reason| reason.contains("the server has not answered"))
+}
+
+/// Whether rich work waits for the reason the stream gives when what became of the terminal's last
+/// request to change its conversation is not known. The other reasons it gives (a request still in
+/// flight, no thread read yet, an unlisted frame) say "unknown" too, so this is the hold's own text.
 fn unknown(waiting: Option<String>) -> bool {
-    waiting.is_some_and(|reason| reason.contains("unknown"))
+    waiting.is_some_and(|reason| reason.contains("what became of the terminal's last request"))
 }
 
 /// KR-REQ-12.06: on a route whose table states conditions, a request whose parameters are not an
@@ -3475,26 +3483,22 @@ async fn kr_req_12_06_a_helpers_leave_and_start_do_not_disturb_a_visible_request
         } else {
             (&selecting, &leaving)
         };
-        for (request, rest) in [
-            (
-                first,
-                if leave_first {
-                    r#""result":{}"#.to_owned()
-                } else {
-                    named_thread("thread-3", false, "user")
-                },
-            ),
-            (
-                second,
-                if leave_first {
-                    named_thread("thread-3", false, "user")
-                } else {
-                    r#""result":{}"#.to_owned()
-                },
-            ),
-        ] {
-            world.server_answers(request, &rest).await;
-        }
+        let new_thread = named_thread("thread-3", false, "user");
+        let (first_rest, second_rest) = if leave_first {
+            (r#""result":{}"#.to_owned(), new_thread)
+        } else {
+            (new_thread, r#""result":{}"#.to_owned())
+        };
+        world.server_answers(first, &first_rest).await;
+        // Between the two replies the other is still in flight: nothing is applied, rich work waits
+        // for it, and the binding is the conversation the terminal had.
+        assert_eq!(world.thread().as_deref(), Some("thread-1"), "{leave_first}");
+        assert!(
+            in_flight(world.waiting()),
+            "{leave_first}: the other request is in flight: {:?}",
+            world.waiting()
+        );
+        world.server_answers(second, &second_rest).await;
         assert_eq!(world.thread().as_deref(), Some("thread-3"), "{leave_first}");
         assert_eq!(world.waiting(), None, "{leave_first}");
     }
@@ -3581,4 +3585,148 @@ async fn kr_req_11_33_an_approval_on_the_helpers_turn_is_listed_as_the_instances
     );
     assert_eq!(world.thread().as_deref(), Some("thread-1"));
     assert_eq!(world.turn().as_deref(), Some("turn-1"));
+}
+
+/// KR-REQ-12.06: what ends the unknown that an unreadable request leaves. The server's refusal, or
+/// the knowledge that the frame never went, says that no thread was started, so the binding is as
+/// it was and a device's prompt goes to the bound thread again. A success reply, which names a
+/// thread no reading of the request can attribute, and an outcome that was lost keep it unknown
+/// until a selection that can be read is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_an_unreadable_request_the_server_refuses_or_that_never_went_leaves_the_binding_as_it_was()
+ {
+    // A refusal, for each shape the server refuses (it decodes parameters only from an object or an
+    // array) and for the array it could read.
+    for (shape, frame) in [
+        (
+            "null",
+            r#"{"id":"odd-1","method":"thread/start","params":null}"#,
+        ),
+        ("none", r#"{"id":"odd-1","method":"thread/start"}"#),
+        ("array", ARRAY_START),
+    ] {
+        let mut world = World::new(1 << 20);
+        world.terminal_selects("thread-1").await;
+        let revision = world.revision();
+        let asked = world.terminal_asks(frame).await;
+        assert_eq!(world.server_reads().await["method"], "thread/start");
+        assert!(unknown(world.waiting()), "{shape}: {:?}", world.waiting());
+        world.server_answers(&asked, REFUSED).await;
+        assert_eq!(world.waiting(), None, "{shape}: the refusal ends it");
+        assert_eq!(world.thread().as_deref(), Some("thread-1"), "{shape}");
+        assert_eq!(world.revision(), revision, "{shape}");
+        assert_eq!(
+            device_prompt(&mut world).await.as_deref(),
+            Ok("thread-1"),
+            "{shape}"
+        );
+    }
+
+    // A frame that never went: the server never saw it.
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let asked = world.terminal_asks(ARRAY_START).await;
+    assert!(unknown(world.waiting()), "{:?}", world.waiting());
+    world
+        .broker
+        .client_request_given_up(world.connection, &asked, false);
+    assert_eq!(world.waiting(), None, "an unsent frame is no thread");
+    assert_eq!(world.thread().as_deref(), Some("thread-1"));
+
+    // A success reply and a lost outcome keep it unknown, until a selection that can be read is
+    // answered.
+    for lost in [false, true] {
+        let mut world = World::new(1 << 20);
+        world.terminal_selects("thread-1").await;
+        let asked = world.terminal_asks(ARRAY_START).await;
+        assert_eq!(world.server_reads().await["method"], "thread/start");
+        if lost {
+            world
+                .broker
+                .client_request_given_up(world.connection, &asked, true);
+        } else {
+            world
+                .server_answers(&asked, &named_thread("thread-2", true, "system"))
+                .await;
+        }
+        assert!(unknown(world.waiting()), "{lost}: {:?}", world.waiting());
+        assert_eq!(world.thread().as_deref(), Some("thread-1"), "{lost}");
+        let refusal = device_prompt(&mut world).await.expect_err("a prompt waits");
+        assert!(refusal.contains("what became of"), "{lost}: {refusal}");
+        let selecting = world.terminal_asks(START).await;
+        assert_eq!(world.server_reads().await["method"], "thread/start");
+        world.server_answers(&selecting, &named("thread-3")).await;
+        assert_eq!(world.thread().as_deref(), Some("thread-3"), "{lost}");
+        assert_eq!(world.waiting(), None, "{lost}");
+    }
+}
+
+/// KR-REQ-12.06: only a request can hold. A notification of a selecting method whose parameters are
+/// not an object has no reply and starts no thread any more than the same frame in object form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_notification_of_a_selecting_method_with_odd_parameters_changes_nothing() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let revision = world.revision();
+    for frame in [
+        r#"{"method":"thread/start","params":[]}"#,
+        r#"{"method":"thread/start","params":null}"#,
+        r#"{"method":"thread/start"}"#,
+        r#"{"method":"thread/start","params":{}}"#,
+    ] {
+        world.terminal_says(frame).await;
+        assert_eq!(world.server_reads().await["method"], "thread/start");
+        assert_eq!(world.waiting(), None, "{frame}");
+        assert_eq!(world.thread().as_deref(), Some("thread-1"), "{frame}");
+        assert_eq!(world.revision(), revision, "{frame}");
+    }
+}
+
+/// KR-REQ-12.06: the replies of an unreadable request and a readable selection come in either
+/// order. A selection admitted after the unreadable request and answered names the conversation the
+/// terminal is in, whichever reply comes last, and the unreadable request's reply then changes
+/// nothing; one admitted before it is answered leaves the unknown to the unreadable request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_selection_answered_after_an_unreadable_request_names_the_conversation() {
+    for (reply, unreadable_reply) in [
+        ("success", named_thread("thread-9", true, "system")),
+        ("refusal", REFUSED.to_owned()),
+    ] {
+        let mut world = World::new(1 << 20);
+        world.terminal_selects("thread-1").await;
+        let unreadable = world.terminal_asks(ARRAY_START).await;
+        let selecting = world.terminal_asks(START).await;
+        assert_eq!(world.server_reads().await["method"], "thread/start");
+        assert_eq!(world.server_reads().await["method"], "thread/start");
+        world.server_answers(&selecting, &named("thread-2")).await;
+        assert_eq!(world.thread().as_deref(), Some("thread-2"), "{reply}");
+        assert_eq!(
+            world.waiting(),
+            None,
+            "{reply}: the selection answered after it names the conversation"
+        );
+        world.server_answers(&unreadable, &unreadable_reply).await;
+        assert_eq!(world.thread().as_deref(), Some("thread-2"), "{reply}");
+        assert_eq!(world.waiting(), None, "{reply}");
+        assert_eq!(
+            device_prompt(&mut world).await.as_deref(),
+            Ok("thread-2"),
+            "{reply}"
+        );
+    }
+
+    // The selection was admitted before the unreadable request: its reply does not end the unknown.
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let selecting = world.terminal_asks(START).await;
+    let unreadable = world.terminal_asks(ARRAY_START).await;
+    assert_eq!(world.server_reads().await["method"], "thread/start");
+    assert_eq!(world.server_reads().await["method"], "thread/start");
+    world.server_answers(&selecting, &named("thread-2")).await;
+    assert_eq!(world.thread().as_deref(), Some("thread-2"));
+    assert!(unknown(world.waiting()), "{:?}", world.waiting());
+    world
+        .server_answers(&unreadable, &named_thread("thread-9", true, "system"))
+        .await;
+    assert!(unknown(world.waiting()), "{:?}", world.waiting());
 }
