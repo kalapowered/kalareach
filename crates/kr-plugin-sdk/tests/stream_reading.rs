@@ -11,9 +11,10 @@
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::connector::{
-    ConnectorManifest, DecisionResponse, DecisionValue, FieldPath, FieldSegment, LeaveRoute,
-    MessageMembers, MethodClass, MethodClassification, Observation, OperationRoute, Operations,
-    ResolvedRoute, ResponseCorrelation, Route, RouteDirection, SelectionRoute, TurnRoute,
+    ConditionValue, ConnectorManifest, DecisionResponse, DecisionValue, FieldPath, FieldSegment,
+    LeaveRoute, MAX_REQUEST_CONDITIONS, MessageMembers, MethodClass, MethodClassification,
+    Observation, OperationRoute, Operations, RequestCondition, ResolvedRoute, ResponseCorrelation,
+    Route, RouteDirection, SelectionRoute, TurnRoute,
 };
 use kr_plugin_sdk::example;
 use kr_plugin_sdk::ids::{MethodName, ParameterName};
@@ -406,6 +407,68 @@ fn kr_req_12_06_an_observation_names_places_inside_messages_the_table_routes() {
         .expect("an end");
     ended.method = method("turn.started");
     refused(&start_and_end, "both the start and the end of a turn");
+}
+
+/// KR-REQ-12.06: the conditions under which a selection route's request starts a thread the
+/// terminal never shows are checked when the table is read. A list of conditions, a place and a list
+/// of values are bounded, and a table that breaks a bound is refused with a message of its own: it
+/// is not read as one that states no condition, which would make every request of the route a
+/// selection, and not as one whose condition can never be met.
+#[test]
+fn kr_req_12_06_the_conditions_of_a_hidden_request_are_checked_when_the_table_is_read() {
+    let condition = |names: &[&str], values: Vec<ConditionValue>| RequestCondition {
+        place: path(names),
+        values,
+    };
+    let text = |value: &str| ConditionValue::Text(value.to_owned());
+    let with = |conditions: Vec<RequestCondition>| {
+        let mut table = server_table();
+        observation(&mut table).selections[0].hidden_when = conditions;
+        table
+    };
+
+    let fits = with(vec![
+        condition(
+            &["params", "ephemeral"],
+            vec![ConditionValue::Boolean(true)],
+        ),
+        condition(&["params", "threadSource"], vec![text("system")]),
+        condition(
+            &["params", "depth"],
+            vec![ConditionValue::Integer(
+                kr_plugin_sdk::scalars::SafeInt::new(1).expect("an integer"),
+            )],
+        ),
+    ]);
+    let report = validated(&fits);
+    assert!(report.is_valid(), "{:?}", report.findings);
+
+    let many = with(
+        (0..=MAX_REQUEST_CONDITIONS)
+            .map(|n| condition(&["params", &format!("member{n}")], vec![text("x")]))
+            .collect(),
+    );
+    refused(&many, "conditions for the requests of thread.start");
+
+    let none = with(vec![condition(&["params", "threadSource"], Vec::new())]);
+    refused(&none, "lists 0 values");
+
+    let crowded = with(vec![condition(
+        &["params", "threadSource"],
+        (0..=MAX_REQUEST_CONDITIONS)
+            .map(|n| text(&format!("source{n}")))
+            .collect(),
+    )]);
+    refused(&crowded, "lists 9 values");
+
+    let nowhere = with(vec![condition(&[], vec![text("system")])]);
+    refused(&nowhere, "a field path with 0 segments");
+
+    let deep = with(vec![condition(
+        &["params", "a", "b", "c", "d", "e", "f", "g", "h"],
+        vec![text("system")],
+    )]);
+    refused(&deep, "a field path with 9 segments");
 }
 
 /// KR-REQ-12.12: the core's operations a table spells are the only requests the host writes of its
