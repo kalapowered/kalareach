@@ -1532,7 +1532,7 @@ async fn a_member_host_at_its_bound_is_told_as_full_and_not_as_a_failed_lease() 
         cause.for_now() && !matches!(cause, Unopened::HostFull),
         "a refusal of the connection at admission for another reason is a connection lost: {cause:?}"
     );
-    assert_eq!(cause.into_error().code, ErrorCode::PermissionDenied);
+    assert_eq!(cause.into_error().code, ErrorCode::ResourceUnavailable);
 }
 
 /// KR-REQ-19.08: a member's host that refuses the connection at admission is told as that refusal

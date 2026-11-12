@@ -399,8 +399,8 @@ fn not_opened(unopened: Unopened) -> OpenFailure {
             ),
             lost: true,
         },
-        Unopened::NotAdmitted(refusal) => OpenFailure {
-            reason: format!("No connection was made for this view: {}", refusal.message),
+        Unopened::NotAdmitted(words) => OpenFailure {
+            reason: format!("No connection was made for this view: {words}"),
             lost: true,
         },
         Unopened::BudgetFull | Unopened::HostFull => OpenFailure {

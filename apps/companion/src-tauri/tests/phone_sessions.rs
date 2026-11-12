@@ -2671,6 +2671,52 @@ async fn kr_req_19_08_a_refusal_at_the_handshake_ends_the_first_open_at_once() {
     adopted.stop().await;
 }
 
+/// KR-REQ-19.08: a command that names no opening is served on the session's ambient link, and when
+/// the host refuses the connection that link needs at its admission, for a reason that is not its
+/// bound, the command is answered as it is when a connection is lost: with the code and the retry
+/// category of a host that cannot be reached for now and with the host's words. The code that the
+/// host refused the connection with is for the connection, not for the command, and the page ends
+/// or refuses on a `PERMISSION_DENIED` that it never got from the command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_an_ambient_command_whose_connection_the_host_refuses_at_admission_is_answered_as_a_lost_one()
+ {
+    use kr_protocol::error::ErrorCode;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+
+    for code in [ErrorCode::PermissionDenied, ErrorCode::HostNotConfigured] {
+        control.refuse_the_connection(Some(code));
+        let refused = companion
+            .call(
+                "question_read",
+                json!({
+                    "params": { "session_id": session.to_string(), "question_id": null, "include_resolved": false },
+                }),
+            )
+            .expect_err("the host refused the connection the command needed");
+        assert_eq!(
+            refused["code"], "RESOURCE_UNAVAILABLE",
+            "{code:?}: {refused}"
+        );
+        assert_eq!(refused["retry"], "transient", "{code:?}: {refused}");
+        assert!(
+            refused["message"]
+                .as_str()
+                .is_some_and(|words| words.contains("the host refused the connection")),
+            "{code:?}: the host's words: {refused}"
+        );
+    }
+    control.refuse_the_connection(None);
+    adopted.stop().await;
+}
+
 /// KR-REQ-19.08: a device that the host revokes between its handshake and its admission is refused
 /// at admission once, and then answered as an unpaired peer, which ends each later connection as a
 /// connection lost. The opening stands, and the words the person reads stay the host's first, not a
@@ -3868,10 +3914,15 @@ async fn kr_req_19_08_a_connection_that_was_not_opened_says_why() {
         cause.for_now() && !matches!(cause, Unopened::HostFull),
         "a refusal of the connection at admission for another reason is a connection lost: {cause:?}"
     );
+    let answer = cause.into_error();
     assert_eq!(
-        cause.into_error().code,
-        ErrorCode::PermissionDenied,
-        "the host's words are kept"
+        answer.code,
+        ErrorCode::ResourceUnavailable,
+        "a command that needed it is answered as a lost connection is"
+    );
+    assert!(
+        answer.message.contains("the host refused the connection"),
+        "the host's words are kept: {answer:?}"
     );
     control.refuse_the_connection(None);
 

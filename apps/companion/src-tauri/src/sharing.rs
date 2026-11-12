@@ -853,8 +853,8 @@ impl Cause {
             }),
             // The host refused the connection itself at its admission: it is lost, and the host's
             // words are why.
-            Unopened::NotAdmitted(error) => {
-                Self::Refused(format!("the connection was not opened: {}", error.message))
+            Unopened::NotAdmitted(words) => {
+                Self::Refused(format!("the connection was not opened: {words}"))
             }
             Unopened::Unreached(_) => Self::Silent,
         }

@@ -2901,10 +2901,9 @@ fn told_by_cause(unopened: &Unopened) -> String {
                 error.message
             ),
         },
-        Unopened::NotAdmitted(error) => format!(
-            "The connection to the host was not opened: {}",
-            error.message
-        ),
+        Unopened::NotAdmitted(words) => {
+            format!("The connection to the host was not opened: {words}")
+        }
     }
 }
 
@@ -3009,7 +3008,7 @@ mod tests {
 
         for unopened in [
             Unopened::Unreached(CommandError::unavailable("gone")),
-            Unopened::NotAdmitted(CommandError::unavailable("open a new connection")),
+            Unopened::NotAdmitted(crate::connection::HostWords::said("open a new connection")),
             Unopened::Refused(Asked::HostInfo, CommandError::unavailable("no")),
             Unopened::Refused(Asked::Connection, CommandError::unavailable("no.")),
             Unopened::HostFull,
@@ -3034,7 +3033,7 @@ mod tests {
         for unopened in [
             Unopened::HostFull,
             Unopened::BudgetFull,
-            Unopened::NotAdmitted(CommandError::unavailable("no")),
+            Unopened::NotAdmitted(crate::connection::HostWords::said("no")),
             Unopened::Refused(Asked::HostInfo, CommandError::unavailable("no")),
             Unopened::Refused(Asked::Connection, CommandError::unavailable("no")),
         ] {

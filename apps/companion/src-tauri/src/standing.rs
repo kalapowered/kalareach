@@ -135,9 +135,10 @@ impl SessionStanding {
     /// says so; any other cause is contact lost.
     fn reconnecting(failure: &Unopened) -> Self {
         let (reason, capacity) = match failure {
-            Unopened::Unreached(error)
-            | Unopened::NotAdmitted(error)
-            | Unopened::Refused(_, error) => (error.message.clone(), false),
+            Unopened::Unreached(error) | Unopened::Refused(_, error) => {
+                (error.message.clone(), false)
+            }
+            Unopened::NotAdmitted(words) => (words.to_string(), false),
             Unopened::HostFull => (crate::places::HOST_FULL.to_owned(), true),
             Unopened::BudgetFull => (crate::places::BUDGET_FULL.to_owned(), true),
         };
@@ -547,7 +548,7 @@ pub(crate) fn transient(code: ErrorCode) -> bool {
 /// them.
 fn waiting_standing(failure: &Unopened, kept: &mut Option<String>) -> SessionStanding {
     match failure {
-        Unopened::NotAdmitted(refusal) => *kept = Some(refusal.message.clone()),
+        Unopened::NotAdmitted(words) => *kept = Some(words.to_string()),
         Unopened::Unreached(_) if kept.is_some() => {}
         _ => *kept = None,
     }
@@ -727,7 +728,7 @@ impl PairedLinks {
                 // The opening stands, and its watch reaches the host again as the same opening.
                 let standing = SessionStanding::reconnecting(&failure);
                 let not_admitted = match &failure {
-                    Unopened::NotAdmitted(refusal) => Some(refusal.message.clone()),
+                    Unopened::NotAdmitted(words) => Some(words.to_string()),
                     _ => None,
                 };
                 let watch = tauri::async_runtime::spawn(Arc::clone(self).keep(

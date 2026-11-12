@@ -413,6 +413,37 @@ impl Asked {
     }
 }
 
+/// The words of a host's refusal of a connection that it did not admit, and nothing else of the
+/// refusal. Its code is the host's decision about one connection, which says nothing about a
+/// request that needs a connection, so it is not kept: only [`Unopened::of_refused_connection`]
+/// makes these words, and no one reads a code from them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostWords(String);
+
+impl HostWords {
+    fn of(refusal: kr_protocol::error::ProtocolError) -> Self {
+        Self(refusal.message)
+    }
+
+    /// The words of a host's refusal, for a case that needs a cause that was not made by a dial.
+    #[cfg(test)]
+    pub(crate) fn said(words: impl Into<String>) -> Self {
+        Self(words.into())
+    }
+
+    /// The words, as the host said them.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for HostWords {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Why a dial or a call did not get its connection to a paired host.
 ///
 /// The cause is made where it is known and carried on unchanged: no text for a person is chosen
@@ -440,8 +471,10 @@ pub enum Unopened {
     /// bound: an authority that was withdrawn since the handshake, or a daemon that has stopped
     /// while its listener still accepts. The connection is as good as lost, so every dialer does
     /// what it does when a connection is lost, and the host's words are the reason that a person
-    /// reads while that stays so. It is made in [`Self::of_refused_connection`] and nowhere else.
-    NotAdmitted(CommandError),
+    /// reads while that stays so. It is made in [`Self::of_refused_connection`] and nowhere else,
+    /// and it carries the host's words and not its code: a command that needed the connection is
+    /// answered as it is when a connection is lost ([`Self::into_error`]).
+    NotAdmitted(HostWords),
     /// The host could not be reached, did not answer in time, or failed in a way that is no
     /// refusal of the host's.
     Unreached(CommandError),
@@ -534,7 +567,7 @@ impl Unopened {
         if refusal.code == kr_protocol::error::ErrorCode::ResourceUnavailable {
             Self::HostFull
         } else {
-            Self::NotAdmitted(CommandError::from(refusal))
+            Self::NotAdmitted(HostWords::of(refusal))
         }
     }
 
@@ -556,11 +589,14 @@ impl Unopened {
         Self::Unreached(CommandError::from(error))
     }
 
-    /// The failure, as a command that needed the connection answers with it.
+    /// The failure, as a command that needed the connection answers with it. A connection that the
+    /// host did not admit is a connection lost, with the host's words: the code that the host
+    /// refused it with is for that connection and not for the command.
     #[must_use]
     pub fn into_error(self) -> CommandError {
         match self {
-            Self::Refused(_, error) | Self::NotAdmitted(error) | Self::Unreached(error) => error,
+            Self::Refused(_, error) | Self::Unreached(error) => error,
+            Self::NotAdmitted(words) => CommandError::unavailable(words.0),
             Self::HostFull => crate::places::host_full_error(),
             Self::BudgetFull => crate::places::full_error(),
         }
@@ -1142,6 +1178,34 @@ mod tests {
         let opaque =
             kr_protocol::envelope::ParamsValue::new(kr_cbor::CanonicalValue::Bytes(vec![1, 2, 3]));
         assert_eq!(read_payload(&opaque), serde_json::Value::Null);
+    }
+
+    /// KR-REQ-19.08: a command that needed a connection which the host did not admit is answered
+    /// as it is when a connection is lost: with the code and the retry category of a host that
+    /// cannot be reached for now, and with the host's words. The host's code is for the
+    /// connection and not for the command, so it does not reach the page.
+    #[test]
+    fn a_command_that_needed_a_connection_the_host_did_not_admit_is_answered_as_a_lost_one() {
+        use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
+
+        for code in [
+            ErrorCode::PermissionDenied,
+            ErrorCode::HostNotConfigured,
+            ErrorCode::ClockUntrusted,
+        ] {
+            let cause = Unopened::of_refused_connection(ProtocolError::new(
+                code,
+                "the authority of this device was withdrawn",
+            ));
+            assert!(matches!(cause, Unopened::NotAdmitted(_)), "{code:?}");
+            let answer = cause.into_error();
+            assert_eq!(answer.code, ErrorCode::ResourceUnavailable, "{code:?}");
+            assert_eq!(answer.retry, RetryCategory::Transient, "{code:?}");
+            assert_eq!(
+                answer.message, "the authority of this device was withdrawn",
+                "{code:?}: the host's words"
+            );
+        }
     }
 
     #[test]
