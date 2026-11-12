@@ -223,11 +223,12 @@ fn what_the_client_reads_of_the_mouse_is_what_the_worker_holds() {
 /// KR-REQ-01.11: what the worker does not hand a terminal is not read by the client, and the client
 /// holds what the worker held where it handed the attachment over to the projected one.
 ///
-/// Three kinds of bytes that an earlier reader read as a mode setting and the worker never forwards:
-/// a mode setting inside a tmux passthrough, one with a control inside the sequence, and one opened
-/// by the raw 8-bit introducer. The worker holds the mode, because its screen is the one the
-/// application drew, and moves the attachment to the projected screen from before the sequence,
-/// which is drawn with that mode in it. Until then the client holds what it was handed.
+/// Three kinds of bytes look like a mode setting to a scanner of the bytes alone, and the worker
+/// never forwards them: a mode setting inside a tmux passthrough, one with a control inside the
+/// sequence, and one opened by the raw 8-bit introducer. The worker holds the mode, because its
+/// screen is the one the application drew, and moves the attachment to the projected screen from
+/// before the sequence, which is drawn with that mode in it. Until then the client holds what it
+/// was handed.
 #[test]
 fn a_mode_setting_the_worker_does_not_forward_is_not_read_by_the_client() {
     for (name, written) in [
