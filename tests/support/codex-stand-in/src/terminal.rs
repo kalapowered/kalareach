@@ -48,7 +48,13 @@ fn begin(prompt: &str) -> Value {
 pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &str) -> i32 {
     // Where a person is at the terminal its keys are read and its composer drawn; elsewhere every
     // line is written as it is.
-    let mut screen = Screen::open();
+    let mut screen = if variants.tick {
+        // The ticks are written by a task of their own, at the pace a test sets, on the lines of
+        // the screen as they stand: no composer is drawn among them.
+        Screen::plain()
+    } else {
+        Screen::open()
+    };
     macro_rules! say {
         ($screen:expr, $($arguments:tt)*) => {
             $screen.say(format_args!($($arguments)*))
@@ -340,6 +346,13 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                             .unwrap_or_default()
                             .to_owned();
                         screen.begins();
+                        // The server does not announce a resumed thread as it does a new one, and
+                        // a person at the terminal is ready for their first key all the same: the
+                        // line a new thread is announced with, which is what the entry takes for
+                        // the composer, is the terminal's own here.
+                        if method == "thread/resume" && screen.is_typed_at() {
+                            say!(screen, "TUI: thread/started");
+                        }
                         // A terminal a person is at, for an agent that keeps a record of its
                         // turns, starts a turn of its own only with words to start one with, and
                         // not with the words that resume a conversation: its turns are the ones
@@ -440,11 +453,7 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                     "turn/started" => screen.works(true),
                     "turn/completed" => screen.works(false),
                     // The server's word that a request was answered, by whoever answered it.
-                    "serverRequest/resolved" => {
-                        let request = &frame["params"]["requestId"];
-                        received.remove(&request.to_string());
-                        screen.resolved(request);
-                    }
+                    "serverRequest/resolved" => screen.resolved(&frame["params"]["requestId"]),
                     _ => {}
                 }
                 say!(screen, "TUI: {method}");
