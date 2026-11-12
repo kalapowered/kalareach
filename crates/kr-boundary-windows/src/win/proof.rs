@@ -290,7 +290,11 @@ fn system_windows_directory() -> Result<String, String> {
 pub(super) fn proof_environment(git: &GitSet, scratch: &Path) -> Result<EnvBlock, String> {
     let roots = RootPaths {
         system: system_windows_directory()?,
-        boundary: Paths::system().program.display().to_string(),
+        boundary: Paths::system()
+            .map_err(|error| error.to_string())?
+            .program
+            .display()
+            .to_string(),
         private_root: scratch.display().to_string(),
     };
     env::build_env(

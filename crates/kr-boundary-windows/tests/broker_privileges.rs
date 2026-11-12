@@ -333,7 +333,12 @@ impl Served {
         let thread = {
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
-                broker::testing::serve(Manifest::begin(), Paths::system(), &[], stop)
+                broker::testing::serve(
+                    Manifest::begin(),
+                    Paths::system().expect("the system's folders are read"),
+                    &[],
+                    stop,
+                )
             })
         };
         Served {
