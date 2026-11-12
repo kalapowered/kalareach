@@ -372,6 +372,15 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
             InstallState::InProgress => Entry::Partial(manifest),
         });
     }
+    // The folders above the program tree are read here, before anything is made, written or
+    // stopped, as the folders above the data tree were by the check above; a link at the program
+    // directory's name, one that points nowhere included, gets the link's own remedy.
+    check_program_parents(paths)?;
+    if records::entry_exists(&paths.program)
+        && let Err(refusal) = DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)?
+    {
+        return Err(anchor_refusal(paths, &refusal));
+    }
     for name in [CHECKOUT, CONNECT] {
         if account::find(name).is_some() {
             return Err(Error::Refused(format!(
@@ -385,7 +394,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
         )));
     }
     for (directory, accepted) in [(&paths.program, false), (&paths.data, data_accepted)] {
-        if directory.exists() && !accepted {
+        if records::entry_exists(directory) && !accepted {
             return Err(Error::Refused(format!(
                 "{} exists and this installation did not make it",
                 directory.display()
@@ -1617,6 +1626,23 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
 /// but nothing here rests on a default. A folder that is not there ends the walk: nothing below it
 /// is there either.
 fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
+/// The refusal of the program directory's own name: a link or a file there is removed, the volume is
+/// a refusal that no change of owner, list or open handle cures.
+fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal) -> Error {
+    let (why, cure) = match refusal {
+        AnchorRefusal::Volume(_) => (refusal.to_string(), Cure::Volume),
+        AnchorRefusal::ReparsePoint => ("it is a link".to_owned(), Cure::RemoveLink),
+        AnchorRefusal::NotADirectory => (refusal.to_string(), Cure::RemoveEntry),
+    };
+    program_refusal(
+        paths,
+        paths.program.parent().unwrap_or(&paths.program),
+        paths.program.file_name().unwrap_or_default(),
+        &why,
+        cure,
+    )
+}
+
     let mut chain: Vec<&Path> = top.ancestors().skip(1).collect();
     chain.reverse();
     for folder in chain {
@@ -1790,22 +1816,7 @@ fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
     let program = paths.program.file_name().unwrap_or_default().to_owned();
     let held = match DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)? {
         Ok(held) => held,
-        Err(refusal) => {
-            // Only the volume is a refusal that no change of owner, list or open handle cures: a
-            // link or a file at the program directory's name is removed.
-            let cure = match refusal {
-                AnchorRefusal::Volume(_) => Cure::Volume,
-                AnchorRefusal::ReparsePoint => Cure::RemoveLink,
-                AnchorRefusal::NotADirectory => Cure::RemoveEntry,
-            };
-            return Err(program_refusal(
-                paths,
-                paths.program.parent().unwrap_or(&paths.program),
-                &program,
-                &refusal.to_string(),
-                cure,
-            ));
-        }
+        Err(refusal) => return Err(anchor_refusal(paths, &refusal)),
     };
     if let Some(why) = check_readable_object(held.handle())? {
         return Err(program_refusal(
