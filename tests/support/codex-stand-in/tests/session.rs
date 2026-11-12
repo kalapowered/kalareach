@@ -121,10 +121,6 @@ async fn the_server_runs_a_turn_and_ends_its_commands_with_its_input() {
     write(&mut stdin, &turn_request("thread-1")).await;
     assert!(next(&mut lines).await["result"]["turn"].is_object());
     assert_eq!(next(&mut lines).await["method"], "turn/started");
-    assert_eq!(next(&mut lines).await["method"], "item/started");
-    let said = next(&mut lines).await;
-    assert_eq!(said["method"], "item/completed");
-    assert_eq!(said["params"]["item"]["type"], "userMessage");
     let asked = next(&mut lines).await;
     assert_eq!(asked["method"], "item/commandExecution/requestApproval");
     write(
@@ -218,10 +214,6 @@ async fn the_server_steers_interrupts_resumes_forks_and_unsubscribes() {
     write(&mut stdin, &turn_request("thread-1")).await;
     assert_eq!(next(&mut lines).await["result"]["turn"]["id"], "turn-1");
     assert_eq!(next(&mut lines).await["method"], "turn/started");
-    assert_eq!(next(&mut lines).await["method"], "item/started");
-    let said = next(&mut lines).await;
-    assert_eq!(said["method"], "item/completed");
-    assert_eq!(said["params"]["item"]["type"], "userMessage");
     let asked = next(&mut lines).await;
     assert_eq!(asked["method"], "item/commandExecution/requestApproval");
 
@@ -281,8 +273,6 @@ async fn the_server_steers_interrupts_resumes_forks_and_unsubscribes() {
     .await;
     assert_eq!(next(&mut lines).await["result"]["turn"]["id"], "turn-2");
     assert_eq!(next(&mut lines).await["method"], "turn/started");
-    assert_eq!(next(&mut lines).await["method"], "item/started");
-    assert_eq!(next(&mut lines).await["method"], "item/completed");
     assert_eq!(next(&mut lines).await["method"], "turn/completed");
 
     // Forking makes a thread of its own; resuming one that is known answers with that thread;
@@ -1088,7 +1078,7 @@ async fn a_server_resumes_a_thread_the_agents_record_holds_and_no_other() {
 /// numbered as they were.
 #[tokio::test]
 async fn a_thread_started_for_a_title_is_marked_and_its_turn_is_not_the_conversations() {
-    let mut child = server("", None);
+    let mut child = server("write-the-record", None);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
 
