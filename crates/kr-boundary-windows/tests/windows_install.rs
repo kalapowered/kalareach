@@ -2110,6 +2110,13 @@ fn the_channel_hands_the_policy_to_powershell_in_a_new_file_of_the_administrator
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     setting.join().unwrap().expect("the policy is set");
+    // PowerShell's own directory of the run (`shell-` and 32 hexadecimal digits) is made in the
+    // same folder and removed with the file: it is not the policy file, which the names below are.
+    seen.retain(|name, _| {
+        !name
+            .strip_prefix("shell-")
+            .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    });
     assert!(
         !seen.is_empty(),
         "the file was there while PowerShell had it"
@@ -2452,6 +2459,8 @@ fn journal_naming(journals: &Path, root: &str, id: u8, finished: bool) -> PathBu
             objects: 0,
             leftovers: 0,
         });
+        // The tracker refuses an end while the root it began is not recorded as removed.
+        rows.push(Row::RootRemoved);
         rows.push(Row::End { root_leftovers: 0 });
     }
     for row in &rows {
