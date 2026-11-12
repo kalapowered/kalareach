@@ -82,6 +82,7 @@ fn the_refusal_of_a_list_names_the_real_sentence_and_every_right_that_the_check_
     assert!(text.contains("It is refused because"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
     for named in [
+        "take away from every other identity the right to delete the folder, to delete or rename an entry in it, to change its list and to take its ownership",
         "delete the folder",
         "delete or rename an entry in it",
         "change its list",
