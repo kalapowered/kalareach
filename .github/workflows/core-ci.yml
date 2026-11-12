@@ -1829,8 +1829,9 @@ jobs:
       # .NET 11. These steps come after every step above, which ran under the first pin, so a cache
       # that main saves does not wait on them. The release is pinned by version and checked against
       # the digest its release notes publish; the macos-powershell job pins the same release for
-      # macOS, and the two change together. Its qualification is published under a prefix of its
-      # own, so the package that the steps above qualified and tested is left as it is.
+      # macOS, and the two change together. Its qualification is published into the same cache
+      # under an identity of its own, and from then on it is the package that the cases find. The
+      # package that the steps above qualified stays in the cache beside it.
       - name: Install the second pinned PowerShell
         env:
           POWERSHELL_VERSION: "7.7.0"
@@ -1848,28 +1849,38 @@ jobs:
           echo "KR_SECOND_POWERSHELL=$RUNNER_TEMP/powershell-$POWERSHELL_VERSION" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
-      # The cases that need a PowerShell, under the second release: the contract, the startup
-      # entries' own tests and the two qualification cases that qualify the PowerShell package.
-      # The release goes first on the path, and the cases read the qualification published to the
-      # prefix of its own.
+      # The cases that drive the PowerShell package, under the second release: the contract, the
+      # startup entries' own tests, the qualification cases that name the PowerShell package, each
+      # PowerShell case of the corpus, and the installer over the homes of the plugin stacks. The
+      # release goes first on the path. The corpus's PowerShell cases are read from the corpus, so
+      # a case added to it runs here without a change to this step.
       - name: Drive the PowerShell package on the second release
         env:
           KR_REQUIRE_UTF8_LOCALE: "1"
         run: |
           export PATH="$KR_SECOND_POWERSHELL:$PATH"
-          export KR_SHELL_PREFIX="$RUNNER_TEMP/kr-shells-second"
+          test "$(command -v pwsh)" = "$KR_SECOND_POWERSHELL/pwsh"
           export KR_TEST_ARTIFACTS_DIR="$RUNNER_TEMP/kr-shell-qualification-second"
-          mkdir -p "$KR_SHELL_PREFIX" "$KR_TEST_ARTIFACTS_DIR"
-          command -v pwsh
+          mkdir -p "$KR_TEST_ARTIFACTS_DIR"
           pwsh -NoProfile -Command '
             Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
             Publish-KalaReachQualification | Format-List'
           cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
           cargo test --locked -p kr-shell-integration --lib host::startup:: -- --include-ignored
           cargo test --locked -p kr-shell-integration --test qualification -- \
-            --test-threads=1 --include-ignored \
+            --test-threads=1 --include-ignored --exact \
             the_package_binds_into_the_editor_it_was_qualified_against \
             a_powershell_release_an_advisory_affects_is_named_and_refused
+          cases=0
+          for file in tests/shells/powershell/*/case.json; do
+            id="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$file")"
+            KR_QUALIFICATION_CASE="$id" cargo test --locked -p kr-shell-integration --test qualification -- \
+              --test-threads=1 --include-ignored --exact every_case_holds_against_the_package_it_names
+            cases=$((cases + 1))
+          done
+          test "$cases" -gt 0
+          cargo test --locked -p kr-shell-integration --test install_homes -- \
+            --test-threads=1 --include-ignored
 
   typescript:
     name: typescript
@@ -3030,9 +3041,11 @@ jobs:
   # shell-packages job pins, from the macOS archive and checked against the digest its release
   # publishes: the package refuses a release that a published advisory affects, and the .NET
   # internals the reader reads can change between runner images, so a gate that took the image's
-  # release would turn on the image's date. Every step has a limit of its own, and the limits add
-  # up to less than the job's. The step that builds and the step that runs the cases have a limit
-  # of at least twice the longest each is expected to take on this runner. The build took 682
+  # release would turn on the image's date. The cases run a second time under the first stable
+  # release of the 7.7 series, which the job pins beside it. Every step has a limit of its own,
+  # and the limits add up to 190 of the job's 195 minutes. The step that builds and the steps
+  # that run the cases have a limit of at least twice the longest each is expected to take on
+  # this runner. The build took 682
   # seconds from nothing on a Mac at background priority with four build jobs, which is 910 with
   # this runner's three. The cases took 263 seconds on a Mac and 389 on a Linux build machine, and
   # this workflow's process-heavy suites have taken up to 4.7 times as long on a hosted runner as
@@ -3042,7 +3055,7 @@ jobs:
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
-    timeout-minutes: 125
+    timeout-minutes: 195
     steps:
       - name: Check out
         timeout-minutes: 5
@@ -3112,8 +3125,8 @@ jobs:
       # The package is also run under the first stable release of the 7.7 series, which carries
       # .NET 11, after its cases have run under the first pin. The release is the one the
       # shell-packages job pins, and the two change together. It is checked against the digest its
-      # release publishes, and its qualification is published under a prefix of its own, so the
-      # package that the steps above qualified and tested is left as it is.
+      # release publishes, and its qualification is published into the same cache under an
+      # identity of its own, from then on the package that the cases find.
       - name: Install the second pinned PowerShell
         timeout-minutes: 5
         env:
@@ -3132,17 +3145,14 @@ jobs:
           echo "KR_SECOND_POWERSHELL=$RUNNER_TEMP/powershell-$POWERSHELL_VERSION" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
-      # The same cases as above, under the second release, against the qualification published to
-      # the prefix of its own.
+      # The same cases as above, under the second release.
       - name: Drive the PowerShell package through the contract on the second release
         timeout-minutes: 65
         env:
           KR_REQUIRE_UTF8_LOCALE: "1"
         run: |
           export PATH="$KR_SECOND_POWERSHELL:$PATH"
-          export KR_SHELL_PREFIX="$RUNNER_TEMP/kr-shells-second"
-          mkdir -p "$KR_SHELL_PREFIX"
-          command -v pwsh
+          test "$(command -v pwsh)" = "$KR_SECOND_POWERSHELL/pwsh"
           pwsh -NoProfile -Command '
             Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
             Publish-KalaReachQualification | Format-List'
