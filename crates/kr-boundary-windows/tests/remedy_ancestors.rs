@@ -5,7 +5,7 @@
 use kr_boundary_windows::remedy::{
     AncestorFault, Stage, Tree, ancestor_refusal, dos_path_of, identity_text,
     is_on_a_network_share, is_the_place_asked_for, is_the_volumes_own_root, program_removal_advice,
-    rights_finding, rights_in_words,
+    rights_finding, rights_in_words, volume_layout,
 };
 
 const DELETE_CHILD: u32 = 0x0000_0040;
@@ -286,6 +286,15 @@ fn a_folder_on_a_volume_that_is_not_used_is_refused_for_its_volume() {
         assert!(!text.contains("Make the Administrators group"), "{text}");
         assert!(!text.contains("Close the program"), "{text}");
         assert!(!text.to_lowercase().contains("remove the link"), "{text}");
+        // The layout is not supported, and no folder that other programs share is to be moved,
+        // re-pointed or changed.
+        assert!(text.contains("This layout is not supported"), "{text}");
+        assert!(
+            text.contains("directs no change to a folder that other programs share"),
+            "{text}"
+        );
+        assert!(!text.contains("Move "), "{text}");
+        assert!(!text.to_lowercase().contains("re-point"), "{text}");
     }
     let program = ancestor_refusal(
         r"Y:\",
@@ -298,6 +307,11 @@ fn a_folder_on_a_volume_that_is_not_used_is_refused_for_its_volume() {
         "{program}"
     );
     assert!(program.contains("Program Files folder"), "{program}");
+    // The anchor's own refusal of a volume ends with the same sentence.
+    let anchor = volume_layout("Program Files");
+    assert!(program.ends_with(&anchor), "{program}");
+    assert!(anchor.contains("This layout is not supported"), "{anchor}");
+    assert!(!anchor.contains("Move "), "{anchor}");
     let data = ancestor_refusal(
         r"Y:\",
         Tree::Data,

@@ -1650,8 +1650,9 @@ fn program_refusal(
             }
         ),
         Cure::Volume => format!(
-            "{} is on a volume that the installation does not use: it keeps its program directory on a fixed, local NTFS volume, and nothing in it can be corrected to make another volume one. {kept_directory} Move the system's Program Files folder to such a volume, or install on a computer where it is on one, then run the setup program again.",
-            entry.display()
+            "{} is on a volume that the installation does not use: it keeps its program directory on a fixed, local NTFS volume, and nothing in it can be corrected to make another volume one. {kept_directory} {}",
+            entry.display(),
+            remedy::volume_layout("Program Files")
         ),
         Cure::Open => format!(
             "Close the program that holds {} open, or correct who may open it, and if it is a link remove the link itself and not what it points to, or if it is not a folder remove that entry and nothing else, then run the setup program again. {kept_directory}",
