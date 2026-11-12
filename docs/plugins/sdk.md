@@ -18,6 +18,21 @@ cannot read the new members and refuses such a package. The `decision_response`,
 `operations` members of a table are in version 0.1.6: a package whose table declares any of them
 declares `"sdk_range": ">=0.1.6, <0.2.0"`, and a host on an earlier contract refuses it.
 
+The `hidden_when` member of a selection route is in version 0.1.7. It lists conditions on the
+request: each names a place in the request's message and the strings, booleans or integers that
+place may hold. A request that meets every condition starts a thread that the terminal never shows,
+so the host does not take the thread its reply names as the one the terminal is in. A route with no
+`hidden_when`, or an empty one, means what it meant before. A package whose table states the member
+declares `"sdk_range": ">=0.1.7, <0.2.0"`.
+
+A host tests a package's `sdk_range` before it reads the package's connector table or presentation,
+and refuses a package whose range excludes its SDK version with that finding alone. A host built
+before this order reads the connector table first, so it reports a table it cannot read, and then
+the range. Either way a host on an earlier contract refuses the package and does not guess at the
+new members. The package's connector then does not run: for the Codex package, Codex runs as typed
+with no gateway until a package the host admits is active. Which members arrived at which SDK
+version is listed in `arrivals` in `packages/plugin-sdk/schema/package-contract.json`.
+
 The examples use the Claude Code Channels surface. Claude Code relays a tool approval as
 `notifications/claude/channel/permission_request` with `params.request_id`, and it reads the answer
 as `notifications/claude/channel/permission` with the same `params.request_id` and a
