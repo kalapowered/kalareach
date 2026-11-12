@@ -1653,9 +1653,15 @@ fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal) -> Error {
 /// but nothing here rests on a default. A folder that is not there ends the walk: nothing below it
 /// is there either.
 fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
+    use remedy::AncestorFault as Fault;
     let mut chain: Vec<&Path> = top.ancestors().skip(1).collect();
     chain.reverse();
     for folder in chain {
+        let shown = folder.display().to_string();
+        let refuse =
+            |fault: Fault<'_>| Error::Refused(remedy::ancestor_refusal(&shown, tree, &fault));
+        let unreadable =
+            |error: &dyn std::fmt::Display| refuse(Fault::Unreadable(&error.to_string()));
         let wide = ffi::wide_path(folder);
         // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
         let raw = unsafe {
@@ -1676,24 +1682,28 @@ fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
             {
                 return Ok(());
             }
-            Err(failure) => {
-                return Err(Error::Refused(remedy::ancestor_refusal(
-                    &folder.display().to_string(),
-                    tree,
-                    &format!("it could not be opened to be checked ({failure})"),
-                )));
+            Err(failure) => return Err(unreadable(&failure)),
+        };
+        let attributes = attributes_of(&handle, "a folder above the installation")
+            .map_err(|error| unreadable(&error))?;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(refuse(Fault::Link));
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(refuse(Fault::NotAFolder));
+        }
+        // A drive letter that is substituted or redirected opens as a folder of another volume: the
+        // folders above its target would be left unread, so the tree is not called checked.
+        if folder.parent().is_none() {
+            let found = final_dos_path(&handle).map_err(|error| unreadable(&error))?;
+            if !remedy::is_the_volumes_own_root(&shown, &found) {
+                return Err(refuse(Fault::Alias(&found)));
             }
-        };
-        let why = match not_a_plain_directory(&handle, "a folder above the installation")? {
-            Some(why) => Some(why.to_owned()),
-            None => acl::replaceable_by_others_on(&handle)?,
-        };
-        if let Some(why) = why {
-            return Err(Error::Refused(remedy::ancestor_refusal(
-                &folder.display().to_string(),
-                tree,
-                &why,
-            )));
+        }
+        if let Some(why) =
+            acl::replaceable_by_others_on(&handle).map_err(|error| unreadable(&error))?
+        {
+            return Err(refuse(Fault::List(&why)));
         }
     }
     Ok(())
