@@ -827,11 +827,14 @@ struct Carry {
 
 /// Why a second connection for a repeat of a sharing action was not opened, as far as what the
 /// person is told is concerned.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Cause {
-    /// The host did not answer, or refused for a reason that is not its bound: told as the host not
-    /// answering.
+    /// The host did not answer.
     Silent,
+    /// The host refused, or the connection was not opened for a reason of its own: the words say
+    /// which, and name the request the host refused when it refused one. It is no host that did not
+    /// answer.
+    Refused(String),
     /// The host cannot take another connection from this computer for now.
     HostFull,
     /// This application holds as many connections to the host as it keeps.
@@ -844,18 +847,24 @@ impl Cause {
         match unopened {
             Unopened::HostFull => Self::HostFull,
             Unopened::BudgetFull => Self::BudgetFull,
-            Unopened::Refused(..) | Unopened::Unreached(_) => Self::Silent,
+            Unopened::Refused(asked, error) => Self::Refused(match asked.request() {
+                Some(request) => format!("the host refused to {request}: {}", error.message),
+                None => format!("the connection was not opened: {}", error.message),
+            }),
+            Unopened::Unreached(_) => Self::Silent,
         }
     }
 
-    fn words(self) -> &'static str {
+    fn words(&self) -> String {
         match self {
-            Self::Silent => "the host did not answer",
+            Self::Silent => "the host did not answer".to_owned(),
+            Self::Refused(words) => words.clone(),
             Self::HostFull => {
-                "the host would not take another connection from this computer just now"
+                "the host would not take another connection from this computer just now".to_owned()
             }
             Self::BudgetFull => {
                 "this computer already holds as many connections to this host as it keeps at once"
+                    .to_owned()
             }
         }
     }
@@ -1689,9 +1698,9 @@ impl Carry {
         let first_refusal = said.refusal.clone();
         let mut asked_again = 0;
         // Why the last connection asked for to repeat the request was not opened, when it was not:
-        // a host that cannot take another from this computer for now, or this computer's own limit,
-        // is an answer, and the words at the end say it. A host that did not answer, or refused for
-        // another reason, is told as the host not answering.
+        // a host that cannot take another from this computer for now, this computer's own limit,
+        // and a refusal are answers, and the words at the end say which. Only a host that did not
+        // answer is told as the host not answering.
         let mut cause = Cause::Silent;
         let challenge = loop {
             match Reply::of(&outcome) {
@@ -2183,20 +2192,40 @@ const _: fn(&GrantCreateParams, &InvitationId, &GrantId) = |_, _, _| {};
 #[cfg(test)]
 mod tests {
 
-    /// KR-REQ-19.08: a second connection that was not opened because the host did not answer is told
-    /// as the host not answering, as it is without a budget; only a refusal for want of room, the
-    /// host's or this computer's own, says that.
+    /// KR-REQ-19.08: a second connection that was not opened is told by its cause: only a host that
+    /// did not answer is told as not answering, and a refusal, or a refusal for want of room, the
+    /// host's or this computer's own, says what it was.
     #[test]
-    fn a_host_that_did_not_answer_is_not_told_as_full() {
+    fn a_second_connection_that_was_not_opened_is_told_by_its_cause() {
         use crate::connection::Unopened;
 
         let silent = Cause::of(&Unopened::Unreached(CommandError::unavailable("gone")));
         assert_eq!(silent.words(), "the host did not answer");
+        // A refusal stays a refusal, whatever its code, and names the request the host refused.
         let refused = Cause::of(&Unopened::Refused(
-            crate::connection::Asked::Connection,
+            crate::connection::Asked::HostInfo,
             CommandError::new(ErrorCode::ResourceUnavailable, "supervision"),
         ));
-        assert_eq!(refused.words(), "the host did not answer");
+        assert!(
+            refused.words().contains("supervision"),
+            "{}",
+            refused.words()
+        );
+        assert!(
+            refused.words().contains("refused to say who it is"),
+            "{}",
+            refused.words()
+        );
+        assert_ne!(refused.words(), "the host did not answer");
+        let unopened = Cause::of(&Unopened::Refused(
+            crate::connection::Asked::Connection,
+            CommandError::new(ErrorCode::PermissionDenied, "withdrawn"),
+        ));
+        assert!(
+            !unopened.words().contains("did not answer"),
+            "{}",
+            unopened.words()
+        );
         assert!(
             Cause::of(&Unopened::HostFull)
                 .words()
