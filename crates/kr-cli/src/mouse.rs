@@ -206,12 +206,10 @@ impl Default for MouseReporting {
 }
 
 impl std::fmt::Debug for MouseReporting {
-    /// What the application asked for, never the output it was read from.
+    /// Which kind it is, never what it holds: the lexer keeps bytes of the output it reads.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MouseReporting")
-            .field("tracking", &self.tracking())
-            .field("encoding", &self.encoding())
             .finish_non_exhaustive()
     }
 }
