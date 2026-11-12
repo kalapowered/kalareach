@@ -248,8 +248,10 @@ The plugin SDK schema has one more exception, for a member that the SDK's own ar
 The table is `arrivals` in `packages/plugin-sdk/schema/package-contract.json`, generated from
 `crates/kr-plugin-sdk/src/arrivals.rs`: for each member, its definition, its name and the SDK
 version it arrived at. The check passes an optional member added to a definition, and says each one
-it passes with both versions, when all of these hold: the definition is an object in both SDK
-schemas, one that neither release's protocol schema has, that the connector table's root (`ConnectorManifest`) reaches and that the
+it passes with both versions, when all of these hold: the definition is a plain closed object in
+both SDK schemas (`type` is `object`, `additionalProperties` is `false`, and the definition's own
+keys are among `type`, `properties`, `required`, `additionalProperties`, `description` and
+`title`), one that neither release's protocol schema has, that the connector table's root (`ConnectorManifest`) reaches and that the
 package manifest's root (`PluginManifest`) does not, in the earlier release's SDK schema and in the
 commit's; the commit's table lists the member at an SDK version above the `sdk_version` that the
 earlier release's contract states; and the commit's own `sdk_version` is above that version too. A
@@ -265,8 +267,9 @@ version or has a table that does not read fails the check with a message of its 
 lists a member only where a package that lacks it means what it meant before. The package check
 refuses a connector table that carries a listed member under an `sdk_range` that admits an SDK
 version below the member's arrival, so a package that uses the member states a range that an
-earlier host does not admit. The comparison sees neither, and the review of the change that lists a
-member must.
+earlier host does not admit. The comparison cannot prove that a member's absence keeps the earlier meaning, so each entry of
+the arrival table is a review item for the member's own schema: the comparison sees neither, and
+the review of the change that lists a member must.
 
 The check fails when it cannot list origin's tags, when this checkout's tags are not origin's, when
 a release's tree cannot be read and when a source is in a form it does not read, and it never leaves

@@ -36,7 +36,9 @@
 //!   generated, and `kr-plugin-sdk-gen --check` holds the committed ones equal to the generated
 //!   ones. A release of the level without the schema or without `package-contract.json`, or a
 //!   file that does not read, fails the check. Only a definition that is new passes, and one kind
-//!   of member: an optional member of a definition that is an object in both schemas, that no
+//!   of member: an optional member of a definition that is a plain closed object in both schemas
+//!   (`type` is `object`, `additionalProperties` is `false`, and its own keys are among `type`,
+//!   `properties`, `required`, `additionalProperties`, `description` and `title`), that no
 //!   protocol schema has, and that the connector table's root reaches and the package manifest's
 //!   root does not, which this commit's arrival table (in its `package-contract.json`) lists at
 //!   an SDK version above the release's own `sdk_version`, in a commit whose SDK version is above
