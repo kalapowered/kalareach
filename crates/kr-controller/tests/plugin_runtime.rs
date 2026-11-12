@@ -693,6 +693,9 @@ struct World {
     /// How much of `requested` an earlier daemon of this tree made: what the current one was asked
     /// to start is what follows.
     counted_from: usize,
+    /// What each worker's link has said of itself in the looks taken so far, put together, since
+    /// one look holds only the newest of it.
+    link_histories: Mutex<Vec<(SessionId, kr_worker::plugin_link_trace::History)>>,
     _published: tempfile::TempDir,
     /// Before the hosts, so a daemon in a process of its own is gone before they are ended.
     apart: Apart,
@@ -789,6 +792,7 @@ impl World {
             agent,
             requested: Arc::clone(&requested),
             counted_from: 0,
+            link_histories: Mutex::new(Vec::new()),
             _published: published,
             apart: Apart { child: None },
             _hosts: HostEnding {
@@ -1287,8 +1291,9 @@ impl World {
     async fn looked(&self) -> Look {
         let controller = self.controller();
         let counted = controller.refresh_admissions().await;
-        let reports = controller
-            .reported_components()
+        let components = controller.reported_components();
+        self.note_link_traces(&components);
+        let reports = components
             .into_iter()
             .map(|(_, binding_id, report)| (binding_id, report))
             .collect();
@@ -1327,19 +1332,21 @@ impl World {
         )
     }
 
-    /// What each worker's link to the plugin runtime says it did, newest last, from the last
-    /// reports the daemon holds: the tail a worker sends after its reports' reasons when its
-    /// environment asks for it. Each time is in seconds on that worker's own clock.
-    fn link_traces_in_words(&self) -> String {
-        let Some(controller) = self.controller.as_ref() else {
-            return "; no link trace (the daemon of this case is a process of its own)".to_owned();
-        };
-        let mut seen: Vec<SessionId> = Vec::new();
-        let mut words = Vec::new();
-        for (session_id, _, report) in controller.reported_components() {
-            if seen.contains(&session_id) {
-                continue;
-            }
+    /// Puts the tail each worker's report carries, where one is asked for, with what the earlier
+    /// looks held of that worker's link.
+    fn note_link_traces(
+        &self,
+        components: &[(
+            SessionId,
+            kr_protocol::ids::BrokerBindingId,
+            kr_protocol::admission::ComponentReport,
+        )],
+    ) {
+        let mut histories = self
+            .link_histories
+            .lock()
+            .expect("the histories are not poisoned");
+        for (session_id, _, report) in components {
             let Some(tail) = report
                 .reason
                 .0
@@ -1348,21 +1355,51 @@ impl World {
             else {
                 continue;
             };
-            seen.push(session_id);
-            let identifier = session_id.to_string();
-            words.push(format!(
-                "the worker of the session ending {}: {tail}",
-                &identifier[identifier.len().saturating_sub(6)..]
-            ));
+            let at = match histories.iter().position(|(held, _)| held == session_id) {
+                Some(at) => at,
+                None => {
+                    histories.push((
+                        *session_id,
+                        kr_worker::plugin_link_trace::History::default(),
+                    ));
+                    histories.len() - 1
+                }
+            };
+            histories[at].1.add(tail);
         }
-        if words.is_empty() {
-            "; no link trace (no worker of this case sent one)".to_owned()
-        } else {
-            format!(
-                "; the workers' link traces, oldest first: {}",
-                words.join(" | ")
-            )
+    }
+
+    /// What each worker's link to the plugin runtime says it did, oldest first, from every look
+    /// this case has taken and the reports the daemon holds now: the tail a worker sends after its
+    /// reports' reasons when a file beside its program asks for it. Each time is in seconds on that
+    /// worker's own clock.
+    fn link_traces_in_words(&self) -> String {
+        let Some(controller) = self.controller.as_ref() else {
+            return "; no link trace (the daemon of this case is a process of its own)".to_owned();
+        };
+        self.note_link_traces(&controller.reported_components());
+        let histories = self
+            .link_histories
+            .lock()
+            .expect("the histories are not poisoned");
+        if histories.is_empty() {
+            return "; no link trace (no worker of this case sent one: its program is built \
+                    with the testing feature for it to)"
+                .to_owned();
         }
+        let words = histories
+            .iter()
+            .map(|(session_id, history)| {
+                let identifier = session_id.to_string();
+                format!(
+                    "the worker of the session ending {}: {}",
+                    &identifier[identifier.len().saturating_sub(6)..],
+                    history.in_words()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("; the workers' link traces, oldest first: {words}")
     }
 
     /// The worker of a session, as the daemon's registry records it, for a daemon this test does
@@ -1886,11 +1923,11 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
     .await;
 }
 
-/// KR-REQ-05.07: a registration the plugin runtime holds unanswered is named in the worker's own
-/// account of what its link is doing, with the call and the limit the link gives it.
+/// A registration the plugin runtime holds unanswered is named in the worker's own account of
+/// what its link is doing, with the call and the limit the link gives it.
 ///
-/// The worker adds that account to the reports it sends when its environment asks for it, and the
-/// cases of this file ask. A worker is running a program the package recognises, and its binding
+/// The worker adds that account to the reports it sends when a file beside its program asks for
+/// it, and the cases of this file ask. A worker is running a program the package recognises, and its binding
 /// is registered. The runtime is stopped, a second program is run, and the worker sends the
 /// registration of its binding to a runtime that answers nothing. The account then names the
 /// registration of that binding with the limit its call is given, and does not say it ended.

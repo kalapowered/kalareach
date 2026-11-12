@@ -667,7 +667,7 @@ impl Link {
             if asked.is_ok() {
                 link_trace::Outcome::Answered
             } else {
-                link_trace::Outcome::Unavailable
+                link_trace::Outcome::Failed
             },
         );
         let told = match asked {
@@ -906,7 +906,13 @@ impl Link {
                 .restore(service_id(binding), held.state, CALL_WAIT)
                 .await;
             #[cfg(feature = "testing")]
-            link_trace::ended(began, link_trace::Outcome::of(&restored));
+            link_trace::ended(
+                began,
+                match &restored {
+                    Ok(called) if !called.answered() => link_trace::Outcome::Unanswered,
+                    _ => link_trace::Outcome::of(&restored),
+                },
+            );
             let note = match restored {
                 Ok(called) if called.answered() => {
                     "the component's state was restored from a checkpoint, and the observations \
@@ -1045,7 +1051,13 @@ impl Link {
             );
             let checkpointed = client.checkpoint(service_id(binding), CALL_WAIT).await;
             #[cfg(feature = "testing")]
-            link_trace::ended(began, link_trace::Outcome::of(&checkpointed));
+            link_trace::ended(
+                began,
+                match &checkpointed {
+                    Ok(called) if !called.answered() => link_trace::Outcome::Unanswered,
+                    _ => link_trace::Outcome::of(&checkpointed),
+                },
+            );
             match checkpointed {
                 Ok(called) => {
                     if let (Some(state), Some(want), Some(generation)) =

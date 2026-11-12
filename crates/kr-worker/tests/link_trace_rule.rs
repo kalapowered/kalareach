@@ -24,9 +24,38 @@ fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The line without its trailing comment and its indentation.
+/// The line without its trailing comment and its indentation. A `//` inside a string literal on
+/// the line does not start a comment.
 fn code(line: &str) -> &str {
-    line.split("//").next().unwrap_or("").trim()
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (at, byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+        } else if *byte == b'"' {
+            in_string = true;
+        } else if *byte == b'/' && bytes.get(at + 1) == Some(&b'/') {
+            return line[..at].trim();
+        }
+    }
+    line.trim()
+}
+
+#[test]
+fn a_comment_marker_inside_a_string_does_not_hide_the_rest_of_the_line() {
+    let line = r#"let _ = ("//", crate::plugin_link_trace::ENTRIES); // a comment"#;
+    assert_eq!(
+        code(line),
+        r#"let _ = ("//", crate::plugin_link_trace::ENTRIES);"#
+    );
+    assert_eq!(code("  call(); // link_trace"), "call();");
 }
 
 /// Whether `line` carries on the statement the line above it began.

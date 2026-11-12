@@ -53,7 +53,7 @@ pub const ENTRIES: usize = 64;
 pub enum Call {
     /// The request to the control daemon for the runtime.
     Ask,
-    /// The connection to the runtime and its handshake.
+    /// The connection to the runtime and its handshake, whose requests are each given the limit.
     Connect,
     /// Telling the runtime whether privacy mode stands.
     Privacy,
@@ -75,7 +75,7 @@ impl Call {
     const fn word(self) -> &'static str {
         match self {
             Self::Ask => "ask",
-            Self::Connect => "connect",
+            Self::Connect => "connect (each request)",
             Self::Privacy => "privacy",
             Self::Register => "register",
             Self::Unbind => "unbind",
@@ -98,6 +98,10 @@ pub enum Outcome {
     Unavailable,
     /// Its limit passed before an answer came.
     Limit,
+    /// It was made, and what answered it said the component gave no answer in its time.
+    Unanswered,
+    /// It ended with no answer, and what ended it is not told.
+    Failed,
 }
 
 impl Outcome {
@@ -107,6 +111,8 @@ impl Outcome {
             Self::Refused => "refused",
             Self::Unavailable => "unavailable",
             Self::Limit => "limit",
+            Self::Unanswered => "unanswered",
+            Self::Failed => "failed",
         }
     }
 
@@ -236,8 +242,17 @@ enum Event {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Entry {
+    /// Which entry this is in the order they were noted, from zero, so that tails taken at
+    /// different times can be put together and a gap between them seen.
+    seq: u64,
     at_ms: u64,
     event: Event,
+}
+
+#[derive(Debug)]
+struct Ring {
+    entries: VecDeque<Entry>,
+    next: u64,
 }
 
 /// A call that has begun, to be ended with its outcome.
@@ -264,7 +279,7 @@ fn millis(duration: Duration) -> u64 {
 #[derive(Debug)]
 pub struct LinkTrace {
     origin: Instant,
-    ring: Mutex<VecDeque<Entry>>,
+    ring: Mutex<Ring>,
 }
 
 impl Default for LinkTrace {
@@ -279,21 +294,26 @@ impl LinkTrace {
     pub fn new() -> Self {
         Self {
             origin: Instant::now(),
-            ring: Mutex::new(VecDeque::with_capacity(ENTRIES)),
+            ring: Mutex::new(Ring {
+                entries: VecDeque::with_capacity(ENTRIES),
+                next: 0,
+            }),
         }
     }
 
-    fn ring(&self) -> MutexGuard<'_, VecDeque<Entry>> {
+    fn ring(&self) -> MutexGuard<'_, Ring> {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn push(&self, event: Event) {
         let at_ms = millis(self.origin.elapsed());
         let mut ring = self.ring();
-        if ring.len() == ENTRIES {
-            ring.pop_front();
+        if ring.entries.len() == ENTRIES {
+            ring.entries.pop_front();
         }
-        ring.push_back(Entry { at_ms, event });
+        let seq = ring.next;
+        ring.next += 1;
+        ring.entries.push_back(Entry { seq, at_ms, event });
     }
 
     /// Notes that a pass began with this many bindings wanting a component.
@@ -349,13 +369,13 @@ impl LinkTrace {
     /// How many entries the record holds.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.ring().len()
+        self.ring().entries.len()
     }
 
     /// Returns true when nothing has been noted.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.ring().is_empty()
+        self.ring().entries.is_empty()
     }
 
     /// The newest entries that fit in `budget` bytes, oldest first, one phrase each.
@@ -364,7 +384,7 @@ impl LinkTrace {
         let ring = self.ring();
         let mut phrases: Vec<String> = Vec::new();
         let mut used = 0usize;
-        for entry in ring.iter().rev() {
+        for entry in ring.entries.iter().rev() {
             let phrase = phrase(entry);
             let cost = phrase.len()
                 + if phrases.is_empty() {
@@ -384,7 +404,8 @@ impl LinkTrace {
 
     /// The report with the record's tail after its reason, within the bound a report carries. The
     /// tail is cut to what room is left and never the reason; a reason that already holds the
-    /// marker, or that leaves no room, is sent as it is.
+    /// marker, or that leaves no room, is sent as it is. A report that has no reason is sent with
+    /// the marker and the tail as its reason, so what comes before the marker is empty then.
     #[must_use]
     pub fn with_tail(&self, mut report: ComponentReport) -> ComponentReport {
         let original = report.reason.0.clone().unwrap_or_default();
@@ -404,7 +425,12 @@ impl LinkTrace {
 const SEPARATOR: &str = "; ";
 
 fn phrase(entry: &Entry) -> String {
-    let at = format!("{}.{:03}", entry.at_ms / 1000, entry.at_ms % 1000);
+    let at = format!(
+        "#{} {}.{:03}",
+        entry.seq,
+        entry.at_ms / 1000,
+        entry.at_ms % 1000
+    );
     let named = |binding: Option<u32>| binding.map_or_else(String::new, |id| format!(" {id:06x}"));
     match entry.event {
         Event::Pass { wants } => format!("{at} pass wants {wants}"),
@@ -446,6 +472,61 @@ pub fn plain(reason: &str) -> &str {
 #[must_use]
 pub fn tail_of(reason: &str) -> Option<&str> {
     reason.split_once(MARKER).map(|(_, tail)| tail)
+}
+
+/// How many entries a [`History`] keeps before it takes no more.
+const HISTORY_ENTRIES: usize = 4096;
+
+/// The tails of one worker's record taken at different times, put together: each entry once, in
+/// the order it was noted, with a note where entries were noted that no tail held.
+///
+/// A tail holds only the newest entries that fit a report, so one taken when a long wait ends has
+/// lost what happened early in it. A reader that takes a tail with each look keeps all of it. It
+/// takes a worker's record to be one, and does not tell that a worker's record began again.
+#[derive(Debug, Default)]
+pub struct History {
+    entries: Vec<String>,
+    next: u64,
+}
+
+impl History {
+    /// Adds the entries of a tail that this history does not hold yet.
+    pub fn add(&mut self, tail: &str) {
+        for phrase in tail.split(SEPARATOR) {
+            let Some(seq) = numbered(phrase) else {
+                continue;
+            };
+            if seq < self.next {
+                continue;
+            }
+            if self.entries.len() >= HISTORY_ENTRIES {
+                return;
+            }
+            if seq > self.next {
+                self.entries
+                    .push(format!("[{} entries not seen]", seq - self.next));
+            }
+            self.entries.push(phrase.to_owned());
+            self.next = seq + 1;
+        }
+    }
+
+    /// Every entry held, oldest first, one phrase each.
+    #[must_use]
+    pub fn in_words(&self) -> String {
+        let full = self.entries.len() >= HISTORY_ENTRIES;
+        let mut words = self.entries.join(SEPARATOR);
+        if full {
+            words.push_str(SEPARATOR);
+            words.push_str("[later entries not kept]");
+        }
+        words
+    }
+}
+
+/// The number an entry's phrase starts with.
+fn numbered(phrase: &str) -> Option<u64> {
+    phrase.strip_prefix('#')?.split_once(' ')?.0.parse().ok()
 }
 
 /// This worker's record, once the link has found the file of [`switch_beside`] beside its program.
@@ -546,6 +627,53 @@ mod tests {
             })
             .collect();
         assert_eq!(numbers, (10..ENTRIES + 10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn tails_taken_over_a_long_wait_are_put_together_with_each_entry_once_and_the_gaps_told() {
+        let trace = LinkTrace::new();
+        let binding = "00000000-0000-0000-0000-000000123456"
+            .parse::<BrokerBindingId>()
+            .expect("an identifier");
+        let mut history = History::default();
+        // The call that is never answered is in the first tail taken, and what follows it fills the
+        // record many times over while the tails taken are each far shorter than the record.
+        let _began = trace.began(Call::Register, Some(binding), Duration::from_secs(35));
+        history.add(&trace.tail(usize::MAX));
+        for wants in 0..ENTRIES * 3 {
+            trace.pass(wants);
+            history.add(&trace.tail(120));
+        }
+        let words = history.in_words();
+        assert!(words.starts_with("#0 "), "{words}");
+        assert!(
+            words.contains("began register 123456 limit 35000"),
+            "{words}"
+        );
+        assert!(!words.contains("not seen"), "{words}");
+        let numbers: Vec<u64> = words
+            .split(SEPARATOR)
+            .map(|phrase| numbered(phrase).expect("a numbered entry"))
+            .collect();
+        assert_eq!(
+            numbers,
+            (0..=u64::try_from(ENTRIES * 3).expect("a count")).collect::<Vec<_>>(),
+            "each entry once, in order"
+        );
+        // Entries noted between two tails that neither held are told, and the same tail twice adds
+        // nothing.
+        for wants in 0..=ENTRIES {
+            trace.pass(wants);
+        }
+        history.add(&trace.tail(usize::MAX));
+        history.add(&trace.tail(usize::MAX));
+        let words = history.in_words();
+        assert_eq!(words.matches("entries not seen]").count(), 1, "{words}");
+        assert!(words.contains("[1 entries not seen]"), "{words}");
+        // A history that starts from the middle of a record says what came before it.
+        let mut later = History::default();
+        later.add(&trace.tail(200));
+        assert!(later.in_words().starts_with("[") && later.in_words().contains("not seen]"));
     }
 
     #[test]
