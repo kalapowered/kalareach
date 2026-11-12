@@ -668,6 +668,31 @@ describe('contact with a session being taken up again', () => {
     expect(await screen.findByText('Not in contact with this host')).toBeInTheDocument()
   })
 
+  it('says contact was lost, and not the limit on connections, while the connection to the host is down', async () => {
+    const { port, controls } = fakeHost()
+    const view = render(screenOn(port))
+    await screen.findByText(FIRST_ENTRY)
+
+    act(() => {
+      controls.standings.say(SESSION_MAIN, {
+        state: 'reconnecting',
+        reason: 'the host cannot take another connection from this computer just now',
+        capacity: true
+      })
+    })
+    expect(
+      await screen.findByText('The host cannot take another connection from this computer just now')
+    ).toBeInTheDocument()
+
+    // The host goes out of contact while the reason is still the last one told: the host is not
+    // full, and the banner says what is true now.
+    view.rerender(screenOn(port, null, undefined, false))
+    expect(await screen.findByText('Not in contact with this host')).toBeInTheDocument()
+    expect(
+      screen.queryByText('The host cannot take another connection from this computer just now')
+    ).toBeNull()
+  })
+
   it('says nothing of contact before the shell has answered whether the host is in contact', async () => {
     const { port, controls } = fakeHost()
     controls.standings.answerOpens(SESSION_MAIN, {

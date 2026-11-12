@@ -921,9 +921,10 @@ export function MobileSession({
   // The connection's words for contact lost. A session whose own link is being taken up again, with
   // the connection to the host still up, says the same, in the same words, and, as the connection's
   // do, nothing before the shell has answered whether the host is in contact. When the link was
-  // not made for want of room, the host's or this computer's own, the banner says that cause.
+  // not made for want of room, the host's or this computer's own, the banner says that cause, but
+  // only while the connection to the host is up: a host that is out of contact is not full.
   const contact =
-    standing?.state === 'reconnecting' && connected !== null
+    standing?.state === 'reconnecting' && connected === true
       ? reconnectBanner(false, mine, standing.capacity ? standing.reason : null)
       : reconnectBanner(connected, mine)
   // A submission whose outcome nobody knows is the one case where sending again could run the
