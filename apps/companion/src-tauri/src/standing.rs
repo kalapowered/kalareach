@@ -211,10 +211,11 @@ enum Opening {
 enum Begin {
     /// The opening has a link, and the watch waits for its connection to end.
     Held(Arc<Link>),
-    /// The opening has no link yet and the watch reaches the host. `refused` is the code of the
-    /// host's refusal of the connection that the opening's first open read and did not end the
-    /// opening with: a refusal is told only when a second ask agrees with it.
-    Reaching { refused: Option<ErrorCode> },
+    /// The opening has no link yet and the watch reaches the host. `not_admitted` is the host's
+    /// words when the opening's first open was refused at the connection's admission: they stay the
+    /// reason the screen shows while the asks that follow do not reach the host
+    /// ([`waiting_standing`]).
+    Reaching { not_admitted: Option<String> },
 }
 
 /// The host a phone opens sessions on, and what it opens them as.
@@ -537,6 +538,28 @@ pub(crate) fn transient(code: ErrorCode) -> bool {
     code.retry_category() == RetryCategory::Transient || code == ErrorCode::ClockUntrusted
 }
 
+/// What the screen says while an opening waits, after a try that did not give a link. The host's
+/// words for a connection it refused at its admission are kept (`kept`) as the reason while the
+/// tries that follow do not reach the host: a device that was revoked at the host between its
+/// handshake and its admission is answered as an unpaired peer afterwards, which ends each later
+/// connection as a connection lost, and the words that say why are the host's first. A cause that
+/// says something else (the host has no room, this computer's budget, another refusal) replaces
+/// them.
+fn waiting_standing(failure: &Unopened, kept: &mut Option<String>) -> SessionStanding {
+    match failure {
+        Unopened::NotAdmitted(refusal) => *kept = Some(refusal.message.clone()),
+        Unopened::Unreached(_) if kept.is_some() => {}
+        _ => *kept = None,
+    }
+    match kept {
+        Some(reason) => SessionStanding::Reconnecting {
+            reason: reason.clone(),
+            capacity: false,
+        },
+        None => SessionStanding::reconnecting(failure),
+    }
+}
+
 impl PairedLinks {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
@@ -691,35 +714,29 @@ impl PairedLinks {
                 if !still_mine {
                     return Ok(SessionStanding::Superseded);
                 }
-                // A refusal of the connection that is not for now is not yet the host's decision
-                // about this opening: a revocation that lands between this device's handshake and
-                // its admission, or a daemon that has stopped while its listener still accepts,
-                // refuses once and may not again. As the watch treats it, the opening stands and
-                // one more ask decides.
-                let first_refusal = match &failure {
-                    Unopened::Refused(Asked::Connection, refusal) if !transient(refusal.code) => {
-                        Some(refusal.code)
-                    }
-                    _ => None,
-                };
-                let unable = first_refusal.is_some() || failure.for_now();
-                if !unable {
+                // A cause that is not for now is the host's decision about this opening, and ends
+                // it with its words: a refusal at the handshake, or of the request that opens the
+                // session. A connection that the host refused at its admission is as good as lost
+                // (a revocation that lands between this device's handshake and its admission, or a
+                // daemon that has stopped while its listener still accepts), as is a host that was
+                // not reached or has no room for this computer's connection: the opening stands.
+                if !failure.for_now() {
                     inner.current.remove(&session_id);
                     return Err(failure.into_error());
                 }
-                // The host could not be reached or could not say yet, or has no room for this
-                // computer's connection: the opening stands, and its watch reaches the host again
-                // as the same opening.
+                // The opening stands, and its watch reaches the host again as the same opening.
                 let standing = SessionStanding::reconnecting(&failure);
+                let not_admitted = match &failure {
+                    Unopened::NotAdmitted(refusal) => Some(refusal.message.clone()),
+                    _ => None,
+                };
                 let watch = tauri::async_runtime::spawn(Arc::clone(self).keep(
                     dial.clone(),
                     emit,
                     session_id,
                     grant_id,
                     opening.to_owned(),
-                    Begin::Reaching {
-                        refused: first_refusal,
-                    },
+                    Begin::Reaching { not_admitted },
                 ));
                 inner.opened.insert(
                     session_id,
@@ -1268,16 +1285,18 @@ impl PairedLinks {
         opening: String,
         begin: Begin,
     ) {
-        let (mut link, mut refused) = match begin {
+        let (mut link, mut not_admitted) = match begin {
             Begin::Held(link) => (Some(link), None),
-            Begin::Reaching { refused } => (None, refused),
+            Begin::Reaching { not_admitted } => (None, not_admitted),
         };
+        let mut refused: Option<ErrorCode> = None;
         let mut backoff = kr_client::reconnect::ReconnectLoop::new();
         loop {
             if let Some(held) = link.take() {
                 // A link that was made and has ended starts the asks over: a refusal from before
                 // it is not one that the next agrees with.
                 refused = None;
+                not_admitted = None;
                 backoff.connected();
                 held.session.closed().await;
                 // An opening that is over, or was left or replaced, is not reached again.
@@ -1356,7 +1375,7 @@ impl PairedLinks {
                     // What the last try came to is told, so that a later refusal while the opening
                     // waits replaces the reason the screen shows.
                     Err(failure) => {
-                        let standing = SessionStanding::reconnecting(&failure);
+                        let standing = waiting_standing(&failure, &mut not_admitted);
                         self.tell_standing(&emit, session_id, &opening, standing);
                     }
                 }

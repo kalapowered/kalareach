@@ -2406,27 +2406,16 @@ async fn kr_req_19_08_an_opening_that_replaces_another_ends_it_at_once() {
     };
     assert_eq!(links(), 0, "the first's link is let go at once");
 
-    // The host refuses the second at admission. A refusal that is not for now is told only once a
-    // second ask agrees, so the second stands, and then it ends with the host's words when the next
-    // ask is refused too. Nothing of the first comes back.
+    // The host refuses the second at the handshake, and nothing of the first comes back.
     control.refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
     control.stop_holding();
     control.release_all();
-    let standing = second
+    let refused = second
         .await
         .expect("the call ran")
-        .expect("the second stands while the host is asked again");
-    assert_eq!(standing["state"], "reconnecting", "{standing}");
-    let told = heard(companion, "second", |standing| {
-        standing["state"] == "refused"
-    })
-    .await;
-    assert_eq!(told["standing"]["code"], "PERMISSION_DENIED", "{told}");
-    assert_eq!(
-        links(),
-        1,
-        "only the second opening, which holds no link, remains"
-    );
+        .expect_err("the second is refused");
+    assert_eq!(code(&refused), "PERMISSION_DENIED", "{refused}");
+    assert_eq!(links(), 0);
     let gone = read("first").expect_err("the first stays over");
     assert_eq!(code(&gone), "STALE_SESSION", "{gone}");
     adopted.stop().await;
