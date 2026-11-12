@@ -31,12 +31,15 @@ fn package(into: &Path, range: Option<&str>, table: impl FnOnce(&mut Value)) -> 
     let path = directory.join("connector.json");
     let mut connector: Value =
         serde_json::from_slice(&std::fs::read(&path).expect("reads")).expect("JSON");
+    let before = connector.clone();
     table(&mut connector);
-    std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(&connector).expect("writes"),
-    )
-    .expect("writes");
+    if connector != before {
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&connector).expect("writes"),
+        )
+        .expect("writes");
+    }
     directory
 }
 
@@ -91,6 +94,50 @@ fn a_range_with_no_upper_bound_that_excludes_this_sdk_is_refused_by_the_range() 
     let findings = validate_package_directory(&directory).report.findings;
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].code, FindingCode::VersionRangeExcludesHost);
+}
+
+/// A table that carries a member that arrived at an SDK version, with a range that admits an SDK
+/// version below it, is refused with a finding that names the member and the version: an earlier
+/// host would try to run it and refuse it only for a table it cannot read. A range that starts at
+/// the arrival passes, and so does a table without the member under a range that admits earlier
+/// versions.
+#[test]
+fn a_table_that_carries_a_listed_member_needs_a_range_that_starts_at_its_arrival() {
+    let carries = |connector: &mut Value| {
+        connector["observation"] = json!({ "selections": [{
+            "method": "thread.start",
+            "thread": { "segments": [{ "type": "member", "name": "result" }] },
+            "hidden_when": [{
+                "place": { "segments": [{ "type": "member", "name": "params" }] },
+                "values": ["x"],
+            }],
+        }] });
+    };
+    for (range, refused) in [(">=0.1.6, <0.2.0", true), (">=0.1.7, <0.2.0", false)] {
+        let home = tempfile::tempdir().expect("a directory");
+        let directory = package(home.path(), Some(range), carries);
+        let findings = validate_package_directory(&directory).report.findings;
+        let arrival = findings
+            .iter()
+            .find(|finding| finding.detail.contains("SelectionRoute.hidden_when"));
+        match (refused, arrival) {
+            (true, Some(finding)) => {
+                assert_eq!(finding.code, FindingCode::ConnectorTableInvalid, "{range}");
+                assert!(finding.detail.contains("SDK 0.1.7"), "{}", finding.detail);
+            }
+            (false, None) => {}
+            _ => panic!("{range}: {findings:?}"),
+        }
+    }
+
+    let home = tempfile::tempdir().expect("a directory");
+    let directory = package(home.path(), Some(">=0.1.6, <0.2.0"), |_| {});
+    let validated = validate_package_directory(&directory);
+    assert!(
+        validated.report.is_valid(),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 /// A package inside the range keeps what it had: a table with a member this SDK lacks is a finding

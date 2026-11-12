@@ -126,6 +126,33 @@ impl VersionRange {
         self.0.matches(version.get())
     }
 
+    /// Returns true when the range admits some version below `limit`.
+    ///
+    /// The lowest version a range admits is a lower bound of one of its comparators, or the first
+    /// version there is when a comparator has none (`<0.1.5`), so each comparator's own version,
+    /// the version after it and the first version of the next minor and major are tried, with
+    /// `0.0.0`; a range that admits one of them below `limit` is one that does.
+    #[must_use]
+    pub fn admits_a_version_below(&self, limit: &PackageVersion) -> bool {
+        let mut probes = vec![Version::new(0, 0, 0)];
+        for comparator in &self.0.comparators {
+            let (major, minor, patch) = (
+                comparator.major,
+                comparator.minor.unwrap_or(0),
+                comparator.patch.unwrap_or(0),
+            );
+            probes.extend([
+                Version::new(major, minor, patch),
+                Version::new(major, minor, patch.saturating_add(1)),
+                Version::new(major, minor.saturating_add(1), 0),
+                Version::new(major.saturating_add(1), 0, 0),
+            ]);
+        }
+        probes
+            .iter()
+            .any(|probe| probe < limit.get() && self.0.matches(probe))
+    }
+
     /// Returns true when the range admits versions above every one it names.
     ///
     /// An unbounded range says the package works on releases that did not exist when it was
@@ -220,6 +247,27 @@ mod tests {
         assert!(range.admits(&sdk_version()));
         assert!(!range.admits(&PackageVersion::parse("0.2.0").expect("valid version")));
         assert!(!range.is_unbounded());
+    }
+
+    #[test]
+    fn a_range_that_admits_a_version_below_a_limit_is_told_from_one_that_does_not() {
+        let limit = PackageVersion::parse("0.1.7").expect("valid version");
+        for (range, below) in [
+            (">=0.1.6, <0.2.0", true),
+            (">=0.1.7, <0.2.0", false),
+            ("^0.1.7", false),
+            (">0.1.6", false),
+            (">0.1.5", true),
+            ("0.1.*", true),
+            ("=0.1.7", false),
+            ("<0.1.5", true),
+            (">=0.0.1, <0.0.5", true),
+            (">=0.2.0, <0.3.0", false),
+            ("*", true),
+        ] {
+            let range = VersionRange::parse(range).expect("valid range");
+            assert_eq!(range.admits_a_version_below(&limit), below, "{range}");
+        }
     }
 
     #[test]
