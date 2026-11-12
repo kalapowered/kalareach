@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use kr_boundary_windows::remedy::{
-    EntryKind, Origin, ParentCure, Presence, Remedy, choose, ending, origin_of_open_error,
-    parent_advice,
+    EntryKind, Origin, ParentCure, Presence, Remedy, Shape, choose, ending, origin_of_open_error,
+    origin_of_shape, parent_advice,
 };
 
 const RECORDS: [EntryKind; 9] = [
@@ -285,4 +285,76 @@ fn a_folder_that_holds_the_data_directory_or_may_is_never_told_to_be_removed() {
         assert!(!text.contains("remove the folder"), "{cure:?}: {text}");
         assert!(!text.contains("loses nothing"), "{cure:?}: {text}");
     }
+}
+
+/// The origin that an opened entry's handle gives is compared with what the layout gives at its
+/// name: a directory at a record file's name and a plain file at a directory's name (a private
+/// root's included) are not the installation's, so the owner is not read and the entry is the
+/// not-made state; so are a link and a file with a second name at any name. What matches is read
+/// for its owner, and a name that the layout does not give may be either kind.
+#[test]
+fn an_entry_of_another_kind_than_the_layout_gives_is_not_the_installations() {
+    let files = [
+        EntryKind::Manifest,
+        EntryKind::Prior,
+        EntryKind::Replacement,
+        EntryKind::JournalFile,
+    ];
+    let directories = [
+        EntryKind::Staging,
+        EntryKind::Journal,
+        EntryKind::Run,
+        EntryKind::NamedRoot,
+        EntryKind::UnnamedRoot,
+    ];
+    let system = || Origin::System;
+    let refused_to_read = || panic!("the owner of an entry of the wrong kind is not read");
+    for kind in files {
+        assert_eq!(
+            origin_of_shape(kind, Shape::Directory, &refused_to_read),
+            Origin::Foreign,
+            "{kind:?}: a directory at a file's name"
+        );
+        assert_eq!(
+            origin_of_shape(kind, Shape::File { names: 1 }, &system),
+            Origin::System,
+            "{kind:?}"
+        );
+    }
+    for kind in directories {
+        assert_eq!(
+            origin_of_shape(kind, Shape::File { names: 1 }, &refused_to_read),
+            Origin::Foreign,
+            "{kind:?}: a plain file at a directory's name"
+        );
+        assert_eq!(
+            origin_of_shape(kind, Shape::Directory, &system),
+            Origin::System,
+            "{kind:?}"
+        );
+    }
+    for kind in files
+        .into_iter()
+        .chain(directories)
+        .chain([EntryKind::Other])
+    {
+        assert_eq!(
+            origin_of_shape(kind, Shape::Link, &refused_to_read),
+            Origin::Foreign,
+            "{kind:?}: a link"
+        );
+        assert_eq!(
+            origin_of_shape(kind, Shape::File { names: 2 }, &refused_to_read),
+            Origin::Foreign,
+            "{kind:?}: a second name"
+        );
+    }
+    assert_eq!(
+        origin_of_shape(EntryKind::Other, Shape::Directory, &system),
+        Origin::System
+    );
+    assert_eq!(
+        origin_of_shape(EntryKind::Other, Shape::File { names: 1 }, &system),
+        Origin::System
+    );
 }
