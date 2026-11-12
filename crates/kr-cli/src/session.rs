@@ -2246,9 +2246,12 @@ impl ConsoleMouse {
     }
 
     /// The stream has a hole in it: output of the subscription that is being replaced, or output
-    /// that cannot be decoded, says nothing of what was lost.
+    /// that cannot be decoded, says nothing of what was lost. A first delivery that could not be
+    /// decoded was not the screen, and no later frame is taken for it: only the first delivery of a
+    /// subscription that is asked for after the hole can close it.
     fn hole_in_the_stream(&mut self) {
         self.hole = true;
+        self.awaiting_first = false;
     }
 
     /// How an output event of the session is read: as part of a restoration, or as what the
@@ -2616,8 +2619,20 @@ async fn drive(
                             let _ = handle.flush();
                         } else if notification.event_type.as_str() == "session.output" {
                             // Output that cannot be decoded is not drawn, and what it carried is
-                            // lost to the reader.
+                            // lost to the reader. A new screen is asked for, as for a projection
+                            // that cannot be decoded, and the hole stays until it arrives.
                             console_mouse.hole_in_the_stream();
+                            if closing || !subscriptions.replace() {
+                                continue;
+                            }
+                            window.recovering();
+                            let request_id = kr_protocol::ids::RequestId::new(next_request);
+                            next_request += 1;
+                            if !resubscribe(client, attaching, request_id, attachment_id).await {
+                                return AttachOutcome::Disconnected;
+                            }
+                            outstanding.insert(request_id, Outstanding::Resubscribe);
+                            continue;
                         }
                         // A projected attachment is sent the canonical grid as state and draws it
                         // itself. The renderer is shared with the client library, so this terminal
@@ -4166,7 +4181,7 @@ mod tests {
         let asked_of = |sent: &[ControlFrame]| {
             sent.iter()
                 .filter(|frame| {
-                    matches!(frame, ControlFrame::Request(request)
+                    matches!(frame, kr_protocol::envelope::ControlFrame::Request(request)
                         if request.method == Method::EventsSubscribe.into())
                 })
                 .count()
@@ -4676,10 +4691,12 @@ mod tests {
         .bytes();
 
         // A reset of 1006 is shed, and the output that follows it resets 1005.
-        let ran = wire::run_switched(true, true, |case| async move {
+        let ran = wire::run_switched(true, true, |mut case| async move {
             case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1006h");
             case.says_resync(2);
             case.says_output_bytes(3, b"\x1b[?1005l");
+            // The replacement screen comes once the client has asked for it.
+            case.next_request_asked(Method::EventsSubscribe).await;
             case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1005;1006l");
             case.says_output_bytes(1, b"\x1b[?1006h\x1b[?1005l");
             case.closes();
@@ -4706,10 +4723,11 @@ mod tests {
             encoding: 1005,
         }
         .bytes();
-        let ran = wire::run_switched(true, true, |case| async move {
+        let ran = wire::run_switched(true, true, |mut case| async move {
             case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1005h");
             case.says_resync(2);
             case.says_output_bytes(3, b"\x1b[?1006l");
+            case.next_request_asked(Method::EventsSubscribe).await;
             case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1005;1006l\x1b[?1006h");
             case.says_output_bytes(1, b"\x1b[?1005h\x1b[?1006l");
             case.closes();
@@ -4743,28 +4761,60 @@ mod tests {
         );
     }
 
-    /// A first delivery that cannot be decoded is not drawn and does not use up the first delivery:
-    /// the next one that decodes is still the screen the session drew for the terminal.
+    /// A delivery that cannot be decoded is not drawn, and it asks for a new subscription: what it
+    /// carried is lost to the reader, and a frame that does decode after it is not the screen. When
+    /// the screen of a new subscription cannot be decoded after a hole, the output that follows it is
+    /// read as drawn until a screen does decode, and no follow-up from the old state is written.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_delivery_that_cannot_be_decoded_does_not_use_up_the_first() {
-        const SCREEN: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1005l";
-        let follow = crate::mouse::Follow {
+    async fn a_delivery_that_cannot_be_decoded_asks_for_a_new_screen_and_is_not_the_first() {
+        let follow_1006 = crate::mouse::Follow {
             at: 0,
             encoding: 1006,
         }
         .bytes();
-        let ran = wire::run_switched(true, true, |case| async move {
+        let ran = wire::run_switched(true, true, |mut case| async move {
+            // The session, the reader and the terminal hold 1006.
+            case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1006h");
+            // The bridge sheds a frame that reset 1006, and queues a marker in its place.
+            case.says_resync(2);
+            case.next_request_asked(Method::EventsSubscribe).await;
+            // The new subscription's screen cannot be decoded: a new one is asked for.
             case.says_output_it_cannot_decode(0);
-            case.says_output_bytes(1, SCREEN);
-            case.says_output_bytes(2, SCREEN);
+            case.next_request_asked(Method::EventsSubscribe).await;
+            // What follows is not that screen, and what it holds is not set again.
+            case.says_output_bytes(1, b"abc");
+            case.says_output_bytes(2, b"\x1b[?1005l");
+            // The subscription asked for second begins with a screen that does decode.
+            case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1005;1006l");
+            case.says_output_bytes(1, b"\x1b[?1006h\x1b[?1005l");
             case.closes();
         })
         .await;
         assert_eq!(
             shown(&ran.written),
-            shown(&[SCREEN, SCREEN, &follow].concat())
+            shown(
+                &[
+                    &b"\x1b[?1000h\x1b[?1006h"[..],
+                    b"abc",
+                    b"\x1b[?1005l",
+                    b"\x1b[?1000h\x1b[?1005;1006l",
+                    // Output of the new subscription is read as live again.
+                    b"\x1b[?1006h\x1b[?1005l",
+                    &follow_1006,
+                ]
+                .concat()
+            )
         );
+        let requests = ran
+            .sent
+            .iter()
+            .filter(|frame| {
+                matches!(frame, kr_protocol::envelope::ControlFrame::Request(request)
+                    if request.method == Method::EventsSubscribe.into())
+            })
+            .count();
+        assert_eq!(requests, 2, "a request for a new subscription at each");
     }
 
     /// The report of a click that is sent behind console keys the session refuses is no more read
