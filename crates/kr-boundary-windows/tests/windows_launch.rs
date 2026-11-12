@@ -1487,18 +1487,129 @@ fn a_stop_that_is_already_set_starts_no_program() {
     let marker = fixture.scratch.join("started");
     let stop = Stop::new().unwrap();
     stop.set();
+    let launches = testing::launches();
     let ran = kr_boundary_windows::win::proof::run_captured_until(
         proof_run_with(&fixture, &["marker", &marker.display().to_string()]),
         Instant::now() + Duration::from_secs(30),
         Some(&stop),
     );
     assert!(
-        ran.is_err(),
+        matches!(ran, Err(LaunchError::Stopped)),
+        "a stop that was already set ends the run with the stop's own error: {ran:?}"
+    );
+    assert_eq!(
+        testing::launches(),
+        launches,
         "a program was made under a stop that was already set"
     );
     assert!(
         !marker.exists(),
         "a program ran under a stop that was already set"
+    );
+}
+
+/// A stop that comes after the process is made, while it is held suspended, and before it is resumed
+/// starts nothing: the process is ended without having run, and the run ends with the stop's own
+/// error. The stop is set when the launch has ended, which is the window of the setup and the
+/// creation of the process, so the case counts the resumes as well as the program's own marker.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_stop_that_comes_after_the_process_is_made_resumes_nothing() {
+    use kr_boundary_windows::win::pipe::Stop;
+    use kr_boundary_windows::win::proof::testing as proof_testing;
+    /// Clears the launch hook however the case ends: it is a flag of the whole process.
+    struct HookCleared;
+    impl Drop for HookCleared {
+        fn drop(&mut self) {
+            proof_testing::after_the_launch(None);
+        }
+    }
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
+    let fixture = Fixture::new();
+    let marker = fixture.scratch.join("started");
+    let stop = Stop::new().unwrap();
+    let _cleared = HookCleared;
+    proof_testing::after_the_launch(Some(Box::new({
+        let stop = std::sync::Arc::clone(&stop);
+        move || stop.set()
+    })));
+    let (launches, resumes) = (testing::launches(), testing::resumes());
+    let ran = kr_boundary_windows::win::proof::run_captured_until(
+        proof_run_with(&fixture, &["marker", &marker.display().to_string()]),
+        Instant::now() + Duration::from_secs(30),
+        Some(&stop),
+    );
+    assert!(
+        matches!(ran, Err(LaunchError::Stopped)),
+        "a stop that came before the resume ends the run with the stop's own error: {ran:?}"
+    );
+    assert_eq!(
+        testing::launches(),
+        launches + 1,
+        "the process was made, so the launch was counted"
+    );
+    assert_eq!(
+        testing::resumes(),
+        resumes,
+        "a process that was made before the stop was resumed after it"
+    );
+    assert!(
+        !marker.exists(),
+        "a program ran after a stop that came before its resume"
+    );
+}
+
+/// A launch that failed after its process was made, under a stop that came when the launch ended,
+/// ends the run at once with the launch's own error: the cleanup takes the short bound of a stop and
+/// not the run's deadline of a minute. The job holds nothing by then, so the case shows the path and
+/// not the bound.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_stop_that_comes_after_a_failed_launch_ends_the_run_with_the_launchs_own_error_at_once() {
+    use kr_boundary_windows::win::pipe::Stop;
+    use kr_boundary_windows::win::proof::testing as proof_testing;
+    /// Clears the launch hook however the case ends: it is a flag of the whole process.
+    struct HookCleared;
+    impl Drop for HookCleared {
+        fn drop(&mut self) {
+            proof_testing::after_the_launch(None);
+        }
+    }
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
+    let fixture = Fixture::new();
+    let stop = Stop::new().unwrap();
+    let _cleared = HookCleared;
+    proof_testing::after_the_launch(Some(Box::new({
+        let stop = std::sync::Arc::clone(&stop);
+        move || stop.set()
+    })));
+    testing::fail_next_launch_after_creation();
+    let resumes = testing::resumes();
+    let begun = Instant::now();
+    let ran = kr_boundary_windows::win::proof::run_captured_until(
+        proof_run_with(&fixture, &["sleep", "600000"]),
+        begun + Duration::from_secs(60),
+        Some(&stop),
+    );
+    assert!(
+        matches!(&ran, Err(LaunchError::Platform(_))),
+        "the failed launch's own error comes back, its end proved: {ran:?}"
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(10),
+        "the cleanup waited for the run's deadline: {:?}",
+        begun.elapsed()
+    );
+    assert_eq!(
+        testing::resumes(),
+        resumes,
+        "a program that failed to launch was resumed"
     );
 }
 

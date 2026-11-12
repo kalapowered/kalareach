@@ -160,13 +160,17 @@ pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchE
 }
 
 /// [`run_captured`] for a request of the broker's service: the wait for the program ends at the
-/// stop as well, and the program is then ended with its job like one that ran out of time. The
-/// outcome of such a run is [`Outcome::TimedOut`] and the caller, which looks at the stop, tells it
-/// from a program that ran out of its time.
+/// stop as well, and a program that the stop reaches while it runs is ended with its job like one
+/// that ran out of time. The outcome of such a run is [`Outcome::TimedOut`] and the caller, which
+/// looks at the stop, tells it from a program that ran out of its time. A stop that is set before
+/// the run starts, or that comes before the program is resumed, starts nothing. After a stop the
+/// readers of the output and the end of the job wait [`STOP_BOUND`] at most, not the run's
+/// deadline.
 ///
 /// # Errors
 ///
-/// As for [`run_captured`].
+/// As for [`run_captured`], and [`LaunchError::Stopped`] when the stop was set before the program
+/// was resumed: the program did not run.
 pub fn run_captured_until(
     run: Run<'_>,
     deadline: Instant,
@@ -204,6 +208,8 @@ pub fn run_captured_until(
         thread_descriptor: &descriptor,
         deadline: Some(deadline),
     });
+    #[cfg(feature = "testing")]
+    testing::launch_ended();
     let wait_until = deadline
         .checked_sub(END_RESERVE)
         .unwrap_or_else(Instant::now);
@@ -215,6 +221,11 @@ pub fn run_captured_until(
         let out = scope.spawn(|| read_pipe(&out_read, deadline, stop));
         let err = scope.spawn(|| read_pipe(&err_read, deadline, stop));
         let result = match launched.and_then(|suspended| {
+            // A stop that came during the setup or the creation of the process starts nothing:
+            // the suspended child is dropped here, which ends it before it ran.
+            if stop.is_some_and(Stop::is_set) {
+                return Err(LaunchError::Stopped);
+            }
             let permit = ResumePermit::for_proof(&suspended);
             suspended.resume(permit)
         }) {
@@ -227,12 +238,7 @@ pub fn run_captured_until(
                 // Anything the program started ends with the job, which also lets the pipes
                 // reach their end. A program still running at the bound is ended the same way.
                 // After a stop the end is given its short bound, not the run's deadline.
-                let end_by = if stop.is_some_and(Stop::is_set) {
-                    deadline.min(Instant::now() + STOP_BOUND)
-                } else {
-                    deadline
-                };
-                let ended = job.end(&[&child], end_by);
+                let ended = job.end(&[&child], end_by(deadline, stop));
                 match settled(&job, ended) {
                     Ok(()) => match waited {
                         Ok(Some(code)) => Ok(Outcome::Ran(code)),
@@ -242,7 +248,7 @@ pub fn run_captured_until(
                     Err(uncertain) => Err(uncertain),
                 }
             }
-            Err(error) => Err(after_failed_launch(&mut job, error, deadline)),
+            Err(error) => Err(after_failed_launch(&mut job, error, deadline, stop)),
         };
         (result, out.join(), err.join())
     });
@@ -283,12 +289,28 @@ const END_RESERVE: Duration = Duration::from_secs(2);
 /// What a launch that failed leaves: the job is ended and the job's reports are read, because the
 /// launch may have made a process before it failed (a process that is not in the job, a thread
 /// that cannot be held, a time that cannot be read) and the child it ended on the way may not have
-/// been seen to end. The error is the launch's own unless the end is not proved.
-fn after_failed_launch(job: &mut Job, error: LaunchError, deadline: Instant) -> LaunchError {
-    let ended = job.end(&[], deadline);
+/// been seen to end. The error is the launch's own unless the end is not proved. After a stop the
+/// end is given its short bound, as for a program that ran.
+fn after_failed_launch(
+    job: &mut Job,
+    error: LaunchError,
+    deadline: Instant,
+    stop: Option<&Stop>,
+) -> LaunchError {
+    let ended = job.end(&[], end_by(deadline, stop));
     match settled(job, ended) {
         Ok(()) => error,
         Err(uncertain) => uncertain,
+    }
+}
+
+/// The time by which the end of a run's job is waited for: the run's deadline, and once the stop has
+/// come, its short bound if that is sooner.
+fn end_by(deadline: Instant, stop: Option<&Stop>) -> Instant {
+    if stop.is_some_and(Stop::is_set) {
+        deadline.min(Instant::now() + STOP_BOUND)
+    } else {
+        deadline
     }
 }
 
@@ -491,6 +513,26 @@ pub mod testing {
     type Hook = Box<dyn Fn() + Send + Sync>;
 
     static AFTER_THE_SEARCH: Mutex<Option<Hook>> = Mutex::new(None);
+    static AFTER_THE_LAUNCH: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Sets, or with none clears, what a run of one program does when its launch has ended (the
+    /// process is made and held suspended, or the launch failed), before the run looks at the stop
+    /// again and resumes it. The hook is a flag of the whole process.
+    pub fn after_the_launch(hook: Option<Hook>) {
+        *AFTER_THE_LAUNCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    pub(super) fn launch_ended() {
+        if let Some(hook) = AFTER_THE_LAUNCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook();
+        }
+    }
 
     /// Sets, or with none clears, what a proof does when its search for a refusal has found one, before
     /// it starts any program that follows. The hook is a flag of the whole process.

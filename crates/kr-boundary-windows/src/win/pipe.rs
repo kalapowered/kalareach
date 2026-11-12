@@ -892,18 +892,6 @@ fn open_client(kind: Kind) -> Result<Handle> {
 /// How long the installer's own connection waits for an instance of the pipe to be free.
 const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Connects to one of the broker's pipes as a client and checks that the process serving it is the one
-/// the service manager reports for the service, so a program that took the name first is refused. The
-/// check is the same on both pipes.
-///
-/// # Errors
-///
-/// Returns the platform's error when the pipe cannot be opened, or an error when the server is
-/// not the expected process.
-pub fn connect(kind: Kind, expected_server: u32) -> Result<Connection> {
-    connect_to(kind, expected_server)
-}
-
 /// The service's process, held open: while the handle lives its process number is not given to another
 /// process, so a number that the service manager reported cannot be reused between the report and the
 /// check of the pipe's server.
@@ -928,17 +916,17 @@ impl ServerProcess {
     }
 }
 
-/// [`connect`] to the server process that `process` holds: the handle outlives the check of the
-/// pipe's server, which is the process that the handle names or the connection is refused.
+/// Connects to one of the broker's pipes as a client and checks that the process serving it is the
+/// one that `process` holds, so a program that took the name first is refused: the handle outlives
+/// the check of the pipe's server, which is the process that the handle names or the connection is
+/// refused. The check is the same on both pipes.
 ///
 /// # Errors
 ///
-/// As for [`connect`].
+/// Returns the platform's error when the pipe cannot be opened, or an error when the server is not
+/// the held process.
 pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
-    connect_to(kind, process.pid)
-}
-
-fn connect_to(kind: Kind, expected_server: u32) -> Result<Connection> {
+    let expected_server = process.pid;
     let name = wide(kind.name());
     let began = Instant::now();
     let pipe = loop {
@@ -947,16 +935,9 @@ fn connect_to(kind: Kind, expected_server: u32) -> Result<Connection> {
             Err(failure) if failure.code == ERROR_PIPE_BUSY => {
                 let left = BUSY_WAIT.saturating_sub(began.elapsed());
                 if left.is_zero() {
-                    let held_by = if kind == Kind::Administrators {
-                        " Other elevated sessions may hold the administrators' pipe."
-                    } else {
-                        ""
-                    };
                     return Err(error(
                         ERROR_PIPE_BUSY,
-                        format!(
-                            "the broker's pipe stayed busy: every connection the broker serves was in use for 10 seconds.{held_by}"
-                        ),
+                        crate::remedy::busy_pipe(BUSY_WAIT.as_secs(), kind == Kind::Administrators),
                     ));
                 }
                 // SAFETY: the name is NUL-terminated; the call waits until an instance listens or
