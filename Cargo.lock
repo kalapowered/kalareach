@@ -1324,6 +1324,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-local-authentication",
+ "objc2-ui-kit",
  "qrcodegen",
  "resvg",
  "rqrr",

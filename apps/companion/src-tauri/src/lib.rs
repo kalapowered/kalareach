@@ -59,6 +59,8 @@ pub mod retained;
 pub mod revocation;
 #[cfg(target_os = "ios")]
 mod scene;
+#[cfg(any(target_os = "ios", test))]
+mod scene_role;
 pub mod services;
 pub mod settings;
 pub mod setup;

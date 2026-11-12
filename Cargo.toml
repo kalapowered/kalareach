@@ -181,6 +181,7 @@ notify = { version = "=8.2.0", default-features = false }
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", default-features = false }
 objc2-local-authentication = { version = "=0.3.2", default-features = false }
+objc2-ui-kit = { version = "=0.3.2", default-features = false }
 # Reads the load commands of a macOS program, to name the libraries Git loads that the system does
 # not supply itself. Only the Mach-O reader; the release is already in the tree through the
 # component engine.

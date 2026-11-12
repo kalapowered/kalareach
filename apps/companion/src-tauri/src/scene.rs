@@ -24,6 +24,8 @@
 
 use tauri::{AppHandle, Manager as _, RunEvent};
 
+use crate::scene_role;
+
 /// The runtime's events, as far as a scene concerns them.
 pub(crate) fn on_run_event(app: &AppHandle, event: &RunEvent) {
     #[cfg(debug_assertions)]
@@ -32,7 +34,22 @@ pub(crate) fn on_run_event(app: &AppHandle, event: &RunEvent) {
         RunEvent::ExitRequested {
             code: None, api, ..
         } => api.prevent_exit(),
-        RunEvent::SceneRequested { .. } => open_main_window_once(app),
+        RunEvent::SceneRequested { scene, .. } => {
+            // Only the application's own scene is the phone's screen. A scene of another role (an
+            // external display's) is left without a window: the main window would be made in it, the
+            // check for an existing window would then stop the phone's scene from getting one when it
+            // returns, and the phone would stay blank.
+            let role = scene.session().role().to_string();
+            if scene_role::takes_the_main_window(&role) {
+                open_main_window_once(app);
+            } else {
+                tracing::info!("a scene of another role was requested, so it was given no window");
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "KalaReach scene probe (rust): a scene of another role was given no window"
+                );
+            }
+        }
         _ => {}
     }
 }
