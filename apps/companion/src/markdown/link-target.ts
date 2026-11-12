@@ -7,8 +7,11 @@
  * element, no event and no layout is read here, so each case of it can be stated with numbers.
  *
  * Among the links of a message, a press belongs to the link whose words are nearest to the point.
- * A press that no target holds is no link's. At an equal distance the earlier link in the message
- * takes the press, and a point on another control of the message is that control's.
+ * A press that no link's target holds is no link's. A link's target is the region of its words, grown
+ * to the least size, to the room beside them and to the height of its line, and the box the page
+ * itself gives the link's button, whole: a link that wraps is one box over all its lines, with its
+ * words centred in it, and the page's own hit test gives a press anywhere in it to the link. At an
+ * equal distance the earlier link in the message takes the press.
  */
 
 /** A point in the page's coordinates. */
@@ -25,6 +28,16 @@ export interface Rect {
   readonly bottom: number
 }
 
+/** A link as the rule sees it. */
+export interface Link {
+  /** The rectangles of the link's words, one for each line its label covers. */
+  readonly words: readonly Rect[]
+  /** The height of the lines the label stands on, or 0 when it is not known (a font's own `normal`). */
+  readonly line: number
+  /** The rectangles of the link's own button. */
+  readonly box: readonly Rect[]
+}
+
 /** How far a link's target reaches past its words. */
 export interface Reach {
   /** The least size of a target in each direction: 44 points on iOS and 48 dp on Android. */
@@ -33,30 +46,33 @@ export interface Reach {
   readonly beside: number
 }
 
+/**
+ * How far past a box's edges the page's own hit test still takes the box: it hits the whole pixels
+ * that enclose a box, and layout puts a box's edge at a fraction of a pixel. The pane's own box is
+ * taken the same way.
+ */
+const SNAP = 1
+
 /** Two distances closer than this are the same distance, so rounding in a layout takes no press away from the earlier link. */
 const EQUAL = 1e-6
 
 /**
  * The index of the link that takes a press at `point`, or null when none does.
  *
- * `links` holds the rectangles of each link's words, one for each line the label covers, in the order
- * the links have in the message. `bounds` is the room the pane gives: no target reaches past it. A
- * press arrives from inside the pane, so `bounds` only cuts a target that the pane would cut.
- * `controls` are the boxes of the message's other controls, which a link's target never takes.
+ * `links` are the links of the message in the order they have there. `bounds` is the room the pane
+ * gives: no target reaches past it. A press arrives from inside the pane, so `bounds` only cuts a
+ * target that the pane would cut.
  */
-export function linkAt(
-  point: Point,
-  links: readonly (readonly Rect[])[],
-  reach: Reach,
-  bounds: Rect,
-  controls: readonly Rect[] = []
-): number | null {
-  if (controls.some((box) => holds(box, point))) return null
+export function linkAt(point: Point, links: readonly Link[], reach: Reach, bounds: Rect): number | null {
+  const room = grown(bounds, SNAP)
   let chosen: number | null = null
   let nearest = Number.POSITIVE_INFINITY
   for (let index = 0; index < links.length; index += 1) {
-    const words = links[index] ?? []
-    if (!words.some((rect) => holds(within(targetOf(rect, reach), bounds), point))) continue
+    const { words, line, box } = links[index] ?? { words: [], line: 0, box: [] }
+    const held =
+      words.some((rect) => holds(within(targetOf(rect, reach, line), room), point)) ||
+      box.some((rect) => holds(within(grown(rect, SNAP), room), point))
+    if (!held) continue
     const distance = Math.min(...words.map((rect) => distanceTo(rect, point)))
     if (distance < nearest - EQUAL) {
       chosen = index
@@ -66,13 +82,22 @@ export function linkAt(
   return chosen
 }
 
-/** The region one rectangle of a link's words is pressable over. */
-export function targetOf(words: Rect, reach: Reach): Rect {
+/**
+ * The region one rectangle of a link's words is pressable over: at least the least size, and as wide
+ * as the words and the reach beside them, and as tall as the words and as the line they stand on, so
+ * it is never smaller than the link's own line.
+ */
+export function targetOf(words: Rect, reach: Reach, line: number): Rect {
   const wide = Math.max(reach.least, words.right - words.left + 2 * reach.beside)
-  const tall = Math.max(reach.least, words.bottom - words.top)
+  const tall = Math.max(reach.least, words.bottom - words.top, line)
   const x = (words.left + words.right) / 2
   const y = (words.top + words.bottom) / 2
   return { left: x - wide / 2, right: x + wide / 2, top: y - tall / 2, bottom: y + tall / 2 }
+}
+
+/** `rect` with `by` more on every side. */
+function grown(rect: Rect, by: number): Rect {
+  return { left: rect.left - by, right: rect.right + by, top: rect.top - by, bottom: rect.bottom + by }
 }
 
 /** What `rect` keeps of itself inside `bounds`; a rectangle wholly outside keeps nothing. */
