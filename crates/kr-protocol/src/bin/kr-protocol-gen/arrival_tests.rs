@@ -678,9 +678,66 @@ fn a_changed_null_branch_is_a_difference_for_both_comparisons() {
             outcome.lines
         );
     }
-    // Annotations of the null branch's definition stay as they were: the plain form is equal.
-    let same = crate::public_contract::compare(&old, &old).expect("compares");
+    // An annotation added to the null branch changes nothing a reader sees: descriptions and titles
+    // are ignored whether or not the branch is the plain null one.
+    let mut annotated = old.clone();
+    annotated["$defs"]["Opt"]["properties"]["x"]["anyOf"][1]["description"] = json!("nothing");
+    let same = crate::public_contract::compare(&old, &annotated).expect("compares");
     assert!(same.is_empty(), "{same:?}");
+}
+
+/// A `description` or `title` key inside a `default`, a `const`, an `enum` or `examples` is data,
+/// not an annotation: changing it is a difference for both comparisons, beside a member that
+/// passes too. A member that is merely named `default` has a schema for its value, and the
+/// annotations in that schema stay ignored.
+#[test]
+fn literal_data_is_compared_whole_for_both_comparisons() {
+    let protocol = protocol_schema();
+    let mut old = sdk_schema();
+    old["$defs"]["Route"]["properties"]["opt"] =
+        json!({ "type": "object", "default": { "description": "old" } });
+    old["$defs"]["Route"]["properties"]["kind"] = json!({ "const": { "title": "a" } });
+    old["$defs"]["Route"]["properties"]["pick"] =
+        json!({ "enum": [{ "description": "a" }, { "description": "b" }] });
+    for (member, keyword, value) in [
+        ("opt", "default", json!({ "description": "new" })),
+        ("kind", "const", json!({ "title": "b" })),
+        (
+            "pick",
+            "enum",
+            json!([{ "description": "a" }, { "description": "c" }]),
+        ),
+    ] {
+        let mut new = old.clone();
+        new["$defs"]["Route"]["properties"][member][keyword] = value;
+        let lines = crate::public_contract::compare(&old, &new).expect("compares");
+        assert_eq!(
+            lines,
+            vec![format!("Route.{member} changed: {keyword}")],
+            "the protocol's comparison"
+        );
+        let outcome = compare(
+            &old,
+            &with_hidden(&new),
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", Some(LISTED)),
+        );
+        assert_eq!(outcome.passed.len(), 1, "{member}");
+        assert_eq!(
+            outcome.lines,
+            vec![format!("Route.{member} changed: {keyword}")],
+            "the SDK's comparison"
+        );
+    }
+
+    let mut old = sdk_schema();
+    old["$defs"]["Route"]["properties"]["default"] =
+        json!({ "type": "string", "description": "a" });
+    let mut new = old.clone();
+    new["$defs"]["Route"]["properties"]["default"]["description"] = json!("b");
+    let lines = crate::public_contract::compare(&old, &new).expect("compares");
+    assert!(lines.is_empty(), "a member named default: {lines:?}");
 }
 
 /// A member of a definition that the protocol schema has stays under the protocol's rule: the
