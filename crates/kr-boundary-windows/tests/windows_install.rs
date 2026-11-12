@@ -3909,7 +3909,7 @@ fn open_the_brokers_pipe_with(access: u32) -> Result<(), u32> {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answer_cross_it() {
-    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
     let stop = Stop::new().unwrap();
     require_clean_machine();
     if needs_the_system() {
@@ -3936,10 +3936,8 @@ fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answe
             }
         }
     });
-    let mut connection = with_token_without(&[SYSTEM_SID], || {
-        pipe::connect(Pipe::Persons, std::process::id())
-    })
-    .expect("the client opens the pipe");
+    let mut connection = with_token_without(&[SYSTEM_SID], || connect_here(Pipe::Persons))
+        .expect("the client opens the pipe");
     kr_boundary_windows::frame::write(
         &mut connection,
         &Request::Prove {
@@ -4035,7 +4033,7 @@ fn a_client_that_holds_only_the_pipes_grant_is_refused_more_than_the_grant_and_m
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
-    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
     require_clean_machine();
@@ -4055,7 +4053,7 @@ fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
             drop(held);
         }
     });
-    let mut connection = pipe::connect(Pipe::Persons, std::process::id()).unwrap();
+    let mut connection = connect_here(Pipe::Persons).unwrap();
     let bound = std::time::Duration::from_secs(2);
     let begun = std::time::Instant::now();
     connection.set_deadline(Some(begun + bound));
@@ -4078,7 +4076,7 @@ fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and_the_connection_takes_no_more()
  {
-    use kr_boundary_windows::win::pipe::{self, Listener, Stop, testing};
+    use kr_boundary_windows::win::pipe::{Listener, Stop, testing};
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
     require_clean_machine();
@@ -4098,7 +4096,7 @@ fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and
             drop(held);
         }
     });
-    let mut connection = pipe::connect(Pipe::Persons, std::process::id()).unwrap();
+    let mut connection = connect_here(Pipe::Persons).unwrap();
     let bound = std::time::Duration::from_secs(1);
     let begun = std::time::Instant::now();
     connection.set_deadline(Some(begun + bound));
@@ -4206,7 +4204,6 @@ fn stand_in_broker(
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_end() {
-    use kr_boundary_windows::win::pipe;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     let bound = Duration::from_secs(4);
@@ -4215,7 +4212,7 @@ fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_e
     // The proof for the second class is answered after the installation's deadline, as a later cycle
     // would answer it: the installation stops reading at the deadline and takes no answer after it.
     let (server, asked, stop) = stand_in_broker(Duration::from_millis(500), Duration::from_secs(5));
-    let mut connection = pipe::connect(Pipe::Persons, std::process::id()).unwrap();
+    let mut connection = connect_here(Pipe::Persons).unwrap();
     let cycle = install::ProofCycle::begin(bound, margin, || Ok(())).unwrap();
     let began = Instant::now();
     let refused = cycle.prove(&mut connection).unwrap_err().to_string();
@@ -4238,7 +4235,7 @@ fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_e
     // that late could be answered only by a cycle of the broker's that the installation did not ask
     // for.
     let (server, asked, stop) = stand_in_broker(Duration::from_millis(3200), Duration::ZERO);
-    let mut connection = pipe::connect(Pipe::Persons, std::process::id()).unwrap();
+    let mut connection = connect_here(Pipe::Persons).unwrap();
     let cycle = install::ProofCycle::begin(bound, margin, || Ok(())).unwrap();
     let refused = cycle.prove(&mut connection).unwrap_err().to_string();
     drop(connection);
@@ -4253,7 +4250,7 @@ fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_e
     // Both inside the cycle: accepted.
     let (server, asked, stop) =
         stand_in_broker(Duration::from_millis(200), Duration::from_millis(200));
-    let mut connection = pipe::connect(Pipe::Persons, std::process::id()).unwrap();
+    let mut connection = connect_here(Pipe::Persons).unwrap();
     install::ProofCycle::begin(bound, margin, || Ok(()))
         .unwrap()
         .prove(&mut connection)
@@ -4368,16 +4365,14 @@ fn after_a_restart_the_brokers_proof_passes_inside_its_bound() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_the_listener() {
-    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
     require_clean_machine();
     if needs_the_system() {
         return;
     }
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(Pipe::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
-    drop(
-        pipe::connect(Pipe::Persons, std::process::id()).expect("the first client opens the pipe"),
-    );
+    drop(connect_here(Pipe::Persons).expect("the first client opens the pipe"));
     let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let server = std::thread::spawn(move || {
         listener
@@ -4385,7 +4380,7 @@ fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_t
             .map(|connection| connection.is_some())
             .map_err(|failure| failure.to_string())
     });
-    let second = std::thread::spawn(|| pipe::connect(Pipe::Persons, std::process::id()).map(drop));
+    let second = std::thread::spawn(|| connect_here(Pipe::Persons).map(drop));
     let accepted = ends_within(server, 20)
         .unwrap_or_else(|failure| Err(format!("the accept did not return: {failure}")));
     stop.set();
@@ -4397,20 +4392,58 @@ fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_t
     );
 }
 
+/// An open of a pipe whose connections are all in use waits for one and then says so, with the
+/// platform's error after the words and no full stop before it. Only the administrators' pipe adds
+/// that other elevated sessions may hold it: the persons' pipe is held by persons, and its words do
+/// not name sessions. Nothing accepts a connection here, so the first client holds the one
+/// instance that listens and the broker's own end holds the other.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_pipe_whose_connections_are_all_in_use_says_so_and_only_the_administrators_pipe_names_sessions()
+{
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    for (kind, names_sessions) in [(Pipe::Administrators, true), (Pipe::Persons, false)] {
+        let stop = Stop::new().unwrap();
+        let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
+        let listener = Listener::bind(kind, &[], stop).unwrap();
+        let first = connect_here(kind).expect("the first client opens the pipe");
+        let Err(busy) = connect_here(kind) else {
+            panic!("a client opened a pipe whose connections are all in use");
+        };
+        let text = busy.to_string();
+        assert_eq!(busy.code, 231, "{text}");
+        assert!(
+            text.contains("every connection the broker serves was in use for 10 seconds"),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("other elevated sessions may hold the administrators' pipe"),
+            names_sessions,
+            "{text}"
+        );
+        assert!(!text.contains(".:"), "{text}");
+        assert!(text.ends_with(": Windows error 231"), "{text}");
+        drop((first, listener));
+    }
+}
+
 /// The listener holds an instance of its own from the bind to its end, so that with every client gone
 /// and no accept pending, no other account can make the first instance of the pipe's name.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_listener_keeps_the_pipes_name_with_every_client_gone_and_no_accept_pending() {
-    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
     require_clean_machine();
     if needs_the_system() {
         return;
     }
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(Pipe::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
-    let client =
-        pipe::connect(Pipe::Persons, std::process::id()).expect("the client opens the pipe");
+    let client = connect_here(Pipe::Persons).expect("the client opens the pipe");
     let served = listener.accept().unwrap().expect("a client is accepted");
     drop(client);
     drop(served);
@@ -4437,9 +4470,10 @@ fn seven_clients_that_send_nothing_do_not_stop_the_service_and_a_real_client_is_
     let manager = service::manager().unwrap();
     let broker = manager.open(SERVICE).unwrap().unwrap();
     let pid = broker.status().unwrap().pid;
+    let held = pipe::ServerProcess::open(pid).expect("the service's process is opened");
     let silent: Vec<_> = (0..7)
         .map(|number| {
-            pipe::connect(Pipe::Persons, pid)
+            pipe::connect_held(Pipe::Persons, &held)
                 .unwrap_or_else(|failure| panic!("silent client {number}: {failure}"))
         })
         .collect();
@@ -4629,16 +4663,24 @@ impl Drop for ServedLoop {
     }
 }
 
+/// Connects to the broker's pipe that this process itself serves, holding its own process while the
+/// pipe's server is checked.
+#[cfg(feature = "testing")]
+fn connect_here(kind: Pipe) -> ffi::Result<kr_boundary_windows::win::pipe::Connection> {
+    use kr_boundary_windows::win::pipe;
+    let me = pipe::ServerProcess::open(std::process::id())?;
+    pipe::connect_held(kind, &me)
+}
+
 /// A client of the loop, opened as a caller whose token has the named identifiers deny-only: the
 /// system and the Administrators group both make a person who is not an administrator, the system
 /// alone makes an elevated administrator, and none is the system.
 #[cfg(feature = "testing")]
 fn client_without(kind: Pipe, disabled: &[&str]) -> kr_boundary_windows::win::pipe::Connection {
-    use kr_boundary_windows::win::pipe;
     with_token_without(disabled, || {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            match pipe::connect(kind, std::process::id()) {
+            match connect_here(kind) {
                 Ok(connection) => return connection,
                 Err(failure) if std::time::Instant::now() >= until => {
                     panic!("the loop's pipe could not be opened: {failure}")
@@ -4817,8 +4859,7 @@ fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_ha
     }
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(Pipe::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
-    let first =
-        pipe::connect(Pipe::Persons, std::process::id()).expect("the first client opens the pipe");
+    let first = connect_here(Pipe::Persons).expect("the first client opens the pipe");
     let _restored = RefillsRestored;
     pipe::testing::fail_refills(2);
     let served = listener
@@ -4832,7 +4873,7 @@ fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_ha
             .map(|connection| connection.is_some())
             .map_err(|failure| failure.to_string())
     });
-    let second = std::thread::spawn(|| pipe::connect(Pipe::Persons, std::process::id()).map(drop));
+    let second = std::thread::spawn(|| connect_here(Pipe::Persons).map(drop));
     let accepted = ends_within(server, 20)
         .unwrap_or_else(|failure| Err(format!("the second accept did not return: {failure}")));
     stop.set();
@@ -4954,7 +4995,6 @@ fn pipe_granting_administrators(grant: u32) -> ffi::Handle {
 fn the_pipes_grant_is_the_least_that_an_open_and_the_clients_calls_need() {
     use kr_boundary_windows::frame::FrameError;
     use kr_boundary_windows::pipe_access::CLIENT;
-    use kr_boundary_windows::win::pipe;
     require_clean_machine();
     let mut grants = vec![CLIENT];
     grants.extend(
@@ -4967,7 +5007,7 @@ fn the_pipes_grant_is_the_least_that_an_open_and_the_clients_calls_need() {
     for grant in grants {
         let _pipe = pipe_granting_administrators(grant);
         let calls = || -> Result<(), String> {
-            let mut connection = pipe::connect(Pipe::Persons, std::process::id())
+            let mut connection = connect_here(Pipe::Persons)
                 .map_err(|failure| format!("the open: error {}", failure.code))?;
             connection.set_deadline(Some(
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
@@ -5078,11 +5118,10 @@ fn try_client_without(
     disabled: &[&str],
     seconds: u64,
 ) -> Result<kr_boundary_windows::win::pipe::Connection, String> {
-    use kr_boundary_windows::win::pipe;
     with_token_without(disabled, || {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
         loop {
-            match pipe::connect(kind, std::process::id()) {
+            match connect_here(kind) {
                 Ok(connection) => return Ok(connection),
                 Err(failure) if std::time::Instant::now() >= until => {
                     return Err(failure.to_string());
@@ -5105,7 +5144,92 @@ impl Drop for RefillsRestored {
     }
 }
 
-/// A client that has sent part of a frame when the stop comes does not keep the service from stopping.
+/// How many bytes this end of a pipe has written that the other end has not read yet: the quota of
+/// the outbound buffer less what is left of it.
+#[cfg(feature = "testing")]
+fn unread_by_the_other_end(handle: windows_sys::Win32::Foundation::HANDLE) -> u32 {
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_PIPE_LOCAL_INFORMATION, FilePipeLocalInformation, NtQueryInformationFile,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    // SAFETY: a zeroed record is a valid start.
+    let mut status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let mut info = FILE_PIPE_LOCAL_INFORMATION::default();
+    // SAFETY: the handle is open, and the buffer is the record that the class fills.
+    let answer = unsafe {
+        NtQueryInformationFile(
+            handle,
+            &raw mut status,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_PIPE_LOCAL_INFORMATION>() as u32,
+            FilePipeLocalInformation,
+        )
+    };
+    assert_eq!(answer, 0, "reading what a pipe holds: status {answer:#x}");
+    info.OutboundQuota.saturating_sub(info.WriteQuotaAvailable)
+}
+
+/// The control of [`unread_by_the_other_end`]: on a pipe that nobody reads, what was written is
+/// counted as unread, and once it is read the count is zero again. Without this a reading of zero
+/// would show nothing.
+#[cfg(feature = "testing")]
+fn the_count_of_unread_bytes_follows_a_pipe_that_is_read() {
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: both pointers are to locals; the call makes two handles that are checked.
+    assert_ne!(
+        unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 0) },
+        0
+    );
+    let (read, write) = (
+        ffi::Handle::new(read, "a pipe's read end").unwrap(),
+        ffi::Handle::new(write, "a pipe's write end").unwrap(),
+    );
+    let mut moved = 0_u32;
+    // SAFETY: the buffer is fourteen bytes and the handle is open.
+    let written = unsafe {
+        WriteFile(
+            write.raw(),
+            b"0123456789abcd".as_ptr(),
+            14,
+            &raw mut moved,
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(
+        written != 0 && moved == 14,
+        "the probe's pipe takes 14 bytes"
+    );
+    assert_eq!(
+        unread_by_the_other_end(write.raw()),
+        14,
+        "the bytes that nobody read are counted"
+    );
+    let mut buffer = [0_u8; 14];
+    // SAFETY: the buffer is fourteen bytes and the handle is open.
+    let taken = unsafe {
+        ReadFile(
+            read.raw(),
+            buffer.as_mut_ptr(),
+            14,
+            &raw mut moved,
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(taken != 0 && moved == 14, "the probe's pipe gives 14 bytes");
+    assert_eq!(
+        unread_by_the_other_end(write.raw()),
+        0,
+        "the bytes that were read are no longer counted"
+    );
+}
+
+/// A client that has sent part of a frame when the stop comes does not keep the service from
+/// stopping. The client waits until the server has taken what it sent (the pipe holds nothing more
+/// for the server to read), so the server is in its read of the rest of the frame when the stop
+/// comes, and the service must end within three seconds, under the five that the read waits for the
+/// rest.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
@@ -5114,18 +5238,54 @@ fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
     if needs_the_system() {
         return;
     }
+    the_count_of_unread_bytes_follows_a_pipe_that_is_read();
     let mut served = serve_in_process();
-    let mut person = client_without(Pipe::Persons, &[SYSTEM_SID, ADMINISTRATORS_SID]);
-    say_hello(&mut person);
+    let client = RawClient::open(persons_pipe_name(), &[SYSTEM_SID, ADMINISTRATORS_SID]);
+    let mut hello = Vec::new();
+    kr_boundary_windows::frame::write(
+        &mut hello,
+        &Request::Hello {
+            version: kr_boundary_windows::frame::VERSION,
+        },
+    )
+    .unwrap();
+    assert!(
+        raw_transfer(client.0.raw(), true, hello).is_some(),
+        "hello is written"
+    );
+    assert!(
+        raw_transfer(client.0.raw(), false, vec![0; 4096]).is_some_and(|said| !said.is_empty()),
+        "hello is answered"
+    );
     // A frame that announces a hundred bytes of body and carries ten.
-    person
-        .write_all(&100_u32.to_le_bytes())
-        .and_then(|()| person.write_all(b"0123456789"))
-        .expect("the part of the frame is written");
+    let mut part = 100_u32.to_le_bytes().to_vec();
+    part.extend_from_slice(b"0123456789");
+    assert!(
+        raw_transfer(client.0.raw(), true, part).is_some(),
+        "the part of the frame is written"
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut first = None;
+    loop {
+        let unread = unread_by_the_other_end(client.0.raw());
+        first.get_or_insert(unread);
+        if unread == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the server did not take the {unread} bytes of the frame that were written: it never reached its read"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    eprintln!(
+        "EVIDENCE: the part of the frame that the server had not yet read right after the write: {} of 14 bytes",
+        first.unwrap_or(0)
+    );
     // The bound is under the five seconds that the connection's read waits for the rest of a
     // frame, so only the stop can have ended it.
     let ended = served.stops_within(3);
-    drop(person);
+    drop(client);
     assert_eq!(
         ended.expect("the service ends with a client in the middle of a frame"),
         Ok(())
@@ -5174,15 +5334,14 @@ fn a_client_that_reads_no_answer_does_not_hold_the_service_at_a_stop() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_read_and_a_write_with_the_stop_set_end_at_once_though_their_transfers_could_finish() {
     use kr_boundary_windows::frame::{self, FrameError};
-    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
     require_clean_machine();
     if needs_the_system() {
         return;
     }
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(Pipe::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
-    let mut client =
-        pipe::connect(Pipe::Persons, std::process::id()).expect("the client opens the pipe");
+    let mut client = connect_here(Pipe::Persons).expect("the client opens the pipe");
     frame::write(
         &mut client,
         &Request::Hello {
@@ -5263,8 +5422,7 @@ fn the_name_stays_the_brokers_with_every_connection_gone_after_a_failed_refill()
     let _restored = RefillsRestored;
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(Pipe::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
-    let client =
-        pipe::connect(Pipe::Persons, std::process::id()).expect("the client opens the pipe");
+    let client = connect_here(Pipe::Persons).expect("the client opens the pipe");
     pipe::testing::fail_refills(1);
     let served = listener
         .accept()
@@ -5632,17 +5790,22 @@ fn a_thousand_and_one_failed_refills_do_not_end_the_loop_and_it_still_serves() {
 }
 
 /// An ordinary account that opens the persons' pipe in a tight loop while the service makes the pipe
-/// again and again never gets a handle on the instance that the broker keeps for itself. The bind is
+/// again and again never gets a handle on the instance that the broker keeps for itself. Each bind is
 /// paused after it has made the first instance and before the broker's own client end is on it, and
-/// every open that the account makes in that pause is refused, and at least one is made; the binds
-/// all succeed, which they would not if the account had taken the first instance.
+/// each pause has a number of its own: every open that the account makes inside one pause is counted
+/// for that pause, and in every one of the hundred pauses the account is refused at least twenty
+/// times and gets no handle and no other answer (the name exists and the first instance listens, so
+/// neither a missing pipe nor a busy one can come). Outside the pauses, where the real list is on
+/// the instance, the same account does open the pipe, so a refusal in a pause is the first
+/// instance's list and not a pipe that cannot be opened. The binds all succeed, which they would not
+/// if the account had taken the first instance.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keeper_is_connected() {
     use kr_boundary_windows::win::pipe::{Listener, Stop, testing};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use windows_sys::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE,
     };
@@ -5650,18 +5813,52 @@ fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keep
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
         SECURITY_SQOS_PRESENT,
     };
-    /// What the account's opens gave, by the platform's answer: in all, and in the pause of the bind.
+    /// How many refusals the account must have had inside a pause before the bind goes on.
+    const AT_WORK: u32 = 20;
+    /// What the account's opens gave inside one pause, by the platform's answer.
+    #[derive(Clone, Default, Debug)]
+    struct Pause {
+        refused: u32,
+        opened: u32,
+        not_found: u32,
+        busy: u32,
+        other: u32,
+    }
+    /// What the account's opens gave, in all and by pause.
     #[derive(Default)]
     struct Counts {
-        paused: AtomicBool,
+        /// The pauses' generation: odd while a bind is paused and even between pauses, so that
+        /// pause number `n` is the generation `2n + 1`. An open belongs to a pause only if the
+        /// generation was the same, and odd, before and after it.
+        generation: AtomicU64,
         opened: AtomicU32,
         refused: AtomicU32,
         not_found: AtomicU32,
         busy: AtomicU32,
         other: AtomicU32,
-        opened_in_the_pause: AtomicU32,
-        refused_in_the_pause: AtomicU32,
-        other_in_the_pause: AtomicU32,
+        /// Opens that the generation shows were made between pauses.
+        opened_outside_the_pauses: AtomicU32,
+        pauses: Mutex<Vec<Pause>>,
+    }
+    impl Counts {
+        fn pause(&self, number: usize, count: impl FnOnce(&mut Pause)) {
+            let mut pauses = self
+                .pauses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pauses.len() <= number {
+                pauses.resize(number + 1, Pause::default());
+            }
+            count(&mut pauses[number]);
+        }
+
+        fn refused_in(&self, number: usize) -> u32 {
+            self.pauses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(number)
+                .map_or(0, |pause| pause.refused)
+        }
     }
     /// The account's loop: ends when the case does, on every path.
     struct Opener {
@@ -5703,7 +5900,7 @@ fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keep
             with_token_without(&[SYSTEM_SID, ADMINISTRATORS_SID], || {
                 let mut told = false;
                 while !done.load(Ordering::Acquire) {
-                    let paused_before = counts.paused.load(Ordering::Acquire);
+                    let before = counts.generation.load(Ordering::Acquire);
                     // SAFETY: the name is NUL-terminated; the result is checked.
                     let opened = unsafe {
                         CreateFileW(
@@ -5718,31 +5915,47 @@ fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keep
                     };
                     // SAFETY: reads this thread's last error, set by the call above.
                     let code = (opened == INVALID_HANDLE_VALUE).then(|| unsafe { GetLastError() });
-                    // An open counts for the pause only if the pause held before and after it.
-                    let in_the_pause = paused_before && counts.paused.load(Ordering::Acquire);
+                    let after = counts.generation.load(Ordering::Acquire);
+                    // An open counts for a pause only if the generation held, odd, before and after
+                    // it, and for the time between pauses only if it held, even.
+                    let steady = (before == after).then_some(before);
+                    let pause = steady.filter(|generation| generation % 2 == 1);
+                    let outside = steady.is_some_and(|generation| generation % 2 == 0);
                     match code {
                         Some(5) => {
                             counts.refused.fetch_add(1, Ordering::SeqCst);
-                            if in_the_pause {
-                                counts.refused_in_the_pause.fetch_add(1, Ordering::SeqCst);
+                            if let Some(generation) = pause {
+                                counts.pause((generation / 2) as usize, |pause| pause.refused += 1);
                             }
                         }
                         Some(ERROR_FILE_NOT_FOUND) => {
                             counts.not_found.fetch_add(1, Ordering::SeqCst);
+                            if let Some(generation) = pause {
+                                counts
+                                    .pause((generation / 2) as usize, |pause| pause.not_found += 1);
+                            }
                         }
                         Some(ERROR_PIPE_BUSY) => {
                             counts.busy.fetch_add(1, Ordering::SeqCst);
+                            if let Some(generation) = pause {
+                                counts.pause((generation / 2) as usize, |pause| pause.busy += 1);
+                            }
                         }
                         Some(_) => {
                             counts.other.fetch_add(1, Ordering::SeqCst);
-                            if in_the_pause {
-                                counts.other_in_the_pause.fetch_add(1, Ordering::SeqCst);
+                            if let Some(generation) = pause {
+                                counts.pause((generation / 2) as usize, |pause| pause.other += 1);
                             }
                         }
                         None => {
                             counts.opened.fetch_add(1, Ordering::SeqCst);
-                            if in_the_pause {
-                                counts.opened_in_the_pause.fetch_add(1, Ordering::SeqCst);
+                            if let Some(generation) = pause {
+                                counts.pause((generation / 2) as usize, |pause| pause.opened += 1);
+                            }
+                            if outside {
+                                counts
+                                    .opened_outside_the_pauses
+                                    .fetch_add(1, Ordering::SeqCst);
                             }
                             // Closed at once, which is what a client that goes does.
                             drop(ffi::Handle::new(opened, "the persons' pipe").unwrap());
@@ -5767,16 +5980,15 @@ fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keep
     testing::before_the_keepers_open(Some(Arc::new({
         let counts = Arc::clone(&counts);
         move || {
-            // The bind waits here until the account has been refused enough times to show that it
-            // is at work, and for no longer than ten seconds.
-            counts.paused.store(true, Ordering::Release);
+            // Each bind opens a pause of its own, and waits here until the account has been refused
+            // enough times inside this pause to show that it is at work, for ten seconds at most.
+            let generation = counts.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            let number = (generation / 2) as usize;
             let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while counts.refused_in_the_pause.load(Ordering::SeqCst) < 20
-                && std::time::Instant::now() < until
-            {
+            while counts.refused_in(number) < AT_WORK && std::time::Instant::now() < until {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            counts.paused.store(false, Ordering::Release);
+            counts.generation.fetch_add(1, Ordering::AcqRel);
         }
     })));
     let everyone = Sid::parse("S-1-1-0").unwrap();
@@ -5790,34 +6002,43 @@ fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keep
     }
     opener.finish();
     let get = |count: &AtomicU32| count.load(Ordering::SeqCst);
+    let pauses = counts
+        .pauses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     eprintln!(
-        "EVIDENCE: the account's opens over 100 binds: opened {}, refused {}, not found {}, busy {}, other {}; in the pause of the bind: opened {}, refused {}, other {}",
+        "EVIDENCE: the account's opens over 100 binds: opened {} (outside the pauses {}), refused {}, not found {}, busy {}, other {}; pauses {}, fewest refusals in one pause {}, most {}",
         get(&counts.opened),
+        get(&counts.opened_outside_the_pauses),
         get(&counts.refused),
         get(&counts.not_found),
         get(&counts.busy),
         get(&counts.other),
-        get(&counts.opened_in_the_pause),
-        get(&counts.refused_in_the_pause),
-        get(&counts.other_in_the_pause)
+        pauses.len(),
+        pauses.iter().map(|pause| pause.refused).min().unwrap_or(0),
+        pauses.iter().map(|pause| pause.refused).max().unwrap_or(0),
     );
     assert!(
         failures.is_empty(),
         "an open of the account took the first instance before the broker's own end was on it: {failures:?}"
     );
+    assert_eq!(pauses.len(), 100, "every bind was paused once");
+    for (number, pause) in pauses.iter().enumerate() {
+        assert!(
+            pause.refused >= AT_WORK,
+            "the account was refused {} times, not {AT_WORK}, in pause {number}: {pause:?}",
+            pause.refused
+        );
+        assert_eq!(
+            (pause.opened, pause.not_found, pause.busy, pause.other),
+            (0, 0, 0, 0),
+            "an open in pause {number} ended with an answer that is not a refusal: {pause:?}"
+        );
+    }
     assert!(
-        get(&counts.refused_in_the_pause) >= 1,
-        "the account made no open in the pause of the bind"
-    );
-    assert_eq!(
-        get(&counts.opened_in_the_pause),
-        0,
-        "the account opened the pipe in the pause of the bind"
-    );
-    assert_eq!(
-        get(&counts.other_in_the_pause),
-        0,
-        "an open in the pause of the bind ended with an answer that is not a refusal"
+        get(&counts.opened_outside_the_pauses) >= 1,
+        "the account never opened the pipe outside the pauses, where its list lets it: a refusal in a pause shows nothing"
     );
     assert_eq!(
         get(&counts.other),
@@ -6009,16 +6230,19 @@ fn the_administrators_pipe_refuses_a_person_and_an_administrator_who_is_not_elev
     assert_eq!(code, 0, "{output}");
     let broker = service::manager().unwrap().open(SERVICE).unwrap().unwrap();
     let pid = broker.status().unwrap().pid;
-    let elevated = pipe::connect(Pipe::Administrators, pid);
+    // The service's process is held before the token changes: the open of the pipe is what each
+    // token is refused or allowed.
+    let held = pipe::ServerProcess::open(pid).expect("the service's process is opened");
+    let elevated = pipe::connect_held(Pipe::Administrators, &held);
     let person = with_token_without(&[SYSTEM_SID, ADMINISTRATORS_SID], || {
-        pipe::connect(Pipe::Administrators, pid)
+        pipe::connect_held(Pipe::Administrators, &held)
     });
     // Under the administrator's own token the group alone is turned off, which is that
     // administrator without the elevation; under the system's token it is the system's entry that
     // would still allow the open, so there the case has only the person to show.
     let not_elevated = (!runs_as_the_system()).then(|| {
         with_token_without(&[ADMINISTRATORS_SID], || {
-            pipe::connect(Pipe::Administrators, pid)
+            pipe::connect_held(Pipe::Administrators, &held)
         })
     });
     assert!(

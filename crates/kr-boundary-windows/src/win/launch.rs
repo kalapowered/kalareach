@@ -323,8 +323,11 @@ pub mod testing {
 
     static LAUNCHES: AtomicU32 = AtomicU32::new(0);
 
-    /// How many programs this process has started so far, counted at the call that makes the
-    /// process: a case compares two readings to show that nothing started between them.
+    static RESUMES: AtomicU32 = AtomicU32::new(0);
+
+    /// How many calls to start a program this process has made so far, counted when `launch` is
+    /// entered, before any check that can refuse it: a case compares two readings to show that no
+    /// call was made between them.
     #[must_use]
     pub fn launches() -> u32 {
         LAUNCHES.load(Ordering::SeqCst)
@@ -332,6 +335,18 @@ pub mod testing {
 
     pub(super) fn count_launch() {
         LAUNCHES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many calls to let a suspended program run this process has made so far, counted when
+    /// `resume` is entered: a case compares two readings to show that a program that was made was
+    /// never resumed.
+    #[must_use]
+    pub fn resumes() -> u32 {
+        RESUMES.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn count_resume() {
+        RESUMES.fetch_add(1, Ordering::SeqCst);
     }
 
     static SKIP_NEXT_TERMINATION: AtomicBool = AtomicBool::new(false);
@@ -490,6 +505,8 @@ impl SuspendedChild {
     /// Returns an error, and ends the child, when the permit is for another child, when the thread
     /// cannot be resumed, or when it was not suspended exactly once.
     pub fn resume(self, permit: ResumePermit) -> Result<Child, LaunchError> {
+        #[cfg(feature = "testing")]
+        testing::count_resume();
         if permit.invocation != self.invocation
             || permit.pid != self.pid
             || permit.creation_time != self.creation_time
@@ -933,13 +950,13 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
 /// The most [`read_pipe`] keeps; the rest is read and dropped.
 const CAPTURE_LIMIT: usize = 8 << 20;
 
-/// How often [`read_pipe`] looks again at a pipe that holds nothing yet.
 /// How long the readers of a program's output and the end of its job are given once the service's
 /// stop has come. The job's processes end within milliseconds, so this only keeps a writer outside
 /// the job, which holds a pipe open, from holding a service that is stopping until the run's own
 /// deadline of thirty or sixty seconds.
 pub const STOP_BOUND: Duration = Duration::from_secs(3);
 
+/// How often [`read_pipe`] looks again at a pipe that holds nothing yet.
 const PIPE_POLL: Duration = Duration::from_millis(10);
 
 /// What [`read_pipe`] read.

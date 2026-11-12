@@ -43,6 +43,13 @@ use kr_boundary_windows::win::root::{create_root, remove_root};
 
 use common::{Rows, Scratch, group, hostile_dir, hostile_file, run_dir};
 
+/// Connects to the persons' pipe that this process itself serves, holding its own process while the
+/// pipe's server is checked.
+fn connect_here() -> kr_boundary_windows::win::ffi::Result<Connection> {
+    let me = pipe::ServerProcess::open(std::process::id())?;
+    pipe::connect_held(pipe::Kind::Persons, &me)
+}
+
 /// Whether a token holds a privilege and has it enabled: `None` when it does not hold it.
 fn state_in(token: HANDLE, name: &str) -> Option<bool> {
     let mut luid = LUID {
@@ -351,7 +358,7 @@ impl Served {
     fn connect(&self) -> Connection {
         let mut tries = 0;
         let mut connection = loop {
-            match pipe::connect(pipe::Kind::Persons, std::process::id()) {
+            match connect_here() {
                 Ok(connection) => break connection,
                 Err(error) => {
                     tries += 1;
@@ -403,8 +410,7 @@ fn nothing_is_served_after(failure: fn()) {
         "the open connection is not served again"
     );
     // A connection that arrives later wakes the loop, which takes none and ends.
-    let mut late =
-        pipe::connect(pipe::Kind::Persons, std::process::id()).expect("the pipe is still there");
+    let mut late = connect_here().expect("the pipe is still there");
     let _ = frame::write(
         &mut late,
         &Request::Hello {
