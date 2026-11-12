@@ -134,6 +134,7 @@ fn server_table() -> ConnectorManifest {
         selections: vec![SelectionRoute {
             method: method("thread.start"),
             thread: path(&["result", "thread", "id"]),
+            hidden_when: Vec::new(),
         }],
         leaves: vec![LeaveRoute {
             method: method("thread.closed"),

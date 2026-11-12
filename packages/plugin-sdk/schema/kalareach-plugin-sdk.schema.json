@@ -960,6 +960,23 @@
       "minLength": 1,
       "type": "string"
     },
+    "ConditionValue": {
+      "anyOf": [
+        {
+          "description": "A string.",
+          "type": "string"
+        },
+        {
+          "description": "A boolean.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/SafeInt",
+          "description": "An integer both Rust and JavaScript represent exactly."
+        }
+      ],
+      "description": "A scalar value a request may hold at a place: a string, a boolean or an integer.\n\nIt is written as the JSON value itself. A number with a fraction, a null, an array and an\nobject are not scalars here, and a table that holds one does not read."
+    },
     "ConnectorManifest": {
       "additionalProperties": false,
       "description": "The connector manifest.",
@@ -4078,6 +4095,28 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "RequestCondition": {
+      "additionalProperties": false,
+      "description": "A condition on a request: the place in its message must hold one of some scalar values.\n\nThe place is a [`FieldPath`] from the root of the request's message. The condition is met when\nthe message has a value at that place and the value is equal to one of `values`; a message\nwith nothing at the place does not meet it, and neither does a condition that lists no value.",
+      "properties": {
+        "place": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the request's message holds the value, from the root of the message."
+        },
+        "values": {
+          "description": "The values the place may hold; the condition is met when it holds any one of them.",
+          "items": {
+            "$ref": "#/$defs/ConditionValue"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "place",
+        "values"
+      ],
+      "type": "object"
+    },
     "ResolvedRoute": {
       "additionalProperties": false,
       "description": "A notification that says a request of the application's was answered or cleared.",
@@ -4238,6 +4277,13 @@
       "additionalProperties": false,
       "description": "A request of the terminal whose success reply names the conversation it selected.",
       "properties": {
+        "hidden_when": {
+          "description": "The conditions under which the request starts a thread the terminal never shows.\n\nA request that meets every one of them starts a thread of the application's own, and the\nterminal does not select it, so the host does not take the thread the reply names as the\none the terminal is in. An empty list is the earlier meaning: no request is hidden, and\nevery request this route matches selects the thread its reply names. The member is left\nout of a table that states no conditions.",
+          "items": {
+            "$ref": "#/$defs/RequestCondition"
+          },
+          "type": "array"
+        },
         "method": {
           "$ref": "#/$defs/MethodName",
           "description": "The routed method, which travels from the host to the application."
