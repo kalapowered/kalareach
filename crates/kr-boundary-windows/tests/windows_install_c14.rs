@@ -31,13 +31,28 @@ impl Drop for Folder {
     }
 }
 
+/// A folder in the temporary folder, owned by the administrators. It is made by an exclusive
+/// creation, so that the guard never removes a folder that the case did not make, and the guard is
+/// armed before the owner changes, so that a failure of that leaves nothing.
 fn inherited_folder() -> Folder {
-    let folder = Folder(std::env::temp_dir().join(format!(
+    let path = std::env::temp_dir().join(format!(
         "krparent-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
-    )));
-    owned_dir(&folder.0);
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let folder = Folder(path);
+    give_to(&folder.0, "*S-1-5-32-544");
     folder
+}
+
+/// Drops the function that a case set for the removal's seam and that did not run, when the case
+/// ends, so that it does not run in another case.
+struct NoHook;
+
+impl Drop for NoHook {
+    fn drop(&mut self) {
+        install::testing::no_hook_after_the_removal_inspects_the_data_directory();
+    }
 }
 
 fn give_to(path: &Path, who: &str) {
@@ -149,6 +164,7 @@ fn bait_is_whole(target: &Path) {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
+    let _hook = NoHook;
     let folder = inherited_folder();
     parent_of(&folder);
     let top = folder.join("KalaReach");
@@ -181,6 +197,7 @@ fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_junction_at_the_data_directorys_name_made_after_the_inspection_is_not_followed() {
+    let _hook = NoHook;
     let folder = inherited_folder();
     parent_of(&folder);
     let paths = paths_in(&folder);
@@ -206,6 +223,7 @@ fn a_junction_at_the_data_directorys_name_made_after_the_inspection_is_not_follo
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn what_is_put_in_an_approved_empty_directory_after_the_inspection_is_not_deleted() {
+    let _hook = NoHook;
     let folder = inherited_folder();
     parent_of(&folder);
     let paths = paths_in(&folder);

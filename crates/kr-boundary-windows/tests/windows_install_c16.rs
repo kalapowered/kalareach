@@ -49,6 +49,11 @@ impl Cleanup {
     }
 
     /// A right that the case gives the users group on a folder that it made, taken away again.
+    /// Drops the function that the case sets for the removal's seam if the removal did not run it.
+    fn hook(&mut self) {
+        self.undo(install::testing::no_hook_after_the_removal_inspects_the_data_directory);
+    }
+
     fn grant(&mut self, folder: &Path, right: &str) {
         icacls(folder, &["/grant", &format!("{USERS}:{right}")]);
         let folder = folder.to_owned();
@@ -86,15 +91,28 @@ fn owned_dir(path: impl AsRef<Path>) {
     icacls(path.as_ref(), &["/setowner", "*S-1-5-32-544"]);
 }
 
-/// A folder in the temporary folder, owned by the administrators and with the list that it inherits.
+/// A folder in the temporary folder, owned by the administrators and with the list that it
+/// inherits. It is made by an exclusive creation, so that the guard never removes a folder that the
+/// case did not make, and the guard is armed before the owner changes, so that a failure of that
+/// leaves nothing.
 fn inherited_folder(clean: &mut Cleanup) -> PathBuf {
     let folder = std::env::temp_dir().join(format!(
         "krancestor-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
-    owned_dir(&folder);
+    std::fs::create_dir(&folder).unwrap();
     clean.folder(&folder);
+    icacls(&folder, &["/setowner", "*S-1-5-32-544"]);
     folder
+}
+
+/// The guest holds no installation: a case whose removal reaches the service, the boot marker and
+/// the policy steps would delete a service of the broker's name.
+fn require_clean_guest() {
+    assert!(
+        matches!(install::entry(&Paths::system().unwrap()), Ok(Entry::Fresh)),
+        "the guest holds an installation, or an account, a service or a directory of its names"
+    );
 }
 
 fn junction(link: &Path, target: &Path) {
@@ -257,6 +275,44 @@ fn a_folder_above_the_program_top_that_an_ordinary_account_may_delete_in_is_refu
     names_the_folder_and_the_right(&text, &above, "program directory");
 }
 
+/// A link at the top of the program tree (a moved `Program Files`) is the administrator's own: the
+/// walk from the top down refuses it with the words of any link above the trees, reads the real
+/// sentence, and never tells to remove the link.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
+    let mut clean = Cleanup::default();
+    let target = inherited_folder(&mut clean);
+    parent_of(&target);
+    let container = inherited_folder(&mut clean);
+    let link = container.join("Program Files");
+    junction(&link, &target);
+    clean.junction(&link);
+    let data_parent = inherited_folder(&mut clean);
+    parent_of(&data_parent);
+    let paths = paths_with(&data_parent, &link.join("Boundary"), &link);
+    let text = install::remove(&paths, true)
+        .expect_err("a link at the top of the program tree")
+        .to_string();
+    assert!(
+        text.contains(&format!(
+            "{} is a folder above the boundary's program directory",
+            link.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("it is a link or a mounted folder"), "{text}");
+    assert!(
+        text.contains("does not go through a link or a mounted folder"),
+        "{text}"
+    );
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(
+        !text.to_lowercase().contains("remove the link"),
+        "an administrator is never told to remove it: {text}"
+    );
+}
+
 /// A fresh installation reads the folders above the program tree before it makes, writes or stops
 /// anything, so that what it says, that nothing was changed, is true. Here the data tree passes and
 /// the program tree has a folder above it that fails.
@@ -310,6 +366,8 @@ fn a_fresh_installation_refuses_a_link_that_points_nowhere_at_the_program_direct
         "{text}"
     );
     assert!(text.contains("not what it points to"), "{text}");
+    // Nothing is installed, so a repair, which is refused where nothing is installed, is not promised.
+    assert!(!text.contains("repair"), "{text}");
     assert!(!paths.data.exists(), "nothing was made");
     assert!(folder.exists());
 }
@@ -463,16 +521,14 @@ fn a_link_in_the_program_directory_is_to_be_removed_as_the_link_itself() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_journal_and_a_run_directory_made_after_the_inspection_are_left() {
-    assert!(
-        matches!(install::entry(&Paths::system().unwrap()), Ok(Entry::Fresh)),
-        "the guest holds an installation, or an account, a service or a directory of its names"
-    );
+    require_clean_guest();
     let mut clean = Cleanup::default();
     let (_folder, paths) = data_parent_with_paths(&mut clean);
     installed_data_directory(&paths);
     std::fs::remove_dir(&paths.journal).unwrap();
     std::fs::remove_dir(&paths.run).unwrap();
     let (journal, run) = (paths.journal.clone(), paths.run.clone());
+    clean.hook();
     install::testing::after_the_removal_inspects_the_data_directory(move || {
         std::fs::create_dir(&journal).unwrap();
         std::fs::create_dir(&run).unwrap();
@@ -496,15 +552,19 @@ fn a_journal_and_a_run_directory_made_after_the_inspection_are_left() {
 
 /// A `staging` directory that was absent at the removal's inspection and is there when it comes to
 /// make it again is not used and not deleted: the removal refuses before it changes anything, and
-/// what appeared stays with its file.
+/// what appeared stays with its file. The case first checks that the guest holds no installation:
+/// a removal that trusted the directory would go on to the service step, which deletes a service of
+/// the broker's name.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_staging_directory_made_after_the_inspection_is_left_and_named() {
+    require_clean_guest();
     let mut clean = Cleanup::default();
     let (_folder, paths) = data_parent_with_paths(&mut clean);
     installed_data_directory(&paths);
     std::fs::remove_dir(&paths.staging).unwrap();
     let staging = paths.staging.clone();
+    clean.hook();
     install::testing::after_the_removal_inspects_the_data_directory(move || {
         std::fs::create_dir(&staging).unwrap();
         std::fs::write(staging.join("keep.txt"), b"x").unwrap();
@@ -528,22 +588,38 @@ fn a_staging_directory_made_after_the_inspection_is_left_and_named() {
 }
 
 /// An earlier-state record that was not in the data directory at the removal's inspection and is
-/// there when it comes to delete the records is left and named, and the manifest stays with it. The
-/// removal reaches the service, the boot marker and the policy steps: the case first checks that the
-/// guest holds no installation.
+/// there when it comes to use and delete the records is not used and not deleted: it is left and
+/// named, and the manifest stays with it. The record parses and says what would change the outcome
+/// if the removal acted on it: the Application Identity service was not running before the
+/// installation (the removal would stop it on this word where it runs), and the earlier policy had
+/// a rule that the machine does not have (the residue check would then report that the earlier
+/// state is not back). The removal reaches the service, the boot marker and the policy steps: the
+/// case first checks that the guest holds no installation.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_prior_record_made_after_the_inspection_is_left_and_named() {
-    assert!(
-        matches!(install::entry(&Paths::system().unwrap()), Ok(Entry::Fresh)),
-        "the guest holds an installation, or an account, a service or a directory of its names"
-    );
+    use kr_boundary_windows::manifest::{Prior, STORE_VERSION};
+    require_clean_guest();
     let mut clean = Cleanup::default();
     let (_folder, paths) = data_parent_with_paths(&mut clean);
     installed_data_directory(&paths);
+    let record = Prior {
+        store: STORE_VERSION,
+        // Disabled: a start value that the removal would put back.
+        appid_start_type: 4,
+        appid_running: false,
+        policy_xml: concat!(
+            r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="Enabled">"#,
+            r#"<FilePathRule Id="b6a4f9d2-3a43-4d0e-9a3c-5f1f0e7a1c10" Name="earlier" Description="" "#,
+            r#"UserOrGroupSid="S-1-1-0" Action="Allow"><Conditions><FilePathCondition Path="*"/>"#,
+            r#"</Conditions></FilePathRule></RuleCollection></AppLockerPolicy>"#
+        )
+        .to_owned(),
+    };
     let prior = paths.prior.clone();
+    clean.hook();
     install::testing::after_the_removal_inspects_the_data_directory(move || {
-        std::fs::write(&prior, b"{}").unwrap();
+        assert!(record.write_once(&prior).unwrap());
     });
     let text = install::remove(&paths, false)
         .expect_err("what appeared was not inspected")
@@ -555,6 +631,9 @@ fn a_prior_record_made_after_the_inspection_is_left_and_named() {
         )),
         "{text}"
     );
+    // Neither the baseline nor the start value was used: the residue check did not run on it.
+    assert!(!text.contains("the earlier state is not back"), "{text}");
+    assert!(!text.contains("checking the earlier state"), "{text}");
     assert!(paths.prior.exists(), "what appeared stays");
     assert!(paths.manifest.exists(), "the manifest stays with it");
 }
