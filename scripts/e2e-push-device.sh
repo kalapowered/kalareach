@@ -24,8 +24,9 @@
 #               for a question; the host's text reaches neither the provider's message nor the
 #               screen. A message it was not waiting for is not answered. On the simulator the
 #               first tapped banner is tapped with the application in the background and the
-#               second with its process ended, and each opens the page on its Attention screen.
-#   does not a real Firebase or APNs delivery, a real registration token, background limits of a
+#               second with its process ended, so the tap starts a new one; each opens the
+#               page on its Attention screen.
+#   does not    a real Firebase or APNs delivery, a real registration token, background limits of a
 #               phone, the notification service extension on a device, or a force-quit
 #               application. A staging run with the staging sender credentials, or the person's
 #               own phone, adds those.
@@ -396,10 +397,16 @@ else:
 say("the application was on its Hosts screen when the notification was tapped, and the tap opened it on its Attention screen (09.21)",
     left_on_hosts and "PUSH-TAPPED" in tapped and "Attention" in tapped, tapped[:200].replace("\n", " "))
 if platform == "ios":
+    import re
     cold = read("tapped-cold.txt")
-    heard = read("application.log").count("(Foundation) KalaReach: a tap on a notification was heard")
-    say("the application heard both taps, the second with its process ended, and then stood in front on its Attention screen (09.21)",
-        heard >= 2 and "foreground=true" in cold and "Attention" in cold, f"taps heard {heard}; {cold[:160]}".replace("\n", " "))
+    ended = read("cold-ended.txt").strip() == "yes"
+    before = read("cold-pid-before.txt").strip()
+    after = read("cold-pid-after.txt").strip()
+    heard_by = set(re.findall(r"KalaReach\[(\d+):\w+\] \(Foundation\) KalaReach: a tap on a notification was heard", read("application.log")))
+    say("the process that took the first tap ended before the second banner, and a new process heard the second tap and stood in front on its Attention screen (09.21)",
+        ended and before != "" and after != "" and before != after and after in heard_by and len(heard_by) >= 2
+        and "foreground=true" in cold and "Attention" in cold,
+        f"ended {ended}, process {before} -> {after}, taps heard by {sorted(heard_by)}; {cold[:120]}".replace("\n", " "))
 say("the person answered Yes from there, and the worker's ledger holds that answer as this paired device's (09.21)",
     report.get("question_answered_from_the_notification") is True and report.get("answer_is_the_paired_devices") is True
     and report.get("answer_is_yes") is True)
@@ -743,6 +750,12 @@ run_android() {
 # taps. The application is sent to the background before the first delivery, so that the banner is
 # the system's and the process is suspended.
 # Says where the application is to be, and waits until the test that drives it has put it there.
+# The process identifier of the application on the simulator, when it runs.
+app_pid() { # <udid>
+    xcrun simctl spawn "$1" launchctl list 2>/dev/null \
+        | awk -v id="UIKitApplication:$app_id[" 'index($3, id) == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
+}
+
 want_ios() { # foreground|background
     # The place is written before `is` is taken away, since the test serves a place when it finds `is`
     # gone, and must then read this one and not the last.
@@ -816,7 +829,17 @@ pump_ios() { # <udid>
             # The second tap is the one that starts the application: the process is ended first, so the
             # tap is a cold start and not a return to a process that was kept.
             if [ "$deliveries" -eq 2 ]; then
+                app_pid "$udid" >"$harness/cold-pid-before-$n"
                 xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
+                cold_gone=no
+                cold_tries=0
+                while [ "$cold_tries" -lt 20 ]; do
+                    if [ -z "$(app_pid "$udid")" ]; then cold_gone=yes; break; fi
+                    sleep 1
+                    cold_tries=$((cold_tries + 1))
+                done
+                echo "$cold_gone" >"$harness/cold-ended-$n"
+                xcrun simctl spawn "$udid" launchctl list 2>/dev/null | grep -F "$app_id" >"$harness/cold-labels-$n"
                 : >"$harness/cold-$n"
             fi
             python3 "$here/scripts/lib/push-inject.py" banner "$file" >"$harness/banner-expect-$n.txt"
@@ -844,7 +867,13 @@ pump_ios() { # <udid>
                     [ "$waited" -lt 150 ] || break
                 done
                 cp "$harness/tapped-$n" "$artefacts/tapped-$n.txt" 2>/dev/null
-                [ -e "$harness/cold-$n" ] && cp "$harness/tapped-$n" "$artefacts/tapped-cold.txt" 2>/dev/null
+                if [ -e "$harness/cold-$n" ]; then
+                    cp "$harness/tapped-$n" "$artefacts/tapped-cold.txt" 2>/dev/null
+                    cp "$harness/cold-ended-$n" "$artefacts/cold-ended.txt" 2>/dev/null
+                    cp "$harness/cold-pid-before-$n" "$artefacts/cold-pid-before.txt" 2>/dev/null
+                    cp "$harness/cold-labels-$n" "$artefacts/cold-labels.txt" 2>/dev/null
+                    app_pid "$udid" >"$artefacts/cold-pid-after.txt"
+                fi
                 want_ios foreground && place=foreground
             fi
             say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> banner: $(head -c 200 "$harness/banner-$n.txt" 2>/dev/null)"

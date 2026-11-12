@@ -244,17 +244,16 @@ final class PushDeviceTests: DeviceTestCase {
             exists("tap-\(n)")
         else { return }
         banner.tap()
-        var opened = app.wait(for: .runningForeground, timeout: 30)
-        if !opened {
-            // The tap may have started a process this test did not: it is attached to by activating it.
-            app.activate()
-            opened = app.wait(for: .runningForeground, timeout: 30)
-        }
+        // The application is looked at through a proxy made after the tap: a tap on a banner can start
+        // a process that this test did not, and the deadline is not extended by bringing it forward.
+        let front = XCUIApplication(bundleIdentifier: applicationIdentifier)
+        let opened = front.wait(for: .runningForeground, timeout: 30)
+        XCTAssertTrue(opened, "the tap did not bring the application to the front")
         // A page that has just been started has no text yet, and is read once it has some.
-        _ = app.staticTexts.firstMatch.waitForExistence(timeout: 30)
+        _ = front.staticTexts.firstMatch.waitForExistence(timeout: 30)
         // What the page shows once the application is in front: the attention screen shows the
         // question, which the banner never did.
-        let shown = app.staticTexts.allElementsBoundByIndex.prefix(60).map { $0.label }.joined(separator: " | ")
+        let shown = front.staticTexts.allElementsBoundByIndex.prefix(60).map { $0.label }.joined(separator: " | ")
         screenshot("tapped-\(n)")
         write("tapped-\(n)", "foreground=\(opened) shows=\(shown)")
     }
