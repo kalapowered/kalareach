@@ -939,3 +939,134 @@ async fn the_terminal_ends_with_a_status_on_a_frame_the_server_would_not_write()
         let _ = std::fs::remove_dir_all(&directory);
     }
 }
+
+/// A server with the handshake done and one thread started, which has had its first turn: the
+/// reader and the writer of its frames.
+async fn server_with_a_thread(
+    home: Option<&std::path::Path>,
+) -> (
+    Child,
+    ChildStdin,
+    tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    let mut server = Command::new(PROGRAM);
+    server
+        .args(["app-server", "--listen", "stdio://"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(home) = home {
+        server.env("CODEX_HOME", home);
+    }
+    let mut child = server.spawn().expect("the server starts");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    write(&mut stdin, &initialize()).await;
+    assert_eq!(next(&mut lines).await["id"], "initialize");
+    assert_eq!(
+        next(&mut lines).await["method"],
+        "remoteControl/status/changed"
+    );
+    write(&mut stdin, &json!({"method":"initialized"})).await;
+    write(
+        &mut stdin,
+        &json!({"id":2,"method":"thread/start","params":{}}),
+    )
+    .await;
+    assert!(next(&mut lines).await["result"]["thread"]["id"].is_string());
+    assert_eq!(next(&mut lines).await["method"], "thread/started");
+    // The terminal's own turn, which asks for an approval of no command and is answered.
+    write(&mut stdin, &turn_request("thread-1")).await;
+    let mut completed = false;
+    while !completed {
+        let frame = next(&mut lines).await;
+        match frame["method"].as_str() {
+            Some("item/commandExecution/requestApproval") => {
+                assert!(frame["params"].get("command").is_none(), "{frame}");
+                write(
+                    &mut stdin,
+                    &json!({"id":frame["id"],"result":{"decision":"accept"}}),
+                )
+                .await;
+            }
+            Some("turn/completed") => completed = true,
+            _ => {}
+        }
+    }
+    (child, stdin, lines)
+}
+
+/// A turn whose input asks to run a command asks for the approval of that command, which is shown
+/// in the request. The command runs once, and the turn stays open until it ends, when the answer
+/// allows it; a command whose approval is declined does not run, and the turn ends.
+#[tokio::test]
+async fn the_server_runs_the_command_a_turn_asks_for_once_and_only_where_it_is_allowed() {
+    let directory = std::env::temp_dir().join(format!("kr-si-command-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let (_server, mut stdin, mut lines) = server_with_a_thread(None).await;
+    for (decision, number) in [("decline", 4_u64), ("accept", 5)] {
+        let output = directory.join(decision);
+        let command = format!("echo ran >> {}", output.display());
+        write(
+            &mut stdin,
+            &turn_asking(
+                number,
+                "thread-1",
+                &format!("(m) Use your shell tool to run exactly this command and nothing else: {command}"),
+            ),
+        )
+        .await;
+        let asked = loop {
+            let frame = next(&mut lines).await;
+            if frame["method"] == "item/commandExecution/requestApproval" {
+                break frame;
+            }
+        };
+        assert_eq!(asked["params"]["command"], command.as_str());
+        assert!(!output.exists(), "the command runs only once it is allowed");
+        write(
+            &mut stdin,
+            &json!({"id":asked["id"],"result":{"decision":decision}}),
+        )
+        .await;
+        loop {
+            let frame = next(&mut lines).await;
+            if frame["method"] == "turn/completed" {
+                break;
+            }
+        }
+        // The turn ended after the command did: what it wrote is there, once.
+        let written = std::fs::read_to_string(&output).unwrap_or_default();
+        assert_eq!(written, if decision == "accept" { "ran\n" } else { "" });
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A thread whose record the agent's folder holds is resumed by a server that did not make it, as
+/// the pinned release resumes a conversation from its files; one with no record is not found.
+#[tokio::test]
+async fn a_server_resumes_a_thread_the_agents_record_holds_and_no_other() {
+    let directory = std::env::temp_dir().join(format!("kr-si-saved-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let day = directory.join("sessions/2026/11/12");
+    std::fs::create_dir_all(&day).expect("a directory");
+    std::fs::write(day.join("rollout-thread-7.jsonl"), "{}\n").expect("a record");
+    let (_server, mut stdin, mut lines) = server_with_a_thread(Some(&directory)).await;
+    write(
+        &mut stdin,
+        &json!({"id":"r1","method":"thread/resume","params":{"threadId":"thread-7"}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["thread"]["id"], "thread-7");
+    write(
+        &mut stdin,
+        &json!({"id":"r2","method":"thread/resume","params":{"threadId":"thread-9"}}),
+    )
+    .await;
+    let refused = next(&mut lines).await;
+    assert_eq!(refused["id"], "r2");
+    assert!(refused.get("error").is_some(), "{refused}");
+    let _ = std::fs::remove_dir_all(&directory);
+}
