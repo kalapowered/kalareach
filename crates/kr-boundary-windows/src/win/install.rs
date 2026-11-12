@@ -2987,14 +2987,29 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
             "the broker's service is not running".to_owned(),
         ));
     }
-    let mut connection = pipe::connect(pipe::Kind::Administrators, status.pid)?;
+    // The process is held from here until the pipe's server is compared with it, so that its number
+    // cannot be given to another process in between. It is the service's own process only if the
+    // service still runs under that number now that it is held.
+    let held = pipe::ServerProcess::open(status.pid)?;
+    let again = service.status()?;
+    if !again.running() || again.pid != status.pid {
+        return Err(Error::Failed(
+            "the broker's service changed while the installer connected to it".to_owned(),
+        ));
+    }
+    let mut connection = pipe::connect_held(pipe::Kind::Administrators, &held)?;
     connection.set_deadline(Some(Instant::now() + HELLO_BOUND));
     let said = ask(
         &mut connection,
         &Request::Hello {
             version: frame::VERSION,
         },
-    )?;
+    )
+    .map_err(|failure| {
+        Error::Failed(format!(
+            "{failure}. Other elevated sessions may hold the administrators' pipe."
+        ))
+    })?;
     match said {
         Response::Hello { .. } => {
             // The caller sets the deadline of what it asks next.
