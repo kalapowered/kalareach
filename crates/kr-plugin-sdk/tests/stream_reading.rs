@@ -461,6 +461,22 @@ fn kr_req_12_06_the_conditions_of_a_hidden_request_are_checked_when_the_table_is
     )]);
     refused(&crowded, "lists 9 values");
 
+    // A place is read in the request's parameters: one in the reply never matches a request, and a
+    // condition on the request's own method would hide every request of the route.
+    let in_reply = with(vec![condition(
+        &["result", "thread", "ephemeral"],
+        vec![ConditionValue::Boolean(true)],
+    )]);
+    refused(
+        &in_reply,
+        "not inside the table's params member of the request",
+    );
+    let on_method = with(vec![condition(&["method"], vec![text("thread/start")])]);
+    refused(
+        &on_method,
+        "not inside the table's params member of the request",
+    );
+
     let nowhere = with(vec![condition(&[], vec![text("system")])]);
     refused(&nowhere, "a field path with 0 segments");
 

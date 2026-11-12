@@ -24,10 +24,20 @@ place may hold. A request that meets every condition starts a thread that the te
 so the host does not take the thread its reply names as the one the terminal is in. A route with no
 `hidden_when`, or an empty one, means what it meant before. A package whose table states the member
 declares `"sdk_range": ">=0.1.7, <0.2.0"`, and the package check refuses a table that carries the
-member under a range that admits an earlier SDK version. It also refuses a table whose route states
-more than eight conditions, whose condition names a place of no segment or of more than eight, or
-whose condition lists no value or more than eight, with a finding of its own: such a table is never
-read as one that states no condition.
+member under a range that admits an earlier SDK version. A condition's place begins with the
+table's `params` member, since the host reads it in the request's parameters. The package check
+also refuses a table whose route states more than eight conditions, whose condition names a place
+of no segment, of more than eight, or outside `params` (a place in the reply, or the request's
+`method`), or whose condition lists no value or more than eight, with a finding of its own: such a
+table is never read as one that states no condition. Those three bounds, eight conditions, eight
+segments and eight values, do not change within SDK 0.1.x. A request of a route that states
+conditions whose `params` is not an object is neither hidden nor a selection: the host does not
+take the thread its reply names, and what the terminal is in stays unknown until a later selection
+that it can read is answered.
+
+Independent of `hidden_when`, the host no longer holds rich work back while the terminal's request
+to leave a conversation other than the bound one is in flight, and no longer holds it when such a
+request is lost. That applies to every table, a table with no conditions included.
 
 A host tests a package's `sdk_range` before it reads the package's connector table or presentation,
 and refuses a package whose range excludes its SDK version with that finding alone. A host built
