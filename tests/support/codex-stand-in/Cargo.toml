@@ -19,8 +19,9 @@ http.workspace = true
 # publishes, so a gateway that makes a frame the pinned release would not write is caught at
 # either end.
 jsonschema.workspace = true
-# The server starts its commands in a session of its own, and ends all of one's processes at once.
-rustix = { workspace = true, features = ["fs", "process"] }
+# The server starts its commands in a session of its own, and ends all of one's processes at once;
+# the terminal reads a person's keys one at a time where its input is a terminal.
+rustix = { workspace = true, features = ["fs", "process", "termios"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "net", "process", "signal"] }
 tokio-websockets.workspace = true
