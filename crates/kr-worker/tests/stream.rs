@@ -2653,3 +2653,155 @@ async fn kr_req_12_04_what_the_stream_says_of_the_conversation_and_the_turn_is_r
         ]
     );
 }
+
+/// What a real 0.155.1 terminal and server exchanged, recorded offline: the terminal's start, the
+/// question typed at it (the first recording) or sent as the host sends a device's prompt (the
+/// second), and the thread the terminal starts for its own purposes, the title of the conversation,
+/// with its turn and its leave. Each frame is its direction, its kind, its method, its identifier,
+/// and the marks the reader's cases need: the thread and turn it names (labelled in order of
+/// appearance) and the members that say what a thread is for. No prompt or reply text is in them.
+const TYPED_RECORDING: &str = include_str!("fixtures/terminal-title-thread-typed.json");
+const DEVICE_RECORDING: &str = include_str!("fixtures/terminal-title-thread-device.json");
+
+/// Replays one recording through the connection owner and checks, after each frame, that the
+/// binding stays the conversation's own thread and turn.
+async fn replay_recording(recording: &str) {
+    let facts: Vec<serde_json::Value> = serde_json::from_str(recording).expect("a recording");
+    let world = World::new(1 << 24);
+    let mut open: std::collections::BTreeMap<String, UpstreamRequestId> = Default::default();
+    let mark = |fact: &serde_json::Value, name: &str| -> Option<String> {
+        fact["marks"].as_array().and_then(|marks| {
+            marks.iter().filter_map(|m| m.as_str()).find_map(|m| {
+                m.strip_prefix(&format!("{name}="))
+                    .map(|value| value.trim_matches('"').to_owned())
+            })
+        })
+    };
+    let thread_of = |label: &str| format!("thread-{}", &label[1..]);
+    let turn_of = |label: &str| format!("turn-{}", &label[1..]);
+    // What the binding says once the conversation's own thread is selected, and the turn it runs.
+    let mut conversation: Option<(String, u64)> = None;
+    let mut running: Option<String> = None;
+    let mut leave_seen = false;
+    for fact in &facts {
+        let (direction, kind, method) = (
+            fact["direction"].as_str().expect("a direction"),
+            fact["kind"].as_str().expect("a kind"),
+            fact["method"].as_str().expect("a method"),
+        );
+        let id = fact["id"].as_str().unwrap_or("").to_owned();
+        let at = format!("{direction} {kind} {method} {id}");
+        match (direction, kind, method) {
+            ("C>S", "request", "thread/start") => {
+                let params = format!(
+                    r#"{{"ephemeral":{},"threadSource":"{}"}}"#,
+                    mark(fact, "ephemeral").expect("a mark"),
+                    mark(fact, "threadSource").expect("a mark")
+                );
+                let asked = world
+                    .terminal_asks(&format!(
+                        r#"{{"id":"{id}","method":"thread/start","params":{params}}}"#
+                    ))
+                    .await;
+                open.insert(id, asked);
+            }
+            ("S>C", "reply", "thread/start") => {
+                let thread = thread_of(&mark(fact, "thread").expect("a thread"));
+                let rest = format!(
+                    r#""result":{{"thread":{{"id":"{thread}","ephemeral":{},"threadSource":"{}"}}}}"#,
+                    mark(fact, "ephemeral").expect("a mark"),
+                    mark(fact, "threadSource").expect("a mark")
+                );
+                world
+                    .server_answers(&open.remove(&id).expect("a request"), &rest)
+                    .await;
+                if conversation.is_none() {
+                    conversation = Some((thread, world.revision()));
+                }
+            }
+            ("S>C", "notification", "turn/started") => {
+                let (thread, turn) = (
+                    thread_of(&mark(fact, "thread").expect("a thread")),
+                    turn_of(&mark(fact, "turn").expect("a turn")),
+                );
+                world
+                    .server_says(&turn_event("turn/started", &thread, &turn))
+                    .await;
+                if Some(&thread) == conversation.as_ref().map(|(own, _)| own) {
+                    running = Some(turn);
+                }
+            }
+            ("C>S", "request", "turn/start") => {
+                let thread = thread_of(&mark(fact, "thread").expect("a thread"));
+                let asked = world
+                    .terminal_asks(&format!(
+                        r#"{{"id":"{id}","method":"turn/start","params":{{"threadId":"{thread}","input":[]}}}}"#
+                    ))
+                    .await;
+                open.insert(id, asked);
+            }
+            ("S>C", "reply", "turn/start") => {
+                let turn = turn_of(&mark(fact, "turn").expect("a turn"));
+                let rest = format!(r#""result":{{"turn":{{"id":"{turn}"}}}}"#);
+                world
+                    .server_answers(&open.remove(&id).expect("a request"), &rest)
+                    .await;
+            }
+            ("C>S", "request", "thread/unsubscribe") => {
+                if !leave_seen {
+                    // The offline model never answers, so the recording has no end of the title
+                    // thread's turn; the real flow ends it before the leave.
+                    world
+                        .server_says(&turn_event("turn/completed", "thread-2", "turn-2"))
+                        .await;
+                    leave_seen = true;
+                }
+                let thread = thread_of(&mark(fact, "thread").expect("a thread"));
+                let asked = world
+                    .terminal_asks(&format!(
+                        r#"{{"id":"{id}","method":"thread/unsubscribe","params":{{"threadId":"{thread}"}}}}"#
+                    ))
+                    .await;
+                open.insert(id, asked);
+            }
+            ("S>C", "reply", "thread/unsubscribe") => {
+                world
+                    .server_answers(
+                        &open.remove(&id).expect("a request"),
+                        r#""result":{"status":"unsubscribed"}"#,
+                    )
+                    .await;
+            }
+            _ => continue,
+        }
+        // From the conversation's first reply on, whatever the terminal starts for its own
+        // purposes, the binding names the conversation's thread at its revision, with the turn the
+        // conversation is running, and rich work is not suspended.
+        if let Some((thread, revision)) = &conversation {
+            assert_eq!(world.thread().as_ref(), Some(thread), "after {at}");
+            assert_eq!(world.revision(), *revision, "after {at}");
+            assert_eq!(world.turn(), running, "after {at}");
+            assert_eq!(world.waiting(), None, "after {at}");
+        }
+    }
+    assert!(
+        conversation.is_some(),
+        "the recording selects a conversation"
+    );
+}
+
+/// KR-REQ-12.06: a thread the terminal starts for its own purposes (the real terminal asks for the
+/// title of a conversation in one, ephemeral and sourced from the system) is not the conversation
+/// the terminal is in: the binding keeps the conversation's thread, its revision and its turn
+/// through that thread's start, its turn and its leave, whether the prompt was typed at the
+/// terminal or sent by a device.
+///
+/// Known red at the base of this case: the reader takes the helper's thread as the conversation and
+/// its leave ends it, so the binding is none and suspended with the unread-thread reason. The case
+/// is the cure's own and turns green with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "known red until the reader skips a thread the terminal starts for its own purposes"]
+async fn kr_req_12_06_a_thread_the_terminal_starts_for_its_own_purposes_is_not_the_conversation() {
+    replay_recording(TYPED_RECORDING).await;
+    replay_recording(DEVICE_RECORDING).await;
+}
