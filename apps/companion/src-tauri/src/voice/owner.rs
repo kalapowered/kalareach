@@ -312,9 +312,11 @@ enum Probe {
     Back(Arc<Session>),
     /// The host answered with a refusal.
     Refused(String),
-    /// The host has no room for another connection from this computer, or this computer holds as
-    /// many as it keeps: the reason, in words. It is not out of contact, and not back.
-    Full(String),
+    /// The connection was not opened for a reason that is no loss of contact: the host has no room
+    /// for another connection from this computer, this computer holds as many as it keeps, or the
+    /// host or this device refused the connection or a request on it. The reason, in words. It is
+    /// not out of contact, and not back.
+    NotOpened(String),
     /// The host could not be reached yet.
     Unreached,
 }
@@ -1861,9 +1863,9 @@ impl Owner {
                             Some(Instant::now() + self.shared.timings.tick * PROBE_PAUSE_TICKS);
                         self.view(|state| state.meet(ProblemKind::HostPath, problem));
                     }
-                    // The host is in contact and would not take this connection for want of room:
+                    // The connection was not opened, and the host is not known to be out of contact:
                     // the probe asks again after a pause.
-                    Probe::Full(words) => {
+                    Probe::NotOpened(words) => {
                         let problem = format!(
                             "{words} So it is not known whether the host still has the call."
                         );
@@ -2871,7 +2873,9 @@ pub(super) async fn stop_at_host(
 /// What a person is told when a connection to the host was not opened to stop the call, by the
 /// cause: a host that did not answer is not reached, a host that has no room for this computer's
 /// connection, or a computer that holds as many as it keeps, says so, and a refusal is the host's
-/// own word.
+/// own word, naming the request it refused. A refusal of the connection itself asked the host
+/// nothing: this device may have been unable to give it the lease it needs, so the words say that
+/// the connection was not opened and not that the host refused it.
 fn not_reached_words(unopened: &Unopened) -> String {
     match unopened {
         Unopened::Unreached(error) => format!("The host could not be reached: {}", error.message),
@@ -2881,9 +2885,22 @@ fn not_reached_words(unopened: &Unopened) -> String {
         Unopened::BudgetFull => "This computer already holds as many connections to this host as \
                                  it keeps at once."
             .to_owned(),
-        Unopened::Refused(_, error) => {
-            format!("The host refused the connection: {}", error.message)
-        }
+        Unopened::Refused(asked, error) => match asked.request() {
+            Some(request) => format!("The host refused to {request}: {}", error.message),
+            None => format!(
+                "The connection to the host was not opened: {}",
+                error.message
+            ),
+        },
+    }
+}
+
+/// What a probe whose connection was not opened came to: a host that was not reached is not told,
+/// and any other cause says why, since the host answered or was not asked.
+fn probe_when_not_opened(unopened: &Unopened) -> Probe {
+    match unopened {
+        Unopened::Unreached(_) => Probe::Unreached,
+        other => Probe::NotOpened(not_reached_words(other)),
     }
 }
 
@@ -2899,10 +2916,8 @@ async fn probe_host(
 ) -> Probe {
     let session = match tokio::time::timeout(within, reach.session_to(&host.paired, None)).await {
         Ok(Ok(session)) => session,
-        Ok(Err(unopened @ (Unopened::HostFull | Unopened::BudgetFull))) => {
-            return Probe::Full(not_reached_words(&unopened));
-        }
-        _ => return Probe::Unreached,
+        Ok(Err(unopened)) => return probe_when_not_opened(&unopened),
+        Err(_) => return Probe::Unreached,
     };
     let Some(session_id) = descriptor.session_ids.iter().next().copied() else {
         return Probe::Back(session);
@@ -2921,7 +2936,7 @@ async fn probe_host(
     {
         Ok(Ok(_)) => Probe::Back(session),
         Ok(Err(error)) => match Unopened::of_connection(&session, &error) {
-            Some(unopened @ Unopened::HostFull) => Probe::Full(not_reached_words(&unopened)),
+            Some(unopened @ Unopened::HostFull) => probe_when_not_opened(&unopened),
             _ => match error {
                 ClientError::Host(error) => Probe::Refused(error.message),
                 _ => Probe::Unreached,
@@ -2947,6 +2962,50 @@ mod tests {
             let words = not_reached_words(&full);
             assert!(!words.contains("could not be reached"), "{words}");
             assert!(words.contains("connection"), "{words}");
+        }
+    }
+
+    /// KR-REQ-19.08: a refusal names the request the host refused, and a refusal of the connection
+    /// itself, which asked the host nothing and may be this device's own failure to give it the
+    /// lease it needs, is not told as the host refusing.
+    #[test]
+    fn a_refusal_names_the_request_and_a_connection_not_opened_is_not_called_a_refusal() {
+        use crate::connection::Asked;
+
+        let refused = |asked| {
+            not_reached_words(&Unopened::Refused(
+                asked,
+                CommandError::unavailable("its words"),
+            ))
+        };
+        let connection = refused(Asked::Connection);
+        assert!(connection.contains("its words"), "{connection}");
+        assert!(!connection.contains("refused"), "{connection}");
+        let request = refused(Asked::HostInfo);
+        assert!(request.contains("its words"), "{request}");
+        assert!(request.contains("refused to say who it is"), "{request}");
+    }
+
+    /// KR-REQ-19.08: a probe whose connection was not opened tells why for every cause but a host
+    /// that was not reached: a refusal is not told as unreached.
+    #[test]
+    fn a_probe_that_was_refused_is_not_unreached() {
+        use crate::connection::Asked;
+
+        assert!(matches!(
+            probe_when_not_opened(&Unopened::Unreached(CommandError::unavailable("gone"))),
+            Probe::Unreached
+        ));
+        for unopened in [
+            Unopened::HostFull,
+            Unopened::BudgetFull,
+            Unopened::Refused(Asked::HostInfo, CommandError::unavailable("no")),
+            Unopened::Refused(Asked::Connection, CommandError::unavailable("no")),
+        ] {
+            assert!(
+                matches!(probe_when_not_opened(&unopened), Probe::NotOpened(_)),
+                "{unopened:?}"
+            );
         }
     }
     use std::collections::BTreeMap;
