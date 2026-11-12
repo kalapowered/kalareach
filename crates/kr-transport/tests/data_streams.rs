@@ -499,21 +499,22 @@ async fn try_write_header(
     send.write_all(&encoded[..sent]).await
 }
 
-/// Writes a header to a host that takes the stream, so every write of it is taken.
+/// Writes a header that the host reads before it can refuse or reset the stream, so every write of
+/// it must be taken.
 async fn write_header(send: &mut SendStream, header: &StreamHeader, bytes: Option<usize>) {
     try_write_header(send, header, bytes)
         .await
-        .expect("the host took the header's writes");
+        .expect("the header's writes complete");
 }
 
 /// Writes a whole header to a host that resets the stream without reading it, as a host whose
 /// receiver is gone does when the stream is accepted.
 ///
 /// The host's reset stops the half the device writes with the revoked code as well as ending the
-/// half it reads, and the length that announces the stream is enough to start it. The stop can
-/// reach the device before the header's bytes are written, so a write that finds the stream
-/// stopped with that code is the host's reset arriving early, and the case goes on to read it. A
-/// write that ends any other way fails the case.
+/// half it reads, and the length that announces the stream is enough for the host to reset it. The
+/// stop can reach the device before the header's bytes are written, so a write that finds the
+/// stream stopped with that code is the host's reset arriving early, and the case goes on to read
+/// it. A write that fails in any other way fails the case.
 async fn write_header_to_a_host_that_resets(send: &mut SendStream, header: &StreamHeader) {
     match try_write_header(send, header, None).await {
         Ok(()) => {}
