@@ -178,16 +178,14 @@ struct Waiters {
 }
 
 impl std::fmt::Debug for Waiters {
-    /// The refusal's code and no more: its words arrived from the host and are not printed.
+    /// Whether the host refused the connection, and no more: its words arrived from the host and
+    /// are not printed.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Waiters")
             .field("pending", &self.pending.len())
             .field("ended", &self.ended)
-            .field(
-                "refused_with",
-                &self.refusal.as_ref().map(|refusal| refusal.code),
-            )
+            .field("refused", &self.refusal.is_some())
             .finish()
     }
 }
