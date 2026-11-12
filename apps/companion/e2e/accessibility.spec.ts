@@ -8,7 +8,7 @@
 
 import { Buffer } from 'node:buffer'
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type CDPSession, type Page } from '@playwright/test'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -145,237 +145,6 @@ test.describe('the attachment controls', () => {
   })
 })
 
-/** What a finger meets, in CSS pixels: 44 points on iOS and 48 dp on Android. */
-const FINGER = { ios: 44, android: 48 } as const
-
-interface Box {
-  readonly left: number
-  readonly top: number
-  readonly width: number
-  readonly height: number
-}
-
-interface LinkReading {
-  readonly label: string
-  /** The size of the link's box where a finger can press it: what the pane and the screen leave of it. */
-  readonly width: number
-  readonly height: number
-  /** How far the words after the link moved because of its reach, and the most the room it has lets them move. */
-  readonly moved: number
-  readonly mostMoved: number
-  /** How far the link's own words and the words before it moved sideways because of its reach. */
-  readonly wordsMoved: number
-  readonly beforeMoved: number
-}
-
-interface LinksReading {
-  /** What moved up or down when the links' reach was taken away: the same page without it is the control. */
-  readonly shifted: readonly string[]
-  readonly links: readonly LinkReading[]
-  /** How far the box of the link on the conversation's last line lies below the pane at its end. */
-  readonly cut: number
-  /** The pane and what holds it, when they scroll or clip sideways and have more than they show. */
-  readonly overflowing: readonly string[]
-}
-
-// KR-REQ-13.19: a link inside a message is a button that is one line tall, and the box that a finger,
-// TalkBack and VoiceOver find for it is the size the platform asks for all the same. The box is read
-// from the page, which is what the platforms' trees are built from, and cut to what the pane and the
-// screen show of it. Taking the reach away shows nothing moves up or down. Sideways, the words around
-// a link move only by what the room beside the link cannot give it: a label as wide as the box needs
-// moves nothing, and a narrower one moves the words after it by the difference and no more, whether
-// it is one character, four narrow ones or one in bold. What is not held, and is not asserted: a line
-// with less room than that difference to spare breaks one word earlier.
-// A link at the start of a line, at its end and alone on a line shows the box is whole at the pane's
-// edges and the conversation does not scroll sideways for it, and a link on the last line shows the
-// pane holds its box at the end. Which link a press at a point belongs to is the next case's.
-test.describe('a link inside a message', () => {
-  for (const surface of ['ios', 'android'] as const) {
-    test(`is a full touch target on ${surface} and moves the words after it only as far as a narrow label needs`, async ({ page }) => {
-      await openSession(page, surface)
-      await page.getByRole('button', { name: 'the reconnect notes' }).scrollIntoViewIfNeeded()
-      const reading = await page.evaluate((finger: number): LinksReading | null => {
-        const originals = Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link'))
-        const first = originals[0]
-        const paragraph = first?.parentElement
-        const pane = document.querySelector<HTMLElement>('.m-pane')
-        const main = document.querySelector<HTMLElement>('.m-main')
-        const nodes = Array.from(document.querySelectorAll<HTMLElement>('.m-node'))
-        const lastNode = nodes[nodes.length - 1]
-        if (!first || !paragraph || !pane || !main || !lastNode) return null
-
-        const wordsOf = (link: HTMLElement): Range => {
-          const range = document.createRange()
-          range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
-          return range
-        }
-        const afterOf = (link: HTMLElement): Range | null => {
-          const next = link.nextSibling
-          if (!next || next.nodeType !== Node.TEXT_NODE || (next.textContent ?? '').length < 1) return null
-          const range = document.createRange()
-          range.setStart(next, 0)
-          range.setEnd(next, 1)
-          return range
-        }
-        const beforeOf = (link: HTMLElement): Range | null => {
-          const previous = link.previousSibling
-          const length = (previous?.textContent ?? '').length
-          if (!previous || previous.nodeType !== Node.TEXT_NODE || length < 1) return null
-          const range = document.createRange()
-          range.setStart(previous, length - 1)
-          range.setEnd(previous, length)
-          return range
-        }
-        const boxOf = (box: DOMRect): Box => ({ left: box.left, top: box.top, width: box.width, height: box.height })
-
-        // More links of the kinds a message can carry, each a copy of the first with other words: on
-        // the next line, beside another with one space between, a single character, one in plain
-        // lines, one as long as the line, one that ends the conversation, a single character at the
-        // start of a line, at its end and alone on a line, one character drawn in bold, four narrow
-        // characters, and two one directly under the other.
-        const another = (text: string, bold = false): HTMLElement => {
-          const link = first.cloneNode(true) as HTMLElement
-          const label = link.querySelector('.md-link-label') ?? link
-          if (bold) {
-            // As `[**1**](...)` is drawn: the words are one character in an element of their own.
-            const strong = document.createElement('strong')
-            strong.textContent = text
-            label.replaceChildren(strong)
-          } else {
-            label.textContent = text
-          }
-          return link
-        }
-        const row = (align: 'left' | 'right', ...parts: (string | HTMLElement)[]): HTMLElement => {
-          const line = document.createElement('p')
-          line.style.textAlign = align
-          line.append(...parts)
-          return line
-        }
-        const second = another('a second link')
-        const third = another('1')
-        const framedLink = another('a link in plain text')
-        const wide = another('a link whose words run the whole width of the line and on to the next ')
-        const closing = another('the last link')
-        const atStart = another('1')
-        const atEnd = another('1')
-        const aloneAtStart = another('1')
-        const aloneAtEnd = another('1')
-        const formatted = another('1', true)
-        const narrow = another('iiii')
-        const pairAbove = another('the first of two links')
-        const pairBelow = another('the second of two links')
-        paragraph.append(document.createElement('br'), second, ' ', third, ', and plain words after it.')
-        const framed = row(
-          'left',
-          'A plain line above the link.',
-          document.createElement('br'),
-          framedLink,
-          ', and plain words after it on the same line.',
-          document.createElement('br'),
-          'A plain line under the link.'
-        )
-        const edges = [
-          row('left', atStart, ', then plain words after the link at the start of the line.'),
-          row('right', 'Plain words before the link at the end of the line, ', atEnd),
-          row('left', aloneAtStart),
-          row('right', aloneAtEnd),
-          row('left', formatted, ', formatted words after a link of one character.'),
-          row('left', narrow, ', four narrow characters after a link.')
-        ]
-        const pair = row('left', pairAbove, document.createElement('br'), pairBelow)
-        const longer = row('left', wide)
-        const ending = row('left', 'The last line of the conversation ends in ', closing)
-        paragraph.after(framed, ...edges, pair, longer)
-        lastNode.append(ending)
-        const links = [...originals, second, third, framedLink, atStart, atEnd, aloneAtStart, aloneAtEnd, formatted, narrow, pairAbove, pairBelow, wide, closing]
-
-        // The control: the same page with the links' reach taken away.
-        const gutter = parseFloat(getComputedStyle(main).paddingLeft)
-        const places = (): Record<string, Box> => {
-          pane.scrollTop = 0
-          const boxes: Record<string, Box> = {
-            'the first lines': boxOf(paragraph.getBoundingClientRect()),
-            'the plain lines': boxOf(framed.getBoundingClientRect()),
-            'the long line': boxOf(longer.getBoundingClientRect()),
-            'the last message': boxOf(lastNode.getBoundingClientRect())
-          }
-          links.forEach((link, index) => {
-            const name = `"${link.textContent ?? ''}" (${String(index + 1)})`
-            boxes[`the words of ${name}`] = boxOf(wordsOf(link).getBoundingClientRect())
-            const after = afterOf(link)
-            if (after) boxes[`what follows ${name}`] = boxOf(after.getBoundingClientRect())
-            const ahead = beforeOf(link)
-            if (ahead) boxes[`what precedes ${name}`] = boxOf(ahead.getBoundingClientRect())
-          })
-          return boxes
-        }
-        const before = places()
-        const bare = document.createElement('style')
-        bare.textContent = [
-          '.m-pane { padding-inline: 0 !important; margin-inline: 0 !important }',
-          '.m-node .md-link { padding: 0 !important; margin: 0 !important; min-inline-size: 0 !important }'
-        ].join(' ')
-        document.head.append(bare)
-        const without = places()
-        bare.remove()
-        const shifted = Object.keys(before).filter(
-          (name) =>
-            Math.abs((before[name]?.top ?? 0) - (without[name]?.top ?? 0)) > 0.5 ||
-            Math.abs((before[name]?.height ?? 0) - (without[name]?.height ?? 0)) > 0.5
-        )
-
-        const paneBox = pane.getBoundingClientRect()
-        const room = Math.min(finger / 2, gutter)
-        const readings = links.map((link, index): LinkReading => {
-          link.scrollIntoView({ block: 'center' })
-          const box = link.getBoundingClientRect()
-          const name = `"${link.textContent ?? ''}" (${String(index + 1)})`
-          const wordsWidth = without[`the words of ${name}`]?.width ?? 0
-          const was = without[`what follows ${name}`]
-          const is = before[`what follows ${name}`]
-          const wordsWas = without[`the words of ${name}`]
-          const wordsIs = before[`the words of ${name}`]
-          const ahead = [without[`what precedes ${name}`], before[`what precedes ${name}`]] as const
-          return {
-            label: link.textContent ?? '',
-            width: Math.min(box.right, paneBox.right, window.innerWidth) - Math.max(box.left, paneBox.left, 0),
-            height: Math.min(box.bottom, paneBox.bottom, window.innerHeight) - Math.max(box.top, paneBox.top, 0),
-            moved: was && is ? Math.abs(is.left - was.left) : 0,
-            wordsMoved: wordsWas && wordsIs ? Math.abs(wordsIs.left - wordsWas.left) : 0,
-            beforeMoved: ahead[0] && ahead[1] ? Math.abs(ahead[1].left - ahead[0].left) : 0,
-            mostMoved: Math.max(0, finger - 2 * room - wordsWidth),
-          }
-        })
-
-        pane.scrollTop = pane.scrollHeight
-        const cut = closing.getBoundingClientRect().bottom - pane.getBoundingClientRect().bottom
-
-        // Sideways, from the pane up: nothing that holds the conversation scrolls or clips it for a link's reach.
-        const overflowing: string[] = []
-        for (let each: HTMLElement | null = pane; each; each = each.parentElement) {
-          const holds = each === document.documentElement || getComputedStyle(each).overflowX !== 'visible'
-          if (holds && each.scrollWidth > each.clientWidth + 1) overflowing.push(each.className || each.tagName)
-        }
-        return { shifted, links: readings, cut, overflowing }
-      }, FINGER[surface])
-      if (!reading) throw new Error('the conversation shows no link')
-      expect.soft(reading.shifted, 'what moved up or down when the reach was taken away').toEqual([])
-      for (const link of reading.links) {
-        expect.soft(link.width, `the width of "${link.label}" where it can be pressed`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
-        expect.soft(link.height, `the height of "${link.label}" where it can be pressed`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
-        // Within a pixel: layout rounds a button's width to a fraction of a pixel, and the same label differs by that.
-        expect.soft(link.moved, `how far the words after "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved + 1)
-        // The label is centred in the box, so a widened box moves it by half of the difference.
-        expect.soft(link.wordsMoved, `how far "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved / 2 + 1)
-        expect.soft(link.beforeMoved, `how far the words before "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved + 1)
-      }
-      expect.soft(reading.cut, 'how far the box of the last line’s link lies below the pane at its end').toBeLessThanOrEqual(0.5)
-      expect.soft(reading.overflowing, 'what scrolls or clips sideways from the pane up').toEqual([])
-    })
-  }
-})
-
 /** The conversation's messages for the press case: what a message can hold that lays links close together. */
 const PRESS_MESSAGES: readonly string[] = [
   // Links in one column of two table rows.
@@ -436,546 +205,87 @@ const PRESS_MESSAGES: readonly string[] = [
   ['[קישור](https://example.org/rtl-start) ואחריו מילים רבות [עוד](https://example.org/rtl-end)', '', 'שלום [שלום](https://example.org/rtl-middle) עולם'].join('\n')
 ]
 
-/** The paragraphs that the press case sets at the end of the line. */
-const PRESS_AT_THE_END = ['https://example.org/at-end', 'https://example.org/alone-end']
-/** The paragraphs that the press case sets right to left. */
-const PRESS_RIGHT_TO_LEFT = ['https://example.org/rtl-start', 'https://example.org/rtl-middle']
-
+/** More messages for the cases of a tap: plain words on the line under a link, and a link in the middle of a line. */
+const NEXT_LINE = ['[the lead link](https://example.org/lead)  \nplain words on the next line, inside the reach of the link above.']
+const MIDDLE = ['Some words before [a middle link](https://example.org/middle) and words that follow it to the end of the line.']
 /** A link that starts a paragraph, with plain words after it that lie inside the link's reach. */
 const TEXT_AFTER_LINK = ['[docs](https://example.org/docs) and more words follow the link on this line, which ends the paragraph.']
 const DOCS = 'https://example.org/docs'
+const LEAD = 'https://example.org/lead'
+const MIDDLE_LINK = 'https://example.org/middle'
 
-/**
- * A point on the plain text after a link's words, inside the link's reach, where the browser's own hit
- * is the paragraph and not the link's button: a press there has the link only from the pane's rule.
- */
-async function pointOnTextAfter(page: Page, href: string): Promise<{ x: number; y: number }> {
-  return page.evaluate((target) => {
-    const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
-    if (!link) throw new Error(`the page shows no link ${target}`)
-    link.scrollIntoView({ block: 'center' })
-    const range = document.createRange()
-    range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
-    const words = range.getBoundingClientRect()
-    const y = words.top + words.height / 2
-    for (let beside = 6; beside <= 16; beside += 1) {
-      const x = words.right + beside
-      const found = document.elementFromPoint(x, y)
-      if (found && !found.closest('.md-link')) return { x, y }
+/** The text sizes the cases of a link run at, as multiples of the default: the default and the largest. */
+const SIZES = [
+  ['the default', 1],
+  ['the largest', 53 / 17]
+] as const
+
+/** What a click was, as the page saw it. `capture` is every click; `bubble` only a click that nothing stopped. */
+interface Clicked {
+  readonly phase: 'capture' | 'bubble'
+  readonly trusted: boolean
+  readonly detail: number
+  /** What the click names: `link <destination>`, `control <label>` or `text <tag>`. */
+  readonly named: string
+}
+
+/** Records every click in the page from now on, in `window.clicks`. */
+async function watchClicks(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const clicks: Clicked[] = []
+    ;(window as unknown as { clicks: Clicked[] }).clicks = clicks
+    const nameOf = (target: EventTarget | null): string => {
+      if (!(target instanceof Element)) return 'none'
+      const link = target.closest('.md-link')
+      if (link) return `link ${link.getAttribute('title') ?? ''}`
+      const control = target.closest('button, a[href], input, select, textarea, summary')
+      if (control) return `control ${control.textContent?.trim() ?? ''}`
+      return `text ${target.tagName.toLowerCase()}`
     }
-    throw new Error('no point on the text after the link lies in the link’s reach')
-  }, href)
-}
-
-/** What a press at one point is expected to do, computed by the case from the rectangles it reads. */
-interface PressPoint {
-  readonly x: number
-  readonly y: number
-  /** The link the case's own rule names, by its target, or null. */
-  readonly expected: string | null
-  /** How far the pane was scrolled when the point was read. */
-  readonly scroll: number
-  /** Whether the point lies on another control of the message, which then takes the press. */
-  readonly control: boolean
-  /**
-   * The link whose button the browser's own hit test names at the point (not on another control of the
-   * message), or null. Where there is one, a link opens at the press: the one named, or one whose words
-   * are as near or nearer, which `acceptable` lists.
-   */
-  readonly hit: string | null
-  readonly acceptable: readonly string[]
-}
-
-interface PressMark {
-  readonly x: number
-  readonly y: number
-  /** How many links had been opened when the press began. */
-  readonly opened: number
-  /** The links that showed the pressed look at the press's start, in the order of the page. */
-  readonly pressed: readonly string[]
-  /** How far the pane was scrolled at the press's start. */
-  readonly scroll: number
-  /** How many clicks the message's other controls had had when the press began. */
-  readonly clicked: number
-}
-
-// KR-REQ-13.19: where a message's links lie close together, the press at a point belongs to the link
-// whose words are nearest to it, and a press that no link's area holds opens nothing. The case presses
-// a grid of points around every link of a table, a quote, a list, a heading, two short links side by
-// side, a link under one that wraps, a link above the control of an image, the pane's edges and a
-// right-to-left paragraph, at two widths and three text sizes, and compares the link that opens with
-// the link the case names from the rectangles of the words it reads from the page. A link's area is
-// its words, grown to the least size the platform asks for and by the room beside the words, held to
-// the pane: the rule written again here, a few lines of it, and not the product's function. A point
-// on another control of the message is that control's. The pressed look must be on that link at the
-// press's start, and on none after the press. A point that the rule decides by less than 1.5 px (an
-// equal distance, the edge of an area) is not pressed: layout and the pointer round to a fraction of a
-// pixel, and the unit cases of the rule hold those points.
-// KR-REQ-13.19: a link opens when its press ends, as a control does. A press that moves away by more
-// than the platform's slop opens nothing and takes the pressed look off, a press that stays within the
-// slop opens the link, and a click that no pointer made (a keyboard's) goes to the element it names.
-test.describe('the end of a press on a link of a message', () => {
-  for (const surface of ['ios', 'android'] as const) {
-    test(`opens the link, unless the press moved away, and a keyboard opens the link it names on ${surface}`, async ({ page }) => {
-      await openSession(page, surface)
-      // Messages enough for the conversation to scroll, and a pane that desktop WebKit does not scroll by focusing it.
-      await page.evaluate(
-        ({ messages, session }) => {
-          for (const message of messages) window.krTestHost?.records.appendEntry(session, 'message', message)
-          document.dispatchEvent(new Event('visibilitychange'))
-          document.querySelector('.m-pane')?.removeAttribute('tabindex')
+    for (const phase of ['capture', 'bubble'] as const) {
+      window.addEventListener(
+        'click',
+        (event) => {
+          clicks.push({ phase, trusted: event.isTrusted, detail: event.detail, named: nameOf(event.target) })
         },
-        { messages: PRESS_MESSAGES, session: SESSION }
+        phase === 'capture'
       )
-      const link = page.getByRole('button', { name: 'the reconnect notes' })
-      await link.evaluate((element) => {
-        element.scrollIntoView({ block: 'center' })
-      })
-      const words = await link.evaluate((element) => {
-        const range = document.createRange()
-        range.selectNodeContents(element.querySelector('.md-link-label') ?? element)
-        const box = range.getBoundingClientRect()
-        return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
-      })
-      const opened = (): Promise<number> => page.evaluate(() => window.krTestHost?.openedLinks.length ?? -1)
-      const lit = (): Promise<number> => page.evaluate(() => document.querySelectorAll('.md-link[data-pressed]').length)
+    }
+  })
+}
 
-      // Within the slop: the pressed look at the start, the link opened at the end.
-      await page.mouse.move(words.x, words.y)
-      await page.mouse.down()
-      expect(await lit(), 'the pressed look at the press’s start').toBe(1)
-      await page.mouse.move(words.x + 4, words.y + 2)
-      expect(await lit(), 'the pressed look after a move within the slop').toBe(1)
-      await page.mouse.up()
-      expect(await lit(), 'the pressed look after the press').toBe(0)
-      expect(await opened(), 'links opened by a press that stayed').toBe(1)
+const clicksSeen = (page: Page): Promise<Clicked[]> =>
+  page.evaluate(() => (window as unknown as { clicks: Clicked[] }).clicks.slice())
 
-      // Away: the look goes when the press leaves, and nothing opens.
-      await page.mouse.move(words.x, words.y)
-      await page.mouse.down()
-      await page.mouse.move(words.x + 6, words.y - 40, { steps: 4 })
-      expect(await lit(), 'the pressed look after a move away').toBe(0)
-      await page.mouse.up()
-      expect(await opened(), 'links opened by a press that moved away').toBe(1)
+/** The clicks the browser made itself, seen before any handler: what the page was given. */
+const browsers = (clicks: readonly Clicked[]): Clicked[] => clicks.filter((click) => click.phase === 'capture' && click.trusted)
+/** The clicks that a handler of the page made. */
+const handlers = (clicks: readonly Clicked[]): Clicked[] => clicks.filter((click) => click.phase === 'capture' && !click.trusted)
 
-      // No pointer: a keyboard's click goes to the focused link, as it is.
-      await link.focus()
-      await page.keyboard.press('Enter')
-      expect(await opened(), 'links opened by Enter').toBe(2)
-      await page.keyboard.press('Space')
-      expect(await opened(), 'links opened by Space').toBe(3)
-
-      // A press while the conversation scrolls: the link has moved from under the press, so the release opens nothing.
-      await link.evaluate((element) => {
-        element.scrollIntoView({ block: 'center' })
-      })
-      const again = await link.evaluate((element) => {
-        const range = document.createRange()
-        range.selectNodeContents(element.querySelector('.md-link-label') ?? element)
-        const box = range.getBoundingClientRect()
-        return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
-      })
-      await page.mouse.move(again.x, again.y)
-      await page.mouse.down()
-      expect(await lit(), 'the pressed look at the start of a press that is then scrolled').toBe(1)
-      const before = await page.evaluate(() => document.querySelector('.m-pane')?.scrollTop ?? 0)
-      await page.mouse.wheel(0, 90)
-      await expect.poll(() => page.evaluate(() => document.querySelector('.m-pane')?.scrollTop ?? 0)).toBeGreaterThan(before + 40)
-      await page.mouse.up()
-      expect(await lit(), 'the pressed look after the press').toBe(0)
-      expect(await opened(), 'links opened by a press that was scrolled').toBe(3)
-    })
-  }
-})
-
-// KR-REQ-13.19: a touch tap, with its pointer events and the click that follows them, opens the link
-// whose words are nearest: on the words, on plain text within the link's area, and not outside it.
-test.describe('a tap on a link of a message', () => {
-  test.use({ hasTouch: true })
-  for (const surface of ['ios', 'android'] as const) {
-    test(`opens the link on its words, beside them and on the text after it, and not outside its area on ${surface}`, async ({ page }) => {
-      await openSession(page, surface)
-      await page.evaluate(
-        ({ messages, session }) => {
-          for (const message of messages) window.krTestHost?.records.appendEntry(session, 'message', message)
-          document.dispatchEvent(new Event('visibilitychange'))
-          document.querySelector('.m-pane')?.removeAttribute('tabindex')
-        },
-        { messages: [...PRESS_MESSAGES, ...TEXT_AFTER_LINK], session: SESSION }
-      )
-      const link = page.getByRole('button', { name: 'the reconnect notes' })
-      const words = await link.evaluate((element) => {
-        element.scrollIntoView({ block: 'center' })
-        const range = document.createRange()
-        range.selectNodeContents(element.querySelector('.md-link-label') ?? element)
-        const box = range.getBoundingClientRect()
-        return { x: box.left + box.width / 2, y: box.top + box.height / 2, right: box.right, bottom: box.bottom }
-      })
-      const opened = (): Promise<number> => page.evaluate(() => window.krTestHost?.openedLinks.length ?? -1)
-      await page.touchscreen.tap(words.x, words.y)
-      await expect.poll(opened, 'links opened by a tap on the words').toBe(1)
-      await page.touchscreen.tap(words.x, words.bottom + 8)
-      await expect.poll(opened, 'links opened by a tap on plain text under the words').toBe(2)
-      await page.touchscreen.tap(words.right + 8, words.y)
-      await expect.poll(opened, 'links opened by a tap on plain text beside the words').toBe(3)
-      await page.touchscreen.tap(words.right + 60, words.y)
-      expect(await opened(), 'links opened by a tap outside the link’s area').toBe(3)
-      // The words after a link lie over its button, so the tap's own target is the paragraph, and only
-      // the pane's rule gives the tap to the link.
-      const text = await pointOnTextAfter(page, DOCS)
-      await page.touchscreen.tap(text.x, text.y)
-      await expect.poll(opened, 'links opened by a tap on the plain text after a link').toBe(4)
-    })
-  }
-})
-
-test.describe('a press by the links of a message', () => {
-  const GRID = 8
-  const EDGE = 1.5
-  const SIZES = [
-    ['the smallest', 14 / 17],
-    ['the default', 1],
-    ['the largest', 53 / 17]
-  ] as const
-  for (const surface of ['ios', 'android'] as const) {
-    for (const width of [320, 390]) {
-      for (const [size, ratio] of SIZES) {
-        test(`opens the link whose words are nearest on ${surface}, ${String(width)} px wide at ${size} text size`, async ({ page }) => {
-          test.setTimeout(300_000)
-          await withTextScale(page, ratio)
-          await openSession(page, surface, width)
-          await page.evaluate(
-            ({ messages, session }) => {
-              for (const message of messages) window.krTestHost?.records.appendEntry(session, 'message', message)
-              document.dispatchEvent(new Event('visibilitychange'))
-            },
-            { messages: PRESS_MESSAGES, session: SESSION }
-          )
-          await page.locator('.m-node .md-link[title="https://example.org/rtl-middle"]').waitFor({ state: 'attached' })
-          await page.evaluate(
-            ({ atTheEnd, rightToLeft }) => {
-              const paragraphOf = (href: string): HTMLElement | null =>
-                document.querySelector(`.m-node .md-link[title="${href}"]`)?.closest('p') ?? null
-              for (const href of atTheEnd) {
-                const paragraph = paragraphOf(href)
-                if (paragraph) paragraph.style.textAlign = 'right'
-              }
-              for (const href of rightToLeft) paragraphOf(href)?.setAttribute('dir', 'rtl')
-              // Desktop WebKit scrolls a pane that it focuses for a press on text, which would move the
-              // points under the case's feet, and a press that scrolls is not a press: the pane is left
-              // unfocusable here. The page's own focus management is not what is checked.
-              document.querySelector('.m-pane')?.removeAttribute('tabindex')
-              // The clicks that the message's other controls get, counted where the page counts them.
-              const counted = window as unknown as { controlClicks: number }
-              counted.controlClicks = 0
-              for (const control of document.querySelectorAll('.m-pane button:not(.md-link)')) {
-                control.addEventListener('click', () => {
-                  counted.controlClicks += 1
-                })
-              }
-              // What a press did, read where the page reads it: at the press's start, after the page's own handling.
-              const marks: PressMark[] = []
-              ;(window as unknown as { pressMarks: PressMark[] }).pressMarks = marks
-              document.addEventListener('pointerdown', (event) => {
-                marks.push({
-                  x: event.clientX,
-                  y: event.clientY,
-                  opened: window.krTestHost?.openedLinks.length ?? 0,
-                  pressed: Array.from(document.querySelectorAll<HTMLElement>('.md-link[data-pressed]'), (link) => link.title),
-                  scroll: document.querySelector('.m-pane')?.scrollTop ?? 0,
-                  clicked: counted.controlClicks
-                })
-              })
-            },
-            { atTheEnd: PRESS_AT_THE_END, rightToLeft: PRESS_RIGHT_TO_LEFT }
-          )
-          const hrefs = await page.evaluate(() =>
-            Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link'), (link) => link.title)
-          )
-          expect(hrefs.length, 'the links on the page').toBeGreaterThanOrEqual(27)
-
-          const planned: PressPoint[] = []
-          let skipped = 0
-          for (const href of hrefs) {
-            const plan = await page.evaluate(
-              ({ href, finger, grid, edge, scrollbar }) => {
-                const links = Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link'))
-                const link = links.find((each) => each.title === href)
-                const pane = document.querySelector<HTMLElement>('.m-pane')
-                const main = document.querySelector<HTMLElement>('.m-main')
-                if (!link || !pane || !main) return null
-                link.scrollIntoView({ block: 'center' })
-                const room = pane.getBoundingClientRect()
-                const beside = Math.min(finger / 2, parseFloat(getComputedStyle(main).paddingLeft))
-                interface Area {
-                  readonly left: number
-                  readonly top: number
-                  readonly right: number
-                  readonly bottom: number
-                }
-                const wordsOf = (each: HTMLElement): Area[] => {
-                  const range = document.createRange()
-                  range.selectNodeContents(each.querySelector('.md-link-label') ?? each)
-                  return Array.from(range.getClientRects())
-                    .filter((rect) => rect.width > 0 && rect.height > 0)
-                    .map((rect) => ({ left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom }))
-                }
-                const areaOf = (words: Area): Area => {
-                  const wide = Math.max(finger, words.right - words.left + 2 * beside)
-                  const tall = Math.max(finger, words.bottom - words.top)
-                  const x = (words.left + words.right) / 2
-                  const y = (words.top + words.bottom) / 2
-                  return {
-                    left: Math.max(x - wide / 2, room.left),
-                    right: Math.min(x + wide / 2, room.right),
-                    top: Math.max(y - tall / 2, room.top),
-                    bottom: Math.min(y + tall / 2, room.bottom)
-                  }
-                }
-                const gap = (area: Area, x: number, y: number): number =>
-                  Math.hypot(Math.max(area.left - x, 0, x - area.right), Math.max(area.top - y, 0, y - area.bottom))
-                // How far inside an area a point is: negative outside it.
-                const depth = (area: Area, x: number, y: number): number =>
-                  Math.min(x - area.left, area.right - x, y - area.top, area.bottom - y)
-                // The page's own box of a link, held to the pane: the browser gives a press anywhere in it to the link.
-                const boxesOf = (each: HTMLElement): Area[] =>
-                  Array.from(each.getClientRects(), (rect) => ({
-                    left: Math.max(rect.left, room.left),
-                    right: Math.min(rect.right, room.right),
-                    top: Math.max(rect.top, room.top),
-                    bottom: Math.min(rect.bottom, room.bottom)
-                  }))
-                const all = links.map((each) => ({ title: each.title, words: wordsOf(each), boxes: boxesOf(each) }))
-                // The message's other controls: a point on one is the control's, whichever link's area holds it.
-                const controls = Array.from(pane.querySelectorAll<HTMLElement>('button:not(.md-link)'), (each): Area => {
-                  const box = each.getBoundingClientRect()
-                  return { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
-                })
-                // The link the rule names at a point, and whether the point is clear of every edge of the rule.
-                const decide = (x: number, y: number): { expected: string | null; clear: boolean; control: boolean } => {
-                  if (controls.some((box) => Math.abs(depth(box, x, y)) < edge)) return { expected: null, clear: false, control: false }
-                  if (controls.some((box) => depth(box, x, y) >= 0)) return { expected: null, clear: true, control: true }
-                  const held = all
-                    .map((each) => ({
-                      title: each.title,
-                      reached: each.words.some((words) => depth(areaOf(words), x, y) >= 0) || each.boxes.some((box) => depth(box, x, y) >= 0),
-                      near:
-                        each.words.some((words) => Math.abs(depth(areaOf(words), x, y)) < edge) ||
-                        each.boxes.some((box) => Math.abs(depth(box, x, y)) < edge),
-                      distance: Math.min(...each.words.map((words) => gap(words, x, y)))
-                    }))
-                    .filter((each) => each.reached || each.near)
-                  const sure = held.filter((each) => each.reached && !each.near)
-                  const ranked = [...sure].sort((a, b) => a.distance - b.distance)
-                  const unsure = held.some((each) => each.near) || (ranked[1] !== undefined && ranked[1].distance - (ranked[0]?.distance ?? 0) < edge)
-                  // The earlier link wins an exact tie, so sorting by distance only keeps the order of the page.
-                  return { expected: ranked[0]?.title ?? null, clear: !unsure, control: false }
-                }
-                const inRoom = (x: number, y: number): boolean => {
-                  if (x < 0 || y < 0 || x > window.innerWidth - 1 || y > window.innerHeight - 1) return false
-                  if (x >= room.right - scrollbar) return false
-                  const found = document.elementFromPoint(x, y)
-                  return found !== null && pane.contains(found)
-                }
-                const seen = new Set<string>()
-                const points: {
-                  x: number
-                  y: number
-                  expected: string | null
-                  scroll: number
-                  control: boolean
-                  hit: string | null
-                  acceptable: string[]
-                }[] = []
-                let unclear = 0
-                let judged = 0
-                // What the browser's own hit test names at a point, away from the message's other controls:
-                // the link whose button is there, and the links whose words are as near to the point as its words.
-                const hitAt = (x: number, y: number): { hit: string | null; acceptable: string[] } => {
-                  const found = document.elementFromPoint(x, y)?.closest<HTMLElement>('.m-node .md-link')
-                  if (!found || controls.some((box) => depth(box, x, y) > -edge)) return { hit: null, acceptable: [] }
-                  const distanceOf = (words: Area[]): number => Math.min(...words.map((each) => gap(each, x, y)))
-                  const away = distanceOf(wordsOf(found))
-                  return {
-                    hit: found.title,
-                    acceptable: all.filter((each) => distanceOf(each.words) <= away + 0.01).map((each) => each.title)
-                  }
-                }
-                const consider = (x: number, y: number, always: boolean): void => {
-                  const px = Math.round(x)
-                  const py = Math.round(y)
-                  const key = `${String(px)},${String(py)}`
-                  if (seen.has(key) || !inRoom(px, py)) return
-                  seen.add(key)
-                  const verdict = decide(px, py)
-                  const named = hitAt(px, py)
-                  if (!verdict.clear) {
-                    unclear += 1
-                    // The rule above is unsure here, but the browser's hit test is not: a link must open.
-                    if (named.hit !== null) {
-                      judged += 1
-                      points.push({ x: px, y: py, expected: null, scroll: pane.scrollTop, control: false, ...named })
-                    }
-                    return
-                  }
-                  // In the open, away from every edge, one point in three says as much as all of them.
-                  if (!always && verdict.expected !== null && (px + py) % 3 !== 0) return
-                  points.push({
-                    x: px,
-                    y: py,
-                    expected: verdict.expected,
-                    scroll: pane.scrollTop,
-                    control: verdict.control,
-                    ...named
-                  })
-                }
-                // Along the edges of every control that this link's area overlaps, on both sides of each edge.
-                const overlapped = controls.filter((box) =>
-                  wordsOf(link).some((words) => {
-                    const area = areaOf(words)
-                    return area.left <= box.right + 6 && area.right >= box.left - 6 && area.top <= box.bottom + 6 && area.bottom >= box.top - 6
-                  })
-                )
-                for (const box of overlapped) {
-                  for (const d of [-3, -1, 1, 3]) {
-                    for (const across of [0.1, 0.3, 0.5, 0.7, 0.9]) {
-                      const x = box.left + (box.right - box.left) * across
-                      const y = box.top + (box.bottom - box.top) * across
-                      consider(x, box.top + d, true)
-                      consider(x, box.bottom + d, true)
-                      consider(box.left + d, y, true)
-                      consider(box.right + d, y, true)
-                    }
-                  }
-                }
-                // The browser's own box of the link, whole: a press anywhere in it is the link's on a page without the pane's rule.
-                for (const box of Array.from(link.getClientRects())) {
-                  for (let x = box.left - 6; x <= box.right + 6; x += grid) {
-                    for (let y = box.top - 6; y <= box.bottom + 6; y += grid) consider(x, y, false)
-                  }
-                  for (const d of [-3, -1, 1, 3]) {
-                    for (const across of [0.1, 0.5, 0.9]) {
-                      consider(box.left + (box.right - box.left) * across, box.top + d, true)
-                      consider(box.left + (box.right - box.left) * across, box.bottom + d, true)
-                      consider(box.left + d, box.top + (box.bottom - box.top) * across, true)
-                      consider(box.right + d, box.top + (box.bottom - box.top) * across, true)
-                    }
-                  }
-                }
-                for (const words of wordsOf(link)) {
-                  const area = areaOf(words)
-                  const x0 = (words.left + words.right) / 2
-                  const y0 = (words.top + words.bottom) / 2
-                  const reachX = Math.max(area.right - x0, x0 - area.left) + 6
-                  const reachY = Math.max(area.bottom - y0, y0 - area.top) + 6
-                  for (let dx = -reachX; dx <= reachX; dx += grid) {
-                    for (let dy = -reachY; dy <= reachY; dy += grid) consider(x0 + dx, y0 + dy, false)
-                  }
-                  // Just beside the words on every side, where a neighbour's area was found to take the press.
-                  for (const d of [1, 2, 3, 5]) {
-                    for (const across of [0.05, 0.25, 0.5, 0.75, 0.95]) {
-                      const x = words.left + (words.right - words.left) * across
-                      const y = words.top + (words.bottom - words.top) * across
-                      consider(x, words.bottom + d, true)
-                      consider(x, words.top - d, true)
-                      consider(words.left - d, y, true)
-                      consider(words.right + d, y, true)
-                    }
-                  }
-                  consider(x0, y0, true)
-                }
-                return { points, unclear: unclear - judged }
-              },
-              // Desktop WebKit's overlay scrollbar takes the presses on the pane's last 16 px, and makes no click of them.
-              { href, finger: FINGER[surface], grid: GRID, edge: EDGE, scrollbar: test.info().project.name === 'webkit' ? 17 : 0 }
-            )
-            if (!plan) throw new Error(`the page shows no link ${href}`)
-            skipped += plan.unclear
-            for (const point of plan.points) {
-              planned.push(point)
-              await page.mouse.click(point.x, point.y)
-            }
-          }
-
-          const done = await page.evaluate(() => ({
-            marks: (window as unknown as { pressMarks: PressMark[] }).pressMarks,
-            opened: window.krTestHost?.openedLinks.slice() ?? [],
-            clicked: (window as unknown as { controlClicks: number }).controlClicks,
-            left: document.querySelectorAll('.md-link[data-pressed]').length
-          }))
-          const inside = planned.filter((point) => point.expected !== null).length
-          const counts = `${String(planned.length)} presses over ${String(hrefs.length)} links: ${String(inside)} inside a link's area, ${String(planned.length - inside)} outside every area; ${String(skipped)} points within ${String(EDGE)} px of an edge of the rule not pressed`
-          test.info().annotations.push({ type: 'presses', description: counts })
-          console.log(`link presses on ${surface}, ${String(width)} px, ${size} text size: ${counts}`)
-          expect(done.marks.length, 'the presses the page saw, one for each point pressed').toBe(planned.length)
-          const wrong: string[] = []
-          const held: string[] = []
-          const unlit: string[] = []
-          const drifted: string[] = []
-          const unclicked: string[] = []
-          planned.forEach((point, index) => {
-            const mark = done.marks[index]
-            const from = mark?.opened ?? 0
-            const to = done.marks[index + 1]?.opened ?? done.opened.length
-            const opened = done.opened.slice(from, to)
-            const at = `(${String(point.x)}, ${String(point.y)})`
-            if (mark !== undefined && Math.abs(mark.scroll - point.scroll) > 0.5) {
-              drifted.push(`${at} pressed at scroll ${String(mark.scroll)}, read at ${String(point.scroll)}`)
-            }
-            const clicks = (done.marks[index + 1]?.clicked ?? done.clicked) - (mark?.clicked ?? 0)
-            if (clicks !== (point.control ? 1 : 0)) {
-              unclicked.push(`${at} clicked ${String(clicks)} other controls, expected ${point.control ? '1' : '0'}`)
-            }
-            if (point.expected === null && point.hit !== null) {
-              // The browser's own hit test names a link here: a link opens, the one named or one whose words are nearer.
-              const [only] = opened
-              if (opened.length !== 1 || only === undefined || !point.acceptable.includes(only)) {
-                held.push(`${at} the browser names ${point.hit}, opened ${opened.join(' ') || 'nothing'}, acceptable ${point.acceptable.join(' ')}`)
-              }
-              if ((mark?.pressed ?? []).join(' ') !== opened.join(' ')) {
-                unlit.push(`${at} looked pressed on ${(mark?.pressed ?? []).join(' ') || 'nothing'}, opened ${opened.join(' ') || 'nothing'}`)
-              }
-              return
-            }
-            const expected = point.expected === null ? [] : [point.expected]
-            if (opened.join(' ') !== expected.join(' ')) {
-              wrong.push(`${at} opened ${opened.join(' ') || 'nothing'}, expected ${expected.join(' ') || 'nothing'}`)
-            }
-            if ((mark?.pressed ?? []).join(' ') !== expected.join(' ')) {
-              unlit.push(`${at} looked pressed on ${(mark?.pressed ?? []).join(' ') || 'nothing'}, expected ${expected.join(' ') || 'nothing'}`)
-            }
-          })
-          expect.soft(drifted.slice(0, 12), 'presses made after the pane had moved from where the point was read').toEqual([])
-          expect.soft(unclicked.slice(0, 12), `${String(unclicked.length)} of ${String(planned.length)} presses gave the click to another control or to none`).toEqual([])
-          expect.soft(wrong.slice(0, 12), `${String(wrong.length)} of ${String(planned.length)} presses opened another link or none, or one that was not named`).toEqual([])
-          expect.soft(
-            held.slice(0, 12),
-            `${String(held.length)} of ${String(planned.length)} presses where the browser's own hit test names a link opened no link, or one whose words are farther`
-          ).toEqual([])
-          expect.soft(unlit.slice(0, 12), `${String(unlit.length)} of ${String(planned.length)} presses showed the pressed look on another link or none`).toEqual([])
-          expect.soft(done.left, 'links still looking pressed after the last press').toBe(0)
-          expect.soft(
-            planned.filter((point) => point.expected !== null).length,
-            'presses inside a link’s area'
-          ).toBeGreaterThan(planned.length / 6)
-          // At the largest size the long link wraps clear of the image's control: there is no overlap to press.
-          if (ratio <= 1) {
-            expect.soft(planned.filter((point) => point.control).length, 'presses on a control of the message').toBeGreaterThan(10)
-          }
-          expect.soft(planned.filter((point) => point.expected === null).length, 'presses outside every link’s area').toBeGreaterThan(40)
-        })
+/** A pause long enough for a click's record to be old, made by the page being busy as the pointer comes up. */
+async function busyAtPointerUp(page: Page, milliseconds: number): Promise<void> {
+  await page.evaluate((busy) => {
+    window.addEventListener('pointerup', () => {
+      const end = performance.now() + busy
+      while (performance.now() < end) {
+        // Busy.
       }
-    }
-  }
-})
+    })
+  }, milliseconds)
+}
 
 /**
- * Opens the conversation with the messages of the press cases. The pane's own `tabindex` is taken off
- * unless the case is of the pane as it ships, and the engine is not to hold what lies above a link in
- * place when a case changes what lies above it.
+ * Opens the conversation with the messages of the cases of a link. The pane's own `tabindex` is taken
+ * off unless the case is of the pane as it ships: desktop WebKit scrolls a pane that it focuses for a
+ * press on text, and a press that scrolls is not a tap.
  */
-async function pressPage(page: Page, surface: 'ios' | 'android', options: { shipped?: boolean; extra?: readonly string[] } = {}): Promise<void> {
-  await openSession(page, surface)
+async function pressPage(
+  page: Page,
+  surface: 'ios' | 'android',
+  options: { shipped?: boolean; extra?: readonly string[]; only?: readonly string[]; scale?: number; width?: number } = {}
+): Promise<void> {
+  if (options.scale !== undefined) await withTextScale(page, options.scale)
+  await openSession(page, surface, options.width)
   await page.evaluate(
     ({ messages, session, shipped }) => {
       for (const message of messages) window.krTestHost?.records.appendEntry(session, 'message', message)
@@ -984,283 +294,433 @@ async function pressPage(page: Page, surface: 'ios' | 'android', options: { ship
       if (pane) pane.style.overflowAnchor = 'none'
       if (!shipped) pane?.removeAttribute('tabindex')
     },
-    { messages: [...PRESS_MESSAGES, ...(options.extra ?? [])], session: SESSION, shipped: options.shipped ?? false }
+    { messages: options.only ?? [...PRESS_MESSAGES, ...(options.extra ?? [])], session: SESSION, shipped: options.shipped ?? false }
   )
-  await page.locator('.m-node .md-link[title="https://example.org/rtl-middle"]').waitFor({ state: 'attached' })
+  await page.locator('.m-node .md-link').last().waitFor({ state: 'attached' })
+  await watchClicks(page)
 }
 
-/** Scrolls a link to the middle of the pane and gives the rectangle of its first line of words. */
-async function wordsOf(page: Page, href: string): Promise<{ x: number; y: number; left: number; top: number; right: number; bottom: number }> {
-  return page.evaluate((target) => {
-    const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
-    if (!link) throw new Error(`the page shows no link ${target}`)
-    link.scrollIntoView({ block: 'center' })
-    const range = document.createRange()
-    range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
-    const box = range.getClientRects()[0] ?? range.getBoundingClientRect()
-    return { x: box.left + box.width / 2, y: box.top + box.height / 2, left: box.left, top: box.top, right: box.right, bottom: box.bottom }
-  }, href)
+interface Words {
+  readonly x: number
+  readonly y: number
+  readonly left: number
+  readonly top: number
+  readonly right: number
+  readonly bottom: number
 }
 
-/** The middle of a link's words where they lie now, with no scrolling. */
-async function centreOf(page: Page, href: string): Promise<{ x: number; y: number }> {
-  return page.evaluate((target) => {
-    const range = document.createRange()
-    range.selectNodeContents(document.querySelector(`.m-node .md-link[title="${target}"] .md-link-label`) ?? document.body)
-    const box = range.getBoundingClientRect()
-    return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
-  }, href)
+/** Scrolls a link to the middle of the pane and gives the rectangle of its `line`th line of words (the last when `line` is -1). */
+async function wordsOf(page: Page, href: string, line = 0): Promise<Words> {
+  return page.evaluate(
+    ({ target, which }) => {
+      const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
+      const pane = document.querySelector<HTMLElement>('.m-pane')
+      if (!link || !pane) throw new Error(`the page shows no link ${target}`)
+      link.scrollIntoView({ block: 'center' })
+      const range = document.createRange()
+      range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
+      const read = (): DOMRect => {
+        const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)
+        const found = which < 0 ? rects[rects.length - 1] : rects[which]
+        if (!found) throw new Error(`the link ${target} has no line ${String(which)}`)
+        return found
+      }
+      // A link of many lines is taller than the pane: bring the line asked for to the middle of it.
+      const room = pane.getBoundingClientRect()
+      pane.scrollTop += read().top + read().height / 2 - (room.top + room.height / 2)
+      const box = read()
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2, left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+    },
+    { target: href, which: line }
+  )
+}
+
+/** The protocol session of a page in Chromium, and the time of its last touch. */
+const touches = new WeakMap<Page, { session: CDPSession; at: number }>()
+
+/**
+ * A touch's tap at a point. Chromium counts a tap that follows another soon and near it as the second
+ * of a double tap (the click's `detail` is 2): each tap here carries a time of its own, a minute after
+ * the one before, so a case that taps many points sees the `detail` a first tap has. WebKit counts no
+ * double tap for these.
+ */
+async function tap(page: Page, x: number, y: number): Promise<void> {
+  if (page.context().browser()?.browserType().name() !== 'chromium') {
+    await page.touchscreen.tap(x, y)
+    return
+  }
+  let state = touches.get(page)
+  if (!state) {
+    state = { session: await page.context().newCDPSession(page), at: Date.now() / 1000 - 3 * 3600 }
+    touches.set(page, state)
+  }
+  state.at += 60
+  await state.session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }], timestamp: state.at })
+  await state.session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [], timestamp: state.at + 0.05 })
+}
+
+/** What one tap did: the clicks the page saw, and the links the page opened, since the tap began. */
+async function tapAndRead(page: Page, x: number, y: number): Promise<{ clicks: Clicked[]; opened: string[] }> {
+  const clicksBefore = (await clicksSeen(page)).length
+  const openedBefore = (await openedLinks(page)).length
+  await tap(page, x, y)
+  await expect.poll(async () => browsers((await clicksSeen(page)).slice(clicksBefore)).length, `a click for a tap at ${String(Math.round(x))}, ${String(Math.round(y))}`).toBeGreaterThan(0)
+  return { clicks: (await clicksSeen(page)).slice(clicksBefore), opened: (await openedLinks(page)).slice(openedBefore) }
 }
 
 const openedLinks = (page: Page): Promise<string[]> => page.evaluate(() => window.krTestHost?.openedLinks.slice() ?? [])
 const pressedLooks = (page: Page): Promise<number> => page.evaluate(() => document.querySelectorAll('.md-link[data-pressed]').length)
 
-// KR-REQ-13.19: a press is decided where it ends as it was where it began. The press stands where the
-// choice at its release names the same link or control as the choice at its start, and the page
-// moving under a finger at rest cancels nothing by itself: content above a link that grows while
-// the link is pressed, and a wheel scroll away and back, still open the link, where the browser's own
-// click would; a press whose link has gone from under the finger, or another link is under it, opens nothing.
-test.describe('a press that ends on a page that changed during it', () => {
-  for (const surface of ['ios', 'android'] as const) {
-    test(`opens the link that still lies under the press after the content above it grew, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface)
-      const href = 'https://example.org/wrapped'
-      const at = await wordsOf(page, href)
-      await page.mouse.move(at.x, at.y)
-      await page.mouse.down()
-      expect(await pressedLooks(page), 'the pressed look at the press’s start').toBe(1)
-      // The message above grows by 20 px, which moves the whole link down by as much, farther than the slop.
-      const moved = await page.evaluate((target) => {
-        const node = document.querySelector(`.m-node .md-link[title="${target}"]`)?.closest<HTMLElement>('.m-node')
-        const before = document.querySelector(`.m-node .md-link[title="${target}"]`)?.getBoundingClientRect().top ?? 0
-        if (node) node.style.paddingTop = `${String(parseFloat(getComputedStyle(node).paddingTop) + 20)}px`
-        return (document.querySelector(`.m-node .md-link[title="${target}"]`)?.getBoundingClientRect().top ?? 0) - before
-      }, href)
-      expect(moved, 'how far the link moved under the press').toBeGreaterThan(15)
-      await page.mouse.up()
-      expect(await openedLinks(page), 'links opened by a press whose link moved down but still lies under it').toEqual([href])
-    })
+/**
+ * A point on the plain text 20 px after a link's words: inside the link's reach (half of the least
+ * size, 22 or 24), and past what the engines' own touch adjustment gives to the link's button, so the
+ * browser's click names the paragraph and only the pane's handler gives the tap to the link.
+ */
+async function pointOnTextAfter(page: Page, href: string): Promise<{ x: number; y: number }> {
+  const words = await wordsOf(page, href)
+  const hit = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest('.md-link') ?? null, { x: words.right + 20, y: words.y })
+  if (hit !== null) throw new Error('the point 20 px after the words is on a link’s button')
+  return { x: words.right + 20, y: words.y }
+}
 
-    test(`opens nothing when another link, or none, lies under the press at its end, and opens the link after a scroll away and back, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface)
-      const first = 'https://example.org/table-1'
-      const second = 'https://example.org/table-2'
-      const one = await wordsOf(page, first)
-      const two = await page.evaluate((target) => {
-        const range = document.createRange()
-        range.selectNodeContents(document.querySelector(`.m-node .md-link[title="${target}"] .md-link-label`) ?? document.body)
-        const box = range.getBoundingClientRect()
-        return { y: box.top + box.height / 2 }
-      }, second)
-      const scrollTop = (): Promise<number> => page.evaluate(() => document.querySelector('.m-pane')?.scrollTop ?? 0)
+const SURFACES = ['ios', 'android'] as const
 
-      // The second link comes under the press: the press ends on a link that it did not begin on.
-      await page.mouse.move(one.x, one.y)
-      await page.mouse.down()
-      const start = await scrollTop()
-      await page.evaluate((by) => {
-        const pane = document.querySelector('.m-pane')
-        if (pane) pane.scrollTop += by
-      }, two.y - one.y)
-      expect(await scrollTop(), 'the pane scrolled to bring the second link under the press').toBeGreaterThan(start + 10)
-      await page.mouse.up()
-      expect(await openedLinks(page), 'links opened by a press whose end lies on another link').toEqual([])
-
-      // A wheel scroll away and back: the same link lies under the release, as it does for the browser's own click.
-      const again = await wordsOf(page, first)
-      await page.mouse.move(again.x, again.y)
-      await page.mouse.down()
-      const before = await scrollTop()
-      await page.mouse.wheel(0, 90)
-      await expect.poll(scrollTop).toBeGreaterThan(before + 40)
-      await page.mouse.wheel(0, -90)
-      await expect.poll(scrollTop).toBeLessThan(before + 1)
-      await page.mouse.up()
-      expect(await openedLinks(page), 'links opened by a press after a scroll away and back').toEqual([first])
-    })
-
-    test(`gives a covered control its click after the control moved less than it is tall, and none when it left, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface)
-      await page.evaluate(() => {
-        const counted = window as unknown as { controlClicks: number; lastDetail: number; focused: boolean }
-        counted.controlClicks = 0
-        for (const control of document.querySelectorAll('.m-pane button:not(.md-link)')) {
-          control.addEventListener('click', (event) => {
-            counted.controlClicks += 1
-            counted.lastDetail = (event as MouseEvent).detail
-          })
+// KR-REQ-13.19: the layout of the pane's links and controls is the page's own. A link has no enlarged
+// box, so the browser's hit test decides every click that lands on a link's words or on another
+// control, and a press near one of them is that one's click. Each case counts the clicks the browser
+// made and the clicks that a handler of the page added: a press on a link's words or on a control gives
+// the one click of the browser and no other.
+test.describe('the links and the controls of a message in the pane', () => {
+  test.use({ hasTouch: true })
+  for (const surface of SURFACES) {
+    for (const [size, ratio] of SIZES) {
+      test(`a press on the lower part of an upper link's words, with a link on the next line, is the upper link's own click on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio })
+        const upper = 'https://example.org/wrapped'
+        const words = await wordsOf(page, upper, -1)
+        const x = words.left + Math.min(12, (words.right - words.left) / 2)
+        for (const by of ['touch', 'mouse'] as const) {
+          const before = (await clicksSeen(page)).length
+          if (by === 'touch') await tap(page, x, words.bottom - 2)
+          else await page.mouse.click(x, words.bottom - 2)
+          await expect.poll(async () => (await clicksSeen(page)).length, `clicks of a ${by} press`).toBeGreaterThan(before)
+          const made = (await clicksSeen(page)).slice(before)
+          expect(browsers(made).map((click) => click.named), `what the browser's click named for a ${by} press`).toEqual([`link ${upper}`])
+          expect(handlers(made), `clicks that the page added to a ${by} press`).toEqual([])
         }
+        expect(await openedLinks(page), 'links opened').toEqual([upper, upper])
       })
-      const clicks = (): Promise<number> => page.evaluate(() => (window as unknown as { controlClicks: number }).controlClicks)
-      // A point on a control of a message that a link's box lies over: the browser's own click goes to the link.
-      const covered = async (): Promise<{ x: number; y: number }> =>
-        page.evaluate(() => {
-          for (const control of Array.from(document.querySelectorAll<HTMLElement>('.m-pane button:not(.md-link)'))) {
-            control.scrollIntoView({ block: 'center' })
-            const box = control.getBoundingClientRect()
-            // Not within 14 px of the control's top, so that it still lies under the point after the pane scrolls 12 px.
-            for (let x = box.left + 4; x < box.right - 4; x += 6) {
-              for (let y = box.top + 14; y < box.bottom - 1; y += 1) {
-                if (document.elementFromPoint(x, y)?.closest('.md-link')) return { x, y }
-              }
-            }
-          }
-          throw new Error('no control of a message lies under a link’s box')
-        })
 
-      const first = await covered()
-      await page.mouse.move(first.x, first.y)
-      await page.mouse.down()
-      await page.evaluate(() => {
-        const pane = document.querySelector('.m-pane')
-        if (pane) pane.scrollTop -= 12
+      test(`a press 1 to 3 px inside the lower edge of "Load this image", with a link on the next line, is one click of the control on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio })
+        const control = page.getByRole('button', { name: 'Load this image' }).nth(1)
+        await control.scrollIntoViewIfNeeded()
+        for (const inside of [1, 2, 3]) {
+          const box = await control.boundingBox()
+          if (!box) throw new Error('the control has no box')
+          const before = (await clicksSeen(page)).length
+          await tap(page, box.x + box.width / 2, box.y + box.height - inside)
+          await expect.poll(async () => (await clicksSeen(page)).length, `clicks of a press ${String(inside)} px inside`).toBeGreaterThan(before)
+          const made = (await clicksSeen(page)).slice(before)
+          expect(browsers(made).map((click) => click.named), `what the click named ${String(inside)} px inside the edge`).toEqual(['control Load this image'])
+          expect(handlers(made), `clicks that the page added ${String(inside)} px inside the edge`).toEqual([])
+        }
+        expect(await openedLinks(page), 'links opened by presses on the control').toEqual([])
       })
-      await page.mouse.up()
-      expect(await clicks(), 'clicks of the control that moved 12 px and still lies under the press').toBe(1)
-      // The redirected click is a pointer's: it counts a press, and the control has the focus, as after a pointer's press.
-      expect(await page.evaluate(() => (window as unknown as { lastDetail: number }).lastDetail), 'the click’s detail').toBeGreaterThan(0)
-      expect(await page.evaluate(() => document.activeElement?.classList.contains('text-link') ?? false), 'the control has the focus').toBe(true)
+    }
 
-      const second = await covered()
-      await page.mouse.move(second.x, second.y)
-      await page.mouse.down()
+    test(`"Attach again", pressed 2 px inside a side and held 200 ms, attaches on ${surface}`, async ({ page }) => {
+      await openSession(page, surface)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
       await page.evaluate(() => {
-        const pane = document.querySelector('.m-pane')
-        if (pane) pane.scrollTop -= 300
+        window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
       })
+      const again = page.getByRole('button', { name: 'Attach again' })
+      const box = await again.boundingBox()
+      if (!box) throw new Error('Attach again has no box')
+      await page.mouse.move(box.x + 2, box.y + box.height / 2)
+      await page.mouse.down()
+      // Long enough for the pressed look to take hold.
+      await page.waitForTimeout(200)
       await page.mouse.up()
-      expect(await clicks(), 'clicks of a control that left from under the press').toBe(1)
+      await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
+    })
+
+    test(`"Attach again", tapped 2 px inside a side, attaches on ${surface}`, async ({ page }) => {
+      await openSession(page, surface)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      await page.evaluate(() => {
+        window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
+      })
+      const box = await page.getByRole('button', { name: 'Attach again' }).boundingBox()
+      if (!box) throw new Error('Attach again has no box')
+      await page.touchscreen.tap(box.x + box.width - 2, box.y + box.height / 2)
+      await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
     })
   }
 })
 
-// KR-REQ-13.19: the press handling holds with the pane as it ships (its own `tabindex`, which every
-// case above takes off to keep geometry still), and at its edges: a keyboard click while a press is
-// down, a second pointer, a click that comes long after its press, and a click on something outside the pane.
-test.describe('a press on the pane as it ships', () => {
-  for (const surface of ['ios', 'android'] as const) {
+// KR-REQ-13.19: where a touch's click lands on plain text near a link's words, the link opens, once;
+// the click on the text stands and the page stops nothing. A mouse's click on plain text opens nothing.
+test.describe('a tap on the plain text near a link of a message', () => {
+  test.use({ hasTouch: true })
+  for (const surface of SURFACES) {
+    for (const [size, ratio] of SIZES) {
+      test(`opens the link once for a tap on the text after it and on the text under it, and nothing for a tap farther off, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio, extra: [...TEXT_AFTER_LINK, ...NEXT_LINE] })
+        const words = await wordsOf(page, DOCS)
+        // From just past what the engines adjust to the link's button, to the end of the link's reach.
+        let added = 0
+        for (const beside of [10, 12, 14, 16, 18, 20]) {
+          const made = await tapAndRead(page, words.right + beside, words.y)
+          expect(made.opened, `links opened by a tap ${String(beside)} px after the words`).toEqual([DOCS])
+          // The browser's click names the link (the engine's own adjustment) or the text (the page adds the link's click).
+          const named = browsers(made.clicks).map((click) => click.named.split(' ')[0])
+          expect(handlers(made.clicks).length, `clicks that the page added, for a browser click that named ${named.join()}`).toBe(named[0] === 'text' ? 1 : 0)
+          added += handlers(made.clicks).length
+        }
+        expect(added, 'taps that the page gave to the link, where the browser named the text').toBeGreaterThan(0)
+        if (ratio === 1) {
+          // The text on the line under the link: within the lower reach, and one line away beyond it.
+          const lead = await wordsOf(page, LEAD)
+          for (const below of [6, 8, 10, 12]) {
+            const made = await tapAndRead(page, lead.left + 8, lead.bottom + below)
+            expect(made.opened, `links opened by a tap ${String(below)} px under the words`).toEqual([LEAD])
+          }
+          const away = await tapAndRead(page, lead.left + 8, lead.bottom + 18)
+          expect(away.opened, 'links opened by a tap 18 px under the words, past the reach').toEqual([])
+          expect(handlers(away.clicks), 'clicks that the page added past the reach').toEqual([])
+        }
+        // Farther than the reach beside the words: the browser's click on the text, and nothing more.
+        const far = await tapAndRead(page, words.right + 22 + 12, words.y)
+        expect(far.opened, 'links opened by a tap 34 px after the words').toEqual([])
+        expect(handlers(far.clicks), 'clicks that the page added 34 px after the words').toEqual([])
+      })
+
+      test(`adds no link click for the second tap of a double tap on ${surface} at ${size} text size`, async ({ page }) => {
+        await pressPage(page, surface, { scale: ratio, extra: TEXT_AFTER_LINK })
+        const after = await pointOnTextAfter(page, DOCS)
+        // Two quick taps: the engine that counts a double tap gives the second click a detail of 2.
+        await page.touchscreen.tap(after.x, after.y)
+        await page.touchscreen.tap(after.x, after.y)
+        await expect.poll(async () => browsers(await clicksSeen(page)).length, 'clicks of two taps').toBe(2)
+        const clicks = browsers(await clicksSeen(page))
+        test.info().annotations.push({ type: 'details of the two clicks', description: clicks.map((click) => `${click.named.split(' ')[0] ?? ''} ${String(click.detail)}`).join(', ') })
+        // A click that names a link opens it, as the browser's own does; a click on text adds a link's click when its detail is 1 and none for another.
+        const expected = clicks.filter((click) => click.named.startsWith('link') || click.detail === 1).length
+        expect(clicks[0]?.detail, 'the first tap’s click').toBe(1)
+        expect((await openedLinks(page)).length, 'links opened by the two taps').toBe(expected)
+      })
+
+      test(`opens nothing for a mouse's click on the text, and nothing for a mouse drag that ends there, and stops neither, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio, extra: TEXT_AFTER_LINK })
+        const after = await pointOnTextAfter(page, DOCS)
+        await page.mouse.click(after.x, after.y)
+        await expect.poll(async () => browsers(await clicksSeen(page)).length, 'a mouse click').toBe(1)
+        expect(await openedLinks(page), 'links opened by a mouse click on plain text').toEqual([])
+        await page.mouse.move(after.x, after.y)
+        await page.mouse.down()
+        await page.mouse.move(after.x + 14, after.y, { steps: 4 })
+        await page.mouse.up()
+        await expect.poll(async () => (await clicksSeen(page)).filter((click) => click.phase === 'bubble' && click.trusted).length, 'clicks that reached the page').toBeGreaterThanOrEqual(1)
+        expect(await openedLinks(page), 'links opened by a mouse drag that ends on plain text').toEqual([])
+        expect(handlers(await clicksSeen(page)), 'clicks that the page added for a mouse').toEqual([])
+      })
+
+      test(`goes by the browser's click for Enter and Space on a focused link, with a fresh tap on another link's text before, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio, extra: TEXT_AFTER_LINK })
+        const after = await pointOnTextAfter(page, DOCS)
+        await page.touchscreen.tap(after.x, after.y)
+        await expect.poll(() => openedLinks(page), 'the tap').toEqual([DOCS])
+        await page.locator('.m-node .md-link[title="https://example.org/list-1"]').evaluate((element) => {
+          element.focus({ preventScroll: true })
+        })
+        await page.keyboard.press('Enter')
+        await page.keyboard.press('Space')
+        expect(await openedLinks(page), 'links opened by the tap, Enter and Space').toEqual([DOCS, 'https://example.org/list-1', 'https://example.org/list-1'])
+        const keyed = browsers(await clicksSeen(page)).filter((click) => click.detail === 0)
+        expect(keyed.map((click) => click.named), 'the clicks of the keyboard').toEqual(['link https://example.org/list-1', 'link https://example.org/list-1'])
+      })
+    }
+
+    test(`opens the link though the page is busy for 1.7 s after the pointer up, and adds nothing when it is busy for 3.2 s, on ${surface}`, async ({
+      page
+    }) => {
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      const after = await pointOnTextAfter(page, DOCS)
+      await busyAtPointerUp(page, 1700)
+      const soon = await tapAndRead(page, after.x, after.y)
+      expect(soon.opened, 'links opened by a click 1.7 s after the pointer up').toEqual([DOCS])
+      await busyAtPointerUp(page, 3200)
+      const late = await tapAndRead(page, after.x, after.y)
+      expect(late.opened, 'links opened by a click 4.9 s after the pointer up, by a record that old').toEqual([])
+      expect(handlers(late.clicks), 'clicks that the page added to a click with an old record').toEqual([])
+      expect(late.clicks.filter((click) => click.phase === 'bubble' && click.trusted).length, 'the late click reached the page: nothing stopped it').toBe(1)
+    })
+
+    test(`does not open a link whose destination changed during the press on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      const after = await pointOnTextAfter(page, DOCS)
+      // After the pane's own handler of the press's start: the page changes what the link opens.
+      await page.evaluate((href) => {
+        window.addEventListener('pointerdown', () => {
+          const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${href}"]`)
+          if (link) link.title = 'https://example.org/changed'
+        })
+      }, DOCS)
+      const made = await tapAndRead(page, after.x, after.y)
+      expect(made.opened, 'links opened by a press on a link whose destination changed').toEqual([])
+      expect(handlers(made.clicks), 'clicks that the page added to a press on a link whose destination changed').toEqual([])
+    })
+
+    test(`opens nothing for a touch that moves beyond the slop on ${surface}`, async ({ page, browserName }) => {
+      test.skip(browserName !== 'chromium', 'the touch is moved through the Chromium protocol: WebKit has no tool for a touch that moves')
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      const after = await pointOnTextAfter(page, DOCS)
+      const session = await page.context().newCDPSession(page)
+      const touch = (type: 'touchStart' | 'touchMove' | 'touchEnd', y: number): Promise<unknown> =>
+        session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x: after.x, y }] })
+      await touch('touchStart', after.y)
+      await touch('touchMove', after.y - 14)
+      await touch('touchMove', after.y - 30)
+      await touch('touchEnd', after.y - 30)
+      await page.waitForTimeout(400)
+      expect(await openedLinks(page), 'links opened by a touch that moved').toEqual([])
+    })
+
+    test(`gives the pressed look to the link a press starts near and takes it off at the pointer up, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      const after = await pointOnTextAfter(page, DOCS)
+      await page.mouse.move(after.x, after.y)
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look at the press’s start').toBe(1)
+      await page.mouse.up()
+      expect(await pressedLooks(page), 'the pressed look after the press').toBe(0)
+      const far = await wordsOf(page, DOCS)
+      await page.mouse.move(far.right + 60, far.y)
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look for a press that no link’s target holds').toBe(0)
+      await page.mouse.up()
+    })
+
+    test(`leaves a press on something outside the pane alone, though a link of the pane lies under it, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      const after = await pointOnTextAfter(page, DOCS)
+      // A sheet over the pane, with plain words where the pane's link has its reach.
+      await page.evaluate(({ x, y }) => {
+        const sheet = document.createElement('div')
+        sheet.id = 'case-sheet'
+        sheet.style.cssText = 'position: fixed; inset: 0; z-index: 99999; background: white'
+        const words = document.createElement('p')
+        words.textContent = 'plain words of the sheet'
+        words.style.cssText = `position: absolute; left: ${String(x - 40)}px; top: ${String(y - 20)}px; width: 160px; height: 40px; margin: 0`
+        sheet.append(words)
+        document.body.append(sheet)
+      }, after)
+      const made = await tapAndRead(page, after.x, after.y)
+      expect(handlers(made.clicks), 'clicks that the page added to a tap on the sheet').toEqual([])
+      expect(await pressedLooks(page), 'the pressed look after the press on the sheet').toBe(0)
+      expect(made.opened, 'links of the pane opened by a tap on the sheet').toEqual([])
+    })
+  }
+})
+
+// KR-REQ-13.19, the pane as it ships (with its own `tabindex`): the words of a link open it, and a
+// tap on the text after it does.
+test.describe('a tap on the pane as it ships', () => {
+  test.use({ hasTouch: true })
+  for (const surface of SURFACES) {
     test(`opens a link on its words and on the text after it, with the pane's own tabindex, on ${surface}`, async ({ page }) => {
       await pressPage(page, surface, { shipped: true, extra: TEXT_AFTER_LINK })
       expect(await page.locator('.m-pane').getAttribute('tabindex'), 'the pane as it ships').not.toBeNull()
       const words = await wordsOf(page, 'https://example.org/table-1')
-      await page.mouse.click(words.x, words.y)
-      expect(await openedLinks(page), 'links opened by a press on the words').toEqual(['https://example.org/table-1'])
+      expect((await tapAndRead(page, words.x, words.y)).opened, 'links opened by a tap on the words').toEqual(['https://example.org/table-1'])
       const text = await pointOnTextAfter(page, DOCS)
-      await page.mouse.click(text.x, text.y)
-      expect(await openedLinks(page), 'links opened by a press on the text after a link').toEqual(['https://example.org/table-1', DOCS])
+      expect((await tapAndRead(page, text.x, text.y)).opened, 'links opened by a tap on the text after a link').toEqual([DOCS])
     })
   }
 })
 
-test.describe('a tap on the pane as it ships', () => {
+/** What a finger meets, in CSS pixels: 44 points on iOS and 48 dp on Android. */
+const FINGER = { ios: 44, android: 48 } as const
+
+const PLAIN = 'Plain words that hold no link, there to give the page room above and below.'
+const CLOSE = ['[the first close link](https://example.org/close-1)  \n[the second close link](https://example.org/close-2)']
+
+/** Taps one point, and says which link it opened, if any: the link that the page's own opened-links list gained. */
+async function tapAt(page: Page, x: number, y: number): Promise<string | null> {
+  const made = await tapAndRead(page, x, y)
+  return made.opened[made.opened.length - 1] ?? null
+}
+
+// KR-REQ-13.19: the area in which a tap opens a link is at least the size the platform asks for around
+// the link's words (44 points on iOS and 48 dp on Android, in every direction), and where two links
+// stand closer than that, the nearer words have the area between them. The case taps a ring of points
+// around the words of a link in the middle of a line, and every point of the axis between two links
+// on neighbouring lines. Where the browser's own hit test names a link's button, that link opens, as
+// on a desktop; everywhere else the nearer words win.
+test.describe('the area in which a tap opens a link', () => {
   test.use({ hasTouch: true })
-  for (const surface of ['ios', 'android'] as const) {
-    test(`opens a link on its words and on the text after it, with the pane's own tabindex, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface, { shipped: true, extra: TEXT_AFTER_LINK })
-      const words = await wordsOf(page, 'https://example.org/table-1')
-      await page.touchscreen.tap(words.x, words.y)
-      await expect.poll(() => openedLinks(page), 'links opened by a tap on the words').toEqual(['https://example.org/table-1'])
-      const text = await pointOnTextAfter(page, DOCS)
-      await page.touchscreen.tap(text.x, text.y)
-      await expect.poll(() => openedLinks(page), 'links opened by a tap on the text after a link').toEqual(['https://example.org/table-1', DOCS])
-    })
-  }
-})
-
-test.describe('the edges of a press on a link', () => {
-  for (const surface of ['ios', 'android'] as const) {
-    test(`leaves a press that moved away cancelled when a keyboard clicks while the pointer is down, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface)
-      const one = await wordsOf(page, 'https://example.org/table-1')
-      const two = await centreOf(page, 'https://example.org/table-2')
-      await page.mouse.move(one.x, one.y)
-      await page.mouse.down()
-      await page.mouse.move(two.x, two.y, { steps: 4 })
-      // The keyboard clicks another link while the pointer is down, and it opens that link as it is.
-      await page.locator('.m-node .md-link[title="https://example.org/list-1"]').evaluate((element) => {
-        element.focus({ preventScroll: true })
-      })
-      await page.keyboard.press('Enter')
-      await page.mouse.up()
-      expect(await openedLinks(page), 'links opened: the keyboard’s, and not the press that moved away').toEqual(['https://example.org/list-1'])
-    })
-
-    test(`leaves a press that moved away cancelled when its click comes long after its end, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface)
-      const one = await wordsOf(page, 'https://example.org/table-1')
-      const two = await centreOf(page, 'https://example.org/table-2')
-      await page.evaluate(() => {
-        window.addEventListener('pointerup', () => {
-          const end = performance.now() + 1700
-          while (performance.now() < end) {
-            // Busy.
+  for (const surface of SURFACES) {
+    for (const [size, ratio] of SIZES) {
+      test(`is at least the least size around a link's words on ${surface} at ${size} text size`, async ({ page }) => {
+        await pressPage(page, surface, { scale: ratio, only: [PLAIN, PLAIN, ...MIDDLE, PLAIN, PLAIN] })
+        const half = FINGER[surface] / 2 - 1
+        const words = await wordsOf(page, MIDDLE_LINK)
+        const missed: string[] = []
+        // The corners and the middles of the sides of a square of the least size about the words' middle.
+        for (const dy of [-half, 0, half]) {
+          for (const dx of [-half, 0, half]) {
+            const opened = await tapAt(page, words.x + dx, words.y + dy)
+            if (opened !== MIDDLE_LINK) missed.push(`${String(dx)}, ${String(dy)}`)
           }
-        })
+        }
+        expect(missed, 'points of the least size about the words that opened no link').toEqual([])
       })
-      // The press ends on another link, which is no press of that link: the click that comes late opens nothing.
-      await page.mouse.move(one.x, one.y)
-      await page.mouse.down()
-      await page.mouse.move(two.x, two.y, { steps: 4 })
-      await page.mouse.up()
-      expect(await openedLinks(page), 'links opened by a click of a cancelled press that came after its record was stale').toEqual([])
-    })
 
-    test(`ignores a second pointer that comes down while a press is held, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
-      const text = await pointOnTextAfter(page, DOCS)
-      await page.mouse.move(text.x, text.y)
-      await page.mouse.down()
-      // A second finger comes down on the same text and stays down.
-      await page.evaluate(({ x, y }) => {
-        document.elementFromPoint(x, y)?.dispatchEvent(
-          new PointerEvent('pointerdown', { pointerId: 7, pointerType: 'touch', isPrimary: false, button: 0, clientX: x, clientY: y, bubbles: true, cancelable: true, composed: true })
-        )
-      }, text)
-      await page.mouse.up()
-      expect(await openedLinks(page), 'links opened by the first pointer’s press').toEqual([DOCS])
-    })
-
-    test(`opens the link of a press whose click comes long after its end, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
-      const text = await pointOnTextAfter(page, DOCS)
-      // The page stays busy after the press ends for longer than a click is waited for.
-      await page.evaluate(() => {
-        window.addEventListener('pointerup', () => {
-          const end = performance.now() + 1700
-          while (performance.now() < end) {
-            // Busy.
-          }
-        })
+      test(`goes between two links on neighbouring lines to the one the browser names, or else the nearer words, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio, only: [PLAIN, PLAIN, ...CLOSE, PLAIN, PLAIN] })
+        const first = await wordsOf(page, 'https://example.org/close-1')
+        const second = await wordsOf(page, 'https://example.org/close-2')
+        const x = first.left + 10
+        const wrong: string[] = []
+        for (let y = first.y; y <= second.y; y += 2) {
+          const expected = await page.evaluate(
+            ({ px, py }) => {
+              const named = document.elementFromPoint(px, py)?.closest('.md-link')
+              if (named) return named.getAttribute('title')
+              const distance = (href: string): number => {
+                const label = document.querySelector(`.m-node .md-link[title="${href}"] .md-link-label`)
+                const range = document.createRange()
+                if (label) range.selectNodeContents(label)
+                const rect = range.getBoundingClientRect()
+                return Math.hypot(Math.max(rect.left - px, 0, px - rect.right), Math.max(rect.top - py, 0, py - rect.bottom))
+              }
+              return distance('https://example.org/close-1') <= distance('https://example.org/close-2')
+                ? 'https://example.org/close-1'
+                : 'https://example.org/close-2'
+            },
+            { px: x, py: y }
+          )
+          const opened = await tapAt(page, x, y)
+          if (opened !== expected) wrong.push(`y ${String(Math.round(y - first.y))}: ${String(opened)}, expected ${String(expected)}`)
+        }
+        expect(wrong, 'taps on the axis between the two links that opened the other link or none').toEqual([])
       })
-      await page.mouse.click(text.x, text.y)
-      await expect.poll(() => openedLinks(page), 'links opened by a click that comes after the press’s record is stale').toEqual([DOCS])
-    })
-
-    test(`leaves a press on something outside the pane alone, though a link of the pane lies under it, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface)
-      const one = await wordsOf(page, 'https://example.org/table-1')
-      // A sheet over the pane, with a link of its own where the pane's link lies.
-      await page.evaluate(({ x, y }) => {
-        const sheet = document.createElement('div')
-        sheet.style.cssText = 'position: fixed; inset: 0; z-index: 99999'
-        const button = document.createElement('button')
-        button.className = 'md-link'
-        button.textContent = 'a link of the sheet'
-        button.style.cssText = `position: absolute; left: ${String(x - 40)}px; top: ${String(y - 20)}px; width: 80px; height: 40px`
-        const counted = window as unknown as { sheetClicks: number }
-        counted.sheetClicks = 0
-        button.addEventListener('click', () => {
-          counted.sheetClicks += 1
-        })
-        sheet.append(button)
-        document.body.append(sheet)
-      }, one)
-      await page.mouse.move(one.x, one.y)
-      await page.mouse.down()
-      expect(await pressedLooks(page), 'the pressed look while the press is on the sheet').toBe(0)
-      await page.mouse.up()
-      expect(await page.evaluate(() => (window as unknown as { sheetClicks: number }).sheetClicks), 'clicks of the sheet’s own link').toBe(1)
-      expect(await openedLinks(page), 'links of the pane opened by a click on the sheet').toEqual([])
-    })
+    }
   }
 })
