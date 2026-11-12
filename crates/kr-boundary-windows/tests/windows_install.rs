@@ -2749,6 +2749,11 @@ fn a_root_that_a_broker_makes_between_the_listing_of_the_roots_and_the_journal_r
     });
     install::make_data_directory(&paths).expect("a root made between the two reads is in use");
     assert!(paths.run.join(&second).exists(), "the seam ran");
+    assert_eq!(
+        install::testing::listing_the_function_ran_after(),
+        Some("run"),
+        "it ran after the listing of the roots, not after the listing of staging or of the journal"
+    );
     install::make_data_directory(&paths).expect("both roots are named now");
     let _ = std::fs::remove_dir_all(&folder);
 }
