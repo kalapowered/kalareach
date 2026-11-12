@@ -5180,20 +5180,22 @@ fn pipe_information(
     if answer == 0 { Ok(info) } else { Err(answer) }
 }
 
-/// How many bytes this end of a pipe has written that the other end has not read yet: the quota of
-/// the outbound buffer less what is left of it.
+/// How much of the quota for writing on this end is in use: what this end has written that the other
+/// end has not read, and what a read of the other end that waits reserves for the data that it
+/// expects. The driver counts both.
 #[cfg(feature = "testing")]
-fn unread_by_the_other_end(handle: windows_sys::Win32::Foundation::HANDLE) -> u32 {
+fn quota_in_use_by_the_other_end(handle: windows_sys::Win32::Foundation::HANDLE) -> u32 {
     let info = pipe_information(handle)
         .unwrap_or_else(|status| panic!("reading what a pipe holds: status {status:#x}"));
     info.OutboundQuota.saturating_sub(info.WriteQuotaAvailable)
 }
 
-/// The control of [`unread_by_the_other_end`]: on a pipe that nobody reads, what was written is
-/// counted as unread, and once it is read the count is zero again. Without this a reading of zero
-/// would show nothing.
+/// The control of [`quota_in_use_by_the_other_end`], on a pipe that this case reads itself: what is
+/// written and not read is counted, and once it is read the count is zero; a read that waits for
+/// ninety bytes is counted as ninety, and once the bytes come it is zero again. Without this a
+/// reading would show nothing about a server.
 #[cfg(feature = "testing")]
-fn the_count_of_unread_bytes_follows_a_pipe_that_is_read() {
+fn the_quota_in_use_follows_what_is_written_and_what_a_waiting_read_expects() {
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::Pipes::CreatePipe;
     let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
@@ -5203,53 +5205,84 @@ fn the_count_of_unread_bytes_follows_a_pipe_that_is_read() {
         0
     );
     let (read, write) = (
-        ffi::Handle::new(read, "a pipe's read end").unwrap(),
+        std::sync::Arc::new(ffi::Handle::new(read, "a pipe's read end").unwrap()),
         ffi::Handle::new(write, "a pipe's write end").unwrap(),
     );
-    let mut moved = 0_u32;
-    // SAFETY: the buffer is fourteen bytes and the handle is open.
-    let written = unsafe {
-        WriteFile(
-            write.raw(),
-            b"0123456789abcd".as_ptr(),
-            14,
-            &raw mut moved,
-            std::ptr::null_mut(),
-        )
+    let write_all = |bytes: &[u8]| {
+        let mut moved = 0_u32;
+        // SAFETY: the buffer and the handle are valid for the call.
+        let written = unsafe {
+            WriteFile(
+                write.raw(),
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &raw mut moved,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            written != 0 && moved as usize == bytes.len(),
+            "the probe's pipe takes the bytes"
+        );
     };
-    assert!(
-        written != 0 && moved == 14,
-        "the probe's pipe takes 14 bytes"
-    );
+    let read_some = |read: &ffi::Handle, wanted: u32| {
+        let mut buffer = vec![0_u8; wanted as usize];
+        let mut moved = 0_u32;
+        // SAFETY: the buffer and the handle are valid for the call.
+        let taken = unsafe {
+            ReadFile(
+                read.raw(),
+                buffer.as_mut_ptr(),
+                wanted,
+                &raw mut moved,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(taken != 0, "the probe's pipe gives bytes");
+        moved
+    };
+    write_all(b"0123456789abcd");
     assert_eq!(
-        unread_by_the_other_end(write.raw()),
+        quota_in_use_by_the_other_end(write.raw()),
         14,
         "the bytes that nobody read are counted"
     );
-    let mut buffer = [0_u8; 14];
-    // SAFETY: the buffer is fourteen bytes and the handle is open.
-    let taken = unsafe {
-        ReadFile(
-            read.raw(),
-            buffer.as_mut_ptr(),
-            14,
-            &raw mut moved,
-            std::ptr::null_mut(),
-        )
-    };
-    assert!(taken != 0 && moved == 14, "the probe's pipe gives 14 bytes");
+    assert_eq!(read_some(&read, 14), 14);
     assert_eq!(
-        unread_by_the_other_end(write.raw()),
+        quota_in_use_by_the_other_end(write.raw()),
         0,
         "the bytes that were read are no longer counted"
+    );
+    // A read that waits for ninety bytes. The bytes are written whatever the readings were, so that
+    // the thread ends on every path.
+    let waiting = std::thread::spawn({
+        let read = std::sync::Arc::clone(&read);
+        move || read_some(&read, 90)
+    });
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut seen = 0;
+    while seen != 90 && std::time::Instant::now() < until {
+        seen = quota_in_use_by_the_other_end(write.raw());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    write_all(&[b'x'; 90]);
+    assert_eq!(waiting.join().unwrap(), 90);
+    assert_eq!(
+        seen, 90,
+        "a read that waits for ninety bytes is counted as ninety"
+    );
+    assert_eq!(
+        quota_in_use_by_the_other_end(write.raw()),
+        0,
+        "once the bytes came the waiting read counts no more"
     );
 }
 
 /// A client that has sent part of a frame when the stop comes does not keep the service from
-/// stopping. The client waits until the server has taken what it sent (the pipe holds nothing more
-/// for the server to read), so the server is in its read of the rest of the frame when the stop
-/// comes, and the service must end within three seconds, under the five that the read waits for the
-/// rest.
+/// stopping. The frame announces a hundred bytes and carries ten; the client waits until the quota
+/// in use on its end is the ninety bytes that the server's read of the rest of the frame waits for,
+/// so the server is in that read when the stop comes, and the service must end within three
+/// seconds, under the five that the read waits for the rest.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
@@ -5258,7 +5291,7 @@ fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
     if needs_the_system() {
         return;
     }
-    the_count_of_unread_bytes_follows_a_pipe_that_is_read();
+    the_quota_in_use_follows_what_is_written_and_what_a_waiting_read_expects();
     let mut served = serve_in_process();
     let client = RawClient::open(persons_pipe_name(), &[SYSTEM_SID, ADMINISTRATORS_SID]);
     let mut hello = Vec::new();
@@ -5284,46 +5317,29 @@ fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
         raw_transfer(client.0.raw(), true, part).is_some(),
         "the part of the frame is written"
     );
+    // The server has taken the header and the ten bytes of the body when what its read of the rest
+    // reserves is all that is in use. It must be there well inside the five seconds that the read
+    // waits, and the stop comes then.
     let begun = std::time::Instant::now();
-    let until = begun + std::time::Duration::from_secs(10);
-    let mut first = None;
-    let mut samples = Vec::new();
+    let until = begun + std::time::Duration::from_secs(3);
+    let mut readings = Vec::new();
     loop {
-        let info = pipe_information(client.0.raw());
-        let unread = info.map(|info| info.OutboundQuota.saturating_sub(info.WriteQuotaAvailable));
-        if samples.len() < 8 || samples.len() % 100 == 0 {
-            samples.push(format!(
-                "{} ms: {:?}",
-                begun.elapsed().as_millis(),
-                info.map(|info| (
-                    info.InboundQuota,
-                    info.ReadDataAvailable,
-                    info.OutboundQuota,
-                    info.WriteQuotaAvailable,
-                    info.NamedPipeEnd,
-                    info.NamedPipeState
-                ))
-            ));
+        let in_use = quota_in_use_by_the_other_end(client.0.raw());
+        if readings.last() != Some(&in_use) {
+            readings.push(in_use);
         }
-        let unread = unread.unwrap_or_else(|status| {
-            panic!("reading what the pipe holds: status {status:#x}; samples (inbound quota, read data available, outbound quota, write quota available, end, state) {samples:?}")
-        });
-        first.get_or_insert(unread);
-        if unread == 0 {
+        if in_use == 90 {
             break;
         }
         assert!(
             std::time::Instant::now() < until,
-            "the server did not take the {unread} bytes of the frame that were written: it never reached its read; samples {samples:?}"
+            "the server's read of the rest of the frame was not there in three seconds: quota in use {readings:?}"
         );
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
     eprintln!(
-        "EVIDENCE: samples of the client end (inbound quota, read data available, outbound quota, write quota available, end, state): {samples:?}"
-    );
-    eprintln!(
-        "EVIDENCE: the part of the frame that the server had not yet read right after the write: {} of 14 bytes",
-        first.unwrap_or(0)
+        "EVIDENCE: quota in use on the client's end after the part of the frame, by change: {readings:?}, ninety after {:?}",
+        begun.elapsed()
     );
     // The bound is under the five seconds that the connection's read waits for the rest of a
     // frame, so only the stop can have ended it.
