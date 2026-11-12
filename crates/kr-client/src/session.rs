@@ -173,6 +173,8 @@ impl Settled {
 struct Waiters {
     pending: HashMap<RequestId, oneshot::Sender<Answer>>,
     ended: bool,
+    /// What the host refused the connection with, when it did: the session ended with it.
+    refusal: Option<kr_protocol::error::ProtocolError>,
 }
 
 /// One mutation this client sent and has not seen settled.
@@ -1632,7 +1634,10 @@ impl Session {
     fn register(&self, request_id: RequestId) -> Result<Waiter> {
         let mut waiters = self.state.waiters();
         if waiters.ended {
-            return Err(ClientError::ConnectionEnded);
+            return Err(waiters
+                .refusal
+                .clone()
+                .map_or(ClientError::ConnectionEnded, ClientError::Host));
         }
         let (sender, receiver) = oneshot::channel();
         waiters.pending.insert(request_id, sender);
@@ -1757,6 +1762,39 @@ fn word_of(response: &Response) -> HostWord {
     }
 }
 
+/// Takes the host's refusal of the connection: the first error answered with request identifier
+/// zero. The session ends with it, and every call, one waiting and one made later, is answered with
+/// that error in the form of a host's answer to the call, in place of a connection that ended.
+/// Returns whether this was the first such error; any later one changes nothing.
+async fn refused_by_the_host(
+    state: &Arc<SessionState>,
+    error: &kr_protocol::error::ProtocolError,
+) -> bool {
+    let pending = {
+        let mut waiters = state.waiters();
+        if waiters.refusal.is_some() {
+            return false;
+        }
+        waiters.refusal = Some(error.clone());
+        waiters.ended = true;
+        std::mem::take(&mut waiters.pending)
+    };
+    for (request_id, sender) in pending {
+        let response = Response {
+            request_id,
+            outcome: Outcome::Error(error.clone()),
+        };
+        match word_of(&response) {
+            HostWord::Definite => state.outcomes.lock().await.settle(request_id),
+            HostWord::Transient => state.outcomes.lock().await.refuse_for_now(request_id),
+            HostWord::Unknown => state.outcomes.lock().await.leave_unresolved(request_id),
+        }
+        let _ = sender.send(Answer::Response(response));
+    }
+    state.ended.send_replace(true);
+    true
+}
+
 /// Routes one frame, and returns whether the session may continue.
 ///
 /// A frame that does not belong on this ingress ends the session. The union is closed so that a
@@ -1778,6 +1816,13 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
                 && !unsignalled
             {
                 state.denied.notify_one();
+            }
+            // Request identifier zero is no request of this client's, which numbers its own from
+            // one: an error with it is the host's word on the connection itself, which it refuses.
+            if request_id == RequestId::new(0)
+                && let Outcome::Error(error) = &response.outcome
+            {
+                return !refused_by_the_host(state, error).await;
             }
             // A correlated answer settles the action *when it is definite*. Most are: the host
             // reached a decision about whatever the request carried, and settling it here rather

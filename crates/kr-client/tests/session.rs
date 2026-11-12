@@ -165,6 +165,10 @@ struct HostScript {
     swallow_reads: Mutex<u32>,
     /// The identities of the reads that were swallowed, in order.
     swallowed: Mutex<Vec<kr_protocol::ids::RequestId>>,
+    /// Refuse the connection, right after the hello is acknowledged, with an answer of request
+    /// identifier zero that succeeds and then two errors with these codes, as a host does that
+    /// refuses a connection it has admitted.
+    refuse_the_connection_with: Mutex<Option<(ErrorCode, ErrorCode)>>,
     /// Whether a local host reads nothing from a connection yet, as a peer that has stopped reading.
     unread: std::sync::atomic::AtomicBool,
     /// Told when `unread` changes.
@@ -3127,6 +3131,20 @@ fn spawn_local_host(
                 {
                     return;
                 }
+                if let Some((first, second)) = *script.refuse_the_connection_with.lock().await {
+                    for outcome in [
+                        Outcome::Ok(ParamsValue::empty()),
+                        Outcome::Error(ProtocolError::new(first, "this connection is refused")),
+                        Outcome::Error(ProtocolError::new(second, "and then again")),
+                    ] {
+                        let _ = writer
+                            .write_message(&ControlFrame::Response(Response {
+                                request_id: kr_protocol::ids::RequestId::new(0),
+                                outcome,
+                            }))
+                            .await;
+                    }
+                }
                 // A peer that has stopped reading takes nothing more until it is told to.
                 loop {
                     let changed = script.reading.notified();
@@ -3269,6 +3287,50 @@ async fn the_local_path_is_a_socket_and_the_remote_path_is_iroh_behind_one_seam(
 
     serving_locally.abort();
     serving_remotely.abort();
+}
+
+/// KR-REQ-19.08: a refusal and an end are told apart by the host's answer. An error answered with
+/// request identifier zero, which no request of the client carries, is the host's refusal of the
+/// connection itself: the session ends with it at once, whatever the host goes on to do, and every
+/// call, one waiting for its answer and one made after, gets that error in the form of a host's
+/// answer, with its code, retry category and text, and not a connection that ended. Only the first
+/// such error counts, and an answer with that identifier that succeeds is not one. Both doors of a
+/// host speak to the same session code: the connection a host serves locally, and the paired one.
+#[tokio::test]
+async fn a_refusal_the_host_gives_at_connection_reaches_the_session_with_its_code() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    *script.refuse_the_connection_with.lock().await =
+        Some((ErrorCode::ResourceUnavailable, ErrorCode::PermissionDenied));
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Session::start(transport.shared()).expect("a session");
+    let ended = tokio::time::timeout(Duration::from_secs(10), session.closed()).await;
+    assert!(ended.is_ok(), "the session ends with the refusal");
+    let error = session
+        .read::<_, SessionList>(Method::SessionList, &Empty {})
+        .await
+        .expect_err("the host refused the connection");
+    assert_eq!(
+        error.code(),
+        ErrorCode::ResourceUnavailable,
+        "the first error counts"
+    );
+    assert!(
+        matches!(&error, ClientError::Host(refusal) if refusal.retry == kr_protocol::error::RetryCategory::Transient
+            && refusal.message == "this connection is refused"),
+        "the error is the host's answer, with its retry category and its words: {error:?}"
+    );
+    serving.abort();
 }
 
 /// A connection the caller opened itself, as a client that has a session's worker prove its key

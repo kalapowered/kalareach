@@ -29,6 +29,16 @@ carries a session over a connection the caller opened and checked itself: the de
 reaches a session's own worker that way, once it has confirmed that the process answering is that
 session's worker, and runs the same session above it.
 
+A session ends when the control stream does, and also when the host refuses the connection itself:
+an error answered with request identifier zero, which no request of the client carries, is the
+host's word on the connection, on a local one as on a paired one. The session takes the first such
+error, closes the connection without waiting for the host to, and answers every call, one waiting
+and one made later, with that error in the form of a host's answer, with its code, retry category
+and words, in place of a connection that ended. A later error with that identifier changes
+nothing, and neither does an answer with it that succeeds. A client tells a refusal from an end by
+that code, never by its words: a transient one, such as a host that cannot take another connection
+from this device now, is asked again.
+
 ## What a failure means
 
 `retry` is one table over every error code section 23 requires. Each code has a step, which is what
