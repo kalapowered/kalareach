@@ -52,6 +52,13 @@ impl Contract {
                 ),
             ),
             (
+                "config/read",
+                validator(
+                    "ConfigReadResponse",
+                    include_str!("../schemas/ConfigReadResponse.json"),
+                ),
+            ),
+            (
                 "thread/start",
                 validator(
                     "ThreadStartResponse",

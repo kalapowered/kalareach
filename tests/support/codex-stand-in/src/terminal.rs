@@ -32,6 +32,10 @@ pub(crate) const TURN: i64 = 3;
 /// The requests a person's commands make: forking the thread, and starting a new one.
 const FORK: i64 = 5;
 const NEW: i64 = 6;
+/// The requests that leave the thread a person's command left behind, and the one `/quit` makes
+/// before the connection closes.
+const LEAVE: i64 = 7;
+const QUIT: i64 = 8;
 
 /// The request that begins the terminal's conversation: resuming the saved one it was started
 /// with (`resume <id>`), or a new one.
@@ -40,9 +44,23 @@ fn begin(prompt: &str) -> Value {
         Some(saved) => {
             json!({ "id": THREAD, "method": "thread/resume", "params": { "threadId": saved } })
         }
-        None => json!({ "id": THREAD, "method": "thread/start", "params": {} }),
+        None => json!({ "id": THREAD, "method": "thread/start", "params": own_thread() }),
     }
 }
+
+/// What the terminal's own `thread/start` asks for: a thread that is kept, whose source is the
+/// person.
+fn own_thread() -> Value {
+    json!({ "ephemeral": false, "threadSource": "user" })
+}
+
+/// The identifiers of the requests the terminal makes for the title of a conversation, as the
+/// pinned terminal names them (each carries a number here where the pinned terminal's carries a
+/// random one).
+const TITLE_CONFIG: &str = "temporary-config-";
+const TITLE_THREAD: &str = "temporary-structured-";
+const TITLE_TURN: &str = "temporary-structured-turn-";
+const TITLE_LEAVE: &str = "temporary-structured-unsubscribe-";
 
 /// Runs the terminal against the server at `socket`, and returns the exit status it ends with.
 pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &str) -> i32 {
@@ -181,6 +199,11 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
     // The thread and the turn the server has said it started.
     let mut thread = String::new();
     let mut turn = String::new();
+    // The threads that have had their title asked for, how many requests that took, and the
+    // thread the terminal started for the title that has not been left yet.
+    let mut titled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut titles = 0_u32;
+    let mut title_thread = String::new();
     // Whether the next answer to `account/read` is the one `ping-when-released` asked for.
     let mut pinged = false;
     // What a terminal under `keep-reading` has to say once the file it waits for exists, each with
@@ -235,15 +258,25 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                         Typed::Command(Command::Fork) => send!(json!({
                             "id": FORK,
                             "method": "thread/fork",
-                            "params": { "threadId": thread }
+                            "params": { "threadId": thread, "threadSource": "user" }
                         })),
                         Typed::Command(Command::New) => {
-                            send!(json!({ "id": NEW, "method": "thread/start", "params": {} }));
+                            send!(
+                                json!({ "id": NEW, "method": "thread/start", "params": own_thread() })
+                            );
                         }
                         Typed::Command(Command::Quit) => {
-                            // A person quitting closes the connection as it leaves.
-                            let _ = connection.send(Message::close(None, "")).await;
-                            return 0;
+                            // A person quitting leaves the thread they are in, and closes the
+                            // connection when the server has answered.
+                            if thread.is_empty() {
+                                let _ = connection.send(Message::close(None, "")).await;
+                                return 0;
+                            }
+                            send!(json!({
+                                "id": QUIT,
+                                "method": "thread/unsubscribe",
+                                "params": { "threadId": thread }
+                            }));
                         }
                         Typed::Decision { request, decision } => {
                             send!(json!({ "id": request, "result": { "decision": decision } }));
@@ -330,15 +363,67 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                             send!(begin(prompt));
                         }
                     }
+                    // The terminal's own request for the title of a conversation: a thread kept
+                    // nowhere and started for that, a turn in it, and its end.
+                    "config/read" if id.trim_matches('"').starts_with(TITLE_CONFIG) => {
+                        send!(json!({
+                            "id": format!("{TITLE_THREAD}{titles}"),
+                            "method": "thread/start",
+                            "params": {
+                                "ephemeral": true,
+                                "threadSource": "system",
+                                "approvalPolicy": "never",
+                                "sandbox": "read-only",
+                                "cwd": std::env::current_dir().unwrap_or_default().display().to_string()
+                            }
+                        }));
+                    }
+                    "thread/start"
+                        if id.trim_matches('"').starts_with(TITLE_THREAD)
+                            && !id.trim_matches('"').starts_with(TITLE_TURN) =>
+                    {
+                        title_thread = frame["result"]["thread"]["id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        send!(json!({
+                            "id": format!("{TITLE_TURN}{titles}"),
+                            "method": "turn/start",
+                            "params": {
+                                "threadId": title_thread,
+                                "input": [{
+                                    "type": "text",
+                                    "text": "Generate a short title for the conversation.",
+                                    "text_elements": []
+                                }]
+                            }
+                        }));
+                    }
+                    "turn/start" if id.trim_matches('"').starts_with(TITLE_TURN) => {}
                     // The thread a person's command forked or started is the one the terminal is on
                     // from here, and no turn begins in it.
                     "thread/fork" | "thread/start"
                         if id == FORK.to_string() || id == NEW.to_string() =>
                     {
-                        thread = frame["result"]["thread"]["id"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned();
+                        let left = std::mem::replace(
+                            &mut thread,
+                            frame["result"]["thread"]["id"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
+                        // The thread shown before is left once the new one has been named.
+                        if !left.is_empty() {
+                            send!(json!({
+                                "id": LEAVE,
+                                "method": "thread/unsubscribe",
+                                "params": { "threadId": left }
+                            }));
+                        }
+                    }
+                    "thread/unsubscribe" if id == QUIT.to_string() => {
+                        let _ = connection.send(Message::close(None, "")).await;
+                        return 0;
                     }
                     "thread/start" | "thread/resume" => {
                         thread = frame["result"]["thread"]["id"]
@@ -390,7 +475,7 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
             Frame::Failure { id, method } if method == "account/login/start" => {
                 sent.remove(&id);
                 say!(screen, "TUI: the sign-in was refused; the stand-in goes on");
-                send!(json!({ "id": THREAD, "method": "thread/start", "params": {} }));
+                send!(json!({ "id": THREAD, "method": "thread/start", "params": own_thread() }));
             }
             Frame::Failure { method, .. } => {
                 say!(screen, "Error: the server refused {method}");
@@ -449,6 +534,41 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                 send!(answer);
             }
             Frame::Notification { method } => {
+                let about_the_title = !title_thread.is_empty()
+                    && (frame["params"]["threadId"] == title_thread.as_str()
+                        || frame["params"]["thread"]["id"] == title_thread.as_str());
+                if about_the_title {
+                    // What happens in the thread the terminal started for a title is not shown. The
+                    // terminal leaves that thread when its turn ends.
+                    if method == "turn/completed" && !variants.keep_the_title_thread {
+                        send!(json!({
+                            "id": format!("{TITLE_LEAVE}{titles}"),
+                            "method": "thread/unsubscribe",
+                            "params": { "threadId": title_thread }
+                        }));
+                        title_thread.clear();
+                    }
+                    continue;
+                }
+                // A person at the terminal has a title asked for once the first message of a
+                // conversation without a name is taken into it.
+                if method == "item/completed"
+                    && screen.is_typed_at()
+                    && frame["params"]["item"]["type"] == "userMessage"
+                    && !thread.is_empty()
+                    && frame["params"]["threadId"] == thread.as_str()
+                    && (titled.insert(thread.clone()) || variants.retitle)
+                {
+                    titles += 1;
+                    send!(json!({
+                        "id": format!("{TITLE_CONFIG}{titles}"),
+                        "method": "config/read",
+                        "params": {
+                            "includeLayers": false,
+                            "cwd": std::env::current_dir().unwrap_or_default().display().to_string()
+                        }
+                    }));
+                }
                 match method.as_str() {
                     "turn/started" => screen.works(true),
                     "turn/completed" => screen.works(false),
@@ -456,7 +576,9 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                     "serverRequest/resolved" => screen.resolved(&frame["params"]["requestId"]),
                     _ => {}
                 }
-                say!(screen, "TUI: {method}");
+                if !matches!(method.as_str(), "item/started" | "item/completed") {
+                    say!(screen, "TUI: {method}");
+                }
                 if variants.answer_the_sum
                     && method == "item/agentMessage/delta"
                     && let Some(answer) = frame["params"]["delta"].as_str()
