@@ -71,7 +71,7 @@ fn a_run_directory_that_holds_something_stays_and_is_named() {
     let failures = case.finish(BOTH);
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
-        failures[0].contains("which still holds an unfinished invocation"),
+        failures[0].contains("failed (") && failures[0].contains("the removal run again reads it"),
         "{failures:?}"
     );
     assert!(failures[0].contains(&case.run.display().to_string()));
