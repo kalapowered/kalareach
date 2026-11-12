@@ -723,14 +723,14 @@ fn inherited_folder() -> PathBuf {
 /// refusal of it is for what the case names and not for an owner that the token's default chose.
 fn owned_dir(path: impl AsRef<Path>) {
     std::fs::create_dir(path.as_ref()).unwrap();
-    give_to(path.as_ref(), "Administrators");
+    give_to(path.as_ref(), "*S-1-5-32-544");
 }
 
 /// Writes a file that the Administrators own, for the same reason as [`owned_dir`].
 #[cfg(feature = "testing")]
 fn owned_file(path: impl AsRef<Path>, bytes: &[u8]) {
     std::fs::write(path.as_ref(), bytes).unwrap();
-    give_to(path.as_ref(), "Administrators");
+    give_to(path.as_ref(), "*S-1-5-32-544");
 }
 
 /// Gives a file or a directory to another account, as the tool does for a person.
@@ -1482,7 +1482,7 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
         assert!(text.contains("Make the Administrators group"), "{text}");
         assert!(text.contains("Do not remove it"), "{text}");
     }
-    give_to(&paths.program, "Administrators");
+    give_to(&paths.program, "*S-1-5-32-544");
     let _ = account::delete(&name);
     let _ = std::fs::remove_dir_all(&target);
     let _ = std::fs::remove_dir_all(&folder);
@@ -2594,7 +2594,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     assert_eq!(summary_of(&paths.journal).entries, before.entries);
     let _ = Command::new("icacls")
         .arg(&paths.journal)
-        .args(["/setowner", "Administrators"])
+        .args(["/setowner", "*S-1-5-32-544"])
         .output();
     let _ = account::delete(&name);
     install::make_data_directory(&paths).expect("the owner is back");
@@ -2602,14 +2602,14 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     // A journal file that another account owns is refused, as is a file that is not a journal's.
     let owned = Command::new("icacls")
         .arg(&journal_file)
-        .args(["/setowner", "Users"])
+        .args(["/setowner", "*S-1-5-32-545"])
         .output()
         .unwrap();
     assert!(owned.status.success(), "{owned:?}");
     moved_aside_with("S-1-5-32-545");
     let _ = Command::new("icacls")
         .arg(&journal_file)
-        .args(["/setowner", "Administrators"])
+        .args(["/setowner", "*S-1-5-32-544"])
         .output();
     owned_file(paths.journal.join("notes.txt"), b"x");
     removal_with("notes.txt");
@@ -2797,7 +2797,7 @@ fn journal_naming(journals: &Path, root: &str, id: u8, finished: bool) -> PathBu
     // broker's journals are the Administrators', and a case that names the root must be refused
     // for the root and not for the file's owner.
     let file = journals.join(format!("{}.journal", format!("{id:02x}").repeat(16)));
-    give_to(&file, "Administrators");
+    give_to(&file, "*S-1-5-32-544");
     file
 }
 
@@ -2888,7 +2888,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
     assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
     assert_eq!(summary_of(&policy), before);
-    give_to(&policy, "Administrators");
+    give_to(&policy, "*S-1-5-32-544");
 
     // A file whose owner is right but whose list names another account, with a right to read only,
     // is refused the same way and is as it was.
@@ -2929,7 +2929,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     std::fs::remove_file(&second).unwrap();
     give_to(&inner, &name);
     refused_with("unlisted.exe");
-    give_to(&inner, "Administrators");
+    give_to(&inner, "*S-1-5-32-544");
 
     // A directory in run that no journal names is refused, with the entry to remove. One that a
     // journal names as unfinished work and another account owns is refused with the owner to
@@ -2948,7 +2948,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     assert!(text.contains("did not make"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
-    give_to(&root, "Administrators");
+    give_to(&root, "*S-1-5-32-544");
     std::fs::write(root.join("anything"), b"x").unwrap();
     install::make_data_directory(&paths).expect("a private root the administrators own");
     std::fs::remove_file(root.join("anything")).unwrap();
@@ -2979,7 +2979,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     assert!(text.contains("journal"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
-    give_to(&paths.journal, "Administrators");
+    give_to(&paths.journal, "*S-1-5-32-544");
     give_to(&paths.manifest, &name);
     let text = install::make_data_directory(&paths)
         .expect_err("a manifest that is owned")
@@ -2992,14 +2992,14 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     assert!(text.contains("did not make"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
     assert!(text.contains("do not remove it"), "{text}");
-    give_to(&paths.manifest, "Administrators");
+    give_to(&paths.manifest, "*S-1-5-32-544");
     install::make_data_directory(&paths).expect("the records are the administrators' again");
 
     // The manifest's replacement that a crash left has a name the layout gives, so it is refused as
     // a record is when another account owns it, and what is there is not removed.
     let replacement = paths.data.join(format!("manifest-{}.new", "ef".repeat(16)));
     std::fs::write(&replacement, b"half").unwrap();
-    give_to(&replacement, "Administrators");
+    give_to(&replacement, "*S-1-5-32-544");
     install::make_data_directory(&paths).expect("a replacement the administrators own");
     give_to(&replacement, &name);
     let text = install::make_data_directory(&paths)
@@ -3012,7 +3012,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     assert!(!text.contains("Remove "), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
     assert_eq!(std::fs::read(&replacement).unwrap(), b"half");
-    give_to(&replacement, "Administrators");
+    give_to(&replacement, "*S-1-5-32-544");
     std::fs::remove_file(&replacement).unwrap();
     install::make_data_directory(&paths).expect("the replacement is gone");
 
