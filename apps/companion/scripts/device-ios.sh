@@ -83,8 +83,35 @@ require_target() {
 
 # What a build is for: the phone's own platform, or the simulator's.
 sdk() { [ "$target" = device ] && echo iphoneos || echo iphonesimulator; }
+
+# The identifier of the simulator `KR_DEVICE` names (its name or its identifier). A destination that
+# names a simulator by its name alone means the newest system installed, so a simulator made on an
+# older system is "not found" as soon as a newer one is installed; its identifier names it on its own
+# system. Two simulators with one name are an error, since either could be meant.
+simulator_id() {
+  xcrun simctl list devices -j | python3 -I -c '
+import json, sys
+
+wanted = sys.argv[1]
+found = [
+    device["udid"]
+    for devices in json.load(sys.stdin)["devices"].values()
+    for device in devices
+    if device["udid"] == wanted or device["name"] == wanted
+]
+if len(found) != 1:
+    sys.stderr.write("device-ios: %d simulators match %r, and one is needed\n" % (len(found), wanted))
+    sys.exit(1)
+print(found[0])
+' "$KR_DEVICE"
+}
+
 destination() {
-  if [ "$target" = device ]; then echo "platform=iOS,id=$KR_DEVICE"; else echo "platform=iOS Simulator,name=$KR_DEVICE"; fi
+  if [ "$target" = device ]; then
+    echo "platform=iOS,id=$KR_DEVICE"
+  else
+    echo "platform=iOS Simulator,id=$(simulator_id || echo no-such-simulator)"
+  fi
 }
 
 # MARK: One thing at a time on the target
