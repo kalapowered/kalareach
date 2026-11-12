@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { CLICK_WITHIN, decide, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
+import { decide, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
 
 /** Links are named by strings here: the decision only compares them. */
 type Id = string
@@ -51,13 +51,18 @@ describe('a click on plain text near the link a touch pressed', () => {
     expect(decide(press(), click(), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
   })
 
+  it('opens the link that the press named, whichever place it has among the links', () => {
+    const second = press({ start: { link: 'lower', destination: LOWER.destination } })
+    expect(decide(second, click({ point: { x: 60, y: 150 } }), layoutOf(UPPER, LOWER))).toEqual({ kind: 'open', link: 'lower' })
+  })
+
   it('opens it for a pen, as for a finger', () => {
     expect(decide(press({ pointerType: 'pen' }), click(), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
   })
 
   it('opens it at the least time and at the last time that a click may come after the pointer up', () => {
     expect(decide(press(), click({ at: 1000 }), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
-    expect(decide(press(), click({ at: 1000 + CLICK_WITHIN }), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
+    expect(decide(press(), click({ at: 4000 }), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
   })
 })
 
@@ -105,7 +110,7 @@ describe('a click with no usable press before it', () => {
   })
 
   it('stands when the click comes more than three seconds after the pointer up', () => {
-    expect(decide(press(), click({ at: 1000 + CLICK_WITHIN + 1 }), layoutOf(UPPER, LOWER))).toEqual(STAND)
+    expect(decide(press(), click({ at: 4001 }), layoutOf(UPPER, LOWER))).toEqual(STAND)
   })
 
   it('stands when the press named no link at its start', () => {
