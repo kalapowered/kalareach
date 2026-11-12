@@ -82,6 +82,21 @@ impl Stop {
         // SAFETY: the event handle is open; a zero wait only reads its state.
         unsafe { WaitForSingleObject(self.0.raw(), 0) == WAIT_OBJECT_0 }
     }
+
+    /// Waits for as long as `duration` or until the event is set, and says whether it is set. A
+    /// pause of a request's own work that the stop must be able to end takes this and not a sleep.
+    #[must_use]
+    pub fn wait(&self, duration: std::time::Duration) -> bool {
+        let milliseconds =
+            u32::try_from(duration.as_millis()).map_or(INFINITE - 1, |left| left.min(INFINITE - 1));
+        // SAFETY: the event handle is open for the length of the wait.
+        unsafe { WaitForSingleObject(self.0.raw(), milliseconds) == WAIT_OBJECT_0 }
+    }
+
+    /// The event's handle, for a wait of another module that the stop must be able to end.
+    pub(super) fn event(&self) -> HANDLE {
+        self.0.raw()
+    }
 }
 
 /// Who is on the other end of a connection, taken from the pipe and never from a message.

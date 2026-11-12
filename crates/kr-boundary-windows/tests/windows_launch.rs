@@ -1776,7 +1776,7 @@ fn the_logs_last_words_are_read_well_inside_their_reserve_for_the_system_and_for
     .unwrap();
     let reserve = Duration::from_secs(20);
     let begun = Instant::now();
-    let words = kr_boundary_windows::win::applocker::latest(&scratch, &env, begun + reserve)
+    let words = kr_boundary_windows::win::applocker::latest(&scratch, &env, begun + reserve, None)
         .expect("the log's last words are read");
     let took = begun.elapsed();
     println!("the log's last words were read in {took:?}: {words}");
@@ -1786,7 +1786,7 @@ fn the_logs_last_words_are_read_well_inside_their_reserve_for_the_system_and_for
         "the query did not enter the last two seconds of its reserve: {took:?}"
     );
     assert!(
-        kr_boundary_windows::win::applocker::latest(&scratch, &env, Instant::now()).is_err(),
+        kr_boundary_windows::win::applocker::latest(&scratch, &env, Instant::now(), None).is_err(),
         "a deadline that has passed reads nothing"
     );
 }
