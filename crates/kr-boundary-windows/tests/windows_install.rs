@@ -5284,7 +5284,8 @@ fn the_quota_in_use_follows_what_is_written_and_what_a_waiting_read_expects() {
 /// stopping. The frame announces a hundred bytes and carries ten; the client waits until the quota
 /// in use on its end is the ninety bytes that the server's read of the rest of the frame waits for,
 /// so the server is in that read when the stop comes, and the service must end within three
-/// seconds, under the five that the read waits for the rest.
+/// seconds of it. Seeing the read pending and the stop's end share one limit of four seconds, under
+/// the five that the read waits for the rest.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
@@ -5320,10 +5321,11 @@ fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
         "the part of the frame is written"
     );
     // The server has taken the header and the ten bytes of the body when what its read of the rest
-    // reserves is all that is in use. It must be there well inside the five seconds that the read
-    // waits, and the stop comes then.
+    // reserves is all that is in use. The read's own deadline is five seconds from the moment that
+    // it began, so the two waits that follow share one limit under it: one second to see the read
+    // pending and three for the stop to end it, four in all.
     let begun = std::time::Instant::now();
-    let until = begun + std::time::Duration::from_secs(3);
+    let until = begun + std::time::Duration::from_secs(1);
     let mut readings = Vec::new();
     loop {
         let in_use = quota_in_use_by_the_other_end(client.0.raw());
@@ -5335,7 +5337,7 @@ fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
         }
         assert!(
             std::time::Instant::now() < until,
-            "the server's read of the rest of the frame was not there in three seconds: quota in use {readings:?}"
+            "the server's read of the rest of the frame was not there in one second: quota in use {readings:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -5343,8 +5345,8 @@ fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
         "EVIDENCE: quota in use on the client's end after the part of the frame, by change: {readings:?}, ninety after {:?}",
         begun.elapsed()
     );
-    // The bound is under the five seconds that the connection's read waits for the rest of a
-    // frame, so only the stop can have ended it.
+    // The one limit, one second and three, is under the five seconds that the connection's read
+    // waits for the rest of a frame, so only the stop can have ended it.
     let ended = served.stops_within(3);
     drop(client);
     assert_eq!(
