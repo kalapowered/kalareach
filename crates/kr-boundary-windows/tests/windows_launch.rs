@@ -1414,6 +1414,39 @@ fn a_program_that_outlasts_the_deadline_is_ended_and_the_call_returns_within_it(
     );
 }
 
+/// A stop that comes while a program of the proof runs ends the program with its job at once: the call
+/// returns at the stop, long before the program's own ten minutes and the deadline it was given, and
+/// the end of the job is proved.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
+    use kr_boundary_windows::win::pipe::Stop;
+    let fixture = Fixture::new();
+    let stop = Stop::new().unwrap();
+    let setter = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        move || {
+            // The program is given this long to be running when the stop comes.
+            std::thread::sleep(Duration::from_secs(3));
+            stop.set();
+        }
+    });
+    let begun = Instant::now();
+    let ran = kr_boundary_windows::win::proof::run_captured_until(
+        proof_run(&fixture, "sleep"),
+        begun + Duration::from_secs(60),
+        Some(&stop),
+    );
+    let elapsed = begun.elapsed();
+    setter.join().unwrap();
+    let ran = ran.expect("a program that the stop reached is ended and proved ended");
+    assert_eq!(ran.outcome, Outcome::TimedOut);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the call did not return at the stop: {elapsed:?}"
+    );
+}
+
 /// How long the name is that the platform gives a pipe's handle: zero for an anonymous pipe, which
 /// has no entry in the pipe namespace and so cannot be opened by name at all.
 fn pipe_name_length(pipe: &Handle) -> usize {
