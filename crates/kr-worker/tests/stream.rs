@@ -2790,18 +2790,19 @@ async fn replay_recording(recording: &str) {
     );
 }
 
-/// KR-REQ-12.06: a thread the terminal starts for its own purposes (the real terminal asks for the
-/// title of a conversation in one, ephemeral and sourced from the system) is not the conversation
+/// A thread the terminal starts for its own purposes (the real terminal asks for the title of a
+/// conversation in one, ephemeral and sourced from the system) is not the conversation
 /// the terminal is in: the binding keeps the conversation's thread, its revision and its turn
 /// through that thread's start, its turn and its leave, whether the prompt was typed at the
 /// terminal or sent by a device.
 ///
 /// Known red at the base of this case: the reader takes the helper's thread as the conversation and
 /// its leave ends it, so the binding is none and suspended with the unread-thread reason. The case
-/// is the cure's own and turns green with it.
+/// is the cure's own: it turns green with it, loses its `ignore` and takes the requirement's
+/// identifier in its name then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "known red until the reader skips a thread the terminal starts for its own purposes"]
-async fn kr_req_12_06_a_thread_the_terminal_starts_for_its_own_purposes_is_not_the_conversation() {
+async fn a_thread_the_terminal_starts_for_its_own_purposes_is_not_the_conversation() {
     replay_recording(TYPED_RECORDING).await;
     replay_recording(DEVICE_RECORDING).await;
 }
