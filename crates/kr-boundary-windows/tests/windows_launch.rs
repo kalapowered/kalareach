@@ -1421,13 +1421,27 @@ fn a_program_that_outlasts_the_deadline_is_ended_and_the_call_returns_within_it(
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
     use kr_boundary_windows::win::pipe::Stop;
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
     let fixture = Fixture::new();
+    let before = pids_named("kr-launch-stand-in");
     let stop = Stop::new().unwrap();
     let setter = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
         move || {
-            // The program is given this long to be running when the stop comes.
-            std::thread::sleep(Duration::from_secs(3));
+            // The stop comes once the program's process exists; the wait for it ends at thirty
+            // seconds, so that the thread ends on every path.
+            let until = Instant::now() + Duration::from_secs(30);
+            while pids_named("kr-launch-stand-in")
+                .difference(&before)
+                .next()
+                .is_none()
+                && Instant::now() < until
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             stop.set();
         }
     });
