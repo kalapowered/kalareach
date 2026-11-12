@@ -22,6 +22,10 @@
 //! This report does not, because a validator built from an earlier package rejects a document that
 //! holds a section it lacks.
 //!
+//! For the plugin SDK's schema the check of a level lets one more kind of member pass, from its own
+//! function (`compare_sdk_for_a_level`): an optional member that the SDK's arrival table lists,
+//! in a release that raises the SDK's version. The report does not read the SDK's schema.
+//!
 //! Until public 1.0 freezes, which is the first client release (a host, command line, desktop or
 //! mobile build published for people to install), the public contract may change with a level move,
 //! and this reports and does not fail: the references are every release at the commit's level.
@@ -276,6 +280,237 @@ pub fn compare_for_a_level(
             }
         }
         lines.push(difference.to_string());
+    }
+    Ok(lines)
+}
+
+/// A version of the plugin SDK as its contract states it: three whole numbers, compared as numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SdkVersion(u64, u64, u64);
+
+impl SdkVersion {
+    /// Reads `major.minor.patch`: three whole numbers made of digits, and nothing else (a
+    /// pre-release, a build or a sign is not one this check reads).
+    ///
+    /// # Errors
+    ///
+    /// When the text is not that.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let number = |part: &str| -> Result<u64, String> {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!(
+                    "{text} is not three whole numbers with dots between"
+                ));
+            }
+            part.parse()
+                .map_err(|_| format!("{text} holds a number that is too large"))
+        };
+        match text.split('.').collect::<Vec<_>>().as_slice() {
+            [major, minor, patch] => Ok(Self(number(major)?, number(minor)?, number(patch)?)),
+            _ => Err(format!(
+                "{text} is not three whole numbers with dots between"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for SdkVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.0, self.1, self.2)
+    }
+}
+
+/// One member that arrived in a definition of the SDK's schema, as a contract lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdkArrival {
+    /// The definition of the SDK's schema.
+    pub definition: String,
+    /// The member's name.
+    pub member: String,
+    /// The SDK version it arrived at.
+    pub version: SdkVersion,
+}
+
+/// What a release's committed package contract says about the SDK: its version, and the members
+/// that arrived inside a level. A contract from before the table has an empty one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdkContract {
+    /// The SDK version the release implements.
+    pub version: SdkVersion,
+    /// The table of arrivals.
+    pub arrivals: Vec<SdkArrival>,
+}
+
+impl SdkContract {
+    /// Reads the committed `package-contract.json`.
+    ///
+    /// # Errors
+    ///
+    /// When it is not JSON, has no `sdk_version` that is text of three numbers, or its
+    /// `arrivals` is not a list of entries that each hold a definition, a member and an SDK
+    /// version and nothing else, with no member listed twice. A contract with no `arrivals` at all
+    /// is one from before the table, and its table is empty.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let document: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let version = document
+            .get("sdk_version")
+            .and_then(Value::as_str)
+            .ok_or("no sdk_version")?;
+        let version =
+            SdkVersion::parse(version).map_err(|error| format!("sdk_version: {error}"))?;
+        let mut arrivals: Vec<SdkArrival> = Vec::new();
+        if let Some(table) = document.get("arrivals") {
+            for entry in table.as_array().ok_or("arrivals is not a list")? {
+                let entry = entry
+                    .as_object()
+                    .ok_or("an entry of arrivals is not an object")?;
+                if let Some(other) = entry
+                    .keys()
+                    .find(|key| !["definition", "member", "sdk_version"].contains(&key.as_str()))
+                {
+                    return Err(format!(
+                        "an entry of arrivals has the member {other}, which this check does not read"
+                    ));
+                }
+                let text_of = |name: &str| -> Result<String, String> {
+                    entry
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("an entry of arrivals has no {name} as text"))
+                };
+                let (definition, member) = (text_of("definition")?, text_of("member")?);
+                let at = SdkVersion::parse(&text_of("sdk_version")?)
+                    .map_err(|error| format!("the entry {definition}.{member}: {error}"))?;
+                if arrivals
+                    .iter()
+                    .any(|listed| listed.definition == definition && listed.member == member)
+                {
+                    return Err(format!("{definition}.{member} is listed twice"));
+                }
+                arrivals.push(SdkArrival {
+                    definition,
+                    member,
+                    version: at,
+                });
+            }
+        }
+        Ok(Self { version, arrivals })
+    }
+
+    fn listing(&self, definition: &str, member: &str) -> Option<&SdkArrival> {
+        self.arrivals
+            .iter()
+            .find(|listed| listed.definition == definition && listed.member == member)
+    }
+}
+
+/// A member of the SDK's schema that the comparison passed because the SDK lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassedMember {
+    /// `Definition.member`.
+    pub member: String,
+    /// The SDK version the head's table lists it at.
+    pub arrived: SdkVersion,
+    /// The SDK version of the release it is new to.
+    pub earlier: SdkVersion,
+}
+
+/// Whether `difference` is a member that arrived in a definition of the SDK's schema in a way the
+/// SDK's table allows. Every one of these holds, or it is a difference like any other:
+///
+/// * it is a member added to a definition, with no nesting: not a member of a variant, an item or
+///   a value, and not a variant;
+/// * both SDK schemas have the definition, the earlier one without the member and the head's with
+///   it, and the head's does not require it;
+/// * neither release's protocol schema has a definition of that name, because the protocol's own
+///   rule holds what a client of the protocol reads;
+/// * the head's table lists the member at an SDK version above the earlier release's;
+/// * the head's SDK version is above the earlier release's.
+fn is_a_listed_arrival(
+    old: &Value,
+    new: &Value,
+    protocols: (&Value, &Value),
+    earlier: &SdkContract,
+    head: &SdkContract,
+    difference: &Difference,
+) -> Option<PassedMember> {
+    if difference.kind != DifferenceKind::Added || difference.detail != "a member" {
+        return None;
+    }
+    let (definition, member) = difference.at.split_once('.')?;
+    if definition.contains(['.', '#', '[', '{']) || member.contains(['.', '#', '[', '{']) {
+        return None;
+    }
+    let has_no_member = old["$defs"][definition]["properties"]
+        .as_object()
+        .is_some_and(|members| !members.contains_key(member));
+    let has_member = new["$defs"][definition]["properties"]
+        .as_object()
+        .is_some_and(|members| members.contains_key(member));
+    let required = new["$defs"][definition]
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|name| name.as_str() == Some(member)));
+    let shared = [protocols.0, protocols.1]
+        .iter()
+        .any(|protocol| protocol["$defs"].get(definition).is_some());
+    let arrived = head.listing(definition, member)?.version;
+    (has_no_member
+        && has_member
+        && !required
+        && !shared
+        && arrived > earlier.version
+        && head.version > earlier.version)
+        .then(|| PassedMember {
+            member: format!("{definition}.{member}"),
+            arrived,
+            earlier: earlier.version,
+        })
+}
+
+/// As [`compare_for_a_level`], for the plugin SDK's schema, which has its own function so that the
+/// protocol's comparison does not change. A difference passes only when the SDK's own arrival
+/// table lists it ([`is_a_listed_arrival`]); every other difference fails, as it does for the
+/// protocol schema, and so does an entry of the earlier release's table that the head's table
+/// changed or lacks, since a member that passed once is not one the table may take back. Each
+/// member that passes is added to `passed`.
+///
+/// `old` and `new` are the SDK schemas of the earlier release and the head, `protocols` the
+/// protocol schemas of the two, and `earlier` and `head` what their contracts say.
+///
+/// # Errors
+///
+/// When a schema cannot be cut.
+pub fn compare_sdk_for_a_level(
+    old: &Value,
+    new: &Value,
+    protocols: (&Value, &Value),
+    earlier: &SdkContract,
+    head: &SdkContract,
+    passed: &mut Vec<PassedMember>,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for difference in rejected(old, new)? {
+        match is_a_listed_arrival(old, new, protocols, earlier, head, &difference) {
+            Some(member) => passed.push(member),
+            None => lines.push(difference.to_string()),
+        }
+    }
+    for listed in &earlier.arrivals {
+        let (definition, member) = (&listed.definition, &listed.member);
+        match head.listing(definition, member) {
+            Some(now) if now.version == listed.version => {}
+            Some(now) => lines.push(format!(
+                "{definition}.{member} is listed in the arrival table at {} there and at {} here",
+                listed.version, now.version
+            )),
+            None => lines.push(format!(
+                "{definition}.{member} is listed in the arrival table at {} there and is not \
+                 listed here",
+                listed.version
+            )),
+        }
     }
     Ok(lines)
 }

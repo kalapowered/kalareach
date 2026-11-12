@@ -18,6 +18,8 @@
 //! kr-protocol-gen --public-contract               report what a client of an earlier release cannot read of this commit's schema, and fail on it once public 1.0 is frozen
 //! ```
 
+#[cfg(test)]
+mod arrival_tests;
 mod in_level;
 #[cfg(test)]
 mod level_tests;
