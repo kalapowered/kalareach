@@ -4546,12 +4546,17 @@ const SYSTEM_SID: &str = "S-1-5-18";
 const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
 
 /// The broker's own loop, run in this process for the people of everyone, the way the service runs
-/// it: its pipe is bound by the loop, and it ends when the stop is set.
+/// it: its pipe is bound by the loop, and it ends when the stop is set. The value sets the stop when
+/// it is dropped, whatever way the case ends, and waits a short time for the loop's thread, so that
+/// no case leaves a loop and its pipe behind for the next one.
 #[cfg(feature = "testing")]
-fn serve_in_process() -> (
-    std::sync::Arc<kr_boundary_windows::win::pipe::Stop>,
-    std::thread::JoinHandle<Result<(), String>>,
-) {
+struct ServedLoop {
+    stop: std::sync::Arc<kr_boundary_windows::win::pipe::Stop>,
+    thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+#[cfg(feature = "testing")]
+fn serve_in_process() -> ServedLoop {
     use kr_boundary_windows::win::broker;
     use kr_boundary_windows::win::pipe::Stop;
     require_clean_machine();
@@ -4568,7 +4573,52 @@ fn serve_in_process() -> (
             )
         }
     });
-    (stop, thread)
+    ServedLoop {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+#[cfg(feature = "testing")]
+impl ServedLoop {
+    /// Waits for the loop to end by itself for at most `seconds`, and returns what it returned.
+    fn ends_within(&mut self, seconds: u64) -> Result<Result<(), String>, String> {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        while self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            if std::time::Instant::now() >= until {
+                return Err(format!(
+                    "the loop had not ended {seconds} seconds after the stop"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(self
+            .thread
+            .take()
+            .expect("the loop's result is read once")
+            .join()
+            .unwrap())
+    }
+
+    /// Sets the stop, and waits for the loop to end for at most `seconds`.
+    fn stops_within(&mut self, seconds: u64) -> Result<Result<(), String>, String> {
+        self.stop.set();
+        self.ends_within(seconds)
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for ServedLoop {
+    fn drop(&mut self) {
+        self.stop.set();
+        if self.thread.is_some() {
+            let _ = self.ends_within(20);
+        }
+    }
 }
 
 /// A client of the loop, opened as a caller whose token has the named identifiers deny-only: the
@@ -4630,24 +4680,6 @@ fn an_administrators_status_within_thirty_seconds() -> Result<Response, String> 
         .map_err(|failure| format!("status: {failure}"))
 }
 
-/// Waits for the loop to end for at most `seconds`, and returns what it returned.
-#[cfg(feature = "testing")]
-fn ended_within(
-    served: std::thread::JoinHandle<Result<(), String>>,
-    seconds: u64,
-) -> Result<Result<(), String>, String> {
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
-    while !served.is_finished() {
-        if std::time::Instant::now() >= until {
-            return Err(format!(
-                "the loop had not ended {seconds} seconds after the stop"
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    Ok(served.join().unwrap())
-}
-
 /// A stop that comes while clients are connected ends the loop: a person who said hello and waits,
 /// an administrator who said hello and waits and a client that has not sent a byte are each served by
 /// a thread, and a thread whose read the stop interrupted must end with it, so that the service
@@ -4665,14 +4697,13 @@ fn a_stop_with_a_client_connected_ends_the_service() {
         );
         return;
     }
-    let (stop, served) = serve_in_process();
+    let mut served = serve_in_process();
     let mut person = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
     say_hello(&mut person);
     let mut administrator = client_without(&[SYSTEM_SID]);
     say_hello(&mut administrator);
     let silent = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
-    stop.set();
-    let ended = ended_within(served, 20);
+    let ended = served.stops_within(20);
     drop((person, administrator, silent));
     assert_eq!(
         ended.expect("the service ends with its clients still connected"),
@@ -4694,7 +4725,8 @@ fn seven_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administ
         );
         return;
     }
-    let (stop, served) = serve_in_process();
+    let mut served = serve_in_process();
+    let began = std::time::Instant::now();
     let holders: Vec<_> = (0..7)
         .map(|_| {
             let mut connection = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
@@ -4702,9 +4734,15 @@ fn seven_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administ
             connection
         })
         .collect();
+    // The case shows what it means to only if the seven are all inside their bound of five seconds
+    // at once, which is a condition of the case and not of the product.
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(3),
+        "the seven connections were not made within three seconds: {:?}",
+        began.elapsed()
+    );
     let answer = an_administrators_status_within_thirty_seconds();
-    stop.set();
-    let ended = ended_within(served, 20);
+    let ended = served.stops_within(20);
     drop(holders);
     assert!(
         matches!(answer, Ok(Response::Status { .. })),
@@ -4727,7 +4765,8 @@ fn seven_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrato
         );
         return;
     }
-    let (stop, served) = serve_in_process();
+    let mut served = serve_in_process();
+    let began = std::time::Instant::now();
     let flooders: Vec<_> = (0..7)
         .map(|_| {
             let mut connection = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
@@ -4751,9 +4790,14 @@ fn seven_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrato
             connection
         })
         .collect();
+    // The seven are all inside the bound of an answer's write, ten seconds, at once.
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(8),
+        "the seven connections were not filled within eight seconds: {:?}",
+        began.elapsed()
+    );
     let answer = an_administrators_status_within_thirty_seconds();
-    stop.set();
-    let ended = ended_within(served, 20);
+    let ended = served.stops_within(20);
     drop(flooders);
     assert!(
         matches!(answer, Ok(Response::Status { .. })),
@@ -4785,6 +4829,14 @@ fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_ha
         .accept()
         .expect("the failed refill does not end the listener")
         .expect("the client in hand is served");
+    // However this case ends, the stop is set, so that no thread waits on for a client.
+    struct StopWhenDropped(std::sync::Arc<Stop>);
+    impl Drop for StopWhenDropped {
+        fn drop(&mut self) {
+            self.0.set();
+        }
+    }
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let server = std::thread::spawn(move || {
         listener
             .accept()
@@ -4792,7 +4844,15 @@ fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_ha
             .map_err(|failure| failure.to_string())
     });
     let second = std::thread::spawn(|| pipe::connect(std::process::id()).map(drop));
-    let accepted = server.join().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !server.is_finished() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let accepted = if server.is_finished() {
+        server.join().unwrap()
+    } else {
+        Err("the second accept did not return in twenty seconds".to_owned())
+    };
     stop.set();
     let second = second.join().unwrap();
     drop((first, served));
@@ -4893,6 +4953,13 @@ fn the_clients_calls_with(access: u32) -> Result<(), String> {
         // SAFETY: an all-zero record is how a transfer's record begins.
         let mut record: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
         record.hEvent = event.raw();
+        // The record, the event and the buffers stay allocated until the transfer has ended: where it
+        // has not, in the time given, they are leaked, because the platform writes to them when the
+        // transfer ends, which can be after this function has returned.
+        let keep = |record: Box<OVERLAPPED>, event: ffi::Handle| {
+            std::mem::forget(record);
+            std::mem::forget(event);
+        };
         if start(&raw mut *record) == 0 {
             // SAFETY: reads the calling thread's last error.
             let code = unsafe { GetLastError() };
@@ -4902,10 +4969,21 @@ fn the_clients_calls_with(access: u32) -> Result<(), String> {
         }
         if cancel {
             // SAFETY: the transfer belongs to this handle and its record lives here.
-            unsafe { CancelIoEx(pipe.raw(), &raw mut *record) };
+            if unsafe { CancelIoEx(pipe.raw(), &raw mut *record) } == 0 {
+                // SAFETY: reads the calling thread's last error.
+                let code = unsafe { GetLastError() };
+                keep(record, event);
+                return Err(format!("{label}: the cancel failed with error {code}"));
+            }
         }
         // SAFETY: the event is open.
         if unsafe { WaitForSingleObject(event.raw(), 5000) } != WAIT_OBJECT_0 {
+            // SAFETY: the transfer belongs to this handle and its record lives here.
+            unsafe { CancelIoEx(pipe.raw(), &raw mut *record) };
+            // SAFETY: the event is open.
+            if unsafe { WaitForSingleObject(event.raw(), 5000) } != WAIT_OBJECT_0 {
+                keep(record, event);
+            }
             return Err(format!("{label}: the transfer did not end in five seconds"));
         }
         let mut count = 0_u32;
@@ -4919,10 +4997,16 @@ fn the_clients_calls_with(access: u32) -> Result<(), String> {
                 Err(format!("{label}: error {code}"))
             };
         }
+        if cancel {
+            return Err(format!("{label}: the read that was cancelled completed"));
+        }
         Ok(count)
     };
+    // The buffers are leaked with the transfers that may outlive this function (a few hundred bytes
+    // per call of the case).
     let mut request = Vec::new();
     kr_boundary_windows::frame::write(&mut request, &Request::Status {}).unwrap();
+    let request: &'static [u8] = request.leak();
     transfer("the write", false, &|record| {
         // SAFETY: the buffer outlives the call and the transfer ends before this function does.
         unsafe {
@@ -4935,13 +5019,16 @@ fn the_clients_calls_with(access: u32) -> Result<(), String> {
             )
         }
     })?;
-    let mut answer = vec![0_u8; 512];
+    let answer: &'static mut [u8] = vec![0_u8; 512].leak();
     let buffer = answer.as_mut_ptr();
     let length = answer.len() as u32;
-    transfer("the read", false, &|record| {
+    let read = transfer("the read", false, &|record| {
         // SAFETY: the buffer outlives the call and the transfer ends before this function does.
         unsafe { ReadFile(pipe.raw(), buffer, length, std::ptr::null_mut(), record) }
     })?;
+    if read == 0 {
+        return Err("the read: the answer was empty".to_owned());
+    }
     transfer("the cancelled read", true, &|record| {
         // SAFETY: as above.
         unsafe { ReadFile(pipe.raw(), buffer, length, std::ptr::null_mut(), record) }
@@ -4999,6 +5086,22 @@ fn the_clients_open_asks_for_the_least_rights_its_calls_need() {
         Ok(()),
         "the calls with the rights the client asks for: {summary:?}"
     );
+    // A right is needed where the platform refuses a call without it (error 5, access denied); a
+    // failure of another kind says nothing about the right.
+    let inconclusive: Vec<&String> = summary[1..]
+        .iter()
+        .zip(&table[1..])
+        .filter(|(_, (_, outcome))| {
+            outcome
+                .as_ref()
+                .is_err_and(|failure| !failure.ends_with("error 5"))
+        })
+        .map(|(text, _)| text)
+        .collect();
+    assert!(
+        inconclusive.is_empty(),
+        "calls that failed for another reason than a refused right: {inconclusive:?}"
+    );
     let unneeded: Vec<String> = table[1..]
         .iter()
         .filter(|(_, outcome)| outcome.is_ok())
@@ -5034,13 +5137,14 @@ fn a_listener_that_cannot_make_its_instance_ends_the_service_after_its_connectio
     }
     let _clear = ClearRefillFailures;
     kr_boundary_windows::win::pipe::testing::fail_refills(5000);
-    let (_stop, served) = serve_in_process();
+    let mut served = serve_in_process();
     // An administrator's connection has the longest idle bound, so only the stop set at the loop's
     // end can have it ended inside this case's time.
     let mut person = client_without(&[SYSTEM_SID]);
     say_hello(&mut person);
     // The refills fail a thousand times in a row, about twenty seconds, and the loop ends.
-    let ended = ended_within(served, 90)
+    let ended = served
+        .ends_within(90)
         .expect("the loop ends when it cannot make an instance")
         .expect_err("the service ends with the reason");
     assert!(ended.contains("making the pipe"), "{ended}");
@@ -5069,7 +5173,7 @@ fn an_administrators_connection_stays_open_past_the_bound_of_a_persons() {
         );
         return;
     }
-    let (stop, served) = serve_in_process();
+    let mut served = serve_in_process();
     let mut administrator = client_without(&[SYSTEM_SID]);
     say_hello(&mut administrator);
     std::thread::sleep(std::time::Duration::from_secs(8));
@@ -5077,8 +5181,7 @@ fn an_administrators_connection_stays_open_past_the_bound_of_a_persons() {
         std::time::Instant::now() + std::time::Duration::from_secs(10),
     ));
     let answer = install::ask(&mut administrator, &Request::Status {});
-    stop.set();
-    let ended = ended_within(served, 20);
+    let ended = served.stops_within(20);
     drop(administrator);
     assert!(
         matches!(answer, Ok(Response::Status { .. })),
