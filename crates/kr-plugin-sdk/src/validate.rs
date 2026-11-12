@@ -24,9 +24,9 @@ use crate::capability::PluginCapability;
 use crate::connector::{
     BrokerTransport, ConnectorManifest, DecisionDestination, DecisionResponse, FieldPath,
     FieldSegment, Framing, MAX_CLASSIFIED_METHODS, MAX_DECISION_VALUE_BYTES, MAX_FIELD_PATH_DEPTH,
-    MAX_OBSERVED_ROUTES, MAX_RESPONSE_METHODS, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_LITERAL_BYTES,
-    MAX_TEMPLATE_NODES, MethodClass, Observation, Operations, ResponseCorrelation, RouteDirection,
-    TemplateHole,
+    MAX_OBSERVED_ROUTES, MAX_REQUEST_CONDITIONS, MAX_RESPONSE_METHODS, MAX_TEMPLATE_DEPTH,
+    MAX_TEMPLATE_LITERAL_BYTES, MAX_TEMPLATE_NODES, MethodClass, Observation, Operations,
+    RequestCondition, ResponseCorrelation, RouteDirection, TemplateHole,
 };
 use crate::digest::PayloadDigest;
 use crate::effect::{
@@ -3023,6 +3023,7 @@ fn check_observation(
             role: Role::Selection,
             paths: vec![("thread", &selection.thread, messages.result.as_str())],
         });
+        check_hidden_when(&selection.method, &selection.hidden_when, report);
     }
     for leave in &observation.leaves {
         readings.push(Reading {
@@ -3133,6 +3134,48 @@ fn check_observation(
                 started.method
             ),
         );
+    }
+}
+
+/// Checks the conditions under which a selection route's request starts a thread the terminal
+/// never shows.
+///
+/// The host tests each request against them as it forwards it, so the list, each place and each
+/// list of values are bounded, and a condition that lists no value could never be met: a table
+/// that states one is refused, not read as though it stated none, which would make every request
+/// of the route a selection.
+fn check_hidden_when(
+    method: &crate::ids::MethodName,
+    conditions: &[RequestCondition],
+    report: &mut Report,
+) {
+    if conditions.len() > MAX_REQUEST_CONDITIONS {
+        table_invalid(
+            report,
+            format!(
+                "the observation states {} conditions for the requests of {method} that start a thread the terminal never shows; the most is {MAX_REQUEST_CONDITIONS}",
+                conditions.len()
+            ),
+        );
+    }
+    for condition in conditions {
+        check_field_path(
+            &condition.place,
+            &format!(
+                "a condition of the requests of {method} that start a thread the terminal never shows"
+            ),
+            report,
+        );
+        if condition.values.is_empty() || condition.values.len() > MAX_REQUEST_CONDITIONS {
+            table_invalid(
+                report,
+                format!(
+                    "the condition at {} for the requests of {method} lists {} values; the range is 1 to {MAX_REQUEST_CONDITIONS}",
+                    dotted(&condition.place),
+                    condition.values.len()
+                ),
+            );
+        }
     }
 }
 
