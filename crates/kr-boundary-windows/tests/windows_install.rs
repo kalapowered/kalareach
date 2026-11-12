@@ -1621,6 +1621,15 @@ fn the_program_directory_holds_only_the_names_the_installation_gives_each_of_its
     // A configuration that holds anything is not the empty one the manifest records.
     std::fs::write(&config, b"[core]\n").unwrap();
     refused("a configuration that holds settings", "it holds settings");
+    // The text fits the file: the installation makes it, empty, and a repair makes it again. It
+    // does not say that the installation never makes it there.
+    for text in both("a configuration that holds settings") {
+        assert!(text.contains("the installation makes it empty"), "{text}");
+        assert!(
+            !text.contains("not something that the installation makes there"),
+            "{text}"
+        );
+    }
     std::fs::write(&config, b"").unwrap();
     accepted("the configuration emptied again");
 
