@@ -1480,6 +1480,56 @@ async fn an_application_that_resets_a_mouse_encoding_it_is_not_in_leaves_the_ter
     );
 }
 
+/// Attaches `kr` in a terminal to a session whose application, once a line is typed, writes
+/// `printf_format` (a format for the shell's `printf`), and returns what the terminal was sent up
+/// to the end of that output.
+async fn terminal_sent_after_the_application_wrote(printf_format: &str) -> Vec<u8> {
+    let hosted = hosted(&format!(
+        "printf 'ready\\r\\n'; IFS= read -r go; printf '{printf_format}'; \
+         printf 'live-done\\r\\n'; exec cat"
+    ))
+    .await;
+    let display = hosted.display.get().to_string();
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let (queries, keys) =
+        answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!("{} attach {display}", kr().display()),
+        ))
+        .expect("starts the shell");
+    output.expect_within(
+        b"ready",
+        LIVENESS_DEADLINE,
+        "the session's screen reached the terminal",
+    );
+    answered(&output, queries);
+    {
+        let mut writer = keys.lock().expect("the writer is not poisoned");
+        writer.write_all(b"go\r").expect("types into the terminal");
+        writer.flush().expect("and it reaches the command");
+    }
+    output.expect_within(
+        b"live-done",
+        LIVENESS_DEADLINE,
+        "the application's output reached the terminal",
+    );
+    let live = output.bytes();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    live
+}
+
 /// KR-REQ-01.11: a mouse reset with padding inside its escape is read by the attachment as the
 /// session reads it, so the terminal is not written a set of the encoding the application cleared.
 ///
@@ -1491,50 +1541,10 @@ async fn an_application_that_resets_a_mouse_encoding_it_is_not_in_leaves_the_ter
 async fn a_mouse_reset_with_padding_inside_its_escape_is_not_followed_by_a_set_of_the_encoding_it_cleared()
  {
     for padding in ["\\000", "\\177"] {
-        let hosted = hosted(&format!(
-            "printf 'ready\\r\\n'; IFS= read -r go; \
-             printf '\\033[?1000;1006h\\033{padding}[?1006l\\033[?1005l'; \
-             printf 'live-done\\r\\n'; exec cat"
+        let live = terminal_sent_after_the_application_wrote(&format!(
+            "\\033[?1000;1006h\\033{padding}[?1006l\\033[?1005l"
         ))
         .await;
-        let display = hosted.display.get().to_string();
-        let pty = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("opens a terminal");
-        let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-        let (queries, keys) =
-            answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
-        let mut shell = pty
-            .slave
-            .spawn_command(shell_running(
-                &hosted,
-                &format!("{} attach {display}", kr().display()),
-            ))
-            .expect("starts the shell");
-        output.expect_within(
-            b"ready",
-            LIVENESS_DEADLINE,
-            "the session's screen reached the terminal",
-        );
-        answered(&output, queries);
-        {
-            let mut writer = keys.lock().expect("the writer is not poisoned");
-            writer.write_all(b"go\r").expect("types into the terminal");
-            writer.flush().expect("and it reaches the command");
-        }
-        output.expect_within(
-            b"live-done",
-            LIVENESS_DEADLINE,
-            "the application's output reached the terminal",
-        );
-        let live = output.bytes();
-        let _ = shell.kill();
-        let _ = shell.wait();
         for (model, held) in [
             ("Terminal.app and iTerm", mouse_encoding(&live)),
             ("xterm", mouse_encoding_by_xterm(&live)),
@@ -1543,6 +1553,50 @@ async fn a_mouse_reset_with_padding_inside_its_escape_is_not_followed_by_a_set_o
                 held,
                 None,
                 "{model} holds the default encoding the session holds after a reset padded with {padding}: {}",
+                String::from_utf8_lossy(&live).escape_debug()
+            );
+        }
+    }
+}
+
+/// KR-REQ-01.11: the longest list the session reads is read by the attachment, and one byte more is
+/// passed over by both.
+///
+/// The session's lexer keeps a sequence of at most 256 bytes. A reset of 1006 in a list of exactly
+/// that length clears the encoding, so the terminal is not written a set of it after the
+/// application's `?1005l`. One byte more is a sequence the session withholds and does not act on:
+/// 1006 stays in force, the terminal is never sent that reset, and what the attachment writes after
+/// `?1005l` is what puts Terminal.app and iTerm in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mouse_reset_in_the_longest_list_the_session_reads_is_read_and_one_byte_more_is_not() {
+    let longest = kr_term::lexer::LexLimits::DEFAULT.max_sequence_bytes;
+    // Every slot names a mode the session tracks, because an empty one makes the sequence an
+    // extension: the modes 1 and 12, which are not the mouse's, fill the list.
+    let list = |bytes: usize| {
+        let mut room = bytes - b"\x1b[?".len() - b"1006l".len();
+        let mut list = String::from("\\033[?");
+        if room % 2 == 1 {
+            list.push_str("12;");
+            room -= 3;
+        }
+        list.push_str(&"1;".repeat(room / 2));
+        list.push_str("1006l");
+        list
+    };
+    for (bytes, expected) in [(longest, None), (longest + 1, Some(1006))] {
+        let live = terminal_sent_after_the_application_wrote(&format!(
+            "\\033[?1000;1006h{}\\033[?1005l",
+            list(bytes)
+        ))
+        .await;
+        for (model, held) in [
+            ("Terminal.app and iTerm", mouse_encoding(&live)),
+            ("xterm", mouse_encoding_by_xterm(&live)),
+        ] {
+            assert_eq!(
+                held,
+                expected,
+                "{model} holds the encoding the session holds after a list of {bytes} bytes: {}",
                 String::from_utf8_lossy(&live).escape_debug()
             );
         }
