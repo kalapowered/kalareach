@@ -133,6 +133,13 @@ pub struct Variants {
     /// of its own where it has no words to start one with: the agent's turns are the ones typed at
     /// it or sent to it.
     pub write_the_record: bool,
+    /// The terminal a person is at never leaves the thread it started for a conversation's title:
+    /// it drops the thread without a `thread/unsubscribe`, as a terminal does whose request for the
+    /// title ended in a way that left it nothing to say.
+    pub keep_the_title_thread: bool,
+    /// The terminal a person is at asks for a title again at every message of a conversation, as
+    /// the pinned terminal does while the conversation has no name: the stand-in never names it.
+    pub retitle: bool,
     /// The server answers a turn whose input asks `What is A plus B?` with the sum of the two
     /// numbers, in a message of its own before the turn ends, and the terminal writes it as a row
     /// of its own. The sum is worked out from the input.
@@ -186,6 +193,8 @@ impl Variants {
                 "leave-a-host" => variants.leave_a_host = true,
                 "answer-the-sum" => variants.answer_the_sum = true,
                 "write-the-record" => variants.write_the_record = true,
+                "keep-the-title-thread" => variants.keep_the_title_thread = true,
+                "retitle" => variants.retitle = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }
