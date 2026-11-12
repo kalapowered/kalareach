@@ -206,6 +206,27 @@ pub mod testing {
         *RAN_AFTER.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    static AFTER_THE_INSPECTION: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Runs the function once, right after the removal has inspected the data directory and before
+    /// it decides what to do: a directory that something made after the inspection found none
+    /// there is then there, as it is on a machine where an ordinary account made it in between.
+    pub fn after_the_removal_inspects_the_data_directory(hook: impl FnOnce() + Send + 'static) {
+        *AFTER_THE_INSPECTION
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    pub(super) fn after_the_removal_inspection() {
+        let hook = AFTER_THE_INSPECTION
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     pub(super) fn after_a_read(read: &'static str) {
         let hook = AFTER_A_READ
             .lock()
@@ -1692,11 +1713,12 @@ fn final_dos_path(handle: &ffi::Handle) -> Result<String, Error> {
 
 /// Reads the program directory on a handle that is held, and everything in it on its own handle:
 /// no link, one name for a file, the installation's own owner, and no right for another account to
-/// change it. Nothing is done to the directory before this has passed.
-fn check_program_directory(paths: &Paths) -> Result<(), Error> {
+/// change it. Nothing is done to the directory before this has passed. Returns whether the
+/// directory was there to be opened and approved: a removal deletes the directory only when it was.
+fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
     check_program_parents(paths)?;
     if !paths.program.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let program = paths.program.file_name().unwrap_or_default().to_owned();
     let held = match DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)? {
@@ -1728,7 +1750,14 @@ fn check_program_directory(paths: &Paths) -> Result<(), Error> {
             Cure::OwnerAndList,
         ));
     }
-    inspect_within(paths, Scope::Program, &paths.program, &held, 1)
+    inspect_within(paths, Scope::Program, &paths.program, &held, 1)?;
+    Ok(true)
+}
+
+/// Whether anything is at the path, a link that points nowhere and an entry that cannot be read
+/// included. It is a look for a refusal's reason, and no deletion follows it.
+fn entry_exists(path: &Path) -> bool {
+    !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
 /// The one name a proof directory holds: the unlisted program. Its bytes are those of the system's
@@ -2993,39 +3022,54 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             "run the setup program as an administrator".to_owned(),
         ));
     }
-    if let Some(parent) = check_data_parent(paths)? {
-        // The manifest, the earlier-state record and the journal that the removal reads, and the
-        // directories it removes from, are checked before any of them is used.
-        inspect_existing_data(paths, &parent)?;
-    }
+    // The data directory is opened by handle, checked and read here, in this run, and the removal
+    // acts on it and on what it holds only through what this inspection approved: a path that no
+    // check opened is never read for a manifest and never deleted from. The handles are closed
+    // before anything is deleted.
+    let found = match check_data_parent(paths)? {
+        Some(parent) => match inspect_existing_data(paths, &parent)? {
+            Some((_, inspected)) => match inspected.manifest {
+                Some(manifest) => records::Inspection::Recorded(manifest),
+                None => records::Inspection::Empty,
+            },
+            None => records::Inspection::Absent,
+        },
+        None => records::Inspection::Absent,
+    };
+    #[cfg(feature = "testing")]
+    testing::after_the_removal_inspection();
     // The program directory is read on a held handle before the removal deletes anything in it.
-    check_program_directory(paths)?;
-    refuse_while_unfinished(paths)?;
-    let manifest = match fs::read(&paths.manifest) {
-        Ok(bytes) => Manifest::parse(&bytes)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // The inspection above passed, so a data directory that is there with no manifest is
-            // empty: what a removal left when it was stopped between the manifest's deletion and
+    let program_checked = check_program_directory(paths)?;
+    if matches!(found, records::Inspection::Recorded(_)) {
+        refuse_while_unfinished(paths)?;
+    }
+    let manifest = match records::begin(
+        found,
+        &|| entry_exists(&paths.data),
+        quiet_when_empty,
+        &paths.data,
+    ) {
+        records::Begin::Refuse(text) => return Err(Error::Refused(text)),
+        records::Begin::Nothing => return Ok(()),
+        records::Begin::FinishEmpty => {
+            // What an earlier removal left when it was stopped between the manifest's deletion and
             // the directory's, or when the directory could not be deleted. It is the
             // installation's own, and the removal finishes it, also when nothing else is recorded.
-            if paths.data.exists() {
-                let stayed = remove_records(paths);
-                if stayed.is_empty() {
-                    say("the empty data directory that an earlier removal left is removed");
-                    return Ok(());
+            let stayed = records::remove_empty(&paths.data);
+            if stayed.is_empty() {
+                if let Some(parent) = paths.data.parent() {
+                    let _ = fs::remove_dir(parent);
                 }
-                return Err(Error::Failed(format!(
-                    "the data directory stays because {} could not be removed. {}",
-                    stayed.join("; "),
-                    records::next_step(false, data_is_empty(paths))
-                )));
-            }
-            if quiet_when_empty {
+                say("the empty data directory that an earlier removal left is removed");
                 return Ok(());
             }
-            return Err(Error::Refused("nothing is installed".to_owned()));
+            return Err(Error::Failed(format!(
+                "the data directory stays because {} could not be removed. {}",
+                stayed.join("; "),
+                records::next_step(false, data_is_empty(paths))
+            )));
         }
-        Err(error) => return Err(io_error("reading the manifest")(error)),
+        records::Begin::Remove(manifest) => manifest,
     };
     let prior = Prior::load(&paths.prior).ok();
     // A removal that took `staging` and could not delete the manifest leaves a manifest with no
@@ -3218,7 +3262,7 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             &mut failures,
         );
     }
-    if paths.program.exists() {
+    if program_checked {
         keep(
             fs::remove_dir_all(&paths.program).map_err(io_error("removing the program directory")),
             "removing the program directory",
@@ -3227,6 +3271,12 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
         if let Some(parent) = paths.program.parent() {
             let _ = fs::remove_dir(parent);
         }
+    } else if entry_exists(&paths.program) {
+        // It was not there when the removal checked, so no check opened it: nothing is deleted.
+        failures.push(format!(
+            "{} was not there when the removal looked for it, and something is there now, so it was not removed",
+            paths.program.display()
+        ));
     }
     // The journal and the private roots' parent go only when empty. Unfinished work was refused
     // before the removal began; what a journal file still holds now is finished or made nothing.

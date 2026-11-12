@@ -112,6 +112,69 @@ pub fn remove_with(
     stayed
 }
 
+/// What a removal's own inspection of the data directory found, in this run: the directory was
+/// opened by handle and checked as the installation's own, or it was not there to be opened. The
+/// removal acts on the directory, and on nothing in it, only through this value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inspection<M> {
+    /// The folder above the directory, or the directory itself, was not there.
+    Absent,
+    /// The directory was opened, checked and found empty.
+    Empty,
+    /// The directory was opened and checked, and its manifest was read.
+    Recorded(M),
+}
+
+/// What a removal does first, decided by what its inspection found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Begin<M> {
+    /// There is nothing to remove, and the removal ends without a word.
+    Nothing,
+    /// The removal ends with this refusal, and nothing was deleted.
+    Refuse(String),
+    /// The empty directory that the inspection approved is removed, and nothing in it is read.
+    FinishEmpty,
+    /// What the manifest records is removed.
+    Remove(M),
+}
+
+/// Decides how a removal begins. Only a directory that the inspection opened and approved is acted
+/// on: when it found none, the path is looked at once more, only to refuse with the reason if
+/// something is there now (the folder above it is one that an ordinary account may write in until
+/// the installation has made it), and no deletion follows that look.
+///
+/// `something_there_now` says whether anything is at the directory's name now; it is asked only
+/// when the inspection found none.
+pub fn begin<M>(
+    found: Inspection<M>,
+    something_there_now: &dyn Fn() -> bool,
+    quiet_when_empty: bool,
+    data: &Path,
+) -> Begin<M> {
+    match found {
+        Inspection::Recorded(manifest) => Begin::Remove(manifest),
+        Inspection::Empty => Begin::FinishEmpty,
+        Inspection::Absent if something_there_now() => Begin::Refuse(format!(
+            "{} was not there when the removal looked for it, and something is there now, so nothing was removed. Run the removal again: it checks the directory first, and says what to do about it if it is not the installation's own.",
+            data.display()
+        )),
+        Inspection::Absent if quiet_when_empty => Begin::Nothing,
+        Inspection::Absent => Begin::Refuse("nothing is installed".to_owned()),
+    }
+}
+
+/// Removes the data directory that the inspection found empty, and nothing else: no record is
+/// deleted by name and no directory is emptied. A directory that holds anything by now stays, and
+/// is named. Returns what could not be removed, with the reason; nothing when it is gone.
+pub fn remove_empty(data: &Path) -> Vec<String> {
+    match fs::remove_dir(data) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            vec![format!("{} ({error})", data.display())]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// A listing's error as the failure to say that no replacement can be ruled out.
 fn unlisted(error: &io::Error) -> io::Error {
     io::Error::other(format!(
