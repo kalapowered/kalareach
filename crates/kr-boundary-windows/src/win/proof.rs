@@ -163,9 +163,10 @@ pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchE
 /// stop as well, and a program that the stop reaches while it runs is ended with its job like one
 /// that ran out of time. The outcome of such a run is [`Outcome::TimedOut`] and the caller, which
 /// looks at the stop, tells it from a program that ran out of its time. A stop that is set before
-/// the run starts, or that comes before the program is resumed, starts nothing. After a stop the
-/// readers of the output and the end of the job wait [`STOP_BOUND`] at most, not the run's
-/// deadline.
+/// the run starts, or that comes before the second look at the stop that precedes the resume,
+/// starts nothing. A stop that comes after that look still lets the program start, and the wait
+/// then ends it at once. After a stop the readers of the output and the end of the job wait
+/// [`STOP_BOUND`] at most, not the run's deadline.
 ///
 /// # Errors
 ///

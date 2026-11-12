@@ -4430,7 +4430,7 @@ fn a_pipe_whose_connections_are_all_in_use_says_so_and_only_the_administrators_p
         let text = busy.to_string();
         assert_eq!(busy.code, 231, "{text}");
         assert!(
-            text.contains("every connection the broker serves was in use for 10 seconds"),
+            text.contains("no instance of it was listening for 10 seconds"),
             "{text}"
         );
         assert_eq!(

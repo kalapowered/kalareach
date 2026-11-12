@@ -489,6 +489,39 @@ fn the_program_trees_own_walk_has_its_own_list_words_and_the_same_link_words() {
     assert!(!link.to_lowercase().contains("remove the link"), "{link}");
 }
 
+/// A link at the boundary's own folder above the program directory is not a known folder of another
+/// computer: the words say that the layout is not supported and what the setup program does, and
+/// never send the administrator to a computer whose known folders are plain, or to remove the link.
+#[test]
+fn a_link_at_the_boundarys_own_folder_sends_the_administrator_nowhere_else() {
+    let text = ancestor_refusal(
+        r"C:\Program Files\KalaReach",
+        Tree::Program,
+        &AncestorFault::OwnLink,
+        Stage::Before,
+    );
+    assert!(
+        text.contains(
+            r"C:\Program Files\KalaReach is a folder above the boundary's program directory"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("it is a link or a mounted folder"), "{text}");
+    assert!(text.contains("This layout is not supported"), "{text}");
+    assert!(
+        text.contains("The setup program makes this folder itself"),
+        "{text}"
+    );
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(
+        text.contains("Do not remove the program directory"),
+        "{text}"
+    );
+    assert!(!text.contains("computer"), "{text}");
+    assert!(!text.contains("plain folders"), "{text}");
+    assert!(!text.to_lowercase().contains("remove the link"), "{text}");
+}
+
 /// What the setup program can do after a link at the program directory's name: a repair makes the
 /// program files again only where an installation is recorded.
 #[test]

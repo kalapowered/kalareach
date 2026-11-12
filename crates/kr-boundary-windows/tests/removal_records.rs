@@ -284,8 +284,9 @@ fn an_empty_data_directory_that_a_stopped_removal_left_is_removed_by_the_next_on
 
 /// A removal whose inspection did not approve the earlier-state record that is there did not read
 /// it: its last words say that the Application Identity service's start value and running state
-/// were not put back and that the next removal does it, and say nothing where the record was read
-/// or is not there.
+/// were not put back and that the next removal inspects the record again (a promise of another
+/// inspection, not of a restoration: the inspection may refuse the record again), and say nothing
+/// where the record was read or is not there.
 #[test]
 fn the_last_words_of_a_removal_say_what_an_unread_earlier_state_record_left() {
     let said = unread_prior(false, true);
@@ -294,9 +295,11 @@ fn the_last_words_of_a_removal_say_what_an_unread_earlier_state_record_left() {
         "{said}"
     );
     assert!(
-        said.contains("the next removal reads the record and does it"),
+        said.contains("the next removal inspects the record again"),
         "{said}"
     );
+    assert!(!said.contains("does it"), "{said}");
+    assert!(!said.contains("puts them back"), "{said}");
     assert!(said.starts_with(". "), "{said}");
     assert_eq!(unread_prior(true, true), "", "the record was read");
     assert_eq!(unread_prior(false, false), "", "there is no record");
@@ -317,6 +320,13 @@ fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
     assert!(kept.contains("inspects the data directory again"), "{kept}");
     assert!(next_step(true, true).contains("inspects the data directory again"));
     assert!(kept.contains("says what remains"), "{kept}");
+    // A record can stay because the inspection did not see it, and nothing holds it then: closing
+    // what holds a record is said only for the case that a program does.
+    assert!(!kept.contains("close what holds them"), "{kept}");
+    assert!(
+        kept.contains("If a program holds one of them open, close it"),
+        "{kept}"
+    );
     assert!(!kept.contains("reads the manifest"), "{kept}");
     assert!(!kept.contains("finishes"), "{kept}");
     let empty = next_step(false, true);

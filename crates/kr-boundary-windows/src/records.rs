@@ -325,12 +325,13 @@ fn unlisted(error: &io::Error) -> io::Error {
 /// What a removal adds to its last words where the earlier-state record is there and its inspection
 /// did not approve it: the record was not read, so the Application Identity service keeps the start
 /// value and the running state that the installation gave it. The next removal inspects the record
-/// and puts them back. The text starts with a full stop, to follow last words that have none, and
-/// is empty where the record was read or is not there.
+/// again, and puts them back only if that inspection approves the record. The text starts with a
+/// full stop, to follow last words that have none, and is empty where the record was read or is
+/// not there.
 #[must_use]
 pub fn unread_prior(approved: bool, there: bool) -> &'static str {
     if there && !approved {
-        ". The earlier-state record was not read, so the Application Identity service's start value and running state were not put back: the next removal reads the record and does it"
+        ". The earlier-state record was not read, so the Application Identity service's start value and running state were not put back: the next removal inspects the record again"
     } else {
         ""
     }
@@ -344,7 +345,7 @@ pub fn unread_prior(approved: bool, there: bool) -> &'static str {
 #[must_use]
 pub fn next_step(manifest_stays: bool, data_is_empty: bool) -> &'static str {
     if manifest_stays {
-        "The manifest stays with them: close what holds them, then run the removal again, which inspects the data directory again and says what remains"
+        "The manifest stays with them. If a program holds one of them open, close it. Then run the removal again, which inspects the data directory again and says what remains"
     } else if data_is_empty {
         "The directory is empty, and a new installation accepts an empty data directory: close what holds it (a console that has it as its current directory, for one), then run the removal again, which removes it"
     } else {

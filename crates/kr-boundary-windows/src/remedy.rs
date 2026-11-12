@@ -366,6 +366,10 @@ pub fn is_the_place_asked_for(supplied: &str, final_path: &str) -> bool {
 pub enum AncestorFault<'a> {
     /// A link or a mounted folder: the installation does not go through either above its trees.
     Link,
+    /// A link or a mounted folder in the boundary's own folders, from the top of its program tree
+    /// down to the program directory's parent: the setup program makes these itself as plain
+    /// folders, so the words do not send anyone to another computer's known folders.
+    OwnLink,
     /// Not a folder.
     NotAFolder,
     /// A drive letter that is no volume's root: the final path of its opened root.
@@ -405,10 +409,11 @@ pub fn hello_failure(failure: &crate::frame::FrameError) -> String {
     }
 }
 
-/// The words of an open of the broker's pipe that found every instance busy for `seconds`. The
-/// platform's error follows them after a colon, so they end with no full stop. Only the
-/// administrators' pipe says that other elevated sessions may hold it: the persons' pipe is held by
-/// persons, which the words do not claim.
+/// The words of an open of the broker's pipe that found no instance listening for `seconds`. Every
+/// connection that the broker serves may be in use, or the broker may have failed to make the next
+/// instance, and the words claim neither. The platform's error follows them after a colon, so they
+/// end with no full stop. Only the administrators' pipe says that other elevated sessions may hold
+/// it: the persons' pipe is held by persons, which the words do not claim.
 #[must_use]
 pub fn busy_pipe(seconds: u64, administrators: bool) -> String {
     let held_by = if administrators {
@@ -417,7 +422,7 @@ pub fn busy_pipe(seconds: u64, administrators: bool) -> String {
         ""
     };
     format!(
-        "the broker's pipe stayed busy: every connection the broker serves was in use for {seconds} seconds{held_by}"
+        "the broker's pipe stayed busy: no instance of it was listening for {seconds} seconds{held_by}"
     )
 }
 
@@ -503,6 +508,9 @@ pub fn ancestor_refusal(
         },
         AncestorFault::Link => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The system's default places have none. The setup program installs only in the system's own known folders and cannot be pointed at another path, and it directs no change to a folder that other programs share: run it on a computer where its known folders are plain folders."
+        ),
+        AncestorFault::OwnLink => format!(
+            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The setup program makes this folder itself, as a plain folder, in the system's own known folder. It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share. Do not remove the program directory."
         ),
         AncestorFault::NotAFolder => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder. The system's default places are folders. {changes} Correct the path, then run the setup program again. {keep}"
