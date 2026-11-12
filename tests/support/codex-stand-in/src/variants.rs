@@ -129,7 +129,9 @@ pub struct Variants {
     /// names, one `.jsonl` file for the thread, and for each such turn one line that marks the
     /// turn's start and one that holds the prompt. It writes nothing where `CODEX_HOME` is not
     /// set, and a turn whose input is empty (the terminal's own, with no prompt typed) is no model
-    /// turn and is not recorded.
+    /// turn and is not recorded. A terminal that a person is at, under this variant, starts no turn
+    /// of its own where it has no words to start one with: the agent's turns are the ones typed at
+    /// it or sent to it.
     pub write_the_record: bool,
     /// The server answers a turn whose input asks `What is A plus B?` with the sum of the two
     /// numbers, in a message of its own before the turn ends, and the terminal writes it as a row
