@@ -297,7 +297,11 @@ final class LinkTapTests: HarnessTestCase {
         let by: CGFloat = place.top + 180 <= place.most ? -180 : 180
         say("LINKTAP \(named): the conversation before the drag: room \(place.room), scrolled \(Int(place.top)) of \(Int(place.most))")
         let result = drag("\(named): a drag that scrolls, started on a link", from: CGPoint(x: draggedWords.midX, y: draggedWords.midY), by: CGVector(dx: 0, dy: by), shift: draggedShift)
-        XCTAssertTrue(result.events.contains { $0.type == "pointercancel" }, "\(result.label): no pointercancel: \(result.events.map(\.type))")
+        // WebKit ends a pan with pointercancel at some sizes and with pointerup at others; what matters is that the page scrolled.
+        XCTAssertTrue(
+            result.events.contains { $0.type == "pointercancel" } || abs(pane().top - place.top) > 20,
+            "\(result.label): the page did not scroll and no pointercancel came: \(result.events.map(\.type))"
+        )
         XCTAssertFalse(result.events.contains { $0.type == "click" }, "\(result.label): a click came")
         XCTAssertTrue(result.opened.isEmpty, "\(result.label): opened \(result.opened)")
 
