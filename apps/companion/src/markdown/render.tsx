@@ -15,13 +15,6 @@
 import { Fragment, type ReactNode } from 'react'
 import { Lexer, type Token, type Tokens } from 'marked'
 
-/**
- * The longest label, in characters, that the phone gives a wider press area: its words are narrower
- * than the box a finger needs, and the area cannot grow without moving the text unless it grows on
- * both sides of the words.
- */
-const SHORT_LINK_LABEL = 3
-
 /** What the renderer needs from the application around it. */
 export interface MarkdownContext {
   /** Opens a link, after the backend has checked its scheme. */
@@ -184,7 +177,7 @@ function renderToken(token: Token, context: MarkdownContext, key: string): React
         <button
           key={key}
           type="button"
-          className={[...link.text].length <= SHORT_LINK_LABEL ? 'md-link md-link-short' : 'md-link'}
+          className="md-link"
           // A link opens on a completed click, never on pointer-down: activating a link is a
           // deliberate act and a press that slides off is a cancelled one.
           onClick={() => {

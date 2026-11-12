@@ -46,15 +46,6 @@ describe('the Markdown renderer', () => {
     expect(screen.getByTestId('out').textContent).toContain('<script>')
   })
 
-  // KR-REQ-13.19: the phone gives a link whose label is a few characters a wider press area, which
-  // its stylesheet applies to this class.
-  it('marks a link of a few characters, and no longer one, for the phone\u2019s wider press area', () => {
-    show('See [1](https://docs.example.org/a), [the guide](https://docs.example.org/b) and [FAQ](https://docs.example.org/c).')
-    expect(screen.getByRole('button', { name: '1' })).toHaveClass('md-link-short')
-    expect(screen.getByRole('button', { name: 'FAQ' })).toHaveClass('md-link-short')
-    expect(screen.getByRole('button', { name: 'the guide' })).not.toHaveClass('md-link-short')
-  })
-
   it('renders an https link as a control that asks the backend to open it', async () => {
     const { context } = show('[the guide](https://docs.example.org/guide)')
     const link = screen.getByRole('button', { name: 'the guide' })

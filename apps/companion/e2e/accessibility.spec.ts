@@ -140,8 +140,12 @@ interface Box {
 
 interface LinkReading {
   readonly label: string
+  /** The size of the link's box where a finger can press it: what the pane and the screen leave of it. */
   readonly width: number
   readonly height: number
+  /** How far the words after the link moved because of its reach, and the most the room it has lets them move. */
+  readonly moved: number
+  readonly mostMoved: number
   /** The points inside the link's own words that another link took the press at. */
   readonly stolen: readonly string[]
   /** The points just inside the link's box, over the plain text around it, that did not reach it. */
@@ -149,79 +153,104 @@ interface LinkReading {
 }
 
 interface LinksReading {
-  /** What moved when the links' reach was taken away: the same page without it is the control. */
-  readonly moved: readonly string[]
+  /** What moved up or down when the links' reach was taken away: the same page without it is the control. */
+  readonly shifted: readonly string[]
   readonly links: readonly LinkReading[]
   /** How far the box of the link on the conversation's last line lies below the pane at its end. */
   readonly cut: number
-  /** The ancestors of a link that scroll or clip its content sideways, and have more of it than they show. */
+  /** The pane and what holds it, when they scroll or clip sideways and have more than they show. */
   readonly overflowing: readonly string[]
 }
 
 // KR-REQ-13.19: a link inside a message is a button that is one line tall, and the box that a finger,
 // TalkBack and VoiceOver find for it is the size the platform asks for all the same. The box is read
-// from the page, which is what the platforms' trees are built from. Taking the reach away shows
-// nothing moves, whatever the link's words (one character, a whole line, wrapped) and wherever it
-// stands. Links on the next line and beside it show that a press on a link's words is that link's;
-// plain lines above and below a link and plain words after it show that a press anywhere in the box is
-// the link's too; a link on the last line shows the pane holds its box at the end; and a link as wide
-// as the line shows the screen does not scroll sideways for the reach.
+// from the page, which is what the platforms' trees are built from, and cut to what the pane and the
+// screen show of it. Taking the reach away shows nothing moves up or down, and the words after a link
+// move sideways only by what the room beside the link cannot give it: a label as wide as the box needs
+// is not moved at all. Links on the next line and beside it show that a press on a link's words is
+// that link's; plain lines above and below a link and plain words after it show that a press anywhere
+// in the box is the link's too; a link at the start of a line, at its end and alone on a line show the
+// box is whole at the pane's edges and the conversation does not scroll sideways for it; and a link on
+// the last line shows the pane holds its box at the end.
 test.describe('a link inside a message', () => {
   for (const surface of ['ios', 'android'] as const) {
-    test(`is a full touch target on ${surface} and leaves the text where it was`, async ({ page }) => {
+    test(`is a full touch target on ${surface} and keeps the text where it was`, async ({ page }) => {
       await openSession(page, surface)
       await page.getByRole('button', { name: 'the reconnect notes' }).scrollIntoViewIfNeeded()
-      const reading = await page.evaluate((): LinksReading | null => {
+      const reading = await page.evaluate((finger: number): LinksReading | null => {
         const originals = Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link'))
         const first = originals[0]
         const paragraph = first?.parentElement
         const pane = document.querySelector<HTMLElement>('.m-pane')
+        const main = document.querySelector<HTMLElement>('.m-main')
         const nodes = Array.from(document.querySelectorAll<HTMLElement>('.m-node'))
         const lastNode = nodes[nodes.length - 1]
-        if (!first || !paragraph || !pane || !lastNode) return null
+        if (!first || !paragraph || !pane || !main || !lastNode) return null
 
         const wordsOf = (link: HTMLElement): Range => {
           const range = document.createRange()
           range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
           return range
         }
+        const afterOf = (link: HTMLElement): Range | null => {
+          const next = link.nextSibling
+          if (!next || next.nodeType !== Node.TEXT_NODE || (next.textContent ?? '').length < 1) return null
+          const range = document.createRange()
+          range.setStart(next, 0)
+          range.setEnd(next, 1)
+          return range
+        }
         const boxOf = (box: DOMRect): Box => ({ left: box.left, top: box.top, width: box.width, height: box.height })
 
         // More links of the kinds a message can carry, each a copy of the first with other words: on
         // the next line, beside another with one space between, a single character, one in plain
-        // lines, one as long as the line, and one that ends the conversation.
+        // lines, one as long as the line, one that ends the conversation, and a single character at
+        // the start of a line, at its end and alone on a line, at the end and at the start.
         const another = (text: string): HTMLElement => {
           const link = first.cloneNode(true) as HTMLElement
           const label = link.querySelector('.md-link-label') ?? link
           label.textContent = text
           return link
         }
+        const row = (align: 'left' | 'right', ...parts: (string | HTMLElement)[]): HTMLElement => {
+          const line = document.createElement('p')
+          line.style.textAlign = align
+          line.append(...parts)
+          return line
+        }
         const second = another('a second link')
         const third = another('1')
-        // The class the renderer gives a label of a few characters (test/markdown.test.tsx holds that rule).
-        third.classList.add('md-link-short')
         const framedLink = another('a link in plain text')
         const wide = another('a link whose words run the whole width of the line and on to the next ')
         const closing = another('the last link')
-        paragraph.append(document.createElement('br'), second, ' ', third)
-        const framed = document.createElement('p')
-        framed.append(
+        const atStart = another('1')
+        const atEnd = another('1')
+        const aloneAtStart = another('1')
+        const aloneAtEnd = another('1')
+        paragraph.append(document.createElement('br'), second, ' ', third, ', and plain words after it.')
+        const framed = row(
+          'left',
           'A plain line above the link.',
           document.createElement('br'),
           framedLink,
-          ' and plain words after it on the same line.',
+          ', and plain words after it on the same line.',
           document.createElement('br'),
           'A plain line under the link.'
         )
-        const longer = document.createElement('p')
-        longer.append(wide)
-        paragraph.after(framed, longer)
-        const ending = document.createElement('p')
-        ending.append('The last line of the conversation ends in ', closing)
+        const edges = [
+          row('left', atStart, ', then plain words after the link at the start of the line.'),
+          row('right', 'Plain words before the link at the end of the line, ', atEnd),
+          row('left', aloneAtStart),
+          row('right', aloneAtEnd)
+        ]
+        const longer = row('left', wide)
+        const ending = row('left', 'The last line of the conversation ends in ', closing)
+        paragraph.after(framed, ...edges, longer)
         lastNode.append(ending)
-        const links = [...originals, second, third, framedLink, wide, closing]
+        const links = [...originals, second, third, framedLink, atStart, atEnd, aloneAtStart, aloneAtEnd, wide, closing]
 
         // The control: the same page with the links' reach taken away.
+        const gutter = parseFloat(getComputedStyle(main).paddingLeft)
         const places = (): Record<string, Box> => {
           pane.scrollTop = 0
           const boxes: Record<string, Box> = {
@@ -231,7 +260,10 @@ test.describe('a link inside a message', () => {
             'the last message': boxOf(lastNode.getBoundingClientRect())
           }
           links.forEach((link, index) => {
-            boxes[`the words of "${link.textContent ?? ''}" (${String(index + 1)})`] = boxOf(wordsOf(link).getBoundingClientRect())
+            const name = `"${link.textContent ?? ''}" (${String(index + 1)})`
+            boxes[`the words of ${name}`] = boxOf(wordsOf(link).getBoundingClientRect())
+            const after = afterOf(link)
+            if (after) boxes[`what follows ${name}`] = boxOf(after.getBoundingClientRect())
           })
           return boxes
         }
@@ -244,17 +276,21 @@ test.describe('a link inside a message', () => {
         document.head.append(bare)
         const without = places()
         bare.remove()
-        const moved = Object.keys(before).filter((name) =>
-          (['left', 'top', 'width', 'height'] as const).some(
-            (side) => Math.abs((before[name]?.[side] ?? 0) - (without[name]?.[side] ?? 0)) > 0.5
-          )
+        const shifted = Object.keys(before).filter(
+          (name) =>
+            Math.abs((before[name]?.top ?? 0) - (without[name]?.top ?? 0)) > 0.5 ||
+            Math.abs((before[name]?.height ?? 0) - (without[name]?.height ?? 0)) > 0.5
         )
 
         const inPlainText = new Set([framedLink])
-        const readings = links.map((link): LinkReading => {
+        const paneBox = pane.getBoundingClientRect()
+        const room = Math.min(finger / 2, gutter)
+        const readings = links.map((link, index): LinkReading => {
           link.scrollIntoView({ block: 'center' })
           const box = link.getBoundingClientRect()
           const words = wordsOf(link).getClientRects()
+          const name = `"${link.textContent ?? ''}" (${String(index + 1)})`
+          const wordsWidth = without[`the words of ${name}`]?.width ?? 0
           const stolen: string[] = []
           for (const rect of [words[0], words[words.length - 1]]) {
             if (!rect) continue
@@ -282,29 +318,42 @@ test.describe('a link inside a message', () => {
               if (found?.closest('.md-link') !== link) lost.push(`${where}: ${found ? `${found.tagName} ${found.className}` : 'nothing'}`)
             }
           }
-          return { label: link.textContent ?? '', width: box.width, height: box.height, stolen, lost }
+          const was = without[`what follows ${name}`]
+          const is = before[`what follows ${name}`]
+          return {
+            label: link.textContent ?? '',
+            width: Math.min(box.right, paneBox.right, window.innerWidth) - Math.max(box.left, paneBox.left, 0),
+            height: Math.min(box.bottom, paneBox.bottom, window.innerHeight) - Math.max(box.top, paneBox.top, 0),
+            moved: was && is ? Math.abs(is.left - was.left) : 0,
+            mostMoved: Math.max(0, finger - 2 * room - wordsWidth),
+            stolen,
+            lost
+          }
         })
 
         pane.scrollTop = pane.scrollHeight
         const cut = closing.getBoundingClientRect().bottom - pane.getBoundingClientRect().bottom
 
+        // Sideways, from the pane up: nothing that holds the conversation scrolls or clips it for a link's reach.
         const overflowing: string[] = []
-        for (let each: HTMLElement | null = wide; each; each = each.parentElement) {
+        for (let each: HTMLElement | null = pane; each; each = each.parentElement) {
           const holds = each === document.documentElement || getComputedStyle(each).overflowX !== 'visible'
           if (holds && each.scrollWidth > each.clientWidth + 1) overflowing.push(each.className || each.tagName)
         }
-        return { moved, links: readings, cut, overflowing }
-      })
+        return { shifted, links: readings, cut, overflowing }
+      }, FINGER[surface])
       if (!reading) throw new Error('the conversation shows no link')
-      expect.soft(reading.moved, 'what moved when the reach was taken away').toEqual([])
+      expect.soft(reading.shifted, 'what moved up or down when the reach was taken away').toEqual([])
       for (const link of reading.links) {
-        expect.soft(link.width, `the width of "${link.label}"`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
-        expect.soft(link.height, `the height of "${link.label}"`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
+        expect.soft(link.width, `the width of "${link.label}" where it can be pressed`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
+        expect.soft(link.height, `the height of "${link.label}" where it can be pressed`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
+        // Within a pixel: Chromium sizes a button to the whole pixel its text needs.
+        expect.soft(link.moved, `how far the words after "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved + 1)
         expect.soft(link.stolen, `where a press on the words of "${link.label}" went to another link`).toEqual([])
         expect.soft(link.lost, `where a press inside the box of "${link.label}" did not reach it`).toEqual([])
       }
       expect.soft(reading.cut, 'how far the box of the last line’s link lies below the pane at its end').toBeLessThanOrEqual(0.5)
-      expect.soft(reading.overflowing, 'the ancestors that scroll sideways').toEqual([])
+      expect.soft(reading.overflowing, 'what scrolls or clips sideways from the pane up').toEqual([])
     })
   }
 })

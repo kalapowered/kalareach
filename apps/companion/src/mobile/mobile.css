@@ -22,8 +22,13 @@
 
 :root[data-surface='ios'],
 :root[data-surface='android'] {
-  /* How far a link in a message is pressable beyond its words, on each side of the line. */
-  --reach-inline: calc(var(--target) / 4);
+  /*
+   * How far a link in a message is pressable beyond its words, on each side: half of `--target`, or
+   * the screen's gutter where that is less. The conversation's pane keeps this much room on each
+   * side, taken from the gutter, so a link at the edge of a line has its whole box on the screen and
+   * the pane has nothing past its edge to scroll.
+   */
+  --reach-inline: min(calc(var(--target) / 2), var(--gap-4));
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
@@ -718,11 +723,13 @@
  * A link inside a message is as tall as its line, which is less than a finger needs. The button's
  * box grows by a reach on each side and its margin takes the same amount back, so the line, the
  * paragraph and the words around the link stay where they were, while the box that a finger, TalkBack
- * and VoiceOver find is `--target` in both directions. The block reach is what the line lacks; the
- * inline reach is a quarter of `--target` on each side, and half of it for a label of a few
- * characters, whose words are narrower than the box needs. A label of four characters or more that
- * is still narrower than half of `--target` (as `iiii` is) is widened to `--target`, which moves the
- * words after it by the difference.
+ * and VoiceOver find is `--target` in both directions. The block reach is what the line lacks. The
+ * inline reach is as much as the pane has room for on each side (see `--reach-inline`): more would
+ * go past the pane at the edge of a line, where the conversation would scroll sideways or the screen
+ * would cut the box. The width that a short label then lacks is taken in the link's own width, not
+ * in more reach: a label narrower than `--target` less two reaches (16 px at the default text size on
+ * Android, 12 on iOS, none at the largest sizes) is widened to `--target`, which moves the words
+ * after it by the difference, up to about half a reach for a single narrow character.
  *
  * The area reaches half a line into the lines above and below, as a target this tall must, and over
  * plain words after the link. Each button is above plain text, so a press anywhere in its box is its
@@ -735,10 +742,6 @@
   padding: var(--reach-block) var(--reach-inline);
   margin: calc(-1 * var(--reach-block)) calc(-1 * var(--reach-inline));
   min-inline-size: var(--target);
-}
-
-.m-node .md-link-short {
-  --reach-inline: calc(var(--target) / 2);
 }
 
 @supports (height: 1lh) {
