@@ -1558,11 +1558,15 @@ struct Subscriptions {
     /// What the retry policy has left for the subscription being asked for.
     attempts: Attempts,
     /// When the subscription the session refused for now is asked for again.
-    retry_at: Option<tokio::time::Instant>,
+    refusal_retry_at: Option<tokio::time::Instant>,
     /// When the requests were made, or are to be made, that asked for a new subscription because
     /// what the session sent could not be used, as far back as [`UNUSABLE_SPAN`] reaches. Only
     /// time takes one out.
     unusable_at: VecDeque<tokio::time::Instant>,
+    /// When the subscription is asked for again after what the session sent could not be used. It
+    /// is kept apart from the refusal's, since an answer to an earlier request can come after the
+    /// new stream's first frame, and it must not take this one away.
+    unusable_retry_at: Option<tokio::time::Instant>,
 }
 
 /// What to do after what the session sent could not be used.
@@ -1582,8 +1586,9 @@ impl Subscriptions {
             replacing: false,
             opening: true,
             attempts: Attempts::new(),
-            retry_at: None,
+            refusal_retry_at: None,
             unusable_at: VecDeque::new(),
+            unusable_retry_at: None,
         }
     }
 
@@ -1620,7 +1625,7 @@ impl Subscriptions {
         }
         let at = now + pause;
         self.unusable_at.push_back(at);
-        self.retry_at = Some(at);
+        self.unusable_retry_at = Some(at);
         Unusable::After
     }
 
@@ -1634,24 +1639,30 @@ impl Subscriptions {
         let Recovery::Retry { delay } = decision.recovery else {
             return false;
         };
-        self.retry_at = Some(tokio::time::Instant::now() + delay);
+        self.refusal_retry_at = Some(tokio::time::Instant::now() + delay);
         true
     }
 
-    /// The session took the new subscription.
+    /// The session took the new subscription. What it refused for now is settled, and nothing of
+    /// what is owed after something that could not be used is: that is a request of its own.
     fn taken(&mut self) {
         self.attempts = Attempts::new();
-        self.retry_at = None;
+        self.refusal_retry_at = None;
     }
 
-    /// When the subscription the session refused for now is asked for again, if it is owed.
-    const fn retry_at(&self) -> Option<tokio::time::Instant> {
-        self.retry_at
+    /// When a subscription is asked for again, if one is owed: the one the session refused for now
+    /// or the one asked for after something that could not be used, whichever is sooner.
+    fn retry_at(&self) -> Option<tokio::time::Instant> {
+        match (self.refusal_retry_at, self.unusable_retry_at) {
+            (Some(refusal), Some(unusable)) => Some(refusal.min(unusable)),
+            (refusal, unusable) => refusal.or(unusable),
+        }
     }
 
-    /// The subscription the session refused for now is being asked for, or is no longer wanted.
+    /// A subscription is being asked for, which answers every request that was owed.
     const fn asked_again(&mut self) {
-        self.retry_at = None;
+        self.refusal_retry_at = None;
+        self.unusable_retry_at = None;
     }
 
     /// Asks for a new subscription, unless one is already being asked for; says which.
@@ -5245,6 +5256,42 @@ mod tests {
                     case.says_output_bytes(0, b"x");
                     tokio::time::sleep(super::UNUSABLE_SPAN).await;
                 }
+                case.closes();
+            }),
+        )
+        .await
+        .expect("the attachment ended");
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Closed { .. }),
+            "{:?}",
+            ran.outcome
+        );
+    }
+
+    /// The answer to a request for a new subscription can come after the new stream's first frame.
+    /// That frame cannot be read and is asked for again after a pause, and the late answer does not
+    /// take the pending request away: the display would stay as it was, and nothing would ask again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_answer_that_comes_late_does_not_cancel_the_next_request_for_a_screen() {
+        use kr_protocol::envelope::{Outcome, ParamsValue};
+
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            wire::run_switched(true, true, |mut case| async move {
+                case.says_output_it_cannot_decode(0);
+                let first = case.next_request_asked(Method::EventsSubscribe).await;
+                case.answers_with(first, Outcome::Ok(ParamsValue::empty()));
+                case.says_output_it_cannot_decode(0);
+                // The second request is asked for after a pause, and is not answered yet.
+                let second = case.next_request_asked(Method::EventsSubscribe).await;
+                // The new stream's first frame cannot be read, and comes before the answer.
+                case.says_output_it_cannot_decode(0);
+                case.answers_with(second, Outcome::Ok(ParamsValue::empty()));
+                // Another is asked for all the same.
+                let third = case.next_request_asked(Method::EventsSubscribe).await;
+                case.answers_with(third, Outcome::Ok(ParamsValue::empty()));
+                case.says_output_bytes(0, b"x");
                 case.closes();
             }),
         )
