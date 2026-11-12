@@ -1652,6 +1652,10 @@ impl Carry {
         // The host's own refusal of the first send, which a repeat's refusal never replaces.
         let first_refusal = said.refusal.clone();
         let mut asked_again = 0;
+        // Whether the last connection asked for to repeat the request was turned away because the
+        // host cannot take another from this computer for now: that is an answer, and the words at
+        // the end say it.
+        let mut no_room = false;
         let challenge = loop {
             match Reply::of(&outcome) {
                 Reply::Result => {
@@ -1682,21 +1686,30 @@ impl Carry {
                     asked_again += 1;
                     outcome = match self.connection.another().await {
                         Ok(second) => {
+                            no_room = false;
                             let outcome = second.session().repeat(composed).await;
                             second.session().settle(sent_action).await;
                             second.session().close();
                             outcome
                         }
-                        Err(_) => Err(ClientError::ConnectionEnded),
+                        Err(error) => {
+                            no_room = crate::places::is_no_room(error.code);
+                            Err(ClientError::ConnectionEnded)
+                        }
                     };
                     said.take(&outcome);
                 }
                 Reply::Refused(_) | Reply::Lost => {
-                    break Err(CommandError::unavailable(
-                        "the host did not answer, so it is not known whether an owner device was \
-                         asked; one can still be shown the request for up to two minutes, and \
-                         nothing this application sends will hand anything over",
-                    ));
+                    let cause = if no_room {
+                        "the host would not take another connection from this computer just now"
+                    } else {
+                        "the host did not answer"
+                    };
+                    break Err(CommandError::unavailable(format!(
+                        "{cause}, so it is not known whether an owner device was asked; one can \
+                         still be shown the request for up to two minutes, and nothing this \
+                         application sends will hand anything over"
+                    )));
                 }
             }
         };
