@@ -150,6 +150,8 @@ interface LinkReading {
   readonly stolen: readonly string[]
   /** The points just inside the link's box, over the plain text around it, that did not reach it. */
   readonly lost: readonly string[]
+  /** The points just above and below the link's words, in its own line, that went to another link or to none. */
+  readonly nearby: readonly string[]
 }
 
 interface LinksReading {
@@ -167,8 +169,8 @@ interface LinksReading {
 // from the page, which is what the platforms' trees are built from, and cut to what the pane and the
 // screen show of it. Taking the reach away shows nothing moves up or down, and the words after a link
 // move sideways only by what the room beside the link cannot give it: a label as wide as the box needs
-// is not moved at all. Links on the next line and beside it show that a press on a link's words is
-// that link's; plain lines above and below a link and plain words after it show that a press anywhere
+// is not moved at all. Links on the next line, one directly under the other, and beside it show that a
+// press on a link's words, and just above and below them in their own line, is that link's; plain lines above and below a link and plain words after it show that a press anywhere
 // in the box is the link's too; a link at the start of a line, at its end and alone on a line show the
 // box is whole at the pane's edges and the conversation does not scroll sideways for it; and a link on
 // the last line shows the pane holds its box at the end.
@@ -227,6 +229,8 @@ test.describe('a link inside a message', () => {
         const atEnd = another('1')
         const aloneAtStart = another('1')
         const aloneAtEnd = another('1')
+        const pairAbove = another('the first of two links')
+        const pairBelow = another('the second of two links')
         paragraph.append(document.createElement('br'), second, ' ', third, ', and plain words after it.')
         const framed = row(
           'left',
@@ -243,11 +247,12 @@ test.describe('a link inside a message', () => {
           row('left', aloneAtStart),
           row('right', aloneAtEnd)
         ]
+        const pair = row('left', pairAbove, document.createElement('br'), pairBelow)
         const longer = row('left', wide)
         const ending = row('left', 'The last line of the conversation ends in ', closing)
-        paragraph.after(framed, ...edges, longer)
+        paragraph.after(framed, ...edges, pair, longer)
         lastNode.append(ending)
-        const links = [...originals, second, third, framedLink, atStart, atEnd, aloneAtStart, aloneAtEnd, wide, closing]
+        const links = [...originals, second, third, framedLink, atStart, atEnd, aloneAtStart, aloneAtEnd, pairAbove, pairBelow, wide, closing]
 
         // The control: the same page with the links' reach taken away.
         const gutter = parseFloat(getComputedStyle(main).paddingLeft)
@@ -271,7 +276,8 @@ test.describe('a link inside a message', () => {
         const bare = document.createElement('style')
         bare.textContent = [
           '.m-pane { padding-inline: 0 !important; margin-inline: 0 !important }',
-          '.m-node .md-link { padding: 0 !important; margin: 0 !important; min-inline-size: 0 !important }'
+          '.m-node .md-link { padding: 0 !important; margin: 0 !important; min-inline-size: 0 !important }',
+          '.m-node .md-link-label { display: inline !important }'
         ].join(' ')
         document.head.append(bare)
         const without = places()
@@ -318,6 +324,21 @@ test.describe('a link inside a message', () => {
               if (found?.closest('.md-link') !== link) lost.push(`${where}: ${found ? `${found.tagName} ${found.className}` : 'nothing'}`)
             }
           }
+          // Just above and just below the words, inside the link's own line: whoever has a box there, the
+          // press is this link's, since its words are the nearer.
+          const nearby: string[] = []
+          const wordsAt = wordsOf(link).getClientRects()
+          const top = wordsAt[0]
+          const bottom = wordsAt[wordsAt.length - 1]
+          const around: [string, DOMRect | undefined, number][] = [
+            ['above the words', top, (top?.top ?? 0) - 1.5],
+            ['below the words', bottom, (bottom?.bottom ?? 0) + 1.5]
+          ]
+          for (const [where, rect, y] of around) {
+            if (!rect) continue
+            const found = document.elementFromPoint(rect.left + rect.width / 2, y)
+            if (found?.closest('.md-link') !== link) nearby.push(`${where}: ${found ? `${found.tagName} ${found.className}` : 'nothing'}`)
+          }
           const was = without[`what follows ${name}`]
           const is = before[`what follows ${name}`]
           return {
@@ -327,7 +348,8 @@ test.describe('a link inside a message', () => {
             moved: was && is ? Math.abs(is.left - was.left) : 0,
             mostMoved: Math.max(0, finger - 2 * room - wordsWidth),
             stolen,
-            lost
+            lost,
+            nearby
           }
         })
 
@@ -351,6 +373,7 @@ test.describe('a link inside a message', () => {
         expect.soft(link.moved, `how far the words after "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved + 1)
         expect.soft(link.stolen, `where a press on the words of "${link.label}" went to another link`).toEqual([])
         expect.soft(link.lost, `where a press inside the box of "${link.label}" did not reach it`).toEqual([])
+        expect.soft(link.nearby, `where a press by the words of "${link.label}" went elsewhere`).toEqual([])
       }
       expect.soft(reading.cut, 'how far the box of the last line’s link lies below the pane at its end').toBeLessThanOrEqual(0.5)
       expect.soft(reading.overflowing, 'what scrolls or clips sideways from the pane up').toEqual([])
