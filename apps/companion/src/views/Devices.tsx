@@ -310,7 +310,9 @@ function HostCard({
             ? 'Answering'
             : host.contact === 'refused'
               ? 'Refusing'
-              : 'Not answering'}
+              : host.contact === 'busy'
+                ? 'Busy'
+                : 'Not answering'}
         </Badge>
       </div>
       <div className="card-body">

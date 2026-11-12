@@ -1500,6 +1500,34 @@ async fn a_computer_that_owns_no_host_to_read_a_feed_of_asks_the_mailbox_nothing
     assert_eq!(view["mailbox"]["last_read_ms"], Value::Null);
 }
 
+/// KR-REQ-10.46: a host that this computer already holds as many connections to as it keeps at
+/// once is not shown as one that does not answer: the screen says it answered that it cannot take
+/// another connection, and asks it again once a place is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_this_computer_holds_every_connection_to_that_it_may_is_busy_and_not_silent() {
+    let rig = Rig::start().await;
+    let host_id = rig
+        .app
+        .device()
+        .pairing()
+        .hosts
+        .list()
+        .expect("the records")
+        .remove(0)
+        .host_device_id;
+    let places = companion_tauri::places::budget();
+    let held: Vec<_> =
+        std::iter::from_fn(|| places.try_take(host_id, companion_tauri::places::Kind::Other))
+            .collect();
+    assert!(!held.is_empty(), "this computer holds the places");
+
+    let busy = host_by(&rig.view().await, "feed");
+    assert_eq!(busy["contact"], "busy", "{busy}");
+
+    drop(held);
+    assert_eq!(host_by(&rig.view().await, "feed")["contact"], "answered");
+}
+
 /// KR-REQ-10.46: a host that does not answer is revoked on through its durable feed: the screen
 /// shows the list it last saw with its time, and the request is published and stands as sent, not
 /// done.

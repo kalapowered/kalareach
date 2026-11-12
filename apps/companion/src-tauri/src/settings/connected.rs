@@ -159,6 +159,10 @@ pub(crate) enum Listing {
     /// gave the right has run out or been revoked. Such a host is not this computer's to ask, and
     /// is not one that failed to answer.
     Refused,
+    /// It answered that it cannot take another connection from this computer for now. That says
+    /// nothing of its devices, as a host that did not answer says nothing; it is not one that
+    /// failed to answer.
+    Busy,
     /// It did not answer in time, could not be reached, or refused for a reason that says nothing
     /// of its devices.
     Silent,
@@ -169,12 +173,15 @@ pub(crate) enum Listing {
 
 impl Listing {
     /// What a refusal with `code` says. Only the refusal to list the host's devices to this
-    /// computer is an answer about them. A host that refuses for another reason, such as a protocol
-    /// this computer does not speak or a limit it has reached, may be the one that lists a device,
-    /// so it counts as one that did not answer.
+    /// computer is an answer about them, and a host that cannot take another connection says so by
+    /// its code. A host that refuses for another reason, such as a protocol this computer does not
+    /// speak or a limit it has reached, may be the one that lists a device, so it counts as one
+    /// that did not answer.
     fn of_refusal(code: ErrorCode) -> Self {
         if code == ErrorCode::PermissionDenied {
             Self::Refused
+        } else if crate::places::is_no_room(code) {
+            Self::Busy
         } else {
             Self::Silent
         }
@@ -287,7 +294,7 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                     match listed_replacing(&connection, &state.replacer()).await {
                         Listing::Listed(list) => found.lists.push(list),
                         Listing::Refused => found.refused = true,
-                        Listing::Silent | Listing::Ended => found.silent = true,
+                        Listing::Silent | Listing::Busy | Listing::Ended => found.silent = true,
                     }
                 }
                 if let Standing::Paired { host, .. } = connection.standing() {
@@ -326,7 +333,9 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                 match visit.await {
                     Ok(Listing::Listed(list)) => found.lists.push(list),
                     Ok(Listing::Refused) => found.refused = true,
-                    Ok(Listing::Silent | Listing::Ended) | Err(_) => found.silent = true,
+                    Ok(Listing::Silent | Listing::Busy | Listing::Ended) | Err(_) => {
+                        found.silent = true;
+                    }
                 }
             }
             found
@@ -510,6 +519,10 @@ mod tests {
         assert!(matches!(
             Listing::of_link(&refused(ErrorCode::PermissionDenied)),
             Listing::Refused
+        ));
+        assert!(matches!(
+            Listing::of_link(&refused(ErrorCode::ResourceUnavailable)),
+            Listing::Busy
         ));
         for code in [
             ErrorCode::UnsupportedSchema,

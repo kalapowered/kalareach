@@ -131,6 +131,8 @@ pub enum Contact {
     /// It will not list them to this computer, as a host does once the grant that gave the right
     /// has run out or been revoked.
     Refused,
+    /// It cannot take another connection from this computer for now.
+    Busy,
     /// It did not answer in time or could not be reached.
     Silent,
 }
@@ -1551,6 +1553,7 @@ async fn visit(
     let (contact, list) = match listing {
         Listing::Listed(list) => (Contact::Answered, Some(list)),
         Listing::Refused => (Contact::Refused, None),
+        Listing::Busy => (Contact::Busy, None),
         Listing::Silent | Listing::Ended => (Contact::Silent, None),
     };
     Reading {

@@ -339,6 +339,20 @@ describe('revoking a device', () => {
     expect(within(row).getByRole('button', { name: /^Revoke with Touch ID/ })).toBeEnabled()
   })
 
+  it('says a host that cannot take another connection answered, and lists it from the list it gave last', async () => {
+    screenOf(view([host({ contact: 'busy' })]))
+    const row = await rowOf('the-phone')
+    expect(
+      screen.getByText(
+        /the-studio cannot take another connection from this computer just now\. These are the devices it listed/
+      )
+    ).toBeVisible()
+    expect(screen.queryByText(/not answering/i)).not.toBeInTheDocument()
+    expect(screen.getByText('Busy')).toBeVisible()
+    // A revocation is still sent through the feed.
+    expect(within(row).getByRole('button', { name: /^Revoke with Touch ID/ })).toBeEnabled()
+  })
+
   it('offers nothing for the host on this computer while it does not answer', async () => {
     screenOf(
       view([
