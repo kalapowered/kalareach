@@ -1825,6 +1825,52 @@ jobs:
           path: ~/.cache/kalareach/shell-stacks
           key: shell-stacks-${{ hashFiles('fixtures/shells/stacks.lock', 'scripts/fetch-shell-stacks.sh') }}
 
+      # The package is also run under the first stable release of the 7.7 series, which carries
+      # .NET 11. These steps come after every step above, which ran under the first pin, so a cache
+      # that main saves does not wait on them. The release is pinned by version and checked against
+      # the digest its release notes publish; the macos-powershell job pins the same release for
+      # macOS, and the two change together. Its qualification is published under a prefix of its
+      # own, so the package that the steps above qualified and tested is left as it is.
+      - name: Install the second pinned PowerShell
+        env:
+          POWERSHELL_VERSION: "7.7.0"
+          POWERSHELL_SHA256: "c89d9c682d2c403dfe726f3df948e359675235a5bd6fab535776de69729ca0cb"
+        run: |
+          set -euo pipefail
+          archive="powershell-$POWERSHELL_VERSION-linux-x64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/PowerShell/PowerShell/releases/download/v$POWERSHELL_VERSION/$archive"
+          echo "$POWERSHELL_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION"
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" \
+            --directory "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION"
+          chmod +x "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh"
+          echo "KR_SECOND_POWERSHELL=$RUNNER_TEMP/powershell-$POWERSHELL_VERSION" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
+      # The cases that need a PowerShell, under the second release: the contract, the startup
+      # entries' own tests and the two qualification cases that qualify the PowerShell package.
+      # The release goes first on the path, and the cases read the qualification published to the
+      # prefix of its own.
+      - name: Drive the PowerShell package on the second release
+        env:
+          KR_REQUIRE_UTF8_LOCALE: "1"
+        run: |
+          export PATH="$KR_SECOND_POWERSHELL:$PATH"
+          export KR_SHELL_PREFIX="$RUNNER_TEMP/kr-shells-second"
+          export KR_TEST_ARTIFACTS_DIR="$RUNNER_TEMP/kr-shell-qualification-second"
+          mkdir -p "$KR_SHELL_PREFIX" "$KR_TEST_ARTIFACTS_DIR"
+          command -v pwsh
+          pwsh -NoProfile -Command '
+            Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
+            Publish-KalaReachQualification | Format-List'
+          cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
+          cargo test --locked -p kr-shell-integration --lib host::startup:: -- --include-ignored
+          cargo test --locked -p kr-shell-integration --test qualification -- \
+            --test-threads=1 --include-ignored \
+            the_package_binds_into_the_editor_it_was_qualified_against \
+            a_powershell_release_an_advisory_affects_is_named_and_refused
+
   typescript:
     name: typescript
     runs-on: ubuntu-24.04
@@ -3062,6 +3108,45 @@ jobs:
         env:
           KR_REQUIRE_UTF8_LOCALE: "1"
         run: cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
+
+      # The package is also run under the first stable release of the 7.7 series, which carries
+      # .NET 11, after its cases have run under the first pin. The release is the one the
+      # shell-packages job pins, and the two change together. It is checked against the digest its
+      # release publishes, and its qualification is published under a prefix of its own, so the
+      # package that the steps above qualified and tested is left as it is.
+      - name: Install the second pinned PowerShell
+        timeout-minutes: 5
+        env:
+          POWERSHELL_VERSION: "7.7.0"
+          POWERSHELL_SHA256: "76449f078f30193fce9cdf6610b77fda14f4224cafcbdf230245ec0dab9ef10d"
+        run: |
+          set -euo pipefail
+          archive="powershell-$POWERSHELL_VERSION-osx-arm64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/PowerShell/PowerShell/releases/download/v$POWERSHELL_VERSION/$archive"
+          echo "$POWERSHELL_SHA256  $RUNNER_TEMP/$archive" | shasum -a 256 --check --strict -
+          mkdir -p "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION"
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" \
+            --directory "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION"
+          chmod +x "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh"
+          echo "KR_SECOND_POWERSHELL=$RUNNER_TEMP/powershell-$POWERSHELL_VERSION" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
+      # The same cases as above, under the second release, against the qualification published to
+      # the prefix of its own.
+      - name: Drive the PowerShell package through the contract on the second release
+        timeout-minutes: 65
+        env:
+          KR_REQUIRE_UTF8_LOCALE: "1"
+        run: |
+          export PATH="$KR_SECOND_POWERSHELL:$PATH"
+          export KR_SHELL_PREFIX="$RUNNER_TEMP/kr-shells-second"
+          mkdir -p "$KR_SHELL_PREFIX"
+          command -v pwsh
+          pwsh -NoProfile -Command '
+            Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
+            Publish-KalaReachQualification | Format-List'
+          cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
 
   # The Zsh, Bash and Fish packages' cases on the macOS runner, against packages built here from
   # the pinned upstream sources, as the release tree builds them for its macOS targets. The
