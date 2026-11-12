@@ -1564,6 +1564,8 @@ enum Cure {
     /// a name it does not give, a directory nested deeper than it makes anything): remove that
     /// entry.
     RemoveEntry,
+    /// The entry is a link: remove the link itself and not what it points to.
+    RemoveLink,
     /// The configuration file that the installation makes empty holds settings: remove it, and a
     /// repair makes it again, empty. It is a name the installation gives there, so the text of
     /// [`Cure::RemoveEntry`] does not fit it.
@@ -1583,10 +1585,8 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
     let entry = dir.join(name);
     let remedy = match cure {
         Cure::OwnerAndList => "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.".to_owned(),
-        Cure::RemoveEntry => format!(
-            "Remove {}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again.",
-            entry.display()
-        ),
+        Cure::RemoveEntry => remedy::program_removal_advice(&entry.display().to_string(), false),
+        Cure::RemoveLink => remedy::program_removal_advice(&entry.display().to_string(), true),
         Cure::EmptyConfig => format!(
             "Remove {}, and nothing else: the installation makes it empty, and a configuration that holds settings would be read by the Git that the boundary's accounts run, and a change of its owner or its list does not cure that. A repair makes it again, empty. Then run the setup program again.",
             entry.display()
@@ -1596,7 +1596,7 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
             entry.display()
         ),
         Cure::Open => format!(
-            "Close the program that holds {} open, or correct who may open it, and if it is a link or not a folder remove that link or entry and nothing else, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is.",
+            "Close the program that holds {} open, or correct who may open it, and if it is a link remove the link itself and not what it points to, or if it is not a folder remove that entry and nothing else, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is.",
             entry.display()
         ),
     };
@@ -1793,7 +1793,8 @@ fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
             // link or a file at the program directory's name is removed.
             let cure = match refusal {
                 AnchorRefusal::Volume(_) => Cure::Volume,
-                AnchorRefusal::ReparsePoint | AnchorRefusal::NotADirectory => Cure::RemoveEntry,
+                AnchorRefusal::ReparsePoint => Cure::RemoveLink,
+                AnchorRefusal::NotADirectory => Cure::RemoveEntry,
             };
             return Err(program_refusal(
                 paths,
@@ -2009,7 +2010,7 @@ fn inspect_within(
             ));
         }
         if opened.kind == Kind::ReparsePoint {
-            return Err(refuse("it is a link", Cure::RemoveEntry, &Origin::Foreign));
+            return Err(refuse("it is a link", Cure::RemoveLink, &Origin::Foreign));
         }
         if opened.kind == Kind::File && opened.links > 1 {
             return Err(refuse(

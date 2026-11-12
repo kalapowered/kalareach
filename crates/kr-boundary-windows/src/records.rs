@@ -184,8 +184,9 @@ fn unlisted(error: &io::Error) -> io::Error {
 
 /// What the person does about a data directory that stayed after the records went: while the
 /// manifest stays, the removal is run again and reads it; an empty directory with no manifest is a
-/// state that a new installation accepts and the next removal finishes; anything else in it is for
-/// the person to remove, and a new installation refuses until it is gone.
+/// state that a new installation accepts and the next removal finishes; anything else in it was
+/// checked by no handle in this run, and a new installation refuses until it is gone: the removal
+/// is run again, reads each entry on its own handle and says what to do about it.
 #[must_use]
 pub fn next_step(manifest_stays: bool, data_is_empty: bool) -> &'static str {
     if manifest_stays {
@@ -193,6 +194,6 @@ pub fn next_step(manifest_stays: bool, data_is_empty: bool) -> &'static str {
     } else if data_is_empty {
         "The directory is empty, and a new installation accepts an empty data directory: close what holds it (a console that has it as its current directory, for one), then run the removal again, which removes it"
     } else {
-        "A new installation refuses until they are gone: remove them, then run the setup program again"
+        "A new installation refuses until they are gone, and nothing has checked them: run the removal again, which reads each entry on its own handle and says what to do about it, then run the setup program again"
     }
 }
