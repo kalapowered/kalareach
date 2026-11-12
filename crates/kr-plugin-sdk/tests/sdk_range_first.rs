@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::validate::{FindingCode, validate_package_directory};
 use kr_plugin_sdk::version::SDK_VERSION;
 use serde_json::{Value, json};
@@ -34,9 +35,24 @@ fn package(into: &Path, range: Option<&str>, table: impl FnOnce(&mut Value)) -> 
     let before = connector.clone();
     table(&mut connector);
     if connector != before {
+        let bytes = serde_json::to_vec_pretty(&connector).expect("writes");
+        std::fs::write(&path, &bytes).expect("writes");
+        // The manifest declares the table's digest and size: bring them up to the changed file, so
+        // that a package that is otherwise right is valid.
+        let manifest_path = directory.join("plugin.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("reads")).expect("JSON");
+        let record = manifest["payloads"]
+            .as_array_mut()
+            .expect("payloads")
+            .iter_mut()
+            .find(|payload| payload["path"] == "connector.json")
+            .expect("the connector payload");
+        record["digest"] = json!(PayloadDigest::of(&bytes).to_string());
+        record["size_bytes"] = json!(bytes.len().to_string());
         std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&connector).expect("writes"),
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("writes"),
         )
         .expect("writes");
     }
@@ -104,16 +120,26 @@ fn a_range_with_no_upper_bound_that_excludes_this_sdk_is_refused_by_the_range() 
 #[test]
 fn a_table_that_carries_a_listed_member_needs_a_range_that_starts_at_its_arrival() {
     let carries = |connector: &mut Value| {
+        connector["messages"] = json!({ "params": "params", "result": "result", "error": "error" });
         connector["observation"] = json!({ "selections": [{
-            "method": "thread.start",
-            "thread": { "segments": [{ "type": "member", "name": "result" }] },
+            "method": "status.read",
+            "thread": { "segments": [
+                { "type": "member", "name": "result" },
+                { "type": "member", "name": "thread" },
+                { "type": "member", "name": "id" },
+            ] },
             "hidden_when": [{
                 "place": { "segments": [{ "type": "member", "name": "params" }] },
                 "values": ["x"],
             }],
         }] });
     };
-    for (range, refused) in [(">=0.1.6, <0.2.0", true), (">=0.1.7, <0.2.0", false)] {
+    for (range, refused) in [
+        (">=0.1.6, <0.2.0", true),
+        (">=0.1.7, <0.2.0", false),
+        (">=0.1.7-alpha, <0.2.0", true),
+        (">=0.1.7, <0.2.0-rc.1", true),
+    ] {
         let home = tempfile::tempdir().expect("a directory");
         let directory = package(home.path(), Some(range), carries);
         let findings = validate_package_directory(&directory).report.findings;
@@ -125,7 +151,9 @@ fn a_table_that_carries_a_listed_member_needs_a_range_that_starts_at_its_arrival
                 assert_eq!(finding.code, FindingCode::ConnectorTableInvalid, "{range}");
                 assert!(finding.detail.contains("SDK 0.1.7"), "{}", finding.detail);
             }
-            (false, None) => {}
+            (false, None) => {
+                assert!(findings.is_empty(), "{range}: {findings:?}");
+            }
             _ => panic!("{range}: {findings:?}"),
         }
     }
