@@ -741,8 +741,6 @@
   padding: var(--reach-block) var(--reach-inline);
   margin: calc(-1 * var(--reach-block)) calc(-1 * var(--reach-inline));
   min-inline-size: var(--target);
-  /* The browser's own highlight would be on the box under the finger, which may be another link's. */
-  -webkit-tap-highlight-color: transparent;
 }
 
 @supports (height: 1lh) {

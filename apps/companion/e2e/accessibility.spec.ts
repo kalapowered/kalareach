@@ -449,6 +449,8 @@ interface PressPoint {
   readonly expected: string | null
   /** How far the pane was scrolled when the point was read. */
   readonly scroll: number
+  /** Whether the point lies on another control of the message, which then takes the press. */
+  readonly control: boolean
 }
 
 interface PressMark {
@@ -460,6 +462,8 @@ interface PressMark {
   readonly pressed: readonly string[]
   /** How far the pane was scrolled at the press's start. */
   readonly scroll: number
+  /** How many clicks the message's other controls had had when the press began. */
+  readonly clicked: number
 }
 
 // KR-REQ-13.19: where a message's links lie close together, the press at a point belongs to the link
@@ -481,8 +485,19 @@ test.describe('the end of a press on a link of a message', () => {
   for (const surface of ['ios', 'android'] as const) {
     test(`opens the link, unless the press moved away, and a keyboard opens the link it names on ${surface}`, async ({ page }) => {
       await openSession(page, surface)
+      // Messages enough for the conversation to scroll, and a pane that desktop WebKit does not scroll by focusing it.
+      await page.evaluate(
+        ({ messages, session }) => {
+          for (const message of messages) window.krTestHost?.records.appendEntry(session, 'message', message)
+          document.dispatchEvent(new Event('visibilitychange'))
+          document.querySelector('.m-pane')?.removeAttribute('tabindex')
+        },
+        { messages: PRESS_MESSAGES, session: SESSION }
+      )
       const link = page.getByRole('button', { name: 'the reconnect notes' })
-      await link.scrollIntoViewIfNeeded()
+      await link.evaluate((element) => {
+        element.scrollIntoView({ block: 'center' })
+      })
       const words = await link.evaluate((element) => {
         const range = document.createRange()
         range.selectNodeContents(element.querySelector('.md-link-label') ?? element)
@@ -513,7 +528,65 @@ test.describe('the end of a press on a link of a message', () => {
       // No pointer: a keyboard's click goes to the focused link, as it is.
       await link.focus()
       await page.keyboard.press('Enter')
-      expect(await opened(), 'links opened by a keyboard').toBe(2)
+      expect(await opened(), 'links opened by Enter').toBe(2)
+      await page.keyboard.press('Space')
+      expect(await opened(), 'links opened by Space').toBe(3)
+
+      // A press while the conversation scrolls: the link has moved from under the press, so the release opens nothing.
+      await link.evaluate((element) => {
+        element.scrollIntoView({ block: 'center' })
+      })
+      const again = await link.evaluate((element) => {
+        const range = document.createRange()
+        range.selectNodeContents(element.querySelector('.md-link-label') ?? element)
+        const box = range.getBoundingClientRect()
+        return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
+      })
+      await page.mouse.move(again.x, again.y)
+      await page.mouse.down()
+      expect(await lit(), 'the pressed look at the start of a press that is then scrolled').toBe(1)
+      const before = await page.evaluate(() => document.querySelector('.m-pane')?.scrollTop ?? 0)
+      await page.mouse.wheel(0, 90)
+      await expect.poll(() => page.evaluate(() => document.querySelector('.m-pane')?.scrollTop ?? 0)).toBeGreaterThan(before + 40)
+      await page.mouse.up()
+      expect(await lit(), 'the pressed look after the press').toBe(0)
+      expect(await opened(), 'links opened by a press that was scrolled').toBe(3)
+    })
+  }
+})
+
+// KR-REQ-13.19: a touch tap, with its pointer events and the click that follows them, opens the link
+// whose words are nearest: on the words, on plain text within the link's area, and not outside it.
+test.describe('a tap on a link of a message', () => {
+  test.use({ hasTouch: true })
+  for (const surface of ['ios', 'android'] as const) {
+    test(`opens the link on its words and beside them, and not outside its area on ${surface}`, async ({ page }) => {
+      await openSession(page, surface)
+      await page.evaluate(
+        ({ messages, session }) => {
+          for (const message of messages) window.krTestHost?.records.appendEntry(session, 'message', message)
+          document.dispatchEvent(new Event('visibilitychange'))
+          document.querySelector('.m-pane')?.removeAttribute('tabindex')
+        },
+        { messages: PRESS_MESSAGES, session: SESSION }
+      )
+      const link = page.getByRole('button', { name: 'the reconnect notes' })
+      const words = await link.evaluate((element) => {
+        element.scrollIntoView({ block: 'center' })
+        const range = document.createRange()
+        range.selectNodeContents(element.querySelector('.md-link-label') ?? element)
+        const box = range.getBoundingClientRect()
+        return { x: box.left + box.width / 2, y: box.top + box.height / 2, right: box.right, bottom: box.bottom }
+      })
+      const opened = (): Promise<number> => page.evaluate(() => window.krTestHost?.openedLinks.length ?? -1)
+      await page.touchscreen.tap(words.x, words.y)
+      await expect.poll(opened, 'links opened by a tap on the words').toBe(1)
+      await page.touchscreen.tap(words.x, words.bottom + 8)
+      await expect.poll(opened, 'links opened by a tap on plain text under the words').toBe(2)
+      await page.touchscreen.tap(words.right + 8, words.y)
+      await expect.poll(opened, 'links opened by a tap on plain text beside the words').toBe(3)
+      await page.touchscreen.tap(words.right + 60, words.y)
+      expect(await opened(), 'links opened by a tap outside the link’s area').toBe(3)
     })
   }
 })
@@ -550,16 +623,18 @@ test.describe('a press by the links of a message', () => {
                 if (paragraph) paragraph.style.textAlign = 'right'
               }
               for (const href of rightToLeft) paragraphOf(href)?.setAttribute('dir', 'rtl')
-              // WebKit scrolls a pane that it focuses for a press on text, which would move the points
-              // under the case's feet. Where the case holds the pane (`pressHold`), the pane is put back.
-              const held = window as unknown as { pressHold: number | null }
-              held.pressHold = null
-              const room = document.querySelector<HTMLElement>('.m-pane')
-              const hold = (): void => {
-                if (room && held.pressHold !== null && room.scrollTop !== held.pressHold) room.scrollTop = held.pressHold
+              // Desktop WebKit scrolls a pane that it focuses for a press on text, which would move the
+              // points under the case's feet, and a press that scrolls is not a press: the pane is left
+              // unfocusable here. The page's own focus management is not what is checked.
+              document.querySelector('.m-pane')?.removeAttribute('tabindex')
+              // The clicks that the message's other controls get, counted where the page counts them.
+              const counted = window as unknown as { controlClicks: number }
+              counted.controlClicks = 0
+              for (const control of document.querySelectorAll('.m-pane button:not(.md-link)')) {
+                control.addEventListener('click', () => {
+                  counted.controlClicks += 1
+                })
               }
-              room?.addEventListener('scroll', hold)
-              document.addEventListener('pointerdown', hold, true)
               // What a press did, read where the page reads it: at the press's start, after the page's own handling.
               const marks: PressMark[] = []
               ;(window as unknown as { pressMarks: PressMark[] }).pressMarks = marks
@@ -569,7 +644,8 @@ test.describe('a press by the links of a message', () => {
                   y: event.clientY,
                   opened: window.krTestHost?.openedLinks.length ?? 0,
                   pressed: Array.from(document.querySelectorAll<HTMLElement>('.md-link[data-pressed]'), (link) => link.title),
-                  scroll: document.querySelector('.m-pane')?.scrollTop ?? 0
+                  scroll: document.querySelector('.m-pane')?.scrollTop ?? 0,
+                  clicked: counted.controlClicks
                 })
               })
             },
@@ -590,8 +666,6 @@ test.describe('a press by the links of a message', () => {
                 const pane = document.querySelector<HTMLElement>('.m-pane')
                 const main = document.querySelector<HTMLElement>('.m-main')
                 if (!link || !pane || !main) return null
-                const held = window as unknown as { pressHold: number | null }
-                held.pressHold = null
                 link.scrollIntoView({ block: 'center' })
                 const room = pane.getBoundingClientRect()
                 const beside = Math.min(finger / 2, parseFloat(getComputedStyle(main).paddingLeft))
@@ -632,9 +706,9 @@ test.describe('a press by the links of a message', () => {
                   return { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
                 })
                 // The link the rule names at a point, and whether the point is clear of every edge of the rule.
-                const decide = (x: number, y: number): { expected: string | null; clear: boolean } => {
-                  if (controls.some((box) => Math.abs(depth(box, x, y)) < edge)) return { expected: null, clear: false }
-                  if (controls.some((box) => depth(box, x, y) >= 0)) return { expected: null, clear: true }
+                const decide = (x: number, y: number): { expected: string | null; clear: boolean; control: boolean } => {
+                  if (controls.some((box) => Math.abs(depth(box, x, y)) < edge)) return { expected: null, clear: false, control: false }
+                  if (controls.some((box) => depth(box, x, y) >= 0)) return { expected: null, clear: true, control: true }
                   const held = all
                     .map((each) => ({
                       title: each.title,
@@ -647,7 +721,7 @@ test.describe('a press by the links of a message', () => {
                   const ranked = [...sure].sort((a, b) => a.distance - b.distance)
                   const unsure = held.some((each) => each.near) || (ranked[1] !== undefined && ranked[1].distance - (ranked[0]?.distance ?? 0) < edge)
                   // The earlier link wins an exact tie, so sorting by distance only keeps the order of the page.
-                  return { expected: ranked[0]?.title ?? null, clear: !unsure }
+                  return { expected: ranked[0]?.title ?? null, clear: !unsure, control: false }
                 }
                 const inRoom = (x: number, y: number): boolean => {
                   if (x < 0 || y < 0 || x > window.innerWidth - 1 || y > window.innerHeight - 1) return false
@@ -656,7 +730,7 @@ test.describe('a press by the links of a message', () => {
                   return found !== null && pane.contains(found)
                 }
                 const seen = new Set<string>()
-                const points: { x: number; y: number; expected: string | null; scroll: number }[] = []
+                const points: { x: number; y: number; expected: string | null; scroll: number; control: boolean }[] = []
                 let unclear = 0
                 const consider = (x: number, y: number, always: boolean): void => {
                   const px = Math.round(x)
@@ -671,7 +745,7 @@ test.describe('a press by the links of a message', () => {
                   }
                   // In the open, away from every edge, one point in three says as much as all of them.
                   if (!always && verdict.expected !== null && (px + py) % 3 !== 0) return
-                  points.push({ x: px, y: py, expected: verdict.expected, scroll: pane.scrollTop })
+                  points.push({ x: px, y: py, expected: verdict.expected, scroll: pane.scrollTop, control: verdict.control })
                 }
                 // Along the edges of every control that this link's area overlaps, on both sides of each edge.
                 const overlapped = controls.filter((box) =>
@@ -714,7 +788,6 @@ test.describe('a press by the links of a message', () => {
                   }
                   consider(x0, y0, true)
                 }
-                held.pressHold = pane.scrollTop
                 return { points, unclear }
               },
               // Desktop WebKit's overlay scrollbar takes the presses on the pane's last 16 px, and makes no click of them.
@@ -731,6 +804,7 @@ test.describe('a press by the links of a message', () => {
           const done = await page.evaluate(() => ({
             marks: (window as unknown as { pressMarks: PressMark[] }).pressMarks,
             opened: window.krTestHost?.openedLinks.slice() ?? [],
+            clicked: (window as unknown as { controlClicks: number }).controlClicks,
             left: document.querySelectorAll('.md-link[data-pressed]').length
           }))
           const inside = planned.filter((point) => point.expected !== null).length
@@ -741,6 +815,7 @@ test.describe('a press by the links of a message', () => {
           const wrong: string[] = []
           const unlit: string[] = []
           const drifted: string[] = []
+          const unclicked: string[] = []
           planned.forEach((point, index) => {
             const mark = done.marks[index]
             const from = mark?.opened ?? 0
@@ -749,6 +824,10 @@ test.describe('a press by the links of a message', () => {
             const at = `(${String(point.x)}, ${String(point.y)})`
             if (mark !== undefined && Math.abs(mark.scroll - point.scroll) > 0.5) {
               drifted.push(`${at} pressed at scroll ${String(mark.scroll)}, read at ${String(point.scroll)}`)
+            }
+            const clicks = (done.marks[index + 1]?.clicked ?? done.clicked) - (mark?.clicked ?? 0)
+            if (clicks !== (point.control ? 1 : 0)) {
+              unclicked.push(`${at} clicked ${String(clicks)} other controls, expected ${point.control ? '1' : '0'}`)
             }
             const expected = point.expected === null ? [] : [point.expected]
             if (opened.join(' ') !== expected.join(' ')) {
@@ -759,6 +838,7 @@ test.describe('a press by the links of a message', () => {
             }
           })
           expect.soft(drifted.slice(0, 12), 'presses made after the pane had moved from where the point was read').toEqual([])
+          expect.soft(unclicked.slice(0, 12), `${String(unclicked.length)} of ${String(planned.length)} presses gave the click to another control or to none`).toEqual([])
           expect.soft(wrong.slice(0, 12), `${String(wrong.length)} of ${String(planned.length)} presses opened another link or none, or one that was not named`).toEqual([])
           expect.soft(unlit.slice(0, 12), `${String(unlit.length)} of ${String(planned.length)} presses showed the pressed look on another link or none`).toEqual([])
           expect.soft(done.left, 'links still looking pressed after the last press').toBe(0)
@@ -766,6 +846,10 @@ test.describe('a press by the links of a message', () => {
             planned.filter((point) => point.expected !== null).length,
             'presses inside a link’s area'
           ).toBeGreaterThan(planned.length / 6)
+          // At the largest size the long link wraps clear of the image's control: there is no overlap to press.
+          if (ratio <= 1) {
+            expect.soft(planned.filter((point) => point.control).length, 'presses on a control of the message').toBeGreaterThan(10)
+          }
           expect.soft(planned.filter((point) => point.expected === null).length, 'presses outside every link’s area').toBeGreaterThan(40)
         })
       }
