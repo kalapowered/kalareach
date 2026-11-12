@@ -3,7 +3,8 @@
  *
  * A test driving the application on a device cannot reach into the page, so the few things a
  * browser test does through the scripted host's controls are buttons here: contact with the host
- * lost and regained, sends held and released, and what the page keeps of drafts and sends cleared.
+ * lost and regained, sends held and released, what the page keeps of drafts and sends cleared, and
+ * the record of taps on a message's links started.
  * The harness bundle is built only for tests, so this never ships in a desktop or phone build.
  *
  * It is one small control in the corner until it is opened, and it closes after each choice, so it
@@ -13,6 +14,7 @@
 
 import { useEffect, useState, type ReactNode } from 'react'
 
+import { TapRecord, fillForTaps } from './harness-taps'
 import type { FakeHostControls, HeldMutations } from './host/fake'
 import { FAKE_DRAFTS_KEY } from './host/fake-drafts'
 import { SUBMISSIONS_KEY } from './mobile/model/store'
@@ -52,6 +54,7 @@ export function HarnessStrip({
   const [open, setOpen] = useState(false)
   const [held, setHeld] = useState<HeldMutations | null>(null)
   const [submissions, setSubmissions] = useState(controls.submissions)
+  const [taps, setTaps] = useState(false)
 
   const choose = (action: () => void) => () => {
     action()
@@ -60,6 +63,7 @@ export function HarnessStrip({
   }
 
   return (
+    <>
     <div
       id="kr-strip"
       style={{
@@ -128,12 +132,24 @@ export function HarnessStrip({
           >
             Reset
           </button>
+          <button
+            type="button"
+            id="kr-strip-taps"
+            onClick={choose(() => {
+              fillForTaps(controls)
+              setTaps(true)
+            })}
+          >
+            Link taps
+          </button>
           <span id="kr-strip-submissions" data-testid="strip-submissions" aria-label={`Sends received: ${submissions}`}>
             {submissions}
           </span>
         </div>
       ) : null}
     </div>
+    {taps ? <TapRecord controls={controls} /> : null}
+    </>
   )
 }
 

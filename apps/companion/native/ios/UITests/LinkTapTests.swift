@@ -1,0 +1,313 @@
+//
+//  Taps on the links of a message, made on the glass as a finger makes them.
+//
+//  The page decides which link a press belongs to, and opens it on the click that the platform sends
+//  for the tap. Whether WebKit sends that click for a tap on plain text depends on where the page's
+//  listeners stand, which no browser test on a desktop engine can show. These tests tap the web view
+//  by coordinates, through UIKit and not through the page's own events, at the points a person
+//  touches, and read what the page saw (the harness's tap record) and what the scripted host opened.
+//
+//  The tap record is the harness's own: a strip control starts it, fills the first session with the
+//  messages the taps need, and shows the events, the links' rectangles and the links opened as text
+//  that this reads.
+//
+
+import XCTest
+
+final class LinkTapTests: HarnessTestCase {
+    private static let largest = "UICTContentSizeCategoryAccessibilityXXXL"
+
+    // MARK: What the page records
+
+    /// One event the page saw, in the order it saw it.
+    private struct Seen {
+        let order: Int
+        let type: String
+        let target: String
+        let trusted: Bool
+        let detail: Int
+    }
+
+    /// One link of the conversation as the page lays it out now: its box and the rectangles of its words.
+    private struct Link {
+        let name: String
+        let box: CGRect
+        let words: [CGRect]
+        let line: CGFloat
+    }
+
+    private func recordText(_ prefix: String) -> String {
+        let element = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
+        XCTAssertTrue(element.waitForExistence(timeout: 20), "the tap record shows no \(prefix) line")
+        return element.label
+    }
+
+    private func floats(_ tokens: ArraySlice<Substring>) -> [CGFloat] {
+        tokens.compactMap { Double($0) }.map { CGFloat($0) }
+    }
+
+    /// The events of the record, oldest first.
+    private func events() -> [Seen] {
+        recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ").compactMap { part in
+            let fields = part.split(separator: " ")
+            guard fields.count >= 6, fields[0] == "E", let order = Int(fields[1]), let detail = Int(fields[5]) else { return nil }
+            return Seen(order: order, type: String(fields[2]), target: String(fields[3]), trusted: fields[4] == "1", detail: detail)
+        }
+    }
+
+    /// The links of the conversation, in the page's own units: a point of the page is a point of the screen.
+    private func links() -> [Link] {
+        recordText("TAPLINKS").dropFirst("TAPLINKS".count).components(separatedBy: " ; ").compactMap { part in
+            let fields = part.split(separator: " ")
+            guard fields.count >= 12, fields[0] == "L", let wordsAt = fields.firstIndex(of: "words"), let lineAt = fields.firstIndex(of: "line") else { return nil }
+            let box = floats(fields[3..<7])
+            let words = floats(fields[(wordsAt + 1)..<lineAt])
+            guard box.count == 4, words.count >= 4, words.count % 4 == 0, let line = Double(fields[lineAt + 1]) else { return nil }
+            let rects = stride(from: 0, to: words.count, by: 4).map {
+                CGRect(x: words[$0], y: words[$0 + 1], width: words[$0 + 2] - words[$0], height: words[$0 + 3] - words[$0 + 1])
+            }
+            return Link(
+                name: String(fields[1]),
+                box: CGRect(x: box[0], y: box[1], width: box[2] - box[0], height: box[3] - box[1]),
+                words: rects,
+                line: CGFloat(line)
+            )
+        }
+    }
+
+    /// The room the conversation has on the page.
+    private func pane() -> CGRect {
+        for part in recordText("TAPLINKS").dropFirst("TAPLINKS".count).components(separatedBy: " ; ") {
+            let fields = part.split(separator: " ")
+            guard fields.count == 5, fields[0] == "P" else { continue }
+            let box = floats(fields[1...4])
+            if box.count == 4 { return CGRect(x: box[0], y: box[1], width: box[2] - box[0], height: box[3] - box[1]) }
+        }
+        return .zero
+    }
+
+    /// The addresses the scripted host has opened, in order.
+    private func opened() -> [String] {
+        let text = recordText("TAPOPENED").dropFirst("TAPOPENED".count)
+        return text.split(separator: " ").dropFirst().map(String.init)
+    }
+
+    private func link(_ name: String) -> Link {
+        guard let found = links().first(where: { $0.name == name }) else {
+            XCTFail("the page lays out no link \(name)")
+            return Link(name: name, box: .zero, words: [.zero], line: 0)
+        }
+        return found
+    }
+
+    /// The names the page's record gives the links, and the labels their buttons have on the screen.
+    private static let labels = [
+        "table-1": "first notes",
+        "table-2": "second notes",
+        "docs": "docs",
+        "reconnect": "the reconnect notes",
+    ]
+
+    /// Where the page's coordinates lie on the screen: the button a link is has a frame the system
+    /// reports, and the page says where the same button is in its own coordinates.
+    private func offset(of reference: Link) -> CGVector {
+        let button = app.buttons[Self.labels[reference.name] ?? reference.name].firstMatch
+        XCTAssertTrue(button.waitForExistence(timeout: 10), "the screen shows no button for \(reference.name)")
+        let frame = button.frame
+        return CGVector(dx: frame.minX - reference.box.minX, dy: frame.minY - reference.box.minY)
+    }
+
+    // MARK: Taps
+
+    /// What one tap did, as the page saw it.
+    private struct Result {
+        let label: String
+        let events: [Seen]
+        let opened: [String]
+        let focus: String
+    }
+
+    private func screenPoint(_ point: CGPoint, _ shift: CGVector) -> XCUICoordinate {
+        app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x + shift.dx, dy: point.y + shift.dy))
+    }
+
+    /// Taps a point of the page and reports what happened after the last event the record had before.
+    private func tap(_ label: String, at point: CGPoint, shift: CGVector) -> Result {
+        let before = events().last?.order ?? 0
+        let openedBefore = opened().count
+        screenPoint(point, shift).tap()
+        Thread.sleep(forTimeInterval: 1.2)
+        let seen = events().filter { $0.order > before }
+        let now = opened()
+        let result = Result(label: label, events: seen, opened: Array(now.dropFirst(openedBefore)), focus: recordText("TAPFOCUS"))
+        report(result, at: point)
+        return result
+    }
+
+    /// Drags from a point of the page to another, slowly enough for the page to scroll with the finger.
+    private func drag(_ label: String, from point: CGPoint, by distance: CGVector, shift: CGVector) -> Result {
+        let before = events().last?.order ?? 0
+        let openedBefore = opened().count
+        let start = screenPoint(point, shift)
+        let end = screenPoint(CGPoint(x: point.x + distance.dx, y: point.y + distance.dy), shift)
+        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.2)
+        Thread.sleep(forTimeInterval: 1.2)
+        let seen = events().filter { $0.order > before }
+        let result = Result(label: label, events: seen, opened: Array(opened().dropFirst(openedBefore)), focus: recordText("TAPFOCUS"))
+        report(result, at: point)
+        return result
+    }
+
+    /// Says what one tap did, one line, where the run's log can be read for it.
+    private func report(_ result: Result, at point: CGPoint) {
+        let list = result.events.map { "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail))" }.joined(separator: " ")
+        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+    }
+
+    /// A tap that opens a link: one trusted click with detail 1 after the pointer's release, and the link opened once.
+    private func expectOpened(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
+        let types = result.events.map(\.type)
+        // The page's own redirected click is the one that is not the system's: only the system's is counted.
+        let clicks = result.events.filter { $0.type == "click" && $0.trusted }
+        XCTAssertEqual(clicks.count, 1, "\(result.label): the system's clicks that came: \(types)", file: file, line: line)
+        if let click = clicks.first {
+            XCTAssertTrue(click.trusted, "\(result.label): the click was not the system's own", file: file, line: line)
+            XCTAssertEqual(click.detail, 1, "\(result.label): the click's detail", file: file, line: line)
+            if let up = result.events.first(where: { $0.type == "pointerup" }) {
+                XCTAssertGreaterThan(click.order, up.order, "\(result.label): the click came before the pointer's release", file: file, line: line)
+            } else {
+                XCTFail("\(result.label): no pointerup before the click: \(types)", file: file, line: line)
+            }
+        }
+        XCTAssertEqual(result.opened.count, 1, "\(result.label): the links that opened: \(result.opened)", file: file, line: line)
+        XCTAssertTrue(result.opened.first?.hasSuffix(name) ?? false, "\(result.label): opened \(result.opened), expected \(name)", file: file, line: line)
+    }
+
+    // MARK: Starting
+
+    /// Starts the harness at a text size, starts the tap record and opens the session that it filled.
+    private func start(size: String?) {
+        var arguments = ["-KRColourMode", "light"]
+        if let size { arguments += ["-UIPreferredContentSizeCategoryName", size] }
+        launchHarness(arguments)
+        strip("Link taps")
+        openFirstSession()
+        Thread.sleep(forTimeInterval: 1.5)
+        XCTAssertTrue(app.buttons["first notes"].waitForExistence(timeout: 20) || app.buttons["docs"].waitForExistence(timeout: 20), "the record's messages are not on the conversation")
+    }
+
+    /// Scrolls the conversation until a link's words lie near the middle of the screen, and reads the link again.
+    private func scroll(to name: String) -> Link {
+        for _ in 0..<10 {
+            let current = link(name)
+            let screenY = (current.words.first?.midY ?? 0) + offset(of: current).dy
+            let distance = screenY - app.windows.firstMatch.frame.height * 0.45
+            if abs(distance) < 80 { return current }
+            // A drag from the pane's empty left edge, which no link's area reaches, moves the content with the finger.
+            let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.04, dy: 0.5))
+            let end = start.withOffset(CGVector(dx: 0, dy: -max(min(distance, 300), -300)))
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+        return link(name)
+    }
+
+    // MARK: The taps
+
+    /// The taps at one text size. Each is made with the finger on the glass; the page reports what it saw.
+    private func runTaps(size: String?, named: String) {
+        continueAfterFailure = true
+        start(size: size)
+        say("LINKTAP size \(named)")
+
+        // On the words of a link.
+        var table1 = scroll(to: "table-1")
+        var shift = offset(of: table1)
+        let wordsOfTable1 = table1.words[0]
+        expectOpened(
+            tap("\(named): on the words", at: CGPoint(x: wordsOfTable1.midX, y: wordsOfTable1.midY), shift: shift),
+            "table-1"
+        )
+
+        // 3 px under the upper link of two table rows: the upper link's.
+        table1 = link("table-1")
+        shift = offset(of: table1)
+        let under = table1.words[0]
+        expectOpened(
+            tap("\(named): 3 px under the upper link of two table rows", at: CGPoint(x: under.midX, y: under.maxY + 3), shift: shift),
+            "table-1"
+        )
+
+        // 4 px above a link's words: the half-leading of its line at the largest size.
+        table1 = link("table-1")
+        shift = offset(of: table1)
+        let above = table1.words[0]
+        expectOpened(
+            tap("\(named): 4 px above the words", at: CGPoint(x: above.midX, y: above.minY - 4), shift: shift),
+            "table-1"
+        )
+
+        // Plain text after a link, inside the link's reach.
+        var docs = scroll(to: "docs")
+        shift = offset(of: docs)
+        var attempt = 0
+        for beside in [10, 12, 8, 14] as [CGFloat] {
+            docs = link("docs")
+            shift = offset(of: docs)
+            let words = docs.words[docs.words.count - 1]
+            let result = tap("\(named): on plain text after the link, \(Int(beside)) px past its words", at: CGPoint(x: words.maxX + beside, y: words.midY), shift: shift)
+            attempt += 1
+            // The point has to land on the paragraph for this to be the case: another target means the next point.
+            let down = result.events.first(where: { $0.type == "pointerdown" })
+            if let down, !down.target.hasPrefix("button") && !down.target.hasPrefix("span.md-link") {
+                expectOpened(result, "docs")
+                break
+            }
+            if attempt == 4 { XCTFail("no point past the words landed on the paragraph: \(result.events.map(\.target))") }
+        }
+
+        // One line away from every link, on the conversation.
+        let all = links()
+        let room = pane()
+        let shiftNow = offset(of: link("docs"))
+        var away: CGPoint?
+        var y = room.minY + 12
+        while y < room.maxY - 12, away == nil {
+            let candidate = CGPoint(x: room.midX, y: y)
+            if all.allSatisfy({ !$0.box.insetBy(dx: -40, dy: -(40 + $0.line)).contains(candidate) }) { away = candidate }
+            y += 6
+        }
+        if let away {
+            let result = tap("\(named): one line away from every link", at: away, shift: shiftNow)
+            XCTAssertTrue(result.opened.isEmpty, "\(result.label): opened \(result.opened)")
+        } else {
+            XCTFail("no point of the conversation lies a line away from every link: \(room)")
+        }
+
+        // A drag that scrolls, started on a link's words: pointercancel, no click, nothing opened.
+        let dragged = scroll(to: "table-2")
+        let draggedShift = offset(of: dragged)
+        let draggedWords = dragged.words[0]
+        let result = drag("\(named): a drag that scrolls, started on a link", from: CGPoint(x: draggedWords.midX, y: draggedWords.midY), by: CGVector(dx: 0, dy: -180), shift: draggedShift)
+        XCTAssertTrue(result.events.contains { $0.type == "pointercancel" }, "\(result.label): no pointercancel: \(result.events.map(\.type))")
+        XCTAssertFalse(result.events.contains { $0.type == "click" }, "\(result.label): a click came")
+        XCTAssertTrue(result.opened.isEmpty, "\(result.label): opened \(result.opened)")
+
+        // A link while the composer has focus: where does the focus go.
+        composer.tap()
+        Thread.sleep(forTimeInterval: 1.5)
+        let reference = scroll(to: "reconnect")
+        let withKeyboard = offset(of: reference)
+        let words = reference.words[0]
+        let focused = tap("\(named): a link while the composer has focus", at: CGPoint(x: words.midX, y: words.midY), shift: withKeyboard)
+        say("LINKTAP \(named): composer focus: opened \(focused.opened)")
+    }
+
+    func testTapsAtTheDefaultTextSize() {
+        runTaps(size: nil, named: "default size")
+    }
+
+    func testTapsAtTheLargestTextSize() {
+        runTaps(size: Self.largest, named: "largest size")
+    }
+}
