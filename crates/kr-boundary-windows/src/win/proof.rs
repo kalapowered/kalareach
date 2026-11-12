@@ -27,7 +27,7 @@ use crate::frame::Class;
 use crate::manifest::{GitSet, Manifest, ObjectKind};
 use crate::policy::{RULE_CHECKOUT, RULE_CONNECT};
 use crate::quote::quote_command_line;
-use crate::window::{Bound, bound, may_ask_the_log, search_is_over};
+use crate::window::{Bound, bound, may_ask_the_log, query_ends_the_search, search_is_over};
 
 use super::applocker;
 use super::ffi::{self, Sid};
@@ -604,13 +604,12 @@ pub fn prove(
                         break;
                     }
                 }
-                // A query that was cut at the window's own end (the deadline it was given) ends the
-                // search; a query that failed to start, a pipe error, a bad exit or a cut at the
-                // query's own bound is a failure of the proof at any time.
-                Err(applocker::Error::TimedOut {
-                    by_the_deadline: true,
-                    ..
-                }) => {
+                // A query that the search's own end stopped ends the search: one cut at the deadline it
+                // was given, one that found the deadline passed before it was made, and one whose
+                // program could not start because the deadline had passed. A query that failed to
+                // start, a pipe error, a bad exit or a cut at the query's own bound is a failure of
+                // the proof at any time.
+                Err(error) if query_ends_the_search(error.query_end()) => {
                     over = true;
                 }
                 Err(error) => return fail(error.to_string()),
