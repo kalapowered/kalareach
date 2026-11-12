@@ -42,7 +42,7 @@ use tauri::{AppHandle, Emitter as _};
 use tokio::sync::Notify;
 
 use crate::agent::Link;
-use crate::connection::{Asked, Unopened};
+use crate::connection::{Asked, Unopened, Waiting};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 
@@ -212,11 +212,11 @@ enum Opening {
 enum Begin {
     /// The opening has a link, and the watch waits for its connection to end.
     Held(Arc<Link>),
-    /// The opening has no link yet and the watch reaches the host. `not_admitted` is the host's
-    /// words when the opening's first open was refused at the connection's admission: they stay the
+    /// The opening has no link yet and the watch reaches the host. `waiting` holds the host's words
+    /// when the opening's first open was refused at the connection's admission: they stay the
     /// reason the screen shows while the asks that follow do not reach the host
     /// ([`waiting_standing`]).
-    Reaching { not_admitted: Option<String> },
+    Reaching { waiting: Waiting },
 }
 
 /// The host a phone opens sessions on, and what it opens them as.
@@ -224,13 +224,48 @@ enum Begin {
 pub struct Dial {
     device: Arc<Device>,
     host: PairedHost,
+    /// Which words a person reads while the views of one opening, each on a connection of its own,
+    /// are opened again and the host is not reached ([`Waiting`]).
+    views: Arc<Mutex<Waiting>>,
 }
 
 impl Dial {
     /// A dial to `host` as `device`.
     #[must_use]
     pub fn new(device: Arc<Device>, host: PairedHost) -> Self {
-        Self { device, host }
+        Self {
+            device,
+            host,
+            views: Arc::default(),
+        }
+    }
+
+    /// This dial, for a view of an opening whose views share `views`.
+    #[must_use]
+    pub(crate) fn for_views(mut self, views: Arc<Mutex<Waiting>>) -> Self {
+        self.views = views;
+        self
+    }
+
+    /// The host's words that a person reads for a view that was not opened, when a try of an opening's
+    /// views came to `unopened` ([`Waiting::after`]).
+    pub(crate) fn view_words_after(
+        &self,
+        unopened: &Unopened,
+    ) -> Option<crate::connection::HostWords> {
+        self.views
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .after(unopened)
+            .cloned()
+    }
+
+    /// Notes that a view's connection opened: the words of an earlier try are no longer the reason.
+    pub(crate) fn view_opened(&self) {
+        self.views
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .opened();
     }
 
     /// The host this dial reaches.
@@ -492,6 +527,9 @@ struct Opened {
     /// How many views of this opening lost their connection since one last drew a screen, so that a
     /// view that cannot hold a connection is not opened again at the speed of the network.
     losses: u32,
+    /// Which words a person reads while the views of this opening are opened again and the host is
+    /// not reached.
+    view_words: Arc<Mutex<Waiting>>,
 }
 
 #[derive(Default)]
@@ -539,22 +577,12 @@ pub(crate) fn transient(code: ErrorCode) -> bool {
     code.retry_category() == RetryCategory::Transient || code == ErrorCode::ClockUntrusted
 }
 
-/// What the screen says while an opening waits, after a try that did not give a link. The host's
-/// words for a connection it refused at its admission are kept (`kept`) as the reason while the
-/// tries that follow do not reach the host: a device that was revoked at the host between its
-/// handshake and its admission is answered as an unpaired peer afterwards, which ends each later
-/// connection as a connection lost, and the words that say why are the host's first. A cause that
-/// says something else (the host has no room, this computer's budget, another refusal) replaces
-/// them.
-fn waiting_standing(failure: &Unopened, kept: &mut Option<String>) -> SessionStanding {
-    match failure {
-        Unopened::NotAdmitted(words) => *kept = Some(words.to_string()),
-        Unopened::Unreached(_) if kept.is_some() => {}
-        _ => *kept = None,
-    }
-    match kept {
-        Some(reason) => SessionStanding::Reconnecting {
-            reason: reason.clone(),
+/// What the screen says while an opening waits, after a try that did not give a link: the words
+/// that `waiting` keeps ([`Waiting`]), and otherwise the cause's own.
+fn waiting_standing(failure: &Unopened, waiting: &mut Waiting) -> SessionStanding {
+    match waiting.after(failure) {
+        Some(words) => SessionStanding::Reconnecting {
+            reason: words.to_string(),
             capacity: false,
         },
         None => SessionStanding::reconnecting(failure),
@@ -726,18 +754,15 @@ impl PairedLinks {
                     return Err(failure.into_error());
                 }
                 // The opening stands, and its watch reaches the host again as the same opening.
-                let standing = SessionStanding::reconnecting(&failure);
-                let not_admitted = match &failure {
-                    Unopened::NotAdmitted(words) => Some(words.to_string()),
-                    _ => None,
-                };
+                let mut waiting = Waiting::default();
+                let standing = waiting_standing(&failure, &mut waiting);
                 let watch = tauri::async_runtime::spawn(Arc::clone(self).keep(
                     dial.clone(),
                     emit,
                     session_id,
                     grant_id,
                     opening.to_owned(),
-                    Begin::Reaching { not_admitted },
+                    Begin::Reaching { waiting },
                 ));
                 inner.opened.insert(
                     session_id,
@@ -748,6 +773,7 @@ impl PairedLinks {
                         watch: Some(watch),
                         views: Vec::new(),
                         losses: 0,
+                        view_words: Arc::default(),
                     },
                 );
                 return Ok(standing);
@@ -788,6 +814,7 @@ impl PairedLinks {
                         watch,
                         views: Vec::new(),
                         losses: 0,
+                        view_words: Arc::default(),
                     },
                 );
                 Ok(standing)
@@ -1128,6 +1155,17 @@ impl PairedLinks {
         }
     }
 
+    /// Which words a person reads while the views of the opening are opened again and the host is not
+    /// reached, shared by the views of one opening.
+    pub(crate) fn view_words(&self, session_id: SessionId, opening: &str) -> Arc<Mutex<Waiting>> {
+        self.lock()
+            .opened
+            .get(&session_id)
+            .filter(|held| held.opening == opening)
+            .map(|held| Arc::clone(&held.view_words))
+            .unwrap_or_default()
+    }
+
     /// Notes that a view of the opening lost its connection, and answers how many have since one
     /// last drew a screen.
     fn note_loss(&self, session_id: SessionId, opening: &str) -> u32 {
@@ -1286,9 +1324,9 @@ impl PairedLinks {
         opening: String,
         begin: Begin,
     ) {
-        let (mut link, mut not_admitted) = match begin {
-            Begin::Held(link) => (Some(link), None),
-            Begin::Reaching { not_admitted } => (None, not_admitted),
+        let (mut link, mut waiting) = match begin {
+            Begin::Held(link) => (Some(link), Waiting::default()),
+            Begin::Reaching { waiting } => (None, waiting),
         };
         let mut refused: Option<ErrorCode> = None;
         let mut backoff = kr_client::reconnect::ReconnectLoop::new();
@@ -1297,7 +1335,7 @@ impl PairedLinks {
                 // A link that was made and has ended starts the asks over: a refusal from before
                 // it is not one that the next agrees with.
                 refused = None;
-                not_admitted = None;
+                waiting.opened();
                 backoff.connected();
                 held.session.closed().await;
                 // An opening that is over, or was left or replaced, is not reached again.
@@ -1376,7 +1414,7 @@ impl PairedLinks {
                     // What the last try came to is told, so that a later refusal while the opening
                     // waits replaces the reason the screen shows.
                     Err(failure) => {
-                        let standing = waiting_standing(&failure, &mut not_admitted);
+                        let standing = waiting_standing(&failure, &mut waiting);
                         self.tell_standing(&emit, session_id, &opening, standing);
                     }
                 }
@@ -1760,6 +1798,7 @@ pub(crate) mod tests {
                     watch: None,
                     views: Vec::new(),
                     losses: 0,
+                    view_words: Arc::default(),
                 },
             );
             inner.ambient.push(AmbientEntry {

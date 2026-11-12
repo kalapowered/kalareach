@@ -842,6 +842,26 @@ enum Cause {
 }
 
 impl Cause {
+    /// What a connection that was not opened for a repeat says, after the repeats before it
+    /// (`waiting`, [`crate::connection::Waiting`]): the host's words for a connection that it did not
+    /// admit stay while the repeats that follow do not reach the host, and any other cause says its
+    /// own.
+    fn after(
+        waiting: &mut crate::connection::Waiting,
+        unopened: &crate::connection::Unopened,
+    ) -> Self {
+        match waiting.after(unopened) {
+            Some(words) => Self::not_opened(words),
+            None => Self::of(unopened),
+        }
+    }
+
+    /// The host refused the connection itself at its admission: it is lost, and the host's words are
+    /// why.
+    fn not_opened(words: &crate::connection::HostWords) -> Self {
+        Self::Refused(format!("the connection was not opened: {words}"))
+    }
+
     fn of(unopened: &crate::connection::Unopened) -> Self {
         use crate::connection::Unopened;
         match unopened {
@@ -851,11 +871,7 @@ impl Cause {
                 Some(request) => format!("the host refused to {request}: {}", error.message),
                 None => format!("the connection was not opened: {}", error.message),
             }),
-            // The host refused the connection itself at its admission: it is lost, and the host's
-            // words are why.
-            Unopened::NotAdmitted(words) => {
-                Self::Refused(format!("the connection was not opened: {words}"))
-            }
+            Unopened::NotAdmitted(words) => Self::not_opened(words),
             Unopened::Unreached(_) => Self::Silent,
         }
     }
@@ -1707,6 +1723,7 @@ impl Carry {
         // and a refusal are answers, and the words at the end say which. Only a host that did not
         // answer is told as the host not answering.
         let mut cause = Cause::Silent;
+        let mut waiting = crate::connection::Waiting::default();
         let challenge = loop {
             match Reply::of(&outcome) {
                 Reply::Result => {
@@ -1737,6 +1754,7 @@ impl Carry {
                     asked_again += 1;
                     outcome = match self.connection.another().await {
                         Ok(second) => {
+                            waiting.opened();
                             cause = Cause::Silent;
                             let outcome = second.session().repeat(composed).await;
                             second.session().settle(sent_action).await;
@@ -1744,7 +1762,7 @@ impl Carry {
                             outcome
                         }
                         Err(unopened) => {
-                            cause = Cause::of(&unopened);
+                            cause = Cause::after(&mut waiting, &unopened);
                             Err(ClientError::ConnectionEnded)
                         }
                     };
@@ -2240,6 +2258,45 @@ mod tests {
             Cause::of(&Unopened::BudgetFull)
                 .words()
                 .contains("already holds")
+        );
+    }
+
+    /// KR-REQ-19.08: the words that a hand-over's repeats end with are the host's for a connection
+    /// that it did not admit, and they stay while the repeats that follow do not reach the host. A
+    /// connection that opens clears them, and the host's bound replaces them.
+    #[test]
+    fn the_hosts_words_for_a_connection_it_did_not_admit_stay_while_the_repeats_do_not_reach_it() {
+        use crate::connection::{HostWords, Unopened, Waiting};
+
+        let not_admitted =
+            || Unopened::NotAdmitted(HostWords::said("the host withdrew this device"));
+        let silent = || Unopened::Unreached(CommandError::unavailable("gone"));
+        let mut waiting = Waiting::default();
+
+        let first = Cause::after(&mut waiting, &not_admitted());
+        assert!(first.words().contains("the host withdrew this device"));
+        assert_eq!(
+            Cause::after(&mut waiting, &silent()).words(),
+            first.words(),
+            "a repeat that did not reach the host leaves the host's words"
+        );
+        // The bound is another cause: it replaces the words, and the next repeat that does not
+        // reach the host is the host not answering.
+        assert!(
+            Cause::after(&mut waiting, &Unopened::HostFull)
+                .words()
+                .contains("would not take another")
+        );
+        assert_eq!(
+            Cause::after(&mut waiting, &silent()).words(),
+            "the host did not answer"
+        );
+        // A connection that opens clears them.
+        Cause::after(&mut waiting, &not_admitted());
+        waiting.opened();
+        assert_eq!(
+            Cause::after(&mut waiting, &silent()).words(),
+            "the host did not answer"
         );
     }
     use std::sync::mpsc;

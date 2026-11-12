@@ -863,8 +863,8 @@ async fn a_connection_to_the_host_is_taken_up_again_when_it_ends() {
         async move {
             // The host does not answer the first two times.
             if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
-                return Attempt::Failed(companion_tauri::CommandError::unavailable(
-                    "the host did not answer",
+                return Attempt::Failed(companion_tauri::connection::Unopened::Unreached(
+                    companion_tauri::CommandError::unavailable("the host did not answer"),
                 ));
             }
             let reached =
@@ -875,7 +875,9 @@ async fn a_connection_to_the_host_is_taken_up_again_when_it_ends() {
                 };
             match reached {
                 Ok(connection) => Attempt::Reached(connection),
-                Err(error) => Attempt::Failed(error),
+                Err(error) => {
+                    Attempt::Failed(companion_tauri::connection::Unopened::Unreached(error))
+                }
             }
         }
     })

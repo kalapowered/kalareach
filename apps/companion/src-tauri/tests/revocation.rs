@@ -2643,7 +2643,9 @@ async fn keeps_its_connection(
             });
             match local_connection(&endpoint).await {
                 Ok(connection) => Attempt::Reached(connection.reopening(reopen)),
-                Err(error) => Attempt::Failed(error),
+                Err(error) => {
+                    Attempt::Failed(companion_tauri::connection::Unopened::Unreached(error))
+                }
             }
         }
     })
