@@ -54,37 +54,6 @@ pub const OPENED_LIMIT: usize = 8;
 /// The most ambient links held at once.
 pub const AMBIENT_LIMIT: usize = 4;
 
-/// The most connections this computer holds to the host in use at once, as the one device it is
-/// there.
-///
-/// * the main connection: one;
-/// * the opened links: one for each opened session, at most [`OPENED_LIMIT`];
-/// * a raw terminal view for each opened session, at most [`OPENED_LIMIT`]: native code holds the
-///   raw views of an opening to no number, and this counts one for each opened session;
-/// * the ambient links, at most [`AMBIENT_LIMIT`];
-/// * the owner's confirmations: two, a review beside the cycle of visits;
-/// * a revocation reading: two, a view beside a revoke or in a second window, which native code
-///   holds to no number;
-/// * the push registration: one;
-/// * the inbox's kept connection: one, which it closes at its next visit after the host became the
-///   host in use;
-/// * a voice call's own connection, when it avoids the main session: one;
-/// * the sharing desk's repeat connection and its reading connection: two for the action it
-///   carries on, and native code holds the actions carried on at once to no number.
-///
-/// Not counted: the settings list's visits (two at once), which reach only hosts that are not in
-/// use; the pairing candidate's first connection, which exists only while a host is being paired;
-/// and the endpoint holds of the push registration, which open no connection to the host.
-///
-/// Not held to this count either: an opened link that was left keeps its connection for up to 60
-/// seconds while its requests finish, and an open that was superseded keeps its connection until
-/// its dial returns. Each of them is a connection to the host beside the ones above, so a person
-/// who leaves and opens sessions faster than the requests finish holds more than this number.
-/// Above the host's bound the host withdraws one of the device's connections for each new one and
-/// cannot tell these from the ones in use, so only a limit here keeps them below it.
-pub const HOST_CONNECTIONS: usize =
-    1 + OPENED_LIMIT + OPENED_LIMIT + AMBIENT_LIMIT + 2 + 2 + 1 + 1 + 1 + 2;
-
 /// How long an ambient link may sit idle before it is let go.
 const AMBIENT_IDLE: Duration = Duration::from_secs(60);
 
@@ -257,6 +226,11 @@ impl Dial {
     #[must_use]
     pub fn new(device: Arc<Device>, host: PairedHost) -> Self {
         Self { device, host }
+    }
+
+    /// The host this dial reaches.
+    pub(crate) fn host_device_id(&self) -> kr_protocol::ids::DeviceId {
+        self.host.host_device_id
     }
 
     /// Reaches the host on a connection of its own, as the device it paired as, and returns the
@@ -479,10 +453,14 @@ impl AmbientEntry {
 }
 
 /// The opening a session's screen holds now, and the number of the call that chose it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct Current {
     opening: String,
     attempt: u64,
+    /// Told when another opening takes this one's place or the screen is left, so that a dial that
+    /// is still under way stops, and gives its place on the host back, rather than finishing for
+    /// nothing.
+    superseded: Arc<Notify>,
 }
 
 /// One session's opened link.
@@ -631,7 +609,7 @@ impl PairedLinks {
                 "an opening is up to 64 letters, digits and dashes",
             ));
         }
-        let (attempt, replaced) = {
+        let (attempt, superseded, replaced) = {
             let mut inner = self.lock();
             let seen = inner.seen.entry(session_id).or_default();
             if seen.iter().any(|seen| seen == opening) {
@@ -652,21 +630,31 @@ impl PairedLinks {
             }
             inner.attempts += 1;
             let attempt = inner.attempts;
-            inner.current.insert(
+            let superseded = Arc::new(Notify::new());
+            // The dial of the opening this one replaces is stopped, not left to finish.
+            if let Some(earlier) = inner.current.insert(
                 session_id,
                 Current {
                     opening: opening.to_owned(),
                     attempt,
+                    superseded: Arc::clone(&superseded),
                 },
-            );
-            (attempt, inner.opened.remove(&session_id))
+            ) {
+                earlier.superseded.notify_one();
+            }
+            (attempt, superseded, inner.opened.remove(&session_id))
         };
         // The earlier opening is over now, not when this one has answered: its commands are
         // refused, its watch stops and its link and views close.
         if let Some(old) = replaced {
             old.end_now();
         }
-        let reached = dial.open(session_id, grant_id).await;
+        // A dial that another opening or a leave has made no longer wanted stops here, and what it
+        // held of the host's places goes back with it.
+        let reached = tokio::select! {
+            reached = dial.open(session_id, grant_id) => reached,
+            () = superseded.notified() => return Ok(SessionStanding::Superseded),
+        };
         let mut inner = self.lock();
         let still_mine = inner
             .current
@@ -768,8 +756,8 @@ impl PairedLinks {
             .current
             .get(&session_id)
             .is_some_and(|current| current.opening == opening);
-        if current {
-            inner.current.remove(&session_id);
+        if current && let Some(earlier) = inner.current.remove(&session_id) {
+            earlier.superseded.notify_one();
         }
         let held = inner
             .opened
@@ -1271,6 +1259,11 @@ impl PairedLinks {
                 if !self.is_current(session_id, &opening) {
                     return;
                 }
+                // A host whose places are all held is waited for on the budget of places, which
+                // says when one is free, and not on the ladder above.
+                crate::places::budget()
+                    .until_free(dial.host_device_id(), crate::places::Kind::Other)
+                    .await;
                 match dial.open(session_id, grant_id).await {
                     Ok(Opening::Open(fresh, standing)) => {
                         if !self.tell_reinstall(&emit, session_id, &opening, &fresh, standing) {

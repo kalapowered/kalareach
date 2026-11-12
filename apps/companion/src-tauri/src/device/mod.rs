@@ -345,7 +345,8 @@ impl Device {
                     Some(leases) => link.presenting_membership(Arc::new(leases.clone())),
                     None => link,
                 };
-                let own: Arc<dyn HostLink> = Arc::new(link);
+                // Every dial to a paired host takes a place from one budget first.
+                let own = crate::places::Budgeted::over(Arc::new(link), crate::places::budget());
                 match parts.link {
                     Some(behind) => behind(own),
                     None => own,

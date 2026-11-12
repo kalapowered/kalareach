@@ -278,6 +278,17 @@ impl Wire {
                 Err(lost) => return Err(lost),
             };
             match frame {
+                // An error with request identifier zero is the host's word on the connection
+                // itself, which it refuses: the call is answered with it, as a host's own answer.
+                ControlFrame::Response(response)
+                    if response.request_id == RequestId::new(0)
+                        && matches!(response.outcome, Outcome::Error(_)) =>
+                {
+                    break match response.outcome {
+                        Outcome::Error(error) => Err(error),
+                        Outcome::Ok(value) => Ok(value),
+                    };
+                }
                 ControlFrame::Response(response) if response.request_id == request_id => {
                     break match response.outcome {
                         Outcome::Ok(value) => Ok(value),

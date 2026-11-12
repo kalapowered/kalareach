@@ -1185,23 +1185,25 @@ async fn kr_req_13_03_a_draft_is_the_same_after_a_visit_to_the_terminal() {
     adopted.stop().await;
 }
 
-/// KR-REQ-19.08: the host withdraws a device's oldest connection at the first one above its bound,
-/// and the phone holds up to `HOST_CONNECTIONS` connections to one host at once, each of which may
-/// linger once beside its replacement after a reconnection. The host lets a device use at least
-/// that many and holds twice what it lets it use, so no connection the phone uses is withdrawn.
+/// KR-REQ-19.08: the companion, paired with a host, opens that host's session over its paired
+/// connection and holds at most `HOST_CONNECTIONS` connections to it at once, every dial counted: a
+/// pending open, a superseded one and a link left while its requests finish included, one place of
+/// them the main link's alone. The host lets a device use that many and holds at least twice as
+/// many live ones, so that every connection in use may linger once beside its replacement, and it
+/// ends none that it heard from lately for a new one.
 #[test]
 fn kr_req_19_08_the_hosts_bound_on_a_devices_connections_covers_the_phones_links() {
     let in_use = kr_controller::service::net::DEVICE_CONNECTIONS_IN_USE;
     let held = kr_controller::service::net::DEVICE_LIVE_CONNECTIONS;
-    let used = companion_tauri::standing::HOST_CONNECTIONS;
+    let total = companion_tauri::places::HOST_CONNECTIONS;
     assert!(
-        used <= in_use,
-        "the phone uses {used} connections to a host and the host lets a device use {in_use}"
+        total <= in_use,
+        "the phone holds {total} connections to a host and the host lets a device use {in_use}"
     );
-    assert_eq!(
-        held,
-        2 * in_use,
-        "each connection in use may linger once beside its replacement"
+    assert!(
+        held >= 2 * total,
+        "the host's bound of {held} live connections is less than twice the {total} the phone \
+         holds, so a connection in use cannot linger once beside its replacement"
     );
 }
 

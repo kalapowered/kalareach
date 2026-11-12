@@ -131,7 +131,7 @@ async fn keep<R: Runtime>(
             let Ok(device) = kept.state::<AppState>().device() else {
                 return Attempt::Nothing;
             };
-            match Connection::paired(&device, &host).await {
+            match crate::places::as_the_main_link(Connection::paired(&device, &host)).await {
                 Ok(connection) => Attempt::Reached(connection),
                 Err(error) => Attempt::Failed(error),
             }

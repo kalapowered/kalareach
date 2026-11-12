@@ -46,6 +46,7 @@ pub mod links;
 pub mod mailbox;
 pub mod owner;
 pub mod pairing;
+pub mod places;
 /// The checks a debug build runs for the voice call's bridge on a phone.
 #[cfg(debug_assertions)]
 pub mod probe;

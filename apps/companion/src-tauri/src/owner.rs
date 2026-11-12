@@ -362,11 +362,24 @@ impl Owner {
             // The host was reached and was asked nothing: this computer could not give it the
             // lease it needs, and the words say why.
             LinkError::Membership(refusal) => Missed::Refused(refusal.message),
+            // The host was reached and cannot take another connection from this computer for now:
+            // it is not out of contact, and the next visit asks again.
+            LinkError::Refused(refusal) if crate::standing::transient(refusal.code) => {
+                Missed::Refused(NO_ROOM_FOR_NOW.to_owned())
+            }
             _ => Missed::OutOfContact,
         })?;
-        let channel = SessionChannel::open(Arc::new(session))
-            .await
-            .map_err(|_| Missed::OutOfContact)?;
+        let channel =
+            SessionChannel::open(Arc::new(session))
+                .await
+                .map_err(|error| match error {
+                    kr_client::error::ClientError::Host(refusal)
+                        if crate::standing::transient(refusal.code) =>
+                    {
+                        Missed::Refused(NO_ROOM_FOR_NOW.to_owned())
+                    }
+                    _ => Missed::OutOfContact,
+                })?;
         Ok(Arc::new(OwnerConfirmations::new(
             host.clone(),
             self.device.identity().keys.authorisation.clone(),
@@ -434,6 +447,12 @@ impl Owner {
         }
     }
 }
+
+/// What a person is told when the host would not take another connection from this computer for
+/// now, because this computer already holds as many to it as it keeps at once: it names the cause,
+/// and the next visit asks again.
+const NO_ROOM_FOR_NOW: &str = "the host cannot take another connection from this computer just \
+                               now; this computer asks again by itself";
 
 /// Why a visit to an owned host found nothing.
 enum Missed {
