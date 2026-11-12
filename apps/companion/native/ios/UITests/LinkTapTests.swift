@@ -122,6 +122,7 @@ final class LinkTapTests: HarnessTestCase {
         "upper": "the upper link",
         "lower": "the lower link",
         "under-image": "a link under the image",
+        "middle": "it",
     ]
 
     /// Where the page's coordinates lie on the screen: the button a link is has a frame the system
@@ -194,7 +195,8 @@ final class LinkTapTests: HarnessTestCase {
     private func named(_ result: Result) -> String {
         guard let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else { return "none" }
         let added = result.events.contains { $0.type == "click" && !$0.trusted }
-        return (click.target.contains("md-link") ? "the link's button" : "plain text (\(click.target))") + (added ? ", with the page's click on the link" : ", no click added by the page")
+        let what = click.target.contains("md-link") ? "the link's button" : click.target.hasPrefix("button") ? "a control (\(click.target))" : "plain text (\(click.target))"
+        return what + (added ? ", with the page's click on the link" : ", no click added by the page")
     }
 
     /// A tap that opens a link: one trusted click with detail 1 after the pointer's release, and the link opened once.
@@ -332,12 +334,14 @@ final class LinkTapTests: HarnessTestCase {
         let underImage = scroll(to: "under-image")
         let control = app.buttons["Load this image"].firstMatch
         XCTAssertTrue(control.waitForExistence(timeout: 10), "the screen shows no Load this image control")
-        let controlShift = offset(of: underImage)
-        let controlFrame = control.frame
+        _ = underImage
+        // The control's frame is the screen's own, so the point is a screen point: no shift. At the largest size the control
+        // is wider than the screen, so the point is in the part of it that the screen shows.
+        let controlFrame = control.frame.intersection(app.frame)
         let onControl = tap(
             "\(named): 2 px inside the lower edge of Load this image",
-            at: CGPoint(x: controlFrame.midX - controlShift.dx, y: controlFrame.maxY - 2 - controlShift.dy),
-            shift: controlShift
+            at: CGPoint(x: controlFrame.midX, y: controlFrame.maxY - 2),
+            shift: .zero
         )
         let controlClicks = onControl.events.filter { $0.type == "click" && $0.trusted }
         XCTAssertEqual(controlClicks.count, 1, "\(onControl.label): the system's clicks that came: \(onControl.events.map(\.type))")
@@ -347,6 +351,32 @@ final class LinkTapTests: HarnessTestCase {
         )
         XCTAssertFalse(onControl.events.contains { $0.type == "click" && !$0.trusted }, "\(onControl.label): the page added a click")
         XCTAssertTrue(onControl.opened.isEmpty, "\(onControl.label): opened \(onControl.opened)")
+
+        // The edge of the area in which a tap opens a link, in each of the four directions, for a link in the middle of
+        // a line with no other link near. The area is what the page gives the words: grown by half the least size beside
+        // them and to the least size in height (so, from the words' frame, 22 points beside the words and a height of 44
+        // about their middle), and the link's own button box, which is the page's. A tap 2 points inside an edge opens the
+        // link once; a tap 4 points outside it opens nothing.
+        let middle = scroll(to: "middle")
+        let middleShift = offset(of: middle)
+        let around = middle.words[0]
+        let least: CGFloat = 44
+        let halfTall = max(least, around.height) / 2
+        let areaLeft = min(around.minX - least / 2, middle.box.minX)
+        let areaRight = max(around.maxX + least / 2, middle.box.maxX)
+        let areaTop = min(around.midY - halfTall, middle.box.minY)
+        let areaBottom = max(around.midY + halfTall, middle.box.maxY)
+        let edges: [(String, CGPoint, CGPoint)] = [
+            ("left", CGPoint(x: areaLeft + 2, y: around.midY), CGPoint(x: areaLeft - 4, y: around.midY)),
+            ("right", CGPoint(x: areaRight - 2, y: around.midY), CGPoint(x: areaRight + 4, y: around.midY)),
+            ("top", CGPoint(x: around.midX, y: areaTop + 2), CGPoint(x: around.midX, y: areaTop - 4)),
+            ("bottom", CGPoint(x: around.midX, y: areaBottom - 2), CGPoint(x: around.midX, y: areaBottom + 4)),
+        ]
+        for (edge, inside, outside) in edges {
+            expectOpened(tap("\(named): the \(edge) edge of the area, 2 points inside", at: inside, shift: middleShift), "middle")
+            let beyond = tap("\(named): the \(edge) edge of the area, 4 points outside", at: outside, shift: middleShift)
+            XCTAssertTrue(beyond.opened.isEmpty, "\(beyond.label): opened \(beyond.opened)")
+        }
 
         // A press of one second on a link's words: what the platform does with it stands, and the page adds nothing.
         let pressed = scroll(to: "table-2")
@@ -389,6 +419,12 @@ final class LinkTapTests: HarnessTestCase {
         say("LINKTAP \(named): composer focus: keyboards before \(keyboardBefore), after \(app.keyboards.count); opened \(focused.opened); \(focused.focus)")
         XCTAssertGreaterThan(keyboardBefore, 0, "\(focused.label): the keyboard was not up before the tap")
         expectOpened(focused, "reconnect")
+        // WebKit's own press moves the focus to the conversation (its tabindex) before the click, and the keyboard goes
+        // with the composer's focus: the focus is on the conversation or on the link, never left in the composer.
+        XCTAssertTrue(
+            focused.focus.contains("active=div.m-pane") || focused.focus.contains("active=button.md-link(reconnect)"),
+            "\(focused.label): the focus is \(focused.focus)"
+        )
     }
 
     func testTapsAtTheDefaultTextSize() {

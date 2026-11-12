@@ -47,6 +47,11 @@ final class AccessibilityTests: HarnessTestCase {
         Thread.sleep(forTimeInterval: 1.5)
     }
 
+    /// A link that sits inside a sentence of the conversation is text, and a size the person sets
+    /// for the text is the size of the link: it is not counted as a control that needs its own
+    /// forty-four points. Each such link is named here, and is said when it is skipped.
+    private static let linksInsideText: Set<String> = ["the reconnect notes"]
+
     /// Whether an element belongs to the product and not to the harness or the debug build.
     private func isThePage(_ element: XCUIElement?) -> Bool {
         guard let element else { return true }
@@ -71,11 +76,6 @@ final class AccessibilityTests: HarnessTestCase {
     /// hidden. The button is what a finger meets, so the button is measured.
     private static let attachmentLabels = ["Photo library", "Take a photo", "Files"]
 
-    /// A link inside a message of the conversation is a button a finger meets like any other, on a
-    /// line of text that is shorter than a finger: it is named here, so that it is found on the
-    /// conversation and its size is said whether it passes or not.
-    private static let linkLabels = ["the reconnect notes"]
-
     // MARK: Target sizes
 
     /// Every control a person is expected to touch is at least 44 by 44 points, at the default size.
@@ -90,24 +90,28 @@ final class AccessibilityTests: HarnessTestCase {
                 // A one-point button is an input the page hides behind its own label, which a
                 // finger cannot reach: the label beside it is the control, and is measured.
                 guard frame.width > 4, frame.height > 4 else { continue }
+                if Self.linksInsideText.contains(control.label) {
+                    say("A11Y \(screen.rawValue): \(control.label) is a link inside a sentence, \(Int(frame.width)) by \(Int(frame.height)), and is not counted")
+                    continue
+                }
                 if frame.width < 44 || frame.height < 44 {
                     say("A11Y \(screen.rawValue): \(control.label) is \(Int(frame.width)) by \(Int(frame.height))")
                     XCTFail("\(control.label) on \(screen.rawValue) is \(Int(frame.width)) by \(Int(frame.height)) points")
                 }
             }
             if screen == .conversation {
-                for name in Self.attachmentLabels + Self.linkLabels {
+                for name in Self.attachmentLabels {
                     // The button the finger meets carries the control's name; the file input behind it is
                     // hidden and one point wide.
                     let button = app.buttons[name].firstMatch
                     guard button.exists else {
-                        XCTFail("\(name) is not on the conversation")
+                        XCTFail("the \(name) control is not on the conversation")
                         continue
                     }
                     let frame = button.frame
-                    say("A11Y \(screen.rawValue): \(name) is \(Int(frame.width)) by \(Int(frame.height)) points")
                     if frame.width < 44 || frame.height < 44 {
-                        XCTFail("\(name) on \(screen.rawValue) is \(Int(frame.width)) by \(Int(frame.height)) points")
+                        say("A11Y \(screen.rawValue): the \(name) control is \(Int(frame.width)) by \(Int(frame.height))")
+                        XCTFail("the \(name) control on \(screen.rawValue) is \(Int(frame.width)) by \(Int(frame.height)) points")
                     }
                 }
             }

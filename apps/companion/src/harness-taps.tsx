@@ -22,14 +22,18 @@ const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 /**
  * What the taps need on the conversation: two table rows, text after a link, a link with another on
- * the next line, the control of an image that has not been loaded with a link on the next line, and
- * room to scroll.
+ * the next line, the control of an image that has not been loaded with a link on the next line, a link
+ * in the middle of a line with no other link near, and room to scroll.
  */
 const TAP_MESSAGES: readonly string[] = [
   ['| Item | Notes |', '| --- | --- |', '| one | [first notes](https://example.org/table-1) |', '| two | [second notes](https://example.org/table-2) |'].join('\n'),
   '[docs](https://example.org/docs) and more words follow the link on this line, which ends the paragraph.',
   '[the upper link](https://example.org/upper)  \n[the lower link](https://example.org/lower) is under it.',
   '![a picture](https://example.org/picture.png)  \n[a link under the image](https://example.org/under-image)',
+  'Plain words above a link that has no other link near it, in a paragraph of their own.',
+  'Plain words, a second paragraph above the link.',
+  'See [it](https://example.org/middle) now',
+  'Plain words under the link, a paragraph of their own, with no other link near the one above.',
   ...Array.from(
     { length: 16 },
     (_, index) => `Plain words in paragraph ${String(index + 1)}, which holds no link, so that the conversation is longer than the screen and scrolls.`
