@@ -36,6 +36,7 @@ use crate::manifest::{
 use crate::messages;
 use crate::notice::NOTICE;
 use crate::policy::{self, Policy};
+use crate::records::{self, Records, is_hex32, is_manifest_replacement};
 use crate::remedy::{self, Origin, Presence, Remedy};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -1020,14 +1021,6 @@ fn data_child_names(paths: &Paths) -> Vec<(OsString, Kind)> {
     ]
 }
 
-/// Whether the name is one the manifest's replacement is written under: `manifest-` and 32
-/// lowercase hexadecimal digits, then `.new`.
-fn is_manifest_replacement(name: &str) -> bool {
-    name.strip_prefix("manifest-")
-        .and_then(|rest| rest.strip_suffix(".new"))
-        .is_some_and(is_hex32)
-}
-
 /// Whether a journal's file name is one an invocation's journal has: 32 lowercase hexadecimal
 /// digits and the extension.
 fn is_journal_file_name(name: &str) -> bool {
@@ -1236,14 +1229,6 @@ enum Layout {
     /// belong to the boundary's accounts by design and are walked only by the broker's removal, so
     /// a root is checked for its owner, its kind and its place alone.
     Run,
-}
-
-/// Whether the text is 32 lowercase hexadecimal digits.
-fn is_hex32(text: &str) -> bool {
-    text.len() == 32
-        && text
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The kind of entry the layout names at a name, or none when the layout names nothing there.
@@ -2911,6 +2896,14 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
         Err(error) => return Err(io_error("reading the manifest")(error)),
     };
     let prior = Prior::load(&paths.prior).ok();
+    // A removal that took `staging` and could not delete the manifest leaves a manifest with no
+    // `staging`, and the channel makes its temporary directory there: it is made again, empty, and
+    // goes with the records.
+    made_if_missing(
+        &paths.staging,
+        &Principals::default(),
+        "making the staging directory again",
+    )?;
     let channel = Channel::new(&paths.staging);
     let manager = service::manager()?;
     let mut failures: Vec<String> = Vec::new();
@@ -3146,8 +3139,15 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             say("the installation is removed");
             Ok(())
         } else {
+            // While the manifest stays, the removal runs again whole and reads it. Without it, what
+            // stays is not the installation's and is for the person to remove.
+            let next = if paths.manifest.exists() {
+                "The manifest stays with them: close what holds them, then run the removal again, which reads the manifest and finishes"
+            } else {
+                "A new installation refuses until they are gone: remove them, then run the setup program again"
+            };
             Err(Error::Failed(format!(
-                "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. A new installation refuses until they are gone: remove them, then run the setup program again",
+                "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}",
                 stayed.join("; ")
             )))
         }
@@ -3159,39 +3159,17 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     }
 }
 
-/// Removes the installation's own records, last of all: the manifest, the earlier-state record, any
-/// replacement of the manifest that a crash or a failed write left, then `staging` (only when each
-/// of those is gone), the data directory and, when it is empty, the folder above it. Returns each thing that could not be removed, with
-/// the reason; nothing is returned when everything is gone.
+/// Removes the installation's own records, last of all, and then the data directory and, when it is
+/// empty, the folder above it. The records go in the order [`records::remove`] gives: the manifest
+/// last, so that a removal that stayed anywhere is run again from it. Returns each thing that could
+/// not be removed, with the reason; nothing is returned when everything is gone.
 pub fn remove_records(paths: &Paths) -> Vec<String> {
-    let mut stayed = Vec::new();
-    // Whether the thing is gone: it stayed when the call failed for any reason but its absence.
-    let mut leave = |path: &Path, result: io::Result<()>| -> bool {
-        if let Err(error) = result
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            stayed.push(format!("{} ({error})", path.display()));
-            return false;
-        }
-        true
-    };
-    let mut records_gone = leave(&paths.manifest, fs::remove_file(&paths.manifest));
-    records_gone &= leave(&paths.prior, fs::remove_file(&paths.prior));
-    // A replacement of the manifest that a crash, or a failed write, left has no use.
-    if let Ok(entries) = fs::read_dir(&paths.data) {
-        for entry in entries.flatten() {
-            if is_manifest_replacement(&entry.file_name().to_string_lossy()) {
-                records_gone &= leave(&entry.path(), fs::remove_file(entry.path()));
-            }
-        }
-    }
-    // The staging directory goes last, and only when every record before it is gone: a removal run
-    // again reads the manifest's policy records through the channel, which makes its temporary
-    // directory in staging, so a record that stayed must find staging where it was.
-    if records_gone {
-        leave(&paths.staging, fs::remove_dir_all(&paths.staging));
-    }
-    leave(&paths.data, fs::remove_dir(&paths.data));
+    let stayed = records::remove(&Records {
+        data: &paths.data,
+        manifest: &paths.manifest,
+        prior: &paths.prior,
+        staging: &paths.staging,
+    });
     if let Some(parent) = paths.data.parent() {
         let _ = fs::remove_dir(parent);
     }
