@@ -47,7 +47,13 @@ fn attributes() -> tauri_build::Attributes {
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
-    attributes.windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
+    // The Tauri build's default is the static Visual C++ runtime, which excludes the dynamic one and
+    // asks for `libcmt`. The workspace leaves `LIBCMT` out of every MSVC link on purpose (see
+    // `.cargo/config.toml`), so both start-ups would be excluded and no program of this package
+    // could link. The dynamic runtime stays.
+    attributes.windows_attributes(
+        tauri_build::WindowsAttributes::new_without_app_manifest().static_vc_runtime(false),
+    )
 }
 
 /// Makes sure the front-end output directory exists before the context is generated.
