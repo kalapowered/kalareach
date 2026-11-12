@@ -535,11 +535,18 @@ impl PairedLinks {
     /// Leaves every opening: the page that made them is gone, and it will make its own again with
     /// tokens of its own. What is in flight on each link answers first.
     pub fn leave_all(&self) {
-        let opened = {
+        let (current, opened) = {
             let mut inner = self.lock();
-            inner.current.clear();
-            std::mem::take(&mut inner.opened)
+            (
+                std::mem::take(&mut inner.current),
+                std::mem::take(&mut inner.opened),
+            )
         };
+        // A dial still under way for an opening that was left stops, as it does when one opening
+        // replaces another, and what it held of the host's places goes back.
+        for (_, current) in current {
+            current.superseded.notify_one();
+        }
         for (_, opened) in opened {
             opened.end();
         }
@@ -559,18 +566,23 @@ impl PairedLinks {
 
     /// Lets every link go and forgets every token: the host has changed.
     pub fn close_all(&self) {
-        let (opened, ambient) = {
+        let (current, opened, ambient) = {
             let mut inner = self.lock();
             // Moved on under the lock an ambient call hands its link over under, so a link is
             // either handed over before this and closed below, or sees the change and closes itself.
             self.generation.fetch_add(1, Ordering::SeqCst);
-            inner.current.clear();
+            let current = std::mem::take(&mut inner.current);
             inner.seen.clear();
             (
+                current,
                 std::mem::take(&mut inner.opened),
                 std::mem::take(&mut inner.ambient),
             )
         };
+        // A dial still under way for an opening is stopped, and gives its places back.
+        for (_, current) in current {
+            current.superseded.notify_one();
+        }
         for (_, opened) in opened {
             opened.end_now();
         }
@@ -1254,11 +1266,20 @@ impl PairedLinks {
                     return;
                 }
                 // A host whose places are all held is waited for on the budget of places, which
-                // says when one is free, and not on the ladder above.
-                crate::places::budget()
-                    .until_free(dial.host_device_id(), crate::places::Kind::Other)
-                    .await;
-                match dial.open(session_id, grant_id).await {
+                // says when one is free, and not on the ladder above. The opening may have been
+                // left or replaced while it waited, and then it dials nothing.
+                let Some(opened) = crate::places::budget()
+                    .dial_when_free(
+                        dial.host_device_id(),
+                        crate::places::Kind::Other,
+                        || self.is_current(session_id, &opening),
+                        dial.open(session_id, grant_id),
+                    )
+                    .await
+                else {
+                    return;
+                };
+                match opened {
                     Ok(Opening::Open(fresh, standing)) => {
                         if !self.tell_reinstall(&emit, session_id, &opening, &fresh, standing) {
                             fresh.session.close();

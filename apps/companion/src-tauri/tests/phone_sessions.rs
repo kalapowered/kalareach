@@ -3560,3 +3560,122 @@ async fn kr_req_19_08_a_connection_that_was_not_opened_says_why() {
     control.unreachable(false);
     adopted.stop().await;
 }
+
+/// KR-REQ-19.08: the reserved place belongs to the main link that is current. A former main link
+/// that something still holds, as a pending share's acceptance holds its connection, gives the
+/// reservation up when a newer one is dialled: after a change of host and back, the new main link
+/// reaches its connection at once with every other place held, and is not made to wait and refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_the_current_main_link_is_given_its_place_while_a_former_one_is_held() {
+    use kr_protocol::error::ErrorCode;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let device = phone.companion.device();
+    // A host this phone holds no connection to, so that every place on it is free; the dials reach
+    // the governed link and never the real host.
+    let mut elsewhere = device.host_in_use().expect("a host in use");
+    elsewhere.host_device_id = kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid());
+    let places = companion_tauri::places::budget();
+    let others = companion_tauri::places::HOST_CONNECTIONS - 1;
+    let dial = |main: bool| {
+        let (device, elsewhere) = (Arc::clone(&device), elsewhere.clone());
+        tokio::spawn(async move {
+            if main {
+                companion_tauri::places::as_the_main_link(Connection::paired(&device, &elsewhere))
+                    .await
+            } else {
+                Connection::paired(&device, &elsewhere).await
+            }
+        })
+    };
+
+    control.hold();
+    let fillers: Vec<_> = (0..others).map(|_| dial(false)).collect();
+    held(&control, others).await;
+    let former = dial(true);
+    held(&control, others + 1).await;
+    assert_eq!(
+        places.held_on(elsewhere.host_device_id),
+        companion_tauri::places::HOST_CONNECTIONS,
+        "every place is held, the former main link's among them"
+    );
+
+    // The main link that replaces it reaches its connection with no wait, though the former one is
+    // still held and every other place is held.
+    let current = dial(true);
+    held(&control, others + 2).await;
+    assert_eq!(
+        places.held_on(elsewhere.host_device_id),
+        companion_tauri::places::HOST_CONNECTIONS + 1,
+        "the former link is counted with the others while it is held"
+    );
+
+    control.refuse(Some(ErrorCode::PermissionDenied));
+    control.stop_holding();
+    control.release_all();
+    for held_dial in fillers.into_iter().chain([former, current]) {
+        held_dial.await.expect("the dial ran").expect_err("refused");
+    }
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: every path that ends an opening stops its dial under way, and the dial's places go
+/// back at once: a page that loads again leaves its openings, and a change of host ends them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_reload_or_a_change_of_host_stops_the_dials_under_way() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(2).await;
+    let first = adopted.workers[0].session_id;
+    let second = adopted.workers[1].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let host = host_of(companion);
+    let places = companion_tauri::places::budget();
+    let main_only = places.held_on(host);
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let links = state.paired_links();
+
+    control.hold();
+    let before = [
+        opening_call(companion, first, None, "before-1"),
+        opening_call(companion, second, None, "before-2"),
+    ];
+    held(&control, 2).await;
+    assert_eq!(places.held_on(host), main_only + 2);
+
+    // The page loads again: its openings are left, and the dials they were making stop where they
+    // are, with their places.
+    links.leave_all();
+    for call in before {
+        let stopped = tokio::time::timeout(STOPS_AT_ONCE, call)
+            .await
+            .expect("the dial of a reloaded page stops")
+            .expect("the call ran")
+            .expect("an answer");
+        assert_eq!(stopped["state"], "superseded", "{stopped}");
+    }
+    assert_eq!(places.held_on(host), main_only, "every place went back");
+
+    // The host changes: the same.
+    let after = [
+        opening_call(companion, first, None, "after-1"),
+        opening_call(companion, second, None, "after-2"),
+    ];
+    held(&control, 4).await;
+    assert_eq!(places.held_on(host), main_only + 2);
+    links.close_all();
+    for call in after {
+        let stopped = tokio::time::timeout(STOPS_AT_ONCE, call)
+            .await
+            .expect("the dial of a host that changed stops")
+            .expect("the call ran")
+            .expect("an answer");
+        assert_eq!(stopped["state"], "superseded", "{stopped}");
+    }
+    assert_eq!(places.held_on(host), main_only, "every place went back");
+    control.stop_holding();
+    control.release_all();
+    adopted.stop().await;
+}

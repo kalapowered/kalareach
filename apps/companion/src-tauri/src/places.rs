@@ -9,11 +9,14 @@
 //!
 //! One place of the budget is the main link's alone: no other kind of connection can take it, so
 //! that the link without which the application cannot reach the host is never made to wait behind
-//! the others. A dial that finds no place waits for one, for no longer than [`PLACE_WAIT`], and is
+//! the others. It belongs to the main link that is current: a main link that a newer one replaces
+//! gives the reservation up at once and is counted as any other connection for as long as
+//! something still holds it, so a link that lingers cannot keep the new one waiting. A dial that finds no place waits for one, for no longer than [`PLACE_WAIT`], and is
 //! then declined ([`LinkError::Declined`], which [`crate::connection::Unopened`] carries as its own
 //! cause): the host is asked nothing, and the refusal is this application's.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -92,8 +95,16 @@ fn kind_of_this_dial() -> Kind {
 
 #[derive(Default)]
 struct Held {
-    main: usize,
+    /// The place that is the main link's now, when there is one, by its serial number.
+    main: Option<u64>,
+    /// Every other place held, a former main link's among them.
     others: usize,
+}
+
+impl Held {
+    fn count(&self) -> usize {
+        usize::from(self.main.is_some()) + self.others
+    }
 }
 
 /// The places held on each host, for every kind.
@@ -101,13 +112,15 @@ pub struct Places {
     total: usize,
     held: Mutex<BTreeMap<DeviceId, Held>>,
     freed: Notify,
+    serials: AtomicU64,
 }
 
 /// One place on one host's bound, given back when it is dropped.
 pub struct Place {
     places: Arc<Places>,
     host: DeviceId,
-    kind: Kind,
+    /// Tells this place from the main link's current one, which another place replaces.
+    serial: u64,
 }
 
 impl Drop for Place {
@@ -119,11 +132,13 @@ impl Drop for Place {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if let Some(count) = held.get_mut(&self.host) {
-                match self.kind {
-                    Kind::Main => count.main = count.main.saturating_sub(1),
-                    Kind::Other => count.others = count.others.saturating_sub(1),
+                // A place the main link's newer one replaced is counted with the others.
+                if count.main == Some(self.serial) {
+                    count.main = None;
+                } else {
+                    count.others = count.others.saturating_sub(1);
                 }
-                if count.main + count.others == 0 {
+                if count.count() == 0 {
                     held.remove(&self.host);
                 }
             }
@@ -149,16 +164,21 @@ impl Places {
             total,
             held: Mutex::new(BTreeMap::new()),
             freed: Notify::new(),
+            serials: AtomicU64::new(0),
         })
     }
 
     fn free_for(&self, held: &BTreeMap<DeviceId, Held>, host: DeviceId, kind: Kind) -> bool {
-        let count = held.get(&host);
-        let (main, others) = count.map_or((0, 0), |count| (count.main, count.others));
+        let (count, others) = held
+            .get(&host)
+            .map_or((0, 0), |held| (held.count(), held.others));
         match kind {
-            Kind::Main => main + others < self.total,
+            // The reservation is the main link's own: it is never made to wait, whatever the others
+            // and the main links it replaced hold. A link that lingers beside its replacement is
+            // what the host's bound has room for.
+            Kind::Main => true,
             // The last place is the main link's.
-            Kind::Other => main + others < self.total && others + 1 < self.total,
+            Kind::Other => count < self.total && others + 1 < self.total,
         }
     }
 
@@ -169,15 +189,22 @@ impl Places {
         if !self.free_for(&held, host, kind) {
             return None;
         }
+        let serial = self.serials.fetch_add(1, Ordering::Relaxed);
         let count = held.entry(host).or_default();
         match kind {
-            Kind::Main => count.main += 1,
+            // The main link that is current has the reservation; the place that held it is counted
+            // with the others from now.
+            Kind::Main => {
+                if count.main.replace(serial).is_some() {
+                    count.others += 1;
+                }
+            }
             Kind::Other => count.others += 1,
         }
         Some(Place {
             places: Arc::clone(self),
             host,
-            kind,
+            serial,
         })
     }
 
@@ -185,7 +212,7 @@ impl Places {
     #[must_use]
     pub fn held_on(&self, host: DeviceId) -> usize {
         let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        held.get(&host).map_or(0, |count| count.main + count.others)
+        held.get(&host).map_or(0, Held::count)
     }
 
     /// Whether a place on `host` is free for `kind` now.
@@ -215,9 +242,26 @@ impl Places {
         }
     }
 
-    /// Waits until a place on `host` is free for `kind`, however long that is: for a task that
-    /// keeps trying in the background and has no caller to give up for it.
-    pub async fn until_free(&self, host: DeviceId, kind: Kind) {
+    /// Runs `dial` once a place on `host` is free for `kind`, however long that takes, and only if
+    /// `wanted` still says so then: a task that keeps trying in the background has no caller to give
+    /// up for it, and what it waited for may have ended while it waited. The dial starts when the
+    /// place frees, not at a later step of the caller's own schedule.
+    pub async fn dial_when_free<T>(
+        &self,
+        host: DeviceId,
+        kind: Kind,
+        wanted: impl Fn() -> bool,
+        dial: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        self.until_free(host, kind).await;
+        if !wanted() {
+            return None;
+        }
+        Some(dial.await)
+    }
+
+    /// Waits until a place on `host` is free for `kind`, however long that is.
+    async fn until_free(&self, host: DeviceId, kind: Kind) {
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
@@ -586,5 +630,127 @@ mod tests {
             "given the place at the close"
         );
         drop(second);
+    }
+
+    /// KR-REQ-19.08: the reserved place belongs to the main link that is current. A main link that a
+    /// newer one replaces gives the reservation up at once and is counted as any other connection
+    /// while something still holds it, so a link that lingers cannot keep the new one waiting.
+    #[tokio::test]
+    async fn the_reserved_place_belongs_to_the_main_link_that_is_current() {
+        let places = Places::new(4);
+        let former = places
+            .try_take(host(1), Kind::Main)
+            .expect("the reservation");
+        let others: Vec<_> = (0..3)
+            .map(|_| places.try_take(host(1), Kind::Other).expect("a place"))
+            .collect();
+        assert_eq!(places.held_on(host(1)), 4, "every place is held");
+
+        // The main link that replaces it is given its place at once, with every place held and the
+        // former link still held.
+        let current = places
+            .try_take(host(1), Kind::Main)
+            .expect("the current main link is not made to wait");
+        assert_eq!(places.held_on(host(1)), 5);
+
+        // The former link is an ordinary connection now: its place frees as any other's does, and
+        // the reservation stays the current link's.
+        drop(former);
+        assert_eq!(places.held_on(host(1)), 4);
+        assert!(places.try_take(host(1), Kind::Other).is_none());
+        drop(current);
+        assert!(
+            places.try_take(host(1), Kind::Other).is_none(),
+            "no other kind takes the reservation when the main link ends"
+        );
+        assert!(places.try_take(host(1), Kind::Main).is_some());
+        drop(others);
+    }
+
+    /// KR-REQ-19.08: a dial that waits for the budget, however long it is held, starts when a place
+    /// frees, and not before and not at a later step of its caller's own schedule.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_that_waited_on_a_full_budget_starts_when_a_place_frees() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let places = Places::new(3);
+        let mut held: Vec<_> = (0..2)
+            .map(|_| places.try_take(host(1), Kind::Other).expect("a place"))
+            .collect();
+        assert!(places.try_take(host(1), Kind::Other).is_none());
+        let started = Arc::new(AtomicBool::new(false));
+        let waiting = tokio::spawn({
+            let (places, started) = (Arc::clone(&places), Arc::clone(&started));
+            async move {
+                places
+                    .dial_when_free(host(1), Kind::Other, || true, async move {
+                        started.store(true, Ordering::SeqCst);
+                    })
+                    .await
+            }
+        });
+
+        // The budget stays full for far longer than a dial waits for a place: no dial starts.
+        tokio::time::advance(PLACE_WAIT * 6).await;
+        tokio::task::yield_now().await;
+        assert!(!started.load(Ordering::SeqCst), "no place is free");
+
+        // The release starts the dial, with no time passing between the two.
+        let at_release = tokio::time::Instant::now();
+        held.pop();
+        waiting
+            .await
+            .expect("the dial ran")
+            .expect("the dial started");
+        assert!(started.load(Ordering::SeqCst));
+        assert_eq!(tokio::time::Instant::now(), at_release);
+    }
+
+    /// KR-REQ-19.08: a dial whose opening ended while it waited for the budget takes nothing when a
+    /// place frees.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_whose_opening_ended_while_it_waited_does_not_start() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let places = Places::new(3);
+        let mut held: Vec<_> = (0..2)
+            .map(|_| places.try_take(host(1), Kind::Other).expect("a place"))
+            .collect();
+        let wanted = Arc::new(AtomicBool::new(true));
+        let started = Arc::new(AtomicBool::new(false));
+        let waiting = tokio::spawn({
+            let (places, wanted, started) = (
+                Arc::clone(&places),
+                Arc::clone(&wanted),
+                Arc::clone(&started),
+            );
+            async move {
+                places
+                    .dial_when_free(
+                        host(1),
+                        Kind::Other,
+                        move || wanted.load(Ordering::SeqCst),
+                        async move {
+                            started.store(true, Ordering::SeqCst);
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::advance(PLACE_WAIT * 6).await;
+        tokio::task::yield_now().await;
+
+        // The opening is left while the dial waits; a place frees.
+        wanted.store(false, Ordering::SeqCst);
+        held.pop();
+        assert!(
+            waiting.await.expect("the dial ran").is_none(),
+            "an opening that was left dials nothing"
+        );
+        assert!(!started.load(Ordering::SeqCst));
+        assert!(
+            places.try_take(host(1), Kind::Other).is_some(),
+            "the place that freed is still free"
+        );
     }
 }
