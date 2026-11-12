@@ -171,6 +171,7 @@ fn a_refusal_after_the_runs_changes_does_not_say_that_nothing_was_changed() {
         AncestorFault::Link,
         AncestorFault::NotAFolder,
         AncestorFault::Alias(r"C:\Shared\Backing"),
+        AncestorFault::Volume("the volume uses FAT32"),
         AncestorFault::Unreadable("Windows error 32"),
         AncestorFault::List("a reason"),
         AncestorFault::Writable("a reason"),
@@ -257,6 +258,62 @@ fn a_drives_root_is_the_volumes_own_only_where_its_final_path_is_the_one_supplie
     assert!(!is_the_volumes_own_root(r"X:\", r"\\?\C:\Shared\Backing\"));
     assert!(!is_the_volumes_own_root(r"X:\", r"D:\"));
     assert!(!is_the_volumes_own_root(r"C:\", r"C:\Windows"));
+}
+
+/// A folder above a tree that is on a volume that the installation does not use is refused for its
+/// volume, with the reason that the volume check gave, in the words of the tree that it holds: the
+/// installation keeps each tree on a fixed, local NTFS volume, nothing in the folder cures it, and
+/// the words never tell to correct an owner or a list, to close a program or to remove a link.
+#[test]
+fn a_folder_on_a_volume_that_is_not_used_is_refused_for_its_volume() {
+    let reason = "the volume uses FAT32, and only NTFS volumes are supported";
+    for (tree, own) in [
+        (Tree::Program, "program directory"),
+        (Tree::Data, "data directory"),
+    ] {
+        let text = ancestor_refusal(r"Y:\", tree, &AncestorFault::Volume(reason), Stage::Before);
+        assert!(
+            text.contains(&format!(r"Y:\ is a folder above the boundary's {own}")),
+            "{text}"
+        );
+        assert!(
+            text.contains("is on a volume that the installation does not use"),
+            "{text}"
+        );
+        assert!(text.contains(reason), "{text}");
+        assert!(text.contains("fixed, local NTFS volume"), "{text}");
+        assert!(text.contains("Nothing was changed"), "{text}");
+        assert!(!text.contains("Make the Administrators group"), "{text}");
+        assert!(!text.contains("Close the program"), "{text}");
+        assert!(!text.to_lowercase().contains("remove the link"), "{text}");
+    }
+    let program = ancestor_refusal(
+        r"Y:\",
+        Tree::Program,
+        &AncestorFault::Volume("a reason"),
+        Stage::Before,
+    );
+    assert!(
+        program.contains("Do not remove the program directory"),
+        "{program}"
+    );
+    assert!(program.contains("Program Files folder"), "{program}");
+    let data = ancestor_refusal(
+        r"Y:\",
+        Tree::Data,
+        &AncestorFault::Volume("a reason"),
+        Stage::Before,
+    );
+    assert!(data.contains("ProgramData folder"), "{data}");
+    assert!(!data.contains("program directory"), "{data}");
+    // After the run's changes the words do not claim that nothing was changed.
+    let after = ancestor_refusal(
+        r"Y:\",
+        Tree::Program,
+        &AncestorFault::Volume("a reason"),
+        Stage::After,
+    );
+    assert!(!after.contains("Nothing was changed"), "{after}");
 }
 
 /// A known folder that an administrator gave a network path has the final path

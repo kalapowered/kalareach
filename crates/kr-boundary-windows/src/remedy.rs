@@ -370,6 +370,9 @@ pub enum AncestorFault<'a> {
     NotAFolder,
     /// A drive letter that is no volume's root: the final path of its opened root.
     Alias(&'a str),
+    /// The folder is on a volume that the installation does not use: why, as the volume check says
+    /// it. No change of the folder cures it.
+    Volume(&'a str),
     /// The folder could not be opened or read: the platform's error.
     Unreadable(&'a str),
     /// The owner or the list is refused: the check's own sentence, which names the identity and the
@@ -459,6 +462,14 @@ pub fn ancestor_refusal(
         AncestorFault::Alias(found) => format!(
             "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread. {changes} The setup program installs only in the system's own known folders, and one of them is reached through {folder}: end the substitution or redirection of that letter, or give the known folder a place on a volume's own root, then run the setup program again."
         ),
+        AncestorFault::Volume(reason) => match tree {
+            Tree::Data => format!(
+                "{folder} is a folder above the boundary's {below}. It is on a volume that the installation does not use ({reason}): it keeps its data directory on a fixed, local NTFS volume, and nothing in {folder} can be corrected to make another volume one. {changes} Move the system's ProgramData folder to such a volume, or install on a computer where it is on one, then run the setup program again."
+            ),
+            Tree::Program => format!(
+                "{folder} is a folder above the boundary's {below}. It is on a volume that the installation does not use ({reason}): it keeps its program directory on a fixed, local NTFS volume, and nothing in {folder} can be corrected to make another volume one. {changes} Do not remove the program directory. Move the system's Program Files folder to such a volume, or install on a computer where it is on one, then run the setup program again."
+            ),
+        },
         AncestorFault::Link => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The system's default places have none. The setup program installs only in the system's own known folders and cannot be pointed at another path, and it directs no change to a folder that other programs share: run it on a computer where its known folders are plain folders."
         ),
