@@ -20,6 +20,7 @@ use crate::env::EnvBlock;
 use crate::events::{self, LogEvent};
 use crate::policy::Policy;
 use crate::quote::quote_command_line;
+use crate::window::QueryEnd;
 
 use super::launch::{LaunchError, Outcome, TokenSpec, VerifiedPath};
 use super::proof::{Run, run_captured};
@@ -59,6 +60,9 @@ pub enum Error {
         /// Whether the deadline the caller gave set that end, and not the run's own bound.
         by_the_deadline: bool,
     },
+    /// The deadline the query was given had passed before it was made.
+    #[error("the deadline passed before the event log was asked")]
+    DeadlinePassed,
     /// A program of the proof could not be started through the launcher.
     #[error("{what} could not be started: {source}")]
     Launch {
@@ -70,6 +74,28 @@ pub enum Error {
     /// The answer could not be read.
     #[error("{0}")]
     Unreadable(String),
+}
+
+impl Error {
+    /// How a query of the log came to an end as far as the search's end is concerned: a deadline that
+    /// passed before the query was made, or before its program could start, and a query cut at the
+    /// deadline it was given, are each told apart from every other failure.
+    #[must_use]
+    pub fn query_end(&self) -> QueryEnd {
+        match self {
+            Error::DeadlinePassed
+            | Error::Launch {
+                source: LaunchError::DeadlinePassed,
+                ..
+            } => QueryEnd::DeadlinePassed,
+            Error::TimedOut {
+                by_the_deadline, ..
+            } => QueryEnd::Cut {
+                by_the_deadline: *by_the_deadline,
+            },
+            _ => QueryEnd::Failed,
+        }
+    }
 }
 
 /// The system's Windows directory from the platform's own call, never from the environment: an
@@ -306,9 +332,7 @@ fn wevtutil(
 ) -> Result<String, Error> {
     let what = "the event log query";
     if Instant::now() >= deadline {
-        return Err(Error::Unreadable(
-            "the deadline passed before the event log was asked".to_owned(),
-        ));
+        return Err(Error::DeadlinePassed);
     }
     let bound = crate::window::bound(deadline, Instant::now() + QUERY_BOUND);
     let program = system_root().join("System32").join("wevtutil.exe");

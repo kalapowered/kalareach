@@ -44,3 +44,35 @@ pub fn may_ask_the_log(now: Instant, search_until: Instant) -> bool {
 pub fn search_is_over(cut: bool, bound: Bound) -> bool {
     cut && bound.by_the_window
 }
+
+/// How a query of the log came to an end, as far as the search's end is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryEnd {
+    /// The query could not be made or did not answer for a reason of its own (it could not start, a
+    /// pipe failed, it ended badly, its answer could not be read): a failure of the proof at any
+    /// time.
+    Failed,
+    /// The deadline the query was given had passed before it started, whether between the test that
+    /// allowed it and the query itself or before its program could be started.
+    DeadlinePassed,
+    /// The query was cut at its deadline. `by_the_deadline` says whether the deadline it was given
+    /// set that end, and not a bound of its own.
+    Cut {
+        /// Whether the window's end set the deadline.
+        by_the_deadline: bool,
+    },
+}
+
+/// Whether a query that came to this end is the end of the search: the search's own end caused it,
+/// whether the query was cut at it or never started because it had passed. Any other end is a
+/// failure of the proof, which would hide the log's last words if it were taken for the search's end.
+#[must_use]
+pub fn query_ends_the_search(end: QueryEnd) -> bool {
+    matches!(
+        end,
+        QueryEnd::DeadlinePassed
+            | QueryEnd::Cut {
+                by_the_deadline: true
+            }
+    )
+}
