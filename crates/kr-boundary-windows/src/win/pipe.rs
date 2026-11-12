@@ -213,7 +213,9 @@ fn wait(
     deadline: Option<Instant>,
     stuck: &mut bool,
 ) -> io::Result<(u32, Transfer)> {
-    let handles = [transfer.event.raw(), stop.0.raw()];
+    // The stop's event is the first handle: when both are signalled the call reports the lower index,
+    // so a transfer that finished at once never wins over the stop.
+    let handles = [stop.0.raw(), transfer.event.raw()];
     let milliseconds = deadline.map_or(INFINITE, |deadline| {
         let left = deadline.saturating_duration_since(Instant::now());
         // One less than the longest wait, which means "forever".
@@ -221,7 +223,7 @@ fn wait(
     });
     // SAFETY: both handles are open for the length of the wait.
     let signalled = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
-    if signalled != WAIT_OBJECT_0 {
+    if signalled != WAIT_OBJECT_0 + 1 {
         if !cancel(pipe, &mut transfer) {
             *stuck = true;
             std::mem::forget(transfer);
@@ -264,6 +266,9 @@ impl Read for Connection {
         }
         if self.stuck {
             return Err(stuck_error());
+        }
+        if self.stop.is_set() {
+            return Err(stopping());
         }
         let length = buffer.len().min(MAX_TRANSFER);
         let mut transfer = Transfer::new(vec![0; length])?;
@@ -315,6 +320,9 @@ impl Write for Connection {
         }
         if self.stuck {
             return Err(stuck_error());
+        }
+        if self.stop.is_set() {
+            return Err(stopping());
         }
         let length = buffer.len().min(MAX_TRANSFER);
         let mut transfer = Transfer::new(buffer[..length].to_vec())?;

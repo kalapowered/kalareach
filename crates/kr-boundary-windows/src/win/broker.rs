@@ -313,7 +313,8 @@ fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
                 break;
             }
         };
-        if super::privilege::revert_failed() {
+        // A connection that is accepted while the service is stopping is ended at once.
+        if state.stop.is_set() || super::privilege::revert_failed() {
             break;
         }
         let shared = Arc::clone(state);
@@ -439,6 +440,11 @@ fn answer(mut connection: Connection, state: &State) {
         PERSON_IDLE
     };
     loop {
+        // The stop is looked at before each request, besides in each read and write: a client that
+        // keeps asking and reading never makes a transfer wait, so no wait would ever see it.
+        if state.stop.is_set() {
+            return;
+        }
         connection.set_deadline(Some(std::time::Instant::now() + idle));
         let request = match frame::read::<_, Request>(&mut connection) {
             Ok(request) => request,
