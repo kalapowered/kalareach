@@ -2892,6 +2892,10 @@ fn not_reached_words(unopened: &Unopened) -> String {
                 error.message
             ),
         },
+        Unopened::NotAdmitted(error) => format!(
+            "The connection to the host was not opened: {}",
+            error.message
+        ),
     }
 }
 
@@ -2936,8 +2940,10 @@ async fn probe_host(
     {
         Ok(Ok(_)) => Probe::Back(session),
         Ok(Err(error)) => match Unopened::of_connection(&session, &error) {
-            Some(unopened @ Unopened::HostFull) => probe_when_not_opened(&unopened),
-            _ => match error {
+            // The host refused the connection itself, for its bound or at its admission: the
+            // connection was not opened, and the cause says why.
+            Some(unopened) => probe_when_not_opened(&unopened),
+            None => match error {
                 ClientError::Host(error) => Probe::Refused(error.message),
                 _ => Probe::Unreached,
             },

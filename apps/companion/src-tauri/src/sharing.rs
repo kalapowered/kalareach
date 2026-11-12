@@ -851,6 +851,11 @@ impl Cause {
                 Some(request) => format!("the host refused to {request}: {}", error.message),
                 None => format!("the connection was not opened: {}", error.message),
             }),
+            // The host refused the connection itself at its admission: it is lost, and the host's
+            // words are why.
+            Unopened::NotAdmitted(error) => {
+                Self::Refused(format!("the connection was not opened: {}", error.message))
+            }
             Unopened::Unreached(_) => Self::Silent,
         }
     }

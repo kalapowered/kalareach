@@ -135,9 +135,9 @@ impl SessionStanding {
     /// says so; any other cause is contact lost.
     fn reconnecting(failure: &Unopened) -> Self {
         let (reason, capacity) = match failure {
-            Unopened::Unreached(error) | Unopened::Refused(_, error) => {
-                (error.message.clone(), false)
-            }
+            Unopened::Unreached(error)
+            | Unopened::NotAdmitted(error)
+            | Unopened::Refused(_, error) => (error.message.clone(), false),
             Unopened::HostFull => (crate::places::HOST_FULL.to_owned(), true),
             Unopened::BudgetFull => (crate::places::BUDGET_FULL.to_owned(), true),
         };
@@ -250,15 +250,11 @@ impl Dial {
         .await
         .map_err(|_| Unopened::unreached("the host did not answer in time"))?
         .map_err(|error| match error {
-            LinkError::Refused(refusal) => {
-                Unopened::Refused(Asked::Connection, CommandError::from(refusal))
-            }
-            // This application's own budget refused the dial, so no host was asked.
-            LinkError::Declined(_) => Unopened::BudgetFull,
             // A connection that could not be given the lease the host needs, or whose account left,
             // is waited out: the opening stands and its watch dials again, as for a host that did
             // not answer.
-            other => Unopened::unreached(other.said().into_string()),
+            error @ LinkError::Membership(_) => Unopened::unreached(error.said().into_string()),
+            other => Unopened::of_link(other),
         })
     }
 

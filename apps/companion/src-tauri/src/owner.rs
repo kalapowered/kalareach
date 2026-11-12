@@ -363,18 +363,14 @@ impl Owner {
             // The host was reached and was asked nothing: this computer could not give it the
             // lease it needs, and the words say why.
             LinkError::Membership(refusal) => Missed::Refused(refusal.message),
-            // This computer's own budget of connections to the host is used: the host is not out
-            // of contact, and the next visit asks again.
-            LinkError::Declined(_) => Self::no_room(&Unopened::BudgetFull),
-            // The host refused the connection itself: it is not out of contact when it has no
-            // room for this computer's connection, and the next visit asks again.
-            LinkError::ConnectionRefused(refusal) => {
-                match Unopened::of_refused_connection(refusal) {
-                    unopened @ Unopened::HostFull => Self::no_room(&unopened),
-                    _ => Missed::OutOfContact,
-                }
-            }
-            _ => Missed::OutOfContact,
+            // The host is not out of contact when this computer's own budget of connections to it
+            // is used, or when it has no room for this computer's connection: the next visit asks
+            // again. Any other cause is out of contact, a connection that the host refused at its
+            // admission among them.
+            other => match Unopened::of_link(other) {
+                unopened @ (Unopened::BudgetFull | Unopened::HostFull) => Self::no_room(&unopened),
+                _ => Missed::OutOfContact,
+            },
         })?;
         let session = Arc::new(session);
         let channel = SessionChannel::open(Arc::clone(&session))

@@ -423,10 +423,10 @@ impl Asked {
 #[derive(Debug)]
 pub enum Unopened {
     /// The host answered, and refused the request named: it is in contact, and the refusal is its
-    /// own. Or the host refused the connection itself (named [`Asked::Connection`]), for a reason
-    /// other than its bound. Or this device could not give the host the lease its organisation
-    /// signs for it, which a host that holds none refuses everything for, and the words are the
-    /// reason.
+    /// own. Or the host refused the connection itself at the handshake (named
+    /// [`Asked::Connection`]), a version or a pairing, which is its decision about this device. Or
+    /// this device could not give the host the lease its organisation signs for it, which a host
+    /// that holds none refuses everything for, and the words are the reason.
     Refused(Asked, CommandError),
     /// The host refused the connection itself because this computer holds as many connections to
     /// it as it allows and the host has heard from every one of them lately: the host cannot take
@@ -436,6 +436,12 @@ pub enum Unopened {
     /// This application's own budget of connections to the host is used ([`crate::places`]): no
     /// connection was made and the host was asked nothing.
     BudgetFull,
+    /// The host refused the connection itself at its admission, for a reason that is not its
+    /// bound: an authority that was withdrawn since the handshake, or a daemon that has stopped
+    /// while its listener still accepts. The connection is as good as lost, so every dialer does
+    /// what it does when a connection is lost, and the host's words are the reason that a person
+    /// reads while that stays so. It is made in [`Self::of_refused_connection`] and nowhere else.
+    NotAdmitted(CommandError),
     /// The host could not be reached, did not answer in time, or failed in a way that is no
     /// refusal of the host's.
     Unreached(CommandError),
@@ -490,40 +496,56 @@ impl Unopened {
     /// keeps the first error the host answered with request identifier zero, which no request of
     /// this application carries, and answers every call with it, so only the session can tell that
     /// refusal from a refusal of a request.
-    ///
-    /// The code of the refusal is read in [`Self::of_refused_connection`] and nowhere else.
     #[must_use]
     pub fn of_connection(session: &Session, error: &kr_client::ClientError) -> Option<Self> {
         let kr_client::ClientError::Host(refusal) = error else {
             return None;
         };
-        if session.connection_refusal().as_ref() != Some(refusal) {
-            return None;
-        }
-        Some(Self::of_refused_connection(refusal.clone()))
+        Self::of_kept_refusal(session.connection_refusal(), refusal)
     }
 
-    /// What the host's refusal of the connection itself says, when `refusal` is the error it
-    /// answered a device with at admission, as a session or a wire kept it
-    /// ([`Self::of_connection`]): the host's bound is [`Self::HostFull`], and any other code is a
-    /// refusal of the connection for another reason, which says its own words.
+    /// The host's refusal of a connection, when `refusal` is the one that the connection's owner
+    /// kept as the host's answer to the connection itself (`kept`, as a session or a wire keeps
+    /// it), and not a refusal of a request.
+    #[must_use]
+    pub fn of_kept_refusal(
+        kept: Option<kr_protocol::error::ProtocolError>,
+        refusal: &kr_protocol::error::ProtocolError,
+    ) -> Option<Self> {
+        (kept.as_ref() == Some(refusal)).then(|| Self::of_refused_connection(refusal.clone()))
+    }
+
+    /// What the host's refusal of a connection at its admission means, for every dialer: the one
+    /// function that reads such a refusal, as a session or a wire kept it
+    /// ([`Self::of_kept_refusal`]).
+    ///
+    /// - The host's bound is [`Self::HostFull`]: the host cannot take another connection for now,
+    ///   and the dialer asks again as it does for any cause that time may mend.
+    /// - Any other refusal is [`Self::NotAdmitted`]: the connection is lost, as it was when the
+    ///   host's refusal was not read, and the host's words are why.
+    ///
+    /// A refusal at the handshake (a version, a pairing) is no refusal at admission: it is the
+    /// host's decision about this device, and [`Self::of_link`] gives it as such. A refusal of a
+    /// request on an open connection stays that request's own refusal.
+    ///
+    /// The code of the refusal is read here and nowhere else.
     #[must_use]
     pub fn of_refused_connection(refusal: kr_protocol::error::ProtocolError) -> Self {
         if refusal.code == kr_protocol::error::ErrorCode::ResourceUnavailable {
             Self::HostFull
         } else {
-            Self::Refused(Asked::Connection, CommandError::from(refusal))
+            Self::NotAdmitted(CommandError::from(refusal))
         }
     }
 
     /// Whether the cause is one that time or another connection may mend, so that a caller that
-    /// waits asks again: a host that was not reached or has no room for this computer's connection,
-    /// this computer's own budget used, or a refusal whose code is for now. Any other refusal is
-    /// the host's decision.
+    /// waits asks again: a host that was not reached, that has no room for this computer's
+    /// connection or that refused the connection at its admission, this computer's own budget used,
+    /// or a refusal of a request whose code is for now. Any other refusal is the host's decision.
     #[must_use]
     pub fn for_now(&self) -> bool {
         match self {
-            Self::Unreached(_) | Self::HostFull | Self::BudgetFull => true,
+            Self::Unreached(_) | Self::NotAdmitted(_) | Self::HostFull | Self::BudgetFull => true,
             Self::Refused(_, refusal) => crate::standing::transient(refusal.code),
         }
     }
@@ -538,7 +560,7 @@ impl Unopened {
     #[must_use]
     pub fn into_error(self) -> CommandError {
         match self {
-            Self::Refused(_, error) | Self::Unreached(error) => error,
+            Self::Refused(_, error) | Self::NotAdmitted(error) | Self::Unreached(error) => error,
             Self::HostFull => crate::places::host_full_error(),
             Self::BudgetFull => crate::places::full_error(),
         }
@@ -1051,7 +1073,10 @@ mod tests {
         let said = |refusal: ProtocolError| match opening_refused(refusal) {
             Unopened::Refused(Asked::SessionOpen, error) => error.message,
             Unopened::Refused(asked, _) => panic!("the opening was refused, not {asked:?}"),
-            Unopened::Unreached(_) | Unopened::HostFull | Unopened::BudgetFull => {
+            Unopened::Unreached(_)
+            | Unopened::NotAdmitted(_)
+            | Unopened::HostFull
+            | Unopened::BudgetFull => {
                 panic!("a refusal the host sent")
             }
         };

@@ -152,7 +152,9 @@ impl From<Unopened> for Missed {
             Unopened::HostFull | Unopened::BudgetFull => {
                 Self::Refused(Asked::Connection, unopened.into_error())
             }
-            Unopened::Unreached(_) => Self::Unreached,
+            // A connection that the host refused at its admission is lost, as a host that did not
+            // answer is: the next visit asks again.
+            Unopened::NotAdmitted(_) | Unopened::Unreached(_) => Self::Unreached,
         }
     }
 }
@@ -429,14 +431,12 @@ async fn present(
             | LinkError::Declined(refusal) => {
                 Missed::Refused(Asked::Connection, CommandError::from(refusal))
             }
-            // The host's refusal of the connection is told by its cause, as a first call on the
-            // connection tells it.
-            LinkError::ConnectionRefused(refusal) => {
-                Unopened::of_refused_connection(refusal).into()
-            }
             LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_) => {
                 Missed::Unreached
             }
+            // The host's refusal of the connection is told by its cause, as a first call on the
+            // connection tells it.
+            other => Unopened::of_link(other).into(),
         })
 }
 

@@ -387,7 +387,8 @@ async fn open_local(
 /// What a view's opening says of a connection that was not opened, by the cause and not by the code
 /// of an error: the cause says whether the host was reached, had no room or refused, and whether
 /// that is for now ([`Unopened::for_now`]), in which case the view is lost and the opening's link
-/// asks the host again, and a refusal that is not is the host's decision about this view.
+/// asks the host again, and a refusal that is not is the host's decision about this view. A
+/// connection that the host refused at its admission is lost, with the host's words as the reason.
 fn not_opened(unopened: Unopened) -> OpenFailure {
     let for_now = unopened.for_now();
     match unopened {
@@ -396,6 +397,10 @@ fn not_opened(unopened: Unopened) -> OpenFailure {
                 "The host could not be reached for this view: {}",
                 error.message
             ),
+            lost: true,
+        },
+        Unopened::NotAdmitted(refusal) => OpenFailure {
+            reason: format!("No connection was made for this view: {}", refusal.message),
             lost: true,
         },
         Unopened::BudgetFull | Unopened::HostFull => OpenFailure {
@@ -448,10 +453,11 @@ async fn open_paired(
             // The refusal the wire kept as the host's answer to the connection is told by its
             // cause, as a refusal of a first call on any connection is; any other is the refusal of
             // this request.
-            not_opened(match wire.connection_refusal() {
-                Some(kept) if kept == refusal => Unopened::of_refused_connection(kept),
-                _ => Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal)),
-            })
+            not_opened(
+                Unopened::of_kept_refusal(wire.connection_refusal(), &refusal).unwrap_or_else(
+                    || Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal)),
+                ),
+            )
         })?;
     let opened: SessionOpenResult = opened.to_typed().map_err(|error| {
         OpenFailure::refused(format!(
