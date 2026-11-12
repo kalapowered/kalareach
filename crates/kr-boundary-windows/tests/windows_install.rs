@@ -5097,3 +5097,467 @@ fn an_administrators_connection_stays_open_past_the_bound_of_a_persons() {
     );
     assert_eq!(ended.expect("the service ends"), Ok(()));
 }
+
+/// Whether this case has nothing to show under this token, which it says in the run's output so that
+/// the table reads "skipped" and not "passed": the loop and the listener make their second instance
+/// of the pipe as the system, and no other account's entry of the pipe's list allows that.
+#[cfg(feature = "testing")]
+fn needs_the_system() -> bool {
+    if runs_as_the_system() {
+        return false;
+    }
+    eprintln!(
+        "SKIPPED: not run under this token: only the system may make a second instance of the pipe"
+    );
+    true
+}
+
+/// A client of the loop opened like [`client_without`], that gives the reason instead of a panic when
+/// no open succeeds within `seconds`.
+#[cfg(feature = "testing")]
+fn try_client_without(
+    disabled: &[&str],
+    seconds: u64,
+) -> Result<kr_boundary_windows::win::pipe::Connection, String> {
+    use kr_boundary_windows::win::pipe;
+    with_token_without(disabled, || {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        loop {
+            match pipe::connect(std::process::id()) {
+                Ok(connection) => return Ok(connection),
+                Err(failure) if std::time::Instant::now() >= until => {
+                    return Err(failure.to_string());
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    })
+}
+
+/// A connection that keeps 200 `Status` requests asked and unanswered and reads the answers one by one,
+/// asking one more for each. The pipe then holds a request and has room for an answer at every moment,
+/// so no read and no write of the thread that serves the connection ever waits, and a thread that only
+/// its waits told about a stop would never learn of it.
+#[cfg(feature = "testing")]
+struct StatusStream {
+    answers: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "testing")]
+impl StatusStream {
+    fn start(mut connection: kr_boundary_windows::win::pipe::Connection) -> StatusStream {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let answers = std::sync::Arc::new(AtomicU64::new(0));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let answers = std::sync::Arc::clone(&answers);
+            let done = std::sync::Arc::clone(&done);
+            move || {
+                let within_five_seconds =
+                    || Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                for _ in 0..200 {
+                    connection.set_deadline(within_five_seconds());
+                    if kr_boundary_windows::frame::write(&mut connection, &Request::Status {})
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                while !done.load(Ordering::SeqCst) {
+                    connection.set_deadline(within_five_seconds());
+                    if kr_boundary_windows::frame::read::<_, Response>(&mut connection).is_err() {
+                        return;
+                    }
+                    answers.fetch_add(1, Ordering::SeqCst);
+                    if kr_boundary_windows::frame::write(&mut connection, &Request::Status {})
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        StatusStream {
+            answers,
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    fn answers(&self) -> u64 {
+        self.answers.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Waits until `count` answers have been read, for at most `seconds`.
+    fn reaches(&self, count: u64, seconds: u64) -> Result<(), String> {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        while self.answers() < count {
+            if std::time::Instant::now() >= until {
+                return Err(format!(
+                    "{} answers in {seconds} seconds, not {count}",
+                    self.answers()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for StatusStream {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            // Every read and write of the thread has a deadline of five seconds.
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Puts the listener's seam for failed refills back to none however the case ends: the counter is
+/// shared by the whole process.
+#[cfg(feature = "testing")]
+struct RefillsRestored;
+
+#[cfg(feature = "testing")]
+impl Drop for RefillsRestored {
+    fn drop(&mut self) {
+        kr_boundary_windows::win::pipe::testing::fail_refills(0);
+    }
+}
+
+/// A client that keeps asking for the status and reading the answers while the stop comes does not keep
+/// the service from stopping: every transfer of the thread that serves it finishes at once, so the
+/// stop must be looked at by the read, the write and the loop, and not only by the waits.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_client_that_keeps_sending_and_reading_does_not_hold_the_service_at_a_stop() {
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let mut served = serve_in_process();
+    let mut person = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
+    say_hello(&mut person);
+    let stream = StatusStream::start(person);
+    stream
+        .reaches(3000, 60)
+        .expect("the traffic flows before the stop");
+    let before = stream.answers();
+    let ended = served.stops_within(20);
+    drop(stream);
+    assert_eq!(
+        ended.unwrap_or_else(|failure| panic!(
+            "the service did not end with a client that keeps asking and reading ({before} answers before the stop): {failure}"
+        )),
+        Ok(())
+    );
+}
+
+/// A client that has sent part of a frame when the stop comes does not keep the service from stopping.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let mut served = serve_in_process();
+    let mut person = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
+    say_hello(&mut person);
+    // A frame that announces a hundred bytes of body and carries ten.
+    person
+        .write_all(&100_u32.to_le_bytes())
+        .and_then(|()| person.write_all(b"0123456789"))
+        .expect("the part of the frame is written");
+    let ended = served.stops_within(20);
+    drop(person);
+    assert_eq!(
+        ended.expect("the service ends with a client in the middle of a frame"),
+        Ok(())
+    );
+}
+
+/// A client that asks and reads no answer, so that the thread that serves it waits to write, does not
+/// keep the service from stopping. The write's own bound is ten seconds and the client's last write
+/// waited one second for the full buffer, so a service that ends within six seconds was ended by the
+/// stop.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_client_that_reads_no_answer_does_not_hold_the_service_at_a_stop() {
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let mut served = serve_in_process();
+    let mut person = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
+    say_hello(&mut person);
+    let mut asked = 0_u32;
+    loop {
+        person.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ));
+        if kr_boundary_windows::frame::write(&mut person, &Request::Status {}).is_err() {
+            break;
+        }
+        asked += 1;
+        assert!(asked < 100_000, "the pipe's buffers never filled");
+    }
+    person.set_deadline(None);
+    let ended = served.stops_within(6);
+    drop(person);
+    assert_eq!(
+        ended.expect("the service ends with a client that reads no answer"),
+        Ok(())
+    );
+}
+
+/// A read and a write that the stop has already been set for end at once with the stop's error, though
+/// their transfers could finish: a request is ready to be read and the pipe has room for an answer.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_read_and_a_write_with_the_stop_set_end_at_once_though_their_transfers_could_finish() {
+    use kr_boundary_windows::frame::{self, FrameError};
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    let mut client = pipe::connect(std::process::id()).expect("the client opens the pipe");
+    frame::write(
+        &mut client,
+        &Request::Hello {
+            version: frame::VERSION,
+        },
+    )
+    .expect("the request is written");
+    let mut served = listener
+        .accept()
+        .expect("the listener accepts")
+        .expect("a client is accepted");
+    stop.set();
+    let read = frame::read::<_, Request>(&mut served);
+    let written = frame::write(&mut served, &Response::Done {});
+    drop((client, served, listener));
+    assert!(
+        matches!(&read, Err(FrameError::Io(failure)) if failure.kind() == std::io::ErrorKind::ConnectionAborted),
+        "a read with the stop set and a request ready returned {read:?}"
+    );
+    assert!(
+        matches!(&written, Err(FrameError::Io(failure)) if failure.kind() == std::io::ErrorKind::ConnectionAborted),
+        "a write with the stop set and room in the pipe returned {written:?}"
+    );
+}
+
+/// A proof that is at work when the stop comes ends with a failure that says the service is stopping:
+/// it looks at the stop after each query and before each program, and does not go on to its last
+/// program as if the stop had not come. The proof's scratch directory is how the case knows that it
+/// is at work.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_proof_that_is_at_work_ends_at_the_stop_with_a_failure_that_says_so() {
+    use kr_boundary_windows::win::pipe::Stop;
+    use kr_boundary_windows::win::proof;
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let case = Case::new();
+    let (code, output) = case.install();
+    assert_eq!(code, 0, "{output}");
+    let paths = Paths::system().expect("the system's folders are read");
+    let manifest = Manifest::load(&paths.manifest).unwrap_or_else(|failure| panic!("{failure}"));
+    for name in [
+        "SeTcbPrivilege",
+        "SeAssignPrimaryTokenPrivilege",
+        "SeIncreaseQuotaPrivilege",
+    ] {
+        token::enable_privilege(name).unwrap_or_else(|failure| panic!("{failure}"));
+    }
+    let stop = Stop::new().unwrap();
+    let proving = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        let staging = paths.staging.clone();
+        move || {
+            proof::prove(
+                &manifest,
+                Class::Checkout,
+                &staging,
+                std::time::Instant::now() + std::time::Duration::from_secs(300),
+                &stop,
+            )
+        }
+    });
+    let at_work = |staging: &Path| {
+        std::fs::read_dir(staging).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("proof"))
+        })
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !at_work(&paths.staging) && !proving.is_finished() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the proof made no scratch directory in sixty seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !proving.is_finished(),
+        "the proof ended before the case could stop it"
+    );
+    stop.set();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !proving.is_finished() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        proving.is_finished(),
+        "the proof was still at work ten seconds after the stop"
+    );
+    let proof = proving.join().unwrap();
+    assert!(
+        !proof.ready && proof.detail.contains("stopping"),
+        "a proof that the stop reached must fail and say the service is stopping: ready {}, detail {}",
+        proof.ready,
+        proof.detail
+    );
+}
+
+/// The service stops inside the installer's wait while a client keeps asking for the status and
+/// reading the answers: the service manager's stop reaches the loop, and the process ends.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+fn the_service_stops_inside_the_installers_wait_with_a_client_that_keeps_asking() {
+    use kr_boundary_windows::win::pipe;
+    let case = Case::new();
+    let (code, output) = case.install();
+    assert_eq!(code, 0, "{output}");
+    let manager = service::manager().unwrap();
+    let broker = manager.open(SERVICE).unwrap().unwrap();
+    let pid = broker.status().unwrap().pid;
+    let mut asking = pipe::connect(pid).expect("the client opens the broker's pipe");
+    say_hello(&mut asking);
+    let stream = StatusStream::start(asking);
+    stream
+        .reaches(2000, 60)
+        .expect("the traffic flows before the stop");
+    broker.stop().unwrap();
+    let ended = broker.wait_for(true, std::time::Duration::from_secs(60));
+    drop(stream);
+    assert!(
+        ended.is_ok(),
+        "the service did not stop inside the installer's wait of sixty seconds: {ended:?}"
+    );
+    drop(case);
+}
+
+/// Eight handles of a person that are kept open with nothing sent do not use up the pipe: the
+/// connections are closed at their bound and the server ends are disconnected with them, so an
+/// administrator's open succeeds once the bound has passed, and when the service stops its pipe's name
+/// is free to make again while the handles are still open.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn eight_handles_kept_open_with_nothing_sent_leave_the_pipe_to_an_administrator_and_its_name_free_at_the_end()
+ {
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let mut served = serve_in_process();
+    let held: Vec<_> = (0..8)
+        .map(|number| {
+            try_client_without(&[SYSTEM_SID, ADMINISTRATORS_SID], 30)
+                .unwrap_or_else(|failure| panic!("handle {number} of the person: {failure}"))
+        })
+        .collect();
+    // The first frame's bound is five seconds; an administrator's open has this long after it.
+    let administrator = try_client_without(&[SYSTEM_SID], 20);
+    let ended = served.stops_within(20);
+    // The name is the service's no longer, and the person's handles are still open.
+    let again = Listener::bind(&[], Stop::new().unwrap()).map(drop);
+    drop(held);
+    assert!(
+        administrator.is_ok(),
+        "no instance was free for an administrator after the bound of the silent handles: {:?}",
+        administrator.err()
+    );
+    assert_eq!(ended.expect("the service ends"), Ok(()));
+    assert!(
+        again.is_ok(),
+        "the pipe's name was not free to make again while the person's handles were open: {:?}",
+        again.err().map(|failure| failure.to_string())
+    );
+}
+
+/// With every connection gone after a refill that failed, the listener still holds the pipe's name:
+/// no other account can make its first instance.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_name_stays_the_brokers_with_every_connection_gone_after_a_failed_refill() {
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let _restored = RefillsRestored;
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    let client = pipe::connect(std::process::id()).expect("the client opens the pipe");
+    pipe::testing::fail_refills(1);
+    let served = listener
+        .accept()
+        .expect("the failed refill does not end the listener")
+        .expect("the client in hand is served");
+    drop(client);
+    drop(served);
+    // Any account's call that makes the first instance of the name, as the system's does here, fails.
+    let taken = Listener::bind(&[], Stop::new().unwrap());
+    stop.set();
+    assert!(
+        taken.is_err(),
+        "the name was free with every connection gone after a failed refill"
+    );
+}
+
+/// A refill that fails again and again never ends the loop by a count: after a thousand and one failures
+/// in a row the next client is still served.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_thousand_and_one_failed_refills_do_not_end_the_loop_and_it_still_serves() {
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let _restored = RefillsRestored;
+    let mut served = serve_in_process();
+    let mut first = client_without(&[SYSTEM_SID]);
+    kr_boundary_windows::win::pipe::testing::fail_refills(1_001);
+    say_hello(&mut first);
+    // The loop tries again every twenty milliseconds, so the failures last about twenty seconds, and
+    // this client's open waits for an instance as long as the installer's own does.
+    let answer = an_administrators_status_within_thirty_seconds();
+    drop(first);
+    let ended = served.stops_within(20);
+    assert!(
+        matches!(answer, Ok(Response::Status { .. })),
+        "the loop did not serve a client after a thousand and one failed refills: {answer:?}"
+    );
+    assert_eq!(ended.expect("the service ends"), Ok(()));
+}
