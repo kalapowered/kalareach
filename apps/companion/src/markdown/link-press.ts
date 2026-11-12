@@ -6,10 +6,14 @@
  * rectangles of the links' words when the press starts. This puts the decision to work on a pane:
  *
  * - at the press's start the pressed look appears on the link that the press belongs to;
+ * - the press is decided again where it ends, with the rectangles as they are then: it stands only
+ *   where that choice names the same link or control as the choice at its start. The page moving under
+ *   a finger at rest (output arriving, the pane scrolling) cancels nothing by itself, and a press
+ *   whose link or control is no longer under the finger opens nothing;
  * - the link opens when the press ends, by the browser's own `click`, which is redirected to that
  *   link. Whether a press makes a click at all stays the browser's: a scroll on a phone ends in
- *   `pointercancel` and makes none. A press that moved past the platform's slop, or whose link moved
- *   from under it (the pane scrolled), makes a click that is dropped, so it opens nothing;
+ *   `pointercancel` and makes none. A press that moved past the platform's slop makes a click that is
+ *   dropped, so it opens nothing;
  * - a press on another control of the message goes to that control, though a link's box lies over it;
  * - a click that no pointer made (a keyboard, a screen reader) goes to the element it names, as it is.
  *
@@ -43,8 +47,7 @@ interface Press extends Choice {
   readonly pointer: number
   readonly x: number
   readonly y: number
-  /** Where what the press belongs to was when the press started: if it has moved, the press is no press. */
-  readonly anchor: { readonly left: number; readonly top: number } | null
+  /** Whether the press is cancelled: it moved past the slop, or it ended somewhere else than it began. */
   moved: boolean
   /** When the pointer was released (`performance.now()`), or null while it is down. */
   endedAt: number | null
@@ -69,12 +72,6 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
     const here = (target: EventTarget | null): boolean => target instanceof Node && element.contains(target)
     const away = (event: PointerEvent): boolean =>
       press !== null && Math.hypot(event.clientX - press.x, event.clientY - press.y) > SLOP
-    const shifted = (current: Press): boolean => {
-      const held = current.link ?? current.control
-      if (held === null || current.anchor === null) return false
-      const box = held.getBoundingClientRect()
-      return Math.hypot(box.left - current.anchor.left, box.top - current.anchor.top) > SLOP
-    }
 
     const move = (event: PointerEvent): void => {
       if (press === null || event.pointerId !== press.pointer || !away(event)) return
@@ -88,7 +85,12 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
     }
     const up = (event: PointerEvent): void => {
       if (press === null || event.pointerId !== press.pointer) return
-      if (away(event) || shifted(press)) press.moved = true
+      // Decided again where the press ends, on the page as it is now. A press that chose nothing has
+      // nothing to keep.
+      if (!press.moved && (press.link !== null || press.control !== null)) {
+        const end = choose(element, event.clientX, event.clientY)
+        if (end.link !== press.link || end.control !== press.control) press.moved = true
+      }
       press.endedAt = performance.now()
       light(null)
       stop()
@@ -105,17 +107,7 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
       stop()
       light(null)
       const choice = choose(element, event.clientX, event.clientY)
-      const held = choice.link ?? choice.control
-      const box = held?.getBoundingClientRect()
-      press = {
-        ...choice,
-        pointer: event.pointerId,
-        x: event.clientX,
-        y: event.clientY,
-        anchor: box ? { left: box.left, top: box.top } : null,
-        moved: false,
-        endedAt: null
-      }
+      press = { ...choice, pointer: event.pointerId, x: event.clientX, y: event.clientY, moved: false, endedAt: null }
       light(choice.link)
       document.addEventListener('pointermove', move)
       document.addEventListener('pointerup', up)
@@ -144,22 +136,24 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
         pressed = { ...choose(element, event.clientX, event.clientY), moved: false }
       }
       const hit = event.target instanceof Element ? event.target.closest(`.md-link, ${OTHER_CONTROLS}`) : null
-      if (pressed.link !== null) {
-        stopped(event)
-        if (!pressed.moved) {
-          pressed.link.focus({ preventScroll: true })
-          pressed.link.click()
-        }
-      } else if (pressed.control !== null) {
-        // The browser's own click went to something else, as a link's box over the control does.
-        if (hit !== pressed.control) {
-          stopped(event)
-          if (!pressed.moved) pressed.control.click()
-        }
-      } else if (hit?.classList.contains('md-link')) {
+      const held = pressed.link ?? pressed.control
+      if (held === null) {
         // The browser would open the link under the pointer, which the press does not belong to.
-        stopped(event)
+        if (hit?.classList.contains('md-link')) stopped(event)
+        return
       }
+      // A cancelled press opens and clicks nothing, whichever element the browser's own click went to.
+      if (pressed.moved) {
+        stopped(event)
+        return
+      }
+      // The browser's own click on the control the press belongs to stands.
+      if (pressed.link === null && hit === held) return
+      // A link's click goes to the link whichever element the browser sent it to, and a control's goes
+      // to the control when a link's box lies over it.
+      stopped(event)
+      if (pressed.link !== null) pressed.link.focus({ preventScroll: true })
+      held.click()
     }
 
     document.addEventListener('pointerdown', down, true)
