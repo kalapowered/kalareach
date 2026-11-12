@@ -63,6 +63,18 @@ pub enum QueryEnd {
     },
 }
 
+/// How a query whose program could not start because its deadline had passed came to an end. When
+/// the search's own end set that deadline, it is the search's end; when the query's own bound did
+/// (the earlier of the two), the search's deadline has not passed, and the query has failed.
+#[must_use]
+pub fn launch_deadline_end(by_the_deadline: bool) -> QueryEnd {
+    if by_the_deadline {
+        QueryEnd::DeadlinePassed
+    } else {
+        QueryEnd::Failed
+    }
+}
+
 /// Whether a query that came to this end is the end of the search: the search's own end caused it,
 /// whether the query was cut at it or never started because it had passed. Any other end is a
 /// failure of the proof, which would hide the log's last words if it were taken for the search's end.
