@@ -334,14 +334,18 @@ impl LeaseDesk {
 /// host refused the connection, which is told as that refusal. Neither is that the lease could not
 /// be given: the host's refusal of a connection it cannot take is not a failure of the
 /// organisation's service.
+///
+/// The host's refusal is read at every stop, and not only at one that comes after the host was
+/// asked to take the lease: a connection the host refused at its admission is refused whatever the
+/// keeper was doing when it stopped, as when it was still asking the organisation's service.
 fn failed_on(session: &Session, stop: &LeaseStop) -> LinkError {
-    if *stop == LeaseStop::ConnectionEnded {
-        if let Some(error) = session.transport().ended_by_this_device() {
-            return LinkError::Membership(error);
-        }
-        if let Some(refusal) = session.connection_refusal() {
-            return LinkError::ConnectionRefused(refusal);
-        }
+    if *stop == LeaseStop::ConnectionEnded
+        && let Some(error) = session.transport().ended_by_this_device()
+    {
+        return LinkError::Membership(error);
+    }
+    if let Some(refusal) = session.connection_refusal() {
+        return LinkError::ConnectionRefused(refusal);
     }
     failed(stop)
 }
