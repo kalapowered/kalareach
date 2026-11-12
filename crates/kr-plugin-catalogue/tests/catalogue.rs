@@ -3427,6 +3427,28 @@ async fn a_release_for_a_newer_sdk_leaves_the_installed_release_in_place() {
         "nothing of the newer release is fetched"
     );
 
+    // What an owner is shown before confirming an installation reads the manifest, which is
+    // fetched when it is not held: for a release that needs a newer SDK it is not fetched.
+    let statement = catalogue
+        .grant_statement(
+            &repository(),
+            &plugin(),
+            &newer.version,
+            newer.manifest_digest,
+            &InstallationGrant::none(),
+        )
+        .await
+        .expect_err("the newest release needs a newer SDK");
+    let CatalogueError::UnsafePackage { detail } = &statement else {
+        panic!("{statement:?}");
+    };
+    assert!(detail.contains("sdk_range >=0.1.99, <0.2.0"), "{detail}");
+    assert_eq!(
+        metered.fetches("/packages/"),
+        fetched,
+        "the manifest of the newer release is not fetched to describe it"
+    );
+
     let installed = catalogue
         .installation(environment(), &plugin())
         .expect("readable")
