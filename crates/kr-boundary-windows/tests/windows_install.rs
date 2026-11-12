@@ -1759,6 +1759,43 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// A folder above the data directory that cannot be opened to be checked, for a reason that is no
+/// program holding it open, shows nothing of who made it: it is told to be moved aside, and neither
+/// corrected into place nor removed.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_parent_folder_that_cannot_be_opened_is_told_to_be_moved_aside_and_not_to_be_corrected_or_removed()
+ {
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let icacls = |arguments: &[&str]| {
+        let done = Command::new("icacls")
+            .arg(&folder)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{done:?}");
+    };
+    // Neither the system nor the Administrators group may list it, so the check's open is refused
+    // with an access error and not with a sharing violation.
+    icacls(&["/deny", "*S-1-5-18:(RD)", "*S-1-5-32-544:(RD)"]);
+    let refused = install::check_data_parent(&paths_under(&folder));
+    icacls(&["/remove:d", "*S-1-5-18", "*S-1-5-32-544"]);
+    let text = refused.unwrap_err().to_string();
+    assert!(text.contains("could not be opened to be checked"), "{text}");
+    assert!(text.contains("Move the folder aside"), "{text}");
+    for other in [
+        "Remove the folder",
+        "remove the folder",
+        "Correct it instead",
+        "Close the program",
+    ] {
+        assert!(!text.contains(other), "one remedy: {text}");
+    }
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 /// A record's remedy comes from what its own handle shows, never from the words of the reason that
 /// refused it. A manifest that another account owns and that has a second name is moved out and is
 /// not corrected into place, since correcting it would make another account's file the
