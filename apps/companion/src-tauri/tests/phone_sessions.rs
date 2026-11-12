@@ -2565,6 +2565,56 @@ async fn kr_req_19_08_a_refusal_is_told_after_two_probes_agree() {
     adopted.stop().await;
 }
 
+/// KR-REQ-19.08: a host's refusal of a connection that is not for now, which a session's first open
+/// reads, does not end the opening. A revocation that lands between the device's handshake and its
+/// admission, and a daemon that has stopped while its listener still accepts, each refuse once and
+/// not again: the opening stands as reconnecting and reaches the host again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_refusal_at_the_first_open_that_does_not_repeat_leaves_the_opening_standing()
+{
+    use kr_protocol::error::ErrorCode;
+
+    for code in [ErrorCode::PermissionDenied, ErrorCode::HostNotConfigured] {
+        let adopted = Adopted::start(1).await;
+        let session = adopted.workers[0].session_id;
+        let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+        let companion = &phone.companion;
+
+        control.refuse_the_connection(Some(code));
+        let standing = open(companion, session, None, "first")
+            .unwrap_or_else(|refused| panic!("{code:?} at the first open ended it: {refused}"));
+        assert_eq!(standing["state"], "reconnecting", "{code:?}: {standing}");
+        control.refuse_the_connection(None);
+        let reached = heard(companion, "first", |standing| standing["state"] == "open").await;
+        assert_eq!(reached["standing"]["via"], "pairing", "{code:?}: {reached}");
+        adopted.stop().await;
+    }
+}
+
+/// KR-REQ-19.08: a refusal of the connection at a session's first open that the next probe repeats
+/// ends the opening, with the host's words, after those two asks and no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_refusal_at_the_first_open_that_repeats_ends_the_opening_with_its_words() {
+    use kr_protocol::error::ErrorCode;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+
+    control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
+    let before = control.asked();
+    let standing = open(companion, session, None, "repeated").expect("the first open stands");
+    assert_eq!(standing["state"], "reconnecting", "{standing}");
+    let told = heard(companion, "repeated", |standing| {
+        standing["state"] == "refused"
+    })
+    .await;
+    assert_eq!(told["standing"]["code"], "PERMISSION_DENIED", "{told}");
+    assert_eq!(control.asked() - before, 2, "the open and one probe agreed");
+    adopted.stop().await;
+}
+
 /// KR-REQ-19.08: an ambient call whose connection was being made when the host changed serves
 /// nothing and leaves no link: the host it was made for is not the host in use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -207,6 +207,16 @@ enum Opening {
     Ended(ShareEnd),
 }
 
+/// How the watch of an opening starts.
+enum Begin {
+    /// The opening has a link, and the watch waits for its connection to end.
+    Held(Arc<Link>),
+    /// The opening has no link yet and the watch reaches the host. `refused` is the code of the
+    /// host's refusal of the connection that the opening's first open read and did not end the
+    /// opening with: a refusal is told only when a second ask agrees with it.
+    Reaching { refused: Option<ErrorCode> },
+}
+
 /// The host a phone opens sessions on, and what it opens them as.
 #[derive(Clone)]
 pub struct Dial {
@@ -685,10 +695,22 @@ impl PairedLinks {
                 if !still_mine {
                     return Ok(SessionStanding::Superseded);
                 }
-                let unable = match &failure {
-                    Unopened::Unreached(_) | Unopened::HostFull | Unopened::BudgetFull => true,
-                    Unopened::Refused(_, refusal) => transient(refusal.code),
+                // A refusal of the connection that is not for now is not yet the host's decision
+                // about this opening: a revocation that lands between this device's handshake and
+                // its admission, or a daemon that has stopped while its listener still accepts,
+                // refuses once and may not again. As the watch treats it, the opening stands and
+                // one more ask decides.
+                let first_refusal = match &failure {
+                    Unopened::Refused(Asked::Connection, refusal) if !transient(refusal.code) => {
+                        Some(refusal.code)
+                    }
+                    _ => None,
                 };
+                let unable = first_refusal.is_some()
+                    || match &failure {
+                        Unopened::Unreached(_) | Unopened::HostFull | Unopened::BudgetFull => true,
+                        Unopened::Refused(_, refusal) => transient(refusal.code),
+                    };
                 if !unable {
                     inner.current.remove(&session_id);
                     return Err(failure.into_error());
@@ -703,7 +725,9 @@ impl PairedLinks {
                     session_id,
                     grant_id,
                     opening.to_owned(),
-                    None,
+                    Begin::Reaching {
+                        refused: first_refusal,
+                    },
                 ));
                 inner.opened.insert(
                     session_id,
@@ -742,7 +766,7 @@ impl PairedLinks {
                         session_id,
                         grant_id,
                         opening.to_owned(),
-                        Some(Arc::clone(&link)),
+                        Begin::Held(Arc::clone(&link)),
                     ))
                 });
                 inner.opened.insert(
@@ -1241,6 +1265,8 @@ impl PairedLinks {
     /// same opening, telling the page where that stands, until the opening is left, replaced or the
     /// host says it is over. An opening that has no link yet, because the host could not be reached
     /// when it was made, starts by reaching the host.
+    ///
+    /// `begin` says how the watch starts ([`Begin`]).
     async fn keep(
         self: Arc<Self>,
         dial: Dial,
@@ -1248,11 +1274,18 @@ impl PairedLinks {
         session_id: SessionId,
         grant_id: Option<GrantId>,
         opening: String,
-        mut link: Option<Arc<Link>>,
+        begin: Begin,
     ) {
+        let (mut link, mut refused) = match begin {
+            Begin::Held(link) => (Some(link), None),
+            Begin::Reaching { refused } => (None, refused),
+        };
         let mut backoff = kr_client::reconnect::ReconnectLoop::new();
         loop {
             if let Some(held) = link.take() {
+                // A link that was made and has ended starts the asks over: a refusal from before
+                // it is not one that the next agrees with.
+                refused = None;
                 backoff.connected();
                 held.session.closed().await;
                 // An opening that is over, or was left or replaced, is not reached again.
@@ -1267,7 +1300,6 @@ impl PairedLinks {
                     return;
                 }
             }
-            let mut refused: Option<ErrorCode> = None;
             loop {
                 // Jittered, growing while the host does not answer, and starting over only once a
                 // link has lasted: a link that opens and closes at once is not reached again at
