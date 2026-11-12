@@ -75,6 +75,47 @@ pub fn launch_deadline_end(by_the_deadline: bool) -> QueryEnd {
     }
 }
 
+/// What a query of the log came back with, as the search's loop reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryResult {
+    /// The log answered; `refusal_found` says whether it holds the refusal that is looked for.
+    Answered {
+        /// Whether the refusal of the unlisted program is in the answer.
+        refusal_found: bool,
+    },
+    /// The query came to an end without an answer.
+    Ended(QueryEnd),
+}
+
+/// What the search's loop does after a query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// The refusal is shown: the search is done.
+    Found,
+    /// The log does not hold it yet: launch again.
+    Keep,
+    /// The search's own end stopped the query: the search is over, and the proof's failure that
+    /// follows says what it saw and what the log last said.
+    Over,
+    /// The query failed for a reason of its own: the proof fails, at any time.
+    Fail,
+}
+
+/// What the loop does after a query: the one decision of its query step.
+#[must_use]
+pub fn next_after_a_query(result: QueryResult) -> Next {
+    match result {
+        QueryResult::Answered {
+            refusal_found: true,
+        } => Next::Found,
+        QueryResult::Answered {
+            refusal_found: false,
+        } => Next::Keep,
+        QueryResult::Ended(end) if query_ends_the_search(end) => Next::Over,
+        QueryResult::Ended(_) => Next::Fail,
+    }
+}
+
 /// Whether a query that came to this end is the end of the search: the search's own end caused it,
 /// whether the query was cut at it or never started because it had passed. Any other end is a
 /// failure of the proof, which would hide the log's last words if it were taken for the search's end.

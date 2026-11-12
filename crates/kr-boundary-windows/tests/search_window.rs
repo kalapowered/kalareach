@@ -6,7 +6,8 @@
 use std::time::{Duration, Instant};
 
 use kr_boundary_windows::window::{
-    QueryEnd, bound, launch_deadline_end, may_ask_the_log, query_ends_the_search, search_is_over,
+    Next, QueryEnd, QueryResult, bound, launch_deadline_end, may_ask_the_log, next_after_a_query,
+    query_ends_the_search, search_is_over,
 };
 
 #[test]
@@ -181,4 +182,45 @@ fn a_launch_that_missed_its_deadline_ends_the_search_only_when_the_searchs_deadl
     assert!(query_ends_the_search(launch_deadline_end(true)));
     assert_eq!(launch_deadline_end(false), QueryEnd::Failed);
     assert!(!query_ends_the_search(launch_deadline_end(false)));
+}
+
+/// The loop's query step over a made sequence of results: each decides alone, the log that does not
+/// hold the refusal yet keeps the search going, and the search's own end (a deadline before a
+/// query, a deadline in a launch, a cut at the window's end) ends it, while a query's own bound and
+/// every other failure fail the proof.
+#[test]
+fn the_loop_decides_each_query_result_of_a_made_sequence() {
+    let sequence = [
+        (
+            QueryResult::Answered {
+                refusal_found: false,
+            },
+            Next::Keep,
+        ),
+        (QueryResult::Ended(QueryEnd::DeadlinePassed), Next::Over),
+        (QueryResult::Ended(launch_deadline_end(true)), Next::Over),
+        (
+            QueryResult::Ended(QueryEnd::Cut {
+                by_the_deadline: true,
+            }),
+            Next::Over,
+        ),
+        (
+            QueryResult::Ended(QueryEnd::Cut {
+                by_the_deadline: false,
+            }),
+            Next::Fail,
+        ),
+        (QueryResult::Ended(launch_deadline_end(false)), Next::Fail),
+        (QueryResult::Ended(QueryEnd::Failed), Next::Fail),
+        (
+            QueryResult::Answered {
+                refusal_found: true,
+            },
+            Next::Found,
+        ),
+    ];
+    for (result, next) in sequence {
+        assert_eq!(next_after_a_query(result), next, "{result:?}");
+    }
 }
