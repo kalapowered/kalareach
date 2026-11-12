@@ -429,6 +429,11 @@ async fn present(
             | LinkError::Declined(refusal) => {
                 Missed::Refused(Asked::Connection, CommandError::from(refusal))
             }
+            // The host's refusal of the connection is told by its cause, as a first call on the
+            // connection tells it.
+            LinkError::ConnectionRefused(refusal) => {
+                Unopened::of_refused_connection(refusal).into()
+            }
             LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_) => {
                 Missed::Unreached
             }

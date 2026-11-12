@@ -1489,6 +1489,50 @@ async fn a_lease_the_host_refuses_as_ended_the_moment_it_is_signed_is_not_asked_
     );
 }
 
+/// KR-REQ-19.08: a member's host that holds as many connections from the device as it allows
+/// refuses the new one at admission, before the lease is presented, and that refusal is what the
+/// connection not being opened says: the host cannot take another connection for now. It is not
+/// told as the organisation's service failing to give the device a lease, which it is not, and it
+/// does not wait out the presentation's own retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_host_at_its_bound_is_told_as_full_and_not_as_a_failed_lease() {
+    use companion_tauri::connection::Unopened;
+
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let requests = rig.lease_requests();
+
+    rig.control
+        .refuse_the_connection(Some(ErrorCode::ResourceUnavailable));
+    let refused = rig
+        .dials()
+        .await
+        .expect_err("the host refused the connection");
+    let cause = Unopened::of_link(refused);
+    assert!(
+        matches!(cause, Unopened::HostFull),
+        "the host's bound, and not a lease that could not be given: {cause:?}"
+    );
+    assert_eq!(
+        rig.lease_requests(),
+        requests,
+        "the lease was not asked for again on a connection the host refused"
+    );
+
+    // The host refuses the connection for another reason: its own words, and not its bound.
+    rig.control
+        .refuse_the_connection(Some(ErrorCode::PermissionDenied));
+    let refused = rig
+        .dials()
+        .await
+        .expect_err("the host refused the connection");
+    let cause = Unopened::of_link(refused);
+    assert!(
+        matches!(&cause, Unopened::Refused(_, error) if error.code == ErrorCode::PermissionDenied),
+        "a refusal of the connection for another reason: {cause:?}"
+    );
+}
+
 /// KR-REQ-17.53: a visit to a paired host, which the application makes to read a host it is not
 /// using, is a connection of the device like any other, and the host refuses it every method until
 /// it holds the device's lease. So a visit presents the lease first, and is served. The

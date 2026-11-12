@@ -45,7 +45,10 @@ transport's failure. A mutation is then not an outcome that is unknown, since th
 connection and nothing was submitted on it. A caller that must tell the refusal of the connection
 from a refusal of its own request asks the session for it (`Session::connection_refusal`), because
 a request's refusal can carry the same code. A link that wraps the host's and declines to dial for a
-limit of its own answers with `LinkError::Declined`, which is no refusal of the host's.
+limit of its own answers with `LinkError::Declined`, which is no refusal of the host's. A link
+that presents a membership lease before it returns the session answers a connection the host
+refused with `LinkError::ConnectionRefused`, which holds that refusal, and not with the failure of
+presenting the lease.
 
 A local host also answers a second hello, and a frame that is no request or mutation, with an error
 of request identifier zero and leaves the connection open. A session sends neither, so none of these

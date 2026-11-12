@@ -444,6 +444,10 @@ impl Unopened {
             LinkError::Membership(refusal) => {
                 Self::Refused(Asked::Connection, CommandError::from(refusal))
             }
+            // The host refused the connection itself while the lease it needs was being
+            // presented, and its refusal is what the session kept: the same cause as one that
+            // the first call on the connection reads.
+            LinkError::ConnectionRefused(refusal) => Self::of_refused_connection(refusal),
             // This application's own budget refused the dial, so no host was asked.
             LinkError::Declined(_) => Self::BudgetFull,
             other => Self::unreached(other.said().into_string()),
@@ -472,10 +476,7 @@ impl Unopened {
     /// this application carries, and answers every call with it, so only the session can tell that
     /// refusal from a refusal of a request.
     ///
-    /// This is the one place that reads the refusal's code: a host refuses a connection with
-    /// `RESOURCE_UNAVAILABLE` only for its bound of connections to one device, and the connection
-    /// is then refused for now ([`Self::HostFull`]). Any other code is a refusal of the connection
-    /// for another reason, which says its own words.
+    /// The code of the refusal is read in [`Self::of_refused_connection`] and nowhere else.
     #[must_use]
     pub fn of_connection(session: &Session, error: &kr_client::ClientError) -> Option<Self> {
         let kr_client::ClientError::Host(refusal) = error else {
@@ -484,13 +485,20 @@ impl Unopened {
         if session.connection_refusal().as_ref() != Some(refusal) {
             return None;
         }
-        Some(
-            if refusal.code == kr_protocol::error::ErrorCode::ResourceUnavailable {
-                Self::HostFull
-            } else {
-                Self::Refused(Asked::Connection, CommandError::from(refusal.clone()))
-            },
-        )
+        Some(Self::of_refused_connection(refusal.clone()))
+    }
+
+    /// What the host's refusal of the connection itself says, when `refusal` is the error it
+    /// answered a device with at admission, as a session or a wire kept it
+    /// ([`Self::of_connection`]): the host's bound is [`Self::HostFull`], and any other code is a
+    /// refusal of the connection for another reason, which says its own words.
+    #[must_use]
+    pub fn of_refused_connection(refusal: kr_protocol::error::ProtocolError) -> Self {
+        if refusal.code == kr_protocol::error::ErrorCode::ResourceUnavailable {
+            Self::HostFull
+        } else {
+            Self::Refused(Asked::Connection, CommandError::from(refusal))
+        }
     }
 
     /// A read that failed for a reason that is no answer of the host's: the host was not reached.

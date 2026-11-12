@@ -898,7 +898,14 @@ impl LeaseKeeper {
             .await
             .and_then(|settled| settled.to_typed())
             .map_err(|error| {
-                let next = from_the_host(&error, presented);
+                // A host that refused the connection answers every request on it with that refusal
+                // and ends it: asking again on it gets the same answer, and the connection is what
+                // ended, so its refusal is the caller's to read from the session.
+                let next = if session.connection_refusal().is_some() {
+                    Next::Stop(LeaseStop::ConnectionEnded)
+                } else {
+                    from_the_host(&error, presented)
+                };
                 if matches!(
                     next,
                     Next::Now | Next::BackOffWithTheChain | Next::Mistrusted(_)

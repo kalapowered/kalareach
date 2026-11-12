@@ -329,13 +329,19 @@ impl LeaseDesk {
     }
 }
 
-/// The failure a lease stop is when the session the stop happened on says this device ended it for
-/// the account's sake: the account's words, not that the connection was lost.
+/// The failure a lease stop is when the session the stop happened on says why its connection
+/// ended: this device ended it for the account's sake, which is told in the account's words, or the
+/// host refused the connection, which is told as that refusal. Neither is that the lease could not
+/// be given: the host's refusal of a connection it cannot take is not a failure of the
+/// organisation's service.
 fn failed_on(session: &Session, stop: &LeaseStop) -> LinkError {
-    if *stop == LeaseStop::ConnectionEnded
-        && let Some(error) = session.transport().ended_by_this_device()
-    {
-        return LinkError::Membership(error);
+    if *stop == LeaseStop::ConnectionEnded {
+        if let Some(error) = session.transport().ended_by_this_device() {
+            return LinkError::Membership(error);
+        }
+        if let Some(refusal) = session.connection_refusal() {
+            return LinkError::ConnectionRefused(refusal);
+        }
     }
     failed(stop)
 }

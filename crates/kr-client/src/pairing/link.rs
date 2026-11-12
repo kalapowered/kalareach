@@ -80,6 +80,13 @@ pub enum LinkError {
     /// which. It is no refusal of what the caller asked the host, so a caller that reads a refusal
     /// as the host's decision about that does not read this as one.
     Membership(ProtocolError),
+    /// The host refused the connection itself, with the error it answers a device with at
+    /// admission, before the device had presented what the host needs of it: the connection was
+    /// made, and the host's refusal came before the lease was taken. The refusal is the session's
+    /// own record of it, which the session that kept it no longer holds, so it is the cause of the
+    /// connection not being used, and a caller that tells a host that cannot take another
+    /// connection from other refusals reads it here. It is no refusal of a request.
+    ConnectionRefused(ProtocolError),
     /// A link that wraps the host's declined to dial, for a limit of its own: no connection was
     /// made and the host was asked nothing. The refusal is that link's and not the host's, so a
     /// caller that reads a refusal as the host's decision does not read this as one, and a caller
@@ -113,6 +120,11 @@ impl Said for LinkError {
                 Shown::protocol(error)
             ),
             Self::Membership(error) | Self::Declined(error) => Shown::protocol(error),
+            Self::ConnectionRefused(error) => crate::shown!(
+                "the host refused the connection: {}: {}",
+                error.code,
+                Shown::protocol(error)
+            ),
             Self::Lost(_) => Shown::said("the host could not be reached"),
             Self::Selection(refusal) => Shown::selection(refusal),
             Self::Configuration(_) => {

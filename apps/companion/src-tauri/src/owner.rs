@@ -366,6 +366,14 @@ impl Owner {
             // This computer's own budget of connections to the host is used: the host is not out
             // of contact, and the next visit asks again.
             LinkError::Declined(_) => Self::no_room(&Unopened::BudgetFull),
+            // The host refused the connection itself: it is not out of contact when it has no
+            // room for this computer's connection, and the next visit asks again.
+            LinkError::ConnectionRefused(refusal) => {
+                match Unopened::of_refused_connection(refusal) {
+                    unopened @ Unopened::HostFull => Self::no_room(&unopened),
+                    _ => Missed::OutOfContact,
+                }
+            }
             _ => Missed::OutOfContact,
         })?;
         let session = Arc::new(session);
