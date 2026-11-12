@@ -152,6 +152,11 @@ interface LinkReading {
   readonly lost: readonly string[]
   /** The points just above and below the link's words, in its own line, that went to another link or to none. */
   readonly nearby: readonly string[]
+  /** The points in the reach beside the link's words, low in its line, that went to another link or to none. */
+  readonly beside: readonly string[]
+  /** How far the link's own words and the words before it moved sideways because of its reach. */
+  readonly wordsMoved: number
+  readonly beforeMoved: number
 }
 
 interface LinksReading {
@@ -167,15 +172,17 @@ interface LinksReading {
 // KR-REQ-13.19: a link inside a message is a button that is one line tall, and the box that a finger,
 // TalkBack and VoiceOver find for it is the size the platform asks for all the same. The box is read
 // from the page, which is what the platforms' trees are built from, and cut to what the pane and the
-// screen show of it. Taking the reach away shows nothing moves up or down, and the words after a link
-// move sideways only by what the room beside the link cannot give it: a label as wide as the box needs
-// does not move them at all, and a narrower one moves them by the difference and no more, whether it is
-// one character, four narrow ones or one in bold. What is held is the line's height and where it
-// breaks; what is not held is a few pixels of width after a label narrower than the box. Links on the next line, one directly under the other, and beside it show that a
-// press on a link's words, and just above and below them in their own line, is that link's; plain lines above and below a link and plain words after it show that a press anywhere
-// in the box is the link's too; a link at the start of a line, at its end and alone on a line show the
-// box is whole at the pane's edges and the conversation does not scroll sideways for it; and a link on
-// the last line shows the pane holds its box at the end.
+// screen show of it. Taking the reach away shows nothing moves up or down. Sideways, the words around
+// a link move only by what the room beside the link cannot give it: a label as wide as the box needs
+// moves nothing, and a narrower one moves the words after it by the difference and no more, whether
+// it is one character, four narrow ones or one in bold. What is not held, and is not asserted: a line
+// with less room than that difference to spare breaks one word earlier.
+// Links on the next line, one directly under the other, and beside it show that a press on a link's
+// words, just above and below them, and in the reach beside them, is that link's. Plain lines above and
+// below a link, and plain words after it, show that a press anywhere in the box is the link's too. A
+// link at the start of a line, at its end and alone on a line shows the box is whole at the pane's
+// edges and the conversation does not scroll sideways for it, and a link on the last line shows the
+// pane holds its box at the end.
 test.describe('a link inside a message', () => {
   for (const surface of ['ios', 'android'] as const) {
     test(`is a full touch target on ${surface} and moves the words after it only as far as a narrow label needs`, async ({ page }) => {
@@ -202,6 +209,15 @@ test.describe('a link inside a message', () => {
           const range = document.createRange()
           range.setStart(next, 0)
           range.setEnd(next, 1)
+          return range
+        }
+        const beforeOf = (link: HTMLElement): Range | null => {
+          const previous = link.previousSibling
+          const length = (previous?.textContent ?? '').length
+          if (!previous || previous.nodeType !== Node.TEXT_NODE || length < 1) return null
+          const range = document.createRange()
+          range.setStart(previous, length - 1)
+          range.setEnd(previous, length)
           return range
         }
         const boxOf = (box: DOMRect): Box => ({ left: box.left, top: box.top, width: box.width, height: box.height })
@@ -283,6 +299,8 @@ test.describe('a link inside a message', () => {
             boxes[`the words of ${name}`] = boxOf(wordsOf(link).getBoundingClientRect())
             const after = afterOf(link)
             if (after) boxes[`what follows ${name}`] = boxOf(after.getBoundingClientRect())
+            const ahead = beforeOf(link)
+            if (ahead) boxes[`what precedes ${name}`] = boxOf(ahead.getBoundingClientRect())
           })
           return boxes
         }
@@ -290,8 +308,7 @@ test.describe('a link inside a message', () => {
         const bare = document.createElement('style')
         bare.textContent = [
           '.m-pane { padding-inline: 0 !important; margin-inline: 0 !important }',
-          '.m-node .md-link { padding: 0 !important; margin: 0 !important; min-inline-size: 0 !important }',
-          '.m-node .md-link-label { display: inline !important }'
+          '.m-node .md-link { padding: 0 !important; margin: 0 !important; min-inline-size: 0 !important }'
         ].join(' ')
         document.head.append(bare)
         const without = places()
@@ -353,17 +370,44 @@ test.describe('a link inside a message', () => {
             const found = document.elementFromPoint(rect.left + rect.width / 2, y)
             if (found?.closest('.md-link') !== link) nearby.push(`${where}: ${found ? `${found.tagName} ${found.className}` : 'nothing'}`)
           }
+          // In the reach beside the words, low in the line, where a link on the next line has its box: the
+          // press is this link's. Where another link follows on the same line, the later link's area is
+          // the one above between their words, so that side is left out.
+          const beside: string[] = []
+          const lowest = wordsAt[wordsAt.length - 1]
+          const first = wordsAt[0]
+          if (lowest && first) {
+            const y = lowest.bottom + 1.5
+            const sides: [string, number][] = [
+              ['at the start of the box', box.left + 4],
+              ['by the start of the words', first.left - 3],
+              ['by the end of the words', lowest.right + 3],
+              ['at the end of the box', box.right - 4]
+            ]
+            for (const [where, x] of sides) {
+              if (link === second && where.includes('end')) continue
+              if (link === third && where.includes('start')) continue
+              const found = document.elementFromPoint(x, y)
+              if (found?.closest('.md-link') !== link) beside.push(`${where}: ${found ? `${found.tagName} ${found.className}` : 'nothing'}`)
+            }
+          }
           const was = without[`what follows ${name}`]
           const is = before[`what follows ${name}`]
+          const wordsWas = without[`the words of ${name}`]
+          const wordsIs = before[`the words of ${name}`]
+          const ahead = [without[`what precedes ${name}`], before[`what precedes ${name}`]] as const
           return {
             label: link.textContent ?? '',
             width: Math.min(box.right, paneBox.right, window.innerWidth) - Math.max(box.left, paneBox.left, 0),
             height: Math.min(box.bottom, paneBox.bottom, window.innerHeight) - Math.max(box.top, paneBox.top, 0),
             moved: was && is ? Math.abs(is.left - was.left) : 0,
+            wordsMoved: wordsWas && wordsIs ? Math.abs(wordsIs.left - wordsWas.left) : 0,
+            beforeMoved: ahead[0] && ahead[1] ? Math.abs(ahead[1].left - ahead[0].left) : 0,
             mostMoved: Math.max(0, finger - 2 * room - wordsWidth),
             stolen,
             lost,
-            nearby
+            nearby,
+            beside
           }
         })
 
@@ -383,11 +427,15 @@ test.describe('a link inside a message', () => {
       for (const link of reading.links) {
         expect.soft(link.width, `the width of "${link.label}" where it can be pressed`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
         expect.soft(link.height, `the height of "${link.label}" where it can be pressed`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
-        // Within a pixel: Chromium sizes a button to the whole pixel its text needs.
+        // Within a pixel: layout rounds a button's width to a fraction of a pixel, and the same label differs by that.
         expect.soft(link.moved, `how far the words after "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved + 1)
         expect.soft(link.stolen, `where a press on the words of "${link.label}" went to another link`).toEqual([])
         expect.soft(link.lost, `where a press inside the box of "${link.label}" did not reach it`).toEqual([])
         expect.soft(link.nearby, `where a press by the words of "${link.label}" went elsewhere`).toEqual([])
+        expect.soft(link.beside, `where a press in the reach beside "${link.label}" went elsewhere`).toEqual([])
+        // The label is centred in the box, so a widened box moves it by half of the difference.
+        expect.soft(link.wordsMoved, `how far "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved / 2 + 1)
+        expect.soft(link.beforeMoved, `how far the words before "${link.label}" moved sideways`).toBeLessThanOrEqual(link.mostMoved + 1)
       }
       expect.soft(reading.cut, 'how far the box of the last line’s link lies below the pane at its end').toBeLessThanOrEqual(0.5)
       expect.soft(reading.overflowing, 'what scrolls or clips sideways from the pane up').toEqual([])
