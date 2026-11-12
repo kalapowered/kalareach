@@ -470,10 +470,35 @@ fn judge_launch(
     }
 }
 
-/// What the cases use to judge a launch as the proof does.
+/// What the cases use to judge a launch as the proof does, and to make a stop come at a point of a
+/// proof that no case could otherwise hit.
 #[cfg(feature = "testing")]
 pub mod testing {
+    use std::sync::Mutex;
+
     use super::{Captured, LaunchError, Seen, judge_launch};
+
+    type Hook = Box<dyn Fn() + Send + Sync>;
+
+    static AFTER_THE_SEARCH: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Sets, or with none clears, what a proof does when its search for a refusal has found one, before
+    /// it starts any program that follows. The hook is a flag of the whole process.
+    pub fn after_the_search(hook: Option<Hook>) {
+        *AFTER_THE_SEARCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    pub(super) fn search_ended() {
+        if let Some(hook) = AFTER_THE_SEARCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook();
+        }
+    }
 
     /// Judges one launch of the unlisted program: `Ok(true)` when it was refused, `Ok(false)` when
     /// it ran with nothing refused before, and the failure's text when the proof fails on it.
@@ -691,6 +716,8 @@ pub fn prove(
         // The pause ends at the stop, and the next pass of the loop sees it.
         let _ = stop.wait(LAUNCH_EVERY.min(search_until.saturating_duration_since(Instant::now())));
     }
+    #[cfg(feature = "testing")]
+    testing::search_ended();
     if let Some(failed) = stopped(stop) {
         return failed;
     }

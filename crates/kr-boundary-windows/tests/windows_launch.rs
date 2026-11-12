@@ -1618,7 +1618,8 @@ fn open_the_brokers_pipe() -> Result<(), u32> {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
     };
-    let name = kr_boundary_windows::win::ffi::wide(kr_boundary_windows::win::pipe::NAME);
+    let name =
+        kr_boundary_windows::win::ffi::wide(kr_boundary_windows::win::pipe::Kind::Persons.name());
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         // SAFETY: the name is NUL-terminated; the result is checked.
@@ -1653,14 +1654,14 @@ fn open_the_brokers_pipe() -> Result<(), u32> {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_boundary_account_cannot_open_the_brokers_pipe_that_the_system_opens() {
-    use kr_boundary_windows::win::pipe::{Listener, Stop};
+    use kr_boundary_windows::win::pipe::{Kind, Listener, Stop};
     let fixture = Fixture::new();
     assert!(
-        std::fs::metadata(kr_boundary_windows::win::pipe::NAME).is_err(),
+        std::fs::metadata(kr_boundary_windows::win::pipe::Kind::Persons.name()).is_err(),
         "the machine is not clean: the broker's pipe is in use"
     );
     let stop = Stop::new().unwrap();
-    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    let mut listener = Listener::bind(Kind::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that takes each client and lets it go, so that the next one finds an instance.
     let server = std::thread::spawn(move || {
         loop {
