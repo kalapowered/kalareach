@@ -889,34 +889,28 @@ fn mouse_tracking(stream: &[u8]) -> Option<u16> {
 /// replay was shown in and not of every terminal.
 fn mouse_encoding(stream: &[u8]) -> Option<u16> {
     let mut encoding = None;
-    let mut index = 0;
-    while index + 3 < stream.len() {
-        if &stream[index..index + 3] != b"\x1b[?" {
-            index += 1;
-            continue;
-        }
-        let mut at = index + 3;
-        let mut number = String::new();
-        while let Some(byte) = stream.get(at).copied() {
-            if byte.is_ascii_digit() {
-                number.push(char::from(byte));
-                at += 1;
-            } else {
-                break;
-            }
-        }
-        let Ok(mode) = number.parse::<u16>() else {
-            index += 3;
+    let mut rest = stream;
+    while let Some(at) = rest.windows(3).position(|window| window == b"\x1b[?") {
+        rest = &rest[at + 3..];
+        // The parameters, which may be several, and the letter that ends them.
+        let length = rest
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b';')
+            .count();
+        let Some(last) = rest
+            .get(length)
+            .copied()
+            .filter(|last| matches!(last, b'h' | b'l'))
+        else {
             continue;
         };
-        if matches!(mode, 1005 | 1006 | 1015 | 1016) {
-            match stream.get(at) {
-                Some(b'h') => encoding = Some(mode),
-                Some(b'l') => encoding = None,
-                _ => {}
-            }
+        for mode in String::from_utf8_lossy(&rest[..length])
+            .split(';')
+            .filter_map(|text| text.parse::<u16>().ok())
+            .filter(|mode| matches!(mode, 1005 | 1006 | 1015 | 1016))
+        {
+            encoding = (last == b'h').then_some(mode);
         }
-        index += 3;
     }
     encoding
 }

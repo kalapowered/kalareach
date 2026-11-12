@@ -2567,7 +2567,7 @@ async fn drive(
                                     || handle
                                         .write_all(&event.bytes.as_slice()[written..follow.at])
                                         .is_err()
-                                    || handle.write_all(&follow.bytes).is_err();
+                                    || handle.write_all(&follow.bytes()).is_err();
                                 written = follow.at;
                             }
                             if failed

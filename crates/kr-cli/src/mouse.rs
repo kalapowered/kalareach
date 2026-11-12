@@ -41,9 +41,11 @@ const MOUSE_WHEELED: u32 = 0x4;
 /// How much the wheel's amount changes for one notch of it.
 const WHEEL_DELTA: i16 = 120;
 
-/// How many parameters of one sequence are kept. A sequence with more is no mode setting this
-/// reads.
-const PARAMETERS_KEPT: usize = 32;
+/// How many parameters of one sequence are kept: as many as the worker's lexer takes in one
+/// sequence (`max_params` in `kr-term`'s lexer, 256, which its sequence length of 256 bytes caps at
+/// fewer). A sequence the worker forwards is always read whole, so a long list of resets cannot be
+/// ignored here while the worker acts on it.
+const PARAMETERS_KEPT: usize = 256;
 
 /// One mouse record, with the fields the console reported it in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,21 +87,33 @@ pub enum Reading {
     /// earlier build draws a screen's tracking modes one by one in numeric order, the ones that are
     /// off among them (`?1000h ?1002l ?1003l`), and that screen has to be read as what its
     /// application asked for, the widest that is on: a reset of a tracking mode that is not on
-    /// changes nothing. Nothing is written after it, because a screen resets before it sets.
+    /// changes nothing. Nothing is written after it, because a current worker's screen resets
+    /// before it sets. A worker of an earlier build also writes the encoding entries in numeric
+    /// order (`?1005h ?1006l`), which leaves Terminal.app and iTerm at the default until the
+    /// application writes next, as it did.
     Restoration,
     /// What this command drew from the session's screen: read as a terminal reads it, and nothing
     /// is written after it.
     Painted,
 }
 
-/// Bytes to write to the terminal after the first `at` bytes of the output it has just been shown,
-/// so that the terminal ends in the state the session holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What to write to the terminal after the first `at` bytes of the output it has just been shown,
+/// so that the terminal ends in the state the session holds: the reset of both encoding modes and
+/// the set of the encoding in force.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Follow {
-    /// How many bytes of the output come before these.
+    /// How many bytes of the output come before it.
     pub at: usize,
-    /// What to write.
-    pub bytes: Vec<u8>,
+    /// The encoding in force: 1005 or 1006.
+    pub encoding: u32,
+}
+
+impl Follow {
+    /// The bytes to write.
+    #[must_use]
+    pub fn bytes(&self) -> Vec<u8> {
+        format!("\x1b[?1005;1006l\x1b[?{}h", self.encoding).into_bytes()
+    }
 }
 
 /// The most bytes one frame of a restoration carries.
@@ -116,8 +130,11 @@ pub const RESTORATION_CHUNK: usize = 256 * 1024;
 /// the cursor the first one carried. A frame that is shorter ends it, and so does one at another
 /// cursor.
 ///
-/// A named limit: the first live frame can carry the same cursor as the restoration's, so when the
-/// restoration is a whole number of chunks long, that one live frame is read as part of it.
+/// Named limits: the first live frame can carry the same cursor as the restoration's, so when the
+/// restoration is a whole number of chunks long, that one live frame is read as part of it. The
+/// frames of a side effect (an operating-system command or a bell, written by the worker's
+/// `send_effect`) carry the cursor of their cause, so after such a restoration they read as part of
+/// it too; none of them holds a mode setting, and the reading differs only for tracking resets.
 #[derive(Debug, Default)]
 pub struct Restoration {
     /// The cursor the next frame carries if it continues the restoration.
@@ -203,6 +220,7 @@ impl Control {
 
 impl MouseReporting {
     /// Reads output as a terminal reads it, and writes nothing after it.
+    #[cfg(test)]
     pub fn observe(&mut self, output: &[u8]) {
         let _ = self.read(output, Reading::Painted);
     }
@@ -213,10 +231,15 @@ impl MouseReporting {
         let mut follows = Vec::new();
         for (at, &byte) in output.iter().enumerate() {
             if self.step(byte, reading) && reading == Reading::Live && self.differs() {
-                follows.push(Follow {
-                    at: at + 1,
-                    bytes: self.put_right(),
-                });
+                self.reset_by_either = self.encoding;
+                // A difference after a sequence that set or reset an encoding is the encoding in
+                // force, which the terminal that returned the default is put back to.
+                if let Some(encoding) = self.encoding {
+                    follows.push(Follow {
+                        at: at + 1,
+                        encoding,
+                    });
+                }
             }
         }
         follows
@@ -226,17 +249,6 @@ impl MouseReporting {
     /// session.
     fn differs(&self) -> bool {
         self.encoding != self.reset_by_either
-    }
-
-    /// The bytes that put every terminal in the encoding in force: the reset of both modes, and the
-    /// set of the one in force.
-    fn put_right(&mut self) -> Vec<u8> {
-        self.reset_by_either = self.encoding;
-        let mut bytes = b"\x1b[?1005;1006l".to_vec();
-        if let Some(mode) = self.encoding {
-            bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
-        }
-        bytes
     }
 
     /// What the application asked to be told of the mouse.
@@ -841,23 +853,40 @@ mod tests {
     /// modes, and one that is cut between two writes.
     #[test]
     fn live_output_that_resets_the_encoding_not_in_force_is_followed_by_what_restores_it() {
-        let restore_1006 = b"\x1b[?1005;1006l\x1b[?1006h".to_vec();
-        let restore_1005 = b"\x1b[?1005;1006l\x1b[?1005h".to_vec();
         let follows = |output: &[u8]| MouseReporting::default().read(output, Reading::Live);
-        let at_the_end = |output: &[u8], bytes: &[u8]| {
+        let at_the_end = |output: &[u8], encoding: u32| {
             vec![Follow {
                 at: output.len(),
-                bytes: bytes.to_vec(),
+                encoding,
             }]
         };
-        for (output, bytes) in [
-            (&b"\x1b[?1006h\x1b[?1005l"[..], &restore_1006),
-            (b"\x1b[?1005h\x1b[?1006l", &restore_1005),
-            (b"\x1b[?1005h\x1b[?1006;1000l", &restore_1005),
-            (b"\x1b[?1005h\x1b[?1000;1006l", &restore_1005),
+        for (output, encoding) in [
+            (&b"\x1b[?1006h\x1b[?1005l"[..], 1006),
+            (b"\x1b[?1005h\x1b[?1006l", 1005),
+            (b"\x1b[?1005h\x1b[?1006;1000l", 1005),
+            (b"\x1b[?1005h\x1b[?1000;1006l", 1005),
         ] {
-            assert_eq!(follows(output), at_the_end(output, bytes), "{output:?}");
+            assert_eq!(follows(output), at_the_end(output, encoding), "{output:?}");
         }
+        // What is written: the reset of both modes, then the set of the one in force.
+        assert_eq!(
+            Follow {
+                at: 0,
+                encoding: 1006
+            }
+            .bytes(),
+            b"\x1b[?1005;1006l\x1b[?1006h".to_vec()
+        );
+        // A reset of the mode that is not in force in a long list of parameters, which the worker
+        // acts on, is read whole: nothing is restored that the application cleared.
+        let mut long = b"\x1b[?1000;1006h\x1b[?".to_vec();
+        for _ in 0..60 {
+            long.extend_from_slice(b"1006;");
+        }
+        long.extend_from_slice(b"1006l\x1b[?1005l");
+        let mut reporting = MouseReporting::default();
+        assert_eq!(reporting.read(&long, Reading::Live), Vec::new());
+        assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::X10);
         // The sequences that leave every terminal where the session is write nothing.
         for output in [
             &b"\x1b[?1006h"[..],
@@ -879,7 +908,7 @@ mod tests {
             reporting.read(b"6lcd\x1b[?1000h", Reading::Live),
             vec![Follow {
                 at: 2,
-                bytes: restore_1005.clone()
+                encoding: 1005
             }]
         );
         // A screen drawn for the terminal and one this command drew write nothing after them.
