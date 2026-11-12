@@ -75,15 +75,15 @@ final class LinkTapTests: HarnessTestCase {
         }
     }
 
-    /// The room the conversation has on the page.
-    private func pane() -> CGRect {
+    /// The room the conversation has on the page, how far it is scrolled and how far it can be.
+    private func pane() -> (room: CGRect, top: CGFloat, most: CGFloat) {
         for part in recordText("TAPLINKS").dropFirst("TAPLINKS".count).components(separatedBy: " ; ") {
             let fields = part.split(separator: " ")
-            guard fields.count == 5, fields[0] == "P" else { continue }
-            let box = floats(fields[1...4])
-            if box.count == 4 { return CGRect(x: box[0], y: box[1], width: box[2] - box[0], height: box[3] - box[1]) }
+            guard fields.count == 7, fields[0] == "P" else { continue }
+            let box = floats(fields[1...6])
+            if box.count == 6 { return (CGRect(x: box[0], y: box[1], width: box[2] - box[0], height: box[3] - box[1]), box[4], box[5]) }
         }
-        return .zero
+        return (.zero, 0, 0)
     }
 
     /// The addresses the scripted host has opened, in order.
@@ -203,8 +203,9 @@ final class LinkTapTests: HarnessTestCase {
             let screenY = (current.words.first?.midY ?? 0) + offset(of: current).dy
             let distance = screenY - app.windows.firstMatch.frame.height * 0.45
             if abs(distance) < 80 { return current }
-            // A drag from the pane's empty left edge, which no link's area reaches, moves the content with the finger.
-            let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.04, dy: 0.5))
+            // A drag from the middle of the pane moves the content with the finger; a drag that starts on a link scrolls too.
+            let room = pane().room
+            let start = screenPoint(CGPoint(x: room.midX, y: room.midY), offset(of: current))
             let end = start.withOffset(CGVector(dx: 0, dy: -max(min(distance, 300), -300)))
             start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
             Thread.sleep(forTimeInterval: 1.0)
@@ -268,7 +269,7 @@ final class LinkTapTests: HarnessTestCase {
 
         // One line away from every link, on the conversation.
         let all = links()
-        let room = pane()
+        let room = pane().room
         let shiftNow = offset(of: link("docs"))
         var away: CGPoint?
         var y = room.minY + 12
@@ -288,7 +289,10 @@ final class LinkTapTests: HarnessTestCase {
         let dragged = scroll(to: "table-2")
         let draggedShift = offset(of: dragged)
         let draggedWords = dragged.words[0]
-        let result = drag("\(named): a drag that scrolls, started on a link", from: CGPoint(x: draggedWords.midX, y: draggedWords.midY), by: CGVector(dx: 0, dy: -180), shift: draggedShift)
+        // Toward the end of the conversation if it has room that way, and toward its start if not.
+        let place = pane()
+        let by: CGFloat = place.top + 180 <= place.most ? -180 : 180
+        let result = drag("\(named): a drag that scrolls, started on a link", from: CGPoint(x: draggedWords.midX, y: draggedWords.midY), by: CGVector(dx: 0, dy: by), shift: draggedShift)
         XCTAssertTrue(result.events.contains { $0.type == "pointercancel" }, "\(result.label): no pointercancel: \(result.events.map(\.type))")
         XCTAssertFalse(result.events.contains { $0.type == "click" }, "\(result.label): a click came")
         XCTAssertTrue(result.opened.isEmpty, "\(result.label): opened \(result.opened)")
