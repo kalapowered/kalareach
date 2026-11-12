@@ -2199,6 +2199,10 @@ struct ConsoleMouse {
     speller: crate::mouse::MouseSpeller,
     /// Which of the output events are a restoration.
     restoration: crate::mouse::Restoration,
+    /// Whether the first delivery of the subscription is output that has yet to be read: it is the
+    /// screen the session drew for this terminal, and only an output event that is decoded and read
+    /// uses it up.
+    awaiting_first: bool,
     /// Whether the console has been asked to report the mouse.
     given: bool,
 }
@@ -2229,9 +2233,16 @@ impl ConsoleMouse {
         let _ = self.shown(output, terminal, may_type, crate::mouse::Reading::Painted);
     }
 
+    /// A subscription has delivered its first notification, which is output or something else: a
+    /// stream that begins with something else, a projected one, has no screen of output to read.
+    fn first_delivery_is(&mut self, output: bool) {
+        self.awaiting_first = output;
+    }
+
     /// How an output event of the session is read: as part of a restoration, or as what the
     /// application wrote.
-    fn reading_of(&mut self, first: bool, cursor: u64, length: usize) -> crate::mouse::Reading {
+    fn reading_of(&mut self, cursor: u64, length: usize) -> crate::mouse::Reading {
+        let first = std::mem::take(&mut self.awaiting_first);
         self.restoration.reading(first, cursor, length)
     }
 
@@ -2529,6 +2540,13 @@ async fn drive(
                         {
                             window.streamed();
                         }
+                        // The same delivery is the screen the session drew for this terminal. A
+                        // payload that cannot be decoded below is not drawn and does not use that
+                        // up: the next output that decodes is the screen.
+                        if heard == Heard::First {
+                            console_mouse
+                                .first_delivery_is(notification.event_type.as_str() == "session.output");
+                        }
                         if notification.event_type.as_str() == "session.output"
                             && let Ok(event) = notification
                                 .payload
@@ -2546,11 +2564,8 @@ async fn drive(
                             // The console is given the mouse before it is shown that the
                             // application asked for it, so that nothing it is shown can be
                             // answered by a mouse the console still kept.
-                            let reading = console_mouse.reading_of(
-                                heard == Heard::First,
-                                event.cursor.get(),
-                                event.bytes.as_slice().len(),
-                            );
+                            let reading = console_mouse
+                                .reading_of(event.cursor.get(), event.bytes.as_slice().len());
                             let follows = console_mouse.shown(
                                 event.bytes.as_slice(),
                                 terminal,
@@ -3721,6 +3736,32 @@ mod tests {
                     .expect("the loop reads the wire");
             }
 
+            /// The session says that the stream does not begin where the terminal asked it to, as the
+            /// `sequence`th thing it says.
+            pub fn says_gap(&self, sequence: u64) {
+                self.answers
+                    .send(ControlFrame::Notification(Notification {
+                        stream_id: StreamId::new("session").expect("a stream"),
+                        sequence: EventSequence::new(sequence),
+                        event_type: EventType::new("session.gap").expect("an event type"),
+                        payload: ParamsValue::empty(),
+                    }))
+                    .expect("the loop reads the wire");
+            }
+
+            /// The session says a batch of output on its stream, the `sequence`th, that this build
+            /// cannot decode.
+            pub fn says_output_it_cannot_decode(&self, sequence: u64) {
+                self.answers
+                    .send(ControlFrame::Notification(Notification {
+                        stream_id: StreamId::new("session").expect("a stream"),
+                        sequence: EventSequence::new(sequence),
+                        event_type: EventType::new("session.output").expect("an event type"),
+                        payload: ParamsValue::empty(),
+                    }))
+                    .expect("the loop reads the wire");
+            }
+
             /// The session says its view of it is no longer continuous, as the `sequence`th thing
             /// it says: the marker a terminal answers by asking for a new subscription.
             pub fn says_resync(&self, sequence: u64) {
@@ -3810,12 +3851,13 @@ mod tests {
             }
         }
 
-        /// How the attachment ended, what it said after the terminal was the person's again, and
-        /// every frame it sent.
+        /// How the attachment ended, what it said after the terminal was the person's again, every
+        /// frame it sent, and every byte it wrote to the terminal.
         pub struct Ran {
             pub outcome: AttachOutcome,
             pub said: Vec<kr_client::shown::Shown>,
             pub sent: Vec<ControlFrame>,
+            pub written: Vec<u8>,
         }
 
         /// Runs the loop with a lease held and a console that will spell its keys, and `case` for
@@ -3936,7 +3978,9 @@ mod tests {
                     None,
                 )
             };
-            let output = Arc::new(device);
+            // What the loop writes to the terminal is kept for the case to read.
+            let written_to = tempfile::tempfile().expect("a file for what the loop writes");
+            let output = Arc::new(written_to.try_clone().expect("a duplicate"));
             let attaching = Attaching {
                 session_id: SessionId::new(Uuid::from_bytes([1; 16])),
                 environment_id: EnvironmentId::new(Uuid::from_bytes([2; 16])),
@@ -3997,6 +4041,14 @@ mod tests {
             drop(keep_open);
             drop(keep_sized);
             let sent = log.lock().expect("the log is not poisoned").clone();
+            let written = {
+                use std::io::{Read, Seek};
+                let mut file = written_to;
+                let mut written = Vec::new();
+                file.rewind().expect("the start of what was written");
+                file.read_to_end(&mut written).expect("what was written");
+                written
+            };
             Ran {
                 outcome,
                 said: super::super::after_the_reader_stops(
@@ -4005,6 +4057,7 @@ mod tests {
                     &mut input,
                 ),
                 sent,
+                written,
             }
         }
     }
@@ -4512,6 +4565,93 @@ mod tests {
             CliError::Refused(refusal(ErrorCode::InputIncompatible, Shown::said(""))).exit_code()
         );
         assert!(outcome.detail().as_str().contains("--no-probe"));
+    }
+
+    /// Bytes as a case reads them in a failure.
+    fn shown(bytes: &[u8]) -> String {
+        bytes.escape_ascii().to_string()
+    }
+
+    /// What a terminal is written after output depends on whether the output is the screen the
+    /// session drew for it or what the application wrote: the first delivery of a subscription is
+    /// that screen, which a terminal is drawn as it is, and the output after it is the application's
+    /// own, after which a terminal that returns the default at a reset of either encoding is put in
+    /// the encoding the session holds. A gap notice is not a delivery of the screen, and a new
+    /// subscription begins a new one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_first_delivery_of_a_subscription_is_read_as_a_restoration_and_later_output_as_live()
+     {
+        const SCREEN: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1005l";
+        let follow = crate::mouse::Follow {
+            at: 0,
+            encoding: 1006,
+        }
+        .bytes();
+
+        // The same bytes as the first delivery and as the second.
+        let ran = wire::run_switched(true, true, |case| async move {
+            case.says_output_bytes(0, SCREEN);
+            case.says_output_bytes(1, SCREEN);
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            shown(&ran.written),
+            shown(&[SCREEN, SCREEN, &follow].concat())
+        );
+
+        // A gap notice before the screen is not the screen.
+        let ran = wire::run_switched(true, true, |case| async move {
+            case.says_gap(0);
+            case.says_output_bytes(1, SCREEN);
+            case.says_output_bytes(2, SCREEN);
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            shown(&ran.written),
+            shown(&[SCREEN, SCREEN, &follow].concat())
+        );
+
+        // A new subscription begins with a screen of its own.
+        let ran = wire::run_switched(true, true, |case| async move {
+            case.says_output_bytes(0, SCREEN);
+            case.says_output_bytes(1, SCREEN);
+            case.says_resync(2);
+            case.says_output_bytes(0, SCREEN);
+            case.says_output_bytes(1, SCREEN);
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            shown(&ran.written),
+            shown(&[SCREEN, SCREEN, &follow, SCREEN, SCREEN, &follow].concat())
+        );
+    }
+
+    /// A first delivery that cannot be decoded is not drawn and does not use up the first delivery:
+    /// the next one that decodes is still the screen the session drew for the terminal.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delivery_that_cannot_be_decoded_does_not_use_up_the_first() {
+        const SCREEN: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1005l";
+        let follow = crate::mouse::Follow {
+            at: 0,
+            encoding: 1006,
+        }
+        .bytes();
+        let ran = wire::run_switched(true, true, |case| async move {
+            case.says_output_it_cannot_decode(0);
+            case.says_output_bytes(1, SCREEN);
+            case.says_output_bytes(2, SCREEN);
+            case.closes();
+        })
+        .await;
+        assert_eq!(
+            shown(&ran.written),
+            shown(&[SCREEN, SCREEN, &follow].concat())
+        );
     }
 
     /// The report of a click that is sent behind console keys the session refuses is no more read
