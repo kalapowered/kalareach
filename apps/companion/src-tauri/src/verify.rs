@@ -362,8 +362,8 @@ pub mod hello {
 
     impl Ceremony for WindowsHello {
         fn kind(&self) -> CeremonyKind {
-            let availability =
-                UserConsentVerifier::CheckAvailabilityAsync().and_then(|operation| operation.get());
+            let availability = UserConsentVerifier::CheckAvailabilityAsync()
+                .and_then(|operation| operation.join());
             match availability {
                 Ok(UserConsentVerifierAvailability::Available) => CeremonyKind::WindowsHello,
                 _ => CeremonyKind::None,

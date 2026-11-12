@@ -38,7 +38,7 @@
   "dependencies": {
     "@kalareach/plugin-sdk": "workspace:*",
     "@kalareach/protocol": "workspace:*",
-    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/api": "2.12.4",
     "@tauri-apps/plugin-dialog": "2.7.3",
     "marked": "18.0.13",
     "react": "19.3.0",

@@ -93,7 +93,7 @@ impl CandidateRoom for NoRoom {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_ceremony_offered_is_the_one_windows_reports() {
     let reported = UserConsentVerifier::CheckAvailabilityAsync()
-        .and_then(|operation| operation.get())
+        .and_then(|operation| operation.join())
         .expect("Windows answers");
     println!("== Windows reports {}", availability_name(reported));
 

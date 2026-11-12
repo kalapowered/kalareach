@@ -244,11 +244,11 @@ subtle = "=2.6.1"
 sysctl = "=0.6.0"
 sysinfo = "=0.33.1"
 # The windowing library Tauri draws with, for a test that needs a window of its own.
-tao = { version = "=0.35.3", default-features = false }
+tao = { version = "=0.37.2", default-features = false }
 # `custom-protocol` is what makes a built application serve its interface from the bundle instead
 # of from a development server. It is not implied by an optimised profile.
-tauri = { version = "=2.11.5", default-features = false, features = ["common-controls-v6", "wry"] }
-tauri-build = { version = "=2.6.3", default-features = false }
+tauri = { version = "=2.12.5", default-features = false, features = ["common-controls-v6", "wry"] }
+tauri-build = { version = "=2.7.4", default-features = false }
 # The companion reads an invitation from the pasteboard in native code, so the text never passes
 # through the page.
 tauri-plugin-clipboard-manager = "=2.3.3"
@@ -298,8 +298,8 @@ wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "9a901511
 widestring = "=1.2.0"
 # Windows Hello for the companion's owner confirmations: the consent verifier and its window
 # interop, and the asynchronous operation it answers with. Both versions are already in the lock.
-windows = { version = "=0.61.3", default-features = false }
-windows-future = { version = "=0.2.1", default-features = false }
+windows = { version = "=0.62.2", default-features = false }
+windows-future = { version = "=0.3.2", default-features = false }
 windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 wit-parser = "=0.259.0"
 zeroize = { version = "=1.9.0", features = ["derive"] }
