@@ -375,6 +375,9 @@ pub enum AncestorFault<'a> {
     Volume(&'a str),
     /// The folder could not be opened or read: the platform's error.
     Unreadable(&'a str),
+    /// The folder's volume did not answer: the query for what the volume is failed, or the root of
+    /// the volume is not there. The platform's error.
+    VolumeUnanswered(&'a str),
     /// The owner or the list is refused: the check's own sentence, which names the identity and the
     /// rights.
     List(&'a str),
@@ -504,6 +507,15 @@ pub fn ancestor_refusal(
         AncestorFault::NotAFolder => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder. The system's default places are folders. {changes} Correct the path, then run the setup program again. {keep}"
         ),
+        AncestorFault::VolumeUnanswered(error) => {
+            let kept = match tree {
+                Tree::Program => "Do not remove the program directory. ",
+                Tree::Data => "",
+            };
+            format!(
+                "{folder} is a folder above the boundary's {below}. It is refused because its volume did not answer ({error}). The installation asks a volume what it is before it reads anything on it, and a drive that is being removed, a disk that has failed or a network share that has gone does not answer. {changes} {kept}Check that the volume is there and answers, then run the setup program again."
+            )
+        }
         AncestorFault::Unreadable(error) => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} Close the program that holds it open or correct who may open it, then run the setup program again. {keep}"
         ),
