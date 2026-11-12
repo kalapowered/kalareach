@@ -50,7 +50,13 @@ pub fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let paths = Paths::system();
+    let paths = match Paths::system() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("kr-boundary-setup: {error}");
+            return ExitCode::from(1);
+        }
+    };
     let outcome = match command.as_str() {
         "install" | "repair" => {
             let repair = command == "repair";

@@ -239,7 +239,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
 fn serve() -> Result<(), String> {
     let stop = Stop::new().map_err(|error| error.to_string())?;
     let _ = STOP.set(Arc::clone(&stop));
-    let paths = Paths::system();
+    let paths = Paths::system().map_err(|error| error.to_string())?;
     let manifest = Manifest::load(&paths.manifest).map_err(|error| error.to_string())?;
     for privilege in [
         "SeTcbPrivilege",
@@ -521,7 +521,7 @@ mod tests {
     fn state_with_first_cycle_ending(deadline: Instant) -> State {
         State::with_first_cycle(
             Manifest::begin(),
-            Paths::system(),
+            Paths::system().expect("the system's folders are read"),
             Stop::new().expect("an event is made"),
             deadline,
         )
