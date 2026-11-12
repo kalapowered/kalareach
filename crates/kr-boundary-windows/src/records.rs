@@ -175,6 +175,62 @@ pub fn remove_empty(data: &Path) -> Vec<String> {
     }
 }
 
+/// Whether anything is at the path: a link that points nowhere and an entry that cannot be read
+/// count, because the look follows no link and only an answer of not found says that nothing is
+/// there. It is a look for a refusal's reason or for a decision to leave something alone, and no
+/// deletion follows it.
+#[must_use]
+pub fn entry_exists(path: &Path) -> bool {
+    !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+/// Which of the data directory's `journal` and `run` directories the removal's inspection opened
+/// and approved. A directory that is not marked was not there when it looked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    /// The journal's directory.
+    pub journal: bool,
+    /// The directory of the invocations' private roots.
+    pub run: bool,
+}
+
+/// Deletes the journal's files and the empty `run` and `journal` directories, in the directories
+/// that the inspection approved and in no other. A directory that it did not see and that is there
+/// now is left whole and named in the result: nothing opened it, so nothing in it was read.
+/// Returns each thing that stayed, with the reason; nothing when all is done.
+pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<String> {
+    let mut stayed = Vec::new();
+    if seen.journal
+        && let Ok(entries) = fs::read_dir(journal)
+    {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|text| text.to_str()) == Some("journal") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    for (directory, approved) in [(run, seen.run), (journal, seen.journal)] {
+        if !approved {
+            if entry_exists(directory) {
+                stayed.push(format!(
+                    "{} was not there when the removal looked for it, and something is there now, so it was not removed",
+                    directory.display()
+                ));
+            }
+            continue;
+        }
+        match fs::remove_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => stayed.push(format!(
+                "removing {}, which still holds an unfinished invocation ({error})",
+                directory.display()
+            )),
+        }
+    }
+    stayed
+}
+
 /// A listing's error as the failure to say that no replacement can be ruled out.
 fn unlisted(error: &io::Error) -> io::Error {
     io::Error::other(format!(

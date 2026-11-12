@@ -200,3 +200,112 @@ fn a_link_above_the_data_parent_is_refused() {
     let _ = std::fs::remove_dir_all(&target);
     let _ = std::fs::remove_dir_all(&container);
 }
+
+fn data_parent_with_paths() -> (PathBuf, Paths) {
+    let folder = inherited_folder();
+    parent_of(&folder);
+    let paths = paths_at(&folder, &folder);
+    (folder, paths)
+}
+
+/// A link that points nowhere at the program directory's name is a link, and gets the link's own
+/// remedy. The look that follows a link found nothing there, so the check let it pass, and the
+/// removal then said that the directory "was not there when the removal looked for it" and kept its
+/// records, every time. Now the check refuses it, before anything is changed.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_link_that_points_nowhere_at_the_program_directorys_name_gets_the_links_own_remedy() {
+    let (folder, paths) = data_parent_with_paths();
+    installed_data_directory(&paths);
+    let target = inherited_folder();
+    junction(&paths.program, &target);
+    std::fs::remove_dir_all(&target).unwrap();
+    assert!(!paths.program.exists(), "the link points nowhere");
+    let text = install::remove(&paths, false)
+        .expect_err("a link at the program directory's name")
+        .to_string();
+    assert!(text.contains("it is a link"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Remove the link {} itself",
+            paths.program.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("not what it points to"), "{text}");
+    assert!(
+        !text.contains("was not there when the removal looked"),
+        "{text}"
+    );
+    assert!(paths.manifest.exists(), "nothing was removed");
+    std::fs::remove_dir(&paths.program).unwrap();
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A link inside the program directory is removed as the link itself and not what it leads to.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_link_in_the_program_directory_is_to_be_removed_as_the_link_itself() {
+    use kr_boundary_windows::win::fresh;
+    use kr_boundary_windows::win::sd::{Principals, SdKind};
+    let (folder, paths) = data_parent_with_paths();
+    fresh::directory_all(
+        &paths.program,
+        SdKind::AdminDir,
+        &Principals {
+            users_may_read: true,
+            ..Principals::default()
+        },
+    )
+    .unwrap();
+    let target = inherited_folder();
+    let link = paths.program.join("linked");
+    junction(&link, &target);
+    let text = install::remove(&paths, true)
+        .expect_err("a link in the program directory")
+        .to_string();
+    assert!(text.contains("it is a link"), "{text}");
+    assert!(
+        text.contains(&format!("Remove the link {} itself", link.display())),
+        "{text}"
+    );
+    assert!(text.contains("not what it points to"), "{text}");
+    std::fs::remove_dir(&link).unwrap();
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A `journal` and a `run` directory that were absent at the removal's inspection and are there when
+/// it comes to delete are not removed: the removal says that they were not there when it looked, and
+/// keeps its records. They are empty here, so that the check for unfinished work passes and the old
+/// test for their existence would have removed both. The guest must hold no installation: the removal
+/// reaches the service, the boot marker and the policy steps, which do nothing on a clean machine.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_journal_and_a_run_directory_made_after_the_inspection_are_left() {
+    let (folder, paths) = data_parent_with_paths();
+    installed_data_directory(&paths);
+    std::fs::remove_dir(&paths.journal).unwrap();
+    std::fs::remove_dir(&paths.run).unwrap();
+    let (journal, run) = (paths.journal.clone(), paths.run.clone());
+    install::testing::after_the_removal_inspects_the_data_directory(move || {
+        std::fs::create_dir(&journal).unwrap();
+        std::fs::create_dir(&run).unwrap();
+    });
+    let text = install::remove(&paths, false)
+        .expect_err("what appeared was not inspected")
+        .to_string();
+    for directory in [&paths.journal, &paths.run] {
+        assert!(
+            text.contains(&format!(
+                "{} was not there when the removal looked for it",
+                directory.display()
+            )),
+            "{text}"
+        );
+        assert!(directory.exists(), "{} was removed", directory.display());
+    }
+    assert!(text.contains("its records are kept"), "{text}");
+    assert!(paths.manifest.exists());
+    let _ = std::fs::remove_dir_all(&folder);
+}
