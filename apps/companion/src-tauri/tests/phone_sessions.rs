@@ -3177,6 +3177,10 @@ async fn kr_req_19_08_a_left_link_keeps_its_place_until_its_mutation_answers() {
     adopted.stop().await;
 }
 
+/// How long a dial that is no longer wanted may take to stop: well inside the 20 seconds a dial is
+/// otherwise given, which is what tells stopping at once from stopping at its own limit.
+const STOPS_AT_ONCE: Duration = Duration::from_secs(10);
+
 /// KR-REQ-19.08: a dial that another opening or a leave has made no longer wanted stops, though its
 /// connection is still being made, and gives its place back at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -3202,7 +3206,7 @@ async fn kr_req_19_08_a_dial_that_is_superseded_or_left_stops_and_gives_its_plac
     // still held, and its place is back.
     let second = opening_call(companion, session, None, "second");
     held(&control, 2).await;
-    let superseded = tokio::time::timeout(WATCHDOG, first)
+    let superseded = tokio::time::timeout(STOPS_AT_ONCE, first)
         .await
         .expect("the superseded dial stops")
         .expect("the call ran")
@@ -3216,7 +3220,7 @@ async fn kr_req_19_08_a_dial_that_is_superseded_or_left_stops_and_gives_its_plac
 
     // A leave stops the second the same way.
     leave(companion, session, "second");
-    let left = tokio::time::timeout(WATCHDOG, second)
+    let left = tokio::time::timeout(STOPS_AT_ONCE, second)
         .await
         .expect("the dial that was left stops")
         .expect("the call ran")
@@ -3453,13 +3457,18 @@ async fn kr_req_19_08_the_main_link_reconnects_while_other_dials_hold_every_othe
     // Every place the other kinds may take is held by a dial that is still being made.
     control.hold();
     let mut fillers = Vec::new();
-    while places.held_on(host) < companion_tauri::places::HOST_CONNECTIONS {
+    for _ in 1..companion_tauri::places::HOST_CONNECTIONS {
         let (device, paired) = (Arc::clone(&device), paired.clone());
         fillers.push(tokio::spawn(async move {
             Connection::paired(&device, &paired).await
         }));
         held(&control, fillers.len()).await;
     }
+    assert_eq!(
+        places.held_on(host),
+        companion_tauri::places::HOST_CONNECTIONS,
+        "every place is held"
+    );
     control.stop_holding();
 
     // The main connection is lost; its place goes back, and the phone reconnects on it.

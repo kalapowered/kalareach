@@ -565,7 +565,7 @@ mod tests {
             let places = Arc::clone(&places);
             async move {
                 places
-                    .take(host(1), Kind::Other, Duration::from_secs(300))
+                    .take(host(1), Kind::Other, Duration::from_secs(60))
                     .await
                     .is_some()
             }
