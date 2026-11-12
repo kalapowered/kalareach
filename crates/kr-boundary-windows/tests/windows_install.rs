@@ -5134,89 +5134,6 @@ fn try_client_without(
     })
 }
 
-/// A connection that keeps 200 `Status` requests asked and unanswered and reads the answers one by one,
-/// asking one more for each. The pipe then holds a request and has room for an answer at every moment,
-/// so no read and no write of the thread that serves the connection ever waits, and a thread that only
-/// its waits told about a stop would never learn of it.
-#[cfg(feature = "testing")]
-struct StatusStream {
-    answers: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(feature = "testing")]
-impl StatusStream {
-    fn start(mut connection: kr_boundary_windows::win::pipe::Connection) -> StatusStream {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        let answers = std::sync::Arc::new(AtomicU64::new(0));
-        let done = std::sync::Arc::new(AtomicBool::new(false));
-        let thread = std::thread::spawn({
-            let answers = std::sync::Arc::clone(&answers);
-            let done = std::sync::Arc::clone(&done);
-            move || {
-                let within_five_seconds =
-                    || Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-                for _ in 0..200 {
-                    connection.set_deadline(within_five_seconds());
-                    if kr_boundary_windows::frame::write(&mut connection, &Request::Status {})
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                while !done.load(Ordering::SeqCst) {
-                    connection.set_deadline(within_five_seconds());
-                    if kr_boundary_windows::frame::read::<_, Response>(&mut connection).is_err() {
-                        return;
-                    }
-                    answers.fetch_add(1, Ordering::SeqCst);
-                    if kr_boundary_windows::frame::write(&mut connection, &Request::Status {})
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        });
-        StatusStream {
-            answers,
-            done,
-            thread: Some(thread),
-        }
-    }
-
-    fn answers(&self) -> u64 {
-        self.answers.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Waits until `count` answers have been read, for at most `seconds`.
-    fn reaches(&self, count: u64, seconds: u64) -> Result<(), String> {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
-        while self.answers() < count {
-            if std::time::Instant::now() >= until {
-                return Err(format!(
-                    "{} answers in {seconds} seconds, not {count}",
-                    self.answers()
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "testing")]
-impl Drop for StatusStream {
-    fn drop(&mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            // Every read and write of the thread has a deadline of five seconds.
-            let _ = thread.join();
-        }
-    }
-}
-
 /// Puts the listener's seam for failed refills back to none however the case ends: the counter is
 /// shared by the whole process.
 #[cfg(feature = "testing")]
@@ -5227,35 +5144,6 @@ impl Drop for RefillsRestored {
     fn drop(&mut self) {
         kr_boundary_windows::win::pipe::testing::fail_refills(0);
     }
-}
-
-/// A client that keeps asking for the status and reading the answers while the stop comes does not keep
-/// the service from stopping: every transfer of the thread that serves it finishes at once, so the
-/// stop must be looked at by the read, the write and the loop, and not only by the waits.
-#[cfg(feature = "testing")]
-#[test]
-#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn a_client_that_keeps_sending_and_reading_does_not_hold_the_service_at_a_stop() {
-    require_clean_machine();
-    if needs_the_system() {
-        return;
-    }
-    let mut served = serve_in_process();
-    let mut person = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
-    say_hello(&mut person);
-    let stream = StatusStream::start(person);
-    stream
-        .reaches(3000, 60)
-        .expect("the traffic flows before the stop");
-    let before = stream.answers();
-    let ended = served.stops_within(20);
-    drop(stream);
-    assert_eq!(
-        ended.unwrap_or_else(|failure| panic!(
-            "the service did not end with a client that keeps asking and reading ({before} answers before the stop): {failure}"
-        )),
-        Ok(())
-    );
 }
 
 /// A client that has sent part of a frame when the stop comes does not keep the service from stopping.
@@ -5435,35 +5323,6 @@ fn a_proof_that_is_at_work_ends_at_the_stop_with_a_failure_that_says_so() {
     );
 }
 
-/// The service stops inside the installer's wait while a client keeps asking for the status and
-/// reading the answers: the service manager's stop reaches the loop, and the process ends.
-#[cfg(feature = "testing")]
-#[test]
-#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
-fn the_service_stops_inside_the_installers_wait_with_a_client_that_keeps_asking() {
-    use kr_boundary_windows::win::pipe;
-    let case = Case::new();
-    let (code, output) = case.install();
-    assert_eq!(code, 0, "{output}");
-    let manager = service::manager().unwrap();
-    let broker = manager.open(SERVICE).unwrap().unwrap();
-    let pid = broker.status().unwrap().pid;
-    let mut asking = pipe::connect(pid).expect("the client opens the broker's pipe");
-    say_hello(&mut asking);
-    let stream = StatusStream::start(asking);
-    stream
-        .reaches(2000, 60)
-        .expect("the traffic flows before the stop");
-    broker.stop().unwrap();
-    let ended = broker.wait_for(true, std::time::Duration::from_secs(60));
-    drop(stream);
-    assert!(
-        ended.is_ok(),
-        "the service did not stop inside the installer's wait of sixty seconds: {ended:?}"
-    );
-    drop(case);
-}
-
 /// Eight handles of a person that are kept open with nothing sent do not use up the pipe: the
 /// connections are closed at their bound and the server ends are disconnected with them, so an
 /// administrator's open succeeds once the bound has passed, and when the service stops its pipe's name
@@ -5560,4 +5419,282 @@ fn a_thousand_and_one_failed_refills_do_not_end_the_loop_and_it_still_serves() {
         "the loop did not serve a client after a thousand and one failed refills: {answer:?}"
     );
     assert_eq!(ended.expect("the service ends"), Ok(()));
+}
+
+/// The persons' pipe's name, as the clients open it.
+#[cfg(feature = "testing")]
+fn persons_pipe_name() -> &'static str {
+    kr_boundary_windows::win::pipe::NAME
+}
+
+/// A client of the loop that is opened with the platform's own calls, so that one thread can write
+/// while another reads: the product's `Connection` takes `&mut self` for both.
+#[cfg(feature = "testing")]
+struct RawClient(std::sync::Arc<ffi::Handle>);
+
+#[cfg(feature = "testing")]
+impl RawClient {
+    /// Opens the named pipe as a caller whose token has the named identifiers deny-only, asking for
+    /// the rights of a client, and waits for the pipe to exist for up to thirty seconds.
+    fn open(name: &str, disabled: &[&str]) -> RawClient {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+            SECURITY_SQOS_PRESENT,
+        };
+        let name = ffi::wide(name);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let opened = with_token_without(disabled, || {
+                // SAFETY: the name is NUL-terminated; the result is checked.
+                let opened = unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        kr_boundary_windows::pipe_access::CLIENT,
+                        0,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                        std::ptr::null_mut(),
+                    )
+                };
+                (opened != INVALID_HANDLE_VALUE)
+                    .then(|| ffi::Handle::new(opened, "the loop's pipe").unwrap())
+            });
+            if let Some(handle) = opened {
+                return RawClient(std::sync::Arc::new(handle));
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the loop's pipe could not be opened in thirty seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// One overlapped transfer on the handle, waited for at most five seconds. Returns what was
+/// transferred, or none when it failed or did not end in time; a transfer that did not end after its
+/// cancel keeps its storage for the life of the process.
+#[cfg(feature = "testing")]
+fn raw_transfer(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    write: bool,
+    mut buffer: Vec<u8>,
+) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, WAIT_OBJECT_0};
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    let event = ffi::Handle::new(
+        // SAFETY: an event with no name.
+        unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) },
+        "an event",
+    )
+    .ok()?;
+    // SAFETY: a zeroed record is a valid start.
+    let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+    overlapped.hEvent = event.raw();
+    let length = buffer.len() as u32;
+    // SAFETY: the buffer and the record live until the transfer ends, or for the life of the process.
+    let started = unsafe {
+        if write {
+            WriteFile(
+                handle,
+                buffer.as_ptr(),
+                length,
+                std::ptr::null_mut(),
+                &raw mut *overlapped,
+            )
+        } else {
+            ReadFile(
+                handle,
+                buffer.as_mut_ptr(),
+                length,
+                std::ptr::null_mut(),
+                &raw mut *overlapped,
+            )
+        }
+    };
+    // SAFETY: reads the calling thread's last error.
+    if started == 0 && unsafe { GetLastError() } != ERROR_IO_PENDING {
+        return None;
+    }
+    // SAFETY: the event is open.
+    if unsafe { WaitForSingleObject(event.raw(), 5000) } != WAIT_OBJECT_0 {
+        // SAFETY: the record is the one of the pending transfer.
+        unsafe {
+            CancelIoEx(handle, &raw mut *overlapped);
+        }
+        // SAFETY: the event is open.
+        if unsafe { WaitForSingleObject(event.raw(), 5000) } != WAIT_OBJECT_0 {
+            std::mem::forget((buffer, overlapped, event));
+        }
+        return None;
+    }
+    let mut count = 0_u32;
+    // SAFETY: the transfer has completed.
+    if unsafe { GetOverlappedResult(handle, &raw mut *overlapped, &raw mut count, 0) } == 0 {
+        return None;
+    }
+    buffer.truncate(count as usize);
+    Some(buffer)
+}
+
+/// A connection that says hello and then keeps writing `Status` requests as fast as the pipe takes
+/// them on one thread while another thread reads the answers as fast as they come. The pipe then
+/// holds a request and has room for an answer at every moment, so no read and no write of the thread
+/// that serves the connection ever waits, and a thread that only its waits told about a stop would
+/// never learn of it.
+#[cfg(feature = "testing")]
+struct RawStream {
+    handle: std::sync::Arc<ffi::Handle>,
+    bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "testing")]
+impl RawStream {
+    fn start(client: &RawClient) -> RawStream {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let bytes_read = std::sync::Arc::new(AtomicU64::new(0));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let mut first = Vec::new();
+        kr_boundary_windows::frame::write(
+            &mut first,
+            &Request::Hello {
+                version: kr_boundary_windows::frame::VERSION,
+            },
+        )
+        .unwrap();
+        let mut block = Vec::new();
+        for _ in 0..150 {
+            kr_boundary_windows::frame::write(&mut block, &Request::Status {}).unwrap();
+        }
+        first.extend_from_slice(&block);
+        let writer = std::thread::spawn({
+            let handle = std::sync::Arc::clone(&client.0);
+            let done = std::sync::Arc::clone(&done);
+            move || {
+                let mut next = first;
+                while !done.load(Ordering::SeqCst) {
+                    if raw_transfer(handle.raw(), true, next).is_none() {
+                        return;
+                    }
+                    next = block.clone();
+                }
+            }
+        });
+        let reader = std::thread::spawn({
+            let handle = std::sync::Arc::clone(&client.0);
+            let done = std::sync::Arc::clone(&done);
+            let bytes_read = std::sync::Arc::clone(&bytes_read);
+            move || {
+                while !done.load(Ordering::SeqCst) {
+                    match raw_transfer(handle.raw(), false, vec![0; 64 * 1024]) {
+                        Some(read) if !read.is_empty() => {
+                            bytes_read.fetch_add(read.len() as u64, Ordering::SeqCst);
+                        }
+                        _ => return,
+                    }
+                }
+            }
+        });
+        RawStream {
+            handle: std::sync::Arc::clone(&client.0),
+            bytes_read,
+            done,
+            threads: vec![writer, reader],
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Waits until `count` bytes of answers have been read, for at most `seconds`.
+    fn reaches(&self, count: u64, seconds: u64) -> Result<(), String> {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        while self.bytes_read() < count {
+            if std::time::Instant::now() >= until {
+                return Err(format!(
+                    "{} bytes of answers in {seconds} seconds, not {count}",
+                    self.bytes_read()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for RawStream {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::IO::CancelIoEx;
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: the handle is open; this ends the transfers that wait, so that the threads end at
+        // once and not at their five-second bound.
+        unsafe {
+            CancelIoEx(self.handle.raw(), std::ptr::null());
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A client that keeps asking for the status and reading the answers while the stop comes does not keep
+/// the service from stopping: every transfer of the thread that serves it finishes at once, so the
+/// stop must be looked at by the read, the write and the loop, and not only by the waits.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_client_that_keeps_sending_and_reading_does_not_hold_the_service_at_a_stop() {
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let mut served = serve_in_process();
+    let client = RawClient::open(persons_pipe_name(), &[SYSTEM_SID, ADMINISTRATORS_SID]);
+    let stream = RawStream::start(&client);
+    stream
+        .reaches(200_000, 60)
+        .expect("the traffic flows before the stop");
+    let before = stream.bytes_read();
+    let ended = served.stops_within(20);
+    drop(stream);
+    assert_eq!(
+        ended.unwrap_or_else(|failure| panic!(
+            "the service did not end with a client that keeps asking and reading ({before} bytes of answers before the stop): {failure}"
+        )),
+        Ok(())
+    );
+}
+
+/// The service stops inside the installer's wait while a client keeps asking for the status and
+/// reading the answers: the service manager's stop reaches the loop, and the process ends.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+fn the_service_stops_inside_the_installers_wait_with_a_client_that_keeps_asking() {
+    let case = Case::new();
+    let (code, output) = case.install();
+    assert_eq!(code, 0, "{output}");
+    let manager = service::manager().unwrap();
+    let broker = manager.open(SERVICE).unwrap().unwrap();
+    let client = RawClient::open(persons_pipe_name(), &[]);
+    let stream = RawStream::start(&client);
+    stream
+        .reaches(200_000, 60)
+        .expect("the traffic flows before the stop");
+    broker.stop().unwrap();
+    let ended = broker.wait_for(true, std::time::Duration::from_secs(60));
+    drop(stream);
+    assert!(
+        ended.is_ok(),
+        "the service did not stop inside the installer's wait of sixty seconds: {ended:?}"
+    );
+    drop(case);
 }
