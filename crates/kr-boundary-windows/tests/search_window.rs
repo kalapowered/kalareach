@@ -5,7 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use kr_boundary_windows::window::{bound, may_ask_the_log, search_is_over};
+use kr_boundary_windows::window::{
+    QueryEnd, bound, may_ask_the_log, query_ends_the_search, search_is_over,
+};
 
 #[test]
 fn a_run_given_the_windows_end_has_it_as_its_deadline_and_says_so() {
@@ -86,5 +88,75 @@ fn the_log_is_asked_after_a_refusal_only_while_the_search_has_time_left() {
     assert!(
         !may_ask_the_log(end + second, end),
         "a refusal that returns after the end is the end of the search, and no event log error"
+    );
+}
+
+#[test]
+fn a_query_that_the_searchs_own_end_stopped_ends_the_search_whether_it_was_cut_or_never_started() {
+    // Cut at the deadline it was given, and that deadline was the window's end.
+    assert!(query_ends_the_search(QueryEnd::Cut {
+        by_the_deadline: true
+    }));
+    // The end passed between the test that allowed the query and the query, or before its program
+    // could start: the same end, and not the event log's failure.
+    assert!(query_ends_the_search(QueryEnd::DeadlinePassed));
+}
+
+#[test]
+fn a_query_that_failed_for_a_reason_of_its_own_or_ran_into_its_own_bound_does_not_end_the_search() {
+    assert!(!query_ends_the_search(QueryEnd::Cut {
+        by_the_deadline: false
+    }));
+    assert!(!query_ends_the_search(QueryEnd::Failed));
+}
+
+/// The query's own errors, as the proof's loop reads them: only an end that the search's own end
+/// caused is the search's end. The platform's error values are what the proof's loop is handed.
+#[cfg(windows)]
+#[test]
+fn each_error_of_a_query_of_the_log_is_told_apart_by_what_ended_it() {
+    use kr_boundary_windows::win::applocker::Error;
+    use kr_boundary_windows::win::launch::LaunchError;
+    let what = "the event log query";
+    assert_eq!(Error::DeadlinePassed.query_end(), QueryEnd::DeadlinePassed);
+    assert_eq!(
+        Error::Launch {
+            what,
+            source: LaunchError::DeadlinePassed
+        }
+        .query_end(),
+        QueryEnd::DeadlinePassed
+    );
+    assert_eq!(
+        Error::TimedOut {
+            what,
+            by_the_deadline: true
+        }
+        .query_end(),
+        QueryEnd::Cut {
+            by_the_deadline: true
+        }
+    );
+    assert_eq!(
+        Error::TimedOut {
+            what,
+            by_the_deadline: false
+        }
+        .query_end(),
+        QueryEnd::Cut {
+            by_the_deadline: false
+        }
+    );
+    assert_eq!(
+        Error::Launch {
+            what,
+            source: LaunchError::NotStarted(5)
+        }
+        .query_end(),
+        QueryEnd::Failed
+    );
+    assert_eq!(
+        Error::Unreadable("a bad answer".to_owned()).query_end(),
+        QueryEnd::Failed
     );
 }
