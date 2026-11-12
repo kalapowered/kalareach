@@ -135,6 +135,18 @@ pub mod testing {
     pub(super) fn take_skip() -> bool {
         SKIP_NEXT_CANCEL.swap(false, Ordering::SeqCst)
     }
+
+    static FAIL_NEXT_REFILL: AtomicBool = AtomicBool::new(false);
+
+    /// Makes the listener's next attempt to make a waiting instance fail, as if the platform had no
+    /// memory for it: the listener must serve the client in hand and try again.
+    pub fn fail_next_refill() {
+        FAIL_NEXT_REFILL.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn take_refill_failure() -> bool {
+        FAIL_NEXT_REFILL.swap(false, Ordering::SeqCst)
+    }
 }
 
 /// One transfer, in storage that the process keeps until the transfer ends: the platform writes the
@@ -489,6 +501,10 @@ impl Listener {
     /// Makes the instance that waits for the next client and confirms it. None when every instance
     /// the pipe may have is in use.
     fn refill(&self) -> Result<Option<Handle>> {
+        #[cfg(feature = "testing")]
+        if testing::take_refill_failure() {
+            return Err(error(8, "making the pipe"));
+        }
         match self.instance(false) {
             Ok(pipe) => {
                 self.confirm(&pipe)?;

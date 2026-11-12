@@ -130,6 +130,10 @@ fn setup(arguments: &[&str], answer: &str, environment: &[(&str, &str)]) -> (i32
 struct Case {
     name: String,
     person: Sid,
+    /// Set by a case whose correct end keeps rules of the application-control policy (an
+    /// administrator's own rule, or a policy that was there before): the cleanup check then leaves
+    /// the policy and the Application Identity service's state that goes with it out.
+    policy_stays: std::cell::Cell<bool>,
 }
 
 /// A case that installs, or that binds the broker's pipe, starts from a machine with no
@@ -139,13 +143,17 @@ struct Case {
 /// for what it shows: this fails first, with one text, so that the run is void and never a verdict
 /// on the product.
 fn require_clean_machine() {
-    let left = machine_problems(true);
+    let left = machine_problems(true, false);
     assert!(
         left.is_empty(),
         "the machine is not clean: {}",
         left.join(", ")
     );
 }
+
+/// The Application Identity service's state that the cases compare with: the state the run began
+/// with, and after a case that correctly ends with it changed, the state that case left.
+static RUN_START: std::sync::Mutex<Option<(bool, u32)>> = std::sync::Mutex::new(None);
 
 /// The Application Identity service's state, which a run begins with: whether it runs and how it
 /// starts.
@@ -165,10 +173,10 @@ fn appid_state() -> (bool, u32) {
 /// for deletion counts only when `strict`), the two accounts and their entries among the hidden
 /// accounts, the data directory and the folder above it, the program directory, the pipe's name,
 /// any rule of the application-control policy, and the Application Identity service in another
-/// state than the run began with.
-fn machine_problems(strict: bool) -> Vec<String> {
-    static RUN_START: std::sync::OnceLock<(bool, u32)> = std::sync::OnceLock::new();
-    let began = *RUN_START.get_or_init(appid_state);
+/// state than the run began with. Where `policy_stays`, the policy's rules and that service's state
+/// are left out, because the case's correct end keeps them.
+fn machine_problems(strict: bool, policy_stays: bool) -> Vec<String> {
+    let began = *RUN_START.lock().unwrap().get_or_insert_with(appid_state);
     let mut left = Vec::new();
     let service = service::manager().unwrap().open(SERVICE).unwrap();
     if service.is_some_and(|service| strict || !service.marked_for_deletion().unwrap()) {
@@ -201,11 +209,11 @@ fn machine_problems(strict: bool) -> Vec<String> {
     if std::fs::metadata(kr_boundary_windows::win::pipe::NAME).is_ok() {
         left.push("the broker's pipe".to_owned());
     }
-    if !channel().effective().unwrap().1.is_unconfigured() {
+    if !policy_stays && !channel().effective().unwrap().1.is_unconfigured() {
         left.push("rules of the application-control policy".to_owned());
     }
     let now = appid_state();
-    if now != began {
+    if !policy_stays && now != began {
         left.push(format!(
             "the Application Identity service (running {}, start type {}) is not as the run began (running {}, start type {})",
             now.0, now.1, began.0, began.1
@@ -226,7 +234,17 @@ impl Case {
             &uuid::Uuid::new_v4().simple().to_string()[..6]
         );
         let person = account::create(&name).expect("the person's account is made");
-        Case { name, person }
+        Case {
+            name,
+            person,
+            policy_stays: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Says that this case ends with rules of the policy still in force, as it should, so that its
+    /// cleanup does not count them as left by the removal.
+    fn leaves_policy_in_place(&self) {
+        self.policy_stays.set(true);
     }
 
     fn payload(&self, directory: &str, environment: &[(&str, &str)]) -> (i32, String) {
@@ -255,7 +273,12 @@ impl Drop for Case {
         // What the removal left, read before the policy is cleared here: a case that ends with
         // something of the installation still on the machine fails itself, and the next case's
         // "not clean" is not the only sign of it.
-        let left = machine_problems(false);
+        let left = machine_problems(false, self.policy_stays.get());
+        if self.policy_stays.get() {
+            // The removal keeps the service running while a rule stays, and the case's own end is
+            // right: the state it leaves is what the next case begins with.
+            *RUN_START.lock().unwrap() = Some(appid_state());
+        }
         let _ = channel().set(CLEAR);
         let _ = account::delete(&self.name);
         if !std::thread::panicking() {
@@ -603,6 +626,7 @@ fn installation_lays_down_and_removal_restores() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn removal_keeps_an_administrators_later_rule_and_the_rule_that_lets_others_run() {
     let case = Case::new();
+    case.leaves_policy_in_place();
     let before = snapshot();
     let (code, output) = case.install();
     assert_eq!(code, 0, "{output}");
@@ -685,6 +709,7 @@ fn removal_keeps_an_administrators_later_rule_and_the_rule_that_lets_others_run(
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn existing_application_control_stops_the_installation_and_changes_nothing() {
     let case = Case::new();
+    case.leaves_policy_in_place();
     let existing = r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="Enabled"><FilePathRule Id="44444444-4444-4444-4444-444444444444" Name="Allow everything" Description="d" UserOrGroupSid="S-1-1-0" Action="Allow"><Conditions><FilePathCondition Path="*" /></Conditions></FilePathRule></RuleCollection></AppLockerPolicy>"#;
     channel().set(existing).unwrap();
     let before = snapshot();
@@ -3808,16 +3833,23 @@ fn open_the_brokers_pipe_with(access: u32) -> Result<(), u32> {
 }
 
 /// A client of the broker's pipe holds the pipe's one grant and nothing else when it is an
-/// elevated administrator (the Administrators entry) and is the system with its own: the installer's
-/// `connect` opens the pipe, sends one request and reads its answer, and, when the answer is late,
-/// its deadline cancels the read on that handle.
+/// elevated administrator (the Administrators entry): the installer's `connect` opens the pipe,
+/// sends one request and reads its answer, and, when the answer is late, its deadline cancels the
+/// read on that handle. The server runs as the system, which alone may make the pipe's next
+/// instance, and the client is a caller whose own entry of the list is the Administrators group's.
 #[cfg(feature = "testing")]
 #[test]
-#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answer_cross_it() {
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     let stop = Stop::new().unwrap();
     require_clean_machine();
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     let server = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
@@ -3839,7 +3871,8 @@ fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answe
             }
         }
     });
-    let mut connection = pipe::connect(std::process::id()).expect("the client opens the pipe");
+    let mut connection = with_token_without(&[SYSTEM_SID], || pipe::connect(std::process::id()))
+        .expect("the client opens the pipe");
     kr_boundary_windows::frame::write(
         &mut connection,
         &Request::Prove {
@@ -4372,5 +4405,388 @@ fn eight_clients_that_send_nothing_do_not_stop_the_service_and_a_real_client_is_
     assert!(
         broker.status().unwrap().running(),
         "the silent clients stopped the service"
+    );
+}
+
+/// Runs `work` on a thread that impersonates a copy of this process's token in which the named
+/// identifiers are deny-only: they give the copy no right, as for a caller that is not that account
+/// or not in that group. Under the system's token, naming the system's own identifier leaves the
+/// Administrators entry of the pipe's list as the copy's grant, and naming that group too leaves the
+/// entry of the people.
+#[cfg(feature = "testing")]
+fn with_token_without<T: Send>(disabled: &[&str], work: impl FnOnce() -> T + Send) -> T {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, DuplicateTokenEx, ImpersonateLoggedOnUser, RevertToSelf,
+        SID_AND_ATTRIBUTES, SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY,
+        TokenImpersonation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let identifiers: Vec<Sid> = disabled
+        .iter()
+        .map(|text| Sid::parse(text).unwrap())
+        .collect();
+    let entries: Vec<SID_AND_ATTRIBUTES> = identifiers
+        .iter()
+        .map(|sid| SID_AND_ATTRIBUTES {
+            Sid: sid.as_ptr(),
+            Attributes: 0,
+        })
+        .collect();
+    let mut process: HANDLE = std::ptr::null_mut();
+    // SAFETY: opens this process's own token for the two rights named; the handle is owned below.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY,
+            &raw mut process,
+        )
+    };
+    assert_ne!(opened, 0, "this process's token is opened");
+    let process = ffi::Handle::new(process, "this process's token").unwrap();
+    let mut restricted: HANDLE = std::ptr::null_mut();
+    // SAFETY: the source token is open for duplication, the entries name identifiers that outlive
+    // the call, and the new token is owned below.
+    let made = unsafe {
+        CreateRestrictedToken(
+            process.raw(),
+            0,
+            entries.len() as u32,
+            entries.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &raw mut restricted,
+        )
+    };
+    assert_ne!(made, 0, "the identifiers are made deny-only");
+    let restricted = ffi::Handle::new(restricted, "the restricted token").unwrap();
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: the restricted token is open with every right; the copy is owned below.
+    let duplicated = unsafe {
+        DuplicateTokenEx(
+            restricted.raw(),
+            TOKEN_ALL_ACCESS,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenImpersonation,
+            &raw mut copy,
+        )
+    };
+    assert_ne!(duplicated, 0, "the token is copied");
+    let copy = ffi::Handle::new(copy, "the copy of the token").unwrap();
+    let token = copy.raw() as usize;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                // SAFETY: the copy outlives the thread, which the scope joins.
+                let began = unsafe { ImpersonateLoggedOnUser(token as HANDLE) };
+                assert_ne!(began, 0, "the copy is impersonated");
+                let result = work();
+                // SAFETY: ends the impersonation this thread began.
+                unsafe {
+                    RevertToSelf();
+                }
+                result
+            })
+            .join()
+            .unwrap()
+    })
+}
+
+/// The system's identifier and the Administrators group's.
+#[cfg(feature = "testing")]
+const SYSTEM_SID: &str = "S-1-5-18";
+#[cfg(feature = "testing")]
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// The broker's own loop, run in this process for the people of everyone, the way the service runs
+/// it: its pipe is bound by the loop, and it ends when the stop is set.
+#[cfg(feature = "testing")]
+fn serve_in_process() -> (
+    std::sync::Arc<kr_boundary_windows::win::pipe::Stop>,
+    std::thread::JoinHandle<Result<(), String>>,
+) {
+    use kr_boundary_windows::win::broker;
+    use kr_boundary_windows::win::pipe::Stop;
+    require_clean_machine();
+    let stop = Stop::new().unwrap();
+    let thread = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        move || {
+            let everyone = Sid::parse("S-1-1-0").unwrap();
+            broker::testing::serve(
+                Manifest::begin(),
+                Paths::system().expect("the system's folders are read"),
+                &[everyone],
+                stop,
+            )
+        }
+    });
+    (stop, thread)
+}
+
+/// A client of the loop, opened as a caller whose token has the named identifiers deny-only: the
+/// system and the Administrators group both make a person who is not an administrator, the system
+/// alone makes an elevated administrator, and none is the system.
+#[cfg(feature = "testing")]
+fn client_without(disabled: &[&str]) -> kr_boundary_windows::win::pipe::Connection {
+    use kr_boundary_windows::win::pipe;
+    with_token_without(disabled, || {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match pipe::connect(std::process::id()) {
+                Ok(connection) => return connection,
+                Err(failure) if std::time::Instant::now() >= until => {
+                    panic!("the loop's pipe could not be opened: {failure}")
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    })
+}
+
+/// Says hello on a connection and reads the answer, within ten seconds.
+#[cfg(feature = "testing")]
+fn say_hello(connection: &mut kr_boundary_windows::win::pipe::Connection) {
+    connection.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    ));
+    let said = install::ask(
+        connection,
+        &Request::Hello {
+            version: kr_boundary_windows::frame::VERSION,
+        },
+    )
+    .expect("hello is answered");
+    assert!(matches!(said, Response::Hello { .. }), "{said:?}");
+    connection.set_deadline(None);
+}
+
+/// An administrator's request to the loop, within the bound the installer's own open has: a new
+/// connection, hello and the status, each waiting for the loop to take it.
+#[cfg(feature = "testing")]
+fn an_administrators_status_within_thirty_seconds() -> Result<Response, String> {
+    let mut connection = client_without(&[SYSTEM_SID]);
+    connection.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    ));
+    let said = install::ask(
+        &mut connection,
+        &Request::Hello {
+            version: kr_boundary_windows::frame::VERSION,
+        },
+    )
+    .map_err(|failure| format!("hello: {failure}"))?;
+    if !matches!(said, Response::Hello { .. }) {
+        return Err(format!("hello was answered with {said:?}"));
+    }
+    install::ask(&mut connection, &Request::Status {})
+        .map_err(|failure| format!("status: {failure}"))
+}
+
+/// Waits for the loop to end for at most `seconds`, and returns what it returned.
+#[cfg(feature = "testing")]
+fn ended_within(
+    served: std::thread::JoinHandle<Result<(), String>>,
+    seconds: u64,
+) -> Result<Result<(), String>, String> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while !served.is_finished() {
+        if std::time::Instant::now() >= until {
+            return Err(format!(
+                "the loop had not ended {seconds} seconds after the stop"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(served.join().unwrap())
+}
+
+/// A stop that comes while clients are connected ends the loop: a person who said hello and waits,
+/// an administrator who said hello and waits and a client that has not sent a byte are each served by
+/// a thread, and a thread whose read the stop interrupted must end with it, so that the service
+/// leaves its stopping state and a removal can delete it.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_stop_with_a_client_connected_ends_the_service() {
+    require_clean_machine();
+    // The loop makes its second instance here, which only the system's entry of the pipe's list
+    // allows: under another token the case has nothing to show, and says so.
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
+    let (stop, served) = serve_in_process();
+    let mut person = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
+    say_hello(&mut person);
+    let mut administrator = client_without(&[SYSTEM_SID]);
+    say_hello(&mut administrator);
+    let silent = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
+    stop.set();
+    let ended = ended_within(served, 20);
+    drop((person, administrator, silent));
+    assert_eq!(
+        ended.expect("the service ends with its clients still connected"),
+        Ok(())
+    );
+}
+
+/// Seven connections of a person who is not an administrator that say hello and then nothing do not
+/// hold every slot: an administrator's request is served inside the bound that the installer's open
+/// has, because the connection of a person is closed when it has asked for nothing for its bound.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn seven_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administrators_request() {
+    require_clean_machine();
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
+    let (stop, served) = serve_in_process();
+    let holders: Vec<_> = (0..7)
+        .map(|_| {
+            let mut connection = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
+            say_hello(&mut connection);
+            connection
+        })
+        .collect();
+    let answer = an_administrators_status_within_thirty_seconds();
+    stop.set();
+    let ended = ended_within(served, 20);
+    drop(holders);
+    assert!(
+        matches!(answer, Ok(Response::Status { .. })),
+        "the administrator's request waited behind the seven connections: {answer:?}"
+    );
+    assert_eq!(ended.expect("the service ends"), Ok(()));
+}
+
+/// Seven connections of a person who is not an administrator that ask for the status again and again
+/// and read no answer do not hold every slot either: the write of an answer has a bound, so that the
+/// thread whose client reads nothing ends and an administrator's request is served.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn seven_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrators_request() {
+    require_clean_machine();
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
+    let (stop, served) = serve_in_process();
+    let flooders: Vec<_> = (0..7)
+        .map(|_| {
+            let mut connection = client_without(&[SYSTEM_SID, ADMINISTRATORS_SID]);
+            say_hello(&mut connection);
+            // The loop answers each request into the pipe's buffer; when that is full its write
+            // waits, and then the requests fill the buffer in the other direction until this write
+            // times out.
+            let mut asked = 0_u32;
+            loop {
+                connection.set_deadline(Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ));
+                if kr_boundary_windows::frame::write(&mut connection, &Request::Status {}).is_err()
+                {
+                    break;
+                }
+                asked += 1;
+                assert!(asked < 100_000, "the pipe's buffers never filled");
+            }
+            connection.set_deadline(None);
+            connection
+        })
+        .collect();
+    let answer = an_administrators_status_within_thirty_seconds();
+    stop.set();
+    let ended = ended_within(served, 20);
+    drop(flooders);
+    assert!(
+        matches!(answer, Ok(Response::Status { .. })),
+        "the administrator's request waited behind the seven connections: {answer:?}"
+    );
+    assert_eq!(ended.expect("the service ends"), Ok(()));
+}
+
+/// A refill that fails once neither ends the listener nor drops the client that just connected: the
+/// instance in hand serves it, and the next call makes the waiting instance again.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_hand() {
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    require_clean_machine();
+    if !runs_as_the_system() {
+        eprintln!(
+            "not run under this token: only the system may make a second instance of the pipe"
+        );
+        return;
+    }
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    let first = pipe::connect(std::process::id()).expect("the first client opens the pipe");
+    pipe::testing::fail_next_refill();
+    let served = listener
+        .accept()
+        .expect("the failed refill does not end the listener")
+        .expect("the client in hand is served");
+    let server = std::thread::spawn(move || {
+        listener
+            .accept()
+            .map(|connection| connection.is_some())
+            .map_err(|failure| failure.to_string())
+    });
+    let second = std::thread::spawn(|| pipe::connect(std::process::id()).map(drop));
+    let accepted = server.join().unwrap();
+    stop.set();
+    let second = second.join().unwrap();
+    drop((first, served));
+    assert_eq!(
+        accepted,
+        Ok(true),
+        "the refill is tried again; the second client's open: {second:?}"
+    );
+}
+
+/// At the stop the listener keeps its instance: the name stays held while the workers end, until the
+/// listener is dropped, so that no other account can make the first instance in between.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_stop_does_not_free_the_pipes_name_before_the_listener_ends() {
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
+    require_clean_machine();
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    let waiting = std::thread::spawn(move || {
+        let result = listener.accept().map(|connection| connection.is_some());
+        (listener, result)
+    });
+    // The thread is let reach its wait for a client; a thread that is late only makes the case
+    // pass where the listener is wrong, never fail where it is right.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    stop.set();
+    let (listener, result) = waiting.join().unwrap();
+    assert!(
+        matches!(result, Ok(false)),
+        "the stop ends the wait: {result:?}"
+    );
+    // Any account's call that makes the first instance of the name, as the system's does here, fails.
+    let taken = Listener::bind(&[], Stop::new().unwrap());
+    let held = taken.is_err();
+    drop(listener);
+    assert!(
+        held,
+        "the name was free after the stop while the listener was still alive"
     );
 }
