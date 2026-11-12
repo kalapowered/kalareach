@@ -4859,7 +4859,8 @@ fn a_stop_does_not_free_the_pipes_name_before_the_listener_ends() {
             std::hint::spin_loop();
         }
         stop.set();
-        let (listener, result) = waiting.join().unwrap();
+        let (listener, result) =
+            ends_within(waiting, 20).expect("the thread that waits for a client ends at the stop");
         assert!(
             matches!(result, Ok(false)),
             "the stop ends the wait: {result:?}"
@@ -5108,7 +5109,9 @@ fn a_client_in_the_middle_of_a_frame_does_not_hold_the_service_at_a_stop() {
         .write_all(&100_u32.to_le_bytes())
         .and_then(|()| person.write_all(b"0123456789"))
         .expect("the part of the frame is written");
-    let ended = served.stops_within(20);
+    // The bound is under the five seconds that the connection's read waits for the rest of a
+    // frame, so only the stop can have ended it.
+    let ended = served.stops_within(3);
     drop(person);
     assert_eq!(
         ended.expect("the service ends with a client in the middle of a frame"),
@@ -5259,9 +5262,11 @@ fn the_name_stays_the_brokers_with_every_connection_gone_after_a_failed_refill()
     // Any account's call that makes the first instance of the name, as the system's does here, fails.
     let taken = Listener::bind(Pipe::Persons, &[], Stop::new().unwrap());
     stop.set();
-    assert!(
-        taken.is_err(),
-        "the name was free with every connection gone after a failed refill"
+    // The refusal is the first-instance flag's: error 5, and no other failure counts.
+    assert_eq!(
+        taken.err().map(|failure| failure.code),
+        Some(5),
+        "the name was free with every connection gone after a failed refill, or the bind failed for another reason"
     );
 }
 
@@ -5842,9 +5847,17 @@ fn a_proof_that_the_stop_reaches_after_its_search_ends_with_a_failure_that_says_
     }
     let stop = Stop::new().unwrap();
     let _cleared = HookCleared;
+    let launches_at_the_stop = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     proof::testing::after_the_search(Some(Box::new({
         let stop = std::sync::Arc::clone(&stop);
-        move || stop.set()
+        let launches_at_the_stop = std::sync::Arc::clone(&launches_at_the_stop);
+        move || {
+            stop.set();
+            launches_at_the_stop.store(
+                kr_boundary_windows::win::launch::testing::launches(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
     })));
     let proof = proof::prove(
         &manifest,
@@ -5858,6 +5871,13 @@ fn a_proof_that_the_stop_reaches_after_its_search_ends_with_a_failure_that_says_
         "a proof that the stop reached must fail and say the service is stopping: ready {}, detail {}",
         proof.ready,
         proof.detail
+    );
+    // The failure's words are the same wherever the stop is seen, so what shows that no program
+    // followed the stop is that none was made.
+    assert_eq!(
+        kr_boundary_windows::win::launch::testing::launches(),
+        launches_at_the_stop.load(std::sync::atomic::Ordering::SeqCst),
+        "a program was started after the stop"
     );
 }
 
