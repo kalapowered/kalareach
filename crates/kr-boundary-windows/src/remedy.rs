@@ -35,40 +35,148 @@ pub enum Origin {
     /// The installation did not make it: another account owns it, it is a link, it is not the kind
     /// of object the installation makes there, or a file has more than one name.
     Foreign,
-    /// The handle could not be opened or read, so nothing is known of who made it. The text carries
-    /// the platform's error.
+    /// A program holds it open, so the handle could not be had. The text carries the platform's
+    /// error. Closing the program cures it, and nothing says who made the entry.
+    Held(String),
+    /// The entry's own list refuses the administrator's open. The installation's lists never do, so
+    /// it did not make the entry. The text carries the platform's error.
+    Refused(String),
+    /// The handle could not be opened or read for another reason, so nothing is known of who made
+    /// it. The text carries the platform's error.
     Unknown(String),
+}
+
+/// The origin that an open which failed with this platform error number shows: a sharing or lock
+/// violation is a program that holds it, an access error is a list that refuses, and any other
+/// error shows nothing. `text` is the error as it is shown to the person.
+#[must_use]
+pub fn origin_of_open_error(code: u32, text: &str) -> Origin {
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_SHARING_VIOLATION: u32 = 32;
+    const ERROR_LOCK_VIOLATION: u32 = 33;
+    match code {
+        ERROR_ACCESS_DENIED => Origin::Refused(text.to_owned()),
+        ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => Origin::Held(text.to_owned()),
+        _ => Origin::Unknown(text.to_owned()),
+    }
+}
+
+/// What an entry of the data directory is, by the name the layout gives it and the place it is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// The manifest.
+    Manifest,
+    /// The earlier-state record.
+    Prior,
+    /// A replacement of the manifest that a crash or a failed write left.
+    Replacement,
+    /// The staging directory.
+    Staging,
+    /// The journal's directory.
+    Journal,
+    /// The directory of the private roots.
+    Run,
+    /// A journal file in the journal's directory.
+    JournalFile,
+    /// A private root that a journal names as unfinished work.
+    NamedRoot,
+    /// A private root that no journal names.
+    UnnamedRoot,
+    /// Anything else: a name the layout does not give, or what is inside `staging`.
+    Other,
 }
 
 /// What the person is told to do about one refused entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remedy {
-    /// Remove the entry: it is no record of the layout, or the manifest is confirmed absent and the
-    /// system's class owns it, so no installation's records are in it.
+    /// Remove the entry: it is no record of the layout, or the system's class owns it and nothing
+    /// is recorded about it (no manifest, or a root that no journal names).
     Remove,
     /// Correct the entry's owner and list: the system's class owns it and a manifest is there.
     Correct,
-    /// Move the entry out of the data directory: the handle shows that the installation did not make
-    /// it, so it is neither removed nor corrected into place.
+    /// Move the entry out of the data directory: the handle shows, or the entry's own list shows,
+    /// that the installation did not make it, or nothing shows who made it.
     MoveAside,
-    /// Neither remove nor correct: nothing is known of who made it, so the entry is read again once
-    /// what stops the reading is gone.
+    /// Close the program that holds the entry open: nothing says who made it until it is read.
     Unreadable,
 }
 
-/// The remedy for a refused entry. `is_record` says whether the layout gives the name as a record or
-/// a directory of records, `origin` is what the entry's handle showed, and `manifest` is the
-/// lookup of the manifest.
+/// The remedy for a refused entry of the given kind, from what its handle showed (`origin`) and
+/// from the lookup of the manifest. A record is corrected into place only when its handle shows the
+/// system's class and a manifest may be there; it is removed only when its handle shows the system's
+/// class and nothing records it. A name that the layout does not give is removed whatever its
+/// handle showed.
 #[must_use]
-pub fn choose(is_record: bool, origin: &Origin, manifest: &Presence) -> Remedy {
-    if !is_record {
+pub fn choose(kind: EntryKind, origin: &Origin, manifest: &Presence) -> Remedy {
+    if kind == EntryKind::Other {
         return Remedy::Remove;
     }
     match origin {
-        Origin::Foreign => Remedy::MoveAside,
-        Origin::Unknown(_) => Remedy::Unreadable,
+        Origin::Foreign | Origin::Refused(_) | Origin::Unknown(_) => Remedy::MoveAside,
+        Origin::Held(_) => Remedy::Unreadable,
+        Origin::System if kind == EntryKind::UnnamedRoot => Remedy::Remove,
         Origin::System if matches!(manifest, Presence::Absent) => Remedy::Remove,
         Origin::System => Remedy::Correct,
+    }
+}
+
+/// The words that end the refusal of an entry: the one remedy, with what the next run then finds.
+/// The manifest and the journal are said to stay only where a manifest is there and the entry is
+/// not the journal; "the next run makes it new" is said only of what the installation makes.
+#[must_use]
+pub fn ending(
+    entry: &std::path::Path,
+    remedy: Remedy,
+    origin: &Origin,
+    kind: EntryKind,
+    manifest: &Presence,
+) -> String {
+    let entry = entry.display();
+    match remedy {
+        Remedy::Remove => {
+            if matches!(manifest, Presence::Present) && kind != EntryKind::Journal {
+                format!(
+                    "Remove {entry}, and nothing else, then run the setup program again: the manifest and the journal stay where they are."
+                )
+            } else {
+                format!("Remove {entry}, and nothing else, then run the setup program again.")
+            }
+        }
+        Remedy::MoveAside => {
+            let basis = match origin {
+                Origin::Refused(error) => format!(
+                    "The permission list of {entry} refuses the Administrators group ({error}), which no list of the installation's does, so the installation did not make it."
+                ),
+                Origin::Unknown(error) => format!(
+                    "Nothing shows who made {entry}, because it could not be read ({error})."
+                ),
+                _ => format!("The handle of {entry} shows that the installation did not make it."),
+            };
+            let next = match kind {
+                EntryKind::Manifest => {
+                    "The directory then holds no manifest, and the next run refuses what else is in it: with no manifest nothing records those entries, and it names each to remove."
+                }
+                EntryKind::Prior | EntryKind::Staging | EntryKind::Journal | EntryKind::Run => {
+                    "The next run finds the entry absent and makes it new."
+                }
+                EntryKind::Replacement
+                | EntryKind::JournalFile
+                | EntryKind::NamedRoot
+                | EntryKind::UnnamedRoot => {
+                    "The next run finds the entry absent, and the installation does not make it again."
+                }
+                EntryKind::Other => "The next run finds the entry absent.",
+            };
+            format!(
+                "{basis} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give, and the next run asks you to remove that), then run the setup program again. {next}"
+            )
+        }
+        Remedy::Unreadable => format!(
+            "Nothing shows who made {entry}, because a program holds it open and it could not be read. Do not correct its owner or its list, and do not remove it: either would hide what it is. Close the program that holds it open, then run the setup program again, which reads it again."
+        ),
+        Remedy::Correct => format!(
+            "Correct what the reason names (the Administrators group, or the system, owns it, and the system and the Administrators group are the only entries of its list), then run the setup program again. Do not remove {entry}: the manifest and the journal record what is installed and stay where they are."
+        ),
     }
 }
 
