@@ -86,6 +86,55 @@ pub enum EntryKind {
     Other,
 }
 
+/// What an opened entry is, as its own handle shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// A reparse point of any kind, a junction or a symbolic link among them.
+    Link,
+    /// A file, with the number of names it has.
+    File {
+        /// How many names the file has.
+        names: u32,
+    },
+    /// A directory that is not a link.
+    Directory,
+}
+
+impl EntryKind {
+    /// What object the layout gives at this kind of name: a file, a directory, or none in
+    /// particular (`None`, for a name that the layout does not give).
+    #[must_use]
+    pub fn layout_shape(self) -> Option<Shape> {
+        match self {
+            EntryKind::Manifest
+            | EntryKind::Prior
+            | EntryKind::Replacement
+            | EntryKind::JournalFile => Some(Shape::File { names: 1 }),
+            EntryKind::Staging
+            | EntryKind::Journal
+            | EntryKind::Run
+            | EntryKind::NamedRoot
+            | EntryKind::UnnamedRoot => Some(Shape::Directory),
+            EntryKind::Other => None,
+        }
+    }
+}
+
+/// Who made an opened entry, from its own handle: a link, a file with a second name, and an object
+/// of another kind than the layout gives at that name (a directory at a record file's name, a
+/// plain file at a private root's name) are none of them the installation's, and the owner is not
+/// read for them. Any other entry is read for its owner, which `owner` does.
+#[must_use]
+pub fn origin_of_shape(kind: EntryKind, shape: Shape, owner: &dyn Fn() -> Origin) -> Origin {
+    let wrong_kind = matches!(
+        (kind.layout_shape(), shape),
+        (_, Shape::Link | Shape::File { names: 2.. })
+            | (Some(Shape::File { .. }), Shape::Directory)
+            | (Some(Shape::Directory), Shape::File { .. })
+    );
+    if wrong_kind { Origin::Foreign } else { owner() }
+}
+
 /// What the person is told to do about one refused entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remedy {
