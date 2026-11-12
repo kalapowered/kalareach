@@ -40,7 +40,8 @@ const EQUAL = 1e-6
  * The index of the link that takes a press at `point`, or null when none does.
  *
  * `links` holds the rectangles of each link's words, one for each line the label covers, in the order
- * the links have in the message. `bounds` is the room the pane gives: no target reaches past it.
+ * the links have in the message. `bounds` is the room the pane gives: no target reaches past it. A
+ * press arrives from inside the pane, so `bounds` only cuts a target that the pane would cut.
  * `controls` are the boxes of the message's other controls, which a link's target never takes.
  */
 export function linkAt(
