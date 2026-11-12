@@ -96,9 +96,46 @@ pub struct Identity {
     pub administrator: bool,
 }
 
+/// A server end of a pipe instance. It is disconnected before it is closed, on every path: an
+/// instance that is closed while a client is connected can stay in use for as long as the client holds
+/// its handle, and handles that clients kept open would then leave the service no instance to listen
+/// on and keep the pipe's name alive after the service ends.
+struct Server(Handle);
+
+impl Server {
+    fn raw(&self) -> HANDLE {
+        self.0.raw()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // SAFETY: the handle is a server end that this value owns; the disconnect of an instance
+        // that no client is connected to fails and changes nothing. The handle closes after it.
+        unsafe {
+            DisconnectNamedPipe(self.0.raw());
+        }
+    }
+}
+
+/// An end of a pipe: the service's end of a client that connected, or a client's own end.
+enum End {
+    Server(Server),
+    Client(Handle),
+}
+
+impl End {
+    fn raw(&self) -> HANDLE {
+        match self {
+            End::Server(server) => server.raw(),
+            End::Client(handle) => handle.raw(),
+        }
+    }
+}
+
 /// One end of a connected pipe.
 pub struct Connection {
-    pipe: Handle,
+    pipe: End,
     stop: Arc<Stop>,
     /// The time after which no transfer on this connection waits, or none.
     deadline: Option<Instant>,
@@ -443,7 +480,7 @@ pub struct Listener {
     /// that from the bind to the end of the listener an instance of the pipe always exists and the
     /// name is never free; it is none only while every instance the pipe may have is in use, and
     /// then the connections hold the name.
-    next: Option<Handle>,
+    next: Option<Server>,
     /// What the first instance shows: its owner and the permission list `bind` set. Every later
     /// instance must show the same.
     bound: Option<Summary>,
@@ -452,7 +489,7 @@ pub struct Listener {
 /// What an attempt to make the waiting instance gave.
 enum Refill {
     /// The instance, made and confirmed.
-    Waiting(Handle),
+    Waiting(Server),
     /// Every instance the pipe may have is in use.
     Busy,
     /// The instance could not be made or read; nothing of it is kept.
@@ -504,7 +541,7 @@ impl Listener {
             bound: None,
         };
         let first = listener.instance(true)?;
-        listener.bound = Some(summary_of_handle(&first)?);
+        listener.bound = Some(summary_of_handle(&first.0)?);
         listener.next = Some(first);
         Ok(listener)
     }
@@ -529,7 +566,7 @@ impl Listener {
             return Ok(Refill::Failed(error(8, "making the pipe")));
         }
         match self.instance(false) {
-            Ok(pipe) => match summary_of_handle(&pipe) {
+            Ok(pipe) => match summary_of_handle(&pipe.0) {
                 Ok(shown) if self.bound.as_ref().is_some_and(|bound| *bound != shown) => {
                     Err(error(
                         0,
@@ -544,7 +581,7 @@ impl Listener {
         }
     }
 
-    fn instance(&self, first: bool) -> Result<Handle> {
+    fn instance(&self, first: bool) -> Result<Server> {
         let name = wide(NAME);
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -571,7 +608,7 @@ impl Listener {
                 &raw const attributes,
             )
         };
-        Handle::new(pipe, "making the pipe")
+        Handle::new(pipe, "making the pipe").map(Server)
     }
 
     /// Waits for a client, and returns `None` when the service is told to stop.
@@ -659,7 +696,7 @@ impl Listener {
                 self.next = Some(next);
             }
             return Ok(Some(Connection {
-                pipe,
+                pipe: End::Server(pipe),
                 stop: Arc::clone(&self.stop),
                 deadline: None,
                 stuck: false,
@@ -730,7 +767,7 @@ pub fn connect(expected_server: u32) -> Result<Connection> {
         ));
     }
     Ok(Connection {
-        pipe,
+        pipe: End::Client(pipe),
         stop: Stop::new()?,
         deadline: None,
         stuck: false,
