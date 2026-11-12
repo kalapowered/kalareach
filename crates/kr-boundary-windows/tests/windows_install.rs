@@ -3892,10 +3892,7 @@ fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answe
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     let stop = Stop::new().unwrap();
     require_clean_machine();
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
+    if needs_the_system() {
         return;
     }
     let mut listener = Listener::bind(Pipe::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
@@ -4022,6 +4019,9 @@ fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
     require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
     let mut listener =
         Listener::bind(Pipe::Persons, &[system], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that accepts and never answers: it holds the connection until it is told to stop.
@@ -4062,6 +4062,9 @@ fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
     require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
     let mut listener =
         Listener::bind(Pipe::Persons, &[system], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that accepts and never answers, and keeps the connection until told to stop.
@@ -4347,12 +4350,7 @@ fn after_a_restart_the_brokers_proof_passes_inside_its_bound() {
 fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_the_listener() {
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     require_clean_machine();
-    // The listener makes its second instance here, which only the system's entry of the pipe's list
-    // allows: under another token the case has nothing to show, and says so.
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
+    if needs_the_system() {
         return;
     }
     let stop = Stop::new().unwrap();
@@ -4384,12 +4382,7 @@ fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_t
 fn the_listener_keeps_the_pipes_name_with_every_client_gone_and_no_accept_pending() {
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     require_clean_machine();
-    // The listener makes its second instance here, which only the system's entry of the pipe's list
-    // allows: under another token the case has nothing to show, and says so.
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
+    if needs_the_system() {
         return;
     }
     let stop = Stop::new().unwrap();
@@ -4682,12 +4675,7 @@ fn an_administrators_status_within_thirty_seconds() -> Result<Response, String> 
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_stop_with_a_client_connected_ends_the_service() {
     require_clean_machine();
-    // The loop makes its second instance here, which only the system's entry of the pipe's list
-    // allows: under another token the case has nothing to show, and says so.
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
+    if needs_the_system() {
         return;
     }
     let mut served = serve_in_process();
@@ -4712,10 +4700,7 @@ fn a_stop_with_a_client_connected_ends_the_service() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn six_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administrators_request() {
     require_clean_machine();
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
+    if needs_the_system() {
         return;
     }
     let mut served = serve_in_process();
@@ -4752,10 +4737,7 @@ fn six_connections_that_say_hello_and_then_nothing_do_not_hold_off_an_administra
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn six_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrators_request() {
     require_clean_machine();
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
+    if needs_the_system() {
         return;
     }
     let mut served = serve_in_process();
@@ -4808,10 +4790,7 @@ fn six_connections_that_ask_and_read_no_answer_do_not_hold_off_an_administrators
 fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_hand() {
     use kr_boundary_windows::win::pipe::{self, Listener, Stop};
     require_clean_machine();
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
+    if needs_the_system() {
         return;
     }
     let stop = Stop::new().unwrap();
@@ -4865,6 +4844,9 @@ fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_ha
 fn a_stop_does_not_free_the_pipes_name_before_the_listener_ends() {
     use kr_boundary_windows::win::pipe::{Listener, Stop};
     require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
     // Nothing shows from outside that the thread has reached its wait for a client, so the stop is
     // set after a longer and longer pause of spinning, with no sleep: a stop that comes before the
     // wait begins ends `accept` at its first check and shows nothing, and one that comes after it
@@ -5024,10 +5006,7 @@ fn the_pipes_grant_is_the_least_that_an_open_and_the_clients_calls_need() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn an_administrators_connection_stays_open_past_the_bound_of_a_persons() {
     require_clean_machine();
-    if !runs_as_the_system() {
-        eprintln!(
-            "not run under this token: only the system may make a second instance of the pipe"
-        );
+    if needs_the_system() {
         return;
     }
     let mut served = serve_in_process();
@@ -5048,16 +5027,13 @@ fn an_administrators_connection_stays_open_past_the_bound_of_a_persons() {
 }
 
 /// Whether this case has nothing to show under this token, which it says in the run's output so that
-/// the table reads "skipped" and not "passed": the loop and the listener make their second instance
-/// of the pipe as the system, and no other account's entry of the pipe's list allows that.
-#[cfg(feature = "testing")]
+/// the table reads "skipped" and not "passed": the loop and the listener make the pipe's first
+/// instance with the system's entry alone, and no other account's token may do that.
 fn needs_the_system() -> bool {
     if runs_as_the_system() {
         return false;
     }
-    eprintln!(
-        "SKIPPED: not run under this token: only the system may make a second instance of the pipe"
-    );
+    eprintln!("SKIPPED: not run under this token: only the system may make the broker's pipe");
     true
 }
 
@@ -5616,6 +5592,128 @@ fn a_thousand_and_one_failed_refills_do_not_end_the_loop_and_it_still_serves() {
         "the loop did not serve a client after a thousand and one failed refills: {answer:?}"
     );
     assert_eq!(ended.expect("the service ends"), Ok(()));
+}
+
+/// An ordinary account that opens the persons' pipe in a tight loop while the service makes the pipe
+/// again and again never gets a handle on the instance that the broker keeps for itself: the first
+/// instance shows the system's entry alone until the broker's own client end is connected to it, so
+/// no bind finds that end taken, and the account's opens are refused or find no pipe until the pipe's
+/// real list is set and only the waiting instance is there to open.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_ordinary_accounts_open_in_a_tight_loop_never_gets_a_handle_before_the_keeper_is_connected() {
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+    /// What the account's opens gave, by the platform's answer.
+    #[derive(Debug, Default)]
+    struct Tally {
+        opened: u32,
+        refused: u32,
+        not_found: u32,
+        busy: u32,
+        other: u32,
+    }
+    /// The account's loop: ends when the case does, on every path.
+    struct Opener {
+        done: std::sync::Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<Tally>>,
+    }
+    impl Opener {
+        fn finish(&mut self) -> Tally {
+            self.done.store(true, Ordering::Release);
+            self.thread
+                .take()
+                .map(|thread| thread.join().unwrap())
+                .unwrap_or_default()
+        }
+    }
+    impl Drop for Opener {
+        fn drop(&mut self) {
+            let _ = self.finish();
+        }
+    }
+    require_clean_machine();
+    if needs_the_system() {
+        return;
+    }
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let (first_try, first_tried) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn({
+        let done = std::sync::Arc::clone(&done);
+        move || {
+            let name = ffi::wide(persons_pipe_name());
+            with_token_without(&[SYSTEM_SID, ADMINISTRATORS_SID], || {
+                let mut tally = Tally::default();
+                let mut told = false;
+                while !done.load(Ordering::Acquire) {
+                    // SAFETY: the name is NUL-terminated; the result is checked.
+                    let opened = unsafe {
+                        CreateFileW(
+                            name.as_ptr(),
+                            kr_boundary_windows::pipe_access::CLIENT,
+                            0,
+                            std::ptr::null(),
+                            OPEN_EXISTING,
+                            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if opened == INVALID_HANDLE_VALUE {
+                        // SAFETY: reads this thread's last error, set by the call above.
+                        match unsafe { GetLastError() } {
+                            5 => tally.refused += 1,
+                            ERROR_FILE_NOT_FOUND => tally.not_found += 1,
+                            ERROR_PIPE_BUSY => tally.busy += 1,
+                            _ => tally.other += 1,
+                        }
+                    } else {
+                        tally.opened += 1;
+                        // Closed at once, which is what a client that goes does.
+                        drop(ffi::Handle::new(opened, "the persons' pipe").unwrap());
+                    }
+                    if !told {
+                        told = true;
+                        let _ = first_try.send(());
+                    }
+                }
+                tally
+            })
+        }
+    });
+    let mut opener = Opener {
+        done,
+        thread: Some(thread),
+    };
+    first_tried
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the account's loop made its first open");
+    let everyone = Sid::parse("S-1-1-0").unwrap();
+    let mut failures = Vec::new();
+    for number in 0..300 {
+        let stop = Stop::new().unwrap();
+        match Listener::bind(Pipe::Persons, std::slice::from_ref(&everyone), stop) {
+            Ok(listener) => drop(listener),
+            Err(failure) => failures.push(format!("bind {number}: {failure}")),
+        }
+    }
+    let tally = opener.finish();
+    eprintln!("the account's opens while the pipe was made 300 times: {tally:?}");
+    assert!(
+        failures.is_empty(),
+        "an open of the account took the first instance before the broker's own end was on it: {failures:?}"
+    );
+    assert_eq!(
+        tally.other, 0,
+        "an open ended with an answer that is neither a refusal, no pipe nor a busy pipe: {tally:?}"
+    );
 }
 
 /// A proof that the stop reaches after its search for a refusal has found one, before any program
