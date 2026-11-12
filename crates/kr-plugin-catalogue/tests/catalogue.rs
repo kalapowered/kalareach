@@ -3361,6 +3361,84 @@ async fn a_package_that_needs_a_newer_sdk_is_refused_before_it_is_fetched() {
     );
 }
 
+/// A repository whose newest release of a package needs a newer SDK than this host implements: the
+/// release the host has installed stays installed, the newer one is refused for its range before
+/// anything of it is fetched, and the refusal changes nothing about the installation.
+#[tokio::test]
+async fn a_release_for_a_newer_sdk_leaves_the_installed_release_in_place() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let mut newer = support::example_entry();
+    newer.version = PackageVersion::parse("0.2.0").expect("a valid version");
+    newer.sdk_range =
+        kr_plugin_sdk::version::VersionRange::parse(">=0.1.99, <0.2.0").expect("a valid range");
+    newer.manifest_digest = PayloadDigest::of(b"the manifest of the newer release");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            listed_only: vec![newer.clone()],
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a generation that lists a release for a newer SDK is taken");
+    let metered = Metered::default();
+    catalogue.set_transport(Arc::new(metered.clone()));
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("the release this host implements the SDK of installs");
+    let fetched = metered.fetches("/packages/");
+
+    let refusal = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &newer.version,
+            newer.manifest_digest,
+            InstallationGrant::none(),
+        )
+        .await
+        .expect_err("the newest release needs a newer SDK");
+    let CatalogueError::UnsafePackage { detail } = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert!(detail.contains("sdk_range >=0.1.99, <0.2.0"), "{detail}");
+    assert_eq!(
+        metered.fetches("/packages/"),
+        fetched,
+        "nothing of the newer release is fetched"
+    );
+
+    let installed = catalogue
+        .installation(environment(), &plugin())
+        .expect("readable")
+        .expect("still installed");
+    assert_eq!(installed.version, version());
+    assert_eq!(installed.package_digest, generation.manifest_digest());
+    assert!(complete(
+        &catalogue.store(&repository()).expect("enrolled"),
+        generation.manifest_digest()
+    ));
+}
+
 /// Reads the local repository, and records every address fetched with the bytes its answer
 /// delivered.
 #[derive(Clone, Debug, Default)]
