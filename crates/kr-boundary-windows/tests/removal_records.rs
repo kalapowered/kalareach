@@ -211,7 +211,7 @@ fn something_in_the_data_directory_that_is_not_a_record_keeps_only_the_data_dire
     );
 }
 
-use kr_boundary_windows::records::{next_step, remove_with};
+use kr_boundary_windows::records::{next_step, remove_with, unread_prior};
 use std::ffi::OsString;
 use std::io;
 
@@ -282,6 +282,27 @@ fn an_empty_data_directory_that_a_stopped_removal_left_is_removed_by_the_next_on
     assert!(!case.data.exists());
 }
 
+/// A removal whose inspection did not approve the earlier-state record that is there did not read
+/// it: its last words say that the Application Identity service's start value and running state
+/// were not put back and that the next removal does it, and say nothing where the record was read
+/// or is not there.
+#[test]
+fn the_last_words_of_a_removal_say_what_an_unread_earlier_state_record_left() {
+    let said = unread_prior(false, true);
+    assert!(
+        said.contains("start value and running state were not put back"),
+        "{said}"
+    );
+    assert!(
+        said.contains("the next removal reads the record and does it"),
+        "{said}"
+    );
+    assert!(said.starts_with(". "), "{said}");
+    assert_eq!(unread_prior(true, true), "", "the record was read");
+    assert_eq!(unread_prior(false, false), "", "there is no record");
+    assert_eq!(unread_prior(true, false), "");
+}
+
 /// A directory that cannot be deleted is named, and the words that follow say what is true of the
 /// state: the manifest stays, or an empty directory is accepted by a new installation and finished
 /// by the next removal, or something else is in it that no handle has checked, so the next removal
@@ -289,11 +310,14 @@ fn an_empty_data_directory_that_a_stopped_removal_left_is_removed_by_the_next_on
 #[test]
 fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
     assert!(next_step(true, false).contains("run the removal again"));
-    assert!(next_step(true, true).contains("reads the manifest"));
-    // The next removal can refuse a link at a replacement's name before it reads the manifest, so
-    // the words promise no completion.
+    // The next removal can refuse a link at a replacement's name in its inspection, before it reads
+    // the manifest, so the words promise another inspection and no read of the manifest and no
+    // completion.
     let kept = next_step(true, false);
+    assert!(kept.contains("inspects the data directory again"), "{kept}");
+    assert!(next_step(true, true).contains("inspects the data directory again"));
     assert!(kept.contains("says what remains"), "{kept}");
+    assert!(!kept.contains("reads the manifest"), "{kept}");
     assert!(!kept.contains("finishes"), "{kept}");
     let empty = next_step(false, true);
     assert!(empty.contains("accepts an empty data directory"), "{empty}");
