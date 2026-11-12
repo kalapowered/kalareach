@@ -16,6 +16,7 @@ use kr_client::chunks::ChunkRoute;
 use kr_client::session::{Session, Settled};
 use kr_client::transport::{ControlTransport, Reach, StreamOpener, TransportFuture};
 use kr_client::uploads::{self, Held, Progress, Stage, Subject, Upload};
+use kr_controller::service::net::config::NetworkSettings;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ControlFrame;
@@ -32,6 +33,7 @@ use kr_protocol::transfer::{
     UploadCancelResult, UploadChunkParams, UploadFinishParams, UploadFinishResult, UploadState,
     UploadStatusParams, UploadStatusResult,
 };
+use kr_transport::deadlines::ManualDeadlines;
 use kr_transport::streams::DataStream;
 use net_support::worker::Adopted;
 use net_support::{Device, Host, on_the_host, on_the_session};
@@ -40,11 +42,6 @@ use net_support::{Device, Host, on_the_host, on_the_session};
 const WAIT: Duration = Duration::from_secs(120);
 
 const TTL: DurationMs = DurationMs::new(60_000);
-
-/// How long a case waits for the host to end a stream the client gave up. The host resets a stream
-/// that stands idle for sixty seconds, so a wait that lasted that long would pass for a lane that left
-/// its stream open: the client's own reset reaches the host in well under this.
-const BEFORE_THE_IDLE_RESET: Duration = Duration::from_secs(30);
 
 async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(WAIT, future)
@@ -89,28 +86,33 @@ async fn counted_session(
     device: &Device,
     record: &DeviceRecord,
 ) -> (Session, Arc<AtomicU64>) {
-    let (session, opened, _finished) = counting_session(host, device, record).await;
+    let (session, opened, _finished, _status_reads) = counting_session(host, device, record).await;
     (session, opened)
 }
 
-/// A connection of the device's, as a session that counts the data streams it opens and the
-/// `upload.finish` mutations it sends.
+/// A connection of the device's, as a session that counts the data streams it opens, the
+/// `upload.finish` mutations it sends and the `upload.status` reads it sends.
 async fn counting_session(
     host: &Host,
     device: &Device,
     record: &DeviceRecord,
-) -> (Session, Arc<AtomicU64>, Arc<AtomicU64>) {
+) -> (Session, Arc<AtomicU64>, Arc<AtomicU64>, StatusReads) {
     let opened = Arc::new(AtomicU64::new(0));
     let finished = Arc::new(AtomicU64::new(0));
+    let status_reads = StatusReads::default();
     let transport = net_support::paired_dial(host, device, record).dial().await;
     let session = Session::start(Arc::new(Counted {
         inner: Arc::new(transport),
         opened: Arc::clone(&opened),
         finished: Arc::clone(&finished),
+        status_reads: status_reads.clone(),
     }))
     .expect("a session");
-    (session, opened, finished)
+    (session, opened, finished, status_reads)
 }
+
+/// Each `upload.status` read a session sent, as the number of finishes it had sent before it.
+type StatusReads = Arc<std::sync::Mutex<Vec<u64>>>;
 
 fn staged(host: &Host) -> u64 {
     host.controller()
@@ -128,12 +130,14 @@ async fn status_of(session: &Session, transfer_id: TransferId) -> UploadStatusRe
 }
 
 /// A transport that counts the data streams opened through it, each once its header is written,
-/// and the `upload.finish` mutations sent through it.
+/// the `upload.finish` mutations sent through it, and each `upload.status` read with the number of
+/// finishes sent before it.
 #[derive(Debug)]
 struct Counted {
     inner: Arc<dyn ControlTransport>,
     opened: Arc<AtomicU64>,
     finished: Arc<AtomicU64>,
+    status_reads: StatusReads,
 }
 
 #[derive(Debug)]
@@ -173,10 +177,21 @@ impl ControlTransport for Counted {
         self.inner.ended_by_this_device()
     }
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
-        if let ControlFrame::Mutation(mutation) = frame
-            && mutation.method == MethodName::from(Method::UploadFinish)
-        {
-            self.finished.fetch_add(1, Ordering::AcqRel);
+        match frame {
+            ControlFrame::Mutation(mutation)
+                if mutation.method == MethodName::from(Method::UploadFinish) =>
+            {
+                self.finished.fetch_add(1, Ordering::AcqRel);
+            }
+            ControlFrame::Request(request)
+                if request.method == MethodName::from(Method::UploadStatus) =>
+            {
+                self.status_reads
+                    .lock()
+                    .expect("the status reads")
+                    .push(self.finished.load(Ordering::Acquire));
+            }
+            _ => {}
         }
         self.inner.send(frame)
     }
@@ -526,7 +541,7 @@ async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_i
     let host = &adopted.host;
     let session_id = adopted.workers[0].session_id;
     let (device, record) = paired(host, &adopted.owner, &[ActionRight::FilesUpload]).await;
-    let (session, _opened, finished) = counting_session(host, &device, &record).await;
+    let (session, _opened, finished, status_reads) = counting_session(host, &device, &record).await;
     let route = ChunkRoute::network(&session, host.environment_id)
         .await
         .expect("the host takes an attachment stream from a device");
@@ -557,6 +572,11 @@ async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_i
         1,
         "the finish was sent once and not again"
     );
+    assert_eq!(
+        *status_reads.lock().expect("the status reads"),
+        vec![1],
+        "the status was read once, after the finish the host could not answer"
+    );
     assert_eq!(staged(host), bytes.len() as u64, "one file");
     session.close();
     adopted.stop().await;
@@ -567,10 +587,21 @@ async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_i
 /// took its transfer's gate, so the exchange is under way when the send is dropped. The dropped lane
 /// resets its stream: once the held chunk goes on, the host's task for the stream ends, no chunk is left
 /// in the transfer service, and the host then cancels the upload and gives back the bytes it reserved.
+/// The host's data-stream deadlines are the case's own and never fire, so the host's idle reset cannot
+/// be what ends the stream: only the client's reset can, and a lane that left its stream open would
+/// leave the host's task standing until the case's liveness wait fails it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upload_the_caller_gives_up_is_cancelled_by_its_transfer_and_its_bytes_are_released() {
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_with_settings(
+        &owner,
+        NetworkSettings {
+            endpoint: net_support::loopback(),
+            data_stream_deadlines: Some(ManualDeadlines::new()),
+            ..NetworkSettings::default()
+        },
+    )
+    .await;
     let (device, record) = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
     let session = net_support::connect(&host, &device, &record).await;
     let route = ChunkRoute::network(&session, host.environment_id)
@@ -594,12 +625,9 @@ async fn an_upload_the_caller_gives_up_is_cancelled_by_its_transfer_and_its_byte
     }
     let transfer = *upload.transfer_id().expect("the plan holds the transfer");
     release.send(()).expect("the held chunk goes on");
-    tokio::time::timeout(BEFORE_THE_IDLE_RESET, ended.wait_for(|ended| *ended >= 1))
+    within(ended.wait_for(|ended| *ended >= 1))
         .await
-        .expect(
-            "the host's task for the dropped lane's stream ends before its idle reset would end it",
-        )
-        .expect("the count stays open");
+        .expect("the host's task for the dropped lane's stream ends, and the count stays open");
     within(
         host.network()
             .until_no_chunk_is_in_the_service(record.device_id, transfer),

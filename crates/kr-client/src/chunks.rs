@@ -1462,6 +1462,10 @@ mod tests {
     /// parked there; the host issues the next window and another lane has that one refused; the
     /// parked lane then goes on. The newer refusal has to stand: a lane opened after carries the
     /// window the host turned down last, and the host refuses it again.
+    ///
+    /// The step that makes the order impossible is the one lock: while the older refusal is parked,
+    /// the marker's lock is held, which the case asks from its own thread, so the result does not
+    /// depend on when the other threads are scheduled.
     #[test]
     fn a_refusal_cannot_replace_a_newer_one_between_its_check_and_its_update() {
         use std::sync::atomic::AtomicBool;
@@ -1490,20 +1494,19 @@ mod tests {
         is_parked
             .recv()
             .expect("the older refusal is parked between its check and its update");
+        assert!(
+            matches!(
+                source.turned_down.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "the older refusal holds the marker's lock between its check and its update"
+        );
         issued.send_replace(issued_as("newer"));
-        let (done, newer_done) = mpsc::channel::<()>();
         let newer_lane = {
             let source = Arc::clone(&source);
             let newer = newer.clone();
-            std::thread::spawn(move || {
-                source.turn_down(&newer);
-                let _ = done.send(());
-            })
+            std::thread::spawn(move || source.turn_down(&newer))
         };
-        // The newer refusal finishes while the older one is parked, or it waits for the lock the
-        // older one holds. The wait only bounds how long the case looks for the first: a longer one
-        // cannot make a lane that finishes wrongly pass.
-        let _ = newer_done.recv_timeout(Duration::from_millis(200));
         release.send(()).expect("the parked refusal goes on");
         older_lane.join().expect("the older refusal ends");
         newer_lane.join().expect("the newer refusal ends");

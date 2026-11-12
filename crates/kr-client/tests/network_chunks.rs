@@ -33,7 +33,7 @@ use kr_protocol::ids::{
     EnvironmentId, RequestId, TransferId,
 };
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
-use kr_protocol::method::Method;
+use kr_protocol::method::{Method, MethodName};
 use kr_protocol::scalars::{
     Bytes, Digest256, DurationMs, EndpointKey, Nullable, TimestampMs, U64, Uuid,
 };
@@ -213,6 +213,7 @@ struct Seen {
     chunks: Vec<SeenChunk>,
     stored: BTreeSet<u64>,
     begins: u64,
+    finishes: u64,
     status_reads: u64,
     /// The request identifiers of every request and mutation read on the control stream.
     control_ids: Vec<RequestId>,
@@ -232,6 +233,8 @@ struct Script {
     state: Mutex<UploadState>,
     /// Resets every stream after reading its header.
     refuses_streams: AtomicBool,
+    /// Answers the next `upload.finish` that the outcome is not known, though it publishes: once.
+    finish_unknown_once: AtomicBool,
     chunks: Mutex<VecDeque<Chunk>>,
     /// A chunk under this window is refused as one that has expired.
     ended_window: Mutex<Option<ActionWindowId>>,
@@ -251,6 +254,7 @@ impl Script {
             streams: Mutex::new(Ok(vec![StreamKind::AttachmentChunks])),
             state: Mutex::new(UploadState::Receiving),
             refuses_streams: AtomicBool::new(false),
+            finish_unknown_once: AtomicBool::new(false),
             chunks: Mutex::new(VecDeque::new()),
             ended_window: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
@@ -506,6 +510,16 @@ fn control_reply(script: &Arc<Script>, frame: ControlFrame) -> Option<ControlFra
                 Some(Method::UploadFinish) => {
                     let params: UploadFinishParams = mutation.params.to_typed().ok()?;
                     let transfer_id = script.seen(|seen| seen.transfer)?;
+                    script.record(|seen| seen.finishes += 1);
+                    if script.finish_unknown_once.swap(false, Ordering::AcqRel) {
+                        return Some(answer(
+                            mutation.request_id,
+                            Err(ProtocolError::new(
+                                ErrorCode::OutcomeUnknown,
+                                "the host cannot say what became of the finish",
+                            )),
+                        ));
+                    }
                     typed(&UploadFinishResult {
                         handle: AttachmentHandle {
                             environment_id: environment(),
@@ -1518,6 +1532,9 @@ struct Ending {
     code: ErrorCode,
     /// The opener the transport gives out instead of the inner transport's, when a case sets one.
     opener: Option<Arc<dyn StreamOpener>>,
+    /// The account signs out as the client sends a request of this method: the reason is recorded,
+    /// and that send fails with the connection ended, as a watcher that closes the connection does.
+    signs_out_at: Option<Method>,
 }
 
 impl ControlTransport for Ending {
@@ -1536,6 +1553,11 @@ impl ControlTransport for Ending {
             .then(|| ProtocolError::new(self.code, "the account signed out"))
     }
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+        if let (ControlFrame::Request(request), Some(method)) = (frame, self.signs_out_at)
+            && request.method == MethodName::from(method)
+        {
+            self.ended.store(true, Ordering::Release);
+        }
         if self.ended.load(Ordering::Acquire) {
             return Box::pin(async { Err(ClientError::ConnectionEnded) });
         }
@@ -1591,6 +1613,7 @@ async fn a_lane_stops_when_the_transport_says_this_device_ended_the_connection()
             ended: flag,
             code: ErrorCode::LeaseLost,
             opener: None,
+            signs_out_at: None,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1674,6 +1697,7 @@ async fn a_sign_out_during_the_wait_for_a_window_is_told_with_its_reason() {
             ended: flag,
             code: ErrorCode::LeaseLost,
             opener: None,
+            signs_out_at: None,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1724,6 +1748,7 @@ async fn a_sign_out_that_reads_as_a_refused_window_reaches_the_caller_of_send_as
             ended: flag,
             code: ErrorCode::PermissionDenied,
             opener: None,
+            signs_out_at: None,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1778,6 +1803,7 @@ async fn a_sign_out_that_cuts_the_open_of_the_stream_is_told_with_its_reason() {
             ended: flag,
             code: ErrorCode::LeaseLost,
             opener: Some(Arc::new(CutOpener { gate: cut })),
+            signs_out_at: None,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1841,4 +1867,102 @@ async fn a_window_that_runs_out_while_a_lane_waits_ends_the_lane() {
         1,
         "only the refused chunk was ever sent"
     );
+}
+
+/// A sign-out that lands after the driver has asked the transport once, between a lane's usual failure
+/// and the status read that follows it, still reaches the caller of `uploads::send` as its reason and
+/// not as a connection that ended. The host answers the first chunk that the outcome is not known,
+/// which the driver reads as a failure to retry; the account signs out as the driver's status read is
+/// sent.
+#[tokio::test]
+async fn a_sign_out_between_a_lane_failure_and_the_status_read_reaches_the_caller_of_send() {
+    let script = Script::new(true);
+    script.will(Chunk::Unknown { stored: false });
+    let ended = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ended);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Ending {
+            inner: Arc::new(transport),
+            ended: flag,
+            code: ErrorCode::LeaseLost,
+            opener: None,
+            signs_out_at: Some(Method::UploadStatus),
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let mut upload = plan(THREE_CHUNKS);
+    let told = within(uploads::send(
+        &session,
+        &route,
+        &target(),
+        &mut upload,
+        TTL,
+        &unwatched(),
+    ))
+    .await
+    .expect_err("the upload ends with the sign-out");
+    assert!(
+        ended.load(Ordering::Acquire),
+        "the sign-out came with the status read"
+    );
+    assert!(
+        matches!(told, ClientError::Host(_)),
+        "the caller is told the account's reason and not that the connection ended: {told}"
+    );
+    assert_eq!(told.code(), ErrorCode::LeaseLost);
+    session.close();
+    serving.abort();
+}
+
+/// A finish the host answers that the outcome is not known is read from the status once. Where the
+/// status does not say the upload is published, the answer stands: the send ends with it after one
+/// finish and one status read, and sends no second finish by itself. The caller's next send reads the
+/// status again and finishes, and the handle comes back.
+#[tokio::test]
+async fn a_finish_the_status_does_not_show_published_ends_the_send_with_the_hosts_answer() {
+    let script = Script::new(true);
+    script.finish_unknown_once.store(true, Ordering::Release);
+    *script.state.lock().expect("the script") = UploadState::Publishing;
+    let pair = pair(Arc::clone(&script)).await;
+    let route = ChunkRoute::network(&pair.session, environment())
+        .await
+        .expect("a route");
+    let mut upload = plan(THREE_CHUNKS);
+    let at = target();
+    let progress = unwatched();
+
+    let told = within(uploads::send(
+        &pair.session,
+        &route,
+        &at,
+        &mut upload,
+        TTL,
+        &progress,
+    ))
+    .await
+    .expect_err("the host cannot say what became of the finish, and the status shows no handle");
+    assert_eq!(told.code(), ErrorCode::OutcomeUnknown, "{told}");
+    script.seen(|seen| {
+        assert_eq!(seen.finishes, 1, "no second finish went by itself");
+        assert_eq!(seen.status_reads, 1, "the status was read once");
+    });
+
+    let handle = within(uploads::send(
+        &pair.session,
+        &route,
+        &at,
+        &mut upload,
+        TTL,
+        &progress,
+    ))
+    .await
+    .expect("the next send reads the status, finishes and returns the handle");
+    assert_eq!(Some(handle.transfer_id), upload.transfer_id().copied());
+    script.seen(|seen| {
+        assert_eq!(seen.finishes, 2);
+        assert_eq!(seen.status_reads, 2);
+    });
 }

@@ -409,12 +409,15 @@ that stands idle for less, so a stream held through the wait would be dead when 
 it. A lane that waits holds no stream and none of the connection's four transfer slots: one that
 has carried a chunk finishes its stream before the wait, between two calls, so the host reads a
 clean end, and opens another for the call once it has its window. The failures of an open come
-back from the call that makes it. A lane that holds no stream learns that the connection ended from
-`StreamOpener::revoked()`, which resolves when the connection's streams are revoked, and a lane
-that holds one watches its own stream.
+back from the call that makes it. A lane waits for a window only while it holds no stream, so that
+wait learns that the connection ended from `StreamOpener::revoked()`, which resolves when the
+connection's streams are revoked; a lane that holds a stream sees the connection end in its own
+call.
 The lane asks the transport whether this device ended the connection, as a sign-out does, before
 each chunk and on every way out of a call or a wait, and stops with the reason the transport
-recorded.
+recorded. `uploads::send` gives that reason in place of `ConnectionEnded` wherever in the send the
+connection ends; a reservation or publication that was sent and unanswered when it ended stays
+`SubmissionUncertain`, and the caller asks the transport for the reason as well.
 
 The client bounds every wait on the host, because its stream registry holds no deadlines. The open
 of the stream, which waits for the host's stream credit while it holds one of the connection's four

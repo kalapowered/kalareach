@@ -674,9 +674,13 @@ struct Unconditional {}
 ///   once more on a new lane, whose window the host has just issued, after the same status read. A
 ///   second such refusal in a row is the host's answer and ends the upload.
 /// * A connection this device ended, as a sign-out does, ends the send with the reason the
-///   transport recorded (`ControlTransport::ended_by_this_device`), whatever code the lane saw:
-///   the reason can carry `PERMISSION_DENIED`, which only a host's answer to a chunk means a window
-///   refused.
+///   transport recorded (`ControlTransport::ended_by_this_device`) in place of
+///   [`ClientError::ConnectionEnded`], wherever in the send the connection ends: a lane's failure,
+///   the status read, a call that found the session ended. The reason can carry
+///   `PERMISSION_DENIED`, which only a host's answer to a chunk means a window refused. A
+///   reservation or publication that was sent and unanswered when the connection ended stays
+///   [`ClientError::SubmissionUncertain`], which names the action; the caller asks the transport
+///   for the reason as well.
 /// * A finish the host answers `OUTCOME_UNKNOWN`, as it does a device that may not view the session
 ///   of a session-bound upload though the upload is published, is read from `upload.status` once.
 ///   When that says published, the send returns the handle, and no second finish is sent;
@@ -689,10 +693,29 @@ struct Unconditional {}
 /// # Errors
 ///
 /// Returns [`ClientError::SubmissionUncertain`] when the session ended with a reservation or a
-/// publication unanswered, a refusal the host decided under its own code, the last failure once
-/// the retries are spent, and the plan's refusal when the host's status says the upload was
-/// cancelled, invalidated or expired.
+/// publication unanswered, the reason this device ended the connection when it did,
+/// [`ClientError::ConnectionEnded`] when the host or the network did, a refusal the host decided
+/// under its own code, the last failure once the retries are spent, and the plan's refusal when the
+/// host's status says the upload was cancelled, invalidated or expired.
 pub async fn send(
+    session: &Session,
+    route: &ChunkRoute,
+    target: &ActionTarget,
+    plan: &mut Upload,
+    requested_ttl: DurationMs,
+    progress: &watch::Sender<Progress>,
+) -> Result<AttachmentHandle> {
+    match drive(session, route, target, plan, requested_ttl, progress).await {
+        Err(ClientError::ConnectionEnded) => Err(session
+            .transport()
+            .ended_by_this_device()
+            .map_or(ClientError::ConnectionEnded, ClientError::Host)),
+        done => done,
+    }
+}
+
+/// The upload's calls, in order, until the handle or the first failure the driver does not retry.
+async fn drive(
     session: &Session,
     route: &ChunkRoute,
     target: &ActionTarget,
