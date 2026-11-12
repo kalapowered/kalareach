@@ -440,6 +440,16 @@ impl Stage {
     }
 }
 
+/// What ends the refusal of a volume that the installation does not use: the layout is not
+/// supported, and the words direct no change to a folder that other programs share. `known` names
+/// the system's known folder that must lie on a fixed, local NTFS volume.
+#[must_use]
+pub fn volume_layout(known: &str) -> String {
+    format!(
+        "This layout is not supported: the setup program installs only where the system's {known} folder is on a fixed, local NTFS volume, and it directs no change to a folder that other programs share. Run it on a computer where that folder is on such a volume, then run the setup program again."
+    )
+}
+
 /// The refusal of a folder above the data directory or the program directory, up to the volume's
 /// root: the folder, the tree below it, why it is refused and what to do. Nothing is removed or
 /// moved: a folder with other things in it is not the installation's to remove, and a link or a
@@ -463,12 +473,18 @@ pub fn ancestor_refusal(
             "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread. {changes} The setup program installs only in the system's own known folders, and one of them is reached through {folder}: end the substitution or redirection of that letter, or give the known folder a place on a volume's own root, then run the setup program again."
         ),
         AncestorFault::Volume(reason) => match tree {
-            Tree::Data => format!(
-                "{folder} is a folder above the boundary's {below}. It is on a volume that the installation does not use ({reason}): it keeps its data directory on a fixed, local NTFS volume, and nothing in {folder} can be corrected to make another volume one. {changes} Move the system's ProgramData folder to such a volume, or install on a computer where it is on one, then run the setup program again."
-            ),
-            Tree::Program => format!(
-                "{folder} is a folder above the boundary's {below}. It is on a volume that the installation does not use ({reason}): it keeps its program directory on a fixed, local NTFS volume, and nothing in {folder} can be corrected to make another volume one. {changes} Do not remove the program directory. Move the system's Program Files folder to such a volume, or install on a computer where it is on one, then run the setup program again."
-            ),
+            Tree::Data => {
+                let layout = volume_layout("ProgramData");
+                format!(
+                    "{folder} is a folder above the boundary's {below}. It is on a volume that the installation does not use ({reason}): it keeps its data directory on a fixed, local NTFS volume, and nothing in {folder} can be corrected to make another volume one. {changes} {layout}"
+                )
+            }
+            Tree::Program => {
+                let layout = volume_layout("Program Files");
+                format!(
+                    "{folder} is a folder above the boundary's {below}. It is on a volume that the installation does not use ({reason}): it keeps its program directory on a fixed, local NTFS volume, and nothing in {folder} can be corrected to make another volume one. {changes} Do not remove the program directory. {layout}"
+                )
+            }
         },
         AncestorFault::Link => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The system's default places have none. The setup program installs only in the system's own known folders and cannot be pointed at another path, and it directs no change to a folder that other programs share: run it on a computer where its known folders are plain folders."

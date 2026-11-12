@@ -2272,6 +2272,8 @@ fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of
         assert!(text.contains(r"Y:\ is a folder above"), "{text}");
         assert!(!text.contains("Make the Administrators group"), "{text}");
         assert!(!text.contains("Close the program"), "{text}");
+        assert!(text.contains("This layout is not supported"), "{text}");
+        assert!(!text.contains("Move "), "{text}");
         assert!(
             text.contains("Do not remove the program directory"),
             "{text}"
