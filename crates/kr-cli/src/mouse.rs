@@ -88,7 +88,7 @@ pub enum Reading {
     /// changes nothing. Nothing is written after it, because a current worker's screen resets
     /// before it sets. A worker of an earlier build also writes the encoding entries in numeric
     /// order (`?1005h ?1006l`), which leaves Terminal.app and iTerm at the default until the
-    /// application writes next, as it did.
+    /// application sets or resets a mouse encoding, or the next restoration, as it did.
     Restoration,
     /// What this command drew from the session's screen: read as a terminal reads it, and nothing
     /// is written after it.
@@ -128,11 +128,21 @@ pub const RESTORATION_CHUNK: usize = 256 * 1024;
 /// the cursor the first one carried. A frame that is shorter ends it, and so does one at another
 /// cursor.
 ///
+/// The two readings differ in what is written after the output as well as in what a reset of a
+/// tracking mode that is not on does: a live frame is followed by what puts Terminal.app and iTerm
+/// in the session's encoding, and a frame of a restoration is not. A frame read as the wrong one
+/// leaves its state wrong until the application next sets or resets a mode of that state (a
+/// tracking mode for the console's tracking, an encoding for the terminal's encoding) or the next
+/// restoration puts it right: ordinary output does not.
+///
 /// Named limits: the first live frame can carry the same cursor as the restoration's, so when the
-/// restoration is a whole number of chunks long, that one live frame is read as part of it. The
-/// frames of a side effect (an operating-system command or a bell, written by the worker's
-/// `send_effect`) carry the cursor of their cause, so after such a restoration they read as part of
-/// it too; none of them holds a mode setting, and the reading differs only for tracking resets.
+/// restoration is a whole number of chunks long, that one live frame is read as part of it. A
+/// bridge that drops the short last frame of a restoration (the frame that ends it) does the same
+/// to the next live frame, which carries the cursor the restoration carried, until the restoration
+/// that follows the resync marker the bridge leaves. The frames of a side effect (an
+/// operating-system command or a bell, written by the worker's `send_effect`) carry the cursor of
+/// their cause, so after such a restoration they read as part of it too; none of them holds a mode
+/// setting, so the reading changes no mouse state for them.
 #[derive(Debug, Default)]
 pub struct Restoration {
     /// The cursor the next frame carries if it continues the restoration.

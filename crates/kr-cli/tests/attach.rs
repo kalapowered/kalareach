@@ -886,7 +886,9 @@ fn mouse_tracking(stream: &[u8]) -> Option<u16> {
 /// 1005 and 1006 as independent booleans, or that took the last one that was set, would not notice
 /// a replay in the wrong order. xterm differs (a reset of a mode that is not in force changes
 /// nothing there), and Terminal.app ignores 1016, so this is a model of the two terminals the
-/// replay was shown in and not of every terminal.
+/// replay was shown in and not of every terminal. It takes 1016 as iTerm does, which Terminal.app
+/// does not: that changes no case here, because the session never forwards 1015 or 1016 and the
+/// streams these cases read, which end before the guard writes its reset block, name neither.
 fn mouse_encoding(stream: &[u8]) -> Option<u16> {
     let mut encoding = None;
     let stream = without_padding(stream);
