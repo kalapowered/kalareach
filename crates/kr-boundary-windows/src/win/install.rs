@@ -1830,8 +1830,10 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
         }
         let attributes = attributes_of(&handle, "a folder above the program directory")
             .map_err(|error| unreadable(&error))?;
+        // These folders are the boundary's own, from the top of its tree down: a link in one of
+        // them is not a known folder that another computer would have plain.
         if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(refuse(Fault::Link));
+            return Err(refuse(Fault::OwnLink));
         }
         if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(refuse(Fault::NotAFolder));
@@ -1840,7 +1842,7 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
         // folder or an alias above it would lead somewhere else.
         let found = final_path_of(&handle).map_err(|error| unreadable(&error))?;
         if !remedy::is_the_place_asked_for(&shown, &found) {
-            return Err(refuse(Fault::Link));
+            return Err(refuse(Fault::OwnLink));
         }
         if let Some(why) =
             acl::changeable_by_others_on(&handle, false).map_err(|error| unreadable(&error))?

@@ -799,7 +799,7 @@ fn a_prior_record_made_after_the_inspection_is_left_and_named() {
     assert!(paths.prior.exists(), "what appeared stays");
     assert!(paths.manifest.exists(), "the manifest stays with it");
     // The service was not touched, and the last words say that it was not put back and that the next
-    // removal does it.
+    // removal inspects the record again.
     assert_eq!(
         appid_state(),
         (start, running),
@@ -810,7 +810,7 @@ fn a_prior_record_made_after_the_inspection_is_left_and_named() {
         "{text}"
     );
     assert!(
-        text.contains("the next removal reads the record and does it"),
+        text.contains("the next removal inspects the record again"),
         "{text}"
     );
 }

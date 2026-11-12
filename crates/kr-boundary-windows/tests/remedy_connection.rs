@@ -49,8 +49,15 @@ fn a_hello_that_failed_for_another_reason_does_not_name_other_sessions() {
 #[test]
 fn a_busy_pipe_names_other_elevated_sessions_only_for_the_administrators_pipe() {
     let administrators = busy_pipe(10, true);
+    // The words claim only what the open saw: no instance of the pipe listened. Every connection
+    // that the broker serves may be in use, or the broker may have failed to make the next
+    // instance, and the words do not say which.
     assert!(
-        administrators.contains("every connection the broker serves was in use for 10 seconds"),
+        administrators.contains("no instance of it was listening for 10 seconds"),
+        "{administrators}"
+    );
+    assert!(
+        !administrators.contains("every connection"),
         "{administrators}"
     );
     assert!(
@@ -59,9 +66,10 @@ fn a_busy_pipe_names_other_elevated_sessions_only_for_the_administrators_pipe() 
     );
     let persons = busy_pipe(10, false);
     assert!(
-        persons.contains("every connection the broker serves was in use for 10 seconds"),
+        persons.contains("no instance of it was listening for 10 seconds"),
         "{persons}"
     );
+    assert!(!persons.contains("every connection"), "{persons}");
     assert!(!persons.contains("elevated sessions"), "{persons}");
     for text in [administrators, persons] {
         assert!(
