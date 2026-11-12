@@ -4261,6 +4261,10 @@ test.describe('a new session and its shell', () => {
     await expect(page.getByTestId('sheet')).toBeHidden({ timeout: PRESENTATION_DEADLINE })
     await still(page, 'shell-status-session-07.21')
 
+    // The message that says the session started is still due to go, and it goes from the sheet the
+    // settings open in: the sheet shrinks by the room the message had and everything in it moves
+    // down. A press aimed at a control while that happens is released on what the move left there.
+    await expect(page.locator('.toast')).toHaveCount(0, { timeout: PRESENTATION_DEADLINE })
     await page.getByTestId('open-settings').click()
     await page.getByRole('button', { name: 'This session' }).click()
     await expect(page.getByTestId('session-shell')).toContainText('Stock shell, /bin/zsh')
