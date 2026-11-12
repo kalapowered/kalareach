@@ -314,6 +314,11 @@ pub const MAX_RESPONSE_METHODS: usize = 8;
 /// How many routes of each kind one observation may name.
 pub const MAX_OBSERVED_ROUTES: usize = 8;
 
+/// How many conditions one selection route may state, and how many values one condition may list.
+///
+/// The host tests a request against them as it forwards it, so the cost of the test is fixed.
+pub const MAX_REQUEST_CONDITIONS: usize = 8;
+
 /// Where an answer goes when the application reads it as the response to the request it asked.
 ///
 /// An application server that asks its client for a decision reads the answer as the response to

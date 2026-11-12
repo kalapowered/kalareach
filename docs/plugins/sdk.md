@@ -24,7 +24,10 @@ place may hold. A request that meets every condition starts a thread that the te
 so the host does not take the thread its reply names as the one the terminal is in. A route with no
 `hidden_when`, or an empty one, means what it meant before. A package whose table states the member
 declares `"sdk_range": ">=0.1.7, <0.2.0"`, and the package check refuses a table that carries the
-member under a range that admits an earlier SDK version.
+member under a range that admits an earlier SDK version. It also refuses a table whose route states
+more than eight conditions, whose condition names a place of no segment or of more than eight, or
+whose condition lists no value or more than eight, with a finding of its own: such a table is never
+read as one that states no condition.
 
 A host tests a package's `sdk_range` before it reads the package's connector table or presentation,
 and refuses a package whose range excludes its SDK version with that finding alone. A host built
