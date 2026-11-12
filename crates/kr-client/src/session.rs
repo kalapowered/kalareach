@@ -945,7 +945,13 @@ impl Session {
             method_version: version,
             params: params.clone(),
         };
-        self.transport.send(&ControlFrame::Request(request)).await?;
+        // A write that fails after the host refused the connection is answered as the calls that
+        // were waiting are: the waiter holds the refusal, and the host decided nothing else.
+        if let Err(error) = self.transport.send(&ControlFrame::Request(request)).await
+            && !self.connection_was_refused()
+        {
+            return Err(error);
+        }
 
         match waiter.wait().await? {
             Answer::Response(response) => match response.outcome {
@@ -1187,9 +1193,10 @@ impl Session {
             Some(sent),
         )?;
         drop(outcomes);
-        if self.transport.send(&frame).await.is_err() {
+        if self.transport.send(&frame).await.is_err() && !self.connection_was_refused() {
             // The frame may or may not have reached the host, so the action stays on the pending
-            // list and the caller is told the outcome is unknown.
+            // list and the caller is told the outcome is unknown. A host that refused the
+            // connection decided nothing of it: the waiter holds that refusal.
             return Err(ClientError::SubmissionUncertain { action_id });
         }
 
@@ -1477,6 +1484,9 @@ impl Session {
                 self.state.outcomes.lock().await.settle_action(action_id);
                 return Err(ClientError::Withheld);
             }
+            // A host that refused the connection decided nothing of the request: the waiter holds
+            // that refusal.
+            Err(_) if self.connection_was_refused() => {}
             Err(_) => return Err(ClientError::SubmissionUncertain { action_id }),
         }
         match waiter.wait().await {
@@ -1578,7 +1588,11 @@ impl Session {
             method_version: entry.version,
             params: ParamsValue::from_typed(params)?,
         };
-        self.transport.send(&ControlFrame::Request(request)).await?;
+        if let Err(error) = self.transport.send(&ControlFrame::Request(request)).await
+            && !self.connection_was_refused()
+        {
+            return Err(error);
+        }
         match waiter.wait().await? {
             Answer::Response(response) => match response.outcome {
                 Outcome::Ok(value) => Ok(value.to_typed()?),
@@ -1620,6 +1634,12 @@ impl Session {
         let mut ended = self.state.ended.subscribe();
         // The value is read once the subscription exists, so an end that came first is not missed.
         let _ = ended.wait_for(|ended| *ended).await;
+    }
+
+    /// Whether the host has refused the connection: a call whose own write failed is then answered
+    /// with that refusal, which the reader has already given every waiting call.
+    fn connection_was_refused(&self) -> bool {
+        self.state.waiters().refusal.is_some()
     }
 
     /// Resolves when the host refuses a request on this connection as not permitted, except a read

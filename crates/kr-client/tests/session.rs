@@ -3333,6 +3333,153 @@ async fn a_refusal_the_host_gives_at_connection_reaches_the_session_with_its_cod
     serving.abort();
 }
 
+/// A transport whose writes are held until released and then fail, and whose reader delivers the
+/// host's refusal of the connection when it is told to: a host that refused the connection and
+/// closed it while a call's own write was still under way.
+#[derive(Debug, Default)]
+struct HeldWrite {
+    /// Told when a write has started and waits.
+    write_started: tokio::sync::Notify,
+    /// Releases the held write, which then fails.
+    release_write: tokio::sync::Notify,
+    /// Has the reader deliver the refusal, and then the end of the stream.
+    deliver_refusal: tokio::sync::Notify,
+    delivered: std::sync::atomic::AtomicBool,
+}
+
+impl kr_client::transport::ControlTransport for HeldWrite {
+    fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
+        kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([42; 16]))
+    }
+
+    fn limits(&self) -> kr_protocol::hello::ReceiveLimits {
+        kr_protocol::hello::ReceiveLimits::default()
+    }
+
+    fn initial_action_window(&self) -> kr_protocol::hello::ActionWindow {
+        kr_protocol::hello::ActionWindow {
+            action_window_id: kr_protocol::ids::ActionWindowId::new("window-1")
+                .expect("a literal window identifier"),
+            connection_id: self.connection_id(),
+            boot_epoch: BootEpoch::new(1),
+            issued_at_ms: TimestampMs::new(0),
+            valid_for_ms: DurationMs::new(60_000),
+        }
+    }
+
+    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        None
+    }
+
+    fn send<'a>(
+        &'a self,
+        _frame: &'a ControlFrame,
+    ) -> kr_client::transport::TransportFuture<'a, ()> {
+        Box::pin(async move {
+            self.write_started.notify_one();
+            self.release_write.notified().await;
+            Err(ClientError::ConnectionEnded)
+        })
+    }
+
+    fn claim_receiver(&self) -> kr_client::error::Result<()> {
+        Ok(())
+    }
+
+    fn recv(&self) -> kr_client::transport::TransportFuture<'_, Option<ControlFrame>> {
+        Box::pin(async move {
+            if self.delivered.swap(true, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.deliver_refusal.notified().await;
+            Ok(Some(ControlFrame::Response(Response {
+                request_id: kr_protocol::ids::RequestId::new(0),
+                outcome: Outcome::Error(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this connection is refused",
+                )),
+            })))
+        })
+    }
+
+    fn revoke_streams(&self) {}
+
+    fn close(&self) {}
+}
+
+/// Starts a session over a transport whose first write is held, makes `call` on it, and, with the
+/// write still held, has the host's refusal of the connection arrive and end the session. Then the
+/// write is released and fails. Returns what the call answered.
+async fn call_whose_write_fails_after_the_refusal<T, F, Fut>(call: F) -> kr_client::error::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<Session>) -> Fut,
+    Fut: std::future::Future<Output = kr_client::error::Result<T>> + Send + 'static,
+{
+    let transport = Arc::new(HeldWrite::default());
+    let session = Arc::new(Session::start(transport.clone()).expect("a session"));
+    let calling = tokio::spawn(call(Arc::clone(&session)));
+    tokio::time::timeout(Duration::from_secs(10), transport.write_started.notified())
+        .await
+        .expect("the call's write started");
+    transport.deliver_refusal.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), session.closed())
+        .await
+        .expect("the session ends with the refusal");
+    transport.release_write.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), calling)
+        .await
+        .expect("the call ends")
+        .expect("the call's task")
+}
+
+/// KR-REQ-19.08: a call whose own write fails after the host's refusal of the connection arrived is
+/// answered with that refusal, as a call that was waiting and one made later are, and not with the
+/// transport's failure. The write is held while the refusal arrives, which a call made after the
+/// session ended cannot show.
+#[tokio::test]
+async fn a_read_whose_write_fails_after_the_refusal_is_answered_with_it() {
+    let error = call_whose_write_fails_after_the_refusal(|session| async move {
+        session
+            .read::<_, SessionList>(Method::SessionList, &Empty {})
+            .await
+    })
+    .await
+    .expect_err("the host refused the connection");
+    assert!(
+        matches!(&error, ClientError::Host(refusal)
+            if refusal.code == ErrorCode::PermissionDenied
+                && refusal.message == "this connection is refused"),
+        "the refusal, not the failed write: {error:?}"
+    );
+}
+
+/// KR-REQ-19.08: a mutation whose write fails after the refusal is answered with the refusal and not
+/// with an outcome that is unknown: the host refused the connection, so nothing was submitted on it.
+#[tokio::test]
+async fn a_mutation_whose_write_fails_after_the_refusal_is_answered_with_it() {
+    let error = call_whose_write_fails_after_the_refusal(|session| async move {
+        session
+            .mutate(
+                Method::SessionCreate,
+                ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+                None,
+                &Empty {},
+                &Empty {},
+                DurationMs::new(120_000),
+            )
+            .await
+            .map(|_| ())
+    })
+    .await
+    .expect_err("the host refused the connection");
+    assert!(
+        !matches!(error, ClientError::SubmissionUncertain { .. }),
+        "the host refused the connection, so nothing was submitted on it: {error:?}"
+    );
+    assert_eq!(error.code(), ErrorCode::PermissionDenied);
+}
+
 /// A connection the caller opened itself, as a client that has a session's worker prove its key
 /// before anything else crosses the connection does, carries the same session a connection the
 /// library opened carries: the host's own stamp of the caller, and reads and mutations over it.
