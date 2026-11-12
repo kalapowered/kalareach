@@ -121,7 +121,7 @@ const CANCEL_GRACE_MS: u32 = 100;
 /// shows what the connection does then.
 #[cfg(feature = "testing")]
 pub mod testing {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     static SKIP_NEXT_CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -136,16 +136,21 @@ pub mod testing {
         SKIP_NEXT_CANCEL.swap(false, Ordering::SeqCst)
     }
 
-    static FAIL_NEXT_REFILL: AtomicBool = AtomicBool::new(false);
+    static REFILLS_TO_FAIL: AtomicU32 = AtomicU32::new(0);
 
-    /// Makes the listener's next attempt to make a waiting instance fail, as if the platform had no
-    /// memory for it: the listener must serve the client in hand and try again.
-    pub fn fail_next_refill() {
-        FAIL_NEXT_REFILL.store(true, Ordering::SeqCst);
+    /// Makes the listener's next `count` attempts to make a waiting instance fail, as if the
+    /// platform had no memory for it: after one failure the listener must serve the client in hand
+    /// and try again, and after more than it can bear it must end the service in order.
+    pub fn fail_refills(count: u32) {
+        REFILLS_TO_FAIL.store(count, Ordering::SeqCst);
     }
 
     pub(super) fn take_refill_failure() -> bool {
-        FAIL_NEXT_REFILL.swap(false, Ordering::SeqCst)
+        REFILLS_TO_FAIL
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
     }
 }
 
