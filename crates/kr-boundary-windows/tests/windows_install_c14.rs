@@ -1,0 +1,288 @@
+//! Guest cases for the removal that deletes nothing in a directory that its own inspection did not
+//! approve, and for the refusals that read an entry's own handle also where the layout gives no
+//! name or gives another kind of object. They run only in a disposable Windows guest, as SYSTEM,
+//! like the cases of `windows_install.rs`.
+
+#![cfg(all(windows, feature = "testing"))]
+#![allow(unsafe_code)]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use kr_boundary_windows::manifest::{Manifest, ObjectKind};
+use kr_boundary_windows::win::install::{self, DataChild, Paths};
+use kr_boundary_windows::win::{acl, sd};
+
+fn inherited_folder() -> PathBuf {
+    let folder = std::env::temp_dir().join(format!(
+        "krparent-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    owned_dir(&folder);
+    folder
+}
+
+fn give_to(path: &Path, who: &str) {
+    let done = Command::new("icacls")
+        .arg(path)
+        .args(["/setowner", who])
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "{done:?}");
+}
+
+fn owned_dir(path: impl AsRef<Path>) {
+    std::fs::create_dir(path.as_ref()).unwrap();
+    give_to(path.as_ref(), "*S-1-5-32-544");
+}
+
+fn owned_file(path: impl AsRef<Path>, bytes: &[u8]) {
+    std::fs::write(path.as_ref(), bytes).unwrap();
+    give_to(path.as_ref(), "*S-1-5-32-544");
+}
+
+fn junction(link: &Path, target: &Path) {
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+}
+
+fn paths_in(folder: &Path) -> Paths {
+    paths_at(folder, folder.join("Boundary"))
+}
+
+/// The program directory beside `folder`, which is also the top the program directory's parents are
+/// checked from, and the data directory where `data` says.
+fn paths_at(folder: &Path, data: PathBuf) -> Paths {
+    let program = folder.join("Program");
+    Paths {
+        git: program.join("git"),
+        program_top: folder.to_owned(),
+        program,
+        staging: data.join("staging"),
+        journal: data.join("journal"),
+        run: data.join("run"),
+        manifest: data.join("manifest.json"),
+        prior: data.join("prior.json"),
+        data,
+    }
+}
+
+fn parent_of(folder: &Path) {
+    acl::set_protected(
+        folder,
+        &sd::descriptor(sd::SdKind::DataParent, &sd::Principals::default()).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A data directory with its manifest and its three directories, as an installation leaves it.
+fn installed_data_directory(paths: &Paths) {
+    let mut holds = install::make_data_directory(paths).unwrap();
+    holds.protect().unwrap();
+    let mut manifest = Manifest::begin();
+    for path in [&paths.data, &paths.staging, &paths.journal, &paths.run] {
+        manifest.record(ObjectKind::Directory, &path.display().to_string(), None);
+    }
+    manifest.save(&paths.manifest).unwrap();
+    for which in [DataChild::Staging, DataChild::Journal, DataChild::Run] {
+        holds.directory(which).unwrap();
+    }
+}
+
+fn refusal(paths: &Paths) -> String {
+    install::make_data_directory(paths)
+        .expect_err("the directory is refused")
+        .to_string()
+}
+
+fn moved_aside(text: &str) {
+    assert!(text.contains("Move it aside"), "{text}");
+    assert!(text.contains("out of the data directory"), "{text}");
+    assert!(!text.contains("Remove "), "{text}");
+    assert!(!text.contains("Correct what the reason names"), "{text}");
+}
+
+/// A directory with files in it, standing for what a link at a name would let a deletion reach.
+fn bait() -> PathBuf {
+    let target = inherited_folder();
+    owned_file(target.join("prior.json"), b"{}");
+    owned_file(target.join("manifest.json"), b"{}");
+    owned_dir(target.join("staging"));
+    owned_file(target.join("staging").join("keep.txt"), b"x");
+    target
+}
+
+fn bait_is_whole(target: &Path) {
+    assert!(target.join("prior.json").exists());
+    assert!(target.join("manifest.json").exists());
+    assert!(target.join("staging").join("keep.txt").exists());
+}
+
+/// Where the data directory's parent was found absent, anything that is at the data directory's name
+/// by the time the removal looks again was made by nobody it checked: the removal refuses, says so,
+/// and deletes none of the recognised files, nor `staging` and what is under it, in either mode.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
+    let folder = inherited_folder();
+    parent_of(&folder);
+    let top = folder.join("KalaReach");
+    let paths = paths_at(&folder, top.join("Boundary"));
+    for quiet in [true, false] {
+        let data = paths.data.clone();
+        install::testing::after_the_removal_inspects_the_data_directory(move || {
+            std::fs::create_dir_all(data.join("staging")).unwrap();
+            std::fs::write(data.join("prior.json"), b"{}").unwrap();
+            std::fs::write(data.join("manifest.json"), b"{}").unwrap();
+            std::fs::write(data.join("staging").join("keep.txt"), b"x").unwrap();
+        });
+        let text = install::remove(&paths, quiet)
+            .expect_err("the directory was not approved")
+            .to_string();
+        assert!(
+            text.contains("was not there when the removal looked"),
+            "{text}"
+        );
+        assert!(text.contains("nothing was removed"), "{text}");
+        assert!(paths.prior.exists(), "quiet {quiet}");
+        assert!(paths.manifest.exists(), "quiet {quiet}");
+        assert!(paths.staging.join("keep.txt").exists(), "quiet {quiet}");
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A junction at the data directory's name, made after the parent was checked and the directory was
+/// found absent, is refused the same way, and what it leads to is untouched.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_junction_at_the_data_directorys_name_made_after_the_inspection_is_not_followed() {
+    let folder = inherited_folder();
+    parent_of(&folder);
+    let paths = paths_in(&folder);
+    let target = bait();
+    let (link, to) = (paths.data.clone(), target.clone());
+    install::testing::after_the_removal_inspects_the_data_directory(move || {
+        junction(&link, &to);
+    });
+    let text = install::remove(&paths, false)
+        .expect_err("the junction was not approved")
+        .to_string();
+    assert!(
+        text.contains("was not there when the removal looked"),
+        "{text}"
+    );
+    bait_is_whole(&target);
+    std::fs::remove_dir(&paths.data).unwrap();
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// An empty directory that the inspection approved is removed as it is. What is put in it after the
+/// inspection (a record, `staging` as a junction) is not deleted and not followed: the directory
+/// stays, and the removal says it could not remove it.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn what_is_put_in_an_approved_empty_directory_after_the_inspection_is_not_deleted() {
+    let folder = inherited_folder();
+    parent_of(&folder);
+    let paths = paths_in(&folder);
+    drop(install::make_data_directory(&paths).unwrap());
+    let target = bait();
+    let (prior, staging, to) = (paths.prior.clone(), paths.staging.clone(), target.clone());
+    install::testing::after_the_removal_inspects_the_data_directory(move || {
+        std::fs::write(&prior, b"{}").unwrap();
+        junction(&staging, &to);
+    });
+    let text = install::remove(&paths, false)
+        .expect_err("the directory holds something now")
+        .to_string();
+    assert!(text.contains("the data directory stays because"), "{text}");
+    assert!(paths.prior.exists());
+    bait_is_whole(&target);
+    std::fs::remove_dir(&paths.staging).unwrap();
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A name that the layout does not give is read on its own handle before any remedy: a junction, and
+/// a file of another account's, are moved aside, whether a manifest is there or not and whether the
+/// name is in the data directory or in `staging`; only one that the system's class owns is removed.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_name_that_the_layout_does_not_give_takes_its_remedy_from_its_own_handle() {
+    let folder = inherited_folder();
+    parent_of(&folder);
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let target = bait();
+
+    // A junction at an unlisted name, with a manifest.
+    let stray = paths.data.join("stray");
+    junction(&stray, &target);
+    let text = refusal(&paths);
+    assert!(text.contains("stray"), "{text}");
+    moved_aside(&text);
+    std::fs::remove_dir(&stray).unwrap();
+
+    // A file that another account owns, and then the same file owned by the administrators.
+    owned_file(&stray, b"x");
+    give_to(&stray, "*S-1-5-32-545");
+    moved_aside(&refusal(&paths));
+    give_to(&stray, "*S-1-5-32-544");
+    let text = refusal(&paths);
+    assert!(text.contains("Remove "), "{text}");
+    assert!(text.contains("stay where they are"), "{text}");
+    std::fs::remove_file(&stray).unwrap();
+
+    // A junction inside `staging`.
+    let inside = paths.staging.join("leftover");
+    junction(&inside, &target);
+    moved_aside(&refusal(&paths));
+    std::fs::remove_dir(&inside).unwrap();
+    bait_is_whole(&target);
+
+    // With no manifest in the directory, the first entry is read the same way.
+    let bare = inherited_folder();
+    parent_of(&bare);
+    let bare_paths = paths_in(&bare);
+    drop(install::make_data_directory(&bare_paths).unwrap());
+    junction(&bare_paths.data.join("stray"), &target);
+    moved_aside(&refusal(&bare_paths));
+    std::fs::remove_dir(bare_paths.data.join("stray")).unwrap();
+    bait_is_whole(&target);
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&bare);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// What the layout gives at a name is compared with what the handle shows: a directory at the
+/// earlier-state record's name, and a plain file at the name of a private root that no journal names,
+/// are not the installation's, though the administrators own them. Each is moved aside, not removed.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn an_object_of_another_kind_than_the_layout_gives_at_a_name_is_moved_aside() {
+    let folder = inherited_folder();
+    parent_of(&folder);
+    let paths = paths_in(&folder);
+    drop(install::make_data_directory(&paths).unwrap());
+    owned_dir(&paths.prior);
+    let text = refusal(&paths);
+    assert!(text.contains("prior.json"), "{text}");
+    moved_aside(&text);
+    std::fs::remove_dir(&paths.prior).unwrap();
+    let _ = std::fs::remove_dir_all(&folder);
+
+    let folder = inherited_folder();
+    parent_of(&folder);
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    owned_file(paths.run.join("ab".repeat(16)), b"x");
+    moved_aside(&refusal(&paths));
+    let _ = std::fs::remove_dir_all(&folder);
+}
