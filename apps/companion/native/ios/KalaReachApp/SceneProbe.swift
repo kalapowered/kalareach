@@ -12,7 +12,8 @@
 //  application's own container:
 //
 //    to.kala.reach.scene-probe.report    the process, each scene with its windows and web views, the
-//                                        anchor a sign-in would use, and what the page answers
+//                                        anchor a sign-in would use, and fields of what the page
+//                                        answers that name no person's content (counts and states)
 //    to.kala.reach.scene-probe.cycle     calls the runtime's scene delegate with what the system calls
 //                                        it with when it takes the scene away (`sceneDidDisconnect:`)
 //                                        and, after a pause, gives it back
@@ -120,9 +121,9 @@ enum SceneProbe {
               id: null, expectedRevision: null, sessionId: '8a7b6c50-22bb-4c3d-8e4f-000000000101',
               applicationInstanceId: null, agentBindingRevision: null, state: 'open',
               text: 'a draft kept before the scene went', attachments: [] } });
-            return { saved: JSON.stringify(draft) };
+            return { saved: !!(draft && draft.draft && draft.draft.id) };
             """
-        page(save) { facts in log("draft \(facts)") }
+        page(save) { facts in log("draft saved=\(facts["saved"] ?? "no")") }
     }
 
     /// Asks for the picker the way the page does, which shows it on the view controller the
@@ -159,18 +160,31 @@ enum SceneProbe {
         let all = scenes().flatMap { $0.windows }
         let anchor = all.first { $0.isKeyWindow } ?? all.first
         log("anchor \(anchor.map { String(describing: type(of: $0)) } ?? "none") key=\(anchor?.isKeyWindow ?? false)")
+        // What the page answers is reduced to fields that name no person's content: the call's own state
+        // fields, the pairing step's name, a count of drafts and whether the probe's own draft is
+        // among them, which of the call's controls are on the screen, and the heading when it is one
+        // of the application's fixed ones.
         let facts = """
             const invoke = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
-            const out = { href: location.href, visibility: document.visibilityState, tauri: !!invoke };
-            out.text = ((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ').trim().slice(0, 240);
-            out.buttons = Array.from(document.querySelectorAll('button')).map((b) =>
-              (b.getAttribute('aria-label') || b.innerText || '').trim()).filter(Boolean).slice(0, 24).join(' | ');
-            const ask = async (name) => { try { return JSON.stringify(await invoke(name)); }
-              catch (error) { return 'error: ' + String((error && error.message) || error); } };
+            const out = { visibility: document.visibilityState, tauri: !!invoke };
+            const present = (label) => Array.from(document.querySelectorAll('button')).some((b) =>
+              (b.getAttribute('aria-label') || b.innerText || '').trim() === label);
+            out.controls = ['Mute microphone', 'Stop the voice', 'End session'].filter(present).join(' | ');
+            const known = ['Attention', 'Sessions', 'Hosts', 'Account', 'Voice', 'Voice session'];
+            const heading = (document.querySelector('h1') || {}).innerText || '';
+            out.heading = known.includes(heading.trim()) ? heading.trim() : 'other';
+            const ask = async (name) => { try { return await invoke(name); }
+              catch (error) { return { failed: true }; } };
             if (invoke) {
-              out.call = (await ask('voice_call_state')).slice(0, 400);
-              out.pairing = (await ask('pairing_view')).slice(0, 400);
-              out.drafts = (await ask('device_drafts')).slice(0, 400);
+              const call = await ask('voice_call_state');
+              out.call = ['running', 'setting_up', 'ending', 'capture', 'playing', 'control']
+                .map((key) => key + '=' + String(call && call[key])).join(' ');
+              const pairing = await ask('pairing_view');
+              out.pairing = 'state=' + String(pairing && pairing.state && pairing.state.state);
+              const drafts = await ask('device_drafts');
+              const list = (drafts && drafts.drafts) || [];
+              out.drafts = 'count=' + list.length + ' probe_draft=' +
+                list.some((d) => d.text === 'a draft kept before the scene went');
             }
             return out;
             """
