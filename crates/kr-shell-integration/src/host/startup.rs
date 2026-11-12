@@ -355,6 +355,37 @@ fn ask_with(
     inputs: &[(&str, &str)],
     allowed: std::time::Duration,
 ) -> Option<String> {
+    ask_given(
+        program,
+        arguments,
+        inputs,
+        allowed,
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    )
+}
+
+/// Whether the variables a shell is started with name a per-user runtime directory: the value that
+/// the program's own variables give it, or else the one this process has, and not empty.
+#[cfg(unix)]
+fn names_a_runtime_directory(
+    own: &[(String, String)],
+    inherited: Option<&std::ffi::OsStr>,
+) -> bool {
+    match own.iter().rev().find(|(name, _)| name == "XDG_RUNTIME_DIR") {
+        Some((_, value)) => !value.is_empty(),
+        None => inherited.is_some_and(|value| !value.is_empty()),
+    }
+}
+
+/// [`ask_with`], told the `XDG_RUNTIME_DIR` of this process rather than reading it, so that a test
+/// can ask with the variable unset.
+fn ask_given(
+    program: &PowerShell,
+    arguments: &[&str],
+    inputs: &[(&str, &str)],
+    allowed: std::time::Duration,
+    inherited_runtime_directory: Option<&std::ffi::OsStr>,
+) -> Option<String> {
     // A directory of this call's own, created rather than opened and owner-only where the platform
     // has modes. `/tmp` is shared: a name another account can guess is a name it can pre-create,
     // and a file opened through it is a file this host writes on somebody else's behalf.
@@ -412,6 +443,25 @@ fn ask_with(
     command
         .env("XDG_CACHE_HOME", directory.join("cache"))
         .env("XDG_DATA_HOME", directory.join("data"));
+    // The .NET 11 runtime of PowerShell keeps its shared memory under the per-user runtime
+    // directory and, where none is set, in a `.dotnet` directory of the home. A session on most
+    // Linux systems has one and a macOS session has none, so a question asked there would leave
+    // that directory in the person's home. A runtime directory that is set is passed on as it
+    // stands; where there is none, this call's own directory has one, owner-only, which leaves with
+    // it. The answer does not depend on it.
+    #[cfg(unix)]
+    {
+        if !names_a_runtime_directory(&program.environment, inherited_runtime_directory) {
+            let own = directory.join("runtime");
+            if builder.create(&own).is_err() {
+                let _ = std::fs::remove_dir_all(&directory);
+                return None;
+            }
+            command.env("XDG_RUNTIME_DIR", own);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = inherited_runtime_directory;
     let started = command.spawn();
     let mut child = match started {
         Ok(child) => child,
@@ -2784,6 +2834,160 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&earlier).expect("reads"),
             format!("{body}{theirs}")
+        );
+    }
+
+    /// What a question puts at its program's `XDG_RUNTIME_DIR`: a program that prints the variable
+    /// and the permissions of the directory it names.
+    #[cfg(unix)]
+    fn what_a_question_gives_its_runtime_directory(
+        own: &[(&str, &str)],
+        inherited: Option<&str>,
+    ) -> (String, String, bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("a directory");
+        let program = root.path().join("shell");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' \"$XDG_RUNTIME_DIR\"\nls -ld \"$XDG_RUNTIME_DIR\" | cut -c1-10\n",
+        )
+        .expect("writes");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("an executable");
+        let shell = PowerShell {
+            executable: program,
+            environment: own
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+        };
+        let said = ask_given(
+            &shell,
+            &[],
+            &[],
+            ASK_DEADLINE,
+            inherited.map(std::ffi::OsStr::new),
+        )
+        .expect("the program answers");
+        let mut lines = said.lines();
+        let directory = lines.next().expect("the variable").to_owned();
+        let mode = lines.next().unwrap_or_default().to_owned();
+        let remains = Path::new(&directory).exists();
+        (directory, mode, remains)
+    }
+
+    /// A question asked of a shell where no per-user runtime directory is set gives it one of the
+    /// call's own, owner-only, that is gone when the question has been answered; one that is set is
+    /// passed on as it stands.
+    #[cfg(unix)]
+    #[test]
+    fn a_question_is_given_a_runtime_directory_only_where_none_is_set() {
+        for (own, inherited) in [
+            (vec![], None),
+            (vec![], Some("")),
+            (vec![("XDG_RUNTIME_DIR", "")], Some("/run/user/1000")),
+        ] {
+            let (directory, mode, remains) =
+                what_a_question_gives_its_runtime_directory(&own, inherited);
+            assert!(
+                Path::new(&directory).starts_with(std::env::temp_dir()),
+                "{own:?} {inherited:?}: {directory} is not under the temporary area"
+            );
+            assert_eq!(mode, "drwx------", "{own:?} {inherited:?}");
+            assert!(
+                !remains,
+                "{own:?} {inherited:?}: {directory} is left behind"
+            );
+        }
+        for (own, inherited) in [
+            (vec![], Some("/run/user/1000")),
+            (vec![("XDG_RUNTIME_DIR", "/run/user/7")], None),
+            (vec![("XDG_RUNTIME_DIR", "/run/user/7")], Some("")),
+        ] {
+            let (directory, _, _) = what_a_question_gives_its_runtime_directory(&own, inherited);
+            let named = own
+                .first()
+                .map_or_else(|| inherited.unwrap(), |(_, value)| value);
+            assert_eq!(directory, named, "{own:?} {inherited:?}");
+        }
+    }
+
+    /// The question that names a profile is answered from the home and `XDG_CONFIG_HOME`, whatever
+    /// runtime directory the shell is given, and asking it leaves the home as it was: the .NET 11
+    /// runtime makes a `.dotnet` directory in a home when it has no runtime directory to use.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn a_profile_question_leaves_the_home_as_it_was_whatever_runtime_directory_it_has() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let shell = powershell_on_path().expect("a PowerShell");
+        let mut answers = Vec::new();
+        for given in [false, true] {
+            let root = tempfile::tempdir().expect("a directory");
+            let home = root.path().join("home");
+            std::fs::create_dir(&home).expect("a home");
+            let runtime = root.path().join("run");
+            std::fs::create_dir(&runtime).expect("a runtime directory");
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+                .expect("owner-only");
+            let layout = HomeLayout {
+                home: home.clone(),
+                zdotdir: None,
+                xdg_config_home: Some(home.join(".config")),
+                powershell: Some(PowerShell {
+                    executable: shell.executable.clone(),
+                    environment: vec![
+                        ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+                        (
+                            "XDG_CONFIG_HOME".to_owned(),
+                            home.join(".config").to_string_lossy().into_owned(),
+                        ),
+                        (
+                            "XDG_RUNTIME_DIR".to_owned(),
+                            if given {
+                                runtime.to_string_lossy().into_owned()
+                            } else {
+                                String::new()
+                            },
+                        ),
+                    ],
+                }),
+            };
+            let (all_hosts, current_host) = layout
+                .powershell_profiles()
+                .expect("PowerShell names its profiles");
+            let held: Vec<_> = std::fs::read_dir(&home)
+                .expect("the home reads")
+                .map(|entry| entry.expect("an entry").file_name())
+                .collect();
+            assert!(
+                held.is_empty(),
+                "a runtime directory {}: the question left {held:?} in the home",
+                if given { "given" } else { "not given" }
+            );
+            answers.push((
+                all_hosts
+                    .strip_prefix(&home)
+                    .expect("under the home")
+                    .to_owned(),
+                current_host
+                    .strip_prefix(&home)
+                    .expect("under the home")
+                    .to_owned(),
+            ));
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "the answer depends on the runtime directory"
+        );
+        assert_eq!(
+            answers[0],
+            (
+                PathBuf::from(".config/powershell/profile.ps1"),
+                PathBuf::from(".config/powershell/Microsoft.PowerShell_profile.ps1")
+            )
         );
     }
 
