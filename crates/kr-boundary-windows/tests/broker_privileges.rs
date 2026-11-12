@@ -448,6 +448,12 @@ fn status(connection: &mut Connection) -> Option<Response> {
 /// An administrator connection stays open while a thread fails to give a privilege back: the open
 /// connection is not served again, and no new one is.
 fn nothing_is_served_after(failure: fn()) {
+    if !runs_as_the_system() {
+        eprintln!(
+            "SKIPPED: not run under this token: the service's pipe is made and served by the system"
+        );
+        return;
+    }
     privilege::testing::stand_in_for_the_process_end();
     let served = Served::start();
     let mut open = served.connect();

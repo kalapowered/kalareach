@@ -164,6 +164,9 @@ fn bait_is_whole(target: &Path) {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
+    if needs_the_system() {
+        return;
+    }
     let _hook = NoHook;
     let folder = inherited_folder();
     parent_of(&folder);
@@ -197,6 +200,9 @@ fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_junction_at_the_data_directorys_name_made_after_the_inspection_is_not_followed() {
+    if needs_the_system() {
+        return;
+    }
     let _hook = NoHook;
     let folder = inherited_folder();
     parent_of(&folder);
@@ -223,6 +229,9 @@ fn a_junction_at_the_data_directorys_name_made_after_the_inspection_is_not_follo
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn what_is_put_in_an_approved_empty_directory_after_the_inspection_is_not_deleted() {
+    if needs_the_system() {
+        return;
+    }
     let _hook = NoHook;
     let folder = inherited_folder();
     parent_of(&folder);
@@ -257,6 +266,9 @@ fn what_is_put_in_an_approved_empty_directory_after_the_inspection_is_not_delete
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_name_that_the_layout_does_not_give_takes_its_remedy_from_its_own_handle() {
+    if needs_the_system() {
+        return;
+    }
     let folder = inherited_folder();
     parent_of(&folder);
     let paths = paths_in(&folder);
@@ -305,6 +317,9 @@ fn a_name_that_the_layout_does_not_give_takes_its_remedy_from_its_own_handle() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn an_object_of_another_kind_than_the_layout_gives_at_a_name_is_moved_aside() {
+    if needs_the_system() {
+        return;
+    }
     let folder = inherited_folder();
     parent_of(&folder);
     let paths = paths_in(&folder);
@@ -321,4 +336,19 @@ fn an_object_of_another_kind_than_the_layout_gives_at_a_name_is_moved_aside() {
     installed_data_directory(&paths);
     owned_file(paths.run.join("ab".repeat(16)), b"x");
     moved_aside(&refusal(&paths));
+}
+
+/// The cases that make their folders under the temporary folder run as the system: under another
+/// token the temporary folder lies in the account's profile, whose folders the account itself may
+/// delete in, and the check of the folders above the trees refuses them, as it should.
+fn needs_the_system() -> bool {
+    if kr_boundary_windows::win::token::current_user()
+        .is_ok_and(|user| user.to_text() == "S-1-5-18")
+    {
+        return false;
+    }
+    eprintln!(
+        "SKIPPED: not run under this token: the case makes its folders in the system's temporary folder"
+    );
+    true
 }
