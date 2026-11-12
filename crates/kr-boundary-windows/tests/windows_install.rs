@@ -2202,12 +2202,14 @@ fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
     let second = paths.data.join(format!("manifest-{}.new", "cd".repeat(16)));
     owned_file(&first, b"x");
     std::fs::hard_link(&first, &second).unwrap();
-    // With the manifest, the file that has two names is a record to correct.
+    // With the manifest, the file that has two names is not the installation's: its handle shows
+    // that, so it is moved aside and never corrected into place.
     let text = install::make_data_directory(&paths)
         .expect_err("a file with two names")
         .to_string();
     assert!(text.contains("more than one name"), "{text}");
-    assert!(text.contains("Do not remove"), "{text}");
+    assert!(text.contains("Move it aside"), "{text}");
+    assert!(text.contains("did not make"), "{text}");
     // Without it, there is nothing the file could be a record of. The inspection stops earlier,
     // at the directory that no manifest records and that is not empty, so the refusal names that
     // directory and not the file's two names.
@@ -3310,8 +3312,9 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     );
     assert_eq!(snapshot(), installed, "the removal changed nothing");
     untouched();
-    // Once the leftover is cleared the finished journal is no work. A private root that is still
-    // there holds the removal.
+    // Once the leftover is cleared the finished journal is no work. A private root that no journal
+    // names is not unfinished work either: the removal refuses it on its own, names it to remove,
+    // and changes nothing.
     journal
         .append(&Row::LeftoverCleared {
             key: r"tmp\held".to_owned(),
@@ -3323,10 +3326,12 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_ne!(code, 0, "{output}");
     assert!(
-        output.contains(REFUSAL)
-            && output.contains("a private root 0123456789abcdef0123456789abcdef")
+        output.contains("no journal names it as unfinished work")
+            && output.contains("0123456789abcdef0123456789abcdef")
+            && output.contains("Remove ")
+            && !output.contains(REFUSAL)
             && !output.contains("the invocation"),
-        "only the root holds it now: {output}"
+        "only the root refuses it now, and no journal names it: {output}"
     );
     assert_eq!(snapshot(), installed, "the removal changed nothing");
     untouched();
