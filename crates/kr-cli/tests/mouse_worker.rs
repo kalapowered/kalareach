@@ -7,7 +7,10 @@
 
 use kr_cli::mouse::{MouseReporting, Reading, Tracking};
 use kr_term::budget::GridSize;
+use kr_term::classify::CsiView;
 use kr_term::engine::{Engine, EngineConfig};
+use kr_term::event::{DirectDisposition, EventKind};
+use kr_term::lexer::{LexLimits, Lexer};
 use kr_term::modes::ModeKind;
 
 /// What the worker did with some output.
@@ -80,18 +83,144 @@ fn worker_up_to_its_hand_over(input: &[u8]) -> Worker {
     }
 }
 
-/// What a reader that is shown the forwarded bytes ends in, read as one write and then cut in two
-/// at every place.
-fn client_after(forwarded: &[u8]) -> (Tracking, Option<u32>) {
+/// What the rules give for a reader that is shown `forwarded` under `reading`: the tracking and the
+/// encoding it ends in, and the follow-ups it is to return, each as the place it goes at and the
+/// encoding it puts a terminal in.
+///
+/// The rules, written out once more here and not read from the reader: the tracking is one state, a
+/// set replaces it and a reset of any of the three turns it off (a screen drawn by a worker of an
+/// earlier build is the exception, where a reset of one that is not on changes nothing); the
+/// encoding is one state by xterm's rule (a set replaces it, and a reset returns the default only
+/// when it names the one in force); a terminal that returns the default at a reset of either mode
+/// holds the last set only, and after live output that leaves it elsewhere than xterm is, it is
+/// written the resets of both and the set of the one in force. Which sequences are acted on is the
+/// lexer's: that is what the worker forwards.
+struct Rules {
+    tracking: Tracking,
+    encoding: Option<u32>,
+    follows: Vec<(usize, u32)>,
+    /// Whether a mouse mode was ever on.
+    changed_a_mode: bool,
+}
+
+fn rules(forwarded: &[u8], reading: Reading) -> Rules {
+    let mut lexer = Lexer::new();
+    let mut events = Vec::new();
+    lexer.feed(forwarded, &mut events);
+    let mut tracking: Option<u16> = None;
+    let mut xterm: Option<u16> = None;
+    let mut terminal: Option<u16> = None;
+    let mut follows = Vec::new();
+    let mut changed_a_mode = false;
+    for event in &events {
+        if event.disposition != DirectDisposition::Forward || event.passthrough_depth != 0 {
+            continue;
+        }
+        match &event.kind {
+            EventKind::Esc {
+                intermediate: None,
+                extra_intermediates: false,
+                final_byte: b'c',
+            } => {
+                tracking = None;
+                xterm = None;
+                terminal = None;
+            }
+            EventKind::Csi {
+                params,
+                truncated,
+                final_byte: final_byte @ (b'h' | b'l'),
+            } => {
+                let csi = CsiView::with_truncation(params, *final_byte, *truncated);
+                if csi.private != Some(b'?') || !csi.intermediates.is_empty() {
+                    continue;
+                }
+                let set = *final_byte == b'h';
+                let mut encoding_named = false;
+                for slot in &csi.numbers {
+                    let Some(mode) = slot.and_then(|value| u16::try_from(value).ok()) else {
+                        continue;
+                    };
+                    match mode {
+                        1000 | 1002 | 1003 => {
+                            if set {
+                                tracking = Some(mode);
+                            } else if reading != Reading::Restoration || tracking == Some(mode) {
+                                tracking = None;
+                            }
+                        }
+                        1005 | 1006 => {
+                            encoding_named = true;
+                            if set {
+                                xterm = Some(mode);
+                                terminal = Some(mode);
+                            } else {
+                                if xterm == Some(mode) {
+                                    xterm = None;
+                                }
+                                terminal = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if encoding_named && reading == Reading::Live && xterm != terminal {
+                    if let Some(encoding) = xterm {
+                        let end = usize::try_from(event.span.end()).expect("an offset");
+                        follows.push((end, u32::from(encoding)));
+                    }
+                    terminal = xterm;
+                }
+            }
+            _ => {}
+        }
+        changed_a_mode |= tracking.is_some() || xterm.is_some();
+    }
+    Rules {
+        tracking: match tracking {
+            Some(1003) => Tracking::Motion,
+            Some(1002) => Tracking::Drag,
+            Some(1000) => Tracking::Clicks,
+            _ => Tracking::Off,
+        },
+        encoding: xterm.map(u32::from),
+        follows,
+        changed_a_mode,
+    }
+}
+
+/// What a reader that is shown the forwarded bytes under `reading` ends in and returns, read as one
+/// write and then cut in two at every place, which must give the same state and the same follow-ups
+/// at the same places. The follow-ups' bytes are checked against what is written after a sequence.
+fn client_reads(forwarded: &[u8], reading: Reading) -> (Tracking, Option<u32>, Vec<(usize, u32)>) {
     let mut whole = MouseReporting::default();
-    let _ = whole.read(forwarded, Reading::Live);
-    let state = (whole.tracking(), whole.encoding_in_force());
+    let follows = whole.read(forwarded, reading);
+    for follow in &follows {
+        assert_eq!(
+            follow.bytes(),
+            format!("\x1b[?1005;1006l\x1b[?{}h", follow.encoding).into_bytes()
+        );
+    }
+    let follows: Vec<(usize, u32)> = follows
+        .iter()
+        .map(|follow| (follow.at, follow.encoding))
+        .collect();
+    let state = (whole.tracking(), whole.encoding_in_force(), follows);
     for cut in 0..=forwarded.len() {
         let mut parts = MouseReporting::default();
-        let _ = parts.read(&forwarded[..cut], Reading::Live);
-        let _ = parts.read(&forwarded[cut..], Reading::Live);
+        let mut cut_follows: Vec<(usize, u32)> = parts
+            .read(&forwarded[..cut], reading)
+            .iter()
+            .map(|follow| (follow.at, follow.encoding))
+            .collect();
+        cut_follows.extend(
+            parts
+                .read(&forwarded[cut..], reading)
+                .iter()
+                .map(|follow| (cut + follow.at, follow.encoding)),
+        );
         assert_eq!(
-            (parts.tracking(), parts.encoding_in_force()),
+            (parts.tracking(), parts.encoding_in_force(), cut_follows),
             state,
             "a stream cut at {cut} is read as one write: {}",
             forwarded.escape_ascii()
@@ -100,23 +229,72 @@ fn client_after(forwarded: &[u8]) -> (Tracking, Option<u32>) {
     state
 }
 
-/// Says what the first difference between the client and the worker is, for the strings it found.
-fn differences(strings: impl IntoIterator<Item = Vec<u8>>) -> (usize, Vec<String>) {
-    let mut count = 0;
-    let mut found = Vec::new();
+/// What a comparison of a set of strings found.
+struct Tally {
+    /// How many strings were compared.
+    count: usize,
+    /// How many of them turned a mouse mode on at some point, which no string that is too short to
+    /// hold a mode setting can.
+    changing: usize,
+    /// The strings where the client and the worker, or the client and the rules, differ.
+    found: Vec<String>,
+}
+
+/// Compares, for each string, the client under each of the three readings with the rules, and under
+/// the reading of live output and of a drawn screen with the worker's own record too.
+fn differences(strings: impl IntoIterator<Item = Vec<u8>>) -> Tally {
+    let mut tally = Tally {
+        count: 0,
+        changing: 0,
+        found: Vec::new(),
+    };
     for input in strings {
         let worker = worker_up_to_its_hand_over(&input);
-        let client = client_after(&worker.forwarded);
-        count += 1;
-        if client != (worker.tracking, worker.encoding) {
-            found.push(format!(
-                "{}: the client holds {client:?} and the worker {:?}",
-                input.escape_ascii(),
-                (worker.tracking, worker.encoding)
-            ));
+        tally.count += 1;
+        for reading in [Reading::Live, Reading::Restoration, Reading::Painted] {
+            let (tracking, encoding, follows) = client_reads(&worker.forwarded, reading);
+            let expected = rules(&worker.forwarded, reading);
+            if reading == Reading::Live && expected.changed_a_mode {
+                tally.changing += 1;
+            }
+            let held_by_worker = match reading {
+                // A screen drawn by a worker of an earlier build is read by a rule of its own for
+                // the tracking, so only the encoding is the worker's.
+                Reading::Restoration => (expected.tracking, worker.encoding),
+                _ => (worker.tracking, worker.encoding),
+            };
+            if (tracking, encoding) != held_by_worker
+                || (tracking, encoding) != (expected.tracking, expected.encoding)
+                || follows != expected.follows
+            {
+                tally.found.push(format!(
+                    "{} read as {reading:?}: the client holds {:?} and returns {follows:?}; the \
+                     worker holds {:?}; the rules give {:?} and {:?}",
+                    input.escape_ascii(),
+                    (tracking, encoding),
+                    (worker.tracking, worker.encoding),
+                    (expected.tracking, expected.encoding),
+                    expected.follows
+                ));
+            }
         }
     }
-    (count, found)
+    tally
+}
+
+/// The longest list of resets of 1006 the worker's lexer keeps as one sequence, as bytes: every slot
+/// names a mode that is tracked, because an empty one makes the sequence an extension, so the filler
+/// is the modes 1 and 12, which are not the mouse's.
+fn reset_of_1006_in(bytes: usize) -> Vec<u8> {
+    let mut list = b"\x1b[?".to_vec();
+    let mut room = bytes - list.len() - b"1006l".len();
+    if room % 2 == 1 {
+        list.extend_from_slice(b"12;");
+        room -= 3;
+    }
+    list.extend(b"1;".repeat(room / 2));
+    list.extend_from_slice(b"1006l");
+    list
 }
 
 /// Every byte string of up to `length` bytes over `alphabet`.
@@ -139,24 +317,37 @@ fn strings_over(alphabet: &[u8], length: usize) -> Vec<Vec<u8>> {
 }
 
 /// KR-REQ-01.11: the client reads from what the worker forwards the mouse modes the worker holds,
-/// whatever the bytes between and inside the sequences are.
+/// whatever the bytes between and inside the sequences are, and is written what the rules say after
+/// a sequence that leaves a terminal elsewhere than the session.
 ///
-/// Two sets. Every string of up to three bytes over the bytes that make and break a sequence:
-/// escape, the opening of a control sequence, its private marker, its separator, the digits of the
-/// mouse modes, `h`, `l`, `c`, padding, cancel, substitute, the bell, one other control and the raw
-/// 8-bit introducer. And the sequences that set and reset the mouse modes, alone, in two lists and
-/// as a full reset, each with one or two of those bytes put in at every place, in the middle of what
-/// an application wrote before and after. The worker's record is taken where it hands a direct
+/// Every string is lexed by a real worker engine, and what the engine forwards is read by the client
+/// under each of the three readings, as one write and cut in two at every place. The client's
+/// tracking and encoding must be the worker's (for a screen drawn by a worker of an earlier build,
+/// the encoding only), and equal what the rules give; the follow-ups it returns must be the ones the
+/// rules give, at the same places however the write is cut, and in the bytes that are written.
+///
+/// Two sets. The first is every string of up to three bytes over the bytes that make and break a
+/// sequence: escape, the opening of a control sequence, its private marker and the other markers, an
+/// intermediate, a colon, its separator, the digits of the mouse modes, `h`, `l`, `c`, padding,
+/// cancel, substitute, the bell, one other control and the raw 8-bit introducer: 12,720 strings,
+/// **none of which can change a mode**, because the shortest mode setting is eight bytes and a full
+/// reset of a terminal in its default state changes nothing; they test the lexer's framing only. The second is the
+/// sequences that set and reset the mouse modes, alone, in two lists and as a full reset, each with
+/// one or two of those bytes put in at every place, in the middle of what an application wrote
+/// before and after, and the resets of 1006 in a list of the longest length the worker's lexer keeps
+/// and in one byte more, which the worker withholds; a bound that is not the same in the engine and
+/// in the client's lexer fails there: about 41,800 strings, of which about 40,200 turn a mouse mode
+/// on at some point, so the comparison's weight is in this set. The worker's record is taken where it hands a direct
 /// attachment over to the projected one, which it does for the sequences a terminal would frame
 /// differently, because a client that is handed the projected screen is then written the state in
 /// it.
 #[test]
 fn what_the_client_reads_of_the_mouse_is_what_the_worker_holds() {
     let alphabet = [
-        0x1b, b'[', b'?', b';', b'0', b'1', b'2', b'3', b'5', b'6', b'h', b'l', b'c', 0x00, 0x7f,
-        0x18, 0x1a, 0x07, 0x01, 0x9b,
+        0x1b, b'[', b'?', b'$', b'>', b':', b';', b'0', b'1', b'2', b'3', b'5', b'6', b'h', b'l',
+        b'c', 0x00, 0x7f, 0x18, 0x1a, 0x07, 0x01, 0x9b,
     ];
-    let mut strings = strings_over(&alphabet, 3);
+    let exhaustive = strings_over(&alphabet, 3);
 
     let bases: [&[u8]; 10] = [
         b"\x1b[?1006l",
@@ -177,15 +368,17 @@ fn what_the_client_reads_of_the_mouse_is_what_the_worker_holds() {
         (b"\x1b[?1003h\x1b[?1006h", b"\x1b[?1002l\x1b[?1006l"),
     ];
     let inserted = [
-        0x00, 0x7f, 0x18, 0x1a, 0x07, 0x01, 0x9b, 0x1b, b'[', b'?', b';', b'c', b'l', b'1',
+        0x00, 0x7f, 0x18, 0x1a, 0x07, 0x01, 0x9b, 0x1b, b'[', b'?', b';', b'c', b'l', b'1', b'$',
+        b'>', b':',
     ];
+    let mut constructed = Vec::new();
     for base in bases {
         for (index, (before, after)) in contexts.into_iter().enumerate() {
             for at in 0..=base.len() {
                 for &byte in &inserted {
                     let mut once = base.to_vec();
                     once.insert(at, byte);
-                    strings.push([before, &once, after].concat());
+                    constructed.push([before, &once, after].concat());
                     // Two of the bytes in one sequence, in the context that has the most at stake.
                     if index != 1 || !inserted[..7].contains(&byte) {
                         continue;
@@ -194,29 +387,44 @@ fn what_the_client_reads_of_the_mouse_is_what_the_worker_holds() {
                         for &other in &inserted[..7] {
                             let mut twice = once.clone();
                             twice.insert(second, other);
-                            strings.push([before, &twice, after].concat());
+                            constructed.push([before, &twice, after].concat());
                         }
                     }
                 }
             }
         }
     }
+    let longest = LexLimits::DEFAULT.max_sequence_bytes;
+    for bytes in [longest, longest + 1] {
+        for (before, after) in contexts {
+            constructed.push([before, &reset_of_1006_in(bytes), after].concat());
+        }
+    }
 
-    let (count, found) = differences(strings);
-    assert!(
-        count > 40_000,
-        "the set is the size it was made to be: {count}"
-    );
+    let exhaustive = differences(exhaustive);
+    let constructed = differences(constructed);
+    let found: Vec<&String> = exhaustive.found.iter().chain(&constructed.found).collect();
     assert!(
         found.is_empty(),
-        "{} of {count} strings differ, the first of them:\n{}",
+        "{} strings differ, the first of them:\n{}",
         found.len(),
         found
             .iter()
             .take(10)
-            .map(String::as_str)
+            .map(|string| string.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    );
+    assert_eq!(
+        exhaustive.changing, 0,
+        "a string of up to three bytes holds no mode setting"
+    );
+    assert!(
+        exhaustive.count == 12_720 && constructed.count > 40_000 && constructed.changing > 35_000,
+        "the sets are the size they were made to be: {} and {} strings, of which {} turn a mode on",
+        exhaustive.count,
+        constructed.count,
+        constructed.changing
     );
 }
 
@@ -257,7 +465,10 @@ fn a_mode_setting_the_worker_does_not_forward_is_not_read_by_the_client() {
         );
         let held = worker_up_to_its_hand_over(&input);
         assert_eq!(
-            client_after(&whole.forwarded),
+            {
+                let (tracking, encoding, _) = client_reads(&whole.forwarded, Reading::Live);
+                (tracking, encoding)
+            },
             (held.tracking, held.encoding),
             "the client holds what the worker held where it handed the attachment over, {name}"
         );
