@@ -291,6 +291,7 @@ describe('a link that wraps, which the page gives as one box', () => {
 
   it('is held to the pane', () => {
     expect(press(1, 440, [words2], IOS, PANE, 72.5, [[{ ...box, left: -20 }]])).toBe(0)
+    expect(press(-0.9, 440, [words2], IOS, PANE, 72.5, [[{ ...box, left: -20 }]])).toBe(0)
     expect(press(-5, 440, [words2], IOS, { ...PANE, left: 0 }, 72.5, [[{ ...box, left: -20 }]])).toBeNull()
   })
 })
