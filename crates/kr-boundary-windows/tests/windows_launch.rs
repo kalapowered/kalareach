@@ -1663,8 +1663,14 @@ fn a_boundary_account_cannot_open_the_brokers_pipe_that_the_system_opens() {
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that takes each client and lets it go, so that the next one finds an instance.
     let server = std::thread::spawn(move || {
-        while let Ok(Some(held)) = listener.accept() {
-            drop(held);
+        loop {
+            match listener.accept() {
+                Ok(Some(held)) => drop(held),
+                Ok(None) => break,
+                // A client that opened and closed at once ends the wait with an error: the next
+                // wait makes a new instance.
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
         }
     });
     assert_eq!(open_the_brokers_pipe(), Ok(()), "the system opens the pipe");

@@ -1485,20 +1485,15 @@ fn the_program_directory_holds_only_the_names_the_installation_gives_each_of_its
             );
         }
     };
-    // Whatever else the check of the directory finds, it finds nothing in the names.
+    // Whatever else the check of the directory finds, it finds nothing in the names. Only the
+    // entry is run: the removal makes the same check, but where it finds nothing it goes on to
+    // remove the installation the manifest records, program directory included, and the next
+    // step of this case would have nothing to look at. Every refusal above is shown for both.
     let accepted = |what: &str| {
-        for text in [
-            install::entry(&paths).err().map(|error| error.to_string()),
-            install::remove(&paths, true)
-                .err()
-                .map(|error| error.to_string()),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        if let Err(error) = install::entry(&paths) {
             assert!(
-                !text.contains("boundary's program directory"),
-                "{what}: {text}"
+                !error.to_string().contains("boundary's program directory"),
+                "{what}: {error}"
             );
         }
     };
@@ -3395,8 +3390,14 @@ fn a_client_that_holds_only_the_pipes_grant_is_refused_more_than_the_grant_and_m
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that takes each client and lets it go, so that the next one finds an instance.
     let server = std::thread::spawn(move || {
-        while let Ok(Some(held)) = listener.accept() {
-            drop(held);
+        loop {
+            match listener.accept() {
+                Ok(Some(held)) => drop(held),
+                Ok(None) => break,
+                // A client that opened and closed at once ends the wait with an error: the next
+                // wait makes a new instance.
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
         }
     });
     assert_eq!(
