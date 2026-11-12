@@ -221,17 +221,11 @@ function choose(pane: HTMLElement, x: number, y: number): Choice {
   })
   const index = linkAt(
     { x, y },
-    near.map((link) => ({ words: wordsOf(link), line: lineOf(link), box: rectsOf(link.getClientRects()) })),
+    near.map((link) => ({ words: wordsOf(link), box: rectsOf(link.getClientRects()) })),
     { least, beside },
     pane.getBoundingClientRect()
   )
   return { link: index === null ? null : (near[index] ?? null), control: null }
-}
-
-/** The height of the lines a link stands on, which is its box's own height before the reach is added; 0 for `normal`. */
-function lineOf(link: HTMLElement): number {
-  const height = parseFloat(getComputedStyle(link).lineHeight)
-  return Number.isFinite(height) ? height : 0
 }
 
 /** The rectangles of a link's words, one for each line its label covers. */
