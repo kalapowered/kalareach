@@ -3265,10 +3265,13 @@ fn runs_as_the_system() -> bool {
 }
 
 /// Opens the broker's pipe asking for exactly `access`, the way the installer's client does, and
-/// closes it at once. A pipe whose instances are all taken is waited for a few seconds.
+/// closes it at once. A pipe whose instances are all taken, or that has none for a moment between
+/// one client and the next, is waited for a few seconds.
 #[cfg(feature = "testing")]
 fn open_the_brokers_pipe_with(access: u32) -> Result<(), u32> {
-    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
     };
@@ -3293,7 +3296,10 @@ fn open_the_brokers_pipe_with(access: u32) -> Result<(), u32> {
         }
         // SAFETY: reads the calling thread's last error.
         let code = unsafe { GetLastError() };
-        if code != ERROR_PIPE_BUSY || std::time::Instant::now() >= until {
+        // Between one client and the next, the broker's loop has no instance for a moment.
+        if !matches!(code, ERROR_PIPE_BUSY | ERROR_FILE_NOT_FOUND)
+            || std::time::Instant::now() >= until
+        {
             return Err(code);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
