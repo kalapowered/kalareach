@@ -37,9 +37,9 @@ use super::pipe::{Connection, Listener, Stop};
 use super::proof;
 use super::token::enable_privilege;
 
-/// The most connections served at once: one fewer than the pipe may have instances, so that the
-/// instance that waits for the next client is never the one that is missing.
-const MAX_CONNECTIONS: usize = super::pipe::MAX_INSTANCES as usize - 1;
+/// The most connections served at once: two fewer than the pipe may have instances, so that neither
+/// the instance that waits for the next client nor the broker's own is the one that is missing.
+const MAX_CONNECTIONS: usize = super::pipe::MAX_INSTANCES as usize - 2;
 /// How long a connection may take to send its first frame. The installer's own first message
 /// follows its open at once; a client that has had the pipe for this long and sent nothing is not
 /// waiting for an answer, and its slot goes to the next client.

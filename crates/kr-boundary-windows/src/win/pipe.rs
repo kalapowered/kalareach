@@ -5,7 +5,10 @@
 //! refuse to start rather than serve beside it. The pipe's permission list names the system,
 //! administrators and the enrolled people with the rights to read and write and without the right
 //! to make another instance, so nobody but the service can stand a second pipe under the name.
-//! Remote clients are refused by the pipe itself.
+//! Remote clients are refused by the pipe itself. The service keeps one instance of the pipe for
+//! itself from the bind to its end, with its own client end on it, so the name is never free while
+//! the service lives, and a server end is always disconnected before it is closed, so a client that
+//! keeps its handle open never keeps an instance in use.
 //!
 //! All input and output is overlapped and waits on the stop event as well as on the transfer, so
 //! a connection never holds the service up when it is asked to end.
@@ -24,12 +27,14 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
-    CheckTokenMembership, GetTokenInformation, RevertToSelf, SECURITY_ATTRIBUTES,
-    SID_AND_ATTRIBUTES, TOKEN_QUERY, TokenUser,
+    CheckTokenMembership, DACL_SECURITY_INFORMATION, GetTokenInformation,
+    PROTECTED_DACL_SECURITY_INFORMATION, RevertToSelf, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
+    SetKernelObjectSecurity, TOKEN_QUERY, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
+    PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WRITE_DAC,
+    WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -191,8 +196,8 @@ pub mod testing {
     static REFILLS_TO_FAIL: AtomicU32 = AtomicU32::new(0);
 
     /// Makes the listener's next `count` attempts to make a waiting instance fail, as if the
-    /// platform had no memory for it: after one failure the listener must serve the client in hand
-    /// and try again, and after more than it can bear it must end the service in order.
+    /// platform had no memory for it: the listener must serve the client in hand and try again,
+    /// with a pause, for as long as it takes, and hold the pipe's name meanwhile.
     pub fn fail_refills(count: u32) {
         REFILLS_TO_FAIL.store(count, Ordering::SeqCst);
     }
@@ -487,18 +492,70 @@ impl Connection {
     }
 }
 
+/// A security descriptor made from text, freed when dropped.
+struct Descriptor(*mut c_void);
+
+// SAFETY: the descriptor is owned by this value and only read.
+unsafe impl Send for Descriptor {}
+
+impl Descriptor {
+    fn from_text(list: &str) -> Result<Descriptor> {
+        let text = wide(list);
+        let mut descriptor: *mut c_void = null_mut();
+        // SAFETY: the text is NUL-terminated and the descriptor is an out-parameter that this value
+        // frees when it drops.
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                1,
+                &raw mut descriptor,
+                null_mut(),
+            ) == 0
+            {
+                return Err(last("reading the pipe's permission list"));
+            }
+        }
+        Ok(Descriptor(descriptor))
+    }
+}
+
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor was allocated by the conversion call and is freed once.
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
+}
+
+/// The permission list of the first instance, until the broker's own client end is on it: the system
+/// alone, so that no account can open the pipe before that end is.
+const KEEPER_LIST: &str = "D:P(A;;GA;;;SY)";
+
+/// The broker's hold on its pipe's name: the first instance, with the broker's own client end
+/// connected to it. No client can take it and no worker is given it, and it counts against the
+/// instance limit. It proves that the name is never free while the service lives: not between two
+/// connections, not when the instance that waits for the next client cannot be made, and not at a stop
+/// while the workers end, because an instance that is connected to a client end that this process holds
+/// stays in use until this process lets both go.
+struct Keeper {
+    server: Server,
+    _client: Handle,
+}
+
 /// The pipe the service listens on.
 pub struct Listener {
-    descriptor: *mut c_void,
+    descriptor: Descriptor,
     stop: Arc<Stop>,
-    /// The instance that waits for the next client. It is made before a connection is handed on, so
-    /// that from the bind to the end of the listener an instance of the pipe always exists and the
-    /// name is never free; it is none only while every instance the pipe may have is in use, and
-    /// then the connections hold the name.
+    /// The instance that waits for the next client. It is made before a connection is handed on; it
+    /// is none only after an attempt to make it failed or found every instance in use, and the
+    /// next call makes it again. The name is held by the keeper meanwhile.
     next: Option<Server>,
-    /// What the first instance shows: its owner and the permission list `bind` set. Every later
-    /// instance must show the same.
-    bound: Option<Summary>,
+    /// The instance that the broker keeps for itself.
+    keeper: Keeper,
+    /// What the keeper shows once the pipe's list is set: its owner and the permission list `bind`
+    /// set. Every later instance must show the same.
+    bound: Summary,
 }
 
 /// What an attempt to make the waiting instance gave.
@@ -511,20 +568,18 @@ enum Refill {
     Failed(super::ffi::Error),
 }
 
-// SAFETY: the descriptor is owned by the listener and only read to make an instance.
-unsafe impl Send for Listener {}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor was allocated by the conversion call and is freed once.
-        unsafe {
-            LocalFree(self.descriptor);
-        }
-    }
-}
+/// How long the listener waits before it tries again to make the waiting instance or to take a
+/// connection that failed.
+const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl Listener {
-    /// Makes the first instance of the pipe, refusing when the name is taken.
+    /// Makes the first instance of the pipe, refusing when the name is taken, and keeps it.
+    ///
+    /// The first instance is made with the first-instance flag and a list of the system alone, and the
+    /// right to change the list. The broker opens its own client end on it at once, and only then is
+    /// the list set to the real one, through the instance's own handle: the list belongs to the name,
+    /// so the instances made after it take the real list, and no account could open the pipe before
+    /// the broker's own end was on its first instance. The waiting instance is made last.
     ///
     /// # Errors
     ///
@@ -534,30 +589,48 @@ impl Listener {
         for person in people {
             list.push_str(&pipe_access::entry(&person.to_text()));
         }
-        let text = wide(&list);
-        let mut descriptor: *mut c_void = null_mut();
-        // SAFETY: the text is NUL-terminated and the descriptor is an out-parameter kept in the
-        // listener and freed when it drops.
-        unsafe {
-            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                text.as_ptr(),
-                1,
-                &raw mut descriptor,
-                null_mut(),
-            ) == 0
-            {
-                return Err(last("reading the pipe's permission list"));
-            }
+        let descriptor = Descriptor::from_text(&list)?;
+        let server = instance(&Descriptor::from_text(KEEPER_LIST)?, true)?;
+        let client = open_client()?;
+        // SAFETY: the handle was made with the right to change the list, and the descriptor is
+        // valid for the call.
+        if unsafe {
+            SetKernelObjectSecurity(
+                server.raw(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.0,
+            )
+        } == 0
+        {
+            return Err(last("setting the pipe's permission list"));
         }
+        let bound = summary_of_handle(&server.0)?;
         let mut listener = Listener {
             descriptor,
             stop,
             next: None,
-            bound: None,
+            keeper: Keeper {
+                server,
+                _client: client,
+            },
+            bound,
         };
-        let first = listener.instance(true)?;
-        listener.bound = Some(summary_of_handle(&first.0)?);
-        listener.next = Some(first);
+        listener.next = Some(match listener.refill()? {
+            Refill::Waiting(waiting) => waiting,
+            Refill::Busy => {
+                return Err(error(
+                    ERROR_PIPE_BUSY,
+                    "making the pipe's waiting instance: every instance is in use",
+                ));
+            }
+            Refill::Failed(failure) => return Err(failure),
+        });
+        if summary_of_handle(&listener.keeper.server.0)? != listener.bound {
+            return Err(error(
+                0,
+                "the pipe's first instance does not show the permission list that was set",
+            ));
+        }
         Ok(listener)
     }
 
@@ -568,8 +641,8 @@ impl Listener {
     }
 
     /// Makes the instance that waits for the next client and confirms that it is the pipe `bind`
-    /// made: the owner and the permission list are the ones the first instance showed, where a pipe
-    /// that another program made first has its own.
+    /// made: the owner and the permission list are the ones the keeper showed, where a pipe that
+    /// another program made first has its own.
     ///
     /// # Errors
     ///
@@ -580,14 +653,12 @@ impl Listener {
         if testing::take_refill_failure() {
             return Ok(Refill::Failed(error(8, "making the pipe")));
         }
-        match self.instance(false) {
+        match instance(&self.descriptor, false) {
             Ok(pipe) => match summary_of_handle(&pipe.0) {
-                Ok(shown) if self.bound.as_ref().is_some_and(|bound| *bound != shown) => {
-                    Err(error(
-                        0,
-                        "the pipe's owner or permission list is not the one the broker set: another program made the pipe's name, so the broker stops",
-                    ))
-                }
+                Ok(shown) if self.bound != shown => Err(error(
+                    0,
+                    "the pipe's owner or permission list is not the one the broker set: another program made the pipe's name, so the broker stops",
+                )),
                 Ok(_) => Ok(Refill::Waiting(pipe)),
                 Err(failure) => Ok(Refill::Failed(failure)),
             },
@@ -596,53 +667,22 @@ impl Listener {
         }
     }
 
-    fn instance(&self, first: bool) -> Result<Server> {
-        let name = wide(NAME);
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: self.descriptor,
-            bInheritHandle: 0,
-        };
-        let open_mode = PIPE_ACCESS_DUPLEX
-            | FILE_FLAG_OVERLAPPED
-            | if first {
-                FILE_FLAG_FIRST_PIPE_INSTANCE
-            } else {
-                0
-            };
-        // SAFETY: the name is NUL-terminated and the attributes outlive the call.
-        let pipe = unsafe {
-            CreateNamedPipeW(
-                name.as_ptr(),
-                open_mode,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                MAX_INSTANCES,
-                64 * 1024,
-                64 * 1024,
-                0,
-                &raw const attributes,
-            )
-        };
-        Handle::new(pipe, "making the pipe").map(Server)
-    }
-
     /// Waits for a client, and returns `None` when the service is told to stop.
     ///
     /// The fault of one connection ends that connection only: a client that connected and closed
     /// before the wait, or an instance that could not be connected, is disconnected and the wait
     /// goes on. The next instance is made before the connection is handed on; when it cannot be
-    /// made, the client in hand is served all the same and the next call makes it again. At the
-    /// stop the instance that waits stays with the listener, so the name is held until the listener
-    /// is dropped.
+    /// made, the client in hand is served all the same and the next call makes it again, with a
+    /// pause between tries, for as long as it takes: a failure to make an instance never ends the
+    /// listener, because the keeper holds the name meanwhile. At the stop the instance that waits
+    /// stays with the listener until the listener is dropped.
     ///
     /// # Errors
     ///
-    /// Returns the platform's error when the listener cannot keep the pipe's name: an instance is
-    /// not the pipe that was bound, none can be made a thousand times in a row, or the pipe fails
-    /// again and again.
+    /// Returns the platform's error when an instance is not the pipe that was bound: another
+    /// program made the pipe's name.
     pub fn accept(&mut self) -> Result<Option<Connection>> {
         let mut failed_in_a_row = 0_u32;
-        let mut refill_failed_in_a_row = 0_u32;
         loop {
             if self.stop.is_set() {
                 return Ok(None);
@@ -651,26 +691,18 @@ impl Listener {
                 Some(pipe) => pipe,
                 None => match self.refill()? {
                     Refill::Waiting(pipe) => pipe,
-                    Refill::Busy => {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                        continue;
-                    }
-                    Refill::Failed(failure) => {
-                        refill_failed_in_a_row += 1;
-                        if refill_failed_in_a_row > 1000 {
-                            return Err(failure);
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    Refill::Busy | Refill::Failed(_) => {
+                        let _ = self.stop.wait(RETRY_PAUSE);
                         continue;
                     }
                 },
             };
-            let mut transfer = Transfer::new(Vec::new()).map_err(|failure| {
-                error(
-                    failure.raw_os_error().unwrap_or(0) as u32,
-                    "making an event",
-                )
-            })?;
+            // An event that cannot be made ends this attempt and nothing else.
+            let Ok(mut transfer) = Transfer::new(Vec::new()) else {
+                self.next = Some(pipe);
+                let _ = self.stop.wait(RETRY_PAUSE);
+                continue;
+            };
             let mut gone = false;
             let mut stuck = false;
             // SAFETY: the pipe is open and the record lives in `transfer`, which `wait` completes,
@@ -694,19 +726,18 @@ impl Listener {
                 }
             }
             if gone {
-                failed_in_a_row += 1;
-                if failed_in_a_row > 1000 {
-                    return Err(error(0, "the pipe failed a thousand times in a row"));
-                }
-                // SAFETY: the pipe is open; the client's end is closed or not connected.
-                unsafe {
-                    DisconnectNamedPipe(pipe.raw());
-                }
+                // A client that went before the wait ended it is normal; one after another is
+                // paused for, so that a fault of the pipe does not spin the thread.
+                failed_in_a_row = failed_in_a_row.saturating_add(1);
+                // The instance is disconnected when it is dropped here, and used again.
                 self.next = Some(pipe);
+                if failed_in_a_row > 1 {
+                    let _ = self.stop.wait(RETRY_PAUSE);
+                }
                 continue;
             }
-            // Where no instance is made now (all are in use, or the platform failed once), the
-            // client in hand is served and the next call makes the instance again.
+            // Where no instance is made now (all are in use, or the platform failed), the client in
+            // hand is served and the next call makes the instance again.
             if let Refill::Waiting(next) = self.refill()? {
                 self.next = Some(next);
             }
@@ -718,6 +749,59 @@ impl Listener {
             }));
         }
     }
+}
+
+/// Makes one instance of the pipe with the list the descriptor holds. The first instance carries
+/// the first-instance flag, which the platform refuses when the name is taken, and the right to change
+/// its list.
+fn instance(descriptor: &Descriptor, first: bool) -> Result<Server> {
+    let name = wide(NAME);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let open_mode = PIPE_ACCESS_DUPLEX
+        | FILE_FLAG_OVERLAPPED
+        | if first {
+            FILE_FLAG_FIRST_PIPE_INSTANCE | WRITE_DAC
+        } else {
+            0
+        };
+    // SAFETY: the name is NUL-terminated and the attributes outlive the call.
+    let pipe = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            open_mode,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            MAX_INSTANCES,
+            64 * 1024,
+            64 * 1024,
+            0,
+            &raw const attributes,
+        )
+    };
+    Handle::new(pipe, "making the pipe").map(Server)
+}
+
+/// Opens a client end of the pipe, asking identification only, so that the server learns who is
+/// calling and cannot act as the caller, and for the rights of a client and no more, which are what
+/// the pipe's list grants it.
+fn open_client() -> Result<Handle> {
+    let name = wide(NAME);
+    // SAFETY: the name is NUL-terminated.
+    let opened = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            pipe_access::CLIENT,
+            0,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            null_mut(),
+        )
+    };
+    Handle::new(opened, "opening the broker's pipe")
 }
 
 /// How long the installer's own connection waits for an instance of the pipe to be free.
@@ -732,24 +816,9 @@ const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// not the expected process.
 pub fn connect(expected_server: u32) -> Result<Connection> {
     let name = wide(NAME);
-    // SAFETY: the name is NUL-terminated; the client asks for identification only, so the server
-    // learns who is calling and cannot act as the caller, and for the rights of a client and no
-    // more, which are what the pipe's list grants it.
     let began = Instant::now();
     let pipe = loop {
-        // SAFETY: as above.
-        let opened = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                pipe_access::CLIENT,
-                0,
-                null(),
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                null_mut(),
-            )
-        };
-        match Handle::new(opened, "opening the broker's pipe") {
+        match open_client() {
             Ok(pipe) => break pipe,
             Err(failure) if failure.code == ERROR_PIPE_BUSY => {
                 let left = BUSY_WAIT.saturating_sub(began.elapsed());
