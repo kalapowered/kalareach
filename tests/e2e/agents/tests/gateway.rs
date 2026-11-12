@@ -188,10 +188,10 @@ fn codex() -> PluginId {
     PluginId::new("kalareach/codex").expect("a plugin identifier")
 }
 
-/// The directory of the released Codex package's copy.
-fn released_codex() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../fixtures/plugins/released/kalareach/codex/0.3.0")
+/// The directory of the Codex package the cases install: a byte copy of the package source whose
+/// table states the conditions under which a thread the terminal starts is not its conversation.
+fn codex_package() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("codex-package")
 }
 
 /// A marker only this case's text holds: `kr` and twelve hexadecimal digits.
@@ -1237,7 +1237,7 @@ async fn install_codex(
     let generation = generations::Generation::build(
         &home,
         generations::GenerationSpec {
-            package: Some(released_codex()),
+            package: Some(codex_package()),
             builds: vec![build],
             ..generations::GenerationSpec::default()
         },
@@ -3907,7 +3907,7 @@ fn a_run_whose_processes_are_not_shown_ended_is_not_read() {
 #[test]
 fn the_launches_the_real_route_types_are_ones_the_command_integration_serves() {
     let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(released_codex().join("plugin.json")).expect("the package's manifest"),
+        &std::fs::read(codex_package().join("plugin.json")).expect("the package's manifest"),
     )
     .expect("a manifest");
     let backend: kr_plugin_sdk::integration::IntegrationBackend =
