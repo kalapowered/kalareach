@@ -115,3 +115,75 @@ function distanceTo(rect: Rect, point: Point): number {
   const dy = Math.max(rect.top - point.y, 0, point.y - rect.bottom)
   return Math.hypot(dx, dy)
 }
+
+/** What a click names: the control or the link the browser sent it to, or neither (plain text). */
+export type Named = 'control' | 'link' | 'neither'
+
+/** A link of the pane as the decision reads it. `id` is the caller's own name for the element. */
+export interface PaneLink<L> extends Link {
+  readonly id: L
+  /** What the link opens: a link that opens something else than it did is not the link that was pressed. */
+  readonly destination: string
+}
+
+/** The links of the pane and what a target needs, as the page lays them out now. */
+export interface Layout<L> {
+  readonly links: readonly PaneLink<L>[]
+  readonly reach: Reach
+  readonly bounds: Rect
+}
+
+/** What the page keeps of a press: written at a primary pointer down, read by the click that follows. */
+export interface Press<L> {
+  /** `touch`, `pen` or `mouse`. */
+  readonly pointerType: string
+  /** The link the nearest-words rule named at the press's start, and what it opened then, or null. */
+  readonly start: { readonly link: L; readonly destination: string } | null
+  /** Whether the press moved beyond the slop between its pointer down and its pointer up. */
+  readonly moved: boolean
+  /** The clock's reading (milliseconds) when the pointer came up, or null while it is down. */
+  readonly upAt: number | null
+}
+
+/** A click, as the decision reads it. */
+export interface Click {
+  readonly trusted: boolean
+  readonly detail: number
+  /** The clock's reading (milliseconds), on the clock of `Press.upAt`. */
+  readonly at: number
+  readonly names: Named
+  readonly point: Point
+}
+
+export type Decision<L> = { readonly kind: 'stand' } | { readonly kind: 'open'; readonly link: L }
+
+/** How long after a press's pointer up its click may still come, in milliseconds. */
+export const CLICK_WITHIN = 3000
+
+const STAND = { kind: 'stand' } as const
+
+/**
+ * What a click does besides what the browser does with it. The click itself always stands: it goes
+ * where the browser sent it, and this adds one thing, a click on a link.
+ *
+ * A click that names a link or a control stands alone. A trusted click that names neither, a click on
+ * plain text, also opens a link when a touch or a pen pressed that link's words or the room beside
+ * them and the click's own point still belongs to it: the press did not move beyond the slop; the
+ * click has a detail of 1 and comes after the pointer's up and within `CLICK_WITHIN` of it; and the
+ * nearest-words rule names the same element, opening the same destination, at the press's start and at
+ * the click's point. A mouse's click on plain text opens nothing, as on a desktop. The press is the
+ * record of the latest primary pointer down: a later press, or a pointer cancel, leaves none.
+ *
+ * `layout` is read only when the other conditions hold.
+ */
+export function decide<L>(press: Press<L> | null, click: Click, layout: () => Layout<L>): Decision<L> {
+  if (click.names !== 'neither' || !click.trusted || click.detail !== 1) return STAND
+  if (press === null || (press.pointerType !== 'touch' && press.pointerType !== 'pen')) return STAND
+  if (press.moved || press.start === null || press.upAt === null) return STAND
+  if (click.at < press.upAt || click.at - press.upAt > CLICK_WITHIN) return STAND
+  const { links, reach, bounds } = layout()
+  const index = linkAt(click.point, links, reach, bounds)
+  const chosen = index === null ? undefined : links[index]
+  if (chosen === undefined || chosen.id !== press.start.link || chosen.destination !== press.start.destination) return STAND
+  return { kind: 'open', link: chosen.id }
+}
