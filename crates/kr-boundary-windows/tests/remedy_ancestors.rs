@@ -191,6 +191,27 @@ fn a_refusal_after_the_runs_changes_does_not_say_that_nothing_was_changed() {
             after.contains("the manifest records them"),
             "{fault:?}: {after}"
         );
+        assert!(!after.contains("stays stopped"), "{fault:?}: {after}");
+        // A repair has no rollback: the broker that it stopped stays stopped.
+        let repair = ancestor_refusal(r"C:\x", Tree::Program, &fault, Stage::AfterRepair);
+        assert!(
+            !repair.contains("Nothing was changed"),
+            "{fault:?}: {repair}"
+        );
+        assert!(
+            repair.contains("has no rollback: the broker stays stopped"),
+            "{fault:?}: {repair}"
+        );
+        // The folder that holds the data directory, made by this run before anything is recorded:
+        // it is empty and stays, and no manifest records it.
+        let made = ancestor_refusal(r"C:\x", Tree::Data, &fault, Stage::DataParentMade);
+        assert!(!made.contains("Nothing was changed"), "{fault:?}: {made}");
+        assert!(
+            made.contains("had already made the folder that holds the data directory"),
+            "{fault:?}: {made}"
+        );
+        assert!(made.contains("it is empty and stays"), "{fault:?}: {made}");
+        assert!(!made.contains("the manifest records"), "{fault:?}: {made}");
     }
 }
 

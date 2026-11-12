@@ -455,8 +455,14 @@ fn install_program_file(source: &Path, target: &Path) -> io::Result<()> {
 ///
 /// Returns [`Error::Refused`] naming the reason, or the failure of the call that looked.
 pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
+    check_data_parent_at(paths, remedy::Stage::Before)
+}
+
+/// [`check_data_parent`] with the stage of the run that reads the folder, so that a refusal says
+/// only what is so of the run's changes.
+fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ffi::Handle>, Error> {
     let parent = paths.data_parent();
-    check_ancestors(parent, remedy::Tree::Data, remedy::Stage::Before)?;
+    check_ancestors(parent, remedy::Tree::Data, stage)?;
     let wide = ffi::wide_path(parent);
     // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
     let raw = unsafe {
@@ -2184,7 +2190,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
         Some(held) => held,
         None => {
             create_data_parent(paths.data_parent())?;
-            check_data_parent(paths)?.ok_or_else(|| {
+            check_data_parent_at(paths, remedy::Stage::DataParentMade)?.ok_or_else(|| {
                 Error::Failed(format!(
                     "{} was made and is gone again",
                     paths.data_parent().display()
@@ -2766,7 +2772,12 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         users_may_read: true,
         ..Principals::default()
     };
-    check_program_parents(&paths, remedy::Stage::After)?;
+    let after = if existing {
+        remedy::Stage::AfterRepair
+    } else {
+        remedy::Stage::After
+    };
+    check_program_parents(&paths, after)?;
     fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)
         .map_err(io_error("making the program directory"))?;
     // What the broker points Git's global file, hooks path and template directory at: empty, and

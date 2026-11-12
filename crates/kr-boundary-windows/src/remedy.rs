@@ -426,6 +426,12 @@ pub enum Stage {
     Before,
     /// The run had already made changes, which the manifest records, when the folder was read again.
     After,
+    /// A repair had already made changes, and stopped the broker, when the folder was read again.
+    /// A repair has no rollback, so the broker stays stopped.
+    AfterRepair,
+    /// The run had made the folder that holds the data directory, empty, and nothing else when
+    /// that folder was read again. No manifest records it, and a later rollback leaves it.
+    DataParentMade,
 }
 
 impl Stage {
@@ -435,6 +441,12 @@ impl Stage {
             Stage::Before => "Nothing was changed.",
             Stage::After => {
                 "This run had already made changes before it read the folder again, and the manifest records them."
+            }
+            Stage::AfterRepair => {
+                "This run had already made changes before it read the folder again, and the manifest records them. A repair has no rollback: the broker stays stopped."
+            }
+            Stage::DataParentMade => {
+                "This run had already made the folder that holds the data directory before it read the folder again; it is empty and stays."
             }
         }
     }
