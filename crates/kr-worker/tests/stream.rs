@@ -2972,3 +2972,124 @@ async fn kr_req_12_06_a_hidden_thread_dropped_with_no_leave_changes_nothing() {
         })
     );
 }
+
+/// KR-REQ-12.06: a leave of a conversation other than the bound one, a request or a notification,
+/// opens nothing and holds nothing back, whatever the server answers it, and the turn that runs is
+/// the conversation's still. It is kept only where a selection is open or its reply waits, since
+/// that selection may be the conversation the leave names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_leave_of_another_conversation_opens_nothing_and_suspends_nothing() {
+    let (world, _notices) = running_conversation().await;
+    let revision = world.revision();
+    for answer in [r#""result":{"status":"notSubscribed"}"#, REFUSED] {
+        let leaving = world.terminal_asks(LEAVE_OTHER).await;
+        assert_eq!(world.waiting(), None, "nothing is in flight");
+        world.server_answers(&leaving, answer).await;
+        assert_eq!(world.thread().as_deref(), Some("thread-1"));
+        assert_eq!(world.turn().as_deref(), Some("turn-1"));
+        assert_eq!(world.revision(), revision);
+        assert_eq!(world.waiting(), None);
+    }
+    world
+        .server_says(r#"{"method":"thread/closed","params":{"threadId":"thread-9"}}"#)
+        .await;
+    assert_eq!(world.thread().as_deref(), Some("thread-1"));
+    assert_eq!(world.waiting(), None);
+
+    // A selection open: the leave is kept in order with it, and ends what the selection named.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let selecting = world.terminal_asks(RESUME).await;
+    let leaving = world
+        .terminal_asks(r#"{"id":5,"method":"thread/unsubscribe","params":{"threadId":"thread-2"}}"#)
+        .await;
+    assert!(
+        world.waiting().is_some(),
+        "the leave may name the selection"
+    );
+    world.server_answers(&selecting, &named("thread-2")).await;
+    world.server_answers(&leaving, r#""result":{}"#).await;
+    assert_eq!(world.thread(), None, "the terminal selected it and left it");
+    assert!(world.waiting().is_some());
+
+    // A selection's reply that waits for an older request: the leave is kept in order with it too.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let leaving_first = world.terminal_asks(LEAVE_ONE).await;
+    let selecting = world.terminal_asks(RESUME).await;
+    world.server_answers(&selecting, &named("thread-2")).await;
+    let leaving = world
+        .terminal_asks(r#"{"id":5,"method":"thread/unsubscribe","params":{"threadId":"thread-2"}}"#)
+        .await;
+    world.server_answers(&leaving_first, r#""result":{}"#).await;
+    world.server_answers(&leaving, r#""result":{}"#).await;
+    assert_eq!(world.thread(), None, "the terminal selected it and left it");
+    assert!(world.waiting().is_some());
+}
+
+/// KR-REQ-12.06: `/new` in the order the terminal sends it (the new conversation's start, its
+/// reply, then the old conversation's leave, twice) ends with the new conversation bound and
+/// nothing held back, and `/quit`'s leave of the bound one gives no conversation, with no fall
+/// back to the one before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_new_conversation_stays_bound_when_the_old_one_is_left_and_a_quit_leaves_none()
+ {
+    let (world, _notices) = running_conversation().await;
+    let user_start = r#"{"id":"new-1","method":"thread/start","params":{"ephemeral":false,"threadSource":"user"}}"#;
+    let asked = world.terminal_asks(user_start).await;
+    assert!(
+        world.waiting().is_some(),
+        "a conversation the terminal shows is a selection"
+    );
+    world
+        .server_answers(&asked, &named_thread("thread-2", false, "user"))
+        .await;
+    assert_eq!(world.thread().as_deref(), Some("thread-2"));
+    assert_eq!(
+        world.turn(),
+        None,
+        "the old conversation's turn went with it"
+    );
+    let bound = world.revision();
+    for id in ["old-leave-1", "old-leave-2"] {
+        let leaving = world
+            .terminal_asks(&format!(
+                r#"{{"id":"{id}","method":"thread/unsubscribe","params":{{"threadId":"thread-1"}}}}"#
+            ))
+            .await;
+        assert_eq!(
+            world.waiting(),
+            None,
+            "{id}: the old conversation's leave holds nothing"
+        );
+        world
+            .server_answers(&leaving, r#""result":{"status":"unsubscribed"}"#)
+            .await;
+        assert_eq!(world.thread().as_deref(), Some("thread-2"), "{id}");
+        assert_eq!(world.revision(), bound, "{id}");
+        assert_eq!(world.waiting(), None, "{id}");
+    }
+
+    // `/quit` leaves the bound one: no conversation, and the earlier one does not return.
+    let quitting = world
+        .terminal_asks(
+            r#"{"id":"quit-1","method":"thread/unsubscribe","params":{"threadId":"thread-2"}}"#,
+        )
+        .await;
+    assert!(
+        world.waiting().is_some(),
+        "the bound conversation's leave is in flight"
+    );
+    world
+        .server_answers(&quitting, r#""result":{"status":"unsubscribed"}"#)
+        .await;
+    assert_eq!(world.thread(), None);
+    assert_eq!(world.revision(), bound + 1);
+    assert!(
+        world
+            .waiting()
+            .is_some_and(|reason| reason.contains("not read"))
+    );
+}
