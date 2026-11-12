@@ -1782,7 +1782,9 @@ fn final_dos_path(handle: &ffi::Handle) -> Result<String, Error> {
 /// directory was there to be opened and approved: a removal deletes the directory only when it was.
 fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
     check_program_parents(paths)?;
-    if !paths.program.exists() {
+    // The look follows no link: a link that points nowhere is there, and gets the link's own remedy
+    // from the open below.
+    if !records::entry_exists(&paths.program) {
         return Ok(false);
     }
     let program = paths.program.file_name().unwrap_or_default().to_owned();
@@ -1816,12 +1818,6 @@ fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
     }
     inspect_within(paths, Scope::Program, &paths.program, &held, 1)?;
     Ok(true)
-}
-
-/// Whether anything is at the path, a link that points nowhere and an entry that cannot be read
-/// included. It is a look for a refusal's reason, and no deletion follows it.
-fn entry_exists(path: &Path) -> bool {
-    !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
 /// The one name a proof directory holds: the unlisted program. Its bytes are those of the system's
@@ -3095,12 +3091,17 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     // acts on it and on what it holds only through what this inspection approved: a path that no
     // check opened is never read for a manifest and never deleted from. The handles are closed
     // before anything is deleted.
+    let mut seen = records::Seen::default();
     let found = match check_data_parent(paths)? {
         Some(parent) => match inspect_existing_data(paths, &parent)? {
-            Some((_, inspected)) => match inspected.manifest {
-                Some(manifest) => records::Inspection::Recorded(manifest),
-                None => records::Inspection::Empty,
-            },
+            Some((_, inspected)) => {
+                seen.journal = inspected.journal.is_some();
+                seen.run = inspected.run.is_some();
+                match inspected.manifest {
+                    Some(manifest) => records::Inspection::Recorded(manifest),
+                    None => records::Inspection::Empty,
+                }
+            }
             None => records::Inspection::Absent,
         },
         None => records::Inspection::Absent,
@@ -3114,7 +3115,7 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     }
     let manifest = match records::begin(
         found,
-        &|| entry_exists(&paths.data),
+        &|| records::entry_exists(&paths.data),
         quiet_when_empty,
         &paths.data,
     ) {
@@ -3340,33 +3341,23 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
         if let Some(parent) = paths.program.parent() {
             let _ = fs::remove_dir(parent);
         }
-    } else if entry_exists(&paths.program) {
+    } else if records::entry_exists(&paths.program) {
         // It was not there when the removal checked, so no check opened it: nothing is deleted.
         failures.push(format!(
             "{} was not there when the removal looked for it, and something is there now, so it was not removed",
             paths.program.display()
         ));
     }
-    // The journal and the private roots' parent go only when empty. Unfinished work was refused
-    // before the removal began; what a journal file still holds now is finished or made nothing.
-    if let Ok(entries) = fs::read_dir(&paths.journal) {
-        for entry in entries.flatten() {
-            if entry.path().extension().and_then(|text| text.to_str()) == Some("journal") {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
-    for directory in [&paths.run, &paths.journal] {
-        if directory.exists() {
-            keep(
-                fs::remove_dir(directory).map_err(io_error(format!(
-                    "removing {}, which still holds an unfinished invocation",
-                    directory.display()
-                ))),
-                "removing the journal or the private roots",
-                &mut failures,
-            );
-        }
+    // The journal's files and the empty `run` and `journal` directories go where the inspection
+    // opened and approved them, and nowhere else. Unfinished work was refused before the removal
+    // began; what a journal file still holds now is finished or made nothing.
+    for stayed in records::finish_journal_and_run(&paths.journal, &paths.run, seen) {
+        say(&format!(
+            "removing the journal or the private roots failed: {stayed}"
+        ));
+        failures.push(format!(
+            "removing the journal or the private roots: {stayed}"
+        ));
     }
     if let Some(prior) = &prior {
         match residue(prior, paths) {
