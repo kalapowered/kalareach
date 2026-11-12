@@ -6,12 +6,15 @@
 //! ends has to end the *other two* as well. A terminal left in raw mode because one half was still
 //! waiting for a keystroke is the failure section 8 names.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::attach::{Attaching, TerminalInput};
 use crate::bridge::link::Link;
 use kr_client::error::{HostWord, refusal};
-use kr_client::retry::{Attempts, Failure, Recovery, RequestClass};
+use kr_client::retry::{
+    Attempts, Failure, MAX_AUTOMATIC_DELAY, MAX_AUTOMATIC_RETRIES, Recovery, RequestClass,
+};
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::attachment::ViewportPosition;
@@ -1512,6 +1515,16 @@ enum Heard {
     Later,
 }
 
+/// How many requests for a new subscription this terminal makes in any [`UNUSABLE_SPAN`] because it
+/// could not use what the session sent: the first at once, and as many more as the retry policy
+/// retries.
+const UNUSABLE_REQUESTS: usize = 1 + MAX_AUTOMATIC_RETRIES as usize;
+
+/// The span in which [`UNUSABLE_REQUESTS`] is counted: the longest the retry policy keeps a call
+/// waiting on its own account, its longest pause that many times over.
+const UNUSABLE_SPAN: std::time::Duration =
+    MAX_AUTOMATIC_DELAY.saturating_mul(MAX_AUTOMATIC_RETRIES);
+
 /// The subscriptions this terminal asks for, and where a new one's stream begins.
 ///
 /// Every subscription's notifications on one connection share a stream identifier and restart
@@ -1527,6 +1540,15 @@ enum Heard {
 /// and for as many times as it gives. The pause is a timer and not the session's next word,
 /// because a session that has sent a resynchronisation marker says nothing more until it is asked
 /// for the screen again.
+///
+/// What the session sends can also be of no use: a frame this build cannot decode, on either path
+/// and wherever in a screen or after it, or a screen the display refuses to install. A new
+/// subscription is asked for then too, and every such request draws on one budget of
+/// [`UNUSABLE_REQUESTS`] in any [`UNUSABLE_SPAN`]. The first goes at once and each other after the
+/// retry policy's pause; the request past the budget is not made, and the attachment ends. A
+/// frame, a screen or an answer does not give the budget back, since the first frame of a screen
+/// that cannot be used is no sign that the screen can: only time does, when a request has been
+/// made for longer than the span.
 #[derive(Debug, Default)]
 struct Subscriptions {
     /// A new subscription has been asked for, and its stream has not begun.
@@ -1537,20 +1559,19 @@ struct Subscriptions {
     attempts: Attempts,
     /// When the subscription the session refused for now is asked for again.
     retry_at: Option<tokio::time::Instant>,
-    /// How many screens in a row could not be read, whatever the session answered to the requests
-    /// that asked for them: only a screen that is read ends the count.
-    unreadable: u32,
-    /// What the retry policy has left for asking again after screens that could not be read.
-    unreadable_attempts: Attempts,
+    /// When the requests were made, or are to be made, that asked for a new subscription because
+    /// what the session sent could not be used, as far back as [`UNUSABLE_SPAN`] reaches. Only
+    /// time takes one out.
+    unusable_at: VecDeque<tokio::time::Instant>,
 }
 
-/// What to do after a screen that could not be read.
-enum Unreadable {
+/// What to do after what the session sent could not be used.
+enum Unusable {
     /// Ask for a new subscription now.
     Now,
     /// It is asked for when the retry policy's pause is over.
     After,
-    /// The policy has no more to give.
+    /// The budget has no more to give.
     GiveUp,
 }
 
@@ -1562,36 +1583,45 @@ impl Subscriptions {
             opening: true,
             attempts: Attempts::new(),
             retry_at: None,
-            unreadable: 0,
-            unreadable_attempts: Attempts::new(),
+            unusable_at: VecDeque::new(),
         }
     }
 
-    /// A screen could not be read, and a new one is to be asked for: now for the first, and then
-    /// after the pauses the retry policy gives, for as many times as it gives. Two clocks are not
-    /// kept: the pause is the policy's, and the request is sent by the same timer that sends a
-    /// subscription the session refused for now.
-    fn screen_unreadable(&mut self) -> Unreadable {
-        self.unreadable += 1;
-        if self.unreadable == 1 {
-            return Unreadable::Now;
+    /// What the session sent could not be used, and a new subscription is to be asked for: at once
+    /// when no request has been made in the span, and otherwise after the retry policy's pause for
+    /// as many requests in a row as the span holds. Two clocks are not kept: the pause is the
+    /// policy's, and the request is sent by the same timer that sends a subscription the session
+    /// refused for now.
+    fn unusable(&mut self) -> Unusable {
+        let now = tokio::time::Instant::now();
+        self.unusable_at
+            .retain(|at| now.saturating_duration_since(*at) < UNUSABLE_SPAN);
+        let made = self.unusable_at.len();
+        if made >= UNUSABLE_REQUESTS {
+            return Unusable::GiveUp;
         }
-        // The policy is asked about a condition it waits out, as it is for a refusal for now.
-        let decision = self.unreadable_attempts.decide(
-            Failure::new(ErrorCode::ResourceUnavailable),
-            RequestClass::IdempotentRead,
-        );
-        let Recovery::Retry { delay } = decision.recovery else {
-            return Unreadable::GiveUp;
-        };
-        self.retry_at = Some(tokio::time::Instant::now() + delay);
-        Unreadable::After
-    }
-
-    /// A screen was read: the first frame of a subscription was decoded.
-    fn screen_readable(&mut self) {
-        self.unreadable = 0;
-        self.unreadable_attempts = Attempts::new();
+        if made == 0 {
+            self.unusable_at.push_back(now);
+            return Unusable::Now;
+        }
+        // The pause is the policy's for a request that many in a row. The policy is asked about a
+        // condition it waits out, as it is for a refusal for now.
+        let mut attempts = Attempts::new();
+        let mut pause = std::time::Duration::ZERO;
+        for _ in 0..made {
+            let decision = attempts.decide(
+                Failure::new(ErrorCode::ResourceUnavailable),
+                RequestClass::IdempotentRead,
+            );
+            let Recovery::Retry { delay } = decision.recovery else {
+                return Unusable::GiveUp;
+            };
+            pause = delay;
+        }
+        let at = now + pause;
+        self.unusable_at.push_back(at);
+        self.retry_at = Some(at);
+        Unusable::After
     }
 
     /// The session refused the new subscription under `code`, for now. Says whether it is asked for
@@ -2612,12 +2642,6 @@ async fn drive(
                                 .payload
                                 .to_typed::<kr_protocol::recovery::OutputEvent>()
                         {
-                            // The first delivery of a subscription is the screen the session drew
-                            // for this terminal, and a screen that is read ends the count of those
-                            // that were not.
-                            if heard == Heard::First {
-                                subscriptions.screen_readable();
-                            }
                             // Bytes drawn while this terminal holds no projection are its own
                             // stream or its restoration, and both are the live screen: what it is
                             // showing from here is not somebody's history. A bell routed to the
@@ -2671,20 +2695,17 @@ async fn drive(
                                 continue;
                             }
                             window.recovering();
-                            match subscriptions.screen_unreadable() {
-                                Unreadable::Now => {
-                                    let request_id =
-                                        kr_protocol::ids::RequestId::new(next_request);
-                                    next_request += 1;
-                                    if !resubscribe(client, attaching, request_id, attachment_id)
-                                        .await
-                                    {
-                                        return AttachOutcome::Disconnected;
-                                    }
-                                    outstanding.insert(request_id, Outstanding::Resubscribe);
-                                }
-                                Unreadable::After => {}
-                                Unreadable::GiveUp => return AttachOutcome::OutputUnreadable,
+                            if let Some(ended) = ask_again_for_what_could_not_be_used(
+                                &mut subscriptions,
+                                client,
+                                attaching,
+                                attachment_id,
+                                &mut next_request,
+                                &mut outstanding,
+                            )
+                            .await
+                            {
+                                return ended;
                             }
                             continue;
                         }
@@ -2706,31 +2727,20 @@ async fn drive(
                                     continue;
                                 }
                                 window.recovering();
-                                match subscriptions.screen_unreadable() {
-                                    Unreadable::Now => {
-                                        let request_id =
-                                            kr_protocol::ids::RequestId::new(next_request);
-                                        next_request += 1;
-                                        if !resubscribe(
-                                            client,
-                                            attaching,
-                                            request_id,
-                                            attachment_id,
-                                        )
-                                        .await
-                                        {
-                                            return AttachOutcome::Disconnected;
-                                        }
-                                        outstanding.insert(request_id, Outstanding::Resubscribe);
-                                    }
-                                    Unreadable::After => {}
-                                    Unreadable::GiveUp => return AttachOutcome::OutputUnreadable,
+                                if let Some(ended) = ask_again_for_what_could_not_be_used(
+                                    &mut subscriptions,
+                                    client,
+                                    attaching,
+                                    attachment_id,
+                                    &mut next_request,
+                                    &mut outstanding,
+                                )
+                                .await
+                                {
+                                    return ended;
                                 }
                                 continue;
                             };
-                            if heard == Heard::First {
-                                subscriptions.screen_readable();
-                            }
                             let drawn = display.apply(event);
                             // What counts as the session writing is the session's output cursor
                             // moving, which is the one thing a screen this terminal asked for
@@ -2777,15 +2787,22 @@ async fn drive(
                                 }
                                 let _ = handle.flush();
                             }
+                            // A screen or an update the display refuses is of no use either, and
+                            // a new screen is asked for within the same budget.
                             if drawn.resubscribe && !closing && subscriptions.replace() {
                                 window.recovering();
-                                let request_id = kr_protocol::ids::RequestId::new(next_request);
-                                next_request += 1;
-                                if !resubscribe(client, attaching, request_id, attachment_id).await
+                                if let Some(ended) = ask_again_for_what_could_not_be_used(
+                                    &mut subscriptions,
+                                    client,
+                                    attaching,
+                                    attachment_id,
+                                    &mut next_request,
+                                    &mut outstanding,
+                                )
+                                .await
                                 {
-                                    return AttachOutcome::Disconnected;
+                                    return ended;
                                 }
-                                outstanding.insert(request_id, Outstanding::Resubscribe);
                             }
 
                         }
@@ -3377,6 +3394,32 @@ async fn drive(
     }
 }
 
+/// Asks for a new subscription because what the session sent could not be used, as far as the
+/// budget of [`Subscriptions::unusable`] allows: at once, or when the retry policy's pause is over.
+/// Says how the attachment ends when the budget has no more to give or the connection has.
+async fn ask_again_for_what_could_not_be_used(
+    subscriptions: &mut Subscriptions,
+    client: &mut impl Link,
+    attaching: &Attaching,
+    attachment_id: kr_protocol::ids::AttachmentId,
+    next_request: &mut u64,
+    outstanding: &mut std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding>,
+) -> Option<AttachOutcome> {
+    match subscriptions.unusable() {
+        Unusable::Now => {
+            let request_id = kr_protocol::ids::RequestId::new(*next_request);
+            *next_request += 1;
+            if !resubscribe(client, attaching, request_id, attachment_id).await {
+                return Some(AttachOutcome::Disconnected);
+            }
+            outstanding.insert(request_id, Outstanding::Resubscribe);
+            None
+        }
+        Unusable::After => None,
+        Unusable::GiveUp => Some(AttachOutcome::OutputUnreadable),
+    }
+}
+
 /// Asks for the session's screen again, on this loop's own connection.
 ///
 /// A resynchronisation marker says the view is no longer continuous; this is how the view is made
@@ -3605,7 +3648,7 @@ mod tests {
         };
         use kr_protocol::input::{InputContent, InputReleaseParams, InputWriteParams};
         use kr_protocol::method::Method;
-        use kr_protocol::scalars::Uuid;
+        use kr_protocol::scalars::{U64, Uuid};
         use kr_protocol::session::{
             ClosureReason, Dimensions, DisplayNumber, SESSION_CLOSED_EVENT,
         };
@@ -3701,6 +3744,87 @@ mod tests {
             }
 
             async fn finish(self) {}
+        }
+
+        /// The header of a projected screen of generation 1 and cursor 0, 4 columns by 2 rows.
+        fn projected_header() -> kr_protocol::projection::ProjectionSnapshot {
+            use kr_protocol::projection::{
+                CellRendition, CharsetState, KittyKeyboardState, MarginState, PaletteProvenance,
+                PaletteState, ProjectedBuffer, ProjectedCursor, ProjectedKeyboard, ProjectedTitle,
+                ProjectedViewport, ProjectionSnapshot, Rgb,
+            };
+            use kr_protocol::scalars::Nullable;
+
+            let colour = Rgb {
+                red: 0x20,
+                green: 0x20,
+                blue: 0x20,
+            };
+            ProjectionSnapshot {
+                projection_generation: U64::new(1),
+                output_cursor: U64::ZERO,
+                window_revision: U64::ZERO,
+                active_buffer: ProjectedBuffer::Primary,
+                dimensions: Dimensions::new(4, 2),
+                viewport: ProjectedViewport {
+                    top_row: U64::ZERO,
+                    screen_top_row: U64::ZERO,
+                    rows: U64::new(2),
+                    left_column: U64::ZERO,
+                    columns: U64::new(4),
+                },
+                cursor: ProjectedCursor {
+                    column: U64::ZERO,
+                    row: U64::ZERO,
+                    visible: true,
+                    style: U64::new(1),
+                    pending_wrap: false,
+                },
+                saved_cursors: Vec::new(),
+                margins: MarginState {
+                    top: U64::ZERO,
+                    bottom: U64::new(1),
+                    left: U64::ZERO,
+                    right: U64::new(3),
+                },
+                rendition: CellRendition::PLAIN,
+                tab_stops: Vec::new(),
+                charsets: CharsetState {
+                    g0: "Ascii".to_owned(),
+                    g1: "Ascii".to_owned(),
+                    shift_out: false,
+                },
+                modes: Vec::new(),
+                keypad_application: false,
+                keyboard: ProjectedKeyboard {
+                    modify_other_keys: U64::ZERO,
+                    primary: KittyKeyboardState {
+                        flags: Nullable::null(),
+                        stack: Vec::new(),
+                    },
+                    alternate: KittyKeyboardState {
+                        flags: Nullable::null(),
+                        stack: Vec::new(),
+                    },
+                },
+                title: ProjectedTitle::default(),
+                title_stack: Vec::new(),
+                hyperlink: Nullable::null(),
+                palette: PaletteState {
+                    source: PaletteProvenance::DarkPreset,
+                    foreground: colour,
+                    background: colour,
+                    cursor: colour,
+                    pointer_foreground: colour,
+                    pointer_background: colour,
+                    selection_background: colour,
+                    selection_foreground: colour,
+                    overrides: Vec::new(),
+                },
+                oldest_retained_row: U64::ZERO,
+                evicted: false,
+                degraded: false,
+            }
         }
 
         /// The case's end: the console it types at, and the frames the loop sends.
@@ -3866,14 +3990,70 @@ mod tests {
             /// The session says a batch of output on its stream, the `sequence`th, that this build
             /// cannot decode.
             pub fn says_output_it_cannot_decode(&self, sequence: u64) {
+                self.says_it_cannot_decode(sequence, "session.output");
+            }
+
+            /// The session says something of `event_type` on its stream, the `sequence`th, whose
+            /// payload this build cannot decode.
+            pub fn says_it_cannot_decode(&self, sequence: u64, event_type: &str) {
+                self.says(sequence, event_type, ParamsValue::empty());
+            }
+
+            /// The session says `payload` as `event_type`, the `sequence`th thing on its stream.
+            fn says(&self, sequence: u64, event_type: &str, payload: ParamsValue) {
                 self.answers
                     .send(ControlFrame::Notification(Notification {
                         stream_id: StreamId::new("session").expect("a stream"),
                         sequence: EventSequence::new(sequence),
-                        event_type: EventType::new("session.output").expect("an event type"),
-                        payload: ParamsValue::empty(),
+                        event_type: EventType::new(event_type).expect("an event type"),
+                        payload,
                     }))
                     .expect("the loop reads the wire");
+            }
+
+            /// The session opens a projected screen, as the `sequence`th thing on its stream.
+            pub fn says_projection_reset(&self, sequence: u64) {
+                let reset = kr_protocol::projection::ProjectionReset {
+                    projection_generation: U64::new(1),
+                    cursor: U64::ZERO,
+                    reason: kr_protocol::projection::ProjectionResetReason::Attached,
+                    window_revision: U64::ZERO,
+                };
+                self.says(
+                    sequence,
+                    kr_protocol::projection::PROJECTION_RESET_EVENT,
+                    ParamsValue::from_typed(&reset).expect("a reset"),
+                );
+            }
+
+            /// The session sends the header of the screen of cursor 0, as the `sequence`th thing on
+            /// its stream.
+            pub fn says_projection_header(&self, sequence: u64) {
+                self.says(
+                    sequence,
+                    kr_protocol::projection::PROJECTION_SNAPSHOT_EVENT,
+                    ParamsValue::from_typed(&projected_header()).expect("a header"),
+                );
+            }
+
+            /// The session sends the last page of rows of the screen of cursor 0, as the
+            /// `sequence`th thing on its stream, with the generation `generation` that the rows
+            /// belong to.
+            pub fn says_projection_rows(&self, sequence: u64, generation: u64) {
+                let page = kr_protocol::projection::ProjectionRowPage {
+                    projection_generation: U64::new(generation),
+                    output_cursor: U64::ZERO,
+                    buffer: kr_protocol::projection::ProjectedBuffer::Primary,
+                    rows: Vec::new(),
+                    oldest_retained_row: U64::ZERO,
+                    evicted: false,
+                    more: false,
+                };
+                self.says(
+                    sequence,
+                    kr_protocol::projection::PROJECTION_ROWS_EVENT,
+                    ParamsValue::from_typed(&page).expect("a page"),
+                );
             }
 
             /// The session says its view of it is no longer continuous, as the `sequence`th thing
@@ -4887,23 +5067,24 @@ mod tests {
         assert_eq!(requests, 2, "a request for a new subscription at each");
     }
 
-    /// A session whose every screen cannot be read is asked for a new one at the retry policy's
-    /// pace and not for ever: the first at once, the next after the pauses the policy gives, and
-    /// when it has no more to give the attachment ends and says what is wrong. The session took
-    /// every request, which does not end the count: only a screen that is read does. The clock is
-    /// stopped, so the pauses cost nothing and the case reads the time that passed.
+    /// Runs a session each of whose subscriptions says what `says` does for it (the number of the
+    /// subscription counts from 0), and every request for a new subscription is taken. What `says`
+    /// sends cannot be used, so this terminal asks again: the first request at once, and each of
+    /// the others after the retry policy's pause. The budget is the same however the screen fails,
+    /// so the attachment ends with the request that would be past it, and says what is wrong. The clock is stopped, so the pauses cost nothing and the case
+    /// reads the time that passed.
     #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn screens_that_cannot_be_read_in_a_row_are_asked_for_at_the_policys_pace_and_then_end_it()
-     {
+    async fn asked_for_at_the_policys_pace_and_then_ended(
+        says: impl Fn(usize, &wire::Case) + 'static,
+    ) {
         use kr_client::retry::RETRY_BACKOFF_MIN;
         use kr_protocol::envelope::{Outcome, ParamsValue};
 
         let ran = tokio::time::timeout(
             std::time::Duration::from_secs(600),
-            wire::run_switched(true, true, |mut case| async move {
-                case.says_output_it_cannot_decode(0);
-                for asked in 1..=4 {
+            wire::run_switched(true, true, move |mut case| async move {
+                says(0, &case);
+                for asked in 1..=super::UNUSABLE_REQUESTS {
                     let sent_at = tokio::time::Instant::now();
                     let request = case.next_request_asked(Method::EventsSubscribe).await;
                     let waited = sent_at.elapsed();
@@ -4916,7 +5097,7 @@ mod tests {
                         );
                     }
                     case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
-                    case.says_output_it_cannot_decode(0);
+                    says(asked, &case);
                 }
             }),
         )
@@ -4941,36 +5122,129 @@ mod tests {
                     if request.method == Method::EventsSubscribe.into())
             })
             .count();
-        assert_eq!(asked, 4, "four requests, and then it ends");
+        assert_eq!(
+            asked,
+            super::UNUSABLE_REQUESTS,
+            "the budget's number of requests, and then it ends"
+        );
     }
 
-    /// A screen that is read ends the count: two that cannot be read and then one that can leave the
-    /// next failure at the first again, which is asked for at once.
+    /// A session whose every first frame cannot be read is asked for a new screen at the retry
+    /// policy's pace and not for ever.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_screen_that_is_read_ends_the_count_of_screens_that_could_not_be() {
+    async fn screens_that_cannot_be_read_in_a_row_are_asked_for_at_the_policys_pace_and_then_end_it()
+     {
+        asked_for_at_the_policys_pace_and_then_ended(|_, case| {
+            case.says_output_it_cannot_decode(0);
+        })
+        .await;
+    }
+
+    /// A screen of two frames whose first is read and whose second is not: the first frame being
+    /// read does not give the budget back.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_screen_in_two_frames_whose_second_cannot_be_read_does_not_give_the_budget_back() {
+        asked_for_at_the_policys_pace_and_then_ended(|_, case| {
+            case.says_output_bytes(0, b"x");
+            case.says_output_it_cannot_decode(1);
+        })
+        .await;
+    }
+
+    /// A subscription whose screens are read and whose next ones are not, in turn: a screen that is
+    /// read does not give the budget back, so the pause is not only on every second request.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn screens_that_are_read_and_screens_that_are_not_in_turn_do_not_give_the_budget_back() {
+        asked_for_at_the_policys_pace_and_then_ended(|which, case| {
+            if which % 2 == 0 {
+                case.says_output_bytes(0, b"x");
+                case.says_output_it_cannot_decode(1);
+            } else {
+                case.says_output_it_cannot_decode(0);
+            }
+        })
+        .await;
+    }
+
+    /// A projected screen whose reset is read and whose snapshot header is not: the reset being
+    /// read does not give the budget back.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_projected_screen_whose_reset_is_read_and_whose_header_is_not_ends_the_attachment() {
+        asked_for_at_the_policys_pace_and_then_ended(|_, case| {
+            case.says_projection_reset(0);
+            case.says_it_cannot_decode(1, kr_protocol::projection::PROJECTION_SNAPSHOT_EVENT);
+        })
+        .await;
+    }
+
+    /// A projected screen whose reset and header are read and whose page of rows is not.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_projected_screen_whose_page_of_rows_cannot_be_read_ends_the_attachment() {
+        asked_for_at_the_policys_pace_and_then_ended(|_, case| {
+            case.says_projection_reset(0);
+            case.says_projection_header(1);
+            case.says_it_cannot_decode(2, kr_protocol::projection::PROJECTION_ROWS_EVENT);
+        })
+        .await;
+    }
+
+    /// A projected screen that is installed, followed by an update that cannot be read: a screen
+    /// being installed does not give the budget back.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_projected_screen_that_is_installed_does_not_give_the_budget_back() {
+        asked_for_at_the_policys_pace_and_then_ended(|_, case| {
+            case.says_projection_reset(0);
+            case.says_projection_header(1);
+            case.says_projection_rows(2, 1);
+            case.says_it_cannot_decode(3, kr_protocol::projection::PROJECTION_DELTA_EVENT);
+        })
+        .await;
+    }
+
+    /// A projected screen whose page of rows belongs to another generation, which the display
+    /// refuses to install, is asked for again at the same pace and not at once for ever.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_projected_screen_that_the_display_refuses_to_install_ends_the_attachment() {
+        asked_for_at_the_policys_pace_and_then_ended(|_, case| {
+            case.says_projection_reset(0);
+            case.says_projection_header(1);
+            case.says_projection_rows(2, 9);
+        })
+        .await;
+    }
+
+    /// The budget is over time: a screen that cannot be read now and then, each long after the one
+    /// before, is asked for at once each time and never ends the attachment.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn screens_that_cannot_be_read_long_apart_are_each_asked_for_at_once() {
         use kr_client::retry::RETRY_BACKOFF_MIN;
         use kr_protocol::envelope::{Outcome, ParamsValue};
 
         let ran = tokio::time::timeout(
-            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(3600),
             wire::run_switched(true, true, |mut case| async move {
-                case.says_output_it_cannot_decode(0);
-                for _ in 0..2 {
+                for round in 0..2 * super::UNUSABLE_REQUESTS {
+                    // The first is a screen; each later one is a frame behind the screen that was
+                    // read before it.
+                    case.says_output_it_cannot_decode(u64::from(round > 0));
+                    let failed_at = tokio::time::Instant::now();
                     let request = case.next_request_asked(Method::EventsSubscribe).await;
+                    assert!(
+                        failed_at.elapsed() < RETRY_BACKOFF_MIN,
+                        "round {round} is asked for at once"
+                    );
                     case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
-                    case.says_output_it_cannot_decode(0);
+                    case.says_output_bytes(0, b"x");
+                    tokio::time::sleep(super::UNUSABLE_SPAN).await;
                 }
-                // The third subscription's screen is read.
-                let request = case.next_request_asked(Method::EventsSubscribe).await;
-                case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
-                case.says_output_bytes(0, b"\x1b[?1000h");
-                // The next failure is the first of a new count, and is asked for at once.
-                case.says_output_it_cannot_decode(1);
-                let failed_at = tokio::time::Instant::now();
-                let request = case.next_request_asked(Method::EventsSubscribe).await;
-                assert!(failed_at.elapsed() < RETRY_BACKOFF_MIN, "at once");
-                case.answers_with(request, Outcome::Ok(ParamsValue::empty()));
                 case.closes();
             }),
         )
