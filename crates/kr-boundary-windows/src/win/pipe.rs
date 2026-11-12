@@ -43,8 +43,8 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentThread, INFINITE, OpenThreadToken, SetEvent, WaitForMultipleObjects,
-    WaitForSingleObject,
+    CreateEventW, GetCurrentThread, INFINITE, OpenProcess, OpenThreadToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::pipe_access;
@@ -874,6 +874,44 @@ const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Returns the platform's error when the pipe cannot be opened, or an error when the server is
 /// not the expected process.
 pub fn connect(kind: Kind, expected_server: u32) -> Result<Connection> {
+    connect_to(kind, expected_server)
+}
+
+/// The service's process, held open: while the handle lives its process number is not given to another
+/// process, so a number that the service manager reported cannot be reused between the report and the
+/// check of the pipe's server.
+pub struct ServerProcess {
+    pid: u32,
+    _handle: Handle,
+}
+
+impl ServerProcess {
+    /// Opens the process with the number the service manager reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the process cannot be opened.
+    pub fn open(pid: u32) -> Result<ServerProcess> {
+        // SAFETY: the call takes a process number and returns a handle that is checked.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        Ok(ServerProcess {
+            pid,
+            _handle: Handle::new(handle, "opening the service's process")?,
+        })
+    }
+}
+
+/// [`connect`] to the server process that `process` holds: the handle outlives the check of the
+/// pipe's server, which is the process that the handle names or the connection is refused.
+///
+/// # Errors
+///
+/// As for [`connect`].
+pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
+    connect_to(kind, process.pid)
+}
+
+fn connect_to(kind: Kind, expected_server: u32) -> Result<Connection> {
     let name = wide(kind.name());
     let began = Instant::now();
     let pipe = loop {
@@ -882,9 +920,16 @@ pub fn connect(kind: Kind, expected_server: u32) -> Result<Connection> {
             Err(failure) if failure.code == ERROR_PIPE_BUSY => {
                 let left = BUSY_WAIT.saturating_sub(began.elapsed());
                 if left.is_zero() {
+                    let held_by = if kind == Kind::Administrators {
+                        " Other elevated sessions may hold the administrators' pipe."
+                    } else {
+                        ""
+                    };
                     return Err(error(
                         ERROR_PIPE_BUSY,
-                        "the broker's pipe stayed busy: every connection the broker serves was in use for 10 seconds",
+                        format!(
+                            "the broker's pipe stayed busy: every connection the broker serves was in use for 10 seconds.{held_by}"
+                        ),
                     ));
                 }
                 // SAFETY: the name is NUL-terminated; the call waits until an instance listens or
