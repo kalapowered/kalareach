@@ -1045,11 +1045,12 @@ test.describe('a press that ends on a page that changed during it', () => {
     test(`gives a covered control its click after the control moved less than it is tall, and none when it left, on ${surface}`, async ({ page }) => {
       await pressPage(page, surface)
       await page.evaluate(() => {
-        const counted = window as unknown as { controlClicks: number }
+        const counted = window as unknown as { controlClicks: number; lastDetail: number }
         counted.controlClicks = 0
         for (const control of document.querySelectorAll('.m-pane button:not(.md-link)')) {
-          control.addEventListener('click', () => {
+          control.addEventListener('click', (event) => {
             counted.controlClicks += 1
+            counted.lastDetail = (event as MouseEvent).detail
           })
         }
       })
@@ -1079,6 +1080,9 @@ test.describe('a press that ends on a page that changed during it', () => {
       })
       await page.mouse.up()
       expect(await clicks(), 'clicks of the control that moved 12 px and still lies under the press').toBe(1)
+      // The redirected click is a pointer's: it counts a press, and the control has the focus, as after a pointer's press.
+      expect(await page.evaluate(() => (window as unknown as { lastDetail: number }).lastDetail), 'the click’s detail').toBeGreaterThan(0)
+      expect(await page.evaluate(() => document.activeElement?.classList.contains('text-link') ?? false), 'the control has the focus').toBe(true)
 
       const second = await covered()
       await page.mouse.move(second.x, second.y)
