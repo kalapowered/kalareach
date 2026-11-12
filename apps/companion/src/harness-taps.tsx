@@ -24,7 +24,7 @@ const TAP_MESSAGES: readonly string[] = [
   ['| Item | Notes |', '| --- | --- |', '| one | [first notes](https://example.org/table-1) |', '| two | [second notes](https://example.org/table-2) |'].join('\n'),
   '[docs](https://example.org/docs) and more words follow the link on this line, which ends the paragraph.',
   ...Array.from(
-    { length: 6 },
+    { length: 16 },
     (_, index) => `Plain words in paragraph ${String(index + 1)}, which holds no link, so that the conversation is longer than the screen and scrolls.`
   )
 ]
