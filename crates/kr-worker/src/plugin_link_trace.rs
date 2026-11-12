@@ -18,7 +18,7 @@
 //! time on the monotonic clock, fixed words, counts, the last six digits of a binding's identifier
 //! and a time limit: no error text, no path, no payload and no value of the environment.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -98,9 +98,10 @@ pub enum Outcome {
     Unavailable,
     /// Its limit passed before an answer came.
     Limit,
-    /// It was made, and what answered it said the component gave no answer in its time.
-    Unanswered,
-    /// It ended with no answer, and what ended it is not told.
+    /// The runtime answered, and the component declared a fault of its own.
+    Faulted,
+    /// It came to no answer that could be used: the other end was not reached, its limit passed,
+    /// or what came back was of the wrong kind. Which of them is not told.
     Failed,
 }
 
@@ -111,7 +112,7 @@ impl Outcome {
             Self::Refused => "refused",
             Self::Unavailable => "unavailable",
             Self::Limit => "limit",
-            Self::Unanswered => "unanswered",
+            Self::Faulted => "faulted",
             Self::Failed => "failed",
         }
     }
@@ -474,19 +475,20 @@ pub fn tail_of(reason: &str) -> Option<&str> {
     reason.split_once(MARKER).map(|(_, tail)| tail)
 }
 
-/// How many entries a [`History`] keeps before it takes no more.
+/// How many entries a [`History`] keeps. Past it, the oldest entries after the first half go.
 const HISTORY_ENTRIES: usize = 4096;
 
 /// The tails of one worker's record taken at different times, put together: each entry once, in
 /// the order it was noted, with a note where entries were noted that no tail held.
 ///
 /// A tail holds only the newest entries that fit a report, so one taken when a long wait ends has
-/// lost what happened early in it. A reader that takes a tail with each look keeps all of it. It
-/// takes a worker's record to be one, and does not tell that a worker's record began again.
+/// lost what happened early in it. A reader that takes a tail with each look keeps all of it, in
+/// whatever order the tails come. It takes a worker's record to be one: entries of a record that
+/// began again carry numbers the history holds already, and are dropped until they pass them.
 #[derive(Debug, Default)]
 pub struct History {
-    entries: Vec<String>,
-    next: u64,
+    entries: BTreeMap<u64, String>,
+    last_new: Option<Instant>,
 }
 
 impl History {
@@ -496,31 +498,41 @@ impl History {
             let Some(seq) = numbered(phrase) else {
                 continue;
             };
-            if seq < self.next {
+            if self.entries.contains_key(&seq) {
                 continue;
             }
-            if self.entries.len() >= HISTORY_ENTRIES {
-                return;
+            self.entries.insert(seq, phrase.to_owned());
+            self.last_new = Some(Instant::now());
+            if self.entries.len() > HISTORY_ENTRIES {
+                // The first half stays, since it holds how a wait began; the oldest of the rest
+                // goes, and shows as a gap.
+                if let Some(&oldest) = self.entries.keys().nth(HISTORY_ENTRIES / 2) {
+                    self.entries.remove(&oldest);
+                }
             }
-            if seq > self.next {
-                self.entries
-                    .push(format!("[{} entries not seen]", seq - self.next));
-            }
-            self.entries.push(phrase.to_owned());
-            self.next = seq + 1;
         }
     }
 
-    /// Every entry held, oldest first, one phrase each.
+    /// Every entry held, oldest first, one phrase each, a note where entries are missing between
+    /// two of them or before the first, and how long ago the newest was taken.
     #[must_use]
     pub fn in_words(&self) -> String {
-        let full = self.entries.len() >= HISTORY_ENTRIES;
-        let mut words = self.entries.join(SEPARATOR);
-        if full {
-            words.push_str(SEPARATOR);
-            words.push_str("[later entries not kept]");
+        let mut words: Vec<String> = Vec::new();
+        let mut expected = 0;
+        for (seq, phrase) in &self.entries {
+            if *seq > expected {
+                words.push(format!("[{} entries not held]", seq - expected));
+            }
+            words.push(phrase.clone());
+            expected = seq + 1;
         }
-        words
+        if let Some(taken) = self.last_new {
+            words.push(format!(
+                "[the newest entry was taken {} ms before this]",
+                millis(taken.elapsed())
+            ));
+        }
+        words.join(SEPARATOR)
     }
 }
 
@@ -650,16 +662,14 @@ mod tests {
             words.contains("began register 123456 limit 35000"),
             "{words}"
         );
-        assert!(!words.contains("not seen"), "{words}");
-        let numbers: Vec<u64> = words
-            .split(SEPARATOR)
-            .map(|phrase| numbered(phrase).expect("a numbered entry"))
-            .collect();
+        assert!(!words.contains("not held"), "{words}");
+        let numbers: Vec<u64> = words.split(SEPARATOR).filter_map(numbered).collect();
         assert_eq!(
             numbers,
             (0..=u64::try_from(ENTRIES * 3).expect("a count")).collect::<Vec<_>>(),
             "each entry once, in order"
         );
+        assert!(words.contains("the newest entry was taken"), "{words}");
         // Entries noted between two tails that neither held are told, and the same tail twice adds
         // nothing.
         for wants in 0..=ENTRIES {
@@ -668,12 +678,59 @@ mod tests {
         history.add(&trace.tail(usize::MAX));
         history.add(&trace.tail(usize::MAX));
         let words = history.in_words();
-        assert_eq!(words.matches("entries not seen]").count(), 1, "{words}");
-        assert!(words.contains("[1 entries not seen]"), "{words}");
+        assert_eq!(words.matches("entries not held]").count(), 1, "{words}");
+        assert!(words.contains("[1 entries not held]"), "{words}");
         // A history that starts from the middle of a record says what came before it.
         let mut later = History::default();
         later.add(&trace.tail(200));
-        assert!(later.in_words().starts_with("[") && later.in_words().contains("not seen]"));
+        assert!(later.in_words().starts_with('[') && later.in_words().contains("not held]"));
+    }
+
+    #[test]
+    fn a_tail_that_comes_after_a_later_one_fills_the_gap_between_what_was_held() {
+        let entry = |seq: u64| format!("#{seq} 0.000 pass wants {seq}");
+        let tail = |from: u64, to: u64| (from..=to).map(entry).collect::<Vec<_>>().join(SEPARATOR);
+        let mut history = History::default();
+        history.add(&tail(0, 1));
+        history.add(&tail(9, 9));
+        history.add(&tail(4, 5));
+        let held: Vec<String> = history
+            .in_words()
+            .split(SEPARATOR)
+            .take_while(|phrase| !phrase.contains("the newest"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            held,
+            [
+                entry(0),
+                entry(1),
+                "[2 entries not held]".to_owned(),
+                entry(4),
+                entry(5),
+                "[3 entries not held]".to_owned(),
+                entry(9),
+            ]
+        );
+        history.add(&tail(2, 8));
+        let words = history.in_words();
+        assert!(!words.contains("not held"), "{words}");
+    }
+
+    #[test]
+    fn a_history_that_outgrows_its_bound_keeps_how_a_wait_began_and_its_newest_entries() {
+        let mut history = History::default();
+        for seq in 0..u64::try_from(HISTORY_ENTRIES * 2).expect("a count") {
+            history.add(&format!("#{seq} 0.000 pass wants 0"));
+        }
+        let words = history.in_words();
+        assert!(words.starts_with("#0 "), "{words}");
+        assert!(
+            words.contains(&format!("#{} ", HISTORY_ENTRIES * 2 - 1)),
+            "{words}"
+        );
+        assert!(words.contains("entries not held]"), "{words}");
+        assert_eq!(history.entries.len(), HISTORY_ENTRIES);
     }
 
     #[test]

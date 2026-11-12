@@ -909,7 +909,7 @@ impl Link {
             link_trace::ended(
                 began,
                 match &restored {
-                    Ok(called) if !called.answered() => link_trace::Outcome::Unanswered,
+                    Ok(called) if !called.answered() => link_trace::Outcome::Faulted,
                     _ => link_trace::Outcome::of(&restored),
                 },
             );
@@ -1054,7 +1054,7 @@ impl Link {
             link_trace::ended(
                 began,
                 match &checkpointed {
-                    Ok(called) if !called.answered() => link_trace::Outcome::Unanswered,
+                    Ok(called) if !called.answered() => link_trace::Outcome::Faulted,
                     _ => link_trace::Outcome::of(&checkpointed),
                 },
             );

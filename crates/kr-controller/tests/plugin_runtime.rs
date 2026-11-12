@@ -1210,7 +1210,7 @@ impl World {
                     .then_some(host)
                     .ok_or_else(String::new)
             },
-            || async { self.link_traces_in_words() },
+            || self.link_traces_after_a_look(),
         )
         .await
     }
@@ -1245,7 +1245,7 @@ impl World {
                     .filter(|health| health.live_bindings == bindings)
                     .ok_or_else(String::new)
             },
-            || async { self.link_traces_in_words() },
+            || self.link_traces_after_a_look(),
         )
         .await
     }
@@ -1367,6 +1367,16 @@ impl World {
             };
             histories[at].1.add(tail);
         }
+    }
+
+    /// As [`Self::link_traces_in_words`], after one more look at the reports where the daemon runs
+    /// in this process: for the end of a wait that did not look at them, so that the account is
+    /// not the one the last look before the wait held.
+    async fn link_traces_after_a_look(&self) -> String {
+        if self.controller.is_some() {
+            self.looked().await;
+        }
+        self.link_traces_in_words()
     }
 
     /// What each worker's link to the plugin runtime says it did, oldest first, from every look
@@ -1869,16 +1879,33 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
     // ends in the same look that finds both true: the registration is still outstanding then, and
     // a registration that had run out its limit and been sent again would not satisfy it.
     let sent = traffic.count();
-    until(
+    until_found(
+        PATIENCE,
         "the terminal to be sent updates while the registration is unanswered",
         || async {
             // A look the worker answered after it was asked, and not the last one accepted.
-            let outstanding = world
-                .reported_fresh()
-                .await?
-                .iter()
-                .any(|(binding, report)| *binding == second_binding && registering(report));
-            (outstanding && traffic.count() > sent + 20).then_some(())
+            let look = world.looked().await;
+            let outstanding = look.counted
+                && look
+                    .reports
+                    .iter()
+                    .any(|(binding, report)| *binding == second_binding && registering(report));
+            if outstanding && traffic.count() > sent + 20 {
+                Ok(())
+            } else {
+                Err(reports_in_words(
+                    &look.reports,
+                    first_binding,
+                    counting_in_words(look.counted),
+                ))
+            }
+        },
+        || async {
+            format!(
+                "; the terminal was sent {} updates since the wait began{}",
+                traffic.count().saturating_sub(sent),
+                world.rounds_in_words().await
+            )
         },
     )
     .await;
