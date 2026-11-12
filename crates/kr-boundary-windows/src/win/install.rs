@@ -217,6 +217,13 @@ pub mod testing {
             .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
+    /// Drops a function that was set and did not run, so that it does not run in another case.
+    pub fn no_hook_after_the_removal_inspects_the_data_directory() {
+        *AFTER_THE_INSPECTION
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
     pub(super) fn after_the_removal_inspection() {
         let hook = AFTER_THE_INSPECTION
             .lock()
@@ -379,7 +386,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     if records::entry_exists(&paths.program)
         && let Err(refusal) = DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)?
     {
-        return Err(anchor_refusal(paths, &refusal));
+        return Err(anchor_refusal(paths, &refusal, true));
     }
     for name in [CHECKOUT, CONNECT] {
         if account::find(name).is_some() {
@@ -1585,6 +1592,11 @@ enum Cure {
     RemoveEntry,
     /// The entry is a link: remove the link itself and not what it points to.
     RemoveLink,
+    /// [`Cure::RemoveEntry`] where nothing is installed, so that a repair cannot make the files
+    /// again.
+    RemoveEntryFresh,
+    /// [`Cure::RemoveLink`] where nothing is installed.
+    RemoveLinkFresh,
     /// The configuration file that the installation makes empty holds settings: remove it, and a
     /// repair makes it again, empty. It is a name the installation gives there, so the text of
     /// [`Cure::RemoveEntry`] does not fit it.
@@ -1604,8 +1616,16 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
     let entry = dir.join(name);
     let remedy = match cure {
         Cure::OwnerAndList => "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.".to_owned(),
-        Cure::RemoveEntry => remedy::program_removal_advice(&entry.display().to_string(), false),
-        Cure::RemoveLink => remedy::program_removal_advice(&entry.display().to_string(), true),
+        Cure::RemoveEntry => {
+            remedy::program_removal_advice(&entry.display().to_string(), false, true)
+        }
+        Cure::RemoveLink => remedy::program_removal_advice(&entry.display().to_string(), true, true),
+        Cure::RemoveEntryFresh => {
+            remedy::program_removal_advice(&entry.display().to_string(), false, false)
+        }
+        Cure::RemoveLinkFresh => {
+            remedy::program_removal_advice(&entry.display().to_string(), true, false)
+        }
         Cure::EmptyConfig => format!(
             "Remove {}, and nothing else: the installation makes it empty, and a configuration that holds settings would be read by the Git that the boundary's accounts run, and a change of its owner or its list does not cure that. A repair makes it again, empty. Then run the setup program again.",
             entry.display()
@@ -1628,11 +1648,13 @@ fn program_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, cure: Cur
 
 /// The refusal of the program directory's own name: a link or a file there is removed, the volume is
 /// a refusal that no change of owner, list or open handle cures.
-fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal) -> Error {
-    let (why, cure) = match refusal {
-        AnchorRefusal::Volume(_) => (refusal.to_string(), Cure::Volume),
-        AnchorRefusal::ReparsePoint => ("it is a link".to_owned(), Cure::RemoveLink),
-        AnchorRefusal::NotADirectory => (refusal.to_string(), Cure::RemoveEntry),
+fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, nothing_installed: bool) -> Error {
+    let (why, cure) = match (refusal, nothing_installed) {
+        (AnchorRefusal::Volume(_), _) => (refusal.to_string(), Cure::Volume),
+        (AnchorRefusal::ReparsePoint, false) => ("it is a link".to_owned(), Cure::RemoveLink),
+        (AnchorRefusal::ReparsePoint, true) => ("it is a link".to_owned(), Cure::RemoveLinkFresh),
+        (AnchorRefusal::NotADirectory, false) => (refusal.to_string(), Cure::RemoveEntry),
+        (AnchorRefusal::NotADirectory, true) => (refusal.to_string(), Cure::RemoveEntryFresh),
     };
     program_refusal(
         paths,
@@ -1716,6 +1738,7 @@ fn check_ancestors(top: &Path, tree: remedy::Tree) -> Result<(), Error> {
 /// delete in it, write its list or take it. The paths that the service control manager runs the
 /// broker by rest on these lists. A folder that is not there is the installation's to make.
 fn check_program_parents(paths: &Paths) -> Result<(), Error> {
+    use remedy::AncestorFault as Fault;
     check_ancestors(&paths.program_top, remedy::Tree::Program)?;
     let Some(parent) = paths.program.parent() else {
         return Ok(());
@@ -1726,6 +1749,16 @@ fn check_program_parents(paths: &Paths) -> Result<(), Error> {
         .collect();
     chain.reverse();
     for folder in chain {
+        let shown = folder.display().to_string();
+        let refuse = |fault: Fault<'_>| {
+            Error::Refused(remedy::ancestor_refusal(
+                &shown,
+                remedy::Tree::Program,
+                &fault,
+            ))
+        };
+        let unreadable =
+            |error: &dyn std::fmt::Display| refuse(Fault::Unreadable(&error.to_string()));
         let wide = ffi::wide_path(folder);
         // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
         let raw = unsafe {
@@ -1748,46 +1781,26 @@ fn check_program_parents(paths: &Paths) -> Result<(), Error> {
             }
             // Any other answer is not an absence: the folder could not be checked, and the person
             // is told what can be done about that.
-            Err(failure) => {
-                return Err(Error::Refused(format!(
-                    "{} is a folder above the boundary's program directory (the program that the service runs as the system). It could not be opened to be checked ({failure}). Another program may hold it open, or its list may forbid the check: close that program, or correct who may open the folder, then run the setup program again. A change of its owner does not close a handle. Do not remove the program directory: the manifest records it and stays where it is.",
-                    folder.display()
-                )));
-            }
+            Err(failure) => return Err(unreadable(&failure)),
         };
-        let mut tag = FILE_ATTRIBUTE_TAG_INFO {
-            FileAttributes: 0,
-            ReparseTag: 0,
-        };
-        // SAFETY: the handle is open and the record is the size the class takes.
-        if unsafe {
-            GetFileInformationByHandleEx(
-                handle.raw(),
-                FileAttributeTagInfo,
-                (&raw mut tag).cast(),
-                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-            )
-        } == 0
-        {
-            return Err(ffi::last("reading a folder above the program directory").into());
+        let attributes = attributes_of(&handle, "a folder above the program directory")
+            .map_err(|error| unreadable(&error))?;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(refuse(Fault::Link));
         }
-        let why = if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(refuse(Fault::NotAFolder));
+        }
+        // The folder that the path leads to is the one that was asked for: a link, a mounted
+        // folder or an alias above it would lead somewhere else.
+        let found = final_dos_path(&handle).map_err(|error| unreadable(&error))?;
+        if !found.eq_ignore_ascii_case(&shown) {
+            return Err(refuse(Fault::Link));
+        }
+        if let Some(why) =
+            acl::changeable_by_others_on(&handle, false).map_err(|error| unreadable(&error))?
         {
-            Some("it is a link or not a folder".to_owned())
-        } else {
-            let found = final_dos_path(&handle)?;
-            if found.eq_ignore_ascii_case(&folder.display().to_string()) {
-                acl::changeable_by_others_on(&handle, false)?
-            } else {
-                Some(format!("it is really {found}: a link leads there"))
-            }
-        };
-        if let Some(why) = why {
-            return Err(Error::Refused(format!(
-                "{} is a folder above the boundary's program directory (the program that the service runs as the system). It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program. Make the Administrators group, the system or the installer service its owner, leave only them able to change it, and if it is a link remove the link, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is.",
-                folder.display()
-            )));
+            return Err(refuse(Fault::Writable(&why)));
         }
     }
     Ok(())
@@ -1818,8 +1831,7 @@ fn final_dos_path(handle: &ffi::Handle) -> Result<String, Error> {
         }
         buffer.resize(length as usize + 1, 0);
     }
-    let text = String::from_utf16_lossy(&buffer);
-    Ok(text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned())
+    Ok(remedy::dos_path_of(&String::from_utf16_lossy(&buffer)))
 }
 
 /// Reads the program directory on a handle that is held, and everything in it on its own handle:
@@ -1836,7 +1848,7 @@ fn check_program_directory(paths: &Paths) -> Result<bool, Error> {
     let program = paths.program.file_name().unwrap_or_default().to_owned();
     let held = match DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)? {
         Ok(held) => held,
-        Err(refusal) => return Err(anchor_refusal(paths, &refusal)),
+        Err(refusal) => return Err(anchor_refusal(paths, &refusal, false)),
     };
     if let Some(why) = check_readable_object(held.handle())? {
         return Err(program_refusal(
@@ -3457,11 +3469,12 @@ fn data_is_empty(paths: &Paths) -> bool {
 /// not be removed, with the reason; nothing is returned when everything is gone. It approves every
 /// record that is there now, for a caller that has inspected nothing; the removal approves what its
 /// own inspection opened.
+#[cfg(feature = "testing")]
 pub fn remove_records(paths: &Paths) -> Vec<String> {
     remove_approved_records(paths, &records::Approved::all_that_are_there(&paths.data))
 }
 
-/// [`remove_records`] for the records that the removal's own inspection approved: a record that is
+/// Removes the records that the removal's own inspection approved: a record that is
 /// there now and that it did not see is left and named.
 fn remove_approved_records(paths: &Paths, approved: &records::Approved) -> Vec<String> {
     let stayed = records::remove(&Records {
