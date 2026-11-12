@@ -455,3 +455,35 @@ fn removal_takes_out_only_our_rules_and_leaves_the_rest_as_written() {
     );
     assert!(policy::strip("not a policy", &[]).is_err());
 }
+
+/// A client asks the platform for what the pipe's list grants and for nothing beyond it. The
+/// generic write right of a file carries the append bit, which on a pipe is the right to make
+/// another instance of its name, so a request that is made of generic rights is refused for the
+/// bit no client is given.
+#[test]
+fn a_clients_rights_on_the_brokers_pipe_are_the_grant_and_hold_no_right_to_make_an_instance() {
+    use kr_boundary_windows::pipe_access::{CLIENT, CREATE_INSTANCE, entry};
+
+    assert_eq!(CLIENT, 0x0012_0183);
+    assert_eq!(
+        CLIENT & CREATE_INSTANCE,
+        0,
+        "no right to make another instance"
+    );
+    // What a file's generic read and write rights add to the grant: extended attributes and the
+    // append bit.
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+    assert_ne!(
+        (FILE_GENERIC_READ | FILE_GENERIC_WRITE) & !CLIENT,
+        0,
+        "the generic rights ask for more than the grant"
+    );
+    assert_eq!(CLIENT & !(FILE_GENERIC_READ | FILE_GENERIC_WRITE), 0);
+    // The grant a person and the Administrators group receive is this value, written once.
+    assert_eq!(entry("BA"), "(A;;0x120183;;;BA)");
+    assert_eq!(
+        entry("S-1-5-21-111-222-333-1001"),
+        "(A;;0x120183;;;S-1-5-21-111-222-333-1001)"
+    );
+}

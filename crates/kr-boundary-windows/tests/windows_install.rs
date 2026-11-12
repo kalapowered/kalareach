@@ -3178,6 +3178,207 @@ fn a_stopped_application_identity_service_is_started_once_and_its_first_event_co
     let _ = std::fs::remove_file(&log);
 }
 
+/// Whether this process's token is the system's own: whose entry in the pipe's list is `GA`, so
+/// that a request for more than the grant is not refused to it.
+#[cfg(feature = "testing")]
+fn runs_as_the_system() -> bool {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut process: HANDLE = std::ptr::null_mut();
+    // SAFETY: opens this process's own token for the one right named; the handle is owned below.
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut process) };
+    assert_ne!(opened, 0, "this process's token is opened");
+    let process = ffi::Handle::new(process, "this process's token").unwrap();
+    let mut buffer = vec![0_u8; 512];
+    let mut length = 0_u32;
+    // SAFETY: the buffer is the length given and the token is open.
+    let read = unsafe {
+        GetTokenInformation(
+            process.raw(),
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &raw mut length,
+        )
+    };
+    assert_ne!(read, 0, "the token's user is read");
+    // SAFETY: the buffer holds a TOKEN_USER whose identifier points into the same buffer.
+    let user = unsafe { Sid::from_ptr((*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid) };
+    user.to_text() == "S-1-5-18"
+}
+
+/// Opens the broker's pipe asking for exactly `access`, the way the installer's client does, and
+/// closes it at once. A pipe whose instances are all taken is waited for a few seconds.
+#[cfg(feature = "testing")]
+fn open_the_brokers_pipe_with(access: u32) -> Result<(), u32> {
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+    };
+    let name = ffi::wide(kr_boundary_windows::win::pipe::NAME);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: the name is NUL-terminated; the result is checked.
+        let opened = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                access,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_IDENTIFICATION,
+                std::ptr::null_mut(),
+            )
+        };
+        if opened != INVALID_HANDLE_VALUE {
+            drop(ffi::Handle::new(opened, "the broker's pipe").unwrap());
+            return Ok(());
+        }
+        // SAFETY: reads the calling thread's last error.
+        let code = unsafe { GetLastError() };
+        if code != ERROR_PIPE_BUSY || std::time::Instant::now() >= until {
+            return Err(code);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A client of the broker's pipe holds the pipe's one grant and nothing else when it is an
+/// elevated administrator (the Administrators entry) and is the system with its own: the installer's
+/// `connect` opens the pipe, sends one request and reads its answer, and, when the answer is late,
+/// its deadline cancels the read on that handle.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answer_cross_it() {
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    let server = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        move || {
+            let Some(mut connection) = listener.accept().unwrap() else {
+                return;
+            };
+            let request: Request = kr_boundary_windows::frame::read(&mut connection).unwrap();
+            assert!(matches!(request, Request::Prove { .. }), "{request:?}");
+            let answer = Response::Proof {
+                ready: true,
+                detail: "answered".to_owned(),
+            };
+            kr_boundary_windows::frame::write(&mut connection, &answer).unwrap();
+            // The next request is not answered: the client's deadline ends its read.
+            let _ = kr_boundary_windows::frame::read::<_, Request>(&mut connection);
+            while !stop.is_set() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    });
+    let mut connection = pipe::connect(std::process::id()).expect("the client opens the pipe");
+    kr_boundary_windows::frame::write(
+        &mut connection,
+        &Request::Prove {
+            class: Class::Checkout,
+        },
+    )
+    .expect("the request crosses");
+    let answer: Response =
+        kr_boundary_windows::frame::read(&mut connection).expect("the answer comes");
+    assert!(
+        matches!(&answer, Response::Proof { ready: true, detail } if detail == "answered"),
+        "{answer:?}"
+    );
+    connection.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    ));
+    kr_boundary_windows::frame::write(
+        &mut connection,
+        &Request::Prove {
+            class: Class::Connect,
+        },
+    )
+    .expect("the second request crosses");
+    let late = kr_boundary_windows::frame::read::<_, Response>(&mut connection)
+        .expect_err("nothing answers the second request")
+        .to_string();
+    assert!(late.contains("deadline"), "{late}");
+    stop.set();
+    drop(connection);
+    server.join().unwrap();
+}
+
+/// The pipe's grant leaves out the right to make another instance of its name (the append bit),
+/// and a request for more than the grant, by generic rights or by that bit, is refused to a client
+/// that holds only the grant. The system's own entry is `GA`, which refuses nothing: there the case
+/// has nothing to show.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated administrator's session that is not the system, in a disposable Windows guest (see the file's header)"]
+fn a_client_that_holds_only_the_pipes_grant_is_refused_more_than_the_grant_and_makes_no_instance() {
+    use kr_boundary_windows::pipe_access::{CLIENT, CREATE_INSTANCE};
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    use windows_sys::Win32::Foundation::{
+        GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT};
+    if runs_as_the_system() {
+        println!("skipped: this session is the system, whose own entry (GA) refuses nothing");
+        return;
+    }
+    let stop = Stop::new().unwrap();
+    let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
+    // A broker that takes each client and lets it go, so that the next one finds an instance.
+    let server = std::thread::spawn(move || {
+        while let Ok(Some(held)) = listener.accept() {
+            drop(held);
+        }
+    });
+    assert_eq!(
+        open_the_brokers_pipe_with(CLIENT),
+        Ok(()),
+        "the grant itself is enough to open the pipe"
+    );
+    assert_eq!(
+        open_the_brokers_pipe_with(GENERIC_READ | GENERIC_WRITE),
+        Err(5),
+        "the generic rights ask for the append bit and more than the grant"
+    );
+    assert_eq!(
+        open_the_brokers_pipe_with(CLIENT | CREATE_INSTANCE),
+        Err(5),
+        "the grant and the right to make an instance are refused"
+    );
+    let name = ffi::wide(pipe::NAME);
+    // SAFETY: the name is NUL-terminated; the result is checked and the default descriptor is
+    // the caller's.
+    let made = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_WAIT,
+            pipe::MAX_INSTANCES,
+            4096,
+            4096,
+            0,
+            std::ptr::null(),
+        )
+    };
+    // SAFETY: reads the calling thread's last error.
+    let code = unsafe { GetLastError() };
+    if made != INVALID_HANDLE_VALUE {
+        drop(ffi::Handle::new(made, "an instance of the broker's pipe").unwrap());
+    }
+    stop.set();
+    server.join().unwrap();
+    assert_eq!(
+        (made == INVALID_HANDLE_VALUE).then_some(code),
+        Some(5),
+        "no client makes another instance of the pipe's name"
+    );
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
