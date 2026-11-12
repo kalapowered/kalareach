@@ -521,9 +521,13 @@ build_tests() {
       *) die "KR_IOS_PACKAGES has to name an absolute path, and holds $KR_IOS_PACKAGES" ;;
     esac
     mkdir -p "$KR_IOS_PACKAGES" || die "the folder of the Swift packages could not be made: $KR_IOS_PACKAGES"
-    packages=(-clonedSourcePackagesDirPath "$KR_IOS_PACKAGES" -onlyUsePackageVersionsFromResolvedFile)
-    # Builds that fetch into one empty folder at the same time break each other, so one runs at a time.
-    lock=(/usr/bin/lockf -k "${KR_IOS_PACKAGES%/}.lock")
+    # The resolved path names the folder and its lock, so every spelling of the path takes the same lock.
+    local folder
+    folder=$(cd "$KR_IOS_PACKAGES" && pwd -P) || die "the folder of the Swift packages is not there: $KR_IOS_PACKAGES"
+    packages=(-clonedSourcePackagesDirPath "$folder" -onlyUsePackageVersionsFromResolvedFile)
+    # Builds that fetch into one empty folder at the same time break each other, so one runs at a
+    # time; one that waits more than half an hour fails.
+    lock=(/usr/bin/lockf -k -t 1800 "$folder.lock")
   fi
   ( cd "$apple" && ${lock[@]+"${lock[@]}"} xcodebuild build-for-testing -project companion-tauri.xcodeproj -scheme "$tests_scheme" -sdk "$(sdk)" \
       -destination "generic/platform=$([ "$target" = device ] && echo iOS || echo 'iOS Simulator')" -derivedDataPath "$derived" \

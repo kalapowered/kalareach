@@ -17,10 +17,10 @@
 # `aarch64-apple-ios-sim` target (a build phase of the scheme compiles the notification preview
 # library for it), and a network to fetch the Swift packages the project pins. Those are fetched at
 # the versions the project's `Package.resolved` records and never resolved again, so the run leaves
-# the file as it found it. They stay in this run's own directory on the internal disk: the shared
-# package folder that KR_IOS_PACKAGES names for the device scripts is not used here, because a run
-# of these tests with the packages in a folder on an external volume made the simulator's test
-# process query access to that volume, and the same run without it did not.
+# the file as it found it. They stay in this run's own directory on the internal disk. The shared
+# package folder that KR_IOS_PACKAGES names for the device scripts is not used here: one run of
+# these tests with the packages in a folder on an external volume logged an access query for that
+# volume from the simulator's test agent, and a run without it logged none.
 #
 # The tests are built with the newest Xcode that is installed under a versioned name
 # (`/Applications/Xcode_<version>.app`, as a hosted runner has them) or is the one selected, by its
@@ -47,7 +47,7 @@ while [ $# -gt 0 ]; do
             break
             ;;
         -h|--help)
-            sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 2
             ;;
         *)

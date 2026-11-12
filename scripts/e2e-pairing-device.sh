@@ -67,8 +67,9 @@
 # through it, so a port that already answers would move another emulator's.
 # KR_IOS_PACKAGES names an absolute folder that the iOS test build keeps the Swift packages in, so
 # that builds share one copy instead of fetching one each (see scripts/lib/xcode.sh).
-# The driving test's result bundle is written to the artefacts folder and removed once the run has
-# been read; KR_KEEP_XCRESULT=1 keeps it.
+# The driving test's result bundle is written to driving-test.xcresult in the artefacts folder,
+# which has to stay on the internal disk. A run that passes removes it; a run that fails keeps it,
+# and the next run replaces it. KR_KEEP_XCRESULT=1 keeps it after a pass too.
 #
 # The phone's logs are searched for every form of an invitation's text and secret. The folders this run
 # writes into (the output folder and the screenshots) are for the account that runs it alone, made before
@@ -504,7 +505,7 @@ run_ios() {
 
     say "building the tests that drive it"
     local derived="$cache/ios-tests"
-    kr_shared_packages || return 2
+    kr_shared_packages || { say "the folder that KR_IOS_PACKAGES names cannot be used"; return 2; }
     ( cd "$companion/src-tauri/gen/apple" && kr_with_packages_lock xcodebuild build-for-testing -project companion-tauri.xcodeproj \
         -scheme KalaReachUITests -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
         -derivedDataPath "$derived" ${kr_package_options[@]+"${kr_package_options[@]}"} ) >"$artefacts/build-tests.log" 2>&1 \
@@ -541,8 +542,6 @@ run_ios() {
         -resultBundlePath "$result_bundle" \
         >"$out" 2>&1 || status=$?
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|PAIRING" "$out" | sed 's/^/    /' | tee -a "$log"
-    # The run is read from the log; the bundle is kept only when asked.
-    [ -n "${KR_KEEP_XCRESULT:-}" ] || /bin/rm -rf "${result_bundle:?}"
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
     # Every level (the default, info and debug lines), from before the run began: its length and a margin
     # of five minutes, never a fixed window. A line of the application's own process reads
@@ -552,6 +551,10 @@ run_ios() {
     search_log ' KalaReach\[[0-9]+:' xcrun simctl spawn "$udid" log show --info --debug \
         --last "$((($(date +%s) - run_started) / 60 + 5))m" --style compact
     judge "$out" || status=2
+    # A pass has said all it has to in the log.
+    if [ "$status" = 0 ] && [ "${KR_KEEP_XCRESULT:-}" != 1 ]; then
+        /bin/rm -rf "${result_bundle:?}"
+    fi
     [ "$status" = 0 ] || return 2
 }
 

@@ -42,8 +42,9 @@
 # KR_PUSH_SHOTS is where the screenshots go (default /tmp/kr-push-phone).
 # KR_IOS_PACKAGES names an absolute folder that the iOS test build keeps the Swift packages in, so
 # that builds share one copy instead of fetching one each (see scripts/lib/xcode.sh).
-# The driving test's result bundle is written to the artefacts folder and removed once the run has
-# been read; KR_KEEP_XCRESULT=1 keeps it.
+# The driving test's result bundle is written to driving-test.xcresult in the artefacts folder,
+# which has to stay on the internal disk. A run that passes removes it; a run that fails keeps it,
+# and the next run replaces it. KR_KEEP_XCRESULT=1 keeps it after a pass too.
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail
@@ -967,7 +968,7 @@ run_ios() {
 
     say "building the tests that drive it"
     local derived="$cache/ios-tests"
-    kr_shared_packages || return 2
+    kr_shared_packages || { say "the folder that KR_IOS_PACKAGES names cannot be used"; return 2; }
     ( cd "$companion/src-tauri/gen/apple" && kr_with_packages_lock xcodebuild build-for-testing -project companion-tauri.xcodeproj \
         -scheme KalaReachUITests -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
         -derivedDataPath "$derived" ${kr_package_options[@]+"${kr_package_options[@]}"} ) >"$artefacts/build-tests.log" 2>&1 \
@@ -1055,11 +1056,6 @@ run_ios() {
     done
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|KR-" "$out" | sed 's/^/    /' | tee -a "$log"
     [ "$(cat "$harness/test-status" 2>/dev/null)" = 0 ] || { say "check=the driving test passed ok=0"; test_status=2; }
-    # The run is read from the log and the test's status; the bundle is kept only when asked, and
-    # never while xcodebuild may still be writing it.
-    if [ -z "${KR_KEEP_XCRESULT:-}" ] && [ -e "$harness/test-status" ]; then
-        /bin/rm -rf "${result_bundle:?}"
-    fi
     cp "$harness/ios.log" "$artefacts/application.log" 2>/dev/null
     search_ios_log "$udid" || test_status=2
     local status=$test_status line
@@ -1067,6 +1063,11 @@ run_ios() {
         say "$line"
         case "$line" in *" ok=0"*) status=2 ;; esac
     done < <(judge)
+    # A pass has said all it has to in the log, and the test has ended: its status is written when
+    # xcodebuild exits, and a pass needs that status to be 0.
+    if [ "$status" = 0 ] && [ "${KR_KEEP_XCRESULT:-}" != 1 ]; then
+        /bin/rm -rf "${result_bundle:?}"
+    fi
     [ "$status" = 0 ] || return 2
 }
 

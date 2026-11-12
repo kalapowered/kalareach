@@ -10,14 +10,19 @@
 # `kr_shared_packages` sets the array `kr_package_options` to the xcodebuild options that put the
 # Swift packages in one folder that every build shares, when KR_IOS_PACKAGES names one, and to
 # nothing otherwise. A build fetches 1.3 GB of packages into a tree of its own unless it is given
-# a folder. The folder has to be an absolute path. A build that is given it uses the package
-# versions the project's `Package.resolved` records, so the shared folder never moves a pin. Only
-# the build and the tools it starts, which are children of the terminal, read the folder.
+# a folder. The folder has to be an absolute path, and the options name its resolved path. A build
+# that is given it uses the package versions the project's `Package.resolved` records, so the shared
+# folder never moves a pin. Only the build and the tools it starts, which are children of the
+# terminal, read the folder, as long as the scheme's test run loads no package product: the UI-test
+# scheme the device scripts build links none. A scheme whose tests load a package (the native unit
+# tests link WebRTC) keeps its own folder, since the simulator's test agent then reads the package
+# from it, and from an external volume that is an access the person would be asked about.
 #
 # `kr_with_packages_lock <command...>` runs the command, and while KR_IOS_PACKAGES names a folder it
-# holds that folder's lock for the whole command. Two builds that fetch into one empty folder at the
-# same time break each other (SwiftPM takes no lock of its own there), so a command that may fetch
-# runs under it. The lock is released when the command ends, however it ends.
+# holds that folder's lock, named from its resolved path, for the whole command, and waits for it
+# for at most half an hour. Two builds that fetch into one empty folder at the same time break each
+# other (SwiftPM takes no lock of its own there), so a command that may fetch runs under it. The
+# lock is released when the command ends, however it ends.
 
 kr_shared_packages() {
     kr_package_options=()
@@ -32,8 +37,10 @@ kr_shared_packages() {
             ;;
     esac
     mkdir -p "$KR_IOS_PACKAGES" || return 2
+    local folder
+    folder="$(cd "$KR_IOS_PACKAGES" && pwd -P)" || return 2
     # shellcheck disable=SC2034 # read by the scripts that source this file
-    kr_package_options=(-clonedSourcePackagesDirPath "$KR_IOS_PACKAGES" -onlyUsePackageVersionsFromResolvedFile)
+    kr_package_options=(-clonedSourcePackagesDirPath "$folder" -onlyUsePackageVersionsFromResolvedFile)
 }
 
 kr_with_packages_lock() {
@@ -41,7 +48,9 @@ kr_with_packages_lock() {
         "$@"
         return
     fi
-    /usr/bin/lockf -k "${KR_IOS_PACKAGES%/}.lock" "$@"
+    local folder
+    folder="$(cd "$KR_IOS_PACKAGES" && pwd -P)" || { echo "the folder KR_IOS_PACKAGES names is not there" >&2; return 2; }
+    /usr/bin/lockf -k -t 1800 "$folder.lock" "$@"
 }
 
 kr_select_xcode() {
