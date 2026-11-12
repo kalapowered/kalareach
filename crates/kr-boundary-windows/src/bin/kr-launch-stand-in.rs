@@ -180,6 +180,11 @@ fn main() -> std::process::ExitCode {
                 .get(1)
                 .and_then(|text| text.parse::<u64>().ok())
                 .unwrap_or(60_000);
+            // A third argument names a file that says the program is running, written before it
+            // sleeps, for the cases that must act on a program that is at its work.
+            if let Some(path) = arguments.get(2) {
+                let _ = std::fs::write(path, std::process::id().to_string());
+            }
             std::thread::sleep(std::time::Duration::from_millis(milliseconds));
         }
         "write-stderr" => eprintln!("on the error stream"),
