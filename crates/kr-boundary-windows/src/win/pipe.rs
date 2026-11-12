@@ -782,7 +782,12 @@ impl Listener {
                 // A client that went before the wait ended it is normal; one after another is
                 // paused for, so that a fault of the pipe does not spin the thread.
                 failed_in_a_row = failed_in_a_row.saturating_add(1);
-                // The instance is disconnected when it is dropped here, and used again.
+                // SAFETY: the pipe is open; the client's end is closed or not connected, and an
+                // instance whose client went answers every wait with "no data" until it is
+                // disconnected, so it is disconnected here and used again.
+                unsafe {
+                    DisconnectNamedPipe(pipe.raw());
+                }
                 self.next = Some(pipe);
                 if failed_in_a_row > 1 {
                     let _ = self.stop.wait(RETRY_PAUSE);
