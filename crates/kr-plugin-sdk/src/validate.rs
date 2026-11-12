@@ -2966,7 +2966,12 @@ fn check_observation(
             role: Role::Selection,
             paths: vec![("thread", &selection.thread, messages.result.as_str())],
         });
-        check_hidden_when(&selection.method, &selection.hidden_when, report);
+        check_hidden_when(
+            &selection.method,
+            &selection.hidden_when,
+            messages.params.as_str(),
+            report,
+        );
     }
     for leave in &observation.leaves {
         readings.push(Reading {
@@ -3086,10 +3091,13 @@ fn check_observation(
 /// The host tests each request against them as it forwards it, so the list, each place and each
 /// list of values are bounded, and a condition that lists no value could never be met: a table
 /// that states one is refused, not read as though it stated none, which would make every request
-/// of the route a selection.
+/// of the route a selection. A place is read in the request's parameters, so one that does not
+/// begin with the table's `params` member is refused: a place in the reply never matches a request,
+/// and one in the request's own `method` member would hide every request of the route.
 fn check_hidden_when(
     method: &crate::ids::MethodName,
     conditions: &[RequestCondition],
+    params: &str,
     report: &mut Report,
 ) {
     if conditions.len() > MAX_REQUEST_CONDITIONS {
@@ -3109,6 +3117,15 @@ fn check_hidden_when(
             ),
             report,
         );
+        if !starts_with_member(&condition.place, params) {
+            table_invalid(
+                report,
+                format!(
+                    "the condition for the requests of {method} reads {}, which is not inside the table's {params} member of the request",
+                    dotted(&condition.place)
+                ),
+            );
+        }
         if condition.values.is_empty() || condition.values.len() > MAX_REQUEST_CONDITIONS {
             table_invalid(
                 report,
