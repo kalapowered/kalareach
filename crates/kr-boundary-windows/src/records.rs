@@ -59,8 +59,17 @@ pub struct Approved {
 }
 
 impl Approved {
-    /// Approves every record that is in the data directory now, for a caller that inspected
-    /// nothing: the earlier-state record, `staging` and each replacement of the manifest.
+    /// The earlier-state record, loaded only where the inspection approved it: a record that appeared
+    /// after the inspection decides nothing (not the Application Identity service's start value, not
+    /// whether that service is stopped, not the baseline of the residue check), and the removal acts
+    /// as with no record. It is left and named when the records are deleted.
+    pub fn prior_record<T>(&self, load: impl FnOnce() -> Option<T>) -> Option<T> {
+        if self.prior { load() } else { None }
+    }
+
+    /// Approves every record that is in the data directory now, for a case that inspected nothing:
+    /// the earlier-state record, `staging` and each replacement of the manifest. It exists for the
+    /// tests alone; the removal approves only what its own inspection opened.
     #[must_use]
     pub fn all_that_are_there(data: &Path) -> Approved {
         let replacements = fs::read_dir(data)

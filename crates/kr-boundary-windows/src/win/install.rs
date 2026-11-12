@@ -3195,7 +3195,7 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
         }
         records::Begin::Remove(manifest) => manifest,
     };
-    let prior = Prior::load(&paths.prior).ok();
+    let prior = approved.prior_record(|| Prior::load(&paths.prior).ok());
     // A removal that took `staging` and could not delete the manifest leaves a manifest with no
     // `staging`, and the channel makes its temporary directory there. Where the inspection did not
     // open `staging`, the removal makes it itself, empty, with a creation that fails when anything is
