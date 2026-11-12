@@ -24,7 +24,7 @@
 
 use kr_protocol::scalars::Nullable;
 
-use crate::scalars::U64;
+use crate::scalars::{SafeInt, U64};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -471,6 +471,35 @@ impl Operations {
     }
 }
 
+/// A scalar value a request may hold at a place: a string, a boolean or an integer.
+///
+/// It is written as the JSON value itself. A number with a fraction, a null, an array and an
+/// object are not scalars here, and a table that holds one does not read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ConditionValue {
+    /// A string.
+    Text(String),
+    /// A boolean.
+    Boolean(bool),
+    /// An integer both Rust and JavaScript represent exactly.
+    Integer(SafeInt),
+}
+
+/// A condition on a request: the place in its message must hold one of some scalar values.
+///
+/// The place is a [`FieldPath`] from the root of the request's message. The condition is met when
+/// the message has a value at that place and the value is equal to one of `values`; a message
+/// with nothing at the place does not meet it, and neither does a condition that lists no value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct RequestCondition {
+    /// Where the request's message holds the value, from the root of the message.
+    pub place: FieldPath,
+    /// The values the place may hold; the condition is met when it holds any one of them.
+    pub values: Vec<ConditionValue>,
+}
+
 /// A request of the terminal whose success reply names the conversation it selected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -479,6 +508,15 @@ pub struct SelectionRoute {
     pub method: MethodName,
     /// Where the success reply names the thread, from the root of the reply.
     pub thread: FieldPath,
+    /// The conditions under which the request starts a thread the terminal never shows.
+    ///
+    /// A request that meets every one of them starts a thread of the application's own, and the
+    /// terminal does not select it, so the host does not take the thread the reply names as the
+    /// one the terminal is in. An empty list is the earlier meaning: no request is hidden, and
+    /// every request this route matches selects the thread its reply names. The member is left
+    /// out of a table that states no conditions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_when: Vec<RequestCondition>,
 }
 
 /// A message after which the terminal no longer has a thread selected.

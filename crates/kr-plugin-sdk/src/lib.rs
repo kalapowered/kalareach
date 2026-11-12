@@ -46,6 +46,7 @@
 //! | [`ids`] | Publisher, plugin, node, control, action and method identifiers |
 //! | [`text`] | Bounded label, description and reason text |
 //! | [`version`] | Package versions and the ranges a package accepts |
+//! | [`arrivals`] | The members that arrived in a definition of the schema inside a level |
 //! | [`digest`] | Payload digests and declared sizes |
 //! | [`identity`] | What binds executable plugin semantics to a verified package |
 //! | [`paths`] | Safe package paths and case-collision detection |
@@ -93,6 +94,7 @@
 //! assert!(!PluginCapability::TerminalInput.within_default_ceiling());
 //! ```
 
+pub mod arrivals;
 pub mod bundle;
 pub mod capability;
 pub mod catalogue;

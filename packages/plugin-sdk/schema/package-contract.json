@@ -1,4 +1,11 @@
 {
+  "arrivals": [
+    {
+      "definition": "SelectionRoute",
+      "member": "hidden_when",
+      "sdk_version": "0.1.7"
+    }
+  ],
   "capabilities": [
     {
       "capability": "metadata.match",
@@ -299,7 +306,7 @@
     "retained_generations": "2",
     "retained_metadata_bytes": "134217728"
   },
-  "sdk_version": "0.1.6",
+  "sdk_version": "0.1.7",
   "wit_package": {
     "export_interface": "adapter",
     "exports": [

@@ -192,6 +192,7 @@ pub fn package_contract() -> Value {
         "wit_version": crate::version::WIT_VERSION,
         "index_version": INDEX_VERSION,
         "manifest_version": PluginManifest::CURRENT_VERSION,
+        "arrivals": crate::arrivals::table(),
         "wit_package": {
             "name": wit::PACKAGE_NAME,
             "world": wit::WORLD,
