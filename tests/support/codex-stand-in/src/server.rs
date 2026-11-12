@@ -76,6 +76,12 @@ struct Server {
     /// How many threads and how many turns the server has made, for the identifiers it gives them.
     threads_made: u32,
     turns_made: u32,
+    /// The threads and turns the terminal started for its own purposes (the title of a
+    /// conversation), which are numbered apart from the conversation's own, and the threads among
+    /// those the server keeps no record of.
+    hidden_made: u32,
+    hidden_turns: u32,
+    ephemeral: BTreeSet<String>,
     /// The turn that is running, until it completes.
     running: Option<Running>,
     /// The approvals the server cleared itself, whose late answers it takes and ignores.
@@ -83,11 +89,18 @@ struct Server {
 }
 
 fn thread(id: &str) -> Value {
+    marked_thread(id, false, None)
+}
+
+/// A thread as the server describes it, with the two members that say what it is for: whether it
+/// is kept, and the source the request that started it named.
+fn marked_thread(id: &str, ephemeral: bool, source: Option<&str>) -> Value {
     json!({
         "cliVersion": RELEASE,
         "createdAt": 0,
         "cwd": "/",
-        "ephemeral": false,
+        "ephemeral": ephemeral,
+        "threadSource": source,
         "id": id,
         "modelProvider": "stand-in",
         "preview": "",
@@ -474,16 +487,35 @@ impl Server {
                 }}))
                 .await;
             }
+            "config/read" => {
+                self.send(json!({ "id": id, "result": { "config": {}, "origins": {} } }))
+                    .await;
+            }
             "thread/start" => {
-                self.threads_made += 1;
-                let made = format!("thread-{}", self.threads_made);
+                // A thread the terminal starts for its own purposes says so in the request, and
+                // the server says so in its answer; nothing is kept of it.
+                let params = &frame["params"];
+                let ephemeral = params["ephemeral"].as_bool().unwrap_or(false);
+                let source = params["threadSource"].as_str().map(str::to_owned);
+                let made = if ephemeral {
+                    self.hidden_made += 1;
+                    format!("title-thread-{}", self.hidden_made)
+                } else {
+                    self.threads_made += 1;
+                    format!("thread-{}", self.threads_made)
+                };
                 self.threads.insert(made.clone(), true);
-                self.thread = Some(made.clone());
-                self.send(json!({ "id": id, "result": opened(thread(&made)) }))
+                if ephemeral {
+                    self.ephemeral.insert(made.clone());
+                } else {
+                    self.thread = Some(made.clone());
+                }
+                let started = marked_thread(&made, ephemeral, source.as_deref());
+                self.send(json!({ "id": id, "result": opened(started.clone()) }))
                     .await;
                 self.send(json!({
                     "method": "thread/started",
-                    "params": { "thread": thread(&made) }
+                    "params": { "thread": started }
                 }))
                 .await;
             }
@@ -505,15 +537,17 @@ impl Server {
                 if !self.threads.contains_key(from) {
                     return self.refuse(id, -32600, "thread not found").await;
                 }
+                let source = frame["params"]["threadSource"].as_str().map(str::to_owned);
                 self.threads_made += 1;
                 let made = format!("thread-{}", self.threads_made);
                 self.threads.insert(made.clone(), true);
                 self.thread = Some(made.clone());
-                self.send(json!({ "id": id, "result": opened(thread(&made)) }))
+                let forked = marked_thread(&made, false, source.as_deref());
+                self.send(json!({ "id": id, "result": opened(forked.clone()) }))
                     .await;
                 self.send(json!({
                     "method": "thread/started",
-                    "params": { "thread": thread(&made) }
+                    "params": { "thread": forked }
                 }))
                 .await;
             }
@@ -697,19 +731,60 @@ impl Server {
             "params": { "threadId": thread_id, "turn": turn(turn_id, "inProgress") }
         }))
         .await;
+        self.user_message(thread_id, turn_id).await;
         self.send(request).await;
     }
 
+    /// Says that the turn's input was taken as the next message of the thread, as the server does
+    /// when a turn starts.
+    async fn user_message(&mut self, thread_id: &str, turn_id: &str) {
+        let item = json!({ "type": "userMessage", "id": format!("user-{turn_id}"), "content": [] });
+        self.send(json!({
+            "method": "item/started",
+            "params": { "item": item, "startedAtMs": 0, "threadId": thread_id, "turnId": turn_id }
+        }))
+        .await;
+        self.send(json!({
+            "method": "item/completed",
+            "params": { "item": item, "completedAtMs": 0, "threadId": thread_id, "turnId": turn_id }
+        }))
+        .await;
+    }
+
+    /// Runs the one turn of a thread the terminal started for its own purposes, to its end.
+    async fn title_turn(&mut self, id: &Value, thread_id: &str) {
+        self.hidden_turns += 1;
+        let turn_id = format!("title-turn-{}", self.hidden_turns);
+        self.send(json!({ "id": id, "result": { "turn": turn(&turn_id, "inProgress") }}))
+            .await;
+        self.send(json!({
+            "method": "turn/started",
+            "params": { "threadId": thread_id, "turn": turn(&turn_id, "inProgress") }
+        }))
+        .await;
+        self.user_message(thread_id, &turn_id).await;
+        self.send(json!({
+            "method": "turn/completed",
+            "params": { "threadId": thread_id, "turn": turn(&turn_id, "completed") }
+        }))
+        .await;
+    }
+
     async fn turn(&mut self, id: &Value, frame: &Value) {
-        if self.variants.die_on_second_turn && self.turns_made >= 1 {
-            std::process::exit(0);
-        }
         let thread_id = frame["params"]["threadId"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
         if !self.threads.contains_key(&thread_id) {
             return self.refuse(id, -32600, "thread not found").await;
+        }
+        // A turn on a thread the terminal started for its own purposes runs to its end at once,
+        // and is no turn of the conversation: it is not counted, recorded or asked about.
+        if self.ephemeral.contains(&thread_id) {
+            return self.title_turn(id, &thread_id).await;
+        }
+        if self.variants.die_on_second_turn && self.turns_made >= 1 {
+            std::process::exit(0);
         }
         self.turns_made += 1;
         let turn_id = format!("turn-{}", self.turns_made);
@@ -731,6 +806,7 @@ impl Server {
                 "params": { "threadId": thread_id, "turn": turn(&turn_id, "inProgress") }
             }))
             .await;
+            self.user_message(&thread_id, &turn_id).await;
             self.answers_the_sum(frame, &thread_id, &turn_id).await;
             self.send(json!({
                 "method": "turn/completed",
@@ -778,7 +854,11 @@ impl Server {
         } else {
             self.send(answer).await;
             self.send(started).await;
+            self.user_message(&thread_id, &turn_id).await;
             self.send(approval).await;
+        }
+        if self.variants.colliding_ids {
+            self.user_message(&thread_id, &turn_id).await;
         }
         self.answers_the_sum(frame, &thread_id, &turn_id).await;
         if let Some(size) = Variants::pad() {
@@ -870,6 +950,9 @@ pub async fn run(variants: Variants) -> ! {
             .collect(),
         threads_made: 0,
         turns_made: 0,
+        hidden_made: 0,
+        hidden_turns: 0,
+        ephemeral: BTreeSet::new(),
         running: None,
         cleared: BTreeSet::new(),
     };
