@@ -1,0 +1,371 @@
+{
+  "manifest_version": 1,
+  "base_revision": "2",
+  "nodes": [
+    {
+      "id": "overview",
+      "revision": "2",
+      "body": {
+        "kind": "markdown",
+        "source": "Codex CLI runs in its own terminal, and KalaReach keeps it there, behind a gateway it opens. The App Server behind it is read through a declarative table, so the session shows the thread, the running turn and the items it produces. Allow once, Allow for the session, Decline and Decline and stop answer a command or file-change approval when this host can carry the answer, and the terminal always can; Codex takes whichever answer comes first."
+      }
+    },
+    {
+      "id": "activity",
+      "revision": "1",
+      "body": {
+        "kind": "progress",
+        "label": "Waiting for Codex",
+        "state": {
+          "kind": "indeterminate"
+        }
+      }
+    },
+    {
+      "id": "approval",
+      "revision": "1",
+      "body": {
+        "kind": "action_group",
+        "label": "Approval",
+        "controls": [
+          {
+            "id": "allow-once",
+            "revision": "1",
+            "label": "Allow once",
+            "icon": "check",
+            "accessible_description": "Allow the command or file change Codex is waiting on, this once",
+            "action_id": "approval.answer",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "decision",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "accept",
+                        "label": "Allow once"
+                      }
+                    ]
+                  },
+                  "label": "Decision",
+                  "required": true
+                }
+              ]
+            },
+            "priority": "primary",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.approval.respond"
+                },
+                {
+                  "op": "flag",
+                  "flag": "pending_approval"
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "binding",
+                    "state": "native_only_volatile"
+                  }
+                },
+                {
+                  "op": "capability",
+                  "capability": "approval.respond",
+                  "state": "qualified_available"
+                }
+              ]
+            },
+            "disabled_reason": "This host cannot answer Codex's approvals right now; answer in the terminal"
+          },
+          {
+            "id": "allow-session",
+            "revision": "1",
+            "label": "Allow for the session",
+            "icon": "check",
+            "accessible_description": "Allow it, and allow the same again for the rest of the session",
+            "action_id": "approval.answer",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "decision",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "accept-for-session",
+                        "label": "Allow for the session"
+                      }
+                    ]
+                  },
+                  "label": "Decision",
+                  "required": true
+                }
+              ]
+            },
+            "priority": "secondary",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.approval.respond"
+                },
+                {
+                  "op": "flag",
+                  "flag": "pending_approval"
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "binding",
+                    "state": "native_only_volatile"
+                  }
+                },
+                {
+                  "op": "capability",
+                  "capability": "approval.respond",
+                  "state": "qualified_available"
+                }
+              ]
+            },
+            "disabled_reason": "This host cannot answer Codex's approvals right now; answer in the terminal"
+          },
+          {
+            "id": "decline",
+            "revision": "1",
+            "label": "Decline",
+            "icon": "cross",
+            "accessible_description": "Decline the command or file change Codex is waiting on",
+            "action_id": "approval.answer",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "decision",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "decline",
+                        "label": "Decline"
+                      }
+                    ]
+                  },
+                  "label": "Decision",
+                  "required": true
+                }
+              ]
+            },
+            "priority": "secondary",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.approval.respond"
+                },
+                {
+                  "op": "flag",
+                  "flag": "pending_approval"
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "binding",
+                    "state": "native_only_volatile"
+                  }
+                },
+                {
+                  "op": "capability",
+                  "capability": "approval.respond",
+                  "state": "qualified_available"
+                }
+              ]
+            },
+            "disabled_reason": "This host cannot answer Codex's approvals right now; answer in the terminal"
+          },
+          {
+            "id": "decline-stop",
+            "revision": "1",
+            "label": "Decline and stop",
+            "icon": "stop",
+            "accessible_description": "Decline it and stop the turn",
+            "action_id": "approval.answer",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "decision",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "decline-and-stop",
+                        "label": "Decline and stop"
+                      }
+                    ]
+                  },
+                  "label": "Decision",
+                  "required": true
+                }
+              ]
+            },
+            "priority": "destructive",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.approval.respond"
+                },
+                {
+                  "op": "flag",
+                  "flag": "pending_approval"
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "binding",
+                    "state": "native_only_volatile"
+                  }
+                },
+                {
+                  "op": "capability",
+                  "capability": "approval.respond",
+                  "state": "qualified_available"
+                }
+              ]
+            },
+            "disabled_reason": "This host cannot answer Codex's approvals right now; answer in the terminal"
+          }
+        ]
+      }
+    },
+    {
+      "id": "controls",
+      "revision": "1",
+      "body": {
+        "kind": "action_group",
+        "label": "Turn",
+        "controls": [
+          {
+            "id": "cancel",
+            "revision": "1",
+            "label": "Stop the turn",
+            "icon": "stop",
+            "accessible_description": "Ask Codex to cancel the turn it is running",
+            "action_id": "turn.cancel",
+            "parameters": {
+              "parameters": []
+            },
+            "priority": "destructive",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.cancel"
+                },
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "binding",
+                    "state": "disabled"
+                  }
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "any",
+                  "terms": [
+                    {
+                      "op": "binding",
+                      "state": "upstream_busy"
+                    },
+                    {
+                      "op": "binding",
+                      "state": "awaiting_person"
+                    }
+                  ]
+                },
+                {
+                  "op": "capability",
+                  "capability": "upstream.action",
+                  "state": "qualified_available"
+                }
+              ]
+            },
+            "disabled_reason": "Codex has no turn in flight that this host can stop"
+          },
+          {
+            "id": "refresh",
+            "revision": "1",
+            "label": "Refresh",
+            "icon": "retry",
+            "accessible_description": "Draw the thread's current state again from what this host already holds",
+            "action_id": "thread.refresh",
+            "parameters": {
+              "parameters": []
+            },
+            "priority": "secondary",
+            "visible_when": {
+              "op": "not",
+              "term": {
+                "op": "binding",
+                "state": "disabled"
+              }
+            },
+            "enabled_when": {
+              "op": "not",
+              "term": {
+                "op": "flag",
+                "flag": "transfer_in_progress"
+              }
+            },
+            "disabled_reason": "An upload is in progress"
+          }
+        ]
+      }
+    }
+  ],
+  "voice": {
+    "status_nodes": [
+      "activity"
+    ],
+    "choice_controls": [
+      "cancel",
+      "allow-once",
+      "allow-session",
+      "decline",
+      "decline-stop"
+    ],
+    "detail_nodes": [
+      "overview"
+    ]
+  }
+}
