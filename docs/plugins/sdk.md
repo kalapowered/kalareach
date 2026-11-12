@@ -31,7 +31,8 @@ and refuses a package whose range excludes its SDK version with that finding alo
 before this order reads the connector table first, so it reports a table it cannot read, and then
 the range. Either way a host on an earlier contract refuses the package and does not guess at the
 new members. The package's connector then does not run: for the Codex package, Codex runs as typed
-with no gateway until a package the host admits is active. Which members arrived at which SDK
+with no gateway until a package the host admits is active, and a terminal session that started
+meanwhile keeps running without it: the person starts a new terminal session. Which members arrived at which SDK
 version is listed in `arrivals` in `packages/plugin-sdk/schema/package-contract.json`.
 
 The examples use the Claude Code Channels surface. Claude Code relays a tool approval as
