@@ -441,6 +441,32 @@ const PRESS_AT_THE_END = ['https://example.org/at-end', 'https://example.org/alo
 /** The paragraphs that the press case sets right to left. */
 const PRESS_RIGHT_TO_LEFT = ['https://example.org/rtl-start', 'https://example.org/rtl-middle']
 
+/** A link that starts a paragraph, with plain words after it that lie inside the link's reach. */
+const TEXT_AFTER_LINK = ['[docs](https://example.org/docs) and more words follow the link on this line, which ends the paragraph.']
+const DOCS = 'https://example.org/docs'
+
+/**
+ * A point on the plain text after a link's words, inside the link's reach, where the browser's own hit
+ * is the paragraph and not the link's button: a press there has the link only from the pane's rule.
+ */
+async function pointOnTextAfter(page: Page, href: string): Promise<{ x: number; y: number }> {
+  return page.evaluate((target) => {
+    const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
+    if (!link) throw new Error(`the page shows no link ${target}`)
+    link.scrollIntoView({ block: 'center' })
+    const range = document.createRange()
+    range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
+    const words = range.getBoundingClientRect()
+    const y = words.top + words.height / 2
+    for (let beside = 6; beside <= 16; beside += 1) {
+      const x = words.right + beside
+      const found = document.elementFromPoint(x, y)
+      if (found && !found.closest('.md-link')) return { x, y }
+    }
+    throw new Error('no point on the text after the link lies in the link’s reach')
+  }, href)
+}
+
 /** What a press at one point is expected to do, computed by the case from the rectangles it reads. */
 interface PressPoint {
   readonly x: number
@@ -567,7 +593,7 @@ test.describe('the end of a press on a link of a message', () => {
 test.describe('a tap on a link of a message', () => {
   test.use({ hasTouch: true })
   for (const surface of ['ios', 'android'] as const) {
-    test(`opens the link on its words and beside them, and not outside its area on ${surface}`, async ({ page }) => {
+    test(`opens the link on its words, beside them and on the text after it, and not outside its area on ${surface}`, async ({ page }) => {
       await openSession(page, surface)
       await page.evaluate(
         ({ messages, session }) => {
@@ -575,7 +601,7 @@ test.describe('a tap on a link of a message', () => {
           document.dispatchEvent(new Event('visibilitychange'))
           document.querySelector('.m-pane')?.removeAttribute('tabindex')
         },
-        { messages: PRESS_MESSAGES, session: SESSION }
+        { messages: [...PRESS_MESSAGES, ...TEXT_AFTER_LINK], session: SESSION }
       )
       const link = page.getByRole('button', { name: 'the reconnect notes' })
       const words = await link.evaluate((element) => {
@@ -594,6 +620,11 @@ test.describe('a tap on a link of a message', () => {
       await expect.poll(opened, 'links opened by a tap on plain text beside the words').toBe(3)
       await page.touchscreen.tap(words.right + 60, words.y)
       expect(await opened(), 'links opened by a tap outside the link’s area').toBe(3)
+      // The words after a link lie over its button, so the tap's own target is the paragraph, and only
+      // the pane's rule gives the tap to the link.
+      const text = await pointOnTextAfter(page, DOCS)
+      await page.touchscreen.tap(text.x, text.y)
+      await expect.poll(opened, 'links opened by a tap on the plain text after a link').toBe(4)
     })
   }
 })
@@ -1045,7 +1076,7 @@ test.describe('a press that ends on a page that changed during it', () => {
     test(`gives a covered control its click after the control moved less than it is tall, and none when it left, on ${surface}`, async ({ page }) => {
       await pressPage(page, surface)
       await page.evaluate(() => {
-        const counted = window as unknown as { controlClicks: number; lastDetail: number }
+        const counted = window as unknown as { controlClicks: number; lastDetail: number; focused: boolean }
         counted.controlClicks = 0
         for (const control of document.querySelectorAll('.m-pane button:not(.md-link)')) {
           control.addEventListener('click', (event) => {
@@ -1093,6 +1124,122 @@ test.describe('a press that ends on a page that changed during it', () => {
       })
       await page.mouse.up()
       expect(await clicks(), 'clicks of a control that left from under the press').toBe(1)
+    })
+  }
+})
+
+// KR-REQ-13.19: the press handling holds with the pane as it ships (its own `tabindex`, which every
+// case above takes off to keep geometry still), and at its edges: a keyboard click while a press is
+// down, a second pointer, a click that comes long after its press, and a click on something outside the pane.
+test.describe('a press on the pane as it ships', () => {
+  for (const surface of ['ios', 'android'] as const) {
+    test(`opens a link on its words and on the text after it, with the pane's own tabindex, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { shipped: true, extra: TEXT_AFTER_LINK })
+      expect(await page.locator('.m-pane').getAttribute('tabindex'), 'the pane as it ships').not.toBeNull()
+      const words = await wordsOf(page, 'https://example.org/table-1')
+      await page.mouse.click(words.x, words.y)
+      expect(await openedLinks(page), 'links opened by a press on the words').toEqual(['https://example.org/table-1'])
+      const text = await pointOnTextAfter(page, DOCS)
+      await page.mouse.click(text.x, text.y)
+      expect(await openedLinks(page), 'links opened by a press on the text after a link').toEqual(['https://example.org/table-1', DOCS])
+    })
+  }
+})
+
+test.describe('a tap on the pane as it ships', () => {
+  test.use({ hasTouch: true })
+  for (const surface of ['ios', 'android'] as const) {
+    test(`opens a link on its words and on the text after it, with the pane's own tabindex, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { shipped: true, extra: TEXT_AFTER_LINK })
+      const words = await wordsOf(page, 'https://example.org/table-1')
+      await page.touchscreen.tap(words.x, words.y)
+      await expect.poll(() => openedLinks(page), 'links opened by a tap on the words').toEqual(['https://example.org/table-1'])
+      const text = await pointOnTextAfter(page, DOCS)
+      await page.touchscreen.tap(text.x, text.y)
+      await expect.poll(() => openedLinks(page), 'links opened by a tap on the text after a link').toEqual(['https://example.org/table-1', DOCS])
+    })
+  }
+})
+
+test.describe('the edges of a press on a link', () => {
+  for (const surface of ['ios', 'android'] as const) {
+    test(`leaves a press that moved away cancelled when a keyboard clicks while the pointer is down, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface)
+      const one = await wordsOf(page, 'https://example.org/table-1')
+      const two = await page.evaluate(() => {
+        const range = document.createRange()
+        range.selectNodeContents(document.querySelector('.m-node .md-link[title="https://example.org/table-2"] .md-link-label') ?? document.body)
+        const box = range.getBoundingClientRect()
+        return { x: box.left + box.width / 2, y: box.top + box.height / 2 }
+      })
+      await page.mouse.move(one.x, one.y)
+      await page.mouse.down()
+      await page.mouse.move(two.x, two.y, { steps: 4 })
+      // The keyboard clicks another link while the pointer is down, and it opens that link as it is.
+      await page.locator('.m-node .md-link[title="https://example.org/list-1"]').evaluate((element) => {
+        element.focus({ preventScroll: true })
+      })
+      await page.keyboard.press('Enter')
+      await page.mouse.up()
+      expect(await openedLinks(page), 'links opened: the keyboard’s, and not the press that moved away').toEqual(['https://example.org/list-1'])
+    })
+
+    test(`ignores a second pointer that comes down while a press is held, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      const text = await pointOnTextAfter(page, DOCS)
+      await page.mouse.move(text.x, text.y)
+      await page.mouse.down()
+      // A second finger comes down on the same text and stays down.
+      await page.evaluate(({ x, y }) => {
+        document.elementFromPoint(x, y)?.dispatchEvent(
+          new PointerEvent('pointerdown', { pointerId: 7, pointerType: 'touch', isPrimary: false, button: 0, clientX: x, clientY: y, bubbles: true, cancelable: true, composed: true })
+        )
+      }, text)
+      await page.mouse.up()
+      expect(await openedLinks(page), 'links opened by the first pointer’s press').toEqual([DOCS])
+    })
+
+    test(`opens the link of a press whose click comes long after its end, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      const text = await pointOnTextAfter(page, DOCS)
+      // The page stays busy after the press ends for longer than a click is waited for.
+      await page.evaluate(() => {
+        window.addEventListener('pointerup', () => {
+          const end = performance.now() + 1700
+          while (performance.now() < end) {
+            // Busy.
+          }
+        })
+      })
+      await page.mouse.click(text.x, text.y)
+      await expect.poll(() => openedLinks(page), 'links opened by a click that comes after the press’s record is stale').toEqual([DOCS])
+    })
+
+    test(`leaves a press on something outside the pane alone, though a link of the pane lies under it, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface)
+      const one = await wordsOf(page, 'https://example.org/table-1')
+      // A sheet over the pane, with a link of its own where the pane's link lies.
+      await page.evaluate(({ x, y }) => {
+        const sheet = document.createElement('div')
+        sheet.style.cssText = 'position: fixed; inset: 0; z-index: 99999'
+        const button = document.createElement('button')
+        button.className = 'md-link'
+        button.textContent = 'a link of the sheet'
+        button.style.cssText = `position: absolute; left: ${String(x - 40)}px; top: ${String(y - 20)}px; width: 80px; height: 40px`
+        const counted = window as unknown as { sheetClicks: number }
+        counted.sheetClicks = 0
+        button.addEventListener('click', () => {
+          counted.sheetClicks += 1
+        })
+        sheet.append(button)
+        document.body.append(sheet)
+      }, one)
+      await page.mouse.move(one.x, one.y)
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look while the press is on the sheet').toBe(0)
+      await page.mouse.up()
+      expect(await page.evaluate(() => (window as unknown as { sheetClicks: number }).sheetClicks), 'clicks of the sheet’s own link').toBe(1)
+      expect(await openedLinks(page), 'links of the pane opened by a click on the sheet').toEqual([])
     })
   }
 })
