@@ -84,7 +84,7 @@ pub enum Tracking {
 /// frame drawn from the screen resets the three and then sets the one that is on. A full reset of
 /// the terminal (`ESC c`) turns tracking off. The encoding is one setting in the same way: a set of
 /// 1005 or 1006 replaces the one in force and a reset of either returns the default, and a frame
-/// resets the four modes xterm names before it sets the one that is on.
+/// resets both before it sets the one that is on.
 #[derive(Debug, Default)]
 pub struct MouseReporting {
     clicks: bool,
@@ -646,8 +646,8 @@ mod tests {
     /// either returns the default, also when it names the one that is not in force. The console is
     /// spelled the SGR report only while 1006 is the one in force; UTF-8 coordinates are spelled
     /// as the original report, as they always were. A frame drawn from the session's screen resets
-    /// the four modes xterm names and sets the one that is on, and a frame of a worker of an earlier
-    /// build that holds both flags on reads as 1006.
+    /// both modes and sets the one that is on, and a frame of a worker of an earlier build that holds
+    /// both flags on reads as 1006.
     #[test]
     fn the_encoding_is_one_state_and_a_reset_of_either_mode_returns_the_default() {
         for (output, encoding) in [
@@ -657,11 +657,11 @@ mod tests {
             (b"\x1b[?1006h\x1b[?1005l", kr_keys::MouseEncoding::X10),
             (b"\x1b[?1006h\x1b[?1006l", kr_keys::MouseEncoding::X10),
             (
-                b"\x1b[?1006h\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l",
+                b"\x1b[?1006h\x1b[?1005l\x1b[?1006l",
                 kr_keys::MouseEncoding::X10,
             ),
             (
-                b"\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1006h",
+                b"\x1b[?1005l\x1b[?1006l\x1b[?1006h",
                 kr_keys::MouseEncoding::Sgr,
             ),
             (

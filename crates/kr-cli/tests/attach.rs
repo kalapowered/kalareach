@@ -1326,7 +1326,7 @@ async fn an_application_that_turned_the_mouse_on_before_the_attachment_is_sent_i
 ///
 /// Terminal.app and iTerm keep one encoding: the last of `1005` and `1006` that was set is in force,
 /// and a reset of either returns the default. The session holds the two as one state, and the
-/// attachment writes the one that is set after a reset of the four modes xterm names, so a terminal
+/// attachment writes the one that is set after a reset of both, so a terminal
 /// that keeps the last encoding it was given reports in the encoding the application asked for and
 /// not in the one of the higher number.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

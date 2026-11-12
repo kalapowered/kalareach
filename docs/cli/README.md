@@ -434,8 +434,8 @@ draws resets the three first and then sets the one that is on.
 The encoding is one setting too: setting 1005 (UTF-8 coordinates) or 1006 replaces the one in force,
 and resetting either returns the original report, also when it names the one that is not in force.
 The command spells the SGR report while 1006 is the one in force and the original report otherwise,
-which is what it also spells for 1005. A screen the command draws resets the four modes xterm names
-for the encoding (1005, 1006, 1015 and 1016) and then sets the one that is on. A screen of a session
+which is what it also spells for 1005. A screen the command draws resets both modes (1005 and 1006)
+and then sets the one that is on. A screen of a session
 started before an upgrade that holds both 1005 and 1006 is read as 1006.
 
 While the application asks and this attachment may send input, the command asks the console for

@@ -315,12 +315,12 @@ const MOUSE_TRACKING_MODES: &[u16] = &[1000, 1002, 1003];
 
 /// The DEC private modes that choose how a destination spells a mouse position, and that a screen
 /// carries: UTF-8 coordinates (1005) and SGR coordinates (1006).
+///
+/// URXVT coordinates (1015) and SGR coordinates in pixels (1016) are outside the profile: a screen
+/// never carries them, a session never puts a destination into either, and a frame resets only these
+/// two. A destination that a program outside the product left in 1015 or 1016 keeps that encoding on
+/// xterm while the session's application uses the default.
 const MOUSE_ENCODING_MODES: &[u16] = &[1005, 1006];
-
-/// The four modes xterm names for the encoding of a mouse position: the two a screen carries, and
-/// URXVT coordinates (1015) and SGR coordinates in pixels (1016). Resetting all four returns any
-/// destination to the default encoding, whichever of them it had been set to.
-const MOUSE_ENCODING_FAMILY: &[u16] = &[1005, 1006, 1015, 1016];
 
 /// The modes that are the buffer selection under another spelling.
 ///
@@ -706,9 +706,9 @@ impl<'a> Writer<'a> {
     /// screen. Terminal.app and iTerm keep one encoding too, the last one they were given, and a
     /// reset of any mode of the family returns the default one, so writing the two in the screen's
     /// order would leave the default for a screen that holds 1005, because the reset of 1006 comes
-    /// after the set of 1005. All four modes xterm names are reset first, because the destination's
-    /// own encoding is not known here and xterm resets only the one that is in force, and the one
-    /// that is on is set last.
+    /// after the set of 1005. Both are reset first, because the destination's own encoding is not
+    /// known here and xterm resets only the one that is in force, and the one that is on is set
+    /// last.
     ///
     /// A screen read from a worker of an earlier build can have both flags on, and the order they
     /// were set in is lost; a delta from such a worker carries only the mode that changed, so it can
@@ -718,7 +718,7 @@ impl<'a> Writer<'a> {
     /// release that holds the one-state encoding in `kr-term`'s `ModeState`; a screen then holds at
     /// most one of the two.
     fn mouse_encoding(&mut self, encoding: Option<u16>) {
-        for mode in MOUSE_ENCODING_FAMILY {
+        for mode in MOUSE_ENCODING_MODES {
             self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
         }
         if let Some(mode) = encoding {
@@ -3387,16 +3387,21 @@ mod safety {
                     .insert((super::super::ProjectedModeSpelling::Dec, mode), enabled);
             }
             let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
-            // The destination was in another encoding before the frame: a screen with none on must
-            // put it back to the default, and the four modes xterm names must all be reset first.
-            let stream = [b"\x1b[?1015h".as_slice(), &painted.bytes].concat();
+            // The destination was in the other encoding before the frame: a screen with none on
+            // must put it back to the default.
+            let before: &[u8] = if modes[1].1 {
+                b"\x1b[?1005h"
+            } else {
+                b"\x1b[?1006h"
+            };
+            let stream = [before, &painted.bytes].concat();
             (
                 mouse_encoding(&stream),
                 mouse_encoding_writes(&painted.bytes),
             )
         };
         let resets_then = |on: Option<u16>| {
-            let mut expected = vec![(1005, false), (1006, false), (1015, false), (1016, false)];
+            let mut expected = vec![(1005, false), (1006, false)];
             expected.extend(on.map(|mode| (mode, true)));
             expected
         };
@@ -3420,9 +3425,39 @@ mod safety {
         );
     }
 
+    /// KR-REQ-01.11: a frame asks a terminal of the profile for nothing it has no class for.
+    ///
+    /// A mode the profile does not track (URXVT and pixel coordinates, 1015 and 1016) is read by an
+    /// engine of the profile as a sequence it has no class for, and a frame that wrote one would be
+    /// a request the profile never makes of a terminal.
+    #[cfg(feature = "terminal")]
+    #[test]
+    fn a_frame_of_the_mouse_modes_is_read_by_an_engine_of_the_profile_without_a_diagnostic() {
+        let mut screen = screen("plain", "text", None);
+        for (mode, enabled) in [
+            (1000, false),
+            (1002, false),
+            (1003, true),
+            (1005, false),
+            (1006, true),
+        ] {
+            screen
+                .modes
+                .insert((super::super::ProjectedModeSpelling::Dec, mode), enabled);
+        }
+        let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
+        let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
+            size: kr_term::budget::GridSize { cols: 80, rows: 24 },
+            ..kr_term::engine::EngineConfig::DEFAULT
+        })
+        .expect("an engine of the profile");
+        let _ = engine.feed(&painted.bytes, 0);
+        let _ = engine.quiesce(0);
+        assert_eq!(engine.diagnostic_totals(), Vec::new());
+    }
+
     /// The mouse encoding a stream leaves a terminal in, in a model of Terminal.app and iTerm:
-    /// setting 1005, 1006, 1015 or 1016 replaces the one in force, and resetting any of them
-    /// returns the default.
+    /// setting 1005 or 1006 replaces the one in force, and resetting either returns the default.
     fn mouse_encoding(stream: &[u8]) -> Option<u16> {
         // Every write replaces the state: a set makes its mode the one in force, a reset the default.
         mouse_encoding_writes(stream)
@@ -3430,7 +3465,7 @@ mod safety {
             .and_then(|(mode, set)| set.then_some(*mode))
     }
 
-    /// Every set and reset of the four mouse encoding modes in a stream, in order.
+    /// Every set and reset of the two mouse encoding modes in a stream, in order.
     fn mouse_encoding_writes(stream: &[u8]) -> Vec<(u16, bool)> {
         let mut writes = Vec::new();
         let mut rest = stream;
@@ -3441,7 +3476,7 @@ mod safety {
                 .ok()
                 .and_then(|text| text.parse::<u16>().ok());
             if let (Some(mode), Some(last)) = (mode, rest.get(digits))
-                && matches!(mode, 1005 | 1006 | 1015 | 1016)
+                && matches!(mode, 1005 | 1006)
                 && matches!(last, b'h' | b'l')
             {
                 writes.push((mode, *last == b'h'));

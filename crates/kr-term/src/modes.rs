@@ -94,13 +94,12 @@ pub const MOUSE_TRACKING_MODES: &[u16] = &[1000, 1002, 1003];
 /// names the one that is not in force. So at most one of the two is set at any time, in the
 /// session's state as in the terminal. xterm differs in one case: there a reset changes the
 /// encoding only when it names the one in force.
+///
+/// URXVT coordinates (1015) and SGR coordinates in pixels (1016) are outside the profile: the engine
+/// consumes them and never forwards them, so a session cannot put a terminal into either, and a
+/// restoration resets only these two. A terminal that a program outside the product left in 1015 or
+/// 1016 keeps that encoding on xterm while the session's application uses the default.
 pub const MOUSE_ENCODING_MODES: &[u16] = &[1005, 1006];
-
-/// The four modes xterm names for the encoding of a mouse position: the two the session tracks, and
-/// URXVT coordinates (1015) and SGR coordinates in pixels (1016), which it consumes without
-/// tracking them. A reset of all four returns any terminal to the default encoding, whichever of
-/// them it had been set to.
-pub const MOUSE_ENCODING_FAMILY: &[u16] = &[1005, 1006, 1015, 1016];
 
 /// The modes a terminal keeps as one state with the given mode, when it is one of the mouse's: the
 /// tracking modes, or the encoding modes.

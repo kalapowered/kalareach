@@ -93,9 +93,7 @@
 
 use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
-use kr_term::modes::{
-    ALTERNATE_BUFFER_MODES, MOUSE_ENCODING_FAMILY, MOUSE_ENCODING_MODES, MOUSE_TRACKING_MODES,
-};
+use kr_term::modes::{ALTERNATE_BUFFER_MODES, MOUSE_ENCODING_MODES, MOUSE_TRACKING_MODES};
 use kr_term::palette::Rgb;
 use kr_term::sideeffect::{
     ClipboardSelection, NotificationDisplay, NotificationUrgency, Progress, SideEffectKind,
@@ -527,14 +525,16 @@ impl Writer {
                     }
                     // The mouse encoding modes are one setting on a terminal too: the last one set
                     // is in force and a reset returns the default. They are written together, where
-                    // the first of them is reached, as a reset of the four modes xterm names (a
-                    // terminal's own encoding is not known at this point, and xterm resets only the
-                    // one that is in force) and then the one that is on. Written one by one in the
-                    // order they are carried, 1006 would come after 1005 whichever of them the
-                    // application set last.
+                    // the first of them is reached, as a reset of both (a terminal's own encoding is
+                    // not known at this point, and xterm resets only the one that is in force) and
+                    // then the one that is on. Written one by one in the order they are carried,
+                    // 1006 would come after 1005 whichever of them the application set last. Only
+                    // the two modes the session tracks are written: a restoration asks a terminal
+                    // for nothing outside the profile, and the session never puts a terminal into
+                    // any other encoding.
                     if MOUSE_ENCODING_MODES.contains(&entry.mode) {
                         if let Some(encoding) = self.mouse_encoding.take() {
-                            for mode in MOUSE_ENCODING_FAMILY {
+                            for mode in MOUSE_ENCODING_MODES {
                                 self.csi(format!("?{mode}l").as_bytes());
                             }
                             if let Some(mode) = encoding {
@@ -1925,8 +1925,9 @@ mod tests {
     /// Read as Terminal.app and iTerm keep it, the encoding is one state: a set of 1005 or 1006
     /// replaces it and a reset of either returns the default. The two entries of a screen are carried
     /// in numeric order, so writing them one by one would leave the default for a screen that holds
-    /// 1005, because the reset of 1006 comes after the set of 1005. The four modes xterm names are
-    /// all reset first, then the one that is on is set.
+    /// 1005, because the reset of 1006 comes after the set of 1005. Both are reset first, then the one
+    /// that is on is set, and nothing else is written: a terminal of the profile has no other
+    /// encoding to be left in.
     #[test]
     fn a_restoration_leaves_the_terminal_in_the_mouse_encoding_the_screen_holds() {
         let written_after = |flags: [bool; 2]| {
@@ -1947,12 +1948,12 @@ mod tests {
                 Keyboard::Install,
                 Scope::WholeScreen,
             );
-            // The terminal was in another encoding before the restoration: a screen with none on
-            // must put it back to the default.
-            let mut encoding = Some(1015);
+            // The terminal was in the other encoding before the restoration: a screen with none
+            // on must put it back to the default.
+            let mut encoding = Some(if flags[1] { 1005 } else { 1006 });
             let mut written = Vec::new();
             for (_, mode, set) in dec_switches(&rendered.bytes) {
-                if matches!(mode, 1005 | 1006 | 1015 | 1016) {
+                if matches!(mode, 1005 | 1006) {
                     encoding = set.then_some(mode);
                     written.push((mode, set));
                 }
@@ -1960,7 +1961,7 @@ mod tests {
             (encoding, written)
         };
         let resets_then = |on: Option<u16>| {
-            let mut expected = vec![(1005, false), (1006, false), (1015, false), (1016, false)];
+            let mut expected = vec![(1005, false), (1006, false)];
             expected.extend(on.map(|mode| (mode, true)));
             expected
         };
@@ -1973,6 +1974,40 @@ mod tests {
             (Some(1006), resets_then(Some(1006)))
         );
         assert_eq!(written_after([false, false]), (None, resets_then(None)));
+    }
+
+    /// KR-REQ-01.11: a restoration asks a terminal of the profile for nothing it has no class for.
+    ///
+    /// The mouse modes are written as resets and a set whatever the screen holds, and a mode the
+    /// profile does not track (URXVT and pixel coordinates, 1015 and 1016) is read by an engine of the
+    /// profile as a sequence it has no class for. A restoration that wrote one would be a request
+    /// the profile never makes of a terminal.
+    #[test]
+    fn a_restoration_of_the_mouse_modes_is_read_by_an_engine_of_the_profile_without_a_diagnostic() {
+        let operations: Vec<RestoreOp> = [1000_u16, 1002, 1003, 1005, 1006]
+            .into_iter()
+            .map(|mode| RestoreOp::SetMode {
+                entry: ModeEntry {
+                    kind: kr_term::modes::ModeKind::Dec,
+                    mode,
+                    enabled: mode == 1003 || mode == 1006,
+                },
+            })
+            .collect();
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
+        let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
+            size: kr_term::budget::GridSize { cols: 80, rows: 24 },
+            ..kr_term::engine::EngineConfig::DEFAULT
+        })
+        .expect("an engine of the profile");
+        let _ = engine.feed(&rendered.bytes, 0);
+        let _ = engine.quiesce(0);
+        assert_eq!(engine.diagnostic_totals(), Vec::new());
     }
 
     #[test]
