@@ -1260,21 +1260,6 @@ impl World {
             .collect()
     }
 
-    /// Every binding whose package ships a component, as the workers report it after each has
-    /// been asked again, or nothing when the controller could not count a current report from
-    /// every worker and the reports are the last ones accepted.
-    async fn reported_fresh(
-        &self,
-    ) -> Option<
-        Vec<(
-            kr_protocol::ids::BrokerBindingId,
-            kr_protocol::admission::ComponentReport,
-        )>,
-    > {
-        let look = self.looked().await;
-        look.counted.then_some(look.reports)
-    }
-
     /// Every binding whose package ships a component, as the workers last reported it after each
     /// has been asked again.
     async fn reported(
