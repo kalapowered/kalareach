@@ -40,6 +40,51 @@ pub struct Records<'a> {
     pub prior: &'a Path,
     /// The directory a run stages in.
     pub staging: &'a Path,
+    /// What the removal's inspection opened and approved: nothing else is deleted.
+    pub approved: &'a Approved,
+}
+
+/// Which records the removal's own inspection opened and approved. A record that is there now and
+/// that it did not see appeared after the inspection: nothing opened it, so it is left and named,
+/// and the removal that is run again reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Approved {
+    /// The earlier-state record.
+    pub prior: bool,
+    /// The directory a run stages in: opened by the inspection, or made by the removal itself with
+    /// an exclusive creation.
+    pub staging: bool,
+    /// The names of the manifest's replacements that the inspection opened.
+    pub replacements: Vec<OsString>,
+}
+
+impl Approved {
+    /// Approves every record that is in the data directory now, for a caller that inspected
+    /// nothing: the earlier-state record, `staging` and each replacement of the manifest.
+    #[must_use]
+    pub fn all_that_are_there(data: &Path) -> Approved {
+        let replacements = fs::read_dir(data)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| is_manifest_replacement(&name.to_string_lossy()))
+            .collect();
+        Approved {
+            prior: true,
+            staging: true,
+            replacements,
+        }
+    }
+}
+
+/// What a removal says of something that is there now and that its inspection did not see.
+#[must_use]
+pub fn not_there_at_the_inspection(path: &Path) -> String {
+    format!(
+        "{} was not there when the removal looked for it, and something is there now, so it was not removed",
+        path.display()
+    )
 }
 
 /// Deletes the records, last of all in a removal, and then the data directory.
@@ -63,6 +108,28 @@ fn list_names(dir: &Path) -> io::Result<Vec<io::Result<OsString>>> {
         .collect())
 }
 
+/// Whether the thing is gone: it stayed when the call failed for any reason but its absence, and
+/// the reason is added to what stayed.
+fn leave(stayed: &mut Vec<String>, path: &Path, result: io::Result<()>) -> bool {
+    if let Err(error) = result
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        stayed.push(format!("{} ({error})", path.display()));
+        return false;
+    }
+    true
+}
+
+/// Whether nothing is at the path of a record that the inspection did not see; something that is
+/// there is left where it is, and named.
+fn unseen(stayed: &mut Vec<String>, path: &Path) -> bool {
+    if entry_exists(path) {
+        stayed.push(not_there_at_the_inspection(path));
+        return false;
+    }
+    true
+}
+
 /// [`remove`] with the way the data directory is listed given, so that a listing that fails can be
 /// shown. An error of the listing, and an error of one entry of it, both mean that a replacement of
 /// the manifest may be there and is not gone: neither `staging` nor the manifest is then deleted,
@@ -72,43 +139,53 @@ pub fn remove_with(
     names: &dyn Fn(&Path) -> io::Result<Vec<io::Result<OsString>>>,
 ) -> Vec<String> {
     let mut stayed = Vec::new();
-    // Whether the thing is gone: it stayed when the call failed for any reason but its absence.
-    let mut leave = |path: &Path, result: io::Result<()>| -> bool {
-        if let Err(error) = result
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            stayed.push(format!("{} ({error})", path.display()));
-            return false;
-        }
-        true
+    let mut gone = if records.approved.prior {
+        leave(&mut stayed, records.prior, fs::remove_file(records.prior))
+    } else {
+        unseen(&mut stayed, records.prior)
     };
-    let mut gone = leave(records.prior, fs::remove_file(records.prior));
     match names(records.data) {
         Ok(listed) => {
             for name in listed {
                 match name {
                     Ok(name) if is_manifest_replacement(&name.to_string_lossy()) => {
                         let path = records.data.join(&name);
-                        gone &= leave(&path, fs::remove_file(&path));
+                        gone &= if records.approved.replacements.contains(&name) {
+                            leave(&mut stayed, &path, fs::remove_file(&path))
+                        } else {
+                            unseen(&mut stayed, &path)
+                        };
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        gone &= leave(records.data, Err(unlisted(&error)));
+                        gone &= leave(&mut stayed, records.data, Err(unlisted(&error)));
                     }
                 }
             }
         }
         // A data directory that is not there has no replacement in it.
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => gone &= leave(records.data, Err(unlisted(&error))),
+        Err(error) => gone &= leave(&mut stayed, records.data, Err(unlisted(&error))),
     }
     if gone {
-        gone = leave(records.staging, fs::remove_dir_all(records.staging));
+        gone = if records.approved.staging {
+            leave(
+                &mut stayed,
+                records.staging,
+                fs::remove_dir_all(records.staging),
+            )
+        } else {
+            unseen(&mut stayed, records.staging)
+        };
     }
     if gone {
-        leave(records.manifest, fs::remove_file(records.manifest));
+        leave(
+            &mut stayed,
+            records.manifest,
+            fs::remove_file(records.manifest),
+        );
     }
-    leave(records.data, fs::remove_dir(records.data));
+    leave(&mut stayed, records.data, fs::remove_dir(records.data));
     stayed
 }
 
@@ -212,10 +289,7 @@ pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<Str
     for (directory, approved) in [(run, seen.run), (journal, seen.journal)] {
         if !approved {
             if entry_exists(directory) {
-                stayed.push(format!(
-                    "{} was not there when the removal looked for it, and something is there now, so it was not removed",
-                    directory.display()
-                ));
+                stayed.push(not_there_at_the_inspection(directory));
             }
             continue;
         }
