@@ -27,7 +27,9 @@ use crate::frame::Class;
 use crate::manifest::{GitSet, Manifest, ObjectKind};
 use crate::policy::{RULE_CHECKOUT, RULE_CONNECT};
 use crate::quote::quote_command_line;
-use crate::window::{Bound, bound, may_ask_the_log, query_ends_the_search, search_is_over};
+use crate::window::{
+    Bound, Next, QueryResult, bound, may_ask_the_log, next_after_a_query, search_is_over,
+};
 
 use super::applocker;
 use super::ffi::{self, Sid};
@@ -594,29 +596,39 @@ pub fn prove(
             // that follows says what it saw and what the log last said.
             over = true;
         } else if refused {
-            match applocker::blocked_after(record, &scratch.0, &environment, search_until) {
-                Ok(events) => {
-                    if events.iter().any(|event| {
+            let answer = applocker::blocked_after(record, &scratch.0, &environment, search_until);
+            let result = match &answer {
+                Ok(events) => QueryResult::Answered {
+                    refusal_found: events.iter().any(|event| {
                         event.rule_id == rule
                             && event.user.eq_ignore_ascii_case(&sid)
                             && same_path(&event.path, &unlisted)
-                    }) {
-                        // The evidence counts only if it was in hand before the deadline.
-                        if let Err(failed) = left_before(deadline) {
-                            return failed;
-                        }
-                        break;
+                    }),
+                },
+                Err(error) => QueryResult::Ended(error.query_end()),
+            };
+            // A query that the search's own end stopped ends the search: one cut at the deadline it
+            // was given, one that found the deadline passed before it was made, and one whose
+            // program could not start because the deadline had passed. A query that failed to
+            // start, a pipe error, a bad exit or a cut at the query's own bound is a failure of
+            // the proof at any time.
+            match next_after_a_query(result) {
+                Next::Found => {
+                    // The evidence counts only if it was in hand before the deadline.
+                    if let Err(failed) = left_before(deadline) {
+                        return failed;
                     }
+                    break;
                 }
-                // A query that the search's own end stopped ends the search: one cut at the deadline it
-                // was given, one that found the deadline passed before it was made, and one whose
-                // program could not start because the deadline had passed. A query that failed to
-                // start, a pipe error, a bad exit or a cut at the query's own bound is a failure of
-                // the proof at any time.
-                Err(error) if query_ends_the_search(error.query_end()) => {
-                    over = true;
+                Next::Keep => {}
+                Next::Over => over = true,
+                Next::Fail => {
+                    return fail(
+                        answer
+                            .err()
+                            .map_or_else(String::new, |error| error.to_string()),
+                    );
                 }
-                Err(error) => return fail(error.to_string()),
             }
         }
         if over {
