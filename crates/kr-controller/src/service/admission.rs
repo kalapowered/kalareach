@@ -233,6 +233,13 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// How many connections are registered as admitted, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn admitted_connections(&self) -> usize {
+        self.admitted_read().len()
+    }
+
     /// Returns the table of admitted connections to add to or to tie a write boundary to: a
     /// registration made, or the latch of a boundary attached to one.
     ///

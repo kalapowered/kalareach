@@ -3360,28 +3360,39 @@ chunk's admission because a fence is owed or the authority feed has refused the 
 device is told, and the stream is read no further. When the connection's authority has gone, the
 connection is closed and nothing more is written on it.
 
-A device holds at most 64 live connections: the host lets it use 32 at once, which covers the
-companion's own count of 30 to the host in use (its main link, a link and a terminal view for each
-of at most eight open sessions, up to four ambient links, and the connections of the owner's
-confirmations, the revocation readings, the push registration, the inbox, a voice call and the
-sharing desk), and the rest is room for the copies a lossy path leaves: a replaced link's connection
-stays with the host for the transport's idle time of 30 seconds, and a link replaced more than once
-in that time leaves a copy for each. At the first connection above the bound the host serves the new
-connection and withdraws the device's connection that it has heard from least recently, never the new
-one; of two that were heard from at the same moment, the one counted first. A connection is heard
-from when the transport receives an authenticated packet from the device on it, keepalives included,
-and a live device sends one at least every 10 seconds. The host dates a packet when it reads the
-transport's counters, once a second and again when it chooses, so a stamp can be one reading late,
-and two connections whose packets came within a reading of each other can be taken in either order.
-A connection silent for much longer than a keepalive interval is withdrawn before one the device
-still sends on, but the host cannot know that the device has gone: a link in use that loses its
-keepalives is as silent. A link the device has left, which still waits for replies, sends keepalives
-as a link in use does, and the host cannot tell the two apart: only the device's own count keeps it
-below the bound. The withdrawn connection is closed as a revocation withdraws a device's
-connections, and one that still waits for the authority feed is closed at its transport at once: a
-request in flight on it gets no answer, and the device presents the same action on a newer
-connection and settles it as it would after any lost connection. Another device's
-connections are not touched. An owner cannot change the bound.
+A device holds at most 64 live connections: the host lets it use 32 at once, which is the
+companion's own total to a host with every dial it makes counted (its main link, a link and a
+terminal view for each of at most eight open sessions, up to four ambient links, the connections of
+the owner's confirmations, the revocation readings, the push registration, the inbox, a voice call
+and the sharing desk, and two places for links that finish beside a replacement), and the rest is
+room for the copies a lossy path leaves: a replaced link's connection stays with the host for the
+transport's idle time of 30 seconds, and a link replaced more than once in that time leaves a copy
+for each. At the first connection above the bound the host withdraws one of the device's connections
+only if it has been silent for more than 15 seconds (a keepalive interval, one reading and 4 seconds
+for delay) at the reading the host makes then: the one silent the longest, and of equal stamps the
+one counted later; the new connection is never the one. When no connection has been silent that
+long, the host withdraws nothing and refuses the new connection for now: it answers on the control
+stream with the error `RESOURCE_UNAVAILABLE`, whose retry category is transient, as a response with
+request identifier zero, waits at most 2 seconds for the device to take it and ends the connection.
+A client takes that response as the host's refusal of the connection and asks again by itself on
+its own backoff, which with a copy that turns silent 15 seconds after the first refusal takes about
+22 seconds at the median and up to about 45. A connection heard from inside the last 15 seconds is
+never withdrawn, and a device that connects again after a withdrawal starts no chain. A connection
+is heard from when the transport receives an authenticated packet from the device on it,
+keepalives included, and a device whose path works sends one at least every 10 seconds. The host
+dates a packet when it reads the transport's counters, once a second and again when it chooses,
+never earlier than the packet. What the rule protects is a connection heard from lately, not the
+main link as such: a path that stops for a few seconds after an idle link's last keepalive makes
+that link as silent as the device's other connections that were heard from just before, and it can
+then be withdrawn; and the host's clock counts the time the host sleeps, which the transport's
+timers do not, so after a sleep every connection reads as silent until it is heard from again. A
+link the device has left, which still waits for replies, sends keepalives as a link in use does, and
+the host cannot tell the two apart: only the device's own count keeps it below the bound. The
+withdrawn connection is closed as a revocation withdraws a device's connections, and one that still
+waits for the authority feed is closed at its transport at once: a request in flight on it gets no
+answer, and the device presents the same action on a newer connection and settles it as it would
+after any lost connection. Another device's connections are not touched. An owner cannot change the
+bound.
 
 The transfer service performs a device's uploads under the device's own principal, which the host
 derives from the device's identity. A device sees and ends only its own uploads: another principal's

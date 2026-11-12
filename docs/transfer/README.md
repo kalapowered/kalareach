@@ -197,7 +197,7 @@ resets the stream, and the device sees a reset and no answer. A request or mutat
 not carry is answered with its refusal, and the stream ends after the answer; any other frame ends
 it with no answer. A newer stream for a transfer
 replaces the older, which is reset, so a device sends a transfer's chunks on one stream at a time.
-A device holds at most 64 connections to a host, and the first above that closes the one the host has heard from least recently. The host's
+A device holds at most 64 connections to a host. At the first above that the host closes a connection of the device only if it has been silent for more than 15 seconds, the one silent the longest, and when none has been it refuses the new connection for now and the device asks again by itself. The host's
 document gives the order of the checks.
 
 | Endpoint | Unix | Windows | Carries |

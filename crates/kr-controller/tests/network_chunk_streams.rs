@@ -14,9 +14,9 @@ mod net_support;
 use std::task::Poll;
 use std::time::Duration;
 
-use kr_controller::service::net::DEVICE_LIVE_CONNECTIONS;
 use kr_controller::service::net::config::NetworkSettings;
 use kr_controller::service::net::devices::DeviceRecord;
+use kr_controller::service::net::{DEVICE_LIVE_CONNECTIONS, DEVICE_SILENT_FOR};
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -1278,14 +1278,33 @@ async fn a_connection_is_dated_by_the_packets_its_device_sends_on_it() {
     host.stop().await;
 }
 
-/// KR-REQ-23.21: a device holds at most `DEVICE_LIVE_CONNECTIONS` live connections, and the newest
-/// is served. With every connection of the device live, which is what a device that has left links
-/// and waits for their replies holds, the host cannot tell one connection from another by what it
-/// hears, so it withdraws the one it heard from least recently, whichever that is, and only one:
-/// the first connection above the bound is served and exactly one of the others ends. Another
-/// device's connections are untouched, and so is its count.
+/// What the host answered a connection it refused with: the error of the response with the request
+/// identifier zero that a refusal at connection is, or nothing when the connection was served.
+async fn refusal_of(raw: &RawDevice) -> Option<ProtocolError> {
+    match raw.next_answer(WAIT).await {
+        Some((id, Outcome::Error(error))) if id == RequestId::new(0) => Some(error),
+        _ => None,
+    }
+}
+
+/// How long a case moves the host's readings on to make a connection that went silent read as
+/// silent for more than the time the host requires.
+fn past_the_silence() -> Duration {
+    DEVICE_SILENT_FOR + Duration::from_secs(1)
+}
+
+/// KR-REQ-23.21: a device holds at most `DEVICE_LIVE_CONNECTIONS` live connections, and a
+/// connection the host heard from inside the time a live connection is heard from is never
+/// withdrawn for a new one. With every connection of the device heard from, which is what a device
+/// that has left links and waits for their replies holds, the connection above the bound is refused
+/// for now with the code a device tries again after, and none of the others ends. When one of the
+/// others has been silent for longer than that time, the next connection above the bound is served
+/// and that one, and only that one, ends; and the connection that follows it is refused again, so a
+/// device that connects again after a withdrawal starts no chain. Another device's connections are
+/// untouched by either, and so is its count; and nothing of a refused connection is left behind
+/// but the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn with_every_connection_live_the_first_above_the_bound_withdraws_exactly_one() {
+async fn with_every_connection_in_use_the_first_above_the_bound_is_refused_and_withdraws_none() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let rights = [ActionRight::FilesUpload, ActionRight::SessionView];
@@ -1301,20 +1320,83 @@ async fn with_every_connection_live_the_first_above_the_bound_withdraws_exactly_
         bound,
         "a bound's worth of connections withdraws nobody"
     );
+    let admitted = host.controller().admitted_connections();
+    let readings = host.readings_running();
 
+    // Every connection answers, so every one was heard from just now, and the one above the bound
+    // is refused.
+    for raw in std::iter::once(&device.raw).chain(&more) {
+        assert!(
+            is_served(raw).await,
+            "a connection within the bound is served"
+        );
+    }
+    let refused = device.again(&host).await;
+    let refusal = refusal_of(&refused).await.expect("the host says why");
+    assert_eq!(refusal.code, ErrorCode::ResourceUnavailable);
+    assert_eq!(refusal.retry, kr_protocol::error::RetryCategory::Transient);
+    assert!(
+        has_ended(&refused).await,
+        "the host ends the connection it refused"
+    );
+    for raw in std::iter::once(&device.raw).chain(&more) {
+        assert!(is_served(raw).await, "no connection in use was withdrawn");
+    }
+    assert_eq!(host.connections_of(&device.record), bound);
+    until(|| host.controller().admitted_connections() == admitted).await;
+    until(|| host.readings_running() == readings).await;
+    assert_eq!(
+        host.heard_from_of(&device.record).len(),
+        DEVICE_LIVE_CONNECTIONS
+    );
+
+    // One connection goes silent and the host's time moves past the silence the host requires; the
+    // others answer again, which is hearing from them.
+    host.silence_connections_of(&device.record, 5..6);
+    host.advance_the_readings(past_the_silence());
+    for raw in std::iter::once(&device.raw)
+        .chain(&more)
+        .enumerate()
+        .filter(|(place, _)| *place != 5)
+        .map(|(_, raw)| raw)
+    {
+        assert!(
+            is_served(raw).await,
+            "a connection that answers is heard from"
+        );
+    }
     let above = device.again(&host).await;
     assert!(
         is_served(&above).await,
         "the connection above the bound is served"
     );
     until(|| host.connections_of(&device.record) == bound).await;
-    let mut ended = 0;
-    for raw in std::iter::once(&device.raw).chain(&more) {
-        if !is_served(raw).await {
-            ended += 1;
-        }
+    let silent = more.get(4).expect("the sixth connection of the device");
+    assert!(
+        has_ended(silent).await,
+        "the silent connection was withdrawn"
+    );
+
+    // The device that lost its connection connects again: every other connection was heard from
+    // since, so it is refused, and nothing in use is withdrawn for it.
+    let again = device.again(&host).await;
+    assert_eq!(
+        refusal_of(&again).await.map(|error| error.code),
+        Some(ErrorCode::ResourceUnavailable),
+        "a connection that connects again after a withdrawal is refused, not served at another's cost"
+    );
+    for raw in std::iter::once(&device.raw)
+        .chain(
+            more.iter()
+                .enumerate()
+                .filter(|(place, _)| *place != 4)
+                .map(|(_, raw)| raw),
+        )
+        .chain([&above])
+    {
+        assert!(is_served(raw).await, "no connection in use was withdrawn");
     }
-    assert_eq!(ended, 1, "the host withdrew exactly one connection");
+
     assert!(is_served(&neighbour.raw).await && is_served(&neighbours_second).await);
     assert_eq!(host.connections_of(&neighbour.record), 2);
     host.stop().await;
@@ -1350,6 +1432,7 @@ async fn the_copies_a_device_left_are_withdrawn_before_the_oldest_connection_it_
     // whatever time the case takes.
     host.hold_the_periodic_readings(true);
     host.silence_connections_of(&device.record, 1..COPIES + 1);
+    host.advance_the_readings(past_the_silence());
     let action = ActionId::new(kr_ipc::new_uuid());
     let (session_id, _) = an_open_session(&host);
     let create = kr_protocol::transfer::DraftCreateParams {
@@ -1431,8 +1514,10 @@ async fn the_copies_a_device_left_are_withdrawn_before_the_oldest_connection_it_
     }
     assert_eq!(host.connections_of(&neighbour.record), 2);
 
-    // Heard from on none of them since one moment: of connections heard from at the same moment
-    // the first counted goes, which is the oldest.
+    // Heard from on none of them since one moment, and that moment is further back than the time a
+    // connection must be silent: of connections silent since the same moment the one counted later
+    // goes, so the oldest connection, which is the one a device has had longest, is the last to
+    // go, and a device whose connections are all silent still gets its new one.
     host.silence_connections_of(&device.record, 0..DEVICE_LIVE_CONNECTIONS);
     let stamps = host.heard_from_of(&device.record);
     assert_eq!(stamps.len(), DEVICE_LIVE_CONNECTIONS);
@@ -1440,14 +1525,80 @@ async fn the_copies_a_device_left_are_withdrawn_before_the_oldest_connection_it_
         stamps.iter().all(|stamp| *stamp == stamps[0]),
         "every connection was heard from at the same moment"
     );
+    host.advance_the_readings(past_the_silence());
     let last = device.again(&host).await;
     assert!(
         is_served(&last).await,
         "the connection above the bound is served"
     );
-    assert!(has_ended(&device.raw).await, "the oldest connection ends");
-    for raw in more[COPIES..].iter().chain(&above) {
+    let newest = above.last().expect("the connections above the bound");
+    assert!(
+        has_ended(newest).await,
+        "the connection counted last of those silent since one moment ends"
+    );
+    assert!(
+        is_served(&device.raw).await,
+        "the oldest connection stands: equal stamps do not fall to it"
+    );
+    for raw in more[COPIES..].iter().chain(&above[..COPIES - 1]) {
         assert!(is_served(raw).await, "no other connection was withdrawn");
+    }
+    host.stop().await;
+}
+
+/// KR-REQ-23.21: the main link of a device that sends nothing but keepalives is not withdrawn
+/// because the device's other connections, replaced three times inside one keepalive interval with
+/// their closes lost, are younger than its last keepalive. The device holds the main link, sixteen
+/// links that it uses and copies of the sixteen links' three replacements, all copies silent since
+/// after the main link was last heard from. The next replacement is refused: no connection has
+/// been silent for longer than the time the host requires. Once that time has passed for the
+/// copies, the main link has been heard from again and the links in use answer, and the next
+/// connection is served at a copy's cost, the one counted last of them, and no other ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_main_link_is_not_withdrawn_for_the_copies_that_followed_its_last_keepalive() {
+    const IN_USE: usize = 16;
+    const COPIES: usize = DEVICE_LIVE_CONNECTIONS - 1 - IN_USE;
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::SessionView]).await;
+    host.hold_the_periodic_readings(true);
+    let more = up_to_the_bound(&device, &host).await;
+
+    // The main link was last heard from first; the copies were heard from later and went quiet.
+    host.silence_connections_of(&device.record, 0..1);
+    host.advance_the_readings(Duration::from_secs(6));
+    host.silence_connections_of(&device.record, 1..COPIES + 1);
+    for raw in &more[COPIES..] {
+        assert!(is_served(raw).await, "a link in use answers");
+    }
+    let refused = device.again(&host).await;
+    assert_eq!(
+        refusal_of(&refused).await.map(|error| error.code),
+        Some(ErrorCode::ResourceUnavailable),
+        "no connection was silent for long enough, so the replacement is refused"
+    );
+    assert!(
+        is_served(&more[COPIES]).await && has_ended(&refused).await,
+        "the connections in use stand and the refused one ends"
+    );
+
+    // Time passes, the main link sends a keepalive and the links in use answer.
+    host.advance_the_readings(past_the_silence());
+    host.hear_connections_of(&device.record, 0..1);
+    assert!(is_served(&device.raw).await, "the main link is heard from");
+    for raw in &more[COPIES..] {
+        assert!(is_served(raw).await, "a link in use answers");
+    }
+    let next = device.again(&host).await;
+    assert!(is_served(&next).await, "the next connection is served");
+    assert!(
+        has_ended(&more[COPIES - 1]).await,
+        "the copy counted last was withdrawn"
+    );
+    assert!(is_served(&device.raw).await, "the main link stands");
+    for raw in &more[COPIES..] {
+        assert!(is_served(raw).await, "no link in use was withdrawn");
     }
     host.stop().await;
 }

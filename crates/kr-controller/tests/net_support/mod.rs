@@ -1362,10 +1362,28 @@ impl Host {
             .silence_connections_of(device.device_id, places);
     }
 
+    /// Lets the host date the packets of the connections of `device` at these places again, after
+    /// they stood in for connections whose packets no longer arrive.
+    pub fn hear_connections_of(&self, device: &DeviceRecord, places: std::ops::Range<usize>) {
+        self.network.hear_connections_of(device.device_id, places);
+    }
+
     /// Holds the once-a-second readings of what each connection's transport has received, or lets
     /// them run again.
     pub fn hold_the_periodic_readings(&self, held: bool) {
         self.network.hold_the_periodic_readings(held);
+    }
+
+    /// Moves forward the time the host dates its connections' packets and chooses a connection to
+    /// withdraw by: a silent connection then reads as silent for `by` longer, with no wait.
+    pub fn advance_the_readings(&self, by: std::time::Duration) {
+        self.network.advance_the_readings(by);
+    }
+
+    /// How many connections have a periodic reading running.
+    #[must_use]
+    pub fn readings_running(&self) -> usize {
+        self.network.readings_running()
     }
 
     /// The record the host committed for `device_id`: the grant it was paired under and the keys

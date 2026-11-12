@@ -377,6 +377,16 @@ impl ControlChannel {
         outcome
     }
 
+    /// Finishes the control stream's sending side and waits, for no longer than `within`, for the
+    /// peer to acknowledge what was written.
+    ///
+    /// A refusal is the last thing a connection says before it ends, and a connection that is
+    /// closed the instant after a write can discard it: this is what makes the words arrive. A
+    /// peer that never acknowledges holds the caller for `within` and no longer.
+    pub async fn finish_and_flush(&self, within: std::time::Duration) {
+        self.writer.lock().await.finish_and_flush(within).await;
+    }
+
     /// Returns the next control frame and when it was read, or `None` once the stream has ended.
     ///
     /// The stream is read by the connection itself, not by this call: a handler that is waiting on

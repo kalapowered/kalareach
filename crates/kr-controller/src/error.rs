@@ -38,6 +38,18 @@ pub enum ControllerError {
         /// What was found and what a create needs.
         detail: String,
     },
+    /// A paired device holds as many connections to this host as the host allows, and the host has
+    /// heard from every one of them within the time a connection in use is heard from, so it
+    /// ends none of them for a new one.
+    ///
+    /// The refusal is for now: the host takes a new connection once one of the others has been
+    /// silent for long enough, and a device that is refused asks again by itself.
+    #[error(
+        "this device already holds as many connections to this host as the host allows, and all \
+         of them are in use; the host takes a new one when one has gone quiet, and this device \
+         asks again by itself"
+    )]
+    ConnectionsInUse,
     /// A configuration edit was refused.
     ///
     /// An edit is validated before a revision is applied, so this is what a caller is told
@@ -325,7 +337,8 @@ impl ControllerError {
             Self::SessionLimit { .. } => ErrorCode::SessionLimit,
             Self::Supervision { .. }
             | Self::WorkInAnotherSession { .. }
-            | Self::ResourceShort { .. } => ErrorCode::ResourceUnavailable,
+            | Self::ResourceShort { .. }
+            | Self::ConnectionsInUse => ErrorCode::ResourceUnavailable,
             Self::RendezvousRefused { .. } | Self::Verification(_) | Self::WindowExpired { .. } => {
                 ErrorCode::PermissionDenied
             }

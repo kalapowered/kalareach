@@ -24,7 +24,7 @@ use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_respo
 use kr_controller::authority_feed::FeedRuntime;
 use kr_controller::grants::restored::{self, Found};
 use kr_controller::service::Clocks;
-use kr_controller::service::net::DEVICE_LIVE_CONNECTIONS;
+use kr_controller::service::net::{DEVICE_LIVE_CONNECTIONS, DEVICE_SILENT_FOR};
 use kr_controller::testing::HeldTimer;
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -7993,6 +7993,15 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
     }
     assert_eq!(rig.host.connections_of(&record), bound);
 
+    // One connection of the device goes silent and the host's time passes the silence it requires
+    // while the others answer, so the connection that waits is served at that connection's cost.
+    rig.host.silence_connections_of(&record, 0..1);
+    rig.host
+        .advance_the_readings(DEVICE_SILENT_FOR + Duration::from_secs(1));
+    for raw in &connections[1..] {
+        assert!(is_served(raw).await, "the others answer");
+    }
+
     // The feed holds its next read, and a connection waits for a synchronisation for a minute.
     rig.runtime()
         .wait_for_a_synchronisation_at_most(Duration::from_secs(60));
@@ -8041,6 +8050,8 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         &record,
         DEVICE_LIVE_CONNECTIONS - 1..DEVICE_LIVE_CONNECTIONS,
     );
+    rig.host
+        .advance_the_readings(DEVICE_SILENT_FOR + Duration::from_secs(1));
     for raw in &alive {
         assert!(is_served(raw).await, "the others answer");
     }
