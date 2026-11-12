@@ -26,6 +26,7 @@
 		2165CA32150D6D8C62BB4271 /* PickerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3032551E6A9CDCC1EFDC5487 /* PickerTests.swift */; };
 		23591009DB33BA0A6E6DF7A4 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 529A8B9ADD788615F4718EB0 /* PushRegistration.swift */; };
 		243B06B450728E7814F317FC /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 21EFF08FF9DFE8027EAA8B8F /* Security.framework */; };
+		24E9292E768A07D4849F9D12 /* LinkTapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0373966FF1BA78C6CE872B39 /* LinkTapTests.swift */; };
 		261806B6F7A3AFFD7D57B70C /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
 		2711FF06F109CDDE842B2803 /* ChallengeAnswerer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A3EA6CD9738D5D1BE903051 /* ChallengeAnswerer.swift */; };
 		27B4FE203288F26127E58B2C /* LaunchPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F7673A3BC9A13535E7488A9 /* LaunchPlan.swift */; };
@@ -159,6 +160,7 @@
 /* Begin PBXFileReference section */
 		019E652DB2C27D9CDAB07505 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
 		02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		0373966FF1BA78C6CE872B39 /* LinkTapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinkTapTests.swift; sourceTree = "<group>"; };
 		051C72A4F29B11CDE86D2A4F /* NotificationRoute.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationRoute.swift; sourceTree = "<group>"; };
 		060ED951D45DB3BF843619B8 /* PreviewKeySet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewKeySet.swift; sourceTree = "<group>"; };
 		090833DCE614DBBC5B713F32 /* ProofTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProofTests.swift; sourceTree = "<group>"; };
@@ -401,6 +403,7 @@
 				89A2D4B3AE9AD80CEDCEC961 /* KeychainTests.swift */,
 				8A7556962086670CA11B4113 /* LayoutTests.swift */,
 				C3579CCF6F90E0C62DBEB619 /* LifecycleTests.swift */,
+				0373966FF1BA78C6CE872B39 /* LinkTapTests.swift */,
 				C24EF43275B87FCEAEE81A36 /* PairingTests.swift */,
 				3032551E6A9CDCC1EFDC5487 /* PickerTests.swift */,
 				090833DCE614DBBC5B713F32 /* ProofTests.swift */,
@@ -968,6 +971,7 @@
 				3BB00F33B3279B6F42690897 /* KeychainTests.swift in Sources */,
 				F81D0C2E43E5082B417A3C2B /* LayoutTests.swift in Sources */,
 				C182F409D322D9E066D5D76F /* LifecycleTests.swift in Sources */,
+				24E9292E768A07D4849F9D12 /* LinkTapTests.swift in Sources */,
 				752DBE07AE22CCA9C99EBD78 /* PairingTests.swift in Sources */,
 				2165CA32150D6D8C62BB4271 /* PickerTests.swift in Sources */,
 				A4D50746AA44675D26153C18 /* ProofTests.swift in Sources */,

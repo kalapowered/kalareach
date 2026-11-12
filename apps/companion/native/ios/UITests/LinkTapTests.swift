@@ -1,11 +1,14 @@
 //
 //  Taps on the links of a message, made on the glass as a finger makes them.
 //
-//  The page decides which link a press belongs to, and opens it on the click that the platform sends
-//  for the tap. Whether WebKit sends that click for a tap on plain text depends on where the page's
-//  listeners stand, which no browser test on a desktop engine can show. These tests tap the web view
-//  by coordinates, through UIKit and not through the page's own events, at the points a person
-//  touches, and read what the page saw (the harness's tap record) and what the scripted host opened.
+//  A link's box and the message's controls are the page's own: the browser's click names the link or
+//  the control that a tap lands on, and nothing stops or redirects it. Where a tap's click lands on
+//  plain text near a link's words, the page gives the link a click of its own. Which element WebKit
+//  names for a tap, and whether it sends a click for plain text at all, no browser test on a desktop
+//  engine can show. These tests tap the web view by coordinates, through UIKit and not through the
+//  page's own events, at the points a person touches, and read what the page saw (the harness's tap
+//  record: each event's type, target, pointer number, pointer type and point) and what the scripted
+//  host opened.
 //
 //  The tap record is the harness's own: a strip control starts it, fills the first session with the
 //  messages the taps need, and shows the events, the links' rectangles and the links opened as text
@@ -26,6 +29,11 @@ final class LinkTapTests: HarnessTestCase {
         let target: String
         let trusted: Bool
         let detail: Int
+        let point: CGPoint
+        /// The event's class (a pointer event or a mouse event), its pointer number and its pointer type.
+        let kind: String
+        let pointer: String
+        let pointerType: String
     }
 
     /// One link of the conversation as the page lays it out now: its box and the rectangles of its words.
@@ -50,8 +58,13 @@ final class LinkTapTests: HarnessTestCase {
     private func events() -> [Seen] {
         recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ").compactMap { part in
             let fields = part.split(separator: " ")
-            guard fields.count >= 6, fields[0] == "E", let order = Int(fields[1]), let detail = Int(fields[5]) else { return nil }
-            return Seen(order: order, type: String(fields[2]), target: String(fields[3]), trusted: fields[4] == "1", detail: detail)
+            guard fields.count >= 11, fields[0] == "E", let order = Int(fields[1]), let detail = Int(fields[5]),
+                let x = Double(fields[6]), let y = Double(fields[7])
+            else { return nil }
+            return Seen(
+                order: order, type: String(fields[2]), target: String(fields[3]), trusted: fields[4] == "1", detail: detail,
+                point: CGPoint(x: x, y: y), kind: String(fields[8]), pointer: String(fields[9]), pointerType: String(fields[10])
+            )
         }
     }
 
@@ -106,6 +119,9 @@ final class LinkTapTests: HarnessTestCase {
         "table-2": "second notes",
         "docs": "docs",
         "reconnect": "the reconnect notes",
+        "upper": "the upper link",
+        "lower": "the lower link",
+        "under-image": "a link under the image",
     ]
 
     /// Where the page's coordinates lie on the screen: the button a link is has a frame the system
@@ -131,11 +147,16 @@ final class LinkTapTests: HarnessTestCase {
         app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x + shift.dx, dy: point.y + shift.dy))
     }
 
-    /// Taps a point of the page and reports what happened after the last event the record had before.
-    private func tap(_ label: String, at point: CGPoint, shift: CGVector) -> Result {
+    /// Taps a point of the page, or holds a finger on it for `hold` seconds, and reports what happened after the last
+    /// event the record had before.
+    private func tap(_ label: String, at point: CGPoint, shift: CGVector, hold: TimeInterval = 0) -> Result {
         let before = events().last?.order ?? 0
         let openedBefore = opened().count
-        screenPoint(point, shift).tap()
+        if hold > 0 {
+            screenPoint(point, shift).press(forDuration: hold)
+        } else {
+            screenPoint(point, shift).tap()
+        }
         Thread.sleep(forTimeInterval: 1.2)
         let seen = events().filter { $0.order > before }
         let now = opened()
@@ -161,8 +182,19 @@ final class LinkTapTests: HarnessTestCase {
 
     /// Says what one tap did, one line, where the run's log can be read for it.
     private func report(_ result: Result, at point: CGPoint) {
-        let list = result.events.map { "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail))" }.joined(separator: " ")
-        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+        let list = result.events.map {
+            "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail),\($0.kind) pointer \($0.pointer) \($0.pointerType),at \(Int($0.point.x)) \(Int($0.point.y)))"
+        }.joined(separator: " ")
+        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+    }
+
+    /// What the system's click named, and whether the page added a click of its own: `button` (the link's own, by the
+    /// platform's adjustment or because the tap landed on it), `text` (plain text, then the page's click follows),
+    /// `none` (no click came).
+    private func named(_ result: Result) -> String {
+        guard let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else { return "none" }
+        let added = result.events.contains { $0.type == "click" && !$0.trusted }
+        return (click.target.contains("md-link") ? "the link's button" : "plain text (\(click.target))") + (added ? ", with the page's click on the link" : ", no click added by the page")
     }
 
     /// A tap that opens a link: one trusted click with detail 1 after the pointer's release, and the link opened once.
@@ -251,26 +283,20 @@ final class LinkTapTests: HarnessTestCase {
             "table-1"
         )
 
-        // Plain text after a link, inside the link's reach.
-        var docs = scroll(to: "docs")
-        shift = offset(of: docs)
-        var attempt = 0
-        for beside in [10, 12, 8, 14] as [CGFloat] {
-            docs = link("docs")
-            shift = offset(of: docs)
+        // Plain text after a link, 16 to 20 px past its words: inside the link's reach. The click that the
+        // system sends names the link's button (the platform's own adjustment) or the plain text (and then
+        // the page gives the link a click); the report line of each tap says which.
+        _ = scroll(to: "docs")
+        for beside in [16, 18, 20] as [CGFloat] {
+            let docs = link("docs")
             let words = docs.words[docs.words.count - 1]
-            let result = tap("\(named): on plain text after the link, \(Int(beside)) px past its words", at: CGPoint(x: words.maxX + beside, y: words.midY), shift: shift)
-            attempt += 1
-            // The point has to land on the paragraph for this to be the case: another target means the next point.
-            let down = result.events.first(where: { $0.type == "pointerdown" })
-            if let down, !down.target.hasPrefix("button") && !down.target.hasPrefix("span.md-link") {
-                expectOpened(result, "docs")
-                break
-            }
-            if attempt == 4 { XCTFail("no point past the words landed on the paragraph: \(result.events.map(\.target))") }
+            expectOpened(
+                tap("\(named): on plain text after the link, \(Int(beside)) px past its words", at: CGPoint(x: words.maxX + beside, y: words.midY), shift: offset(of: docs)),
+                "docs"
+            )
         }
 
-        // One line away from every link, on the conversation.
+        // One line away from every link, beyond the reach: nothing opens.
         let all = links()
         let room = pane().room
         let shiftNow = offset(of: link("docs"))
@@ -287,6 +313,52 @@ final class LinkTapTests: HarnessTestCase {
         } else {
             XCTFail("no point of the conversation lies a line away from every link: \(room)")
         }
+
+        // A paragraph with a link on the next line: the upper link's words, and the lower part of them, are the upper link's.
+        var upper = scroll(to: "upper")
+        expectOpened(
+            tap("\(named): on the upper link's words, a link on the next line", at: CGPoint(x: upper.words[0].minX + min(12, upper.words[0].width / 2), y: upper.words[0].midY), shift: offset(of: upper)),
+            "upper"
+        )
+        upper = link("upper")
+        let lastLine = upper.words[upper.words.count - 1]
+        expectOpened(
+            tap("\(named): on the lower part of the upper link's words, a link on the next line", at: CGPoint(x: lastLine.minX + min(12, lastLine.width / 2), y: lastLine.maxY - 2), shift: offset(of: upper)),
+            "upper"
+        )
+
+        // The control of an image that has not been loaded, 2 px inside its lower edge, with a link on the next line:
+        // one click of the control, and no link opens.
+        let underImage = scroll(to: "under-image")
+        let control = app.buttons["Load this image"].firstMatch
+        XCTAssertTrue(control.waitForExistence(timeout: 10), "the screen shows no Load this image control")
+        let controlShift = offset(of: underImage)
+        let controlFrame = control.frame
+        let onControl = tap(
+            "\(named): 2 px inside the lower edge of Load this image",
+            at: CGPoint(x: controlFrame.midX - controlShift.dx, y: controlFrame.maxY - 2 - controlShift.dy),
+            shift: controlShift
+        )
+        let controlClicks = onControl.events.filter { $0.type == "click" && $0.trusted }
+        XCTAssertEqual(controlClicks.count, 1, "\(onControl.label): the system's clicks that came: \(onControl.events.map(\.type))")
+        XCTAssertTrue(
+            (controlClicks.first?.target.hasPrefix("button") ?? false) && !(controlClicks.first?.target.contains("md-link") ?? true),
+            "\(onControl.label): the click named \(controlClicks.first?.target ?? "nothing"), not the control"
+        )
+        XCTAssertFalse(onControl.events.contains { $0.type == "click" && !$0.trusted }, "\(onControl.label): the page added a click")
+        XCTAssertTrue(onControl.opened.isEmpty, "\(onControl.label): opened \(onControl.opened)")
+
+        // A press of one second on a link's words: what the platform does with it stands, and the page adds nothing.
+        let pressed = scroll(to: "table-2")
+        let held = tap(
+            "\(named): a press of one second on a link's words",
+            at: CGPoint(x: pressed.words[0].midX, y: pressed.words[0].midY),
+            shift: offset(of: pressed),
+            hold: 1.0
+        )
+        let heldClicks = held.events.filter { $0.type == "click" && $0.trusted }.count
+        XCTAssertEqual(held.opened.count, heldClicks, "\(held.label): \(heldClicks) clicks of the system's, \(held.opened.count) links opened")
+        XCTAssertFalse(held.events.contains { $0.type == "click" && !$0.trusted }, "\(held.label): the page added a click")
 
         // A drag that scrolls, started on a link's words: pointercancel, no click, nothing opened.
         let dragged = scroll(to: "table-2")
@@ -305,14 +377,18 @@ final class LinkTapTests: HarnessTestCase {
         XCTAssertFalse(result.events.contains { $0.type == "click" }, "\(result.label): a click came")
         XCTAssertTrue(result.opened.isEmpty, "\(result.label): opened \(result.opened)")
 
-        // A link while the composer has focus: where does the focus go.
+        // A link tapped while the composer has focus: the link opens once, and the report says where the focus is
+        // and whether the keyboard is still up.
         composer.tap()
         Thread.sleep(forTimeInterval: 1.5)
+        let keyboardBefore = app.keyboards.count
         let reference = scroll(to: "reconnect")
         let withKeyboard = offset(of: reference)
         let words = reference.words[0]
         let focused = tap("\(named): a link while the composer has focus", at: CGPoint(x: words.midX, y: words.midY), shift: withKeyboard)
-        say("LINKTAP \(named): composer focus: opened \(focused.opened)")
+        say("LINKTAP \(named): composer focus: keyboards before \(keyboardBefore), after \(app.keyboards.count); opened \(focused.opened); \(focused.focus)")
+        XCTAssertGreaterThan(keyboardBefore, 0, "\(focused.label): the keyboard was not up before the tap")
+        expectOpened(focused, "reconnect")
     }
 
     func testTapsAtTheDefaultTextSize() {
