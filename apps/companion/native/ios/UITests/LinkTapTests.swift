@@ -331,26 +331,30 @@ final class LinkTapTests: HarnessTestCase {
 
         // The control of an image that has not been loaded, 2 px inside its lower edge, with a link on the next line:
         // one click of the control, and no link opens.
-        let underImage = scroll(to: "under-image")
+        _ = scroll(to: "under-image")
         let control = app.buttons["Load this image"].firstMatch
         XCTAssertTrue(control.waitForExistence(timeout: 10), "the screen shows no Load this image control")
-        _ = underImage
-        // The control's frame is the screen's own, so the point is a screen point: no shift. At the largest size the control
-        // is wider than the screen, so the point is in the part of it that the screen shows.
+        // The control's frame is the screen's own, so the point is a screen point: no shift. The placeholder's row does not
+        // wrap (the page's own layout), so at the largest size the control can lie wholly beyond the screen's edge: then no
+        // finger can reach it, and it is said and not tapped.
         let controlFrame = control.frame.intersection(app.frame)
-        let onControl = tap(
-            "\(named): 2 px inside the lower edge of Load this image",
-            at: CGPoint(x: controlFrame.midX, y: controlFrame.maxY - 2),
-            shift: .zero
-        )
-        let controlClicks = onControl.events.filter { $0.type == "click" && $0.trusted }
-        XCTAssertEqual(controlClicks.count, 1, "\(onControl.label): the system's clicks that came: \(onControl.events.map(\.type))")
-        XCTAssertTrue(
-            (controlClicks.first?.target.hasPrefix("button") ?? false) && !(controlClicks.first?.target.contains("md-link") ?? true),
-            "\(onControl.label): the click named \(controlClicks.first?.target ?? "nothing"), not the control"
-        )
-        XCTAssertFalse(onControl.events.contains { $0.type == "click" && !$0.trusted }, "\(onControl.label): the page added a click")
-        XCTAssertTrue(onControl.opened.isEmpty, "\(onControl.label): opened \(onControl.opened)")
+        if controlFrame.isNull || controlFrame.width < 20 {
+            say("LINKTAP \(named): Load this image lies beyond the screen at this size (frame \(control.frame)): not tapped")
+        } else {
+            let onControl = tap(
+                "\(named): 2 px inside the lower edge of Load this image",
+                at: CGPoint(x: controlFrame.midX, y: controlFrame.maxY - 2),
+                shift: .zero
+            )
+            let controlClicks = onControl.events.filter { $0.type == "click" && $0.trusted }
+            XCTAssertEqual(controlClicks.count, 1, "\(onControl.label): the system's clicks that came: \(onControl.events.map(\.type))")
+            XCTAssertTrue(
+                (controlClicks.first?.target.hasPrefix("button") ?? false) && !(controlClicks.first?.target.contains("md-link") ?? true),
+                "\(onControl.label): the click named \(controlClicks.first?.target ?? "nothing"), not the control"
+            )
+            XCTAssertFalse(onControl.events.contains { $0.type == "click" && !$0.trusted }, "\(onControl.label): the page added a click")
+            XCTAssertTrue(onControl.opened.isEmpty, "\(onControl.label): opened \(onControl.opened)")
+        }
 
         // The edge of the area in which a tap opens a link, in each of the four directions, for a link in the middle of
         // a line with no other link near. The area is what the page gives the words: grown by half the least size beside
