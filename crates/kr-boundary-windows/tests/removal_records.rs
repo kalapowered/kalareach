@@ -350,3 +350,29 @@ fn records_that_the_inspection_did_not_see_and_that_are_not_there_are_nothing_to
     assert!(stayed.is_empty(), "{stayed:?}");
     assert!(!case.data.exists());
 }
+
+/// The removal loads the earlier-state record only where its inspection approved it: a record that
+/// appeared after the inspection is not read at all, so that its start value, its "was not running"
+/// and its baseline decide nothing, and the removal acts as with no record.
+#[test]
+fn the_earlier_state_record_is_loaded_only_where_the_inspection_approved_it() {
+    let approved = Approved {
+        prior: true,
+        ..Approved::default()
+    };
+    assert_eq!(approved.prior_record(|| Some(7)), Some(7));
+    // Approved, and the record cannot be read: no record, as before.
+    assert_eq!(approved.prior_record(|| None::<u32>), None);
+
+    let unseen = Approved::default();
+    let mut read = false;
+    let loaded = unseen.prior_record(|| {
+        read = true;
+        Some(7)
+    });
+    assert_eq!(loaded, None);
+    assert!(
+        !read,
+        "a record that the inspection did not approve is not read"
+    );
+}
