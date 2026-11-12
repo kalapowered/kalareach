@@ -26,7 +26,7 @@ use tokio::time::Instant;
 use super::delegation::{Cause, usable};
 use super::view::HostEnd;
 use crate::commands::{MUTATION_TTL, NoPreconditions, fence_of};
-use crate::connection::{Connection, Standing};
+use crate::connection::{Connection, Standing, Unopened};
 use crate::error::{CommandError, Result};
 use crate::state::AppState;
 
@@ -41,8 +41,9 @@ pub struct CallHost {
     pub session: Arc<Session>,
 }
 
-/// What reaching the host takes.
-pub type Reaching<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+/// What reaching the host takes, and why it did not give a connection when it did not.
+pub type Reaching<'a, T> =
+    Pin<Box<dyn Future<Output = std::result::Result<T, Unopened>> + Send + 'a>>;
 
 /// How a call reaches its host.
 pub trait HostReach: Send + Sync + 'static {
@@ -142,7 +143,7 @@ impl<R: Runtime> HostReach for AppReach<R> {
                     return Ok(session);
                 }
             }
-            let device = state.device()?;
+            let device = state.device().map_err(Unopened::Unreached)?;
             let connection = Connection::paired(&device, host).await?;
             Ok(connection.session())
         })

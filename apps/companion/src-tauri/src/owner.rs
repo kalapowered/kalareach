@@ -38,6 +38,7 @@ use kr_protocol::ids::{ConfirmationId, DeviceId};
 use kr_protocol::pairing::{OwnerConfirmationRequest, SensitiveAction, group_verification_value};
 use serde::{Deserialize, Serialize};
 
+use crate::connection::Unopened;
 use crate::device::hosts::UNNAMED_HOST;
 use crate::device::{Contact, Device};
 use crate::error::{CommandError, Result};
@@ -362,30 +363,41 @@ impl Owner {
             // The host was reached and was asked nothing: this computer could not give it the
             // lease it needs, and the words say why.
             LinkError::Membership(refusal) => Missed::Refused(refusal.message),
-            // The host was reached and cannot take another connection from this computer for now:
-            // it is not out of contact, and the next visit asks again.
-            LinkError::Refused(refusal) if crate::places::is_no_room(refusal.code) => {
-                Missed::Refused(crate::places::NO_ROOM_FOR_NOW.to_owned())
-            }
+            // This computer's own budget of connections to the host is used: the host is not out
+            // of contact, and the next visit asks again.
+            LinkError::Declined(_) => Self::no_room(&Unopened::BudgetFull),
             _ => Missed::OutOfContact,
         })?;
-        let channel =
-            SessionChannel::open(Arc::new(session))
-                .await
-                .map_err(|error| match error {
-                    kr_client::error::ClientError::Host(refusal)
-                        if crate::places::is_no_room(refusal.code) =>
-                    {
-                        Missed::Refused(crate::places::NO_ROOM_FOR_NOW.to_owned())
-                    }
+        let session = Arc::new(session);
+        let channel = SessionChannel::open(Arc::clone(&session))
+            .await
+            .map_err(|error| {
+                // The host refused the connection because it cannot take another from this
+                // computer for now: it is not out of contact, and the next visit asks again. Any
+                // other refusal, of the connection or of the request, is out of contact as before.
+                match Unopened::of_connection(&session, &error) {
+                    Some(unopened @ Unopened::HostFull) => Self::no_room(&unopened),
                     _ => Missed::OutOfContact,
-                })?;
+                }
+            })?;
         Ok(Arc::new(OwnerConfirmations::new(
             host.clone(),
             self.device.identity().keys.authorisation.clone(),
             Arc::new(channel),
             Arc::clone(&pairing.clock),
         )))
+    }
+
+    /// What a person reads when a connection for a confirmation was not opened for want of room
+    /// (the host's or this computer's own): the cause, and that the next visit asks again.
+    fn no_room(unopened: &Unopened) -> Missed {
+        let cause = match unopened {
+            Unopened::HostFull => crate::places::HOST_FULL,
+            _ => crate::places::BUDGET_FULL,
+        };
+        Missed::Refused(format!(
+            "{cause}; this computer asks again at its next visit"
+        ))
     }
 
     /// The open session to `host`, if there is one.

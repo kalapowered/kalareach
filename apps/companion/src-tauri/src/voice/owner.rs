@@ -73,6 +73,7 @@ use super::provider;
 use super::view::{DelegationRow, EndedView, HostEnd, OwedView, ProblemKind, VoiceCallState};
 use super::{Closed, Cmd, NoteKey, ServiceCall, Shared, StartRequest, Started, now_ms};
 use crate::commands::{MUTATION_TTL, NoPreconditions};
+use crate::connection::Unopened;
 use crate::error::{CommandError, Result};
 
 /// What the model is told, once, as the call is attached: this version does not act on the host.
@@ -311,6 +312,9 @@ enum Probe {
     Back(Arc<Session>),
     /// The host answered with a refusal.
     Refused(String),
+    /// The host has no room for another connection from this computer, or this computer holds as
+    /// many as it keeps: the reason, in words. It is not out of contact, and not back.
+    Full(String),
     /// The host could not be reached yet.
     Unreached,
 }
@@ -1857,6 +1861,16 @@ impl Owner {
                             Some(Instant::now() + self.shared.timings.tick * PROBE_PAUSE_TICKS);
                         self.view(|state| state.meet(ProblemKind::HostPath, problem));
                     }
+                    // The host is in contact and would not take this connection for want of room:
+                    // the probe asks again after a pause.
+                    Probe::Full(words) => {
+                        let problem = format!(
+                            "{words} So it is not known whether the host still has the call."
+                        );
+                        self.probe_after =
+                            Some(Instant::now() + self.shared.timings.tick * PROBE_PAUSE_TICKS);
+                        self.view(|state| state.meet(ProblemKind::HostPath, problem));
+                    }
                     Probe::Unreached => {}
                 }
                 self.probing = false;
@@ -2837,9 +2851,9 @@ pub(super) async fn stop_at_host(
             .await
         {
             Ok(Ok(session)) => session,
-            Ok(Err(error)) => {
+            Ok(Err(unopened)) => {
                 return HostEnd::NotTold {
-                    words: format!("The host could not be reached: {}", error.message),
+                    words: not_reached_words(&unopened),
                 };
             }
             Err(_) => {
@@ -2854,6 +2868,25 @@ pub(super) async fn stop_at_host(
     revoke(&session, host.environment_id, voice_session_id, within).await
 }
 
+/// What a person is told when a connection to the host was not opened to stop the call, by the
+/// cause: a host that did not answer is not reached, a host that has no room for this computer's
+/// connection, or a computer that holds as many as it keeps, says so, and a refusal is the host's
+/// own word.
+fn not_reached_words(unopened: &Unopened) -> String {
+    match unopened {
+        Unopened::Unreached(error) => format!("The host could not be reached: {}", error.message),
+        Unopened::HostFull => "The host cannot take another connection from this computer just \
+                               now."
+            .to_owned(),
+        Unopened::BudgetFull => "This computer already holds as many connections to this host as \
+                                 it keeps at once."
+            .to_owned(),
+        Unopened::Refused(_, error) => {
+            format!("The host refused the connection: {}", error.message)
+        }
+    }
+}
+
 /// Reaches a host that was lost, and asks whether it still knows the call.
 ///
 /// The read is the context of the call's first session, which the host answers only for a voice
@@ -2864,9 +2897,12 @@ async fn probe_host(
     descriptor: VoiceSessionDescriptor,
     within: Duration,
 ) -> Probe {
-    let Ok(Ok(session)) = tokio::time::timeout(within, reach.session_to(&host.paired, None)).await
-    else {
-        return Probe::Unreached;
+    let session = match tokio::time::timeout(within, reach.session_to(&host.paired, None)).await {
+        Ok(Ok(session)) => session,
+        Ok(Err(unopened @ (Unopened::HostFull | Unopened::BudgetFull))) => {
+            return Probe::Full(not_reached_words(&unopened));
+        }
+        _ => return Probe::Unreached,
     };
     let Some(session_id) = descriptor.session_ids.iter().next().copied() else {
         return Probe::Back(session);
@@ -2884,13 +2920,35 @@ async fn probe_host(
     .await
     {
         Ok(Ok(_)) => Probe::Back(session),
-        Ok(Err(ClientError::Host(error))) => Probe::Refused(error.message),
-        _ => Probe::Unreached,
+        Ok(Err(error)) => match Unopened::of_connection(&session, &error) {
+            Some(unopened @ Unopened::HostFull) => Probe::Full(not_reached_words(&unopened)),
+            _ => match error {
+                ClientError::Host(error) => Probe::Refused(error.message),
+                _ => Probe::Unreached,
+            },
+        },
+        Err(_) => Probe::Unreached,
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// KR-REQ-19.08: a connection that was not opened for want of room is told as that, and not as a
+    /// host that could not be reached; a host that did not answer is told as not reached.
+    #[test]
+    fn a_connection_refused_for_want_of_room_is_not_told_as_unreached() {
+        let unreached = not_reached_words(&Unopened::Unreached(CommandError::unavailable("gone")));
+        assert!(
+            unreached.starts_with("The host could not be reached"),
+            "{unreached}"
+        );
+        for full in [Unopened::HostFull, Unopened::BudgetFull] {
+            let words = not_reached_words(&full);
+            assert!(!words.contains("could not be reached"), "{words}");
+            assert!(words.contains("connection"), "{words}");
+        }
+    }
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 

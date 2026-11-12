@@ -184,6 +184,7 @@ impl Pairing {
                 LinkError::Lost(_)
                 | LinkError::Configuration(_)
                 | LinkError::Membership(_)
+                | LinkError::Declined(_)
                 | LinkError::Selection(_),
             ) => {
                 drop(preauth);
@@ -206,7 +207,9 @@ impl Pairing {
 fn reached(error: &LinkError) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, true),
-        LinkError::Lost(_) | LinkError::Membership(_) => FailureKind::HostUnreachable,
+        LinkError::Lost(_) | LinkError::Membership(_) | LinkError::Declined(_) => {
+            FailureKind::HostUnreachable
+        }
         // The host answered, and what it answered is not the host the invitation names: a new try
         // gets the same answer.
         LinkError::Selection(_) => FailureKind::HostMismatch,

@@ -147,6 +147,11 @@ impl From<Unopened> for Missed {
     fn from(unopened: Unopened) -> Self {
         match unopened {
             Unopened::Refused(asked, refusal) => Self::Refused(asked, refusal),
+            // No room for another connection is an answer, the host's or this computer's own: the
+            // visit is refused in the cause's words, and the next visit asks again.
+            Unopened::HostFull | Unopened::BudgetFull => {
+                Self::Refused(Asked::Connection, unopened.into_error())
+            }
             Unopened::Unreached(_) => Self::Unreached,
         }
     }
@@ -419,7 +424,9 @@ async fn present(
         .present_membership(&connection.session(), host, &identity, presentation)
         .await
         .map_err(|error| match error {
-            LinkError::Refused(refusal) | LinkError::Membership(refusal) => {
+            LinkError::Refused(refusal)
+            | LinkError::Membership(refusal)
+            | LinkError::Declined(refusal) => {
                 Missed::Refused(Asked::Connection, CommandError::from(refusal))
             }
             LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_) => {

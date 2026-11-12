@@ -26,10 +26,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::{ClientError, Said as _, Session};
-use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
+use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_protocol::ids::{EnvironmentId, GrantId, SessionEpoch, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -42,6 +41,7 @@ use tauri::{AppHandle, Emitter as _};
 use tokio::sync::Notify;
 
 use crate::agent::Link;
+use crate::connection::{Asked, Unopened};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 
@@ -117,10 +117,31 @@ pub enum SessionStanding {
     Reconnecting {
         /// Why, in words a person reads.
         reason: String,
+        /// Whether the reason is that no connection to the host was made for want of room: the
+        /// host cannot take another from this computer for now, or this computer holds as many to
+        /// it as it keeps. The screen says that reason, which names the cause and promises no time;
+        /// for every other reason it says contact is lost.
+        capacity: bool,
     },
     /// Another opening of the same session took this one's place, or this one was left before it
     /// finished opening.
     Superseded,
+}
+
+impl SessionStanding {
+    /// The standing of an opening that waits because the try to open it did not give a link: the
+    /// cause of the try, from where it was made. A refusal for want of room carries its words and
+    /// says so; any other cause is contact lost.
+    fn reconnecting(failure: &Unopened) -> Self {
+        let (reason, capacity) = match failure {
+            Unopened::Unreached(error) | Unopened::Refused(_, error) => {
+                (error.message.clone(), false)
+            }
+            Unopened::HostFull => (crate::places::HOST_FULL.to_owned(), true),
+            Unopened::BudgetFull => (crate::places::BUDGET_FULL.to_owned(), true),
+        };
+        Self::Reconnecting { reason, capacity }
+    }
 }
 
 /// One change of an opened session's standing, as the page receives it.
@@ -177,35 +198,6 @@ impl Drop for InFlight {
     }
 }
 
-/// How reaching a host, or having it open a session, did not give a link.
-#[derive(Debug)]
-pub(crate) enum Failure {
-    /// The host answered with a refusal.
-    Refused(ProtocolError),
-    /// The host could not be reached, or the connection to it ended.
-    Unreached(String),
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Refused(refusal) => write!(formatter, "The host refused: {}", refusal.message),
-            Self::Unreached(reason) => {
-                write!(formatter, "The host could not be reached: {reason}")
-            }
-        }
-    }
-}
-
-impl Failure {
-    fn command(self) -> CommandError {
-        match self {
-            Self::Refused(refusal) => CommandError::from(refusal),
-            Self::Unreached(reason) => CommandError::unavailable(reason),
-        }
-    }
-}
-
 /// What a host did with a request to open a session.
 enum Opening {
     /// The session is open under the grant it names.
@@ -237,7 +229,7 @@ impl Dial {
     /// connection's transport with nothing yet said on it.
     pub(crate) async fn transport(
         &self,
-    ) -> std::result::Result<Arc<dyn kr_client::transport::ControlTransport>, Failure> {
+    ) -> std::result::Result<Arc<dyn kr_client::transport::ControlTransport>, Unopened> {
         let pairing = self.device.pairing();
         let identity = pairing.paired_identity_for(&self.host);
         tokio::time::timeout(
@@ -245,11 +237,8 @@ impl Dial {
             pairing.link.connect_paired_transport(&self.host, &identity),
         )
         .await
-        .map_err(|_| Failure::Unreached("the host did not answer in time".to_owned()))?
-        .map_err(|error| match error {
-            LinkError::Refused(refusal) => Failure::Refused(refusal),
-            other => Failure::Unreached(other.said().into_string()),
-        })
+        .map_err(|_| Unopened::unreached("the host did not answer in time"))?
+        .map_err(Unopened::of_link)
     }
 
     /// Reaches the host on a connection of its own and has it open `session_id` under `grant_id`.
@@ -257,10 +246,10 @@ impl Dial {
         &self,
         session_id: SessionId,
         grant_id: Option<GrantId>,
-    ) -> std::result::Result<Opening, Failure> {
+    ) -> std::result::Result<Opening, Unopened> {
         let transport = self.transport().await?;
         let session = Session::start(transport)
-            .map_err(|error| Failure::Unreached(error.said().into_string()))?;
+            .map_err(|error| Unopened::unreached(error.said().into_string()))?;
         let opened = tokio::time::timeout(
             OPEN_WITHIN,
             session.read::<_, SessionOpenResult>(
@@ -275,8 +264,15 @@ impl Dial {
         let opened = match opened {
             Ok(Ok(opened)) => opened,
             Ok(Err(ClientError::Host(refusal))) => {
+                // The host refused the connection, which the session tells from a refusal of this
+                // request, or it refused the request.
+                let unopened =
+                    Unopened::of_connection(&session, &ClientError::Host(refusal.clone()))
+                        .unwrap_or_else(|| {
+                            Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal))
+                        });
                 session.close();
-                return Err(Failure::Refused(refusal));
+                return Err(unopened);
             }
             Ok(Err(other)) => {
                 // This device ended the connection, because the account left or the keeper holds
@@ -286,12 +282,12 @@ impl Dial {
                     .ended_by_this_device()
                     .map_or_else(|| other.said().into_string(), |refusal| refusal.message);
                 session.close();
-                return Err(Failure::Unreached(words));
+                return Err(Unopened::unreached(words));
             }
             Err(_) => {
                 session.close();
-                return Err(Failure::Unreached(
-                    "the host did not open the session in time".to_owned(),
+                return Err(Unopened::unreached(
+                    "the host did not open the session in time",
                 ));
             }
         };
@@ -310,8 +306,8 @@ impl Dial {
                 let standing = standing_of(&opened);
                 let Some(summary) = summary.0.clone() else {
                     session.close();
-                    return Err(Failure::Unreached(
-                        "the host opened a connection for no session".to_owned(),
+                    return Err(Unopened::unreached(
+                        "the host opened a connection for no session",
                     ));
                 };
                 let link = Arc::new(Link::paired(
@@ -667,20 +663,17 @@ impl PairedLinks {
                     return Ok(SessionStanding::Superseded);
                 }
                 let unable = match &failure {
-                    Failure::Unreached(_) => true,
-                    Failure::Refused(refusal) => transient(refusal.code),
+                    Unopened::Unreached(_) | Unopened::HostFull | Unopened::BudgetFull => true,
+                    Unopened::Refused(_, refusal) => transient(refusal.code),
                 };
                 if !unable {
                     inner.current.remove(&session_id);
-                    return Err(failure.command());
+                    return Err(failure.into_error());
                 }
-                // The host could not be reached or could not say yet: the opening stands, and its
-                // watch reaches the host again as the same opening.
-                let reason = match failure {
-                    Failure::Unreached(reason) => reason,
-                    Failure::Refused(refusal) => refusal.message,
-                };
-                let standing = SessionStanding::Reconnecting { reason };
+                // The host could not be reached or could not say yet, or has no room for this
+                // computer's connection: the opening stands, and its watch reaches the host again
+                // as the same opening.
+                let standing = SessionStanding::reconnecting(&failure);
                 let watch = tauri::async_runtime::spawn(Arc::clone(self).keep(
                     dial.clone(),
                     emit,
@@ -955,7 +948,7 @@ impl PairedLinks {
                         "This session is not open to this device.",
                     ));
                 }
-                Err(failure) => return Err(failure.command()),
+                Err(failure) => return Err(failure.into_error()),
             };
             // A host that changed while this was asked is not the host this was asked of: the
             // link is handed over, or closed, under the lock a host change moves the generation
@@ -1245,6 +1238,7 @@ impl PairedLinks {
                         || "contact with this session was lost".to_owned(),
                         |refusal| refusal.message,
                     ),
+                    capacity: false,
                 };
                 if !self.tell_standing(&emit, session_id, &opening, lost) {
                     return;
@@ -1280,7 +1274,7 @@ impl PairedLinks {
                         self.tell_standing(&emit, session_id, &opening, standing);
                         return;
                     }
-                    Err(Failure::Refused(refusal)) if !transient(refusal.code) => {
+                    Err(Unopened::Refused(_, refusal)) if !transient(refusal.code) => {
                         // A refusal is told only once a second probe agrees: a revocation or an
                         // expiry landing between the host's two reads reads as a refusal once.
                         if refused == Some(refusal.code) {
@@ -1293,9 +1287,10 @@ impl PairedLinks {
                         }
                         refused = Some(refusal.code);
                     }
-                    Err(Failure::Refused(_)) => {}
-                    Err(Failure::Unreached(reason)) => {
-                        let standing = SessionStanding::Reconnecting { reason };
+                    // What the last try came to is told, so that a later refusal while the opening
+                    // waits replaces the reason the screen shows.
+                    Err(failure) => {
+                        let standing = SessionStanding::reconnecting(&failure);
                         self.tell_standing(&emit, session_id, &opening, standing);
                     }
                 }
@@ -1567,6 +1562,7 @@ pub(crate) mod tests {
     use kr_client::error::Result as ClientResult;
     use kr_client::transport::{ControlTransport, TransportFuture};
     use kr_protocol::envelope::{ActionTarget, ControlFrame};
+    use kr_protocol::error::ProtocolError;
     use kr_protocol::hello::{ActionWindow, ReceiveLimits};
     use kr_protocol::ids::{ActionId, ActionWindowId, BootEpoch, ConnectionId};
     use kr_protocol::scalars::{DurationMs, TimestampMs, Uuid};

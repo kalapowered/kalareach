@@ -1740,7 +1740,11 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
         let endpoint = endpoint.clone();
         move || {
             let endpoint = endpoint.clone();
-            Box::pin(async move { local_connection(&endpoint).await })
+            Box::pin(async move {
+                local_connection(&endpoint)
+                    .await
+                    .map_err(companion_tauri::connection::Unopened::Unreached)
+            })
         }
     });
     let connection = local_connection(&endpoint)
@@ -1968,10 +1972,14 @@ async fn a_direct_revocation_is_told_to_settings_sync_though_the_view_after_it_c
             let first = opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
             Box::pin(async move {
                 if first {
-                    local_connection(&endpoint).await
+                    local_connection(&endpoint)
+                        .await
+                        .map_err(companion_tauri::connection::Unopened::Unreached)
                 } else {
-                    Err(companion_tauri::error::CommandError::unavailable(
-                        "the host did not answer",
+                    Err(companion_tauri::connection::Unopened::Unreached(
+                        companion_tauri::error::CommandError::unavailable(
+                            "the host did not answer",
+                        ),
                     ))
                 }
             })
@@ -2026,7 +2034,11 @@ async fn a_device_the_host_on_this_computer_lists_as_revoked_is_taken_out_of_the
         let endpoint = endpoint.clone();
         move || {
             let endpoint = endpoint.clone();
-            Box::pin(async move { local_connection(&endpoint).await })
+            Box::pin(async move {
+                local_connection(&endpoint)
+                    .await
+                    .map_err(companion_tauri::connection::Unopened::Unreached)
+            })
         }
     });
     let connection = local_connection(&endpoint)
@@ -2077,7 +2089,11 @@ async fn the_host_on_this_computer_takes_a_second_revocation_though_a_revision_w
         let endpoint = endpoint.clone();
         move || {
             let endpoint = endpoint.clone();
-            Box::pin(async move { local_connection(&endpoint).await })
+            Box::pin(async move {
+                local_connection(&endpoint)
+                    .await
+                    .map_err(companion_tauri::connection::Unopened::Unreached)
+            })
         }
     });
     let connection = local_connection(&endpoint)
@@ -2168,8 +2184,8 @@ async fn a_host_on_this_computer_whose_connection_cannot_be_replaced_is_not_said
         .expect("connects to the control endpoint")
         .reopening(Arc::new(|| {
             Box::pin(async {
-                Err(companion_tauri::error::CommandError::unavailable(
-                    "the host did not answer",
+                Err(companion_tauri::connection::Unopened::Unreached(
+                    companion_tauri::error::CommandError::unavailable("the host did not answer"),
                 ))
             })
         }));
@@ -2437,7 +2453,11 @@ async fn held_connection(rig: &Rig) -> companion_tauri::connection::Connection {
         let endpoint = endpoint.clone();
         move || {
             let endpoint = endpoint.clone();
-            Box::pin(async move { local_connection(&endpoint).await })
+            Box::pin(async move {
+                local_connection(&endpoint)
+                    .await
+                    .map_err(companion_tauri::connection::Unopened::Unreached)
+            })
         }
     });
     let connection = local_connection(&endpoint)
@@ -2558,7 +2578,9 @@ async fn keeps_its_connection(
                     reopens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Box::pin(async move {
                         tokio::time::sleep(Duration::from_millis(300)).await;
-                        local_connection(&endpoint).await
+                        local_connection(&endpoint)
+                            .await
+                            .map_err(companion_tauri::connection::Unopened::Unreached)
                     })
                 }
             });

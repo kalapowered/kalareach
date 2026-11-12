@@ -70,8 +70,9 @@ pub enum Standing {
 /// a request it sent on this one, or reads its state, and must not do either on the connection
 /// that may still carry the original.
 pub type Reopen = Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Connection>> + Send>>
-        + Send
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::result::Result<Connection, Unopened>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -167,12 +168,13 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns why the host could not be reached, or that this connection cannot be opened again.
-    pub async fn another(&self) -> Result<Self> {
+    /// Returns why no other connection was opened: what the first one's dial says, or that this
+    /// connection cannot be opened again.
+    pub async fn another(&self) -> std::result::Result<Self, Unopened> {
         match &self.reopen {
             // The one opened can be opened from again: it may take the place of this one.
             Some(reopen) => Ok(reopen().await?.reopening(Arc::clone(reopen))),
-            None => Err(CommandError::unavailable(
+            None => Err(Unopened::unreached(
                 "this application cannot open a second connection to this host",
             )),
         }
@@ -197,14 +199,18 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns the failure when the host cannot be reached, cannot say which environment it is, or
-    /// refuses to open the connection.
-    pub async fn paired(device: &Arc<Device>, host: &PairedHost) -> Result<Self> {
-        let connection = Self::paired_once(device, host).await?;
+    /// Returns why the connection was not opened ([`Unopened`]): the host cannot be reached, cannot
+    /// say which environment it is, or refuses to open the connection, or this application holds
+    /// as many connections to the host as it keeps.
+    pub async fn paired(
+        device: &Arc<Device>,
+        host: &PairedHost,
+    ) -> std::result::Result<Self, Unopened> {
+        let connection = Self::open(device, host, false).await?;
         let (device, host) = (Arc::clone(device), host.clone());
         Ok(connection.reopening(Arc::new(move || {
             let (device, host) = (Arc::clone(&device), host.clone());
-            Box::pin(async move { Self::paired_once(&device, &host).await })
+            Box::pin(async move { Self::open(&device, &host, false).await })
         })))
     }
 
@@ -223,12 +229,6 @@ impl Connection {
         host: &PairedHost,
     ) -> std::result::Result<Self, Unopened> {
         Self::open(device, host, true).await
-    }
-
-    async fn paired_once(device: &Arc<Device>, host: &PairedHost) -> Result<Self> {
-        Self::open(device, host, false)
-            .await
-            .map_err(Unopened::into_error)
     }
 
     /// Opens the connection, as a visit when `visiting`.
@@ -250,18 +250,7 @@ impl Connection {
         let session = tokio::time::timeout(CONNECT_WITHIN, connecting)
             .await
             .map_err(|_| Unopened::unreached("the host did not answer in time"))?
-            .map_err(|error| match error {
-                LinkError::Refused(refusal) => {
-                    Unopened::Refused(Asked::Connection, CommandError::from(refusal))
-                }
-                // The host was reachable and was not asked for anything: the device could not give
-                // it the lease it needs, or the account it was to be opened under left, and the
-                // words say why.
-                LinkError::Membership(refusal) => {
-                    Unopened::Refused(Asked::Connection, CommandError::from(refusal))
-                }
-                other => Unopened::unreached(other.said().into_string()),
-            })?;
+            .map_err(Unopened::of_link)?;
         // The connection is bound to the account signed in when it was dialled (`crate::bound`): if
         // that account left while the host was asked who it is, or at any time before this
         // returns, nothing is opened, and the words say why.
@@ -275,7 +264,7 @@ impl Connection {
             )
             .await
             .map_err(|_| Unopened::unreached("the host did not say which environment it is"))?
-            .map_err(|error| Unopened::of_read(Asked::HostInfo, error))?;
+            .map_err(|error| Unopened::of_call(&session, Asked::HostInfo, error))?;
             let rights = open_for_the_host(&session).await?;
             Ok::<_, Unopened>((info, rights))
         }
@@ -376,9 +365,11 @@ async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionR
     )
     .await
     .map_err(|_| Unopened::unreached("the host did not open the connection in time"))?
-    .map_err(|error| match error {
-        kr_client::ClientError::Host(refusal) => opening_refused(refusal),
-        other => Unopened::of_read(Asked::SessionOpen, other),
+    .map_err(|error| {
+        Unopened::of_connection(session, &error).unwrap_or_else(|| match error {
+            kr_client::ClientError::Host(refusal) => opening_refused(refusal),
+            other => Unopened::of_read(Asked::SessionOpen, other),
+        })
     })?;
     match opened {
         SessionOpenResult::InForce { actions, .. } => Ok(actions.iter().copied().collect()),
@@ -407,21 +398,56 @@ pub enum Asked {
     AttentionRead,
 }
 
-/// Why a connection to a paired host was not opened.
+/// Why a dial or a call did not get its connection to a paired host.
+///
+/// The cause is made where it is known and carried on unchanged: no text for a person is chosen
+/// from an error's code or words after that place, because one code stands for several causes.
+/// The host refuses a connection it cannot take with the code it also uses for a supervision, work
+/// in another session and a resource that is short, and a host that did not answer is told with it
+/// too.
 #[derive(Debug)]
 pub enum Unopened {
     /// The host answered, and refused the request named: it is in contact, and the refusal is its
-    /// own. Or this device could not give the host the lease its organisation signs for it, which a
-    /// host that holds none refuses everything for, and the words are the reason.
+    /// own. Or the host refused the connection itself (named [`Asked::Connection`]), for a reason
+    /// other than its bound. Or this device could not give the host the lease its organisation
+    /// signs for it, which a host that holds none refuses everything for, and the words are the
+    /// reason.
     Refused(Asked, CommandError),
+    /// The host refused the connection itself because this computer holds as many connections to
+    /// it as it allows and the host has heard from every one of them lately: the host cannot take
+    /// another for now. It is in contact. The refusal comes from the host's id-0 error that the
+    /// session kept ([`Self::of_connection`]), and no other refusal is this one.
+    HostFull,
+    /// This application's own budget of connections to the host is used ([`crate::places`]): no
+    /// connection was made and the host was asked nothing.
+    BudgetFull,
     /// The host could not be reached, did not answer in time, or failed in a way that is no
     /// refusal of the host's.
     Unreached(CommandError),
 }
 
 impl Unopened {
-    fn unreached(reason: impl Into<String>) -> Self {
+    pub(crate) fn unreached(reason: impl Into<String>) -> Self {
         Self::Unreached(CommandError::unavailable(reason))
+    }
+
+    /// What a failed dial of the link says.
+    #[must_use]
+    pub fn of_link(error: LinkError) -> Self {
+        match error {
+            LinkError::Refused(refusal) => {
+                Self::Refused(Asked::Connection, CommandError::from(refusal))
+            }
+            // The host was reachable and was not asked for anything: the device could not give it
+            // the lease it needs, or the account it was to be opened under left, and the words say
+            // why.
+            LinkError::Membership(refusal) => {
+                Self::Refused(Asked::Connection, CommandError::from(refusal))
+            }
+            // This application's own budget refused the dial, so no host was asked.
+            LinkError::Declined(_) => Self::BudgetFull,
+            other => Self::unreached(other.said().into_string()),
+        }
     }
 
     /// What a failed read of `asked` says: a refusal of that request when the host sent an error,
@@ -432,6 +458,39 @@ impl Unopened {
             kr_client::ClientError::Host(_) => Self::Refused(asked, CommandError::from(error)),
             other => Self::lost(other),
         }
+    }
+
+    /// What a failed read of `asked` over `session` says: the host's refusal of the connection
+    /// when `error` is it ([`Self::of_connection`]), and otherwise what [`Self::of_read`] says.
+    #[must_use]
+    pub fn of_call(session: &Session, asked: Asked, error: kr_client::ClientError) -> Self {
+        Self::of_connection(session, &error).unwrap_or_else(|| Self::of_read(asked, error))
+    }
+
+    /// The host's refusal of the connection `session` runs on, when `error` is it. The session
+    /// keeps the first error the host answered with request identifier zero, which no request of
+    /// this application carries, and answers every call with it, so only the session can tell that
+    /// refusal from a refusal of a request.
+    ///
+    /// This is the one place that reads the refusal's code: a host refuses a connection with
+    /// `RESOURCE_UNAVAILABLE` only for its bound of connections to one device, and the connection
+    /// is then refused for now ([`Self::HostFull`]). Any other code is a refusal of the connection
+    /// for another reason, which says its own words.
+    #[must_use]
+    pub fn of_connection(session: &Session, error: &kr_client::ClientError) -> Option<Self> {
+        let kr_client::ClientError::Host(refusal) = error else {
+            return None;
+        };
+        if session.connection_refusal().as_ref() != Some(refusal) {
+            return None;
+        }
+        Some(
+            if refusal.code == kr_protocol::error::ErrorCode::ResourceUnavailable {
+                Self::HostFull
+            } else {
+                Self::Refused(Asked::Connection, CommandError::from(refusal.clone()))
+            },
+        )
     }
 
     /// A read that failed for a reason that is no answer of the host's: the host was not reached.
@@ -445,7 +504,15 @@ impl Unopened {
     pub fn into_error(self) -> CommandError {
         match self {
             Self::Refused(_, error) | Self::Unreached(error) => error,
+            Self::HostFull => crate::places::host_full_error(),
+            Self::BudgetFull => crate::places::full_error(),
         }
+    }
+}
+
+impl From<Unopened> for CommandError {
+    fn from(unopened: Unopened) -> Self {
+        unopened.into_error()
     }
 }
 
@@ -540,9 +607,9 @@ impl ConnectionState {
 /// Returns the failure when there is no controller to reach, when its endpoint belongs to another
 /// user, or when the two builds share no protocol major.
 pub async fn connect_local() -> Result<Connection> {
-    Ok(connect_local_once()
-        .await?
-        .reopening(Arc::new(|| Box::pin(connect_local_once()))))
+    Ok(connect_local_once().await?.reopening(Arc::new(|| {
+        Box::pin(async { connect_local_once().await.map_err(Unopened::Unreached) })
+    })))
 }
 
 /// One connection to the controller on this machine, that cannot be opened again from.
@@ -949,7 +1016,9 @@ mod tests {
         let said = |refusal: ProtocolError| match opening_refused(refusal) {
             Unopened::Refused(Asked::SessionOpen, error) => error.message,
             Unopened::Refused(asked, _) => panic!("the opening was refused, not {asked:?}"),
-            Unopened::Unreached(_) => panic!("a refusal the host sent"),
+            Unopened::Unreached(_) | Unopened::HostFull | Unopened::BudgetFull => {
+                panic!("a refusal the host sent")
+            }
         };
 
         let earlier_host = ProtocolError::new(

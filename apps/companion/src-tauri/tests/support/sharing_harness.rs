@@ -204,8 +204,8 @@ async fn local_connection(host: &Host, faults: Option<&Arc<Faults>>) -> Connecti
                 companion_tauri::connection::build_id().expect("a build identity"),
             )
             .await
-            .map_err(companion_tauri::CommandError::from)?;
-            Connection::over(transport)
+            .map_err(|error| companion_tauri::connection::Unopened::Unreached(companion_tauri::CommandError::from(error)))?;
+            Connection::over(transport).map_err(companion_tauri::connection::Unopened::Unreached)
         })
     });
     Connection::assembled(
@@ -295,7 +295,7 @@ async fn paired_connection(
         let dial = dial.clone();
         Box::pin(async move {
             let session = Session::start(Arc::new(dial.dial().await)).expect("a session");
-            open_for_the_host(&session).await?;
+            open_for_the_host(&session).await.map_err(companion_tauri::connection::Unopened::Unreached)?;
             Ok(Connection::assembled(
                 session,
                 // The environment of a connection that is only read from or repeated on is not

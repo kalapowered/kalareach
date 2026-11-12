@@ -920,10 +920,11 @@ export function MobileSession({
   }, [port, receiptReads, sessionId, openings, mine, draft, book, settleFromRecord, say, send])
   // The connection's words for contact lost. A session whose own link is being taken up again, with
   // the connection to the host still up, says the same, in the same words, and, as the connection's
-  // do, nothing before the shell has answered whether the host is in contact.
+  // do, nothing before the shell has answered whether the host is in contact. When the link was
+  // not made for want of room, the host's or this computer's own, the banner says that cause.
   const contact =
     standing?.state === 'reconnecting' && connected !== null
-      ? reconnectBanner(false, mine)
+      ? reconnectBanner(false, mine, standing.capacity ? standing.reason : null)
       : reconnectBanner(connected, mine)
   // A submission whose outcome nobody knows is the one case where sending again could run the
   // same thing twice. Until a receipt settles it, this session sends nothing more.

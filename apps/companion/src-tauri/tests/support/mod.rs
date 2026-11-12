@@ -1079,6 +1079,9 @@ struct LinkState {
     /// at once does.
     ending: bool,
     refusing: Option<kr_protocol::error::ErrorCode>,
+    /// The code the host refuses the connection with after it is admitted, as an error with
+    /// request identifier zero that ends the connection, as a host does that cannot take another.
+    refusing_connection: Option<kr_protocol::error::ErrorCode>,
     /// The method of the requests the host refuses, on any connection to it, and its refusal: the
     /// connection is admitted and every other request is answered.
     refusing_request: Option<(String, kr_protocol::error::ProtocolError)>,
@@ -1219,6 +1222,14 @@ impl LinkControl {
     /// Makes the host refuse every connection at admission with `code`, or stops that.
     pub fn refuse(&self, code: Option<kr_protocol::error::ErrorCode>) {
         self.state.lock().expect("the record").refusing = code;
+    }
+
+    /// Makes the host refuse every connection it admits from now on with `code`, as an error with
+    /// request identifier zero that ends the connection, or stops that. The connection is made, and
+    /// its first read is answered with the refusal, as a host answers that cannot take another.
+    /// Connections made before stay as they are.
+    pub fn refuse_the_connection(&self, code: Option<kr_protocol::error::ErrorCode>) {
+        self.state.lock().expect("the record").refusing_connection = code;
     }
 
     /// Makes the host refuse every request of `method`, on any connection to it, with `refusal`, or
@@ -1714,9 +1725,14 @@ impl ControlledLink {
         }
         // What the host does is decided when the connection is let through, so a test can change it
         // while the connection is held.
-        let (refusing, unreachable, ending) = {
+        let (refusing, unreachable, ending, refusing_connection) = {
             let state = self.control.state.lock().expect("the record");
-            (state.refusing, state.unreachable, state.ending)
+            (
+                state.refusing,
+                state.unreachable,
+                state.ending,
+                state.refusing_connection,
+            )
         };
         if let Some(code) = refusing {
             return Err(kr_client::pairing::link::LinkError::Refused(
@@ -1745,6 +1761,8 @@ impl ControlledLink {
             garbled: Mutex::new(Vec::new()),
             receipted: Mutex::new(Vec::new()),
             asked: Mutex::new(std::collections::HashMap::new()),
+            refusing_connection,
+            refused: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 }
@@ -1868,6 +1886,11 @@ struct Tapped {
     receipted: Mutex<Vec<(kr_protocol::ids::RequestId, kr_protocol::ids::ActionId)>>,
     /// The method of each request sent on this connection that has not been answered.
     asked: Mutex<std::collections::HashMap<kr_protocol::ids::RequestId, String>>,
+    /// What the host refuses this connection with, as an error with request identifier zero, when
+    /// it was made while the test had the host refuse the connections it admits.
+    refusing_connection: Option<kr_protocol::error::ErrorCode>,
+    /// Whether the host's refusal of the connection has been read from it.
+    refused: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for LinkControl {
@@ -2024,6 +2047,24 @@ impl kr_client::transport::ControlTransport for Tapped {
 
     fn recv(&self) -> kr_client::transport::TransportFuture<'_, Option<ControlFrame>> {
         Box::pin(async move {
+            if let Some(code) = self.refusing_connection {
+                // The host refuses the connection and ends it: the refusal is read once, and then
+                // there is nothing more.
+                if self.refused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                return Ok(Some(ControlFrame::Response(
+                    kr_protocol::envelope::Response {
+                        request_id: kr_protocol::ids::RequestId::new(0),
+                        outcome: kr_protocol::envelope::Outcome::Error(
+                            kr_protocol::error::ProtocolError::new(
+                                code,
+                                "the host refused the connection",
+                            ),
+                        ),
+                    },
+                )));
+            }
             let frame = self.inner.recv().await?;
             if let Some(ControlFrame::Response(response)) = &frame {
                 self.note_answered(response);

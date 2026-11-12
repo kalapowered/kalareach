@@ -219,7 +219,17 @@ export type SessionStanding =
   | { readonly state: 'ended'; readonly reason: 'revoked' | 'expired' }
   | { readonly state: 'closed' }
   | { readonly state: 'refused'; readonly code: string; readonly message: string }
-  | { readonly state: 'reconnecting'; readonly reason: string }
+  | {
+      readonly state: 'reconnecting'
+      /** Why, in words a person reads. */
+      readonly reason: string
+      /**
+       * Whether the reason is that no connection to the host was made for want of room: the host
+       * cannot take another from this computer for now, or this computer holds as many to it as it
+       * keeps. The reason then names that cause and promises no time, and the screen says it.
+       */
+      readonly capacity: boolean
+    }
   | { readonly state: 'superseded' }
 
 /** One change of an opened session's standing, as native code publishes it. */

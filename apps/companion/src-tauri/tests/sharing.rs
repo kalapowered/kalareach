@@ -1256,15 +1256,22 @@ async fn an_invitation_found_by_a_read_closes_as_happened_without_the_hosts_resu
             let opened = Arc::clone(&opened);
             Box::pin(async move {
                 if opened.fetch_add(1, Ordering::SeqCst) < 3 {
-                    return Err(companion_tauri::CommandError::unavailable("no connection"));
+                    return Err(companion_tauri::connection::Unopened::Unreached(
+                        companion_tauri::CommandError::unavailable("no connection"),
+                    ));
                 }
                 let transport = IpcTransport::connect_app(
                     &endpoint,
                     companion_tauri::connection::build_id().expect("a build identity"),
                 )
                 .await
-                .map_err(companion_tauri::CommandError::from)?;
+                .map_err(|error| {
+                    companion_tauri::connection::Unopened::Unreached(
+                        companion_tauri::CommandError::from(error),
+                    )
+                })?;
                 Connection::over(transport)
+                    .map_err(companion_tauri::connection::Unopened::Unreached)
             })
         })
     };
@@ -1441,15 +1448,22 @@ async fn an_attempt_is_hidden_and_shown_by_the_person_and_not_undone_by_the_task
                     release.notified().await;
                 }
                 if !open.load(Ordering::SeqCst) {
-                    return Err(companion_tauri::CommandError::unavailable("no connection"));
+                    return Err(companion_tauri::connection::Unopened::Unreached(
+                        companion_tauri::CommandError::unavailable("no connection"),
+                    ));
                 }
                 let transport = IpcTransport::connect_app(
                     &endpoint,
                     companion_tauri::connection::build_id().expect("a build identity"),
                 )
                 .await
-                .map_err(companion_tauri::CommandError::from)?;
+                .map_err(|error| {
+                    companion_tauri::connection::Unopened::Unreached(
+                        companion_tauri::CommandError::from(error),
+                    )
+                })?;
                 Connection::over(transport)
+                    .map_err(companion_tauri::connection::Unopened::Unreached)
             })
         })
     };

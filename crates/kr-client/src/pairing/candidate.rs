@@ -759,6 +759,7 @@ impl Pairing {
                 LinkError::Lost(_)
                 | LinkError::Configuration(_)
                 | LinkError::Membership(_)
+                | LinkError::Declined(_)
                 | LinkError::Selection(_),
             ) => {
                 drop(preauth);
@@ -935,6 +936,7 @@ impl Pairing {
                             LinkError::Lost(_)
                             | LinkError::Configuration(_)
                             | LinkError::Membership(_)
+                            | LinkError::Declined(_)
                             | LinkError::Selection(_),
                         ) => {
                             looked = true;
@@ -990,6 +992,7 @@ impl Pairing {
                     LinkError::Lost(_)
                     | LinkError::Configuration(_)
                     | LinkError::Membership(_)
+                    | LinkError::Declined(_)
                     | LinkError::Selection(_),
                 ) => {
                     // The connection is gone; it is let go of before the wait, not after.
@@ -1696,7 +1699,9 @@ fn step_failed(error: &PairingError, tries: Option<u32>) -> PairingFailure {
 fn link_failed(error: &LinkError, tries: Option<u32>) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, false),
-        LinkError::Lost(_) | LinkError::Membership(_) => FailureKind::HostUnreachable,
+        LinkError::Lost(_) | LinkError::Membership(_) | LinkError::Declined(_) => {
+            FailureKind::HostUnreachable
+        }
         // The host answered, and what it answered is not the host the bundle names: a new try gets
         // the same answer, and costs one of this device's tries.
         LinkError::Selection(_) => FailureKind::HostMismatch,

@@ -24,7 +24,7 @@ use tauri::{AppHandle, Manager as _, Runtime};
 
 use super::drafts::{Holds, HostLists, HostPrivacy, Hosts};
 use crate::commands::NoParams;
-use crate::connection::{Connection, Replacer, Standing};
+use crate::connection::{Connection, Replacer, Standing, Unopened};
 use crate::drafts::DraftHost;
 use crate::error::CommandError;
 use crate::state::AppState;
@@ -159,9 +159,10 @@ pub(crate) enum Listing {
     /// gave the right has run out or been revoked. Such a host is not this computer's to ask, and
     /// is not one that failed to answer.
     Refused,
-    /// It answered that it cannot take another connection from this computer for now. That says
-    /// nothing of its devices, as a host that did not answer says nothing; it is not one that
-    /// failed to answer.
+    /// It answered that it cannot take another connection from this computer for now, or this
+    /// computer's own budget of connections to it declined the dial and the host was asked nothing.
+    /// That says nothing of its devices, as a host that did not answer says nothing; it is not one
+    /// that failed to answer.
     Busy,
     /// It did not answer in time, could not be reached, or refused for a reason that says nothing
     /// of its devices.
@@ -172,16 +173,15 @@ pub(crate) enum Listing {
 }
 
 impl Listing {
-    /// What a refusal with `code` says. Only the refusal to list the host's devices to this
-    /// computer is an answer about them, and a host that cannot take another connection says so by
-    /// its code. A host that refuses for another reason, such as a protocol this computer does not
-    /// speak or a limit it has reached, may be the one that lists a device, so it counts as one
-    /// that did not answer.
+    /// What a refusal of the question, with `code`, says. Only the refusal to list the host's
+    /// devices to this computer is an answer about them. A host that refuses for another reason,
+    /// such as a protocol this computer does not speak or a limit it has reached, may be the one
+    /// that lists a device, so it counts as one that did not answer. A host that cannot take
+    /// another connection is no refusal of the question, and is [`Self::Busy`] by the cause the
+    /// connection's refusal gives ([`Unopened::of_connection`]), never by this code.
     fn of_refusal(code: ErrorCode) -> Self {
         if code == ErrorCode::PermissionDenied {
             Self::Refused
-        } else if crate::places::is_no_room(code) {
-            Self::Busy
         } else {
             Self::Silent
         }
@@ -189,10 +189,12 @@ impl Listing {
 
     /// What a failed connection to a host says. A host that does not find this computer paired
     /// answers the hello as it would an unpaired peer, which this computer ends itself, so it
-    /// reads as a connection lost, as a host that is asleep does.
+    /// reads as a connection lost, as a host that is asleep does. A dial that this computer's own
+    /// budget of connections declined asked the host nothing: the host is busy.
     pub(crate) fn of_link(error: &LinkError) -> Self {
         match error {
             LinkError::Refused(refusal) => Self::of_refusal(refusal.code),
+            LinkError::Declined(_) => Self::Busy,
             _ => Self::Silent,
         }
     }
@@ -208,7 +210,7 @@ pub(crate) async fn listed(session: &Arc<Session>) -> Listing {
         session.read::<_, DeviceListResult>(Method::DeviceList, &params),
     )
     .await;
-    listing_of(asked)
+    listing_of(session, asked)
 }
 
 /// What the host lists of its devices, asked as a question about the connection: a refusal of it
@@ -225,10 +227,11 @@ async fn listed_unsignalled(session: &Arc<Session>) -> Listing {
         session.read_unsignalled::<_, DeviceListResult>(Method::DeviceList, &params),
     )
     .await;
-    listing_of(asked)
+    listing_of(session, asked)
 }
 
 fn listing_of(
+    session: &Session,
     asked: std::result::Result<
         std::result::Result<DeviceListResult, ClientError>,
         tokio::time::error::Elapsed,
@@ -236,6 +239,16 @@ fn listing_of(
 ) -> Listing {
     match asked {
         Ok(Ok(list)) => Listing::Listed(list),
+        // The host refused the connection, and not the question, because it cannot take another
+        // from this computer for now.
+        Ok(Err(error))
+            if matches!(
+                Unopened::of_connection(session, &error),
+                Some(Unopened::HostFull)
+            ) =>
+        {
+            Listing::Busy
+        }
         Ok(Err(ClientError::Host(refused))) => Listing::of_refusal(refused.code),
         Ok(Err(ClientError::ConnectionEnded)) => Listing::Ended,
         Ok(Err(_)) | Err(_) => Listing::Silent,
@@ -520,11 +533,17 @@ mod tests {
             Listing::of_link(&refused(ErrorCode::PermissionDenied)),
             Listing::Refused
         ));
+        // A dial this computer's own budget declined asked the host nothing: the host is busy.
         assert!(matches!(
-            Listing::of_link(&refused(ErrorCode::ResourceUnavailable)),
+            Listing::of_link(&LinkError::Declined(
+                kr_protocol::error::ProtocolError::new(ErrorCode::ResourceUnavailable, "no place")
+            )),
             Listing::Busy
         ));
         for code in [
+            // The code a host answers a request with for several causes is none of them by itself:
+            // a host that cannot take another connection is told by the connection's refusal.
+            ErrorCode::ResourceUnavailable,
             ErrorCode::UnsupportedSchema,
             ErrorCode::RateLimited,
             ErrorCode::EnvironmentUnavailable,

@@ -2964,11 +2964,9 @@ impl Registrar for ConnectionRegistrar {
             .map_err(|error| error.said().into_string())?;
             let connection = match reach {
                 Reach::Asked => crate::connection::Connection::paired(&self.device, host).await,
-                Reach::Visit => crate::connection::Connection::visited(&self.device, host)
-                    .await
-                    .map_err(crate::connection::Unopened::into_error),
+                Reach::Visit => crate::connection::Connection::visited(&self.device, host).await,
             }
-            .map_err(|error| error.message)?;
+            .map_err(|unopened| unopened.into_error().message)?;
             Ok(Box::new(ConnectionLine {
                 connection,
                 device: Arc::clone(&self.device),

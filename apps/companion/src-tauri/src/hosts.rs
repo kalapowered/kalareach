@@ -133,7 +133,7 @@ async fn keep<R: Runtime>(
             };
             match crate::places::as_the_main_link(Connection::paired(&device, &host)).await {
                 Ok(connection) => Attempt::Reached(connection),
-                Err(error) => Attempt::Failed(error),
+                Err(error) => Attempt::Failed(error.into_error()),
             }
         }
     })

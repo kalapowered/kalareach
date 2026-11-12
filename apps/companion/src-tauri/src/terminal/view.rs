@@ -45,6 +45,7 @@ use kr_protocol::session::{
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::connection::Unopened;
 use crate::error::CommandError;
 use crate::launch::{LaunchSurfaceAnswer, Press};
 
@@ -392,24 +393,36 @@ async fn open_paired(
 ) -> Result<(Wire, ActionTarget), OpenFailure> {
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 
-    let transport = dial.transport().await.map_err(|failure| match failure {
+    let transport = dial.transport().await.map_err(|unopened| match unopened {
         // The host could not be reached for this view's connection: the connection is what was
         // lost, and the host is asked again on the opening's link.
-        crate::standing::Failure::Unreached(reason) => OpenFailure {
-            reason: format!("The host could not be reached for this view: {reason}"),
+        Unopened::Unreached(error) => OpenFailure {
+            reason: format!(
+                "The host could not be reached for this view: {}",
+                error.message
+            ),
+            lost: true,
+        },
+        // No connection was made for want of room, and the host was not asked: the opening's link
+        // asks again.
+        Unopened::BudgetFull | Unopened::HostFull => OpenFailure {
+            reason: format!(
+                "No connection was made for this view: {}",
+                unopened.into_error().message
+            ),
             lost: true,
         },
         // A host that cannot answer now has not refused the view: the opening's link asks again.
-        crate::standing::Failure::Refused(refusal) if crate::standing::transient(refusal.code) => {
-            OpenFailure {
-                reason: format!(
-                    "The host could not answer for this view now: {}",
-                    refusal.message
-                ),
-                lost: true,
-            }
+        Unopened::Refused(_, refusal) if crate::standing::transient(refusal.code) => OpenFailure {
+            reason: format!(
+                "The host could not answer for this view now: {}",
+                refusal.message
+            ),
+            lost: true,
+        },
+        Unopened::Refused(_, refusal) => {
+            OpenFailure::refused(format!("The host refused: {}", refusal.message))
         }
-        refused @ crate::standing::Failure::Refused(_) => OpenFailure::refused(refused.to_string()),
     })?;
     let mut wire =
         Wire::Paired(Paired::over(transport, grant_id).map_err(|lost| OpenFailure::lost(&lost))?);

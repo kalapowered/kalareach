@@ -15,7 +15,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use companion_tauri::connection::Connection;
+use companion_tauri::connection::{Connection, Unopened};
 use kr_protocol::agent::{AgentMutationTarget, AgentPromptParams, PromptText};
 use kr_protocol::ids::{
     ActionId, AgentBindingRevision, ApplicationInstanceId, GrantId, InvitationId, SessionId,
@@ -3329,13 +3329,12 @@ async fn kr_req_19_08_the_main_links_dial_does_not_wait_behind_other_dials() {
         .await
         .expect("the dial ran")
         .expect_err("the other dial is refused");
-    assert_eq!(
-        code_of(&turned_away),
-        ErrorCode::ResourceUnavailable,
-        "it was never given the main link's place"
+    assert!(
+        matches!(turned_away, Unopened::BudgetFull),
+        "it was never given the main link's place, and says that the budget is used: {turned_away:?}"
     );
     assert_eq!(
-        turned_away.retry,
+        turned_away.into_error().retry,
         kr_protocol::error::RetryCategory::Transient
     );
     assert_eq!(
@@ -3352,7 +3351,7 @@ async fn kr_req_19_08_the_main_links_dial_does_not_wait_behind_other_dials() {
         .expect("the dial ran")
         .expect_err("the governed link refuses");
     assert_eq!(
-        code_of(&reached),
+        code_of(&reached.into_error()),
         ErrorCode::PermissionDenied,
         "the main link's dial was given its place and reached the link"
     );
@@ -3416,8 +3415,14 @@ async fn kr_req_19_08_holders_that_ask_for_another_connection_are_refused_and_ev
         let error = ask
             .expect("each holder is answered inside its own time limit")
             .expect_err("and refused");
-        assert_eq!(code_of(&error), ErrorCode::ResourceUnavailable);
-        assert_eq!(error.retry, kr_protocol::error::RetryCategory::Transient);
+        assert!(
+            matches!(error, Unopened::BudgetFull),
+            "refused for this computer's own budget: {error:?}"
+        );
+        assert_eq!(
+            error.into_error().retry,
+            kr_protocol::error::RetryCategory::Transient
+        );
     }
 
     control.refuse(Some(ErrorCode::PermissionDenied));
@@ -3491,5 +3496,67 @@ async fn kr_req_19_08_the_main_link_reconnects_while_other_dials_hold_every_othe
     for filler in fillers {
         filler.await.expect("the dial ran").expect_err("refused");
     }
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a connection that was not opened says why, from where the cause is known. The host
+/// refuses a connection it cannot take with an error of request identifier zero, which the session
+/// keeps: that refusal is the host's bound and no other error is. The same code answering a request,
+/// a host that does not answer, a refusal of the connection for another reason and this computer's
+/// own budget are each told apart, and none is told as another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_connection_that_was_not_opened_says_why() {
+    use companion_tauri::connection::Asked;
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let device = phone.companion.device();
+    let host = device.host_in_use().expect("a host in use");
+    let dial = || async { Connection::paired(&device, &host).await.map(|_| ()) };
+
+    // The host refuses the connection for its bound.
+    control.refuse_the_connection(Some(ErrorCode::ResourceUnavailable));
+    let cause = dial().await.expect_err("the host refused the connection");
+    assert!(
+        matches!(cause, Unopened::HostFull),
+        "the host's bound, and not a refusal of a request: {cause:?}"
+    );
+
+    // The host refuses the connection for another reason: its own words, and not its bound.
+    control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
+    let cause = dial().await.expect_err("the host refused the connection");
+    assert!(
+        matches!(&cause, Unopened::Refused(Asked::Connection, error)
+            if error.code == ErrorCode::PermissionDenied),
+        "a refusal of the connection for another reason: {cause:?}"
+    );
+    control.refuse_the_connection(None);
+
+    // The same code that the host's bound has, answering one request: a refusal of that request.
+    control.refuse_request(Some((
+        Method::HostInfo,
+        ProtocolError::new(
+            ErrorCode::ResourceUnavailable,
+            "another session holds the work",
+        ),
+    )));
+    let cause = dial().await.expect_err("the host refused the request");
+    assert!(
+        matches!(&cause, Unopened::Refused(Asked::HostInfo, error)
+            if error.code == ErrorCode::ResourceUnavailable),
+        "a request's own refusal is not the host's bound: {cause:?}"
+    );
+    control.refuse_request(None);
+
+    // A host that does not answer.
+    control.unreachable(true);
+    let cause = dial().await.expect_err("the host was not reached");
+    assert!(
+        matches!(cause, Unopened::Unreached(_)),
+        "a host that did not answer is not full: {cause:?}"
+    );
+    control.unreachable(false);
     adopted.stop().await;
 }

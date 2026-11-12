@@ -1636,6 +1636,15 @@ impl Session {
         let _ = ended.wait_for(|ended| *ended).await;
     }
 
+    /// What the host refused the connection with, when it did: the first error it answered with
+    /// request identifier zero. The session ended with it, and every call was answered with it as a
+    /// host's answer to the call, so a caller that must tell a refusal of the connection from a
+    /// refusal of its own request asks here.
+    #[must_use]
+    pub fn connection_refusal(&self) -> Option<kr_protocol::error::ProtocolError> {
+        self.state.waiters().refusal.clone()
+    }
+
     /// Whether the host has refused the connection: a call whose own write failed is then answered
     /// with that refusal, which the reader has already given every waiting call.
     fn connection_was_refused(&self) -> bool {

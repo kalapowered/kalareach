@@ -135,7 +135,8 @@ describe("the phone's output is the grant the screen opened the session under (K
     const { port, controls } = fakeHost()
     controls.standings.answerOpens(SESSION_MAIN, {
       state: 'reconnecting',
-      reason: 'Contact with the session was lost.'
+      reason: 'Contact with the session was lost.',
+      capacity: false
     })
     render(screenOn(port, SHARE))
     await person.click(screen.getByRole('tab', { name: 'Output' }))

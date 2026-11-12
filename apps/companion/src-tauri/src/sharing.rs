@@ -825,6 +825,42 @@ struct Carry {
     store: AttemptStore,
 }
 
+/// Why a second connection for a repeat of a sharing action was not opened, as far as what the
+/// person is told is concerned.
+#[derive(Clone, Copy)]
+enum Cause {
+    /// The host did not answer, or refused for a reason that is not its bound: told as the host not
+    /// answering.
+    Silent,
+    /// The host cannot take another connection from this computer for now.
+    HostFull,
+    /// This application holds as many connections to the host as it keeps.
+    BudgetFull,
+}
+
+impl Cause {
+    fn of(unopened: &crate::connection::Unopened) -> Self {
+        use crate::connection::Unopened;
+        match unopened {
+            Unopened::HostFull => Self::HostFull,
+            Unopened::BudgetFull => Self::BudgetFull,
+            Unopened::Refused(..) | Unopened::Unreached(_) => Self::Silent,
+        }
+    }
+
+    fn words(self) -> &'static str {
+        match self {
+            Self::Silent => "the host did not answer",
+            Self::HostFull => {
+                "the host would not take another connection from this computer just now"
+            }
+            Self::BudgetFull => {
+                "this computer already holds as many connections to this host as it keeps at once"
+            }
+        }
+    }
+}
+
 impl Carry {
     fn keep(&self, attempt: &Attempt) -> Result<()> {
         self.desk.save(&self.store, attempt)
@@ -1652,10 +1688,11 @@ impl Carry {
         // The host's own refusal of the first send, which a repeat's refusal never replaces.
         let first_refusal = said.refusal.clone();
         let mut asked_again = 0;
-        // Whether the last connection asked for to repeat the request was turned away because the
-        // host cannot take another from this computer for now: that is an answer, and the words at
-        // the end say it.
-        let mut no_room = false;
+        // Why the last connection asked for to repeat the request was not opened, when it was not:
+        // a host that cannot take another from this computer for now, or this computer's own limit,
+        // is an answer, and the words at the end say it. A host that did not answer, or refused for
+        // another reason, is told as the host not answering.
+        let mut cause = Cause::Silent;
         let challenge = loop {
             match Reply::of(&outcome) {
                 Reply::Result => {
@@ -1686,29 +1723,25 @@ impl Carry {
                     asked_again += 1;
                     outcome = match self.connection.another().await {
                         Ok(second) => {
-                            no_room = false;
+                            cause = Cause::Silent;
                             let outcome = second.session().repeat(composed).await;
                             second.session().settle(sent_action).await;
                             second.session().close();
                             outcome
                         }
-                        Err(error) => {
-                            no_room = crate::places::is_no_room(error.code);
+                        Err(unopened) => {
+                            cause = Cause::of(&unopened);
                             Err(ClientError::ConnectionEnded)
                         }
                     };
                     said.take(&outcome);
                 }
                 Reply::Refused(_) | Reply::Lost => {
-                    let cause = if no_room {
-                        "the host would not take another connection from this computer just now"
-                    } else {
-                        "the host did not answer"
-                    };
                     break Err(CommandError::unavailable(format!(
-                        "{cause}, so it is not known whether an owner device was asked; one can \
+                        "{}, so it is not known whether an owner device was asked; one can \
                          still be shown the request for up to two minutes, and nothing this \
-                         application sends will hand anything over"
+                         application sends will hand anything over",
+                        cause.words()
                     )));
                 }
             }
@@ -2149,6 +2182,32 @@ const _: fn(&GrantCreateParams, &InvitationId, &GrantId) = |_, _, _| {};
 
 #[cfg(test)]
 mod tests {
+
+    /// KR-REQ-19.08: a second connection that was not opened because the host did not answer is told
+    /// as the host not answering, as it is without a budget; only a refusal for want of room, the
+    /// host's or this computer's own, says that.
+    #[test]
+    fn a_host_that_did_not_answer_is_not_told_as_full() {
+        use crate::connection::Unopened;
+
+        let silent = Cause::of(&Unopened::Unreached(CommandError::unavailable("gone")));
+        assert_eq!(silent.words(), "the host did not answer");
+        let refused = Cause::of(&Unopened::Refused(
+            crate::connection::Asked::Connection,
+            CommandError::new(ErrorCode::ResourceUnavailable, "supervision"),
+        ));
+        assert_eq!(refused.words(), "the host did not answer");
+        assert!(
+            Cause::of(&Unopened::HostFull)
+                .words()
+                .contains("would not take another")
+        );
+        assert!(
+            Cause::of(&Unopened::BudgetFull)
+                .words()
+                .contains("already holds")
+        );
+    }
     use std::sync::mpsc;
 
     use kr_crypto::keys::DeviceKeys;

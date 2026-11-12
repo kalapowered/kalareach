@@ -80,6 +80,11 @@ pub enum LinkError {
     /// which. It is no refusal of what the caller asked the host, so a caller that reads a refusal
     /// as the host's decision about that does not read this as one.
     Membership(ProtocolError),
+    /// A link that wraps the host's declined to dial, for a limit of its own: no connection was
+    /// made and the host was asked nothing. The refusal is that link's and not the host's, so a
+    /// caller that reads a refusal as the host's decision does not read this as one, and a caller
+    /// that dials again later may be given a connection.
+    Declined(ProtocolError),
     /// The host could not be reached, or the connection to it ended.
     Lost(String),
     /// The host answered, and this device refused its selection before using anything under it:
@@ -107,7 +112,7 @@ impl Said for LinkError {
                 error.code,
                 Shown::protocol(error)
             ),
-            Self::Membership(error) => Shown::protocol(error),
+            Self::Membership(error) | Self::Declined(error) => Shown::protocol(error),
             Self::Lost(_) => Shown::said("the host could not be reached"),
             Self::Selection(refusal) => Shown::selection(refusal),
             Self::Configuration(_) => {

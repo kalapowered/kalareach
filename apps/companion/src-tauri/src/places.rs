@@ -10,8 +10,8 @@
 //! One place of the budget is the main link's alone: no other kind of connection can take it, so
 //! that the link without which the application cannot reach the host is never made to wait behind
 //! the others. A dial that finds no place waits for one, for no longer than [`PLACE_WAIT`], and is
-//! then refused for now with the code a host refuses with when it cannot take another connection;
-//! every caller treats that as it treats the host's own refusal.
+//! then declined ([`LinkError::Declined`], which [`crate::connection::Unopened`] carries as its own
+//! cause): the host is asked nothing, and the refusal is this application's.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -32,6 +32,7 @@ use kr_protocol::scalars::EndpointKey;
 use kr_transport::handshake::LocalIdentity;
 use tokio::sync::Notify;
 
+use crate::error::CommandError;
 use crate::standing::{AMBIENT_LIMIT, OPENED_LIMIT};
 
 /// How many connections this application holds to one host at once, of every kind, the main link's
@@ -229,26 +230,33 @@ impl Places {
     }
 }
 
-/// Whether a refusal says that a host cannot take another connection from this computer for now.
-/// It is read from the code alone: the host refuses with it when this computer holds as many
-/// connections as the host allows, and a dial that finds no place here is refused with it.
-pub(crate) fn is_no_room(code: ErrorCode) -> bool {
-    code == ErrorCode::ResourceUnavailable
+/// What a person is told when the host refuses a connection because this computer holds as many
+/// connections to it as it allows ([`crate::connection::Unopened::HostFull`]): the cause alone.
+/// Each caller says what it does next.
+pub(crate) const HOST_FULL: &str = "the host cannot take another connection from this computer \
+                                    just now";
+
+/// What a person is told when this application's own budget is used ([`Unopened::BudgetFull`]): the
+/// limit alone. Each caller says what it does next.
+///
+/// [`Unopened::BudgetFull`]: crate::connection::Unopened::BudgetFull
+pub(crate) const BUDGET_FULL: &str = "this computer already holds as many connections to this \
+                                      host as it keeps at once";
+
+/// The failure a command answers with when the host cannot take another connection for now.
+pub(crate) fn host_full_error() -> CommandError {
+    CommandError::new(ErrorCode::ResourceUnavailable, HOST_FULL)
 }
 
-/// What a person is told when a host cannot take another connection from this computer for now:
-/// the cause, and that the next try asks again, with no time promised.
-pub(crate) const NO_ROOM_FOR_NOW: &str = "the host cannot take another connection from this \
-                                          computer just now; this computer asks again by itself";
+/// The failure a command answers with when this application's budget is used.
+pub(crate) fn full_error() -> CommandError {
+    CommandError::new(ErrorCode::ResourceUnavailable, BUDGET_FULL)
+}
 
-/// What a dial that finds no place is refused with: the code a host refuses a connection with when
-/// it cannot take another for now, which every caller asks again after.
+/// What a dial that finds no place is refused with. The link says it is no refusal of the host's
+/// ([`LinkError::Declined`]); the code is the one of a refusal for now.
 fn full() -> ProtocolError {
-    ProtocolError::new(
-        ErrorCode::ResourceUnavailable,
-        "this device already holds as many connections to this host as it keeps at once, and one \
-         of them is still finishing; it asks again by itself",
-    )
+    ProtocolError::new(ErrorCode::ResourceUnavailable, BUDGET_FULL)
 }
 
 /// A link that takes a place from `places` before each dial to a paired host.
@@ -268,7 +276,7 @@ impl Budgeted {
         self.places
             .take(host.host_device_id, kind_of_this_dial(), PLACE_WAIT)
             .await
-            .ok_or_else(|| LinkError::Refused(full()))
+            .ok_or_else(|| LinkError::Declined(full()))
     }
 }
 

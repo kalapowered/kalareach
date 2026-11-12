@@ -271,6 +271,11 @@ export function leavesOutcomeUnknown(error: { code: string; retry: string | null
   return error.code === 'OUTCOME_UNKNOWN' || error.retry === 'outcome_unknown'
 }
 
+/** A reason as the first word of a sentence. */
+function sentence(reason: string): string {
+  return reason.charAt(0).toUpperCase() + reason.slice(1)
+}
+
 /** The submissions that are not finished, which is what the reconnect banner lists. */
 export function unresolved(submissions: readonly Submission[]): readonly Submission[] {
   return submissions.filter(
@@ -286,17 +291,22 @@ export function unresolved(submissions: readonly Submission[]): readonly Submiss
  * nothing is, it says the connection is back and nothing more. Before anything has answered
  * whether the host is in contact, `connected` is null and it says nothing at all: neither contact
  * nor its loss is known yet.
+ *
+ * `noRoom` is the reason a session's own connection was not made when that reason is a limit on
+ * connections, the host's or this computer's: the host is then in contact, so the banner names the
+ * limit in place of contact lost, and promises no time.
  */
 export function reconnectBanner(
   connected: boolean | null,
-  submissions: readonly Submission[]
+  submissions: readonly Submission[],
+  noRoom: string | null = null
 ): { readonly tone: 'warning' | 'accent'; readonly title: string; readonly detail: string } | null {
   if (connected === null) return null
   const pending = unresolved(submissions)
   if (!connected) {
     return {
       tone: 'warning',
-      title: 'Not in contact with this host',
+      title: noRoom === null ? 'Not in contact with this host' : sentence(noRoom),
       detail:
         pending.length > 0
           ? `${pending.length} ${pending.length === 1 ? 'action has' : 'actions have'} no confirmed outcome. Their processes may still be running.`

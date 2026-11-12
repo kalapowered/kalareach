@@ -165,7 +165,8 @@ describe('a session screen opens its session (KR-REQ-19.08)', () => {
     const { port, controls } = fakeHost()
     controls.standings.answerOpens(SESSION_MAIN, {
       state: 'reconnecting',
-      reason: 'Contact with the session was lost.'
+      reason: 'Contact with the session was lost.',
+      capacity: false
     })
     render(screenOn(port))
     expect(await screen.findByText('Not in contact with this host')).toBeInTheDocument()
@@ -619,17 +620,60 @@ describe('contact with a session being taken up again', () => {
     })
 
     act(() => {
-      controls.standings.say(SESSION_MAIN, { state: 'reconnecting', reason: 'lost' })
+      controls.standings.say(SESSION_MAIN, { state: 'reconnecting', reason: 'lost', capacity: false })
     })
     expect(await screen.findByText('Not in contact with this host')).toBeInTheDocument()
     expect(screen.queryByText('Connected again')).toBeNull()
+  })
+
+  it('says the limit on connections, not contact lost, while the session waits for room', async () => {
+    const { port, controls } = fakeHost()
+    render(screenOn(port))
+    await screen.findByText(FIRST_ENTRY)
+
+    act(() => {
+      controls.standings.say(SESSION_MAIN, {
+        state: 'reconnecting',
+        reason: 'the host cannot take another connection from this computer just now',
+        capacity: true
+      })
+    })
+    expect(
+      await screen.findByText('The host cannot take another connection from this computer just now')
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Not in contact with this host')).toBeNull()
+
+    // A later refusal while the session waits replaces the reason the screen shows.
+    act(() => {
+      controls.standings.say(SESSION_MAIN, {
+        state: 'reconnecting',
+        reason: 'this computer already holds as many connections to this host as it keeps at once',
+        capacity: true
+      })
+    })
+    expect(
+      await screen.findByText(
+        'This computer already holds as many connections to this host as it keeps at once'
+      )
+    ).toBeInTheDocument()
+
+    // Any other reason is contact lost, as before.
+    act(() => {
+      controls.standings.say(SESSION_MAIN, {
+        state: 'reconnecting',
+        reason: 'the host did not answer in time',
+        capacity: false
+      })
+    })
+    expect(await screen.findByText('Not in contact with this host')).toBeInTheDocument()
   })
 
   it('says nothing of contact before the shell has answered whether the host is in contact', async () => {
     const { port, controls } = fakeHost()
     controls.standings.answerOpens(SESSION_MAIN, {
       state: 'reconnecting',
-      reason: 'Contact with the session was lost.'
+      reason: 'Contact with the session was lost.',
+      capacity: false
     })
     render(screenOn(port, null, undefined, null))
     // The screen has its opening, and it is being reached again; the connection has not said.
@@ -775,7 +819,8 @@ describe('what became of a send the host could not confirm', () => {
     act(() => {
       host.controls.standings.say(SESSION_MAIN, {
         state: 'reconnecting',
-        reason: 'Contact with the session was lost.'
+        reason: 'Contact with the session was lost.',
+        capacity: false
       })
     })
     await screen.findByText('Not in contact with this host')
@@ -857,7 +902,8 @@ describe('the terminal under an opening', () => {
     act(() => {
       controls.standings.say(SESSION_MAIN, {
         state: 'reconnecting',
-        reason: 'Contact with the session was lost.'
+        reason: 'Contact with the session was lost.',
+        capacity: false
       })
     })
     expect(screen.getByRole('button', { name: 'Escape' })).toBeDisabled()

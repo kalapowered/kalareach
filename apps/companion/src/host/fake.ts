@@ -1786,7 +1786,7 @@ export function fakeHost(
         // A host that cannot be reached does not refuse: the opening stands as `reconnecting` and
         // is taken up again when the host can be reached, as native code does.
         if (!connected) {
-          const standing: SessionStanding = { state: 'reconnecting', reason: lostBecause }
+          const standing: SessionStanding = { state: 'reconnecting', reason: lostBecause, capacity: false }
           openings.set(request.sessionId, {
             token: request.opening,
             grantId: request.grantId,
