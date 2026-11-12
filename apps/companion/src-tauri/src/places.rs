@@ -14,6 +14,15 @@
 //! something still holds it, so a link that lingers cannot keep the new one waiting. Such a link
 //! is held beside the total, which the host's bound of twice the total has room for.
 //!
+//! The number of such links is not bounded, and the cost is known. Each takes one of the places of
+//! the other kinds for as long as something holds it, so those kinds are declined sooner, in the
+//! words of this budget. A process that ends while it holds the total and `k` former main links
+//! leaves them at the host for up to 15 seconds, the time the host waits before it withdraws a
+//! connection it has not heard from, and its successor can be refused `k` more dials in that time.
+//! It is not bounded because more than the host's bound of twice the total would take as many
+//! shares or calls held at once, each holding a former main link, and as many changes of host and
+//! back, which a person does not reach.
+//!
 //! A dial that finds no place waits for one, for no longer than [`PLACE_WAIT`], and is then
 //! declined ([`LinkError::Declined`], which [`crate::connection::Unopened`] carries as its own
 //! cause): the host is asked nothing, and the refusal is this application's.
