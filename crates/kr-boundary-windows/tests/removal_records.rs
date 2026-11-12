@@ -182,3 +182,88 @@ fn something_in_the_data_directory_that_is_not_a_record_keeps_only_the_data_dire
         "every record is gone and the person is told about the stray file by the next run"
     );
 }
+
+use kr_boundary_windows::records::{next_step, remove_with};
+use std::ffi::OsString;
+use std::io;
+
+/// How a data directory is listed in the cases that make the listing fail.
+type Listing = dyn Fn(&Path) -> io::Result<Vec<io::Result<OsString>>>;
+
+impl Data {
+    fn remove_listing(&self, names: &Listing) -> Vec<String> {
+        remove_with(
+            &Records {
+                data: &self.data,
+                manifest: &self.manifest(),
+                prior: &self.prior(),
+                staging: &self.staging(),
+            },
+            names,
+        )
+    }
+}
+
+/// A listing that fails, and an entry of it that fails, each mean that a replacement of the
+/// manifest cannot be ruled out: `staging` and the manifest stay, and the removal says so.
+#[test]
+fn a_listing_that_fails_keeps_staging_and_the_manifest_and_says_so() {
+    let broken: [Box<Listing>; 2] = [
+        Box::new(|_| Err(io::Error::other("the listing was refused"))),
+        Box::new(|_| {
+            Ok(vec![
+                Ok(OsString::from("manifest.json")),
+                Err(io::Error::other("an entry was refused")),
+            ])
+        }),
+    ];
+    for listing in &broken {
+        let case = Data::installed();
+        let stayed = case.remove_listing(listing.as_ref());
+        assert!(
+            stayed
+                .iter()
+                .any(|line| line.contains("a replacement of the manifest cannot be ruled out")),
+            "{stayed:?}"
+        );
+        assert!(case.manifest().is_file(), "the manifest stays");
+        assert!(case.staging().exists(), "staging stays");
+        assert!(!case.prior().exists(), "the earlier record went");
+        // With the listing working again the removal finishes.
+        assert!(case.remove().is_empty());
+        assert!(!case.data.exists());
+    }
+}
+
+/// A data directory that is not there has no replacement in it: its listing's error is no failure.
+#[test]
+fn a_data_directory_that_is_not_there_is_not_a_failed_listing() {
+    let case = Data::new();
+    fs::remove_dir(&case.data).unwrap();
+    assert!(case.remove().is_empty());
+}
+
+/// A removal stopped between the manifest's deletion and the directory's leaves an empty data
+/// directory; the next removal removes it and ends clean.
+#[test]
+fn an_empty_data_directory_that_a_stopped_removal_left_is_removed_by_the_next_one() {
+    let case = Data::new();
+    let stayed = case.remove();
+    assert!(stayed.is_empty(), "{stayed:?}");
+    assert!(!case.data.exists());
+}
+
+/// A directory that cannot be deleted is named, and the words that follow say what is true of the
+/// state: the manifest stays, or an empty directory is accepted by a new installation and finished
+/// by the next removal, or something else is in it for the person to remove.
+#[test]
+fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
+    assert!(next_step(true, false).contains("run the removal again"));
+    assert!(next_step(true, true).contains("reads the manifest"));
+    let empty = next_step(false, true);
+    assert!(empty.contains("accepts an empty data directory"), "{empty}");
+    assert!(!empty.contains("refuses"), "{empty}");
+    let full = next_step(false, false);
+    assert!(full.contains("refuses until they are gone"), "{full}");
+    assert!(!full.contains("accepts"), "{full}");
+}

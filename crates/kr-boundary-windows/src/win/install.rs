@@ -3004,6 +3004,22 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     let manifest = match fs::read(&paths.manifest) {
         Ok(bytes) => Manifest::parse(&bytes)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // The inspection above passed, so a data directory that is there with no manifest is
+            // empty: what a removal left when it was stopped between the manifest's deletion and
+            // the directory's, or when the directory could not be deleted. It is the
+            // installation's own, and the removal finishes it, also when nothing else is recorded.
+            if paths.data.exists() {
+                let stayed = remove_records(paths);
+                if stayed.is_empty() {
+                    say("the empty data directory that an earlier removal left is removed");
+                    return Ok(());
+                }
+                return Err(Error::Failed(format!(
+                    "the data directory stays because {} could not be removed. {}",
+                    stayed.join("; "),
+                    records::next_step(false, data_is_empty(paths))
+                )));
+            }
             if quiet_when_empty {
                 return Ok(());
             }
@@ -3255,13 +3271,10 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             say("the installation is removed");
             Ok(())
         } else {
-            // While the manifest stays, the removal runs again whole and reads it. Without it, what
-            // stays is not the installation's and is for the person to remove.
-            let next = if paths.manifest.exists() {
-                "The manifest stays with them: close what holds them, then run the removal again, which reads the manifest and finishes"
-            } else {
-                "A new installation refuses until they are gone: remove them, then run the setup program again"
-            };
+            // While the manifest stays, the removal runs again whole and reads it. Without it,
+            // an empty directory is finished by the next removal, and anything else in it is for
+            // the person to remove.
+            let next = records::next_step(paths.manifest.exists(), data_is_empty(paths));
             Err(Error::Failed(format!(
                 "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}",
                 stayed.join("; ")
@@ -3273,6 +3286,11 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             failures.join("; ")
         )))
     }
+}
+
+/// Whether the data directory holds nothing.
+fn data_is_empty(paths: &Paths) -> bool {
+    fs::read_dir(&paths.data).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Removes the installation's own records, last of all, and then the data directory and, when it is
