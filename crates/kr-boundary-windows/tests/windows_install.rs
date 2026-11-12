@@ -4170,10 +4170,6 @@ fn stand_in_broker(
     let stop = Stop::new().unwrap();
     let system = Sid::parse("S-1-5-18").unwrap();
     require_clean_machine();
-    // The pipe's list names the system alone, so an account of another token cannot open it.
-    if needs_the_system() {
-        return;
-    }
     let mut listener =
         Listener::bind(Pipe::Persons, &[system], std::sync::Arc::clone(&stop)).unwrap();
     let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4216,6 +4212,11 @@ fn stand_in_broker(
 fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_end() {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
+    // The stand-in broker's pipe names the system alone, so an account of another token cannot
+    // open it.
+    if needs_the_system() {
+        return;
+    }
     let bound = Duration::from_secs(4);
     let margin = Duration::from_secs(1);
 
