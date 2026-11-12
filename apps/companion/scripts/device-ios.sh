@@ -89,7 +89,7 @@ sdk() { [ "$target" = device ] && echo iphoneos || echo iphonesimulator; }
 # older system is "not found" as soon as a newer one is installed; its identifier names it on its own
 # system. Two simulators with one name are an error, since either could be meant.
 simulator_id() {
-  xcrun simctl list devices -j | python3 -I -c '
+  xcrun simctl list devices available -j | python3 -I -c '
 import json, sys
 
 wanted = sys.argv[1]

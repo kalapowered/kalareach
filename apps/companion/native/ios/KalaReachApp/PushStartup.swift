@@ -67,6 +67,7 @@ enum PushStartup {
             case .hearNotificationTaps:
                 UNUserNotificationCenter.current().delegate = NotificationRouter.shared
             case .registerForRemoteNotifications:
+                NSLog("KalaReach: asking the system for an APNs token, application state %ld", UIApplication.shared.applicationState.rawValue)
                 UIApplication.shared.registerForRemoteNotifications()
             case .setAutoInit(let on):
                 Messaging.messaging().isAutoInitEnabled = on

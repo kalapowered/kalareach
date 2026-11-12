@@ -441,8 +441,8 @@ fn watch_suspension(app: &tauri::AppHandle) {
     }
 }
 
-/// The same on iOS, where the window's `Suspended` event is raised at `applicationWillResignActive`,
-/// which iOS also sends for the Control Center, the Notification Center and the system's own
+/// The same on iOS, where the window's `Suspended` event is raised when the scene resigns active,
+/// which iOS also does for the Control Center, the Notification Center and the system's own
 /// questions: a person who turns on Wi-Fi in the middle of pairing has not left, and the invitation
 /// they scanned stays. The platform plugin says when the application goes to the background.
 #[cfg(target_os = "ios")]

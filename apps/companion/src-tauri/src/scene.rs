@@ -3,10 +3,10 @@
 //! On iOS the window belongs to a scene. The system may disconnect the scene while the process
 //! lives on, and connect one again later. The windowing library reports the disconnect as the
 //! window's destruction. With no window left, the runtime asks the application to exit, and iOS
-//! ignores an exit, so letting that request pass would leave a process with no window, while a call
-//! or a pairing goes on in it. This refuses that request (only the runtime's own: an exit the
-//! application asks for carries a code and passes) and opens the main window again when the system
-//! returns a scene.
+//! ignores an exit, so the process lives on with no window while a call or a pairing goes on in it.
+//! This refuses that request (only the runtime's own: an exit the application asks for carries a
+//! code and passes), which keeps the runtime from treating the application as finished, and opens
+//! the main window again when the system returns a scene: that is what gives the page back.
 //!
 //! What a simulator shows of this is limited. The system's own disconnect of the only scene in a
 //! live process happens under memory pressure and cannot be caused: a request to destroy the scene
