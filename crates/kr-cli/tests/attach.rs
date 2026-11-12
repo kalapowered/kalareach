@@ -3026,7 +3026,8 @@ fn shell_quoted(text: &str) -> String {
 /// modes, in that order, instead of the default three, so that the encoding of a click can be shown
 /// for the sequence an application chose. Under the link line the application writes the plain text
 /// address `https://example.invalid/kr-plain`, which a terminal that detects addresses itself offers
-/// to open, so that the two ways a terminal can offer a link are shown beside each other.
+/// to open, so that the two ways a terminal can offer a link are shown beside each other. A mode in
+/// that list is written with padding after its escape when it is spelled `nul:1006l` or `del:1006l`.
 ///
 /// It writes `env.sh` into `KR_HOLD_DIR` (a directory only this account can write to), which names the
 /// environment `kr attach 1` runs in, the `TERM` to use and the `kr` to run, prints `KR_HOLD_READY`,
@@ -3069,14 +3070,21 @@ async fn a_session_is_held_for_a_person_at_a_terminal() {
         "true".to_owned()
     } else if let Ok(sequence) = std::env::var("KR_HOLD_MODES") {
         let mut written = String::from("\\033[?1000h");
-        for mode in sequence.split_whitespace() {
+        for entry in sequence.split_whitespace() {
+            // A mode may be written with padding after its escape: `nul:1006l` or `del:1006l`.
+            let (padding, mode) = match entry.split_once(':') {
+                Some(("nul", mode)) => ("\\000", mode),
+                Some(("del", mode)) => ("\\177", mode),
+                Some(_) => panic!("KR_HOLD_MODES pads with `nul:` or `del:`: {entry}"),
+                None => ("", entry),
+            };
             assert!(
                 mode.strip_suffix(['h', 'l']).is_some_and(|number| {
                     !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
                 }),
                 "KR_HOLD_MODES lists private modes with their final letter, such as `1006h 1005h`: {mode}"
             );
-            written.push_str(&format!("\\033[?{mode}"));
+            written.push_str(&format!("\\033{padding}[?{mode}"));
         }
         format!("printf '{written}'")
     } else {
