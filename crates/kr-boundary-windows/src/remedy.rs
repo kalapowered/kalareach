@@ -710,7 +710,7 @@ fn shared_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: St
         ),
         AncestorFault::Link => (
             format!(
-                "{head} It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read."
+                "{head} It is refused because it is a reparse point, such as a link or a mounted folder. The installation does not go through a reparse point at or above its trees: the folders above the place that it leads to are not the ones that it read."
             ),
             Ending::Layout,
         ),
@@ -786,7 +786,7 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
     };
     match fault {
         AncestorFault::Link => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The setup program makes this folder itself, as a plain folder, in the system's own known folder. It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share. {kept}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it is a reparse point, such as a link or a mounted folder. The installation does not go through a reparse point at or above its trees: the folders above the place that it leads to are not the ones that it read. This layout is not supported. {changes} The setup program makes this folder itself, as a plain folder, in the system's own known folder. It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share. {kept}"
         ),
         AncestorFault::NotAFolder => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} Remove or rename what is in its place if nothing else needs it, then run the setup program again. {kept}"

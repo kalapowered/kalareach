@@ -802,7 +802,7 @@ fn payloads_that_are_unsigned_wrongly_signed_or_links_are_refused() {
     let (code, output) = case.payload("payload-linked", &[]);
     let _ = std::fs::remove_dir_all(&linked);
     assert_ne!(code, 0, "{output}");
-    assert!(output.contains("is a link, not a file"), "{output}");
+    assert!(output.contains("is a reparse point"), "{output}");
     assert_eq!(snapshot(), before, "nothing remains");
 }
 
@@ -1011,7 +1011,9 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     assert!(made.status.success(), "{made:?}");
     let refused = install::check_data_parent(&paths_under(&link)).unwrap_err();
     assert!(
-        refused.to_string().contains("it is a link or not a folder"),
+        refused
+            .to_string()
+            .contains("it is a reparse point or not a folder"),
         "{refused}"
     );
     let _ = std::fs::remove_dir(&link);
@@ -1403,7 +1405,7 @@ fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_
             .expect("a link at the data directory"),
     ] {
         let text = refused.to_string();
-        assert!(text.contains("it is a link"), "{text}");
+        assert!(text.contains("it is a reparse point"), "{text}");
         assert!(text.contains("did not make"), "{text}");
         assert!(text.contains("Move it aside"), "{text}");
         assert!(text.contains("do not remove it"), "{text}");
@@ -1651,7 +1653,7 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
         .unwrap();
     assert!(linked.status.success(), "{linked:?}");
     for text in both("a link") {
-        assert!(text.contains("it is a link"), "{text}");
+        assert!(text.contains("it is a reparse point"), "{text}");
         assert!(text.contains("Remove "), "{text}");
         assert!(text.contains("itself"), "{text}");
         assert!(text.contains("not what it points to"), "{text}");
@@ -1880,7 +1882,10 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
     let text = install::check_data_parent(&paths_under(&link))
         .unwrap_err()
         .to_string();
-    assert!(text.contains("it is a link or not a folder"), "{text}");
+    assert!(
+        text.contains("it is a reparse point or not a folder"),
+        "{text}"
+    );
     assert!(text.contains("Move the folder aside"), "{text}");
     never(
         &text,
@@ -2192,9 +2197,9 @@ fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link
     paths.program_top = link.clone();
     paths.git = paths.program.join("git");
     for text in refused(&paths, "a link above the program directory") {
-        assert!(text.contains("it is a link or a mounted folder"), "{text}");
+        assert!(text.contains("it is a reparse point"), "{text}");
         assert!(
-            text.contains("does not go through a link or a mounted folder at or above its trees"),
+            text.contains("does not go through a reparse point at or above its trees"),
             "{text}"
         );
         assert!(text.contains(&link.display().to_string()), "{text}");
@@ -2910,7 +2915,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .output()
         .unwrap();
     assert!(made.status.success(), "{made:?}");
-    moved_aside_with("it is a link");
+    moved_aside_with("it is a reparse point");
     assert_eq!(summary_of(&target), targets_list);
     std::fs::remove_dir(&paths.run).unwrap();
     let _ = std::fs::remove_dir_all(&target);
@@ -2935,9 +2940,12 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .output()
         .unwrap();
     assert!(linked.status.success(), "{linked:?}");
-    moved_aside_with("it is a link");
+    moved_aside_with("it is a reparse point");
     match install::entry(&paths) {
-        Err(error) => assert!(error.to_string().contains("it is a link"), "{error}"),
+        Err(error) => assert!(
+            error.to_string().contains("it is a reparse point"),
+            "{error}"
+        ),
         Ok(_) => panic!("the manifest is read through a link"),
     }
     std::fs::remove_file(&paths.manifest).unwrap();
@@ -3305,7 +3313,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .output()
         .unwrap();
     assert!(linked.status.success(), "{linked:?}");
-    moved_aside_with("it is a link");
+    moved_aside_with("it is a reparse point");
     assert_eq!(summary_of(&target), targets_list);
     std::fs::remove_dir(&junction).unwrap();
     install::make_data_directory(&paths).expect("the link is gone");

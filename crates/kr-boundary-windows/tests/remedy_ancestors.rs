@@ -397,9 +397,9 @@ fn the_refusal_of_a_link_or_a_mounted_folder_never_tells_an_administrator_to_rem
             Stage::Before,
         );
         assert!(text.contains(r"C:\ProgramData"), "{text}");
-        assert!(text.contains("it is a link or a mounted folder"), "{text}");
+        assert!(text.contains("it is a reparse point"), "{text}");
         assert!(
-            text.contains("does not go through a link or a mounted folder at or above its trees"),
+            text.contains("does not go through a reparse point at or above its trees"),
             "{text}"
         );
         assert!(text.contains("Nothing was changed"), "{text}");
@@ -952,7 +952,7 @@ fn a_link_at_the_boundarys_own_folder_sends_the_administrator_nowhere_else() {
         ),
         "{text}"
     );
-    assert!(text.contains("it is a link or a mounted folder"), "{text}");
+    assert!(text.contains("it is a reparse point"), "{text}");
     assert!(text.contains("This layout is not supported"), "{text}");
     assert!(
         text.contains("The setup program makes this folder itself"),

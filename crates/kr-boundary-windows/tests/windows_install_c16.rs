@@ -379,7 +379,7 @@ fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
         )),
         "{text}"
     );
-    assert!(text.contains("it is a link or a mounted folder"), "{text}");
+    assert!(text.contains("it is a reparse point"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
     assert!(
         text.contains("The setup program makes this folder itself"),
@@ -446,7 +446,7 @@ fn a_fresh_installation_refuses_a_link_that_points_nowhere_at_the_program_direct
         .err()
         .expect("a link at the program directory's name")
         .to_string();
-    assert!(text.contains("it is a link"), "{text}");
+    assert!(text.contains("it is a reparse point"), "{text}");
     assert!(
         text.contains(&format!(
             "Remove the link {} itself",
@@ -488,7 +488,7 @@ fn a_link_above_the_data_parent_is_refused() {
         )),
         "{text}"
     );
-    assert!(text.contains("it is a link or a mounted folder"), "{text}");
+    assert!(text.contains("it is a reparse point"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
     assert!(
         !text.to_lowercase().contains("remove the link"),
@@ -764,7 +764,7 @@ fn a_link_that_points_nowhere_at_the_program_directorys_name_gets_the_links_own_
     let text = install::remove(&paths, false)
         .expect_err("a link at the program directory's name")
         .to_string();
-    assert!(text.contains("it is a link"), "{text}");
+    assert!(text.contains("it is a reparse point"), "{text}");
     assert!(
         text.contains(&format!(
             "Remove the link {} itself",
@@ -807,7 +807,7 @@ fn a_link_in_the_program_directory_is_to_be_removed_as_the_link_itself() {
     let text = install::remove(&paths, true)
         .expect_err("a link in the program directory")
         .to_string();
-    assert!(text.contains("it is a link"), "{text}");
+    assert!(text.contains("it is a reparse point"), "{text}");
     assert!(
         text.contains(&format!("Remove the link {} itself", link.display())),
         "{text}"
@@ -1034,7 +1034,7 @@ fn a_removal_where_nothing_is_installed_promises_no_repair() {
     let text = install::remove(&paths, false)
         .expect_err("a link at the program directory's name")
         .to_string();
-    assert!(text.contains("it is a link"), "{text}");
+    assert!(text.contains("it is a reparse point"), "{text}");
     assert!(
         text.contains(&format!(
             "Remove the link {} itself",
