@@ -788,7 +788,7 @@ test.describe('a tap on the plain text near a link of a message', () => {
       await touch('touchMove', after.y - 30)
       // The engine takes the moving touch for a scroll and cancels the pointer. The handler's move past the slop (the
       // first move, 14 px) ends the press and takes the look off before the cancel arrives, so this case holds the move
-      // and the cancel together, not each; the next case holds the cancel alone.
+      // and the cancel together, not each; the held-press case below cancels a touch that made no move.
       await expect.poll(() => pressedLooks(page), 'the pressed look once the engine cancelled the touch').toBe(0)
       await touch('touchEnd', after.y - 30)
       expect(await page.evaluate(() => (window as unknown as { pointerEnds: string[] }).pointerEnds), 'how the pointer ended').toEqual(['pointercancel'])
@@ -839,7 +839,9 @@ test.describe('a tap on the plain text near a link of a message', () => {
       const held = (): Promise<{ moves: number; ends: string[] }> => page.evaluate(() => (window as unknown as { held: { moves: number; ends: string[] } }).held)
       const scrollBy = (by: number): Promise<unknown> => page.evaluate((px) => document.querySelector('.m-pane')?.scrollBy(0, px), by)
 
-      // A touch cancelled with no move: the cancel alone ends the press.
+      // A touch cancelled with no move. The engine follows the pointer cancel with a lost capture of the same pointer, and
+      // the handler ends the press at either, so this case holds the two paths together and cannot tell which ended the
+      // press; the unit cases hold the cancel and the lost capture each alone.
       await touch('touchStart')
       expect(await pressedLooks(page), 'the pressed look of a held touch').toBe(1)
       await touch('touchCancel')
