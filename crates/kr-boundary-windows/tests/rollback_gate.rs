@@ -346,3 +346,31 @@ fn the_folder_above_the_program_directory_is_made_and_removed_only_as_the_run_th
         removal.contains("remedy::folder_act(record, read.as_ref()) != remedy::FolderAct::Remove")
     );
 }
+
+#[test]
+fn the_program_directory_and_the_sweeps_go_through_the_handles_that_the_run_or_the_check_holds() {
+    let source = install_source();
+    // The program directory: held from its read to its removal, removed with its tree through the
+    // handles beneath the held folder, and never by `remove_dir_all` of its path.
+    assert!(!source.contains("fs::remove_dir_all(&paths.program)"));
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    assert!(steps.contains("program.take_away_tree()"));
+    for caller in ["fn roll_back(", "fn remove_at("] {
+        if source.contains(caller) {
+            let text = code_of(body_of(&source, caller));
+            assert!(
+                text.contains("hold_program_directory("),
+                "{caller} does not hold the program directory"
+            );
+        }
+    }
+    // The staging sweep and the journal sweep list and remove through a held handle: no listing
+    // of a path and no removal of an entry's path.
+    assert!(!source.contains("fn sweep_staging(staging: &Path)"));
+    assert!(!source.contains("fs::read_dir(staging)"));
+    assert!(steps.contains("run.sweep(Layout::Journal)"));
+    let ending = code_of(body_of(&source, "fn undo_recorded("));
+    assert!(ending.contains("run.sweep(Layout::Staging);"));
+    let lay = code_of(body_of(&source, "fn lay_down("));
+    assert!(lay.contains("sweep_staging(staging);"));
+}
