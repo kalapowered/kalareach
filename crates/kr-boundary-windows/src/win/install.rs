@@ -32,7 +32,7 @@ use sha2::{Digest as _, Sha256};
 use crate::filekey::FileKey;
 use crate::frame::{self, Class, Request, Response};
 use crate::manifest::{
-    GitSet, Image, InstallState, Manifest, ObjectKind, Prior, STORE_VERSION, StoreError,
+    GitSet, Image, InstallState, Manifest, ObjectKind, Outcome, Prior, STORE_VERSION, StoreError,
     git_version,
 };
 use crate::messages;
@@ -171,6 +171,7 @@ pub const STEPS: [&str; 7] = [
 /// share read, write and delete, so neither open meets a sharing violation.
 #[cfg(feature = "testing")]
 fn inject(run: &Run, step: &str) -> Result<(), Error> {
+    make_after(run, step)?;
     if std::env::var("KR_BOUNDARY_FAIL_AFTER").as_deref() == Ok(step) {
         if let Some(how) = std::env::var_os("KR_BOUNDARY_DAMAGE_MANIFEST") {
             damage_manifest(run, &how.to_string_lossy()).map_err(|why| {
@@ -186,6 +187,36 @@ fn inject(run: &Run, step: &str) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+/// Makes an object at a reserved name right after the step that `KR_BOUNDARY_MAKE_AFTER` names, as
+/// another administrator would between this run's inspection and the step that makes the object:
+/// `<step>:account` makes the checkout account, `<step>:service` a service at the broker's name, with
+/// the broker's own file as its program (the steps are those of `KR_BOUNDARY_FAIL_AFTER`). A case
+/// that makes the account after `payload`, or the service after `accounts`, shows what the
+/// rollback does with an object that this run did not make. The test build only.
+#[cfg(feature = "testing")]
+fn make_after(run: &Run, step: &str) -> Result<(), Error> {
+    let wanted = std::env::var("KR_BOUNDARY_MAKE_AFTER");
+    let account = format!("{step}:account");
+    let service = format!("{step}:service");
+    let made = if wanted.as_deref() == Ok(account.as_str()) {
+        account::add(CHECKOUT).map_err(Error::from)
+    } else if wanted.as_deref() == Ok(service.as_str()) {
+        let binary = run.paths.program.join(BROKER).display().to_string();
+        service::manager()
+            .and_then(|manager| manager.create(SERVICE, DISPLAY, &binary))
+            .map(drop)
+            .map_err(Error::from)
+    } else {
+        return Ok(());
+    };
+    made.map_err(|why| {
+        // text: inject-3
+        Error::Failed(format!(
+            "the object that the test asked for could not be made ({why})"
+        ))
+    })
 }
 
 /// Damages the manifest through the run's handle of the data directory, as `how` says: `garbage`
@@ -327,9 +358,13 @@ impl Identity<'_> {
         Ok(self.0.set_automatic()?)
     }
 
-    fn start(&self) -> Result<(), Error> {
+    /// Asks the service manager to start the service, calls `accepted` where it accepted the
+    /// request (the run records its own start there), and waits for the service to run. A request
+    /// that the manager refused leaves `accepted` uncalled.
+    fn start(&self, accepted: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
         note_call("appid start");
         self.0.start()?;
+        accepted()?;
         Ok(self.0.wait_for(false, Duration::from_secs(60))?)
     }
 
@@ -3661,6 +3696,13 @@ impl Run {
         self.save()
     }
 
+    /// Records the result of the step that followed an intent, and writes the manifest. The result
+    /// is in the run's value before the write, so a rollback of a failed write still has it.
+    fn conclude(&mut self, kind: ObjectKind, id: &str, outcome: Outcome) -> Result<(), Error> {
+        self.manifest.conclude(kind, id, outcome);
+        self.save()
+    }
+
     /// Writes the manifest, replacing the file whole, beside the held handle of the data directory,
     /// and holds the identity of the object that the write proved to be at the manifest's name.
     fn save(&self) -> Result<(), Error> {
@@ -4281,11 +4323,21 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // The accounts.
     let mut sids = Vec::new();
     for name in [CHECKOUT, CONNECT] {
+        // The intent is on record before the step, and the result after it: an account that this
+        // run's call made is `made`; one that a repair found where the manifest lists it is
+        // `found` (an earlier run's `made` stays); a call that failed, "the account exists
+        // already" among the reasons, leaves the intent alone, and nothing of that account is
+        // this run's to undo.
         let sid = match account::find(name)? {
-            Some(sid) if existing => sid,
+            Some(sid) if existing => {
+                run.conclude(ObjectKind::Account, name, Outcome::Found)?;
+                sid
+            }
             _ => {
                 run.record(ObjectKind::Account, name, None)?;
-                account::create(name)?
+                account::add(name)?;
+                run.conclude(ObjectKind::Account, name, Outcome::Made)?;
+                account::sid_of(name)?
             }
         };
         let sid_text = sid.to_text()?;
@@ -4310,13 +4362,30 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
 
     // The service.
     run.record(ObjectKind::Service, SERVICE, None)?;
+    // The service is `made` where this run's call made it and `found` where one stood at the name.
+    // A new installation does not take over a service that stood there: it ends, and the rollback
+    // leaves the service as it was. A repair finds the service that the manifest lists.
     let broker_service = match manager.open(SERVICE)? {
-        Some(service) => service,
-        None => manager.create(
-            SERVICE,
-            DISPLAY,
-            &paths.program.join(BROKER).display().to_string(),
-        )?,
+        Some(service) if existing => {
+            run.conclude(ObjectKind::Service, SERVICE, Outcome::Found)?;
+            service
+        }
+        Some(_) => {
+            run.conclude(ObjectKind::Service, SERVICE, Outcome::Found)?;
+            // text: lay_down-21
+            return Err(Error::Failed(format!(
+                "a service named {SERVICE} stood on this computer when this run was to make it; this run did not make it and has not changed it"
+            )));
+        }
+        None => {
+            let made = manager.create(
+                SERVICE,
+                DISPLAY,
+                &paths.program.join(BROKER).display().to_string(),
+            )?;
+            run.conclude(ObjectKind::Service, SERVICE, Outcome::Made)?;
+            made
+        }
     };
     broker_service.configure(
         "Starts Git for KalaReach as its two repository boundary accounts, on behalf of the people it serves.",
@@ -4358,7 +4427,10 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         );
     } else {
         let before_start = applocker::newest_record(&paths.staging, &log_env, within(QUERY_BOUND))?;
-        Identity(&appid).start()?;
+        // This run's own start is on record from the moment that the service manager accepted it:
+        // the rollback stops the service only where that record is there.
+        Identity(&appid)
+            .start(|| run.conclude(ObjectKind::AppIdentityStarted, APPID, Outcome::Made))?;
         let first_deadline = within(FIRST_APPLIED_BOUND);
         inject(run, "appid")?;
         // text: lay_down-14
@@ -4775,6 +4847,13 @@ enum DataTree<'a> {
     Laid(&'a mut Run),
 }
 
+impl DataTree<'_> {
+    /// Whether the steps are a rollback's: they act on what the failed run itself made.
+    fn is_rollback(&self) -> bool {
+        matches!(self, DataTree::Laid(_))
+    }
+}
+
 /// Undoes what a failed installation did, by what the run itself made and recorded: the run's
 /// manifest in memory (every object is recorded before its step) says what the service, the
 /// accounts, the policy and the program directory are, and what the run laid in the data directory
@@ -4873,11 +4952,16 @@ fn undo_recorded(
     let channel = Channel::new(&paths.staging);
     let manager = service::manager()?;
     let mut failures: Vec<String> = earlier;
+    // What the steps may act on is what a result shows: a rollback acts on what this run made, and
+    // the removal on what a run made or found. An object that is on record as an intent with no
+    // result is not acted on, and a line says so.
+    let rollback = tree.is_rollback();
+    let service_is_ours = manifest
+        .find(ObjectKind::Service, SERVICE)
+        .is_some_and(|object| object.acted_on_by(rollback));
     // (1) the broker stays up and refuses new invocations.
     let mut session = None;
-    if manifest.find(ObjectKind::Service, SERVICE).is_some()
-        && let Some(service) = manager.open(SERVICE)?
-    {
+    if service_is_ours && let Some(service) = manager.open(SERVICE)? {
         if !service.status()?.running() {
             let _ = service.start();
             let _ = service.wait_for(false, Duration::from_secs(60));
@@ -5110,9 +5194,23 @@ fn undo_recorded(
                     && let Some(appid) = manager.open(APPID)?
                     && appid.status()?.running()
                 {
-                    Identity(&appid).stop()?;
-                    // text: remove_at-17
-                    say("the Application Identity service is stopped as it was");
+                    // A rollback stops the service only where this run's own start of it is on
+                    // record; the removal's rule (the earlier-state record says it was not running,
+                    // and no rule is left) is the removal's alone.
+                    if rollback
+                        && !manifest
+                            .find(ObjectKind::AppIdentityStarted, APPID)
+                            .is_some_and(|object| object.outcome == Some(Outcome::Made))
+                    {
+                        // text: remove_at-29-appid
+                        say(
+                            "the Application Identity service is running and this run's record holds no start of it that this run made, so the rollback leaves it running",
+                        );
+                    } else {
+                        Identity(&appid).stop()?;
+                        // text: remove_at-17
+                        say("the Application Identity service is stopped as it was");
+                    }
                 }
                 Ok(())
             })(),
@@ -5120,10 +5218,19 @@ fn undo_recorded(
             &mut failures,
         );
     }
-    // A rollback takes away the service only where this run recorded it: it acts on what the run
-    // made and on nothing else.
-    let service_is_ours =
-        matches!(tree, DataTree::ByName) || manifest.find(ObjectKind::Service, SERVICE).is_some();
+    // The service goes only where a result shows that a run made it, or, for the removal, found and
+    // used it: a service that this run did not make is not deleted.
+    if let Some(object) = manifest.find(ObjectKind::Service, SERVICE)
+        && !service_is_ours
+    {
+        // text: remove_at-29-service
+        say(&remedy::left_alone(
+            "the service",
+            SERVICE,
+            object.outcome,
+            rollback,
+        ));
+    }
     keep(
         (|| -> Result<(), Error> {
             if service_is_ours && let Some(service) = manager.open(SERVICE)? {
@@ -5156,6 +5263,18 @@ fn undo_recorded(
     for object in manifest.of_kind(ObjectKind::Account) {
         let name = object.id.clone();
         let recorded = object.detail.clone();
+        // An account whose create failed, or whose create no result shows, is not touched: not its
+        // rights, not its profile, not its sign-in entry, not the account.
+        if !object.acted_on_by(rollback) {
+            // text: remove_at-29-account
+            say(&remedy::left_alone(
+                "account",
+                &name,
+                object.outcome,
+                rollback,
+            ));
+            continue;
+        }
         keep(
             (|| -> Result<(), Error> {
                 // The account is looked up by the identifier that the manifest records, so an
