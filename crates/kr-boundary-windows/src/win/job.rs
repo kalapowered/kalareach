@@ -395,6 +395,9 @@ impl Job {
         // first failure of any turn of the loop is kept for the report, and a later turn that reads
         // the process does not drop it.
         let mut wait_failed = None;
+        // The same for the count of the job's processes: the first read of a turn that failed is
+        // kept, though a later turn read it.
+        let mut count_failed = None;
         loop {
             let all_exited = retained.iter().all(|child| {
                 // text: job_end-2
@@ -412,6 +415,9 @@ impl Job {
                 }
             });
             let counted = self.active_processes();
+            if let Err(failure) = &counted {
+                count_failed.get_or_insert_with(|| failure.to_string());
+            }
             let (active_zero, count_read) = match &counted {
                 Ok(count) => (*count == 0, true),
                 Err(_) => (false, false),
@@ -423,9 +429,12 @@ impl Job {
                         || "the call to end the job succeeded".to_owned(),
                         |error| error.to_string(),
                     );
-                    let count = match &counted {
-                        Ok(count) => format!("{count}"),
-                        Err(error) => format!("not read ({error})"),
+                    let count = match (&counted, count_failed) {
+                        (Ok(count), None) => format!("{count}"),
+                        (Ok(count), Some(earlier)) => {
+                            format!("{count}; an earlier read of it failed ({earlier})")
+                        }
+                        (Err(error), _) => format!("not read ({error})"),
                     };
                     let waited =
                         wait_failed.map_or_else(String::new, |failure| format!("; {failure}"));
