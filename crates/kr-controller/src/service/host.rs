@@ -63,16 +63,16 @@ impl Controller {
     ) -> Given<Result<ParamsValue>> {
         let params: kr_protocol::skill::AgentToolsParams = match parse(&mutation.params) {
             Ok(params) => params,
-            Err(refusal) => return Given::Fresh(Err(refusal)),
+            Err(refusal) => return Given::fresh(Err(refusal)),
         };
         let installer = match self.installer() {
             Ok(installer) => installer,
-            Err(refusal) => return Given::Fresh(Err(refusal)),
+            Err(refusal) => return Given::fresh(Err(refusal)),
         };
         let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
             Ok(digest) => digest,
             Err(error) => {
-                return Given::Fresh(Err(ControllerError::InvalidArgument(error.to_string())));
+                return Given::fresh(Err(ControllerError::InvalidArgument(error.to_string())));
             }
         };
         // From here to the recorded outcome is one sequence. Two callers cannot both find no
@@ -83,7 +83,7 @@ impl Controller {
         // the agent's files is read. The authority itself is asked where an answer the host
         // holds goes back and where the dispatch marker is written, below.
         if let Err(refusal) = self.authorised(carried.connection_id) {
-            return Given::Fresh(Err(refusal));
+            return Given::fresh(Err(refusal));
         }
         // What the host holds of the action goes back only under the authority this attempt
         // arrived under, asked with it in hand. That is a result, the conflict a reused identifier
@@ -105,7 +105,7 @@ impl Controller {
             Method::AgentToolsInstall => installer.declined_before_writing(&params, false),
             Method::AgentToolsRemove => installer.declined_before_writing(&params, true),
             _ => {
-                return Given::Fresh(Err(ControllerError::InvalidArgument(format!(
+                return Given::fresh(Err(ControllerError::InvalidArgument(format!(
                     "{} is not an installation this daemon serves",
                     method.as_str()
                 ))));
@@ -114,14 +114,14 @@ impl Controller {
         match declined {
             Ok(()) => {}
             Err(crate::agent_tools::Declined::ByTheRequest(refusal)) => {
-                return Given::Fresh(Err(refusal));
+                return Given::fresh(Err(refusal));
             }
             // A record this host cannot read says that a record exists.
             Err(crate::agent_tools::Declined::ByARecord(record)) => {
                 return record.copied().map(Err);
             }
         }
-        Given::Fresh(
+        Given::fresh(
             self.install_or_remove(
                 actor_id, mutation, method, carried, &params, &installer, &digest,
             )
@@ -345,12 +345,10 @@ impl Controller {
         match claimed {
             Ok(crate::grants::ActionClaim::Claimed { hold }) => {
                 let given = perform.await;
-                let (Given::Fresh(outcome) | Given::Copied(outcome) | Given::Withheld(outcome)) =
-                    &given;
                 // A receipt that cannot be kept does not change what the action did, and the caller
                 // is told that, not that the registry failed: the claim stays unfinished, and a
                 // retry is answered as an outcome this host does not know, never performed again.
-                if let Err(unrecorded) = self.settle_claim(&hold, outcome) {
+                if let Err(unrecorded) = self.settle_claim(&hold, given.answer_ref()) {
                     eprintln!("kr-controller: an action's receipt could not be kept: {unrecorded}");
                 }
                 drop(hold);
@@ -416,9 +414,9 @@ impl Controller {
             .environment_change(actor, bridged, mutation, method, carried)
             .await
         {
-            Ok(Reading::Own(answer)) => Given::Fresh(Ok(answer)),
-            Ok(Reading::Record(answer)) => Given::Copied(Ok(answer)),
-            Err(refusal) => Given::Fresh(Err(refusal)),
+            Ok(Reading::Own(answer)) => Given::fresh(Ok(answer)),
+            Ok(Reading::Record(answer)) => Given::copied(Ok(answer)),
+            Err(refusal) => Given::fresh(Err(refusal)),
         }
     }
 

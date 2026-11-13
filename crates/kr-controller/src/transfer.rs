@@ -1376,7 +1376,7 @@ impl TransferModule {
         let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
             Ok(digest) => digest,
             Err(error) => {
-                return Given::Fresh(Err(ProtocolError::new(
+                return Given::fresh(Err(ProtocolError::new(
                     ErrorCode::InvalidArgument,
                     error.to_string(),
                 )));

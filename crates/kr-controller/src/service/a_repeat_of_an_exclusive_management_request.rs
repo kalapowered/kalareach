@@ -54,13 +54,17 @@ async fn a_repeated_request_to_end_exclusive_management_is_answered_as_a_copy_of
         !first.is_copied(),
         "the submission that issued the challenge is not a copy"
     );
-    let first = first.into_answer().expect("the first request is answered");
+    let first = first
+        .into_answer_for_test()
+        .expect("the first request is answered");
     assert!(
         again.is_copied(),
         "the repeat is answered from the record of the first"
     );
     assert_eq!(
-        again.into_answer().expect("the repeat is answered"),
+        again
+            .into_answer_for_test()
+            .expect("the repeat is answered"),
         first,
         "with the challenge the first was given"
     );
@@ -90,7 +94,9 @@ async fn a_repeated_request_to_end_exclusive_management_is_answered_as_a_copy_of
         !reused.is_copied(),
         "a reused identifier is not answered from the record of the first"
     );
-    let refused = reused.into_answer().expect_err("the reuse is refused");
+    let refused = reused
+        .into_answer_for_test()
+        .expect_err("the reuse is refused");
     assert_eq!(
         refused.to_protocol_error().code,
         kr_protocol::error::ErrorCode::IdConflict

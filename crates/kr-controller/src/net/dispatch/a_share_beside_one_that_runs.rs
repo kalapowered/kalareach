@@ -142,17 +142,15 @@ async fn until_claimed(
 
 /// The refusal an answer carries, or a panic naming what it carried.
 fn refused(answer: &Answer) -> &ControllerError {
-    match answer {
-        Given::Fresh(Err(error)) | Given::Copied(Err(error)) | Given::Withheld(Err(error)) => error,
-        Given::Fresh(Ok(value)) | Given::Copied(Ok(value)) | Given::Withheld(Ok(value)) => {
-            panic!("the share was written: {value:?}")
-        }
+    match answer.answer_ref() {
+        Err(error) => error,
+        Ok(value) => panic!("the share was written: {value:?}"),
     }
 }
 
 /// The error a frame carries, or a panic naming what it carried.
 fn refusal_in(frame: Option<Recorded<ControlFrame>>) -> ProtocolError {
-    let frame = frame.map(|recorded| recorded.copied().into_answer());
+    let frame = frame.map(|recorded| recorded.copied().into_answer_for_test());
     let Some(ControlFrame::Response(response)) = frame else {
         panic!("a repeat of an action this host claimed is answered: {frame:?}");
     };
@@ -164,7 +162,7 @@ fn refusal_in(frame: Option<Recorded<ControlFrame>>) -> ProtocolError {
 
 /// The share a frame carries, or a panic naming what it carried.
 fn share_in(frame: Option<Recorded<ControlFrame>>) -> GrantCreateResult {
-    let frame = frame.map(|recorded| recorded.copied().into_answer());
+    let frame = frame.map(|recorded| recorded.copied().into_answer_for_test());
     let Some(ControlFrame::Response(response)) = frame else {
         panic!("a repeat of an action this host claimed is answered: {frame:?}");
     };
@@ -294,10 +292,10 @@ async fn kr_req_23_24_a_fresh_share_is_refused_while_an_earlier_share_of_its_sub
     let (first_answer, in_elsewhere_answer, to_another_answer, by_other_answer) =
         tokio::join!(running, held_elsewhere, held_to_another, held_by_other);
     first_answer
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first share is written");
     for answer in [in_elsewhere_answer, to_another_answer, by_other_answer] {
-        answer.into_answer().expect("the share is written");
+        answer.into_answer_for_test().expect("the share is written");
     }
     assert!(invitation_written(&world, 0x01));
     assert!(
@@ -376,12 +374,12 @@ async fn kr_req_23_24_a_device_that_delegates_is_held_to_its_running_share_too()
     drop(registry);
     running
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the device's delegation is written");
     assert_eq!(grants_written(&world), 2, "the parent and the delegation");
     later
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("a delegation under a fresh action is admitted once the first has ended");
     assert_eq!(grants_written(&world), 3);
 
@@ -423,14 +421,14 @@ async fn kr_req_23_24_a_share_is_admitted_once_the_earlier_one_has_ended() {
     drop(registry);
     fresh
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the share is written once the earlier one is gone");
     assert_eq!(grants_written(&world), 1);
 
     starting(&world, &owner, AuthorityCaller::Owner, &third)
         .await
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("a share after one that wrote its share is written");
     assert_eq!(grants_written(&world), 2);
 }
@@ -569,7 +567,7 @@ async fn kr_req_23_24_a_share_whose_result_cannot_be_kept_is_found_and_holds_its
     starting(&world, &owner, AuthorityCaller::Owner, &afresh)
         .await
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("a share of the subject is admitted after a restart");
     assert_eq!(grants_written(&world), 2);
 }
@@ -639,7 +637,7 @@ async fn kr_req_23_24_a_share_whose_store_fails_while_it_is_written_holds_its_su
     starting(&world, &owner, AuthorityCaller::Owner, &third)
         .await
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("a share of the subject is admitted after a restart");
     assert_eq!(grants_written(&world), 1);
 }
@@ -679,7 +677,7 @@ async fn kr_req_23_24_a_share_whose_store_fails_before_it_is_written_holds_nothi
     starting(&world, &owner, AuthorityCaller::Owner, &second)
         .await
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("a share of the subject is admitted: the failed one held nothing");
     assert_eq!(grants_written(&world), 1);
 }
@@ -696,7 +694,7 @@ async fn kr_req_23_24_a_share_written_under_earlier_identities_is_not_called_unp
     starting(&world, &owner, AuthorityCaller::Owner, &first)
         .await
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the share is written");
 
     let (grant_id, invitation_id) =
@@ -758,7 +756,7 @@ async fn kr_req_23_24_a_share_under_earlier_identities_that_cannot_be_read_is_no
     starting(&world, &owner, AuthorityCaller::Owner, &first)
         .await
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the share is written");
 
     let (grant_id, invitation_id) =
@@ -819,7 +817,7 @@ async fn kr_req_23_24_a_share_that_cannot_be_read_back_is_not_called_unperformed
     starting(&world, &owner, AuthorityCaller::Owner, &first)
         .await
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the share is written");
 
     let registry = beside(&world);
@@ -916,6 +914,6 @@ async fn a_share_refused_beside_one_that_runs_is_not_told_after_a_fence_lands() 
     drop(registry);
     running
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first share is written");
 }

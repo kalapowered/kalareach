@@ -6350,7 +6350,7 @@ async fn a_grant_withdrawn_before_the_write_stops_each_of_the_five_operations() 
             .await;
         // The attempt that performs, or is refused before it can, answers for itself.
         assert!(!outcome.is_copied(), "{name}: a fresh answer is not a copy");
-        let outcome = outcome.into_answer();
+        let outcome = outcome.into_answer_for_test();
         if standing {
             outcome.unwrap_or_else(|error| {
                 panic!(

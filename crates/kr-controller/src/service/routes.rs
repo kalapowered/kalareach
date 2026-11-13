@@ -88,7 +88,7 @@ impl Controller {
                     ..carried
                 },
             ) {
-                return Given::Fresh(Err(error.to_protocol_error()));
+                return Given::fresh(Err(error.to_protocol_error()));
             }
         }
         // And again inside the service's own work. Between the answer above and the effect there
@@ -148,7 +148,7 @@ impl Controller {
                     ..carried
                 },
             ) {
-                return Given::Fresh(Err(error.to_protocol_error()));
+                return Given::fresh(Err(error.to_protocol_error()));
             }
         }
         let admission: crate::automation::Admission = Arc::new(self.admission_in_service(carried));
@@ -162,16 +162,16 @@ impl Controller {
         // door made and without asking the admission, so what it gives back as a copy goes back
         // only under the authority this attempt arrived under, asked with the answer in hand.
         // The conflict of a reused identifier is no copy, and is held to the same check.
-        let reused =
-            matches!(&given, Given::Fresh(Err(refusal)) if refusal.code == ErrorCode::IdConflict);
+        let reused = given.origin() == crate::given::Origin::Fresh
+            && matches!(given.answer_ref(), Err(refusal) if refusal.code == ErrorCode::IdConflict);
         if (given.is_copied() || reused)
             && let Err(refusal) = self.check_retained_in_hand(&carried).await
         {
             let refusal = Err(refusal.to_protocol_error());
             return if given.is_copied() {
-                Given::Withheld(refusal)
+                Given::withheld(refusal)
             } else {
-                Given::Fresh(refusal)
+                Given::fresh(refusal)
             };
         }
         given
@@ -921,7 +921,7 @@ impl Controller {
                             self.descriptions.wake_host();
                             outcome
                         } else if crate::describe::serves(method) {
-                            Given::Fresh(self.description_write(method, mutation, carried).await)
+                            Given::fresh(self.description_write(method, mutation, carried).await)
                         } else {
                             let summary = match mutation.target.session_id.as_ref().copied() {
                                 Some(session_id) => self.session_summary(session_id).await,
@@ -929,7 +929,7 @@ impl Controller {
                                     "a rename names the session it renames".to_owned(),
                                 )),
                             };
-                            Given::Fresh(match summary {
+                            Given::fresh(match summary {
                                 Ok(summary) => {
                                     self.session_rename(actor_id, mutation, summary, carried)
                                         .await
@@ -949,7 +949,7 @@ impl Controller {
                 return respond(
                     mutation.request_id,
                     self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::Fresh(self.account_sign_in(mutation).await)
+                        Given::fresh(self.account_sign_in(mutation).await)
                     })
                     .await
                     .into_answer(),
@@ -961,7 +961,7 @@ impl Controller {
                 return respond(
                     mutation.request_id,
                     self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::Fresh(self.account_sign_out(mutation).await)
+                        Given::fresh(self.account_sign_out(mutation).await)
                     })
                     .await
                     .into_answer(),
@@ -973,7 +973,7 @@ impl Controller {
                 return respond(
                     mutation.request_id,
                     self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::Fresh(self.account_storage_sign_in(mutation).await)
+                        Given::fresh(self.account_storage_sign_in(mutation).await)
                     })
                     .await
                     .into_answer(),
@@ -983,7 +983,7 @@ impl Controller {
                 return respond(
                     mutation.request_id,
                     self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::Fresh(self.account_storage_sign_out(mutation).await)
+                        Given::fresh(self.account_storage_sign_out(mutation).await)
                     })
                     .await
                     .into_answer(),
@@ -1031,7 +1031,7 @@ impl Controller {
                 return respond(
                     mutation.request_id,
                     self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::Fresh(self.update_handover(mutation).await)
+                        Given::fresh(self.update_handover(mutation).await)
                     })
                     .await
                     .into_answer(),
