@@ -796,7 +796,7 @@ test.describe('a tap on the plain text near a link of a message', () => {
       expect(await openedLinks(page), 'links opened by a touch that moved').toEqual([])
     })
 
-    test(`adds no click for a mouse press on a link's own element that is released on plain text just past it, on ${surface}`, async ({ page }) => {
+    test(`shows the look of a mouse press on a link's own element only while the pointer lies in the element, and adds no click for a release on plain text just past it, on ${surface}`, async ({ page }) => {
       await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
       await wordsOf(page, DOCS)
       const box = await boxOf(page, DOCS)
@@ -805,6 +805,11 @@ test.describe('a tap on the plain text near a link of a message', () => {
       await page.mouse.down()
       expect(await pressedLooks(page), 'the pressed look of a mouse press on the link’s own element').toBe(1)
       await page.mouse.move(box.right + 3, y)
+      expect(await pressedLooks(page), 'the pressed look after a move of 5 px to plain text past the element').toBe(0)
+      await page.mouse.move(box.right - 2, y)
+      expect(await pressedLooks(page), 'the pressed look after the pointer is back in the element').toBe(1)
+      await page.mouse.move(box.right + 3, y)
+      expect(await pressedLooks(page), 'the pressed look after the pointer leaves the element again').toBe(0)
       await page.mouse.up()
       await page.waitForTimeout(400)
       expect(handlers(await clicksSeen(page)), 'clicks that the page added for a mouse released on plain text').toEqual([])

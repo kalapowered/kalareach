@@ -63,6 +63,8 @@ interface Recorded extends Press<HTMLElement> {
   readonly pointer: number
   /** Whether the press went down on the link's own element, which the browser's click opens. */
   readonly own: boolean
+  /** Where the press's pointer is now: a mouse's click opens by where it is released, not by where it went down. */
+  current: { x: number; y: number }
   moved: boolean
   upAt: number | null
 }
@@ -104,16 +106,26 @@ export function startLinkPress(element: HTMLElement): () => void {
     light(null)
     stop()
   }
+  // The slop is measured from the press's first point. A mouse's or a trackpad's click opens by where the
+  // button is released, so its look follows the pointer: lit while the pointer lies in the link's own
+  // element, out where it has left it, lit again where it is back. For a touch or a pen the rule opens
+  // from the first point, and a move within the slop changes nothing.
   const move = (event: PointerEvent): void => {
-    if (press !== null && event.pointerId === press.pointer && away(event)) die()
+    if (press === null || event.pointerId !== press.pointer) return
+    if (away(event)) {
+      die()
+      return
+    }
+    press.current = { x: event.clientX, y: event.clientY }
+    if (press.start !== null && !opensByRule(press.pointerType)) light(releaseOpens(element, press) ? press.start.link : null)
   }
   // The scroll of any box (scroll events do not bubble, so the capture phase on the document hears them
   // all) and the visual viewport's scroll and resize move the page under a held finger: the look is kept
   // only where a release at the press's point would still open the lit link (`releaseOpens`).
   const recheck = (): void => {
     if (press === null || press.start === null) return
-    if (releaseOpens(element, press)) return
-    die()
+    if (!releaseOpens(element, press)) die()
+    else light(press.start.link)
   }
   // The pointer's capture was taken from the pointer, the window is no longer in front or the page is
   // no longer shown: no release will come to this press.
@@ -164,6 +176,7 @@ export function startLinkPress(element: HTMLElement): () => void {
       at: { x: event.clientX, y: event.clientY },
       start: found === null ? null : { link: found.id, destination: found.destination },
       own: found?.own === true,
+      current: { x: event.clientX, y: event.clientY },
       moved: false,
       upAt: null
     }
@@ -240,8 +253,10 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
  */
 function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
   if (press.start === null) return false
-  if (press.own && liesInView(pane, press.start.link, press.at)) return true
-  return opensByRule(press.pointerType) && keepsPress(press, (point) => layoutNear(pane, point.x, point.y))
+  const by = opensByRule(press.pointerType)
+  // A touch's or a pen's click comes from the press's first point; a mouse's from where it is released.
+  if (press.own && liesInView(pane, press.start.link, by ? press.at : press.current)) return true
+  return by && keepsPress(press, (point) => layoutNear(pane, point.x, point.y))
 }
 
 /** Whether `point` lies in the part of `link`'s own element that every box clipping it leaves in view. */

@@ -743,6 +743,81 @@ describe('a press for a pointer that can open, and the look it gives', () => {
   })
 })
 
+describe('the look of a mouse press on a link’s own element as the pointer moves', () => {
+  // The words and the element at x 100 to 140, y 100 to 117; the press is 2 px inside the right edge.
+  const words = { left: 100, top: 100, right: 140, bottom: 117 }
+  const mouse = (x: number, over: Record<string, unknown> = {}): Record<string, unknown> => ({ clientX: x, clientY: 108, pointerType: 'mouse', ...over })
+
+  it('goes out where the pointer leaves the element within the slop, is lit again where it returns, and a release outside opens nothing', () => {
+    const { pane, text, links } = between(words)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], mouse(138)))
+    expect(isLit(links[0]), 'the look of the press').toBe(true)
+    fire('pointermove', pointer(text, mouse(143)))
+    expect(isLit(links[0]), 'the look 5 px to the right, outside the element').toBe(false)
+    fire('pointermove', pointer(links[0], mouse(138)))
+    expect(isLit(links[0]), 'the look back inside the element').toBe(true)
+    fire('pointermove', pointer(text, mouse(143)))
+    expect(isLit(links[0]), 'the look outside again').toBe(false)
+    fire('pointerup', pointer(text, mouse(143, { timeStamp: 120 })))
+    fire('click', click(text, { clientX: 143, clientY: 108 }))
+    expect(isLit(links[0]), 'the look after the release').toBe(false)
+    expect(opened).toEqual([])
+  })
+
+  it('measures the slop from the press’s first point, not from the last one', () => {
+    const { pane, text, links } = between(words)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], mouse(138)))
+    fire('pointermove', pointer(text, mouse(147)))
+    expect(isLit(links[0]), 'the look 9 px to the right').toBe(false)
+    fire('pointermove', pointer(links[0], mouse(129)))
+    expect(isLit(links[0]), 'the look 9 px to the left of the first point, inside the element').toBe(true)
+    fire('pointermove', pointer(links[0], mouse(127)))
+    expect(isLit(links[0]), 'the look 11 px to the left: the press has ended').toBe(false)
+    fire('pointermove', pointer(links[0], mouse(138)))
+    expect(isLit(links[0]), 'the look back at the first point: an ended press is not lit again').toBe(false)
+  })
+
+  it('goes out where the pointer moves into the part of the element that a box clips, and is lit again where it leaves that part', () => {
+    const { pane, text, links } = between(words)
+    clip(text, { left: 0, top: 0, right: 120, bottom: 844 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], mouse(116)))
+    expect(isLit(links[0]), 'the look of the press inside the clip').toBe(true)
+    fire('pointermove', pointer(links[0], mouse(122)))
+    expect(isLit(links[0]), 'the look at x 122: inside the element’s rectangle, past the clip').toBe(false)
+    fire('pointermove', pointer(links[0], mouse(118)))
+    expect(isLit(links[0]), 'the look at x 118, inside the clip').toBe(true)
+  })
+
+  it('is lit again where a scroll brings the element under the pointer that left it', () => {
+    const { pane, text, links } = between(words)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], mouse(138)))
+    fire('pointermove', pointer(text, mouse(143)))
+    expect(isLit(links[0]), 'the look outside the element').toBe(false)
+    scrolledSideways(-4)
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after a scroll that put the element’s edge past the pointer').toBe(true)
+  })
+
+  for (const pointerType of ['touch', 'pen']) {
+    it(`keeps the look of a ${pointerType} press for a move within the slop, where the press’s own element ends: nothing changes for it`, () => {
+      const { pane, text, links } = between(words)
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(links[0], mouse(138, { pointerType })))
+      fire('pointermove', pointer(text, mouse(143, { pointerType })))
+      expect(isLit(links[0]), `the look of a ${pointerType} 5 px to the right`).toBe(true)
+    })
+  }
+})
+
 describe('a scroll under a held press', () => {
   const y = 328
 
