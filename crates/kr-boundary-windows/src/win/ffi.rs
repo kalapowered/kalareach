@@ -565,6 +565,31 @@ impl Handle {
         self.0
     }
 
+    /// The same object opened again through this handle, never through a path, with the access given
+    /// and full sharing: the new handle can hold a right (the right to delete) that this one does not,
+    /// and this one must have been opened with a sharing that allows that right.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last error when the object cannot be opened again.
+    pub fn reopen(&self, access: u32) -> Result<Handle> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        };
+        // SAFETY: the handle is open and owned by this value; the call keeps nothing of it.
+        let raw = unsafe {
+            ReOpenFile(
+                self.0,
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        // text: handle_reopen-1
+        Handle::new(raw, "opening an object again through its own handle")
+    }
+
     /// A second handle to the same object, with the access given (which may not exceed the access of
     /// this handle), owned by the value that is returned. Closing either leaves the other open.
     ///

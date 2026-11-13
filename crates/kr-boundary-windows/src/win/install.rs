@@ -705,10 +705,14 @@ pub struct DataHolds {
 }
 
 /// What a run made of the data directory's place, each object held through the handle of the call
-/// that made it, opened with the right to delete it. A cleanup marks these objects for removal
-/// through these handles and never by path, so that an object that was put at the path since (or a
-/// link) is never taken for what this run made. The handles are held until the first manifest is
-/// written: after that a removal finds the objects by the manifest.
+/// that made it. The handle holds an identity and no right to delete: it is opened with full sharing
+/// and without the right to delete, so that no later open of the product or of the system meets a
+/// handle of the run that holds the right (an open that does not share delete would be refused by
+/// it). A cleanup opens the same object again through that handle, never through a path, with the
+/// right to delete, marks it, and closes every handle of it before it turns to the folder above, so
+/// that an object that was put at the path since (or a link) is never taken for what this run made.
+/// The handles are held until the first manifest is written: after that a removal finds the objects
+/// by the manifest.
 #[derive(Debug, Default)]
 struct Made {
     /// The folder above the data directory, where this run's own call made it.
@@ -717,45 +721,55 @@ struct Made {
     directory: Option<ffi::Handle>,
 }
 
+/// Marks the object behind `identity` for removal: opens it again through that handle, with the right
+/// to delete, marks it through the new handle (the name goes when the object has no other handle and
+/// no entry) and closes the new handle. The words are the platform's refusal, of the reopen or of the
+/// mark.
+fn mark_for_removal(identity: &ffi::Handle) -> Result<(), String> {
+    let deleter = identity.reopen(DELETE | FILE_READ_ATTRIBUTES).map_err(|failure| {
+        remedy::platform_error(
+            "the platform refused to open it again through its own handle to mark it for removal",
+            failure.code,
+        )
+    })?;
+    super::root::delete(&deleter).map_err(|failure| {
+        remedy::platform_error("the platform refused to mark it for removal", failure.code)
+    })
+}
+
 impl Made {
     /// Whether this run made nothing of the data directory's place.
     fn is_empty(&self) -> bool {
         self.parent.is_none() && self.directory.is_none()
     }
 
-    /// Marks what this run made for removal through its own handles: the data directory first, and
-    /// the folder above it where this run made that too once the directory is gone. Returns whether
-    /// the directory that this run made is gone (or was not made by it), and each object that
-    /// stays, with the platform's answer: a refused mark, or a folder that stays because the
+    /// Marks what this run made for removal: the data directory first, through its own handle, and
+    /// every handle of it is closed before the folder above it is marked, where this run made that
+    /// too, and only once the directory is gone. The caller has closed its own handles of both. Returns
+    /// whether the directory that this run made is gone (or was not made by it), and each object that
+    /// stays, with the platform's answer: a refused reopen or mark, or a folder that stays because the
     /// directory in it stays.
-    fn take_away(&self, paths: &Paths) -> (bool, Vec<String>) {
+    fn take_away(self, paths: &Paths) -> (bool, Vec<String>) {
+        let Made { parent, directory } = self;
         let mut stayed = Vec::new();
         let mut directory_gone = true;
-        if let Some(handle) = &self.directory
-            && let Err(failure) = super::root::delete(handle)
-        {
-            directory_gone = false;
-            stayed.push(format!(
-                "{} ({})",
-                paths.data.display(),
-                remedy::platform_error("the platform refused to mark it for removal", failure.code)
-            ));
+        if let Some(identity) = directory {
+            if let Err(words) = mark_for_removal(&identity) {
+                directory_gone = false;
+                stayed.push(format!("{} ({words})", paths.data.display()));
+            }
+            // The identity is the last handle of the directory that this run holds: it is closed
+            // before the folder is marked, which finds it empty only when the directory has gone.
+            drop(identity);
         }
-        if let Some(handle) = &self.parent {
+        if let Some(identity) = parent {
             if !directory_gone {
                 stayed.push(format!(
                     "{} (the data directory in it stays)",
                     paths.data_parent().display()
                 ));
-            } else if let Err(failure) = super::root::delete(handle) {
-                stayed.push(format!(
-                    "{} ({})",
-                    paths.data_parent().display(),
-                    remedy::platform_error(
-                        "the platform refused to mark it for removal",
-                        failure.code
-                    )
-                ));
+            } else if let Err(words) = mark_for_removal(&identity) {
+                stayed.push(format!("{} ({words})", paths.data_parent().display()));
             }
         }
         (directory_gone, stayed)
@@ -763,8 +777,9 @@ impl Made {
 
     /// The error of a step that failed after this run made something of the data directory's place,
     /// with what was done about what it made: the words of the failure, then what was removed and
-    /// what stays. An error where this run made nothing is returned as it is.
-    fn after(&self, paths: &Paths, error: Error) -> Error {
+    /// what stays. An error where this run made nothing is returned as it is. The caller has closed
+    /// every handle of the run to what it made, so only the handles of `self` remain.
+    fn after(self, paths: &Paths, error: Error) -> Error {
         if self.is_empty() {
             return error;
         }
@@ -788,6 +803,25 @@ impl std::fmt::Debug for DataHolds {
 }
 
 impl DataHolds {
+    /// The failure of a step after this run made the data directory or the folder above it, and the
+    /// cleanup of what it made: every handle of the run to those objects is closed first (the folders
+    /// and directories held here, which are copies of the handles of the creating calls), and then
+    /// what the run made is marked for removal through the handles of the calls that made it.
+    fn undo(self, error: Error) -> Error {
+        let DataHolds {
+            paths,
+            purpose: _,
+            _parent,
+            made,
+            data,
+            staging,
+            journal,
+            run,
+        } = self;
+        drop((_parent, data, staging, journal, run));
+        made.after(&paths, error)
+    }
+
     /// Gives the data directory the installation's protected list, on the handle held since the
     /// directory was made or checked. The call propagates to nothing: what the directory holds is
     /// given its list by the steps that make it.
@@ -1469,7 +1503,15 @@ fn open_directory_at(
             &raw mut status_block,
             std::ptr::null(),
             FILE_ATTRIBUTE_DIRECTORY,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            // An object that this call makes is held for the run's cleanup, which opens it again
+            // through this handle: it shares everything and holds no right to delete, so that no
+            // open of the product or of the system is refused by it. An object that is only opened
+            // is held against a rename or a delete.
+            if disposition == FILE_CREATE {
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            } else {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            },
             disposition,
             FILE_DIRECTORY_FILE
                 | FILE_OPEN_REPARSE_POINT
@@ -2784,13 +2826,7 @@ fn inspect_existing_data(
 /// Returns [`Error::Refused`] naming the reason when the folder, the directory or anything in it is
 /// not the installation's own, and the platform's error when a call fails.
 pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
-    let mut holds = make_data_directory_for(paths, Purpose::Install)?;
-    // The handles that can mark what the run made for removal belong to an installation run, which
-    // holds them until its first manifest is written. This entry returns the holds without them: a
-    // caller that opens the folder or the directory by a path meets no handle that has the right to
-    // delete it.
-    holds.made = Made::default();
-    Ok(holds)
+    make_data_directory_for(paths, Purpose::Install)
 }
 
 /// [`make_data_directory`] for a run with this purpose. What the run makes of the data directory's
@@ -2865,7 +2901,7 @@ fn open_data_directory(
                 name,
                 FILE_CREATE,
                 Some(&descriptor),
-                LIST | WRITE_DAC | DELETE,
+                LIST | WRITE_DAC,
             )? {
                 Some(made_here) => made_here,
                 // Another program made it between the two calls: it is opened, and was not made here.
@@ -2962,7 +2998,7 @@ fn create_data_parent(parent: &Path) -> Result<Option<ffi::Handle>, Error> {
         &name,
         FILE_CREATE,
         Some(&descriptor),
-        LIST | FILE_ADD_SUBDIRECTORY | DELETE,
+        LIST | FILE_ADD_SUBDIRECTORY,
     )?
     .map(|(handle, _)| handle))
 }
@@ -3429,15 +3465,16 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     )?;
     // Until the first manifest is written a removal finds nothing of what this run made, so a failure
     // of the next two steps takes it away through the handles that made it.
-    holds
-        .protect()
-        .map_err(|error| holds.made.after(&paths, error))?;
-    run.record(
+    if let Err(error) = holds.protect() {
+        return Err(holds.undo(error));
+    }
+    if let Err(error) = run.record(
         ObjectKind::Directory,
         &paths.data.display().to_string(),
         None,
-    )
-    .map_err(|error| holds.made.after(&paths, error))?;
+    ) {
+        return Err(holds.undo(error));
+    }
     // The manifest records the directory now: a removal finds it by the manifest, and the handles
     // that could mark what this run made for removal are closed.
     holds.made = Made::default();
