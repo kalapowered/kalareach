@@ -315,14 +315,30 @@ fn replacement_name(path: &Path) -> PathBuf {
     path.with_file_name(format!("{stem}-{}.new", uuid::Uuid::new_v4().simple()))
 }
 
-/// Writes the bytes to the replacement, which must not exist, and renames it over the file.
+/// Writes the bytes to the replacement, which must not exist, and renames it over the file. Where
+/// the write, the flush or the rename fails after this call made the replacement, the replacement is
+/// removed again, so that a failed write leaves no file of its own; a removal that fails too is named
+/// beside the first error. A replacement that this call did not make (the name was taken) is not
+/// touched.
 fn replace_through(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
-    {
-        let mut file: File = create(staging, true)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+    let mut file: File = create(staging, true)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let Err(failure) = written.and_then(|()| fs::rename(staging, path)) else {
+        return Ok(());
+    };
+    match fs::remove_file(staging) {
+        Ok(()) => Err(failure),
+        // The rename may have moved it already: nothing is left to remove.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(failure),
+        Err(error) => Err(io::Error::new(
+            failure.kind(),
+            format!(
+                "{failure}; the replacement {} could not be removed either: {error}",
+                staging.display()
+            ),
+        )),
     }
-    fs::rename(staging, path)
 }
 
 #[cfg(test)]
@@ -374,6 +390,28 @@ mod tests {
         assert!(
             write.starts_with("the installation record could not be written: "),
             "{write}"
+        );
+    }
+
+    /// A replacement that this call made and could not put over the file is removed again, so that a
+    /// directory that holds only what the call made is empty after a first write that failed.
+    #[test]
+    fn a_replacement_that_could_not_be_put_over_the_file_is_removed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the file's name: the rename fails after the replacement was written whole.
+        let path = dir.path().join("manifest.json");
+        fs::create_dir(&path).unwrap();
+        let staging = dir.path().join("manifest-made.new");
+        let failed = replace_through(&path, &staging, b"the record").unwrap_err();
+        let look = fs::metadata(&staging).unwrap_err();
+        assert_eq!(
+            look.kind(),
+            io::ErrorKind::NotFound,
+            "the replacement is left: {failed}"
+        );
+        assert!(
+            fs::metadata(&path).unwrap().is_dir(),
+            "what was at the name is as it was"
         );
     }
 

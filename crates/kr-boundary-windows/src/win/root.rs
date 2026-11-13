@@ -440,7 +440,7 @@ fn open_waiting(
 /// Deletes the object behind the handle with POSIX semantics: the name goes at once, whatever
 /// else has the object open, and the read-only attribute does not stop it. The handle must be
 /// open with the right to delete.
-fn delete(handle: &Handle) -> Result<(), super::ffi::Error> {
+pub(super) fn delete(handle: &Handle) -> Result<(), super::ffi::Error> {
     let information = FILE_DISPOSITION_INFORMATION_EX {
         Flags: FILE_DISPOSITION_DELETE
             | FILE_DISPOSITION_POSIX_SEMANTICS

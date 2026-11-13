@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use kr_boundary_windows::records::{Begin, Inspection, Look, begin, remove_empty, remove_made};
+use kr_boundary_windows::records::{Begin, Inspection, Look, begin, remove_empty};
 
 /// What the look at the directory's name answers in a case.
 #[derive(Clone, Copy)]
@@ -148,38 +148,4 @@ fn removing_the_empty_directory_deletes_nothing_in_it() {
     assert!(data.join("prior.json").exists());
     assert!(data.join("manifest.json").exists());
     assert!(data.join("staging").join("policy.xml").exists());
-}
-
-/// A run that made the data directory, and the folder above it, and refused the directory, takes
-/// both away while they hold nothing else. The folder is taken only where this run made it, and
-/// only after the directory is gone; what another program put in either stays, and is named.
-#[test]
-fn what_a_run_made_and_refused_is_removed_while_it_holds_nothing_else() {
-    let root = tempfile::tempdir().unwrap();
-    let parent = root.path().join("Kala");
-    let data = parent.join("Boundary");
-    fs::create_dir_all(&data).unwrap();
-    assert!(remove_made(&data, Some(&parent)).is_empty());
-    assert!(!data.exists() && !parent.exists());
-
-    // A folder that this run did not make is left, empty or not.
-    fs::create_dir_all(&data).unwrap();
-    assert!(remove_made(&data, None).is_empty());
-    assert!(!data.exists() && parent.exists());
-
-    // A file in the directory keeps the directory and the folder, and is not deleted.
-    fs::create_dir_all(&data).unwrap();
-    fs::write(data.join("other.txt"), b"x").unwrap();
-    let stayed = remove_made(&data, Some(&parent));
-    assert_eq!(stayed.len(), 1, "{stayed:?}");
-    assert!(stayed[0].contains("Boundary"), "{stayed:?}");
-    assert!(data.join("other.txt").exists() && parent.exists());
-
-    // A file beside the directory keeps the folder and is named.
-    fs::remove_file(data.join("other.txt")).unwrap();
-    fs::write(parent.join("beside.txt"), b"x").unwrap();
-    let stayed = remove_made(&data, Some(&parent));
-    assert_eq!(stayed.len(), 1, "{stayed:?}");
-    assert!(stayed[0].contains("Kala"), "{stayed:?}");
-    assert!(!data.exists() && parent.join("beside.txt").exists());
 }

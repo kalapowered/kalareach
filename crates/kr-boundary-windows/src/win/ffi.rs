@@ -564,6 +564,36 @@ impl Handle {
     pub fn raw(&self) -> HANDLE {
         self.0
     }
+
+    /// A second handle to the same object, with the access given (which may not exceed the access of
+    /// this handle), owned by the value that is returned. Closing either leaves the other open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last error when the handle cannot be copied.
+    pub fn duplicate(&self, access: u32) -> Result<Handle> {
+        use windows_sys::Win32::Foundation::DuplicateHandle;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut copy: HANDLE = null_mut();
+        // SAFETY: the source is open and owned by this value, and the target is this function's own.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.0,
+                GetCurrentProcess(),
+                &raw mut copy,
+                access,
+                0,
+                0,
+            )
+        };
+        if duplicated == 0 {
+            // text: handle_duplicate-1
+            return Err(last("copying a handle"));
+        }
+        // text: handle_duplicate-2
+        Handle::new(copy, "copying a handle")
+    }
 }
 
 impl Drop for Handle {
