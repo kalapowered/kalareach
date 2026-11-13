@@ -407,3 +407,33 @@ fn the_journal_files_go_only_where_the_service_never_ran_or_a_read_showed_that_i
         "broker_is_there || manifest.find(ObjectKind::ServiceStarted, SERVICE).is_some();"
     ));
 }
+
+#[test]
+fn the_jobs_proof_and_its_diagnostics_are_two_lists() {
+    let job = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/win/job.rs")).unwrap();
+    let proof =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/win/proof.rs")).unwrap();
+    let end = code_of(body_of(&job, "    pub fn end("));
+    // The end that was seen proved adds what it recovered from to the diagnostics, and only an end
+    // that was not proved adds a reason that keeps it from being proved.
+    let proved = end.find("if all_exited && active_zero {").unwrap();
+    let else_branch = end[proved..].find("} else {").unwrap() + proved;
+    assert!(
+        end[proved..else_branch].contains("self.diagnostics.add(")
+            && !end[proved..else_branch].contains("self.reports.add("),
+        "the proved branch of the end writes the diagnostics only"
+    );
+    assert!(
+        end[else_branch..].contains("self.reports.add(")
+            && !end[else_branch..].contains("self.diagnostics.add("),
+        "the branch of an end that is not proved writes the reasons only"
+    );
+    // The proof of an end reads the reasons and never the diagnostics.
+    let settled = code_of(body_of(&proof, "fn settled("));
+    assert!(settled.contains("job.unproved_reasons().is_empty()"));
+    assert!(!settled.contains("diagnostics"));
+    let uncertain = code_of(body_of(&proof, "fn uncertain_end("));
+    assert!(!uncertain.contains("diagnostics"));
+    // A proved run tells the diagnostics beside the outcome.
+    assert!(proof.contains("Ok(Some(code)) => Ok((Outcome::Ran(code), job.diagnostics())),"));
+}

@@ -257,9 +257,11 @@ pub fn run_captured_until(
                 // After a stop the end is given its short bound, not the run's deadline.
                 let ended = job.end(&[&child], end_by(deadline, stop));
                 match settled(&job, ended) {
+                    // The end is proved: what the end of the job met on the way and recovered from
+                    // is told beside it, and judges nothing.
                     Ok(()) => match waited {
-                        Ok(Some(code)) => Ok(Outcome::Ran(code)),
-                        Ok(None) => Ok(Outcome::TimedOut),
+                        Ok(Some(code)) => Ok((Outcome::Ran(code), job.diagnostics())),
+                        Ok(None) => Ok((Outcome::TimedOut, job.diagnostics())),
                         Err(error) => Err(LaunchError::Platform(error)),
                     },
                     // The end is not proved; a wait for the child that failed is told with it.
@@ -319,7 +321,16 @@ pub fn run_captured_until(
         }
         (Err(error), Ok(_)) => return Err(error),
         (Ok(_), Err(reason)) => return Err(LaunchError::EndUncertain(reason)),
-        (Ok(outcome), Ok((out, err))) => (outcome, out, err),
+        (Ok((outcome, diagnostics)), Ok((out, err))) => {
+            if !diagnostics.is_empty() {
+                // text: run_captured_until-1
+                eprintln!(
+                    "the end of the program's job was proved, and its reads reported on the way: {}",
+                    diagnostics.join("; ")
+                );
+            }
+            (outcome, out, err)
+        }
     };
     Ok(Captured {
         outcome,

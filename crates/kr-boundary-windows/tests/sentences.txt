@@ -721,7 +721,7 @@ listed | pub fn | win/boot.rs | 1 | names, keys, limits, encodings and paths; no
 listed | pub fn | win/broker.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/ffi.rs | 5 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/install.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
-listed | pub fn | win/job.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
+listed | pub fn | win/job.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person (`unproved_reasons` and `diagnostics` return the words of what the job's own reads reported, which their callers say)
 listed | pub fn | win/journal.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/proof.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/registry.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
@@ -729,3 +729,5 @@ listed | pub fn | win/sd.rs | 2 | names, keys, limits, encodings and paths; no s
 listed | pub fn | win/service.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/walk.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
+
+run_captured_until-1 | the end of the program's job was proved, and its reads reported on the way | the end of the program's job was proved, and its reads reported on the way: each error that a later read recovered from | read: Job::end saw the job empty by reads that came last (every retained process exited and the job's count was zero), and a refused call to end the job, an earlier wait or an earlier read of the count had failed; they are in the job's diagnostics, apart from the reasons that make an end uncertain
