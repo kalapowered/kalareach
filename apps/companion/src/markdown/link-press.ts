@@ -256,7 +256,13 @@ function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
   const by = opensByRule(press.pointerType)
   // A touch's or a pen's click comes from the press's first point; a mouse's from where it is released.
   if (press.own && liesInView(pane, press.start.link, by ? press.at : press.current)) return true
-  return by && keepsPress(press, (point) => layoutNear(pane, point.x, point.y))
+  if (!by) return false
+  // The rule opens a link only from plain text of the pane, as at the pointer down: where a scroll has put
+  // another control, another link or an element outside the pane under the point, the click is that
+  // element's and the rule adds nothing.
+  const hit = document.elementFromPoint(press.at.x, press.at.y)
+  if (hit === null || !pane.contains(hit) || namedBy(hit) !== 'neither') return false
+  return keepsPress(press, (point) => layoutNear(pane, point.x, point.y))
 }
 
 /** Whether `point` lies in the part of `link`'s own element that every box clipping it leaves in view. */

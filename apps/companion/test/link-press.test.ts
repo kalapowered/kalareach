@@ -87,6 +87,8 @@ beforeEach(() => {
         overflowY: overflows.get(element)?.y ?? 'visible'
       }) as unknown as CSSStyleDeclaration
   )
+  // jsdom has no hit test: the element at a point is the one whose made box holds it.
+  Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: hitAt })
   // jsdom has no layout: the words of a link are the box that the made page gives its label.
   Object.defineProperty(Range.prototype, 'getClientRects', {
     configurable: true,
@@ -101,8 +103,30 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  Reflect.deleteProperty(document, 'elementFromPoint')
   document.body.replaceChildren()
 })
+
+/**
+ * What the made page's hit test names at (`x`, `y`): an overlay, a control or a link whose made box holds
+ * the point, else the text of a message.
+ */
+function hitAt(x: number, y: number): Element | null {
+  for (const element of document.querySelectorAll('.overlay, .m-other, .md-link')) {
+    const box = boxes.get(element)
+    if (box !== undefined && x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) return element
+  }
+  return document.querySelector('.m-node p') ?? document.body
+}
+
+/** An element with a made box, put in `parent`: `m-other` is a control that is not a link. */
+function placed(parent: HTMLElement, className: string, box: Box, tag = 'button'): HTMLElement {
+  const element = document.createElement(tag)
+  element.className = className
+  boxes.set(element, box)
+  parent.append(element)
+  return element
+}
 
 /** A conversation: `count` messages 100 px apart, each with `each` links in a row 18 px apart. */
 function conversation(count: number, each: number): { pane: HTMLElement; messages: HTMLElement[]; links: HTMLElement[][]; texts: HTMLElement[] } {
@@ -622,7 +646,7 @@ describe('the boxes the handler reads', () => {
 
 /** Moves every box of the made page up by `by`, as a scroll of the pane does. */
 function scrolled(by: number): void {
-  for (const element of document.querySelectorAll('.m-node, .md-link, .md-link-label')) {
+  for (const element of document.querySelectorAll('.m-node, .md-link, .md-link-label, .m-other')) {
     const box = boxes.get(element)
     if (box !== undefined) boxes.set(element, { ...box, top: box.top - by, bottom: box.bottom - by })
   }
@@ -630,7 +654,7 @@ function scrolled(by: number): void {
 
 /** Moves every box of the made page left by `by`, as a sideways scroll of the pane does. */
 function scrolledSideways(by: number): void {
-  for (const element of document.querySelectorAll('.m-node, .md-link, .md-link-label')) {
+  for (const element of document.querySelectorAll('.m-node, .md-link, .md-link-label, .m-other')) {
     const box = boxes.get(element)
     if (box !== undefined) boxes.set(element, { ...box, left: box.left - by, right: box.right - by })
   }
@@ -986,6 +1010,60 @@ describe('a scroll under a held press', () => {
     fire('pointerup', pointer(text, { clientX: 138, clientY: 108, timeStamp: 120 }))
     fire('click', click(text, { clientX: 138, clientY: 108 }))
     expect(opened).toEqual([links[0]])
+  })
+
+  describe('that puts another element under the point of a touch press on plain text, where the rule still names the link', () => {
+    // The words at x 100 to 140, y 100 to 117. The press is on plain text 10 px before them and 6 px above, in
+    // the 22 px that the rule reaches. The elements below lie at y 97 to 113, so the point is above them.
+    const words = { left: 100, top: 100, right: 140, bottom: 117 }
+    const press = { clientX: 90, clientY: 94 }
+    const beside = { left: 60, top: 97, right: 96, bottom: 113 }
+
+    it('ends the look where a control that is not a link comes under the point, and keeps it where the control still lies below it: the button of an image that loads', () => {
+      const { pane, text, links } = between(words)
+      const button = placed(text, 'm-other', beside)
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, press))
+      expect(isLit(links[0]), 'the look of the press on plain text').toBe(true)
+      scrolled(2)
+      fire('scroll', {} as Event)
+      expect(isLit(links[0]), 'the look after a scroll of 2 px: the button still lies below the point').toBe(true)
+      scrolled(2)
+      fire('scroll', {} as Event)
+      expect(boxes.get(button)?.top, 'the button’s top after 4 px').toBe(93)
+      expect(isLit(links[0]), 'the look after a scroll of 4 px: the button lies under the point').toBe(false)
+      fire('pointerup', pointer(button, { ...press, timeStamp: 120 }))
+      fire('click', click(button, press))
+      expect(opened, 'the click on the button opens no link').toEqual([])
+    })
+
+    it('ends the look where another link comes under the point', () => {
+      const { pane, text, links } = between(words)
+      // A link that no message holds, so the rule does not weigh it.
+      const other = placed(pane, 'md-link m-other', beside)
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, press))
+      expect(isLit(links[0]), 'the look of the press').toBe(true)
+      scrolled(4)
+      fire('scroll', {} as Event)
+      expect(boxes.get(other)?.top, 'the other link’s top after 4 px').toBe(93)
+      expect(isLit(links[0]), 'the look after a scroll that put another link under the point').toBe(false)
+    })
+
+    it('ends the look where an element outside the pane comes under the point, since a release there is not the pane’s', () => {
+      const { pane, text, links } = between(words)
+      const overlay = placed(document.body, 'overlay', { left: 0, top: 200, right: 390, bottom: 844 }, 'div')
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, press))
+      expect(isLit(links[0]), 'the look of the press').toBe(true)
+      boxes.set(overlay, { left: 0, top: 80, right: 390, bottom: 844 })
+      scrolled(2)
+      fire('scroll', {} as Event)
+      expect(isLit(links[0]), 'the look after an overlay came under the point').toBe(false)
+    })
   })
 })
 
