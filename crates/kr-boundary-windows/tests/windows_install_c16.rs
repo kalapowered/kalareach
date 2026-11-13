@@ -198,7 +198,7 @@ fn data_parent_with_paths(clean: &mut Cleanup) -> (PathBuf, Paths) {
 fn names_the_folder_and_the_right(text: &str, folder: &Path, tree: &str) {
     assert!(
         text.contains(&format!(
-            "{} is a folder above the boundary's {tree}",
+            "{} is on the path above the boundary's {tree}",
             folder.display()
         )),
         "{text}"
@@ -332,7 +332,7 @@ fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
         .to_string();
     assert!(
         text.contains(&format!(
-            "{} is a folder above the boundary's program directory",
+            "{} is on the path above the boundary's program directory",
             link.display()
         )),
         "{text}"
@@ -374,7 +374,7 @@ fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
         .to_string();
     assert!(
         text.contains(&format!(
-            "{} is a folder above the boundary's program directory",
+            "{} is on the path above the boundary's program directory",
             own.display()
         )),
         "{text}"
@@ -449,7 +449,7 @@ fn a_fresh_installation_refuses_a_link_that_points_nowhere_at_the_program_direct
     assert!(text.contains("it is a reparse point"), "{text}");
     assert!(
         text.contains(&format!(
-            "Remove the link {} itself",
+            "Remove {} itself, and not what it points to",
             paths.program.display()
         )),
         "{text}"
@@ -483,7 +483,7 @@ fn a_link_above_the_data_parent_is_refused() {
         .to_string();
     assert!(
         text.contains(&format!(
-            "{} is a folder above the boundary's data directory",
+            "{} is on the path above the boundary's data directory",
             link.display()
         )),
         "{text}"
@@ -522,7 +522,7 @@ fn a_known_folder_that_is_not_there_refuses_the_run() {
     let parent = missing.join("KalaReach");
     let paths = paths_with(&parent, &parent.join("Program"), &container);
     let above = format!(
-        "{} is a folder above the boundary's data directory",
+        "{} is on the path above the boundary's data directory",
         missing.display()
     );
     let text = install::check_data_parent(&paths)
@@ -550,7 +550,7 @@ fn a_known_folder_that_is_not_there_refuses_the_run() {
         .to_string();
     assert!(
         text.contains(&format!(
-            "{} is a folder above the boundary's program directory",
+            "{} is on the path above the boundary's program directory",
             top.display()
         )),
         "{text}"
@@ -591,9 +591,7 @@ fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
         .expect_err("a substituted drive letter")
         .to_string();
     assert!(
-        text.contains(&format!(
-            "{letter}\\ is a drive letter that is not the root of its volume"
-        )),
+        text.contains(&format!("{letter}\\ is a drive letter whose root opens as")),
         "{text}"
     );
     assert!(
@@ -629,7 +627,7 @@ fn a_root_that_is_not_there_is_refused_before_a_change_by_every_run() {
         .expect("a free drive letter");
     let words = |text: &str, tree: &str| {
         for needle in [
-            format!("{letter}\\ is a folder above the boundary's {tree}"),
+            format!("{letter}\\ is on the path above the boundary's {tree}"),
             "the root of its volume is not there".to_owned(),
             "Nothing was changed".to_owned(),
             "Run the setup program again when it can be read.".to_owned(),
@@ -663,7 +661,7 @@ fn a_root_that_is_not_there_is_refused_before_a_change_by_every_run() {
     let shape = |text: &str| {
         for needle in [
             format!(
-                "{} is a folder above the boundary's program directory",
+                "{} is on the path above the boundary's program directory",
                 paths.program_top.display()
             ),
             "It is refused because it could not be opened or read to be checked".to_owned(),
@@ -730,7 +728,7 @@ fn a_volume_that_is_not_there_is_refused_by_the_program_walk_as_a_root_that_is_n
         .expect_err("a program tree on a drive that is not there")
         .to_string();
     for needle in [
-        format!("{letter}\\ is a folder above the boundary's program directory"),
+        format!("{letter}\\ is on the path above the boundary's program directory"),
         "the root of its volume is not there".to_owned(),
         "Nothing was changed".to_owned(),
         "Run the setup program again when it can be read.".to_owned(),
@@ -768,7 +766,7 @@ fn a_program_tree_known_folder_taken_away_after_the_shape_check_is_refused_by_th
         .to_string();
     for needle in [
         format!(
-            "{} is a folder above the boundary's program directory",
+            "{} is on the path above the boundary's program directory",
             top.display()
         ),
         "It is refused because it could not be opened or read to be checked".to_owned(),
@@ -806,7 +804,7 @@ fn a_data_tree_known_folder_taken_away_after_the_shape_check_is_refused_by_the_d
         .to_string();
     for needle in [
         format!(
-            "{} is a folder above the boundary's data directory",
+            "{} is on the path above the boundary's data directory",
             program_data.display()
         ),
         "It is refused because it could not be opened or read to be checked".to_owned(),
@@ -844,7 +842,7 @@ fn a_link_that_points_nowhere_at_the_program_directorys_name_gets_the_links_own_
     assert!(text.contains("it is a reparse point"), "{text}");
     assert!(
         text.contains(&format!(
-            "Remove the link {} itself",
+            "Remove {} itself, and not what it points to",
             paths.program.display()
         )),
         "{text}"
@@ -886,7 +884,10 @@ fn a_link_in_the_program_directory_is_to_be_removed_as_the_link_itself() {
         .to_string();
     assert!(text.contains("it is a reparse point"), "{text}");
     assert!(
-        text.contains(&format!("Remove the link {} itself", link.display())),
+        text.contains(&format!(
+            "Remove {} itself, and not what it points to",
+            link.display()
+        )),
         "{text}"
     );
     assert!(text.contains("not what it points to"), "{text}");
@@ -1114,7 +1115,7 @@ fn a_removal_where_nothing_is_installed_promises_no_repair() {
     assert!(text.contains("it is a reparse point"), "{text}");
     assert!(
         text.contains(&format!(
-            "Remove the link {} itself",
+            "Remove {} itself, and not what it points to",
             paths.program.display()
         )),
         "{text}"

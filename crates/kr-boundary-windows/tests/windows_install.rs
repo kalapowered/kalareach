@@ -352,7 +352,7 @@ fn installation_lays_down_and_removal_restores() {
         messages::APPLICATION_CONTROL_STARTING,
         "application control has started",
         "the policy is written",
-        "the platform has applied the policy",
+        "the platform reports that it applied a policy after the write",
         "an unlisted program was refused",
     ] {
         let found = output[at..]
@@ -819,7 +819,7 @@ fn a_failure_at_any_step_is_undone_to_the_earlier_state() {
             "{step}: {output}"
         );
         assert!(
-            output.contains("the earlier state is back"),
+            output.contains("the removal after the failure finished"),
             "{step}: {output}"
         );
         assert_eq!(
@@ -842,7 +842,7 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
     account::delete(CHECKOUT).unwrap();
     assert_ne!(code, 0, "{output}");
     assert!(
-        output.contains(CHECKOUT) && output.contains("did not make it"),
+        output.contains(CHECKOUT) && output.contains("no manifest of the installation records it"),
         "{output}"
     );
     assert_eq!(snapshot(), before);
@@ -944,7 +944,7 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     let refused = install::check_data_parent(&paths_under(&inherited)).unwrap_err();
     let text = refused.to_string();
     assert!(
-        text.contains("holds the boundary's data"),
+        text.contains("keeps the boundary's data"),
         "what the folder is: {text}"
     );
     assert!(text.contains("is refused because"), "why: {text}");
@@ -2179,7 +2179,7 @@ fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link
     // The folder keeps the list it inherited, which lets ordinary accounts add to it.
     for text in refused(&paths, "a folder that others can change") {
         assert!(
-            text.contains("is a folder above the boundary's program directory"),
+            text.contains("is on the path above the boundary's program directory"),
             "{text}"
         );
         assert!(text.contains(&above.display().to_string()), "{text}");
@@ -2338,7 +2338,7 @@ fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of
         );
         assert!(text.contains("NTFS"), "{text}");
         assert!(text.contains("the volume uses FAT32"), "{text}");
-        assert!(text.contains(r"Y:\ is a folder above"), "{text}");
+        assert!(text.contains(r"Y:\ is on the path above"), "{text}");
         assert!(!text.contains("Make the Administrators group"), "{text}");
         assert!(!text.contains("Close the program"), "{text}");
         assert!(text.contains("This layout is not supported"), "{text}");
@@ -3242,7 +3242,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     // it, whatever it holds.
     let root = paths.run.join("ab".repeat(16));
     owned_dir(&root);
-    refused_with("no journal names it");
+    refused_with("names it as unfinished work");
     let unfinished = journal_naming(&paths.journal, &"ab".repeat(16), 7, false);
     give_to(&root, &name);
     let text = install::make_data_directory(&paths)
@@ -3262,7 +3262,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     // journal names, with the entry to remove.
     std::fs::remove_file(&unfinished).unwrap();
     let finished = journal_naming(&paths.journal, &"ab".repeat(16), 8, true);
-    refused_with("no journal names it");
+    refused_with("names it as unfinished work");
     std::fs::remove_file(&finished).unwrap();
     std::fs::remove_dir(&root).unwrap();
 
@@ -3558,7 +3558,8 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
             other => panic!("{other:?}"),
         }
     };
-    const REFUSAL: &str = "unfinished work is recorded, so nothing was changed";
+    const REFUSAL: &str =
+        "work that is not proved done is recorded, so this removal changed nothing";
 
     // An unfinished invocation in the journal.
     let id = InvocationId([5; 16]);
@@ -3630,7 +3631,7 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_ne!(code, 0, "{output}");
     assert!(
-        output.contains("no journal names it as unfinished work")
+        output.contains("no journal that could be read names it as unfinished work")
             && output.contains("0123456789abcdef0123456789abcdef")
             && output.contains("Remove ")
             && !output.contains(REFUSAL)
@@ -3762,7 +3763,7 @@ fn an_application_identity_service_that_already_runs_is_never_stopped_and_the_ev
         .find("the policy is written")
         .expect("the policy is written");
     let applied = output
-        .find("the platform has applied the policy")
+        .find("the platform reports that it applied a policy after the write")
         .expect("the event after the write is awaited");
     assert!(written < applied, "{output}");
     let (code, output) = setup(&["remove"], "yes\n", &[]);
@@ -4524,7 +4525,7 @@ fn a_pipe_whose_connections_are_all_in_use_says_so_and_only_the_administrators_p
         let text = busy.to_string();
         assert_eq!(busy.code, 231, "{text}");
         assert!(
-            text.contains("no instance of it was listening for 10 seconds"),
+            text.contains("every open of it in 10 seconds found no free instance"),
             "{text}"
         );
         assert_eq!(

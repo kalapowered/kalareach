@@ -53,7 +53,7 @@ fn a_busy_pipe_names_other_elevated_sessions_only_for_the_administrators_pipe() 
     // that the broker serves may be in use, or the broker may have failed to make the next
     // instance, and the words do not say which.
     assert!(
-        administrators.contains("no instance of it was listening for 10 seconds"),
+        administrators.contains("every open of it in 10 seconds found no free instance"),
         "{administrators}"
     );
     assert!(
@@ -66,7 +66,7 @@ fn a_busy_pipe_names_other_elevated_sessions_only_for_the_administrators_pipe() 
     );
     let persons = busy_pipe(10, false);
     assert!(
-        persons.contains("no instance of it was listening for 10 seconds"),
+        persons.contains("every open of it in 10 seconds found no free instance"),
         "{persons}"
     );
     assert!(!persons.contains("every connection"), "{persons}");

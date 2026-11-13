@@ -399,14 +399,14 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
         if account::find(name).is_some() {
             // text: entry-1
             return Err(Error::Refused(format!(
-                "an account named {name} exists and this installation did not make it"
+                "an account named {name} exists, and no manifest of the installation records it"
             )));
         }
     }
     if service::manager()?.open(SERVICE)?.is_some() {
         // text: entry-2
         return Err(Error::Refused(format!(
-            "a service named {SERVICE} exists and this installation did not make it"
+            "a service named {SERVICE} exists, and no manifest of the installation records it"
         )));
     }
     for (directory, accepted) in [(&paths.program, false), (&paths.data, data_accepted)] {
@@ -418,7 +418,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
             records::Look::There => {
                 // text: entry-3
                 return Err(Error::Refused(format!(
-                    "{} exists and this installation did not make it",
+                    "{} exists, and no manifest of the installation records it",
                     directory.display()
                 )));
             }
@@ -508,14 +508,15 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
             return Ok(None);
         }
         // Every folder above the data parent was read before this open, so a path that is not
-        // found is a known folder, or one above it, that is gone since: a refusal as a known folder
-        // that is gone, never an absent data parent.
+        // found is a folder on its path that is gone since: a refusal, never an absent data parent.
+        // The words name the open that failed, the data parent's, and its error: no call opened
+        // the folder that is gone.
         Err(failure) if failure.code == ERROR_PATH_NOT_FOUND => {
-            let known = parent.parent().unwrap_or(parent).display().to_string();
+            let shown = parent.display().to_string();
             // text: check_data_parent_at-1
             return Err(Error::Refused(remedy::ancestor_refusal(
                 &remedy::Subject::shared(
-                    &known,
+                    &shown,
                     remedy::AncestorFault::Unreadable(&failure.to_string()),
                 ),
                 remedy::Tree::Data,
@@ -596,7 +597,7 @@ fn parent_refusal(paths: &Paths, why: &str, cure: ParentCure) -> Error {
     let remedy = remedy::parent_advice(&cure);
     // text: parent_refusal-1
     Error::Refused(format!(
-        "{} is the folder that holds the boundary's data (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns that folder, or can write or delete in it, could put data of their own in its place while the broker runs as the system. {remedy}",
+        "{} is the folder in which the installation keeps the boundary's data. It is refused because {why}. Whoever owns that folder, or can write or delete in it, could put data of their own in its place while the broker runs as the system. {remedy}",
         parent.display()
     ))
 }
@@ -748,7 +749,7 @@ fn data_refusal(paths: &Paths, why: &str, origin: &Origin) -> Error {
 fn data_failure(paths: &Paths, error: Error) -> Error {
     match error {
         Error::Win(failure) => {
-            let why = format!("it could not be opened to be checked ({failure})");
+            let why = format!("it could not be checked ({failure})");
             let origin = remedy::origin_of_open_error(failure.code, &failure.to_string());
             data_refusal(paths, &why, &origin)
         }
@@ -768,7 +769,22 @@ fn child_refusal(paths: &Paths, name: &OsStr, why: &str, origin: &Origin) -> Err
 /// to remove only when the handle shows the system's class, and moved aside when it shows another
 /// account's, a link or a second name.
 fn removal_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, origin: &Origin) -> Error {
-    refusal_with(paths, dir, name, why, EntryKind::Other, origin)
+    refusal_with(paths, dir, name, why, EntryKind::Other, origin, None)
+}
+
+/// The refusal of the manifest, or of a directory of the data directory, that the manifest's own
+/// record does not show: the entry's own handle passed its checks, so the remedy comes from the
+/// manifest's record of it, which says that nothing records what is in the entry.
+fn unrecorded_refusal(paths: &Paths, name: &OsStr, why: &str) -> Error {
+    refusal_with(
+        paths,
+        &paths.data,
+        name,
+        why,
+        kind_of(paths, &paths.data, name, true),
+        &Origin::System,
+        Some(remedy::Record::NotRecorded),
+    )
 }
 
 /// What the layout makes of the name in the directory: the manifest, the earlier-state record, a
@@ -834,6 +850,15 @@ fn origin_of_opened(opened: &Opened, kind: EntryKind) -> Origin {
     remedy::origin_of_shape(kind, shape, &|| origin_of(&opened.handle))
 }
 
+/// Why a child that was lost is refused: an open that failed was refused, and a child that is not
+/// where or what the listing said was opened and found changed or moved.
+fn lost_reason(lost: &Lost) -> String {
+    match lost {
+        Lost::Refused(_) => format!("it could not be opened to be checked ({lost})"),
+        other => format!("it changed or moved while it was read ({other})"),
+    }
+}
+
 /// What the loss of a child shows: a list that refuses the administrator, a program that holds the
 /// child, or nothing. A child that is gone since the listing is the caller's to treat as absent.
 fn origin_of_lost(lost: &Lost) -> Origin {
@@ -857,6 +882,7 @@ fn entry_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, origin: &Or
         why,
         kind_of(paths, dir, name, true),
         origin,
+        None,
     )
 }
 
@@ -876,6 +902,7 @@ fn unnamed_root_refusal(
         why,
         kind_of(paths, dir, name, false),
         origin,
+        None,
     )
 }
 
@@ -886,11 +913,12 @@ fn refusal_with(
     why: &str,
     kind: EntryKind,
     origin: &Origin,
+    record: Option<remedy::Record>,
 ) -> Error {
     let entry = dir.join(name);
     let manifest = presence_of(&paths.manifest);
-    let remedy = remedy::choose(kind, origin, &manifest);
-    let ending = remedy::ending(&entry, remedy, origin, kind, &manifest);
+    let remedy = remedy::choose(kind, origin, &manifest, record);
+    let ending = remedy::ending(&entry, remedy, origin, kind, &manifest, record);
     // text: refusal_with-1
     Error::Refused(format!(
         "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because of {}: {why}. Whatever is in it that another account made or can change could be read by the broker, running as the system, as its own. {ending}",
@@ -1241,7 +1269,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                     paths,
                     &paths.data,
                     &shown,
-                    "the installation did not make it",
+                    "the layout does not give that name there",
                     &origin,
                 ));
             }
@@ -1259,7 +1287,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 return Err(child_refusal(
                     paths,
                     &shown,
-                    &format!("it could not be opened to be checked ({lost})"),
+                    &lost_reason(&lost),
                     &origin_of_lost(&lost),
                 ));
             }
@@ -1343,11 +1371,10 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             .is_some()
     };
     if !records(&paths.data) {
-        return Err(child_refusal(
+        return Err(unrecorded_refusal(
             paths,
             &names[0].0,
             "its manifest does not record this directory, and a directory that no manifest records must be empty",
-            &Origin::System,
         ));
     }
     for (child, path) in [
@@ -1359,11 +1386,10 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             && !records(path)
             && !held.children()?.is_empty()
         {
-            return Err(child_refusal(
+            return Err(unrecorded_refusal(
                 paths,
                 path.file_name().unwrap_or_default(),
-                "no manifest records this directory, and a directory that no manifest records must be empty",
-                &Origin::System,
+                "the manifest holds no record of this directory, and a directory that the manifest holds no record of must be empty",
             ));
         }
     }
@@ -1526,7 +1552,7 @@ fn inspect_layout(
                     paths,
                     dir,
                     &shown,
-                    &format!("it could not be opened to be checked ({lost})"),
+                    &lost_reason(&lost),
                     &origin_of_lost(&lost),
                 ));
             }
@@ -1649,7 +1675,7 @@ fn program_refusal(
     let kept_directory = remedy::program_keeping(recorded, true);
     let remedy = match cure {
         Cure::OwnerAndList => format!(
-            "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. {kept}"
+            "Correct what the reason names (the Administrators group, or the system, owns it, and only the system, the Administrators group and the installer service may change it), then run the setup program again. {kept}"
         ),
         Cure::RemoveEntry => {
             remedy::program_removal_advice(&entry.display().to_string(), false, recorded)
@@ -2040,7 +2066,7 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
                     paths,
                     dir,
                     &shown,
-                    &format!("it could not be opened to be checked ({lost})"),
+                    &lost_reason(&lost),
                     &origin_of_lost(&lost),
                 ));
             }
@@ -2194,7 +2220,7 @@ fn inspect_within(
             Err(Lost::Gone) => continue,
             Err(lost) => {
                 return Err(refuse(
-                    &format!("it could not be opened to be checked ({lost})"),
+                    &lost_reason(&lost),
                     Cure::Open,
                     &origin_of_lost(&lost),
                 ));
@@ -2308,17 +2334,25 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
             // The words say that this run made the folder only where its own call did: a folder
             // that appeared between the look and the call is another program's, and the run has
             // changed nothing yet.
-            let stage = if create_data_parent(paths.data_parent())? {
+            let made = create_data_parent(paths.data_parent())?;
+            let stage = if made {
                 remedy::Stage::DataParentMade
             } else {
                 remedy::Stage::Before
             };
             check_data_parent_at(paths, stage)?.ok_or_else(|| {
                 // text: make_data_directory-1
-                Error::Failed(format!(
-                    "{} was made and is gone again",
-                    paths.data_parent().display()
-                ))
+                Error::Failed(if made {
+                    format!(
+                        "{} was made and is gone again",
+                        paths.data_parent().display()
+                    )
+                } else {
+                    format!(
+                        "something was at {} when this run tried to make it, and the open after that answered not found",
+                        paths.data_parent().display()
+                    )
+                })
             })?
         }
     };
@@ -2581,7 +2615,7 @@ pub fn qualify_git() -> Result<GitSet, Error> {
     let version = git_version(output.status.success(), &output.stdout).ok_or_else(|| {
         // text: qualify_git-5
         Error::Refused(format!(
-            "Git did not report its version: it ended with {} and wrote {:?}",
+            "Git's --version run gave no version that the policy can be written for: it ended with {} and wrote {:?}",
             output.status,
             String::from_utf8_lossy(&output.stdout).trim()
         ))
@@ -2711,18 +2745,21 @@ pub struct Options {
     pub person: Option<String>,
 }
 
-/// Asks the person to type yes after showing the notice.
+/// Asks the person to type yes after showing the notice, and the account that the broker will
+/// serve where there is one: an installation or a repair names it, and a removal enrols none.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Refused`] for any answer but yes.
-pub fn confirm(person: &str, action: &str) -> Result<(), Error> {
+pub fn confirm(person: Option<&str>, action: &str) -> Result<(), Error> {
     // text: confirm-1
     say(NOTICE);
     // text: confirm-2
     say("");
-    // text: confirm-3
-    say(&format!("The broker will serve the account {person}."));
+    if let Some(person) = person {
+        // text: confirm-3
+        say(&format!("The broker will serve the account {person}."));
+    }
     print!("Type yes to {action}: ");
     let _ = io::stdout().flush();
     let mut answer = String::new();
@@ -2766,14 +2803,22 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
         (Entry::Fresh, false) => (Manifest::begin(), false),
         (Entry::Fresh, true) => {
             // text: install-2
-            return Err(Error::Refused(
-                "nothing is installed, so there is nothing to repair".to_owned(),
-            ));
+            return Err(Error::Refused(format!(
+                "no manifest says what to repair: the data directory {} is not there, or it holds no manifest",
+                paths.data.display()
+            )));
         }
-        (Entry::Installed(_) | Entry::Partial(_), false) => {
+        (Entry::Installed(_), false) => {
             // text: install-3
             return Err(Error::Refused(
-                "the boundary is already installed or half installed: use repair or remove"
+                "a manifest of this installation is here and says that the installation finished: use repair or remove"
+                    .to_owned(),
+            ));
+        }
+        (Entry::Partial(_), false) => {
+            // text: install-3-partial
+            return Err(Error::Refused(
+                "a manifest of this installation is here and says that an installation began and did not finish: use repair or remove"
                     .to_owned(),
             ));
         }
@@ -2789,7 +2834,10 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
     let outcome = lay_down(&mut run, options, existing);
     if let Err(failure) = outcome {
         // text: install-4
-        say(&format!("the installation stopped: {failure}"));
+        say(&format!(
+            "the {} stopped: {failure}",
+            if existing { "repair" } else { "installation" }
+        ));
         if existing {
             return Err(failure);
         }
@@ -2797,7 +2845,7 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
         say("undoing what was done");
         match remove_at(paths, true, remedy::Stage::Rollback) {
             // text: install-6
-            Ok(()) => say("the earlier state is back"),
+            Ok(()) => say("the removal after the failure finished"),
             // text: install-7
             Err(error) => say(&format!(
                 "the removal after the failure also failed: {error}"
@@ -2836,7 +2884,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         holds.directory(which).map_err(|error| match error {
             Error::Refused(_) => error,
             // text: lay_down-1
-            other => Error::Failed(format!("making {what}: {other}")),
+            other => Error::Failed(format!("making or protecting {what}: {other}")),
         })?;
     }
     drop(holds);
@@ -2906,8 +2954,15 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         policy_xml: baseline_xml,
     };
     if prior.write_once(&paths.prior)? {
-        // text: lay_down-7
-        say("the earlier state is recorded");
+        if existing {
+            // text: lay_down-7-repair
+            say(
+                "no earlier-state record was there, so the state that this repair found is recorded in its place",
+            );
+        } else {
+            // text: lay_down-7
+            say("the earlier state is recorded");
+        }
     }
     inject("directories")?;
 
@@ -3041,7 +3096,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         account::hide_from_sign_in(name)?;
         // text: lay_down-11
         say(&format!(
-            "account {name} ({}) refused sign-in and hidden from the sign-in screen",
+            "account {name} ({}) refused sign-in at the screen, by Remote Desktop, as a batch job and as a service, and hidden from the sign-in screen",
             sid.to_text()
         ));
         sids.push(sid);
@@ -3113,7 +3168,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         )?;
         // text: lay_down-15
         say(&format!(
-            "application control has started, {:.0} s after the service",
+            "application control has started: this run saw the platform's report {:.0} s after it started the service",
             waited.as_secs_f32()
         ));
     }
@@ -3147,7 +3202,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     )?;
     note_call(&format!("policy applied by record {applied_record}"));
     // text: lay_down-17
-    say("the platform has applied the policy");
+    say("the platform reports that it applied a policy after the write");
     let (after_xml, after) = channel.effective()?;
     let _ = after_xml;
     let differences = after.differences(&wanted);
@@ -3238,7 +3293,7 @@ impl ProofCycle {
             if Instant::now() >= ask_until {
                 // text: prove-1
                 return Err(Error::Failed(format!(
-                    "the start-up proof's cycle of {} seconds had less than {} seconds left before the proof for {class:?} was asked",
+                    "by the installation's count, which began before it started the broker's service, the start-up proof's cycle of {} seconds had less than {} seconds left, so the proof for {class:?} was not asked",
                     self.bound.as_secs(),
                     self.margin.as_secs()
                 )));
@@ -3248,7 +3303,7 @@ impl ProofCycle {
             if Instant::now() > deadline {
                 // text: prove-2
                 return Err(Error::Failed(format!(
-                    "the broker answered the proof for {class:?} after the end of its cycle of {} seconds",
+                    "the answer to the proof for {class:?} was read after the installation's count of the start-up cycle ({} seconds from before the broker's service started) had ended, so it is not taken",
                     self.bound.as_secs()
                 )));
             }
@@ -3310,7 +3365,7 @@ fn wait_for_applied(
     let too_late = || {
         // text: wait_for_applied-1
         Error::Failed(format!(
-            "Windows did not report {what} within {} seconds",
+            "the installation did not find {what} in the application-control log within {} seconds",
             deadline.saturating_duration_since(begun).as_secs()
         ))
     };
@@ -3481,12 +3536,12 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                     let _ = fs::remove_dir(parent);
                 }
                 // text: remove_at-3
-                say("the empty data directory is removed");
+                say("the empty data directory is not there now");
                 return Ok(());
             }
             // text: remove_at-4
             return Err(Error::Failed(format!(
-                "the data directory stays because {} could not be removed. {}",
+                "the data directory stays: {}. {}",
                 stayed.join("; "),
                 records::next_step(
                     &records::look(&paths.manifest),
@@ -3516,7 +3571,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                     records::not_there_at_the_inspection(&paths.staging)
                 )));
             }
-            Err(error) => return Err(io_error("making the staging directory again")(error)),
+            Err(error) => return Err(io_error("making the staging directory")(error)),
         }
     }
     let channel = Channel::new(&paths.staging);
@@ -3532,8 +3587,17 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             let _ = service.wait_for(false, Duration::from_secs(60));
         }
         match open_session().and_then(|mut connection| {
-            ask(&mut connection, &Request::Maintenance { on: true })?;
-            Ok(connection)
+            match ask(&mut connection, &Request::Maintenance { on: true })? {
+                Response::Done {} => Ok(connection),
+                // text: remove_at-7-refused
+                Response::Refused { reason, detail } => Err(Error::Failed(format!(
+                    "the broker refused it ({reason:?}: {detail})"
+                ))),
+                // text: remove_at-7-answer
+                other => Err(Error::Failed(format!(
+                    "the broker answered with {other:?}, not that the request was carried out"
+                ))),
+            }
         }) {
             Ok(connection) => {
                 // text: remove_at-6
@@ -3542,7 +3606,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             }
             // text: remove_at-7
             Err(error) => say(&format!(
-                "the broker could not be reached, so the release will be read from the policy alone: {error}"
+                "the broker's maintenance state could not be set ({error}), so the release is not proved through the broker"
             )),
         }
     }
@@ -3557,7 +3621,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 if kept {
                     // text: remove_at-8
                     say(
-                        "an administrator's rule shares the executable collection, so the allow-all rule and the collection's mode stay in force beside it",
+                        "a rule that the installation did not make is in the executable collection, so the allow-all rule and the collection's mode stay in force beside it",
                     );
                 }
                 let drop: &[&str] = if kept {
@@ -3597,7 +3661,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                         key.set_dword("Start", prior.appid_start_type)?;
                         // text: remove_at-12
                         say(&format!(
-                            "the Application Identity service's start type is back to {}",
+                            "the Application Identity service's start value in the registry is back to {}",
                             prior.appid_start_type
                         ));
                     }
@@ -3669,7 +3733,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 }
                 Ok(())
             })(),
-            "stopping the Application Identity service",
+            "deciding whether the Application Identity service stops",
             &mut failures,
         );
     }
@@ -3685,12 +3749,14 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 if service.marked_for_deletion()? {
                     // text: remove_at-18
                     say(
-                        "the broker's service is already deleted and goes when the last program that holds it lets go",
+                        "the broker's service is already marked for deletion: the service manager removes it once it is stopped and no program holds it open",
                     );
                 } else {
                     service.delete()?;
                     // text: remove_at-19
-                    say("the broker's service is deleted");
+                    say(
+                        "the broker's service is marked for deletion: the service manager removes it once it is stopped and no program holds it open",
+                    );
                 }
             }
             Ok(())
@@ -3704,14 +3770,22 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         let name = object.id.clone();
         keep(
             (|| -> Result<(), Error> {
-                if let Some(sid) = account::find(&name) {
-                    account::revoke_all_rights(&sid)?;
-                    account::delete_profile(&sid)?;
+                let found = account::find(&name);
+                if let Some(sid) = &found {
+                    account::revoke_all_rights(sid)?;
+                    account::delete_profile(sid)?;
                 }
                 account::unhide_from_sign_in(&name)?;
                 account::delete(&name)?;
-                // text: remove_at-20
-                say(&format!("account {name} is removed with its rights"));
+                if found.is_some() {
+                    // text: remove_at-20
+                    say(&format!("account {name} is removed with its rights"));
+                } else {
+                    // text: remove_at-20-not-found
+                    say(&format!(
+                        "account {name} is not found by its name, so its rights were not taken away"
+                    ));
+                }
                 Ok(())
             })(),
             "removing an account",
@@ -3736,9 +3810,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     // began; what a journal file still holds now is finished or made nothing.
     for stayed in records::finish_journal_and_run(&paths.journal, &paths.run, seen) {
         // text: remove_at-21
-        say(&format!(
-            "removing the journal or the private roots failed: {stayed}"
-        ));
+        say(&format!("the journal or the private roots stay: {stayed}"));
         failures.push(format!(
             "removing the journal or the private roots: {stayed}"
         ));
@@ -3746,7 +3818,9 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     if let Some(prior) = &prior {
         match residue(prior, paths) {
             // text: remove_at-22
-            Ok(left) if left.is_empty() => say("the machine matches the earlier-state record"),
+            Ok(left) if left.is_empty() => say(
+                "the policy, the two accounts and their hiding, the broker's service and the program directory show no difference from the earlier-state record",
+            ),
             Ok(left) => {
                 for line in &left {
                     // text: remove_at-23
@@ -3787,7 +3861,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             );
             // text: remove_at-25
             Err(Error::Failed(format!(
-                "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}{unread_prior}",
+                "the service, the accounts and the installation's policy rules are removed, but the data directory stays: {}. {next}{unread_prior}",
                 stayed.join("; ")
             )))
         }
@@ -3881,7 +3955,7 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
     } else {
         // text: refuse_while_unfinished-2
         Err(Error::Refused(format!(
-            "unfinished work is recorded, so nothing was changed: {}",
+            "work that is not proved done is recorded, so this removal changed nothing: {}",
             found.join("; ")
         )))
     }
@@ -3913,7 +3987,7 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
             left.push(format!("the account {name} is still there"));
         }
         if account::hidden_from_sign_in(name)? {
-            left.push(format!("{name} is still hidden from the sign-in screen"));
+            left.push(format!("the sign-in list still has a value for {name}"));
         }
     }
     if let Some(service) = service::manager()?.open(SERVICE)?
@@ -3921,8 +3995,13 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
     {
         left.push("the broker's service is still there".to_owned());
     }
-    if paths.program.exists() {
-        left.push(format!("{} is still there", paths.program.display()));
+    match records::look(&paths.program) {
+        records::Look::There => left.push(format!("{} is there", paths.program.display())),
+        records::Look::NotThere => {}
+        records::Look::Unread(error) => left.push(format!(
+            "a look at {} failed ({error}), so whether it is gone is not known",
+            paths.program.display()
+        )),
     }
     Ok(left)
 }

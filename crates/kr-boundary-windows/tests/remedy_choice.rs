@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use kr_boundary_windows::remedy::{
-    AncestorFault, EntryKind, Origin, ParentCure, Presence, Remedy, Shape, Stage, Subject, Tree,
-    ancestor_refusal, choose, ending, origin_of_open_error, origin_of_shape, parent_advice,
+    AncestorFault, EntryKind, Origin, ParentCure, Presence, Record, Remedy, Shape, Stage, Subject,
+    Tree, ancestor_refusal, choose, ending, origin_of_open_error, origin_of_shape, parent_advice,
     program_removal_advice,
 };
 
@@ -48,7 +48,7 @@ fn a_record_that_another_account_made_is_moved_out_whatever_the_manifest_says() 
                 Origin::Refused("Windows error 5".to_owned()),
             ] {
                 assert_eq!(
-                    choose(kind, &origin, &manifest),
+                    choose(kind, &origin, &manifest, None),
                     Remedy::MoveAside,
                     "{kind:?} {origin:?} {manifest:?}"
                 );
@@ -62,12 +62,12 @@ fn a_record_that_could_not_be_read_is_never_corrected_or_removed_whatever_the_ma
     for kind in RECORDS {
         for manifest in lookups() {
             assert_eq!(
-                choose(kind, &held(), &manifest),
+                choose(kind, &held(), &manifest, None),
                 Remedy::Unreadable,
                 "{kind:?} {manifest:?}"
             );
             assert_eq!(
-                choose(kind, &unknown(), &manifest),
+                choose(kind, &unknown(), &manifest, None),
                 Remedy::MoveAside,
                 "{kind:?} {manifest:?}"
             );
@@ -90,13 +90,13 @@ fn a_record_of_the_systems_class_is_corrected_while_a_manifest_may_be_there_and_
                 Remedy::Correct
             };
             assert_eq!(
-                choose(kind, &Origin::System, &manifest),
+                choose(kind, &Origin::System, &manifest, None),
                 expected,
                 "{kind:?} {manifest:?}"
             );
         }
         assert_eq!(
-            choose(kind, &Origin::System, &Presence::Absent),
+            choose(kind, &Origin::System, &Presence::Absent, None),
             Remedy::Remove,
             "{kind:?}"
         );
@@ -110,7 +110,7 @@ fn a_record_of_the_systems_class_is_corrected_while_a_manifest_may_be_there_and_
 fn a_name_that_the_layout_does_not_give_takes_the_four_states_of_its_own_handle() {
     for manifest in lookups() {
         assert_eq!(
-            choose(EntryKind::Other, &Origin::System, &manifest),
+            choose(EntryKind::Other, &Origin::System, &manifest, None),
             Remedy::Remove,
             "{manifest:?}"
         );
@@ -120,13 +120,13 @@ fn a_name_that_the_layout_does_not_give_takes_the_four_states_of_its_own_handle(
             Origin::Refused("Windows error 5".to_owned()),
         ] {
             assert_eq!(
-                choose(EntryKind::Other, &origin, &manifest),
+                choose(EntryKind::Other, &origin, &manifest, None),
                 Remedy::MoveAside,
                 "{origin:?} {manifest:?}"
             );
         }
         assert_eq!(
-            choose(EntryKind::Other, &held(), &manifest),
+            choose(EntryKind::Other, &held(), &manifest, None),
             Remedy::Unreadable,
             "{manifest:?}"
         );
@@ -139,19 +139,19 @@ fn a_name_that_the_layout_does_not_give_takes_the_four_states_of_its_own_handle(
 fn a_private_root_that_no_journal_names_takes_its_remedy_from_its_handle() {
     for manifest in lookups() {
         assert_eq!(
-            choose(EntryKind::UnnamedRoot, &Origin::System, &manifest),
+            choose(EntryKind::UnnamedRoot, &Origin::System, &manifest, None),
             Remedy::Remove
         );
         assert_eq!(
-            choose(EntryKind::UnnamedRoot, &Origin::Foreign, &manifest),
+            choose(EntryKind::UnnamedRoot, &Origin::Foreign, &manifest, None),
             Remedy::MoveAside
         );
         assert_eq!(
-            choose(EntryKind::UnnamedRoot, &unknown(), &manifest),
+            choose(EntryKind::UnnamedRoot, &unknown(), &manifest, None),
             Remedy::MoveAside
         );
         assert_eq!(
-            choose(EntryKind::UnnamedRoot, &held(), &manifest),
+            choose(EntryKind::UnnamedRoot, &held(), &manifest, None),
             Remedy::Unreadable
         );
     }
@@ -208,6 +208,124 @@ fn the_words_of_a_refused_entry_say_what_the_handle_showed_and_nothing_of_who_ma
     );
 }
 
+/// An entry that the manifest holds no record of is moved aside whatever its owner shows, with a
+/// basis of its own that says what was read: the manifest's record of it, and for a directory that
+/// it holds entries. The manifest is never told to be removed: a removal reads it. The words that
+/// follow are the standing ones of the entry's kind. An entry that the manifest records, or whose
+/// record was not read, keeps the choice that its handle gives.
+#[test]
+fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_of_its_record() {
+    let data = "D:/data";
+    for origin in [Origin::System, Origin::Foreign, unknown(), held()] {
+        for kind in [
+            EntryKind::Manifest,
+            EntryKind::Staging,
+            EntryKind::Journal,
+            EntryKind::Run,
+        ] {
+            let remedy = choose(kind, &origin, &Presence::Present, Some(Record::NotRecorded));
+            assert_eq!(remedy, Remedy::MoveAside, "{kind:?} {origin:?}");
+        }
+    }
+    // What the handle chooses is chosen again where the manifest records the entry or the record was
+    // not read.
+    for record in [None, Some(Record::Recorded)] {
+        assert_eq!(
+            choose(
+                EntryKind::Staging,
+                &Origin::System,
+                &Presence::Absent,
+                record
+            ),
+            Remedy::Remove
+        );
+        assert_eq!(
+            choose(
+                EntryKind::Manifest,
+                &Origin::System,
+                &Presence::Present,
+                record
+            ),
+            Remedy::Correct
+        );
+    }
+
+    // The manifest that holds no record of its own data directory: the text names the manifest and
+    // the directory, says to keep the manifest, and ends with the standing words of a manifest.
+    let manifest = format!("{data}/manifest.json");
+    let text = ending(
+        Path::new(&manifest),
+        Remedy::MoveAside,
+        &Origin::System,
+        EntryKind::Manifest,
+        &Presence::Present,
+        Some(Record::NotRecorded),
+    );
+    assert!(
+        text.starts_with(&format!(
+            "The manifest in {data} holds no record of {data} itself, so nothing records what {data} holds."
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("and do not remove it. Move it aside: out of the data directory"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Keep it: it may be the record of an installation."),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("or to close the program that holds it open."),
+        "{text}"
+    );
+    assert!(!text.contains("Correct what the reason names"), "{text}");
+    assert!(!text.contains("Remove "), "{text}");
+
+    // A directory that the manifest holds no record of and that holds entries.
+    for (kind, next) in [
+        (
+            EntryKind::Staging,
+            "An installation or a repair run next finds the entry absent and makes it new.",
+        ),
+        (
+            EntryKind::Journal,
+            "An installation or a repair run next finds the entry absent and makes it new.",
+        ),
+        (
+            EntryKind::Run,
+            "An installation or a repair run next finds the entry absent and makes it new.",
+        ),
+    ] {
+        let entry = format!("{data}/child");
+        let text = ending(
+            Path::new(&entry),
+            Remedy::MoveAside,
+            &Origin::System,
+            kind,
+            &Presence::Present,
+            Some(Record::NotRecorded),
+        );
+        assert!(
+            text.starts_with(&format!(
+                "The manifest holds no record of {entry}, and {entry} holds entries: nothing shows what wrote them."
+            )),
+            "{kind:?}: {text}"
+        );
+        assert!(
+            text.contains("Move it aside: out of the data directory"),
+            "{kind:?}: {text}"
+        );
+        assert!(text.ends_with(next), "{kind:?}: {text}");
+        assert!(!text.contains("Keep it"), "{kind:?}: {text}");
+        assert!(
+            !text.contains("Correct what the reason names"),
+            "{kind:?}: {text}"
+        );
+        assert!(!text.contains("Remove "), "{kind:?}: {text}");
+    }
+}
+
 /// An open that failed shows what its error shows: a list that refuses, a program that holds the
 /// entry, or nothing.
 #[test]
@@ -222,8 +340,15 @@ fn an_open_error_is_told_apart_by_what_it_shows() {
 }
 
 fn said(kind: EntryKind, origin: &Origin, manifest: &Presence) -> (Remedy, String) {
-    let remedy = choose(kind, origin, manifest);
-    let text = ending(Path::new("D:\\data\\entry"), remedy, origin, kind, manifest);
+    let remedy = choose(kind, origin, manifest, None);
+    let text = ending(
+        Path::new("D:\\data\\entry"),
+        remedy,
+        origin,
+        kind,
+        manifest,
+        None,
+    );
     (remedy, text)
 }
 
@@ -245,6 +370,7 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
         &Origin::System,
         EntryKind::Journal,
         &Presence::Present,
+        None,
     );
     assert!(text.contains(STAYS), "{text}");
     // With no manifest, or none read, nothing is said to stay beside the entry.
@@ -402,8 +528,9 @@ fn a_link_at_the_folder_above_the_data_directory_is_told_as_one_at_an_own_folder
         for never in [
             "Move the folder aside",
             "rename",
-            "Remove",
-            "remove",
+            "Remove ",
+            "remove it",
+            "remove the",
             "Correct its list",
             "did not make this folder",
         ] {
@@ -620,8 +747,11 @@ fn the_parenthesis_about_a_new_name_beside_an_entry_does_not_promise_its_removal
 fn in_the_program_directory_a_link_is_removed_as_the_link_itself_and_not_what_it_leads_to() {
     let entry = r"D:\Program Files\KalaReach\Boundary\link";
     let link = program_removal_advice(entry, true, true);
+    // Any reparse tag is a reparse point here, not a link: the words say which they know.
     assert!(
-        link.starts_with(&format!("Remove the link {entry} itself")),
+        link.starts_with(&format!(
+            "{entry} is a reparse point (a link, a mounted folder or another kind), which the installation does not make there. Remove {entry} itself"
+        )),
         "{link}"
     );
     assert!(link.contains("not what it points to"), "{link}");

@@ -52,13 +52,14 @@ fn every_state() -> Vec<(EntryKind, Origin, Presence)> {
 #[test]
 fn no_ending_of_an_entry_claims_the_journal_or_what_the_entry_holds() {
     for (kind, origin, manifest) in every_state() {
-        let remedy = choose(kind, &origin, &manifest);
+        let remedy = choose(kind, &origin, &manifest, None);
         let text = ending(
             Path::new(r"D:\data\entry"),
             remedy,
             &origin,
             kind,
             &manifest,
+            None,
         );
         let what = format!("{kind:?} {origin:?} {manifest:?}: {text}");
         assert!(!text.contains("stay where they are"), "{what}");
@@ -134,7 +135,9 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
     assert!(flag.contains("setCaseSensitiveInfo"), "{flag}");
     let owner = data_ending(&Origin::System, false);
     assert!(
-        owner.contains("Make the Administrators group its owner"),
+        owner.contains(
+            "Leave the system and the Administrators group as the only entries of its list"
+        ),
         "{owner}"
     );
     assert!(CASE_SENSITIVE_WHY.starts_with("it separates names that differ only by case"));
@@ -178,10 +181,9 @@ fn an_entry_that_could_not_be_opened_is_not_said_to_be_held_by_a_program() {
         text.contains("If its list refuses the check, correct who may open it."),
         "{text}"
     );
-    assert!(
-        text.contains("If it is a link, remove the link itself and not what it points to;"),
-        "{text}"
-    );
+    // An open that failed is no sign of a link or of a file: the advice names neither.
+    assert!(!text.contains("link"), "{text}");
+    assert!(!text.contains("not a folder"), "{text}");
     assert!(!text.starts_with("Close the program"), "{text}");
     assert!(text.ends_with(program_keeping(true, true)), "{text}");
 }
@@ -190,7 +192,10 @@ fn an_entry_that_could_not_be_opened_is_not_said_to_be_held_by_a_program() {
 /// broker is doing.
 #[test]
 fn a_root_that_no_journal_names_is_not_said_to_be_idle() {
-    assert_eq!(UNNAMED_ROOT_WHY, "no journal names it as unfinished work");
+    assert_eq!(
+        UNNAMED_ROOT_WHY,
+        "no journal that could be read names it as unfinished work"
+    );
 }
 
 /// A data directory that stayed empty is said to be held only as a condition.

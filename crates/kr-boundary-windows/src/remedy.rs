@@ -154,15 +154,37 @@ pub enum Remedy {
     Unreadable,
 }
 
-/// The remedy for a refused entry of the given kind, from what its handle showed (`origin`) and
-/// from the lookup of the manifest. A record is corrected into place only when its handle shows the
+/// What the manifest's own record showed of a refused entry, where the refusal read it: the
+/// manifest was read and either records the entry or holds no record of it. A refusal that did not
+/// read the manifest's record passes none, and its remedy comes from the entry's own handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Record {
+    /// The manifest was read and records the entry.
+    Recorded,
+    /// The manifest was read and holds no record of the entry, so nothing records what is in it.
+    NotRecorded,
+}
+
+/// The remedy for a refused entry of the given kind, from what its handle showed (`origin`), from
+/// what the manifest's record of it showed (`record`) and from the lookup of the manifest. An entry
+/// that the manifest holds no record of is moved aside, whatever its owner shows: nothing shows
+/// what wrote what is in it, and removing a record, the manifest above all, would hide what a
+/// removal reads. A record is corrected into place only when its handle shows the
 /// system's class and a manifest may be there; it is removed only when its handle shows the system's
 /// class and nothing records it. A name that the layout does not give is no record, and takes the
 /// same four states: it is removed when its handle shows the system's class, moved aside when it
 /// shows another account's, a link or a second name or when its list refuses the check, and
 /// closed on when a program holds it.
 #[must_use]
-pub fn choose(kind: EntryKind, origin: &Origin, manifest: &Presence) -> Remedy {
+pub fn choose(
+    kind: EntryKind,
+    origin: &Origin,
+    manifest: &Presence,
+    record: Option<Record>,
+) -> Remedy {
+    if record == Some(Record::NotRecorded) {
+        return Remedy::MoveAside;
+    }
     match origin {
         Origin::Foreign | Origin::Refused(_) | Origin::Unknown(_) | Origin::Changed(_) => {
             Remedy::MoveAside
@@ -188,7 +210,9 @@ pub fn ending(
     origin: &Origin,
     kind: EntryKind,
     manifest: &Presence,
+    record: Option<Record>,
 ) -> String {
+    let data = entry.parent().map(|data| data.display().to_string());
     let entry = entry.display();
     match remedy {
         Remedy::Remove => {
@@ -201,7 +225,17 @@ pub fn ending(
             }
         }
         Remedy::MoveAside => {
+            let not_recorded = record == Some(Record::NotRecorded);
             let basis = match origin {
+                _ if not_recorded && kind == EntryKind::Manifest => {
+                    let data = data.unwrap_or_default();
+                    format!(
+                        "The manifest in {data} holds no record of {data} itself, so nothing records what {data} holds."
+                    )
+                }
+                _ if not_recorded => format!(
+                    "The manifest holds no record of {entry}, and {entry} holds entries: nothing shows what wrote them."
+                ),
                 Origin::Refused(error) => format!(
                     "Nothing shows who made {entry}: it could not be opened ({error}). A permission list that refuses the Administrators group gives that error, and no list of the installation's does; an entry with a delete pending gives it too, and a rename of such an entry fails: if its delete is pending, close the program that holds it, and the entry goes."
                 ),
@@ -230,8 +264,13 @@ pub fn ending(
                 }
                 EntryKind::Other => "The next run finds the entry absent.",
             };
+            let kept = if not_recorded && kind == EntryKind::Manifest {
+                " Keep it: it may be the record of an installation."
+            } else {
+                ""
+            };
             format!(
-                "{basis} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again. {next}"
+                "{basis} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again.{kept} {next}"
             )
         }
         Remedy::Unreadable => format!(
@@ -597,9 +636,11 @@ pub fn hello_failure(failure: &crate::frame::FrameError) -> String {
     }
 }
 
-/// The words of an open of the broker's pipe that found no instance listening for `seconds`. Every
-/// connection that the broker serves may be in use, or the broker may have failed to make the next
-/// instance, and the words claim neither. The platform's error follows them after a colon, so they
+/// The words of the opens of the broker's pipe that found no free instance in `seconds`. Each open
+/// found the pipe busy; the wait between two opens is not read, so an instance that listened and
+/// was taken by another client in between is not excluded, and the words claim only the opens.
+/// Every connection that the broker serves may be in use, or the broker may have failed to make the
+/// next instance, and the words claim neither. The platform's error follows them after a colon, so they
 /// end with no full stop. Only the administrators' pipe says that other elevated sessions may hold
 /// it: the persons' pipe is held by persons, which the words do not claim.
 #[must_use]
@@ -611,7 +652,7 @@ pub fn busy_pipe(seconds: u64, administrators: bool) -> String {
         ""
     };
     format!(
-        "the broker's pipe stayed busy: no instance of it was listening for {seconds} seconds{held_by}"
+        "the broker's pipe stayed busy: every open of it in {seconds} seconds found no free instance{held_by}"
     )
 }
 
@@ -621,8 +662,9 @@ pub enum Stage {
     /// The run has changed nothing yet: the folder is read before anything is made, written or
     /// stopped.
     Before,
-    /// An installation had already made changes, which the manifest records, when the folder was
-    /// read again.
+    /// An installation had already made changes when the folder was read again: the manifest
+    /// records the objects that it laid down, and not the earlier-state record or the folder that
+    /// holds the data directory.
     After,
     /// A repair had already made changes when the folder was read again. A repair has no rollback.
     AfterRepair {
@@ -634,8 +676,8 @@ pub enum Stage {
     /// else, when that folder was read again. No manifest records it, and a later rollback leaves
     /// it. The words say nothing of what is in it, which nothing has looked at yet.
     DataParentMade,
-    /// A removal that undoes an installation that failed read the folder. The removal has changed
-    /// nothing; what the installation had made before it failed is still there.
+    /// A removal that undoes an installation that failed read the folder. The removal had removed
+    /// nothing yet.
     Rollback,
 }
 
@@ -645,7 +687,7 @@ impl Stage {
         match self {
             Stage::Before => "Nothing was changed.",
             Stage::After => {
-                "This run had already made changes before it read the folder again, and the manifest records them."
+                "This run had already made changes before it read the folder again. The manifest records the objects that it laid down; it does not record the earlier-state record or the folder that holds the data directory, which this run may have made."
             }
             Stage::AfterRepair {
                 broker_stopped: true,
@@ -661,7 +703,7 @@ impl Stage {
                 "This run had already made the folder that holds the data directory before it read the folder again, and the folder stays."
             }
             Stage::Rollback => {
-                "This removal, which undoes the installation that failed, had changed nothing when it read the folder: whatever that installation had already made is still there."
+                "This removal, which undoes the installation that failed, had removed nothing when it read the folder."
             }
         }
     }
@@ -736,11 +778,11 @@ fn below(tree: Tree) -> &'static str {
 /// add an instruction to change the folder.
 fn shared_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage) -> String {
     let below = below(tree);
-    let head = format!("{folder} is a folder above the boundary's {below}.");
+    let head = format!("{folder} is on the path above the boundary's {below}.");
     let (found, ending) = match fault {
         AncestorFault::Alias(found) => (
             format!(
-                "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread."
+                "{folder} is a drive letter whose root opens as {found}. The installation reads every folder above the boundary's {below} up to the root of a volume, and a tree reached through {folder} would leave the folders above {found}, if there are any, unread."
             ),
             Ending::Layout,
         ),
@@ -826,20 +868,20 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
     };
     match fault {
         AncestorFault::Link => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is a reparse point, such as a link or a mounted folder. {} {kept}",
+            "{folder} is on the path above the boundary's {below}. It is refused because it is a reparse point, such as a link or a mounted folder. {} {kept}",
             own_link_words(stage)
         ),
         AncestorFault::NotAFolder => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} Remove or rename what is in its place if nothing else needs it, then run the setup program again. {kept}"
+            "{folder} is on the path above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} Remove or rename what is in its place if nothing else needs it, then run the setup program again. {kept}"
         ),
         AncestorFault::Leads(found) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because the folder that it opens is at {found}, not at {folder}. {changes} The setup program makes this folder itself, as a plain folder, at its own path in the system's own known folder, and it directs no change to a folder that other programs share. {kept}"
+            "{folder} is on the path above the boundary's {below}. It is refused because the folder that it opens is at {found}, not at {folder}. {changes} The setup program makes this folder itself, as a plain folder, at its own path in the system's own known folder, and it directs no change to a folder that other programs share. {kept}"
         ),
         AncestorFault::Unreadable(error) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} If a program holds it open, close that program, then run the setup program again. {kept}"
+            "{folder} is on the path above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} If a program holds it open, close that program. If its list refuses the open, correct who may open it. Then run the setup program again. {kept}"
         ),
         AncestorFault::Writable(why) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, or change its entries or its list, could replace that program. {changes} Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. {kept}"
+            "{folder} is on the path above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, or change its entries or its list, could replace that program. {changes} Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. {kept}"
         ),
         AncestorFault::Alias(_)
         | AncestorFault::Volume(_)
@@ -864,11 +906,11 @@ fn own_link_words(stage: Stage) -> String {
 
 /// The words the refusal of the data directory itself ends with when its handle shows the system's
 /// class as its owner: what the administrator does. Nothing the installation recorded is removed.
-const DATA_REMEDY: &str = "Make the Administrators group its owner and leave the system and the Administrators group as the only entries of its list, then run the setup program again. Nothing in it is removed.";
+const DATA_REMEDY: &str = "Leave the system and the Administrators group as the only entries of its list, then run the setup program again. Nothing in it is removed.";
 
 /// The words the refusal of a data directory ends with when its handle shows that the installation
 /// did not make it (another account owns it, or it is a link or not a directory).
-const DATA_NOT_MADE: &str = "The handle of this directory shows that the installation did not make it, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
+const DATA_NOT_MADE: &str = "The handle of this directory shows what the installation does not leave there: an owner that is not the system or the Administrators group, a reparse point, or an object that is not a directory. It can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
 
 /// The words the refusal of a data directory ends with when its list refuses the open, or the open
 /// failed for a reason that shows nothing: the installation's lists never refuse the administrator,
@@ -906,7 +948,7 @@ pub fn data_ending(origin: &Origin, case_sensitive: bool) -> &'static str {
 /// Why a private root is refused when no journal names it: what the journals say, and nothing of
 /// what the broker is doing.
 // text: UNNAMED_ROOT_WHY
-pub const UNNAMED_ROOT_WHY: &str = "no journal names it as unfinished work";
+pub const UNNAMED_ROOT_WHY: &str = "no journal that could be read names it as unfinished work";
 
 /// What a refusal in the program directory says is kept: the program directory or the entry in it
 /// is not removed, and the manifest is said to record the installation and stay only where one was
@@ -933,7 +975,7 @@ pub fn program_keeping(recorded: bool, whole_directory: bool) -> &'static str {
 // text: program_open_advice
 pub fn program_open_advice(entry: &str, keeping: &str) -> String {
     format!(
-        "If a program holds {entry} open, close that program. If its list refuses the check, correct who may open it. If it is a link, remove the link itself and not what it points to; if it is not a folder, remove that entry and nothing else. Then run the setup program again. {keeping}"
+        "If a program holds {entry} open, close that program. If its list refuses the check, correct who may open it. Then run the setup program again. {keeping}"
     )
 }
 
@@ -952,7 +994,7 @@ pub fn program_removal_advice(entry: &str, link: bool, repair: bool) -> String {
     };
     if link {
         format!(
-            "Remove the link {entry} itself, and not what it points to (`rmdir` without `/s` removes a link to a folder, and `del` a link to a file), and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. {after}"
+            "{entry} is a reparse point (a link, a mounted folder or another kind), which the installation does not make there. Remove {entry} itself, and not what it points to (`rmdir` without `/s` removes a reparse point to a folder, and `del` one to a file), and nothing else: a change of its owner or its list does not cure that. {after}"
         )
     } else {
         format!(
@@ -1394,7 +1436,7 @@ pub fn application_control_set(enforced: &[&str], ruled: &[&str]) -> String {
         facts.push(format!("it holds rules in {}", ruled.join(", ")));
     }
     format!(
-        "The effective application control policy is not empty: {}. The installation does not go on beside a policy that it did not write. This run had already made or protected the data directory and the directories in it before it read the policy, and the manifest records them. The folder that holds the data directory is one that this run made unless it was already there, and no manifest records that folder.",
+        "The effective application control policy is not empty: {}. The installation does not go on beside a policy that is not empty. This run had already made or protected the data directory and the directories in it before it read the policy, and the manifest records them. The folder that holds the data directory is one that this run made unless it was already there, and no manifest records that folder.",
         facts.join(" and ")
     )
 }
@@ -1425,17 +1467,22 @@ pub fn empty_config_advice(entry: &str, repair: bool) -> String {
 #[must_use]
 // text: appid_start_type_left
 pub fn appid_start_type_left(current: u32, recorded: Option<&str>, prior: u32) -> String {
-    let recorded = recorded.and_then(|detail| detail.strip_prefix("start="));
-    match recorded {
+    let number = recorded.and_then(|detail| detail.strip_prefix("start="));
+    match number {
         Some(number) if number == current.to_string() && current == prior => format!(
             "the Application Identity service's start type is {current}, the same as the installation recorded and the earlier-state record holds: there is nothing to put back"
         ),
         Some(number) => format!(
             "the Application Identity service's start type is {current}, not the {number} that the installation recorded, so it is left alone"
         ),
-        None => format!(
-            "the Application Identity service's start type is {current}, and the installation recorded no start type for it, so it is left alone"
-        ),
+        None => match recorded {
+            Some(detail) => format!(
+                "the Application Identity service's start type is {current}, and the installation's record for it is not a start type ({detail}), so it is left alone"
+            ),
+            None => format!(
+                "the Application Identity service's start type is {current}, and the installation recorded no start type for it, so it is left alone"
+            ),
+        },
     }
 }
 

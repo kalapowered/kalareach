@@ -54,7 +54,7 @@ pub fn main() -> ExitCode {
             };
             person.map_err(install::Error::from).and_then(|person| {
                 install::confirm(
-                    &person,
+                    Some(&person),
                     if repair {
                         "repair the boundary"
                     } else {
@@ -64,11 +64,8 @@ pub fn main() -> ExitCode {
                 install::install(&paths, &options, repair)
             })
         }
-        Command::Remove => install::confirm(
-            "(no account is enrolled by a removal)",
-            "remove the boundary",
-        )
-        .and_then(|()| install::remove(&paths, false)),
+        Command::Remove => install::confirm(None, "remove the boundary")
+            .and_then(|()| install::remove(&paths, false)),
         Command::Status => install::entry(&paths).map(|entry| match entry {
             Entry::Fresh => println!("not installed"),
             Entry::Installed(manifest) => println!(
