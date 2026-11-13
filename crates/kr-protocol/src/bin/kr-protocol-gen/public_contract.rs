@@ -39,6 +39,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use kr_protocol::method::MethodName;
 use kr_protocol::retained::{Difference, DifferenceKind, differences};
 use serde_json::Value;
 
@@ -130,17 +131,6 @@ pub fn compare(old: &Value, new: &Value) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Whether `name` has the shape of a method's name: words of lower-case letters, digits and
-/// underscores, with single dots between.
-fn is_a_method_name(name: &str) -> bool {
-    name.split('.').all(|word| {
-        !word.is_empty()
-            && word
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    })
-}
-
 /// Whether `keyword` with `value` only describes a schema to its reader and decides nothing: a
 /// `description` or a `title` that is a text, which is what the comparer leaves out.
 fn is_an_annotation(keyword: &str, value: &Value) -> bool {
@@ -150,9 +140,9 @@ fn is_an_annotation(keyword: &str, value: &Value) -> bool {
 /// The names that the `Method` definition of `schema` accepts, when it is the definition that the
 /// rule for a new method is written for, and none otherwise. That is a `oneOf` list and nothing
 /// else (annotations aside), every branch of it a plain text constant (`const` a text, `type`
-/// "string", annotations aside), every name in the shape of a method's name and every name once.
-/// Such a definition accepts exactly its names. Any other shape accepts something that its names
-/// do not say, or has names that the rule cannot read.
+/// "string", annotations aside), every name a method's name as the protocol writes it
+/// ([`MethodName`]) and every name once. Such a definition accepts exactly its names. For any other
+/// shape the rule does not say what the definition accepts, so it reads no names.
 fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
     let definition = schema["$defs"]["Method"].as_object()?;
     if !definition
@@ -173,25 +163,96 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
         if branch.get("type")?.as_str()? != "string" {
             return None;
         }
-        if !is_a_method_name(name) || !names.insert(name) {
+        if MethodName::new(name).is_err() || !names.insert(name) {
             return None;
         }
     }
     Some(names)
 }
 
-/// Whether `difference` is one new method: the addition of a variant that `Method` gains, where
-/// `Method` is in both schemas the list of plain text constants that [`plain_method_names`]
-/// describes, every name of the earlier list is in the new one, and the line is about a name that
-/// the new list adds. The rule is then the difference of two sets of names, and the definition
-/// accepts exactly the names that the new list has over the earlier one.
+/// Whether every use of the definition `name` in `schema` is one where a wider definition makes the
+/// place that uses it accept more: a use as a property, an item, an additional or pattern property,
+/// in an `anyOf` or an `allOf`, or as a whole definition, through any chain of definitions that
+/// reach it. A use in a `oneOf` (a value that matched one branch can then match two), in a `not`, in
+/// an `if` or under any other keyword is not one: a wider definition there can make the place
+/// refuse a value that it accepted, or accept one that it refused.
+fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
+    let Some(definitions) = schema["$defs"].as_object() else {
+        return true;
+    };
+    let mut reaching: BTreeSet<&str> = BTreeSet::from([name]);
+    loop {
+        let known = reaching.len();
+        for (definition, node) in definitions {
+            let mut found = Vec::new();
+            references(node, "", &mut found);
+            if found.iter().any(|(_, target)| {
+                target
+                    .strip_prefix("#/$defs/")
+                    .is_some_and(|target| reaching.contains(target))
+            }) {
+                reaching.insert(definition);
+            }
+        }
+        if reaching.len() == known {
+            break;
+        }
+    }
+    definitions
+        .values()
+        .all(|node| widens_with(node, &reaching, true))
+}
+
+/// Whether every `$ref` under `node` to a definition of `reaching` stands where a wider definition
+/// widens the place: `widening` says that the path to `node` has only such places.
+fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
+    match node {
+        Value::Object(members) => members
+            .iter()
+            .all(|(keyword, member)| match keyword.as_str() {
+                "$ref" => {
+                    widening
+                        || member
+                            .as_str()
+                            .and_then(|target| target.strip_prefix("#/$defs/"))
+                            .is_none_or(|target| !reaching.contains(target))
+                }
+                "properties" | "patternProperties" if member.is_object() => member
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|named| named.values())
+                    .all(|schema| widens_with(schema, reaching, widening)),
+                "items" | "additionalProperties" | "anyOf" | "allOf" | "prefixItems" => {
+                    widens_with(member, reaching, widening)
+                }
+                _ => widens_with(member, reaching, false),
+            }),
+        Value::Array(items) => items
+            .iter()
+            .all(|item| widens_with(item, reaching, widening)),
+        _ => true,
+    }
+}
+
+/// Whether `difference` is one new method: the addition of a variant that `Method` gains. Every one
+/// of these holds, or it is a difference like any other:
+///
+/// * `Method` is, in both schemas, the list of plain text constants that [`plain_method_names`]
+///   describes, so it accepts exactly its names;
+/// * every name of the earlier list is in the new one;
+/// * the line is about a name that the new list adds;
+/// * every use of `Method` in both schemas is one where a wider `Method` only widens the place that
+///   uses it ([`is_used_only_where_it_widens`]).
+///
+/// Then the new schema accepts what the earlier one did, and at each place that uses `Method`
+/// that name besides, and nothing else.
 ///
 /// The label of a line says where it is and not which list it came from: other lists have the
 /// place `Method` as its `oneOf` does (its `anyOf`, the inner list of a nullable pair, a
 /// definition that an old reference to `Method` is compared with), and two lines of them can be
-/// one. So the label only says which name the line is about, and the shape of the definition
-/// decides. Where the shape does not hold, no line under `Method` passes, and each is reported as
-/// it is.
+/// one. So the label only says which name the line is about, and the shape of `Method` and the
+/// uses of it decide. Where they do not hold, this rule excuses no line under `Method`, and each
+/// is reported as it is.
 fn is_an_added_method(old: &Value, new: &Value, difference: &Difference) -> bool {
     if difference.kind != DifferenceKind::Added || difference.detail != "a variant" {
         return false;
@@ -202,7 +263,10 @@ fn is_an_added_method(old: &Value, new: &Value, difference: &Difference) -> bool
     let (Some(before), Some(after)) = (plain_method_names(old), plain_method_names(new)) else {
         return false;
     };
-    before.is_subset(&after) && after.difference(&before).any(|added| *added == name)
+    before.is_subset(&after)
+        && after.difference(&before).any(|added| *added == name)
+        && is_used_only_where_it_widens(old, "Method")
+        && is_used_only_where_it_widens(new, "Method")
 }
 
 /// The name of the member that `difference` adds directly to the configuration document: the only

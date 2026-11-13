@@ -548,7 +548,8 @@ fn nullable(branches: &[Value]) -> Option<&Value> {
 /// What tells one branch of a choice from the others: a text constant (`const:` and the text), a
 /// constant that is not a text (`value:` and its JSON text, so that the number 5 and the text "5"
 /// are two branches), a reference, the one key of a variant carried by name, the constant member
-/// of a variant carried with a tag, or else the names of its members.
+/// of a variant carried with a tag, the names of its members, its `type` (`type:`), or else
+/// `any`.
 fn head(branch: &Value) -> String {
     if let Some(constant) = branch.get("const") {
         return match constant.as_str() {
@@ -600,10 +601,10 @@ type BranchKey = (String, usize);
 /// which adds no part to the place; a definition that an old reference is compared with, whose
 /// place is the old reference's name; and what stands beside a reference. Branches of lists nested
 /// in one another can share a label too, since a text can hold a `#`. Two differences of different
-/// lists can be one line, of which the comparison keeps one. So a rule that excuses a line never
-/// decides by its label alone: it decides by the shape of the definition that the label names
-/// (`is_an_added_method` in `public_contract.rs` reads the whole of `Method`), and the label only
-/// says which branch the line is about.
+/// lists can be one line, of which the comparison keeps one. So a rule that excuses a line must
+/// not decide by its label alone: `is_an_added_method` in `public_contract.rs` decides by the shape
+/// of the whole of `Method` and by how the schema uses it, and the label only says which branch the
+/// line is about.
 fn branch_label(place: &str, (text, number): &BranchKey) -> String {
     if *number == 0 {
         format!("{place}#{text}")

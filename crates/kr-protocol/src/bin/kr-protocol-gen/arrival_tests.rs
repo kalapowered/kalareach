@@ -902,8 +902,9 @@ fn a_nested_branch_cannot_pass_as_a_new_method_by_its_label() {
 
 /// Other lists have the place `Method` as its `oneOf` has: its `anyOf` and the inner list of a
 /// nullable pair. A branch of one of them gives the line of a new method, so the line of a new
-/// method passes only where `Method` is a `oneOf` list and nothing else in both schemas; none of
-/// these does.
+/// method passes only where `Method` is a plain `oneOf` list in both schemas. None of these is:
+/// each has an `anyOf` and a branch that is not a text constant (an `anyOf` beside a plain `oneOf`
+/// is held by the keyword loop of the case for definitions that are not plain lists).
 #[test]
 fn a_list_of_another_keyword_at_the_place_of_method_does_not_pass_as_a_new_method() {
     let integer = || json!({ "type": "integer" });
@@ -1082,11 +1083,111 @@ fn a_definition_that_is_not_a_list_of_plain_text_constants_passes_no_line() {
     }
 }
 
+/// A new name makes a place that uses `Method` accept more only where that place gains values
+/// when `Method` does. A use inside a `oneOf` beside a branch that accepts the new name, inside a
+/// `not` or inside an `if` can lose or gain values the other way, and the comparer reports a use
+/// that is the same in both schemas at no line, so the change shows only as a new name under
+/// `Method`. No line under `Method` passes where a place uses it so, directly or through another
+/// definition that reaches it.
+#[test]
+fn a_new_method_does_not_pass_where_a_use_of_method_does_not_widen() {
+    let reference = json!({ "$ref": "#/$defs/Method" });
+    for (extra, says) in [
+        (
+            json!({ "Call": { "type": "object", "properties": { "method": { "oneOf": [
+                reference.clone(), { "const": "b", "type": "string" } ] } } } }),
+            // The old schema accepts "b" as a `Call.method` (only the second branch matches); the
+            // new one refuses it (both match).
+            "a oneOf beside a branch that accepts the new name",
+        ),
+        (
+            json!({ "Name": { "type": "string", "not": reference.clone() } }),
+            // The old schema accepts "b" as a `Name`; the new one refuses it.
+            "a not",
+        ),
+        (
+            json!({ "Envelope": { "type": "object",
+                "if": { "properties": { "method": reference.clone() } },
+                "then": true, "else": { "maxProperties": 1 } } }),
+            // The new schema accepts `{"method": "b", "x": 1}`, which the old one refuses.
+            "an if",
+        ),
+        (
+            json!({
+                "Holder": { "type": "object", "properties": { "m": reference.clone() } },
+                "Choice": { "oneOf": [{ "$ref": "#/$defs/Holder" }, { "type": "object" }] },
+            }),
+            // Through another definition: the old schema accepts `{"m": "b"}` as a `Choice` (only
+            // the plain object matches); the new one refuses it (both branches match).
+            "a oneOf beside a branch, one definition away",
+        ),
+    ] {
+        let lines = level_lines(
+            &with_methods(&extra, &["a"]),
+            &with_methods(&extra, &["a", "b"]),
+        );
+        assert_eq!(lines, vec![added("b")], "{says}");
+    }
+    // The use is in one schema only: the use is a difference of its own beside the new name, and
+    // the new name does not pass for either direction of the change.
+    let using = json!({ "Name": { "type": "string", "not": reference } });
+    let without = json!({ "Name": { "type": "string" } });
+    for (old, new) in [(&using, &without), (&without, &using)] {
+        let lines = level_lines(&with_methods(old, &["a"]), &with_methods(new, &["a", "b"]));
+        assert!(lines.contains(&added("b")), "{lines:?}");
+    }
+}
+
+/// Where every use of `Method` widens with it, the new name passes: a use as a property (also one
+/// whose name is a keyword), an item, an additional property, a pattern property, in an `anyOf`,
+/// an `allOf`, a nullable pair, beside an annotation, as a whole definition, through another
+/// definition, and nowhere at all.
+#[test]
+fn a_new_method_passes_where_every_use_of_method_widens() {
+    let reference = || json!({ "$ref": "#/$defs/Method" });
+    let uses = json!({
+        "Property": { "type": "object", "properties": {
+            "method": reference(), "not": reference(), "oneOf": reference() } },
+        "Items": { "type": "array", "items": reference() },
+        "Open": { "type": "object", "additionalProperties": reference() },
+        "Pattern": { "type": "object", "patternProperties": { "^m": reference() } },
+        "Either": { "anyOf": [reference(), { "type": "integer" }] },
+        "Both": { "allOf": [reference(), { "type": "string" }] },
+        "Nullable": { "anyOf": [reference(), { "type": "null" }] },
+        "Described": { "$ref": "#/$defs/Method", "description": "a method" },
+        "Chain": { "type": "object", "properties": { "inner": { "$ref": "#/$defs/Property" } } },
+    });
+    assert!(
+        level_lines(
+            &with_methods(&uses, &["a"]),
+            &with_methods(&uses, &["a", "b"])
+        )
+        .is_empty()
+    );
+    let none = json!({ "Other": { "type": "string" } });
+    assert!(
+        level_lines(
+            &with_methods(&none, &["a"]),
+            &with_methods(&none, &["a", "b"])
+        )
+        .is_empty()
+    );
+}
+
+/// A schema whose only definitions are `extra` and a `Method` that lists `names`.
+fn with_methods(extra: &Value, names: &[&str]) -> Value {
+    let mut definitions = extra.clone();
+    definitions["Method"] =
+        json!({ "oneOf": names.iter().map(|name| method(name)).collect::<Vec<_>>() });
+    json!({ "$defs": definitions })
+}
+
 /// A name that has not the shape of a method's name (lower-case letters, digits and underscores in
 /// words, with single dots between) is no new method, whether it is the line's name or any other
 /// name of the old list or the new one: the definition is then not the list the rule is for. In
-/// each case the new schema accepts a text that the old one refuses, which no method's name says;
-/// `a#b`, `a[0]`, `a{}` and `x@1` are also the labels that a nested or numbered branch has.
+/// each case the new schema accepts a text that the old one refuses, which no method's name says.
+/// `#`, `[`, `{` and `@` are the characters that labels are made of, so a name that holds one can
+/// look like the label of a nested or numbered branch.
 #[test]
 fn a_name_that_is_not_the_shape_of_a_methods_is_no_new_method() {
     for name in [
@@ -1140,8 +1241,8 @@ fn a_name_that_is_not_the_shape_of_a_methods_is_no_new_method() {
 
 /// The names of the old list are all in the new list, and each name stands once in its list. A
 /// method that goes beside one that arrives is a difference, so a new method does not pass there:
-/// the old schema accepted "b". A name twice in the old list or in the new list leaves the new
-/// method as a difference: "a" is refused by `oneOf` in the list that holds it twice.
+/// the old schema accepted "b". A name twice in a list is refused by that list's `oneOf` (the text
+/// "a" in the old list below, the text "b" in the new one), so no new method passes beside it.
 #[test]
 fn a_new_method_passes_only_beside_the_old_names_each_once() {
     // "b" goes and "c" arrives.
