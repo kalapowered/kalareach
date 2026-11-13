@@ -1091,21 +1091,9 @@ fn a_known_folder_that_is_not_its_own_final_path_is_refused_with_what_it_leads_t
             r"\\?\C:\Shared\ProgramData",
             r"C:\Shared\ProgramData",
         ),
-        (
-            r"\\server\share\Data",
-            r"\\?\UNC\server\share\Data",
-            r"\\server\share\Data",
-        ),
-        (PF_FINAL, PF_FINAL, PF),
-        (r"C:\Program Files\", PF_FINAL, PF),
         ("E:", r"\\?\E:\", r"E:\"),
         ("E:/", r"\\?\E:\", r"E:\"),
         (r"\\?\Volume{0-1}\", r"\\?\E:\", r"E:\"),
-        (
-            r"\\server\share\",
-            r"\\?\UNC\server\share\",
-            r"\\server\share\",
-        ),
     ];
     for (given, found, leads_to) in forms {
         for tree in [Tree::Program, Tree::Data] {
@@ -1128,6 +1116,9 @@ fn a_known_folder_that_is_not_its_own_final_path_is_refused_with_what_it_leads_t
                 text.contains(&format!("that folder's own path is {leads_to}.")),
                 "{given}: {text}"
             );
+            // The words say that a path leads elsewhere only where the two paths, as they are
+            // shown, differ: the text never shows one path twice as two.
+            assert_ne!(leads_to, given, "{given}: {text}");
             assert!(text.contains(&supported_layout(tree)), "{given}: {text}");
             assert!(!text.contains("root of a volume"), "{given}: {text}");
             assert!(!text.contains("overlaps"), "{given}: {text}");
@@ -1138,6 +1129,97 @@ fn a_known_folder_that_is_not_its_own_final_path_is_refused_with_what_it_leads_t
                     "{given} {cause}: {text}"
                 );
             }
+        }
+    }
+}
+
+/// A known folder whose path, as the system gave it, is its own final path in the forms that the
+/// system itself writes (with or without the `\\?\` prefix, the case of ASCII letters, a trailing
+/// backslash) is never refused for that: the shape check goes on to the root and overlap tests.
+#[test]
+fn a_known_folder_equal_to_its_final_path_is_never_refused() {
+    let program_files = [
+        (PF, PF_FINAL),
+        (PF_FINAL, PF_FINAL),
+        (PF, PF),
+        (r"c:\program files", PF_FINAL),
+        (r"\\?\c:\PROGRAM FILES", PF_FINAL),
+        (r"C:\Program Files\", PF_FINAL),
+        (r"\\?\C:\Program Files\", PF_FINAL),
+        (PF, r"\\?\C:\Program Files\"),
+    ];
+    let program_data = [
+        (PD, PD_FINAL),
+        (PD_FINAL, PD_FINAL),
+        (r"c:\programdata", PD_FINAL),
+        (r"\\?\C:\PROGRAMDATA", PD_FINAL),
+        (r"C:\ProgramData\", PD_FINAL),
+    ];
+    for (given, found) in program_files.into_iter().chain(program_data) {
+        assert!(is_the_place_asked_for(given, found), "{given} {found}");
+    }
+    for (given, found) in program_files {
+        let refusal = shape_refusal(&known(given, found), &known(PD, PD_FINAL), Stage::Before);
+        assert_eq!(refusal, None, "{given} {found}");
+    }
+    for (given, found) in program_data {
+        let refusal = shape_refusal(&known(PF, PF_FINAL), &known(given, found), Stage::Before);
+        assert_eq!(refusal, None, "{given} {found}");
+    }
+    // A drive's name without its backslash is not the root that its final path is.
+    assert!(!is_the_place_asked_for("E:", r"\\?\E:\"));
+    assert!(is_the_place_asked_for(r"E:\", r"\\?\E:\"));
+    assert!(!is_the_place_asked_for("E:/", r"\\?\E:\"));
+    // A forward slash, another letter and a short name are not forms that the system writes.
+    assert!(!is_the_place_asked_for("C:/Program Files", PF_FINAL));
+    assert!(!is_the_place_asked_for(r"C:\PROGRA~1", PF_FINAL));
+    assert!(!is_the_place_asked_for(r"D:\Program Files", PF_FINAL));
+}
+
+/// A known folder whose final path is on a network share gets the words of a volume that the
+/// installation does not use, before any comparison of the two paths: it is on another computer
+/// whatever its given path says, and the text shows the folder once, never one path as two.
+#[test]
+fn a_known_folder_on_a_network_share_gets_the_words_of_a_volume_that_is_not_used() {
+    let forms = [
+        (r"\\server\share\Data", r"\\?\UNC\server\share\Data"),
+        (r"\\?\UNC\server\share\Data", r"\\?\UNC\server\share\Data"),
+        (r"\\SERVER\Share\Data", r"\\?\UNC\server\share\Data"),
+        (r"\\server\share\", r"\\?\UNC\server\share\"),
+        (r"\\server\share\Data\", r"\\?\UNC\server\share\Data"),
+    ];
+    for (given, found) in forms {
+        for tree in [Tree::Program, Tree::Data] {
+            let (files, data) = match tree {
+                Tree::Program => (known(given, found), known(PD, PD_FINAL)),
+                Tree::Data => (known(PF, PF_FINAL), known(given, found)),
+            };
+            let text = shape_refusal(&files, &data, Stage::Before)
+                .unwrap_or_else(|| panic!("{given} for {tree:?} is refused"));
+            let above = match tree {
+                Tree::Program => "above the boundary's program directory",
+                Tree::Data => "above the boundary's data directory",
+            };
+            assert!(
+                text.starts_with(&format!("{given} is a folder {above}")),
+                "{given}: {text}"
+            );
+            assert!(
+                text.contains(
+                    "It is on a volume that the installation does not use (the volume is on another computer, and only local volumes are supported)."
+                ),
+                "{given}: {text}"
+            );
+            // The folder is named once: no second path, and no word that a path leads elsewhere.
+            assert_eq!(
+                text.to_lowercase().matches("server").count(),
+                1,
+                "{given}: {text}"
+            );
+            assert!(!text.contains("is not the final path"), "{given}: {text}");
+            assert!(!text.contains("own path"), "{given}: {text}");
+            assert!(text.contains(&supported_layout(tree)), "{given}: {text}");
+            shape_words(&text);
         }
     }
 }

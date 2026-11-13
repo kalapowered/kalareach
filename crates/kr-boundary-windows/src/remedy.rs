@@ -326,6 +326,11 @@ pub fn rights_finding(identity: &str, mask: u32) -> String {
     )
 }
 
+/// The reason that a volume on another computer is not used: the words of the volume check's
+/// refusal and of the shape check's, which reads a share in a final path.
+pub const REMOTE_VOLUME: &str =
+    "the volume is on another computer, and only local volumes are supported";
+
 /// Whether a folder's final path, as the system gives it, is on a network share
 /// (`\\?\UNC\server\share`). The folders above a share are the server's, not the ones that the
 /// installation read, so no check that compares a final path with a supplied path accepts one.
@@ -355,16 +360,27 @@ fn plain_path(text: &str) -> String {
 }
 
 /// Whether the folder that a path leads to is the one that was asked for: its final path, as the
-/// system gives it, is the supplied path, ignoring case and the `\\?\` prefix of the extended form,
-/// and is not on a network share. A link, a mounted folder or an alias above the folder leads
-/// somewhere else.
+/// system gives it, is the supplied path, and is not on a network share. The two are compared in
+/// the forms that the system itself writes for one folder, on both sides: with or without the `\\?\`
+/// prefix of the extended form, in any case of ASCII letters, with or without a trailing backslash
+/// (the root of a drive keeps its backslash: `E:` is not `E:\`). A forward slash, a short name, a
+/// link, a mounted folder or an alias above the folder leads somewhere else.
 #[must_use]
 pub fn is_the_place_asked_for(supplied: &str, final_path: &str) -> bool {
-    !is_on_a_network_share(final_path)
-        && final_path
-            .strip_prefix(r"\\?\")
-            .unwrap_or(final_path)
-            .eq_ignore_ascii_case(supplied)
+    /// The path without the extended prefix and without a trailing backslash that is not a drive's own.
+    fn bare(path: &str) -> &str {
+        let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+        match path.strip_suffix('\\') {
+            Some(shorter) if !is_a_drive_name(shorter) => shorter,
+            _ => path,
+        }
+    }
+    !is_on_a_network_share(final_path) && bare(supplied).eq_ignore_ascii_case(bare(final_path))
+}
+
+/// Whether a text is a drive's name (`C:`), with no folder and no backslash after it.
+fn is_a_drive_name(text: &str) -> bool {
+    matches!(text.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic())
 }
 
 /// What was found at a folder of the walk that reads the folders above and around the
@@ -867,10 +883,15 @@ pub struct KnownFolder<'a> {
 ///
 /// 1. a known folder that could not be opened is refused with the words of a folder that could not
 ///    be opened;
-/// 2. a known folder whose path is not its own final path is refused with what it leads to: a link
+/// 2. a known folder whose final path is on a network share is refused with the words of a volume
+///    that the installation does not use;
+/// 3. a known folder whose path is not its own final path is refused with what it leads to: a link
 ///    or a mounted folder at it, a short name, a forward slash, a substituted letter and another
-///    form of its letters all end here, and the root and overlap tests never read a spelling;
-/// 3. the final paths alone are then compared: a known folder that is the root of a volume (so no
+///    form of its letters all end here, and the root and overlap tests never read a spelling. A
+///    path that is its own final path in the forms that the system writes (with or without the
+///    extended prefix, in any case of ASCII letters, with or without a trailing backslash) is not
+///    refused for that;
+/// 4. the final paths alone are then compared: a known folder that is the root of a volume (so no
 ///    folder is above it), and known folders that overlap (the same folder, or one at or below the
 ///    other tree's own folder, `<known>\KalaReach`).
 ///
@@ -890,6 +911,11 @@ pub fn shape_refusal(
         let leads_to;
         let fault = match known.opened {
             Err(error) => AncestorFault::Unreadable(error),
+            // A share is another computer's volume whatever its path says: its words come before
+            // any comparison of the two paths, so that a share never gets words about a path that
+            // leads elsewhere.
+            Ok(found) if is_on_a_network_share(found) => AncestorFault::Volume(REMOTE_VOLUME),
+            // The words that a path leads elsewhere are for two paths that, as shown, differ.
             Ok(found) if !is_the_place_asked_for(known.given, found) => {
                 leads_to = dos_path_of(found);
                 AncestorFault::Leads(&leads_to)
