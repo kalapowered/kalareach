@@ -1892,7 +1892,6 @@ const VERSION_RIGHTS: &[ActionRight] = &[
 /// A host whose owner has captured one version of a repository's working tree, and one more for a
 /// session, with the identifiers a device names them by.
 struct Recorded {
-    host: Host,
     owner: DeviceKeys,
     control: LocalClient,
     workspace: kr_protocol::ids::WorkspaceId,
@@ -1903,6 +1902,8 @@ struct Recorded {
     session: SessionId,
     /// When the later of the two was captured.
     captured_at_ms: kr_protocol::scalars::TimestampMs,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Recorded {

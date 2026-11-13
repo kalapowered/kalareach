@@ -41,12 +41,13 @@ pub const VIEW_ONLY: &[ActionRight] = &[ActionRight::SessionView];
 
 /// A daemon enrolled in an organisation, on clocks the suite moves.
 pub struct Fixture {
-    pub host: Host,
     pub owner: DeviceKeys,
     pub organisation: Organisation,
     pub revision: AuthorityRevision,
     pub continuous: ManualClock,
     pub moved: Arc<AtomicI64>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    pub host: Host,
 }
 
 impl Fixture {

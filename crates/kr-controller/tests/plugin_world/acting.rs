@@ -135,7 +135,6 @@ fn the_file_is_as_framed(line: &str, environment: &str) -> bool {
 /// A daemon, this process as the worker of one session, a real plugin host with the preparing
 /// component registered for one binding, and a scripted upstream behind the production transport.
 pub struct Acting {
-    pub hosted: Hosted,
     /// The connection this test registered the component over, where it registered it by hand.
     pub runtime: Option<Arc<PluginClient>>,
     /// The gate that connection runs through, which keeps the host's replies back while it is held.
@@ -152,6 +151,8 @@ pub struct Acting {
     pub native: Option<tokio::sync::Mutex<NativeTerminal>>,
     /// The binding revision the world's invocations are prepared at.
     pub revision: AgentBindingRevision,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    pub hosted: Hosted,
 }
 
 /// The native terminal's end of the production transport: the frames it writes go to the upstream

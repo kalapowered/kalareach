@@ -215,7 +215,6 @@ fn instance_of(report: &BTreeMap<String, String>) -> ApplicationInstanceId {
 struct Shell {
     /// The process group every launch this shell starts runs in, ended with the shell.
     group: LaunchGroup,
-    placed: Placed,
     runtime: tokio::runtime::Runtime,
     broker: Arc<Broker>,
     backends: Arc<CommandBackends>,
@@ -230,6 +229,8 @@ struct Shell {
     /// The forwarder the installation registers, which a package that installs no bridge of its
     /// own has its hooks run.
     registered: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    placed: Placed,
 }
 
 impl Shell {

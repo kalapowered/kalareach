@@ -400,9 +400,10 @@ KR_RUNTIME_DIR='{runtime}' KR_STATE_DIR='{state}' HOME='{home}' exec "$6" "$7" "
 /// What a test sets up: environment A, the host `kr` runs against, and environment B, which A has
 /// enrolled for a process bridge as `bravo`.
 struct Pair {
+    bridges: tempfile::TempDir,
+    // Declared last: the directory is removed after every field above has let go of its files.
     a: Host,
     b: Host,
-    bridges: tempfile::TempDir,
 }
 
 impl Pair {

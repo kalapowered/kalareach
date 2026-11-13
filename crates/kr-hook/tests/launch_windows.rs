@@ -97,7 +97,6 @@ fn parsed(text: &str) -> BTreeMap<String, String> {
 
 /// This test process, the root shell of every launch it starts.
 struct Shell {
-    placed: Placed,
     runtime: tokio::runtime::Runtime,
     broker: Arc<Broker>,
     backends: Arc<CommandBackends>,
@@ -113,6 +112,8 @@ struct Shell {
     job: SessionJob,
     /// A file the launchers it starts wait for before they start their program, where it is set.
     barrier: std::sync::Mutex<Option<PathBuf>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    placed: Placed,
 }
 
 impl Shell {

@@ -62,7 +62,6 @@ fn this_minor() -> u16 {
 
 /// A store of two releases: the one whose forwarder runs, and the one a launch's worker runs.
 struct Launch {
-    placed: Placed,
     store: Store,
     /// The release whose real forwarder runs.
     mine: ReleaseName,
@@ -72,6 +71,8 @@ struct Launch {
     out: PathBuf,
     started: PathBuf,
     go: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    placed: Placed,
 }
 
 impl Launch {

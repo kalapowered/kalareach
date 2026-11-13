@@ -3463,13 +3463,14 @@ async fn the_asking_again_of_an_announcement_is_bounded_for_all_the_workers_it_c
 /// the case does not depend on the worker refusing a page at the right moment. The daemon asks again
 /// once the limit is lifted.
 struct Unasked {
-    hosted: Hosted,
     client: LocalClient,
     /// The revocation of a grant, as the local owner sent it: repeating it repeats the action.
     mutation: MutationRequest,
     /// What the host answered the revocation with.
     given: kr_protocol::sharing::RevocationResult,
     affected: usize,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    hosted: Hosted,
 }
 
 /// A grant the host issued, which a revocation can name.

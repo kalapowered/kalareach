@@ -45,7 +45,6 @@ use plugin_world::acting::{
 /// The action has a receipt that says `accepted`, no dispatch marker and nothing written to the
 /// upstream.
 struct HeldDeviceAction {
-    acting: Acting,
     proxy: kr_ipc::client::BoundLink,
     authority: kr_ipc::client::BoundLink,
     device: kr_protocol::actor::ActorEnvelope,
@@ -53,6 +52,8 @@ struct HeldDeviceAction {
     action_id: ActionId,
     /// Lets the preparation go on.
     release: std::sync::mpsc::Sender<()>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    acting: Acting,
 }
 
 impl HeldDeviceAction {

@@ -2910,10 +2910,11 @@ async fn reached(web: &ServiceWeb, path: &str, count: usize) {
 /// A host with a backup in its service, a kit file naming it, and a folder to fill.
 struct Fixture {
     world: World,
-    rig: Rig,
     held: Vec<(String, Vec<u8>)>,
     kit: String,
     into: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 impl Fixture {

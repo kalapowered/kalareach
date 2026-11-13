@@ -232,12 +232,13 @@ async fn workspace_over(
 ///
 /// The repositories live in a directory of the rig's own, so they outlast a restart of the daemon.
 struct Rig {
-    host: Host,
     worker: Worker,
     control: LocalClient,
     work: tempfile::TempDir,
     source: PathBuf,
     workspace: WorkspaceId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Rig {
