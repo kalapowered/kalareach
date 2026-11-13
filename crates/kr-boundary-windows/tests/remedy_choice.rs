@@ -389,7 +389,7 @@ fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_o
             "{kind:?}: {text}"
         );
         assert!(
-            text.contains("Move it aside: out of the data directory"),
+            text.contains("Move it aside only if you know that nothing of an installation is left: out of the data directory"),
             "{kind:?}: {text}"
         );
         assert!(text.ends_with(next), "{kind:?}: {text}");

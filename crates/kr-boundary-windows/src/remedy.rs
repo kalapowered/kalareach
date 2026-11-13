@@ -160,11 +160,11 @@ pub enum Purpose {
 
 /// What the setup program is doing and how it finds out what its reads showed of the rest of the
 /// installation. The reads are made only when the answer can matter: a removal, a repair and a status
-/// report never read for it.
-#[derive(Clone, Copy)]
+/// report never read for it. The reads are made once, at the first question.
 pub struct Grounds<'a> {
     purpose: Purpose,
     reads: &'a dyn Fn() -> Standing,
+    answer: std::cell::OnceCell<Standing>,
 }
 
 impl<'a> Grounds<'a> {
@@ -172,7 +172,11 @@ impl<'a> Grounds<'a> {
     /// (made only for an installation, and only when an ending asks).
     #[must_use]
     pub fn new(purpose: Purpose, reads: &'a dyn Fn() -> Standing) -> Self {
-        Self { purpose, reads }
+        Self {
+            purpose,
+            reads,
+            answer: std::cell::OnceCell::new(),
+        }
     }
 
     /// The purpose of the run.
@@ -186,8 +190,23 @@ impl<'a> Grounds<'a> {
     /// installation where a read found a part of the installation or failed.
     #[must_use]
     pub fn clearance(&self) -> Option<Clearance> {
-        (self.purpose == Purpose::Install && (self.reads)() == Standing::NothingFound)
-            .then_some(Clearance(()))
+        matches!(self.standing(), Some(Standing::NothingFound)).then_some(Clearance(()))
+    }
+
+    /// Where the run is an installation and a read found a part of the installation or failed: what
+    /// that read showed, which is the reason that no move is named.
+    #[must_use]
+    // text: withheld
+    pub fn withheld(&self) -> Option<&str> {
+        match self.standing() {
+            Some(Standing::MayBeInstalled(why)) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// What the reads showed, made at the first question and only for an installation.
+    fn standing(&self) -> Option<&Standing> {
+        (self.purpose == Purpose::Install).then(|| self.answer.get_or_init(|| (self.reads)()))
     }
 }
 
@@ -275,8 +294,17 @@ pub fn choose(
 /// What the reads of the run showed, said where a step that takes an object out of its place
 /// stands: the run is an installation, and every read found nothing of the installation. The move
 /// itself rests on what the administrator knows, which no read of this program shows.
-const FOUND_NOTHING: &str =
-    "The reads of this run found no service, no account and no rule of the installation.";
+const FOUND_NOTHING: &str = "The reads of this run found no service of the installation's name, no account of the installation's two names and none of its rules. They do not see an account that was renamed.";
+
+/// Why no move is named at an installation where a read found a part of the installation or failed:
+/// the reads did not show that nothing of an installation is left. `why` is what the read showed.
+fn withheld_words(why: Option<&str>) -> String {
+    why.map_or_else(String::new, |why| {
+        format!(
+            " The reads of this run did not show that nothing of an installation is left: {why}."
+        )
+    })
+}
 
 /// The one step for an object that another account owns, where the run has no clearance to move
 /// it. It rests on what the administrator knows and on no read of this program, and it says all that
@@ -369,7 +397,7 @@ pub fn ending(
                 EntryKind::Other => "The next run finds the entry absent.",
             };
             format!(
-                "{basis} {FOUND_NOTHING} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again. {next}"
+                "{basis} {FOUND_NOTHING} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside only if you know that nothing of an installation is left: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again. {next}"
             )
         }
         Remedy::Unreadable => format!(
@@ -1052,9 +1080,8 @@ fn own_link_words(stage: Stage) -> String {
 const DATA_REMEDY: &str = "Leave the system and the Administrators group as the only entries of its list, then run the setup program again. Nothing in it is removed.";
 
 /// The words that tell an administrator to move the data directory aside. They stand only at an
-/// installation where reads that succeeded found no service, no account and no rule of the
-/// installation, and where the handle shows that the installation did not make the directory.
-const DATA_NOT_MADE: &str = "The directory can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
+/// installation where reads that succeeded found nothing of the installation, and where the handle shows that the installation did not make the directory.
+const DATA_NOT_MADE: &str = "The directory can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside only if you know that nothing of an installation is left (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
 
 /// What the handle of a data directory shows when it is a link or not a directory.
 const DATA_KIND: &str = "The handle of this directory shows a reparse point or an object that is not a directory, which the installation does not leave there.";
@@ -1079,14 +1106,15 @@ const DATA_CAN_BE_CHANGED: &str = "Whoever owns it, or can change its list, coul
 
 /// What the reads of one run showed of the rest of the installation. Only an installation can have
 /// [`Standing::NothingFound`]: see [`Grounds::clearance`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Standing {
     /// An installation, and every read of the service, of the two accounts and of the policy
     /// succeeded and found nothing of the installation.
     NothingFound,
     /// A read found a part of the installation or failed: the records in the data directory may be
-    /// the only record of what is on the computer.
-    MayBeInstalled,
+    /// the only record of what is on the computer. The text says which read found what, or failed
+    /// with which error.
+    MayBeInstalled(String),
 }
 
 /// The words that end the refusal of the data directory itself, from what its own handle showed
@@ -1106,14 +1134,18 @@ pub fn data_ending(grounds: &Grounds<'_>, origin: &Origin, case_sensitive: bool)
     match origin {
         Origin::Foreign => match grounds.clearance() {
             Some(_) => format!("{DATA_KIND} {FOUND_NOTHING} {DATA_NOT_MADE}"),
-            None => format!("{DATA_KIND} {DATA_KIND_STANDS}"),
+            None => format!(
+                "{DATA_KIND}{} {DATA_KIND_STANDS}",
+                withheld_words(grounds.withheld())
+            ),
         },
         Origin::Owned(owner) => match grounds.clearance() {
             Some(_) => format!(
                 "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. {FOUND_NOTHING} {DATA_NOT_MADE}"
             ),
             None => format!(
-                "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. The setup program does not use the records in it while that account owns it. {}",
+                "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group.{} The setup program does not use the records in it while that account owns it. {}",
+                withheld_words(grounds.withheld()),
                 owner_step("the data directory")
             ),
         },
