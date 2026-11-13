@@ -437,9 +437,43 @@ describe('where the handler’s listeners stand', () => {
     fire('visibilitychange', {} as Event)
     expect(standing(), 'listeners after the page was hidden').toEqual([])
     expect([...listening.keys()], 'visibility listener after the page was hidden').not.toContain('visibilitychange')
-    // A press that lights nothing has no look to keep and stands on no scroll.
-    fire('pointerdown', pointer(pane, { clientX: 300, clientY: 700 }))
-    expect(standing(), 'listeners for a press that lit nothing').toEqual([])
+  })
+
+  it('registers no listener for a press that lights nothing, and the ends of a press leave none of any press standing', () => {
+    viewportOf({ left: 0, top: 0, right: 390, bottom: 844 })
+    const { pane } = between({ left: 0, top: 0, right: 8, bottom: 17 })
+    start(pane)
+    clock(100)
+    const permanent = ['click', 'pointerdown']
+    const standing = (): string[] => [...listening.keys()].sort()
+    const unlit = { clientX: 300, clientY: 700 }
+    const ends: [string, () => void][] = [
+      ['a release', () => fire('pointerup', pointer(pane, { ...unlit, timeStamp: 120 }))],
+      ['a cancel', () => fire('pointercancel', pointer(pane, unlit))],
+      ['a move past the slop', () => fire('pointermove', pointer(pane, { clientX: 300, clientY: 650 }))],
+      ['a lost capture', () => fire('lostpointercapture', pointer(pane))],
+      ['a blur', () => fire('window blur', {} as Event)],
+      [
+        'a hidden page',
+        () => {
+          vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+          fire('visibilitychange', {} as Event)
+        }
+      ]
+    ]
+    for (const [end, make] of ends) {
+      fire('pointerdown', pointer(pane, unlit))
+      expect(standing(), `listeners during a press that lit nothing, before ${end}`).toEqual(permanent)
+      make()
+      expect(standing(), `listeners after ${end} of a press that lit nothing`).toEqual(permanent)
+    }
+    // A mouse press on plain text lights nothing either, and a press that lit a link and is replaced by one that lights nothing leaves no listener.
+    fire('pointerdown', pointer(pane, { ...unlit, pointerType: 'mouse' }))
+    expect(standing(), 'listeners during a mouse press on plain text').toEqual(permanent)
+    fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
+    expect(standing(), 'listeners during a press that lit a link').not.toEqual(permanent)
+    fire('pointerdown', pointer(pane, { ...unlit, pointerId: 2 }))
+    expect(standing(), 'listeners after a press that lit nothing replaced a lit one').toEqual(permanent)
   })
 
   it('opens a link for a tap on the pane’s bare area, where no message lies', () => {
