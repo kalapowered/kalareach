@@ -4720,6 +4720,9 @@ async fn a_workers_answer_to_a_local_prompt_is_not_shown_once_a_fence_lands_afte
     for (refused, fenced) in [(false, false), (true, false), (false, true), (true, true)] {
         let script = Scripted::new();
         script.accepts_prompts(!refused);
+        // A refusal that says the prompt was not taken: the fence must turn it into what the
+        // host cannot say, and not into the fence's own refusal.
+        script.refuses_with(ErrorCode::InvalidArgument);
         let world = scripted::scripted(&script).await;
         let controller = &world.controller;
         let admission = fake::admission(controller, world.accepted).await;
@@ -4760,9 +4763,9 @@ async fn a_workers_answer_to_a_local_prompt_is_not_shown_once_a_fence_lands_afte
                 }),
                 true,
                 false,
-            ) => assert_ne!(
+            ) => assert_eq!(
                 error.code,
-                ErrorCode::OutcomeUnknown,
+                ErrorCode::InvalidArgument,
                 "the worker's own refusal is given as it is: {error:?}"
             ),
             (
@@ -4783,6 +4786,95 @@ async fn a_workers_answer_to_a_local_prompt_is_not_shown_once_a_fence_lands_afte
         }
         world.serving.abort();
     }
+}
+
+/// KR-REQ-09.09: what a worker answers a local prompt with is a copy as far as the host can tell, so
+/// a withdrawal of another device that restamps the registration after the worker's answer arrived
+/// and before it is told has the caller not shown the acceptance, whose effect stands: the worker
+/// was sent the prompt once. A repeat of the prompt on the same connection is admitted under the
+/// new revision and answered from the worker's receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workers_acceptance_across_a_restamp_is_not_shown_and_the_repeat_is_answered() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_copy_meets_a_restamp::another_devices_withdrawal;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let admission = fake::admission(controller, world.accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let mutation = a_local_prompt(
+        &world,
+        &admission,
+        ActionId::new(kr_ipc::new_uuid()),
+        Nullable::null(),
+        Nullable::some(kr_protocol::agent::PromptText::new("run the tests").expect("text")),
+    );
+    let before = controller
+        .admitted_revision(admission.connection_id)
+        .expect("the connection stands")
+        .get();
+
+    let (arrived, release) = controller.pause_after_a_route_answers();
+    let door = controller.perform(&actor, admission.connection_id, None, mutation.clone());
+    let restamping = async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+            .await
+            .expect("the worker's answer arrives")
+            .expect("the pause is armed");
+        another_devices_withdrawal(controller).await;
+        release.send(()).expect("the door goes on");
+    };
+    let (told, ()) = tokio::join!(door, restamping);
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(error),
+        ..
+    }) = &told
+    else {
+        panic!("a copy across a restamp is not shown: {told:?}");
+    };
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{error:?}"
+    );
+    assert!(
+        controller
+            .admitted_revision(admission.connection_id)
+            .expect("the connection stands")
+            .get()
+            > before,
+        "the registration was restamped"
+    );
+    assert_eq!(
+        prompts_the_worker_was_asked_to_take(&script).len(),
+        1,
+        "the prompt was sent: its effect stands"
+    );
+
+    let again = controller
+        .perform(&actor, admission.connection_id, None, mutation)
+        .await;
+    assert!(
+        matches!(
+            &again,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "a repeat on the same connection is answered from the worker's receipt: {again:?}"
+    );
+    let asked = prompts_the_worker_was_asked_to_take(&script);
+    assert!(
+        asked.len() == 2 && asked[0].mutation.action_id == asked[1].mutation.action_id,
+        "the repeat reaches the worker as the same action, which it answers from its receipt"
+    );
+    world.serving.abort();
 }
 
 /// KR-REQ-14.11, KR-REQ-09.09: the same for a paired device's prompt. The record is made under the
