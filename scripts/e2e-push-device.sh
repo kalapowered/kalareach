@@ -397,7 +397,6 @@ else:
 say("the application was on its Hosts screen when the notification was tapped, and the tap opened it on its Attention screen (09.21)",
     left_on_hosts and "PUSH-TAPPED" in tapped and "Attention" in tapped, tapped[:200].replace("\n", " "))
 if platform == "ios":
-    import re
     cold = read("tapped-cold.txt")
     ended = read("cold-ended.txt").strip() == "yes"
     before = read("cold-pid-before.txt").strip()
@@ -750,10 +749,13 @@ run_android() {
 # taps. The application is sent to the background before the first delivery, so that the banner is
 # the system's and the process is suspended.
 # Says where the application is to be, and waits until the test that drives it has put it there.
-# The process identifier of the application on the simulator, when it runs.
+# The process identifier of the application on the simulator, when it runs. Fails when the simulator's
+# process list could not be read, so that an unreadable list is never taken for an absent process.
 app_pid() { # <udid>
-    xcrun simctl spawn "$1" launchctl list 2>/dev/null \
-        | awk -v id="UIKitApplication:$app_id[" 'index($3, id) == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
+    local list
+    list="$(xcrun simctl spawn "$1" launchctl list 2>/dev/null)" || return 1
+    printf '%s\n' "$list" \
+        | awk -v id="UIKitApplication:${app_id}[" 'index($3, id) == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
 }
 
 want_ios() { # foreground|background
@@ -834,7 +836,7 @@ pump_ios() { # <udid>
                 cold_gone=no
                 cold_tries=0
                 while [ "$cold_tries" -lt 20 ]; do
-                    if [ -z "$(app_pid "$udid")" ]; then cold_gone=yes; break; fi
+                    if gone="$(app_pid "$udid")" && [ -z "$gone" ]; then cold_gone=yes; break; fi
                     sleep 1
                     cold_tries=$((cold_tries + 1))
                 done
