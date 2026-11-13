@@ -38,12 +38,14 @@ final class LinkTapTests: HarnessTestCase {
         let lit: String?
     }
 
-    /// One link of the conversation as the page lays it out now: its box and the rectangles of its words.
+    /// One link of the conversation as the page lays it out now: its box, the rectangles of its words and its view,
+    /// the part of the page that every box clipping the link leaves of it.
     private struct Link {
         let name: String
         let box: CGRect
         let words: [CGRect]
         let line: CGFloat
+        let view: CGRect
     }
 
     private func recordText(_ prefix: String) -> String {
@@ -76,10 +78,11 @@ final class LinkTapTests: HarnessTestCase {
     private func links() -> [Link] {
         recordText("TAPLINKS").dropFirst("TAPLINKS".count).components(separatedBy: " ; ").compactMap { part in
             let fields = part.split(separator: " ")
-            guard fields.count >= 12, fields[0] == "L", let wordsAt = fields.firstIndex(of: "words"), let lineAt = fields.firstIndex(of: "line") else { return nil }
+            guard fields.count >= 19, fields[0] == "L", let wordsAt = fields.firstIndex(of: "words"), let lineAt = fields.firstIndex(of: "line"), let viewAt = fields.firstIndex(of: "view") else { return nil }
             let box = floats(fields[3..<7])
             let words = floats(fields[(wordsAt + 1)..<lineAt])
-            guard box.count == 4, words.count >= 4, words.count % 4 == 0, let line = Double(fields[lineAt + 1]) else { return nil }
+            let view = floats(fields[(viewAt + 1)...])
+            guard box.count == 4, view.count == 4, words.count >= 4, words.count % 4 == 0, let line = Double(fields[lineAt + 1]) else { return nil }
             let rects = stride(from: 0, to: words.count, by: 4).map {
                 CGRect(x: words[$0], y: words[$0 + 1], width: words[$0 + 2] - words[$0], height: words[$0 + 3] - words[$0 + 1])
             }
@@ -87,7 +90,8 @@ final class LinkTapTests: HarnessTestCase {
                 name: String(fields[1]),
                 box: CGRect(x: box[0], y: box[1], width: box[2] - box[0], height: box[3] - box[1]),
                 words: rects,
-                line: CGFloat(line)
+                line: CGFloat(line),
+                view: CGRect(x: view[0], y: view[1], width: view[2] - view[0], height: view[3] - view[1])
             )
         }
     }
@@ -112,7 +116,7 @@ final class LinkTapTests: HarnessTestCase {
     private func link(_ name: String) -> Link {
         guard let found = links().first(where: { $0.name == name }) else {
             XCTFail("the page lays out no link \(name)")
-            return Link(name: name, box: .zero, words: [.zero], line: 0)
+            return Link(name: name, box: .zero, words: [.zero], line: 0, view: .zero)
         }
         return found
     }
@@ -293,26 +297,18 @@ final class LinkTapTests: HarnessTestCase {
 
     /// Taps the outer boundary of the area that the page gives a link: the corners and the middle of each side, at the
     /// area's own edge (half a point inside it) and one step (two points) outside it, and the words' middle. The area is
-    /// what the rule gives: the words grown to the least size and to 22 points beside them, slid into the pane. A tap
-    /// inside opens the link once. A tap outside opens nothing by the page; where the platform's own adjustment
-    /// opens the link there, the click names the link's button.
+    /// what the rule gives: the words grown to the least size and to 22 points beside them, held to the link's view (the
+    /// pane and the message that clips it), a cut on one side given to the other. A tap inside opens the link once. A
+    /// tap outside opens nothing by the page; where the platform's own adjustment opens the link there, or the tap lands
+    /// on the link's own button (which is taller than its words at the largest size and lights by design), the system's
+    /// click names the link's button.
     private func tapAround(_ edge: Link, named: String) {
-        let least: CGFloat = 44
-        let beside: CGFloat = 22
         let edgeShift = offset(of: edge)
         let room = pane().room
         let words = edge.words[0]
-        let wide = max(least, words.width + 2 * beside)
-        let tall = max(least, words.height)
-        var left = words.midX - wide / 2
-        var right = words.midX + wide / 2
-        var top = words.midY - tall / 2
-        var bottom = words.midY + tall / 2
-        if left < room.minX { right += room.minX - left; left = room.minX }
-        if right > room.maxX { left -= right - room.maxX; right = room.maxX }
-        if top < room.minY { bottom += room.minY - top; top = room.minY }
-        if bottom > room.maxY { top -= bottom - room.maxY; bottom = room.maxY }
-        say("LINKTAP \(named): \(edge.name) words \(words), pane \(room), area \(left) \(top) \(right) \(bottom)")
+        let area = Self.areaOf(words, in: edge.view)
+        let (left, top, right, bottom) = (area.minX, area.minY, area.maxX, area.maxY)
+        say("LINKTAP \(named): \(edge.name) words \(words), pane \(room), view \(edge.view), box \(edge.box), area \(left) \(top) \(right) \(bottom)")
         let inset: CGFloat = 0.5
         let step: CGFloat = 2
         let xs = [left, (left + right) / 2, right]
@@ -330,13 +326,48 @@ final class LinkTapTests: HarnessTestCase {
                 // A step outside a side that is the pane's own edge lies outside the pane: no tap there.
                 if !room.contains(outside) { continue }
                 let beyond = tap("\(label), one step outside", at: outside, shift: edgeShift)
-                expectNotOpenedByThePage(beyond, edge.name)
+                if edge.box.intersection(edge.view).contains(outside) {
+                    expectOnTheLinksButton(beyond, edge.name)
+                } else {
+                    expectNotOpenedByThePage(beyond, edge.name)
+                }
             }
         }
         if edge.name == "at-end" {
             let outermost = tap("\(named): \(edge.name), the pane's right-most column", at: CGPoint(x: room.maxX - 1, y: words.midY), shift: edgeShift)
             expectOpened(outermost, edge.name)
         }
+    }
+
+    /// The area of the rule for one rectangle of a link's words held to the link's view: the words grown to the least
+    /// size (44 points) and to 22 points beside them; where an edge of the view cuts one side of that and the words are
+    /// wholly in view on that axis, the other side grows by what was cut; where the edge cuts through the words, only
+    /// the part in view stays.
+    private static func areaOf(_ words: CGRect, in view: CGRect) -> CGRect {
+        let least: CGFloat = 44
+        let beside: CGFloat = 22
+        let wide = max(least, words.width + 2 * beside)
+        let tall = max(least, words.height)
+        func span(_ low: CGFloat, _ high: CGFloat, _ min: CGFloat, _ max: CGFloat, whole: Bool) -> (CGFloat, CGFloat) {
+            var from = low
+            var to = high
+            if whole {
+                if from < min { to += min - from; from = min }
+                if to > max { from -= to - max; to = max }
+            }
+            return (Swift.max(from, min), Swift.min(to, max))
+        }
+        let across = span(words.midX - wide / 2, words.midX + wide / 2, view.minX, view.maxX, whole: words.minX >= view.minX && words.maxX <= view.maxX)
+        let down = span(words.midY - tall / 2, words.midY + tall / 2, view.minY, view.maxY, whole: words.minY >= view.minY && words.maxY <= view.maxY)
+        return CGRect(x: across.0, y: down.0, width: across.1 - across.0, height: down.1 - down.0)
+    }
+
+    /// A tap outside the area that lands on the link's own button: the system's click names the button, the page adds
+    /// no click, and the look lit nothing or that link, as for any press on a link's own element.
+    private func expectOnTheLinksButton(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertFalse(result.events.contains { $0.type == "click" && !$0.trusted }, "\(result.label): the page added a click on the link's own button", file: file, line: line)
+        if let disagreement = lookDisagreement(result) { XCTFail("\(result.label): \(disagreement)", file: file, line: line) }
+        XCTAssertTrue(result.opened.allSatisfy { $0.hasSuffix(name) }, "\(result.label): opened \(result.opened), expected only \(name)", file: file, line: line)
     }
 
     /// A tap outside the area: the page adds no click and lights nothing; where the platform's own adjustment opens the
@@ -374,9 +405,10 @@ final class LinkTapTests: HarnessTestCase {
         let shift = offset(of: last)
         let room = pane().room
         let words = last.words[0]
-        let area = max(44, words.height)
+        // The lowest point that the link's area or its own button reaches.
+        let lowest = max(Self.areaOf(words, in: last.view).maxY, last.box.intersection(last.view).maxY)
         for below in [12, 40, 120, 300] as [CGFloat] {
-            let y = min(words.midY + area / 2 + below, room.maxY - 2)
+            let y = min(lowest + below, room.maxY - 2)
             let bare = tap("\(named): the pane's bare area \(Int(below)) points under the link's area", at: CGPoint(x: words.midX, y: y), shift: shift)
             XCTAssertTrue(bare.events.contains { $0.type == "click" && $0.trusted }, "\(bare.label): the system sent no click to the bare area: \(bare.events.map(\.type))")
             XCTAssertFalse(bare.events.contains { $0.type == "click" && !$0.trusted }, "\(bare.label): the page added a click")
