@@ -32,7 +32,9 @@ pub enum SurfaceError {
     /// A root names no definition.
     #[error("the schema has no definition named {0}")]
     UnknownRoot(String),
-    /// A reference does not name a definition of the schema.
+    /// A reference does not name a definition of the schema; one of the schema's own root is to a
+    /// definition by its plain name only (`#/$defs/NAME`, with a NAME of ASCII letters, digits and
+    /// `_`).
     #[error("{0} is not a reference to a definition")]
     BadReference(String),
     /// The text is not a surface document.
@@ -113,7 +115,7 @@ impl Surface {
         }
         let own = own_keywords(schema);
         for reference in references(&own) {
-            let target = reference_name(&reference)?;
+            let target = plain_reference_name(&reference)?;
             if !definitions.contains_key(&target) {
                 return Err(SurfaceError::RootReference(target));
             }
@@ -318,6 +320,24 @@ fn collect_references(node: &Value, found: &mut Vec<String>) {
 fn reference_name(reference: &str) -> Result<String, SurfaceError> {
     reference
         .strip_prefix("#/$defs/")
+        .map(str::to_owned)
+        .ok_or_else(|| SurfaceError::BadReference(reference.to_owned()))
+}
+
+/// The name that a reference of the schema's own root points to: only `#/$defs/NAME` with a NAME of
+/// ASCII letters, digits and `_`. A validator reads the fragment as a JSON pointer, which decodes
+/// `~1` and `%2F` to `/` and takes a trailing `/` or `#` as more than a name, so any other text
+/// could point elsewhere than at the definition that has it as a literal name, and the comparison
+/// of the root would compare the wrong target.
+fn plain_reference_name(reference: &str) -> Result<String, SurfaceError> {
+    reference
+        .strip_prefix("#/$defs/")
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
         .map(str::to_owned)
         .ok_or_else(|| SurfaceError::BadReference(reference.to_owned()))
 }
