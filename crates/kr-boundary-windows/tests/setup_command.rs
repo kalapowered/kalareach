@@ -26,6 +26,29 @@ fn no_command_and_a_wrong_command_get_the_usage() {
     }
 }
 
+/// A removal or a status with words after it is a wrong command line, whatever the words are: it is
+/// refused with the usage, so that no known folder is read for it.
+#[test]
+fn a_command_with_words_after_it_gets_the_usage() {
+    for (words, message) in [
+        (&["remove", "--bogus"][..], "unknown argument --bogus"),
+        (&["status", "unexpected"][..], "unknown argument unexpected"),
+        (&["remove", "status"][..], "unknown argument status"),
+        (
+            &["status", "--payload", "D"][..],
+            "unknown argument --payload",
+        ),
+    ] {
+        assert_eq!(
+            rejected(words),
+            Rejected {
+                message: Some(message.to_owned())
+            },
+            "{words:?}"
+        );
+    }
+}
+
 /// A bad option of an installation or a repair is refused with its own words, for the usage to
 /// follow: a missing value, an option that is not one, and a missing payload.
 #[test]

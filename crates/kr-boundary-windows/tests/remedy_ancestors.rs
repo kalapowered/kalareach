@@ -969,8 +969,10 @@ fn a_link_at_the_boundarys_own_folder_sends_the_administrator_nowhere_else() {
 }
 
 /// A folder strictly below the known folder whose final path is not the one asked for is said as what
-/// it is, a path that leads elsewhere, and is never called a link: a short name or another spelling
-/// leads elsewhere as well. Its words are the layout's, and no word tells to change anything.
+/// it is, a folder that opens somewhere else, and is never called a link: a short name or another
+/// spelling leads elsewhere as well. It is the installation's own folder, so its words never speak
+/// of a path "that the system gives" (the system gave no path for it), and no word tells to change
+/// anything.
 #[test]
 fn a_final_path_below_the_known_folder_that_is_not_the_one_asked_for_names_no_cause() {
     let known = r"C:\Program Files";
@@ -987,13 +989,24 @@ fn a_final_path_below_the_known_folder_that_is_not_the_one_asked_for_names_no_ca
         "{text}"
     );
     assert!(
-        text.contains(r"that folder's own path is C:\Elsewhere\KalaReach."),
+        text.contains(
+            r"the folder that it opens is at C:\Elsewhere\KalaReach, not at C:\Program Files\KalaReach."
+        ),
         "{text}"
     );
-    assert!(text.contains(&supported_layout(Tree::Program)), "{text}");
-    assert!(text.ends_with(CLOSING), "{text}");
+    assert!(!text.contains("that the system gives"), "{text}");
+    assert!(!text.contains("final path"), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(text.contains("makes this folder itself"), "{text}");
+    assert!(
+        text.contains("Do not remove the program directory"),
+        "{text}"
+    );
+    assert!(
+        text.contains("it directs no change to a folder that other programs share"),
+        "{text}"
+    );
     assert!(!text.to_lowercase().contains("link"), "{text}");
-    assert!(!text.contains("makes this folder itself"), "{text}");
     assert!(instructions_in(&text).is_empty(), "{text}");
 }
 
@@ -1461,7 +1474,7 @@ fn the_line_for_a_known_folder_that_cannot_be_read_names_the_folder_and_the_erro
         "The system's Program Files folder could not be read: 0x80070003 (The system cannot find the path specified.). Nothing was changed.",
         "reads what to remove from the manifest in the data directory",
         "checks the program directory before it deletes anything",
-        "cannot go on while that folder cannot be read",
+        "cannot go on while the Program Files folder cannot be read",
         "If the boundary is installed, the broker's service, its two accounts and its rules in the policy stay.",
         "If the volume of the Program Files folder is gone for good, the setup program cannot remove them.",
     ] {

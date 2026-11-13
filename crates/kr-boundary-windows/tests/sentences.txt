@@ -54,7 +54,8 @@ ancestor_refusal | It is refused because it is a link or a mounted folder | read
 ancestor_refusal | It is refused because it is not a folder | read: attributes_of has no directory bit
 ancestor_refusal | the folder's list gives to others the right to swap a folder below it for a link, or to replace that program | read: the list of the handle; rule that names the risk
 ancestor_refusal | It is refused because it could not be opened or read to be checked (error) | read: the call failed, error printed
-ancestor_refusal | the path that the system gives for it is not the final path of the folder that it opens: that folder's own path is Y | read: SHGetKnownFolderPath and GetFinalPathNameByHandleW of the opened folder
+ancestor_refusal | the path that the system gives for it is not the final path of the folder that it opens: that folder's own path is Y | read: SHGetKnownFolderPath and GetFinalPathNameByHandleW of the opened known folder
+ancestor_refusal | the folder that it opens is at Y, not at X (a folder of the installation's own, strictly below the known folder) | read: the final path of the opened folder differs from the path that was walked
 ancestor_refusal | it is the root of a volume | read: the final path of the opened known folder has nothing after the volume's name
 ancestor_refusal | it overlaps Y, the system's other known folder | read: the two final paths
 ancestor_refusal | its volume could not be asked what it is (error) | read: the volume query failed
@@ -76,6 +77,7 @@ program_removal_advice | A repair makes the program files again | read: a manife
 shape_refusal | the refusal of a known folder that could not be opened, that leads elsewhere, that is on a share, that is a volume root or that overlaps the other | read: opened_final_path of both known folders, compared by is_the_place_asked_for, is_a_volume_root and is_at_or_below
 shape_refusal | Nothing was changed, or what this run had already changed | flow: the shape check runs first (Stage)
 known_folder_unreadable | The system's folder could not be read: status. Nothing was changed | read: SHGetKnownFolderPath returned the status
+known_folder_unreadable | A removal cannot go on while the folder cannot be read | rule: the removal reads the manifest and checks the program directory before it deletes anything
 known_folder_unreadable | If the boundary is installed, the broker's service, its two accounts and its rules in the policy stay | read: the removal could not read the known folder, so it removed nothing
 broker_not_stopped | The broker's service did not reach the stopped state | read: stop_broker returned Ok(false): the last read at the bound did not say stopped
 broker_not_stopped | What it had already changed stays, and a repair has no rollback | rule of a repair; flow: the run stopped before the program directory
@@ -107,6 +109,7 @@ data_refusal-1 | X is the boundary's data directory; it is refused because (reas
 refusal_with-1 | X is the boundary's data directory; it is refused because of an entry: reason | read: the handle of the entry (kind, owner, list, link count) or the lookup of its name; no manifest records a directory that must be empty
 program_refusal-1 | X is the program directory; it is refused because of an entry: reason | read: the handle of the entry (owner, list, kind, link count, size) against the layout's names
 program_refusal-1 | it is not empty, and the installation's own configuration is empty; it is a directory, not a file; the installation does not give that name there | read: file_size not 0; opened.kind; program_kind of the name
+check_data_parent_at-1 | the words of remedy::ancestor_refusal for the known folder above the data parent | read: the open of the data parent answered path not found after every folder above it was read, so a known folder or one above it is gone
 check_shape-1 | the words of remedy::shape_refusal | read: see shape_refusal
 check_ancestors-1 | the words of remedy::ancestor_refusal | read: see ancestor_refusal
 check_program_parents-1 | the words of remedy::ancestor_refusal | read: see ancestor_refusal
