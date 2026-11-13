@@ -9,10 +9,11 @@
 
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NONE_MAPPED};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NONE_MAPPED};
 use windows_sys::Win32::NetworkManagement::NetManagement::{
-    NERR_Success, NERR_UserNotFound, NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD,
-    UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
+    FILTER_NORMAL_ACCOUNT, MAX_PREFERRED_LENGTH, NERR_Success, NERR_UserNotFound, NetApiBufferFree,
+    NetUserAdd, NetUserDel, NetUserEnum, UF_DONT_EXPIRE_PASSWD, UF_PASSWD_CANT_CHANGE, UF_SCRIPT,
+    USER_INFO_1, USER_PRIV_USER,
 };
 use windows_sys::Win32::Security::Authentication::Identity::{
     LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose,
@@ -25,7 +26,7 @@ use windows_sys::Win32::Security::Authentication::Identity::{
 };
 use windows_sys::Win32::UI::Shell::DeleteProfileW;
 
-use super::ffi::{Named, Result, Sid, error, last, wide};
+use super::ffi::{Named, Result, Sid, error, from_wide, last, wide};
 use super::registry;
 
 /// The rights that refuse an account sign-in at the screen and by Remote Desktop, and the two
@@ -151,6 +152,10 @@ pub fn account_domain() -> Result<String> {
     }
 }
 
+/// The comment that every account of the installation carries, which a change of the account's name
+/// does not change.
+const COMMENT: &str = "KalaReach repository boundary account";
+
 /// Makes a local account: no group, a password nobody keeps that never expires and cannot be
 /// changed.
 ///
@@ -160,7 +165,7 @@ pub fn account_domain() -> Result<String> {
 pub fn create(name: &str) -> Result<Sid> {
     let mut account = wide(name);
     let mut secret = wide(&random_password());
-    let mut comment = wide("KalaReach repository boundary account");
+    let mut comment = wide(COMMENT);
     let info = USER_INFO_1 {
         usri1_name: account.as_mut_ptr(),
         usri1_password: secret.as_mut_ptr(),
@@ -181,6 +186,78 @@ pub fn create(name: &str) -> Result<Sid> {
         return Err(error(status, format!("making the account {name}")));
     }
     Sid::of_account(name)
+}
+
+/// The names of the local accounts that carry the comment which the installation gives its accounts
+/// (see [`create`]), whatever the accounts are named now: one enumeration of the local user
+/// accounts (`NetUserEnum`, level 1, which returns each account's name and comment). The comment
+/// is the installation's, so a name that an administrator gave an account of the installation does
+/// not hide it; another account that carries the same comment is found too, and that only withholds
+/// a step from a person, which is the safe direction. An account whose comment was changed is not
+/// found.
+///
+/// # Errors
+///
+/// Returns the platform's error when the enumeration fails, or an error when it answers that more
+/// data is there and returns none: nothing is then known of which accounts carry the comment.
+pub fn carrying_the_installation_comment() -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    let mut resume = 0_u32;
+    loop {
+        let mut buffer: *mut u8 = std::ptr::null_mut();
+        let mut read = 0_u32;
+        let mut total = 0_u32;
+        // SAFETY: the out parameters are this function's own for the call; the buffer that the
+        // system allocates is read below only for the answers that fill it, and freed after.
+        let status = unsafe {
+            NetUserEnum(
+                null(),
+                1,
+                FILTER_NORMAL_ACCOUNT,
+                &raw mut buffer,
+                MAX_PREFERRED_LENGTH,
+                &raw mut read,
+                &raw mut total,
+                &raw mut resume,
+            )
+        };
+        if (status == NERR_Success || status == ERROR_MORE_DATA) && !buffer.is_null() {
+            // SAFETY: for these two answers the buffer holds `read` records of the level asked for,
+            // each with NUL-terminated strings (or a null comment) that stay valid until it is freed.
+            let entries =
+                unsafe { std::slice::from_raw_parts(buffer.cast::<USER_INFO_1>(), read as usize) };
+            for entry in entries {
+                // SAFETY: the strings are the buffer's own, valid until it is freed below.
+                let (name, comment) =
+                    unsafe { (from_wide(entry.usri1_name), from_wide(entry.usri1_comment)) };
+                if comment == COMMENT {
+                    found.push(name);
+                }
+            }
+        }
+        if !buffer.is_null() {
+            // SAFETY: the buffer is the system's, from the call above, and is freed once, also for
+            // the answer that more data is there.
+            unsafe { NetApiBufferFree(buffer.cast()) };
+        }
+        if status == NERR_Success {
+            return Ok(found);
+        }
+        match status {
+            ERROR_MORE_DATA if read > 0 => {}
+            ERROR_MORE_DATA => {
+                // text: account_carrying-1
+                return Err(error(
+                    status,
+                    "enumerating the local accounts: more data was there, and none was returned",
+                ));
+            }
+            other => {
+                // text: account_carrying-2
+                return Err(error(other, "enumerating the local accounts"));
+            }
+        }
+    }
 }
 
 /// Deletes a local account. An account that is not there counts as deleted.

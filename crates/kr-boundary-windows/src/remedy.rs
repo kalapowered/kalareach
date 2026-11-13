@@ -294,7 +294,7 @@ pub fn choose(
 /// What the reads of the run showed, said where a step that takes an object out of its place
 /// stands: the run is an installation, and every read found nothing of the installation. The move
 /// itself rests on what the administrator knows, which no read of this program shows.
-const FOUND_NOTHING: &str = "The reads of this run found no service of the installation's name, no account of the installation's two names and none of its rules. They do not see an account that was renamed.";
+const FOUND_NOTHING: &str = "The reads of this run found no service of the installation's name, no account of the installation's two names and none that carries its comment, and none of its rules. They do not see an account that was renamed and whose comment was changed.";
 
 /// Why no move is named at an installation where a read found a part of the installation or failed:
 /// the reads did not show that nothing of an installation is left. `why` is what the read showed.

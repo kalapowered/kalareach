@@ -179,7 +179,7 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
                 );
                 assert_eq!(
                     text.contains(
-                        "found no service of the installation's name, no account of the installation's two names and none of its rules. They do not see an account that was renamed."
+                        "found no service of the installation's name, no account of the installation's two names and none that carries its comment, and none of its rules. They do not see an account that was renamed and whose comment was changed."
                     ),
                     moved,
                     "{what}"
