@@ -22,7 +22,7 @@ function words(left: number, top: number, width: number, height = 17): Rect {
 }
 
 function link(id: Id, rect: Rect, destination = `https://example.org/${id}`): PaneLink<Id> {
-  return { id, destination, words: [rect] }
+  return { id, destination, words: [rect], view: PANE }
 }
 
 /** Two links, one above the other, 40 px apart: the press's point decides between them. */
@@ -30,7 +30,7 @@ const UPPER = link('upper', words(16, 100, 120))
 const LOWER = link('lower', words(16, 140, 120))
 
 function layoutOf(...links: PaneLink<Id>[]): () => Layout<Id> {
-  return () => ({ links, reach: IOS, bounds: PANE })
+  return () => ({ links, reach: IOS })
 }
 
 /** A press of a finger 8 px under the upper link's words that has ended 300 ms before the click. */
@@ -146,7 +146,7 @@ describe('the nearest-words rule at the press’s point, run again at the click'
 
   it('stands when the pane scrolled between the press and the click so that the link’s words are out of view', () => {
     // The pane's view now starts 40 px below the link's words: a link out of view never opens.
-    const scrolled = () => ({ links: [UPPER], reach: IOS, bounds: { left: 0, top: 140, right: 390, bottom: 984 } })
+    const scrolled = () => ({ links: [{ ...UPPER, view: { left: 0, top: 140, right: 390, bottom: 984 } }], reach: IOS })
     expect(decide(press({ at: { x: 60, y: 145 } }), click({ point: { x: 60, y: 145 } }), scrolled)).toEqual(STAND)
   })
 
@@ -159,7 +159,7 @@ describe('the nearest-words rule at the press’s point, run again at the click'
     const at: { x: number; y: number }[] = []
     decide(press(), click({ point: { x: 64, y: 130 } }), (point) => {
       at.push(point)
-      return { links: [UPPER, LOWER], reach: IOS, bounds: PANE }
+      return { links: [UPPER, LOWER], reach: IOS }
     })
     expect(at).toEqual([{ x: 60, y: 125 }])
   })

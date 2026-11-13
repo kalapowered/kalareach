@@ -24,12 +24,11 @@ function words(left: number, top: number, width: number, height = 17): Rect {
 }
 
 /** A point, over links given by the rectangles of their words. */
-function press(x: number, y: number, links: readonly (readonly Rect[])[], reach: Reach = ANDROID, bounds: Rect = PANE): number | null {
+function press(x: number, y: number, links: readonly (readonly Rect[])[], reach: Reach = ANDROID, view: Rect = PANE): number | null {
   return linkAt(
     { x, y },
-    links.map((each) => ({ words: each })),
-    reach,
-    bounds
+    links.map((each) => ({ words: each, view })),
+    reach
   )
 }
 
@@ -440,5 +439,47 @@ describe('a link on lines taller than its words', () => {
     expect(press(60, 156, [upper, lower], IOS)).toBe(0)
     expect(press(60, 164, [upper, lower], IOS)).toBeNull()
     expect(press(60, 172.5, [upper, lower], IOS)).toBe(1)
+  })
+})
+
+describe('a link’s view: what the boxes that clip it leave of the page', () => {
+  // The inner box of a scroller inside a message, (40,100) to (350,160), in the pane (0,0) to (390,844).
+  const INNER: Rect = { left: 40, top: 100, right: 350, bottom: 160 }
+
+  it('gives no area to words that the view hides wholly, where the pane alone would show them', () => {
+    const hidden = [{ left: 22, top: 120, right: 30, bottom: 137 }]
+    expect(press(45, 145, [hidden], IOS, PANE), 'in the pane').toBe(0)
+    expect(press(45, 145, [hidden], IOS, INNER), 'in the inner box').toBeNull()
+  })
+
+  it('keeps what the view leaves of words that it cuts, and gives nothing back on the axis of the cut', () => {
+    const cut = [words(30, 120, 30)]
+    expect(press(45, 145, [cut], IOS, INNER), 'inside the view').toBe(0)
+    expect(press(35, 128, [cut], IOS, INNER), 'in the cut').toBeNull()
+    // The area reaches 22 px past the words' right edge (60): 82. The cut at the left is not given to the right.
+    expect(press(82, 128, [cut], IOS, INNER), 'at the reach').toBe(0)
+    expect(press(83, 128, [cut], IOS, INNER), 'past the reach').toBeNull()
+  })
+
+  it('gives back what the view cuts on an axis where the words are wholly in view', () => {
+    // Words at x 50 to 58: the area is x 28 to 80, and the view's left edge (40) cuts 12 px, which grows the right side to 92.
+    const words50 = [words(50, 120, 8)]
+    expect(press(92, 128, [words50], IOS, INNER), 'at the given back reach').toBe(0)
+    expect(press(93, 128, [words50], IOS, INNER), 'past it').toBeNull()
+  })
+
+  it('has no area at all in a view that is empty, though the words span the gap between two boxes', () => {
+    const empty: Rect = { left: 50, top: 100, right: 40, bottom: 160 }
+    expect(press(45, 128, [[words(30, 120, 30)]], IOS, empty)).toBeNull()
+  })
+
+  it('takes the distance to the part of the words in the link’s own view, so that hidden words are no nearer', () => {
+    // A is at the pane's corner and holds (35,40) only by the room that the corner gives back. B's tall words are
+    // nearer to that point as a whole, but its view shows only their lower part, which is farther than A's.
+    const a = { words: [words(0, 0, 8)], view: PANE }
+    const tall = { left: 40, top: 50, right: 70, bottom: 300 }
+    const b = { words: [tall], view: { left: 0, top: 200, right: 390, bottom: 844 } }
+    expect(linkAt({ x: 35, y: 40 }, [a, b], IOS)).toBe(0)
+    expect(linkAt({ x: 35, y: 40 }, [a, { words: [tall], view: PANE }], IOS), 'with B in view wholly').toBeNull()
   })
 })
