@@ -3300,13 +3300,29 @@ fn sha256_of(path: &Path) -> Result<String, Error> {
 struct Run {
     paths: Paths,
     manifest: Manifest,
+    /// A handle of the data directory, held from the step that makes or checks the directory to the
+    /// end of the run: every replacement of the manifest is named relative to it, and the manifest
+    /// is proved to be at its name by opening the name relative to it.
+    directory: Option<ffi::Handle>,
 }
 
 impl Run {
     /// Records an object and writes the manifest, before the step that makes the object.
     fn record(&mut self, kind: ObjectKind, id: &str, detail: Option<&str>) -> Result<(), Error> {
         self.manifest.record(kind, id, detail);
-        self.manifest.save(&self.paths.manifest)?;
+        self.save()
+    }
+
+    /// Writes the manifest, replacing the file whole, beside the held handle of the data directory.
+    fn save(&self) -> Result<(), Error> {
+        let Some(directory) = &self.directory else {
+            // text: run_save-1
+            return Err(Error::Failed(
+                "the manifest was to be written before a handle of the data directory was held"
+                    .to_owned(),
+            ));
+        };
+        self.manifest.save_beside(&self.paths.manifest, directory)?;
         Ok(())
     }
 }
@@ -3431,6 +3447,7 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
     let mut run = Run {
         paths: paths.clone(),
         manifest,
+        directory: None,
     };
     if !run.manifest.persons.contains(&person) {
         run.manifest.persons.push(person);
@@ -3475,6 +3492,12 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             Purpose::Install
         },
     )?;
+    // The manifest's replacements are named relative to this handle, a copy of the held directory's
+    // that stays to the end of the run, so that no path names the directory.
+    run.directory = match holds.data.handle().duplicate(LIST) {
+        Ok(copy) => Some(copy),
+        Err(error) => return Err(holds.undo(error.into())),
+    };
     // Until the first manifest is written a removal finds nothing of what this run made, so a failure
     // of the next two steps takes it away through the handles that made it.
     #[cfg(feature = "testing")]
@@ -3571,7 +3594,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         ));
     }
     run.manifest.git = Some(git);
-    run.manifest.save(&paths.manifest)?;
+    run.save()?;
 
     let appid = service::manager()?.open(APPID)?.ok_or_else(|| {
         // text: lay_down-6
@@ -3761,7 +3784,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         &BROKER_PRIVILEGES,
     )?;
     broker_service.set_security(&service_security(&run.manifest.persons))?;
-    run.manifest.save(&paths.manifest)?;
+    run.save()?;
 
     inject("service")?;
 
@@ -3868,7 +3891,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     let mut session = open_session()?;
     cycle.prove(&mut session)?;
     run.manifest.state = InstallState::Installed;
-    run.manifest.save(&paths.manifest)?;
+    run.save()?;
     // text: lay_down-20
     say("the boundary is installed and in force");
     Ok(())

@@ -16,7 +16,10 @@ use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
 use std::path::{Path, PathBuf};
 
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FILE_SHARE_READ, FileRenameInfoEx,
@@ -25,6 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::ffi;
 use super::sd::{self, OwnedSd, Principals, SdKind};
+use super::walk::{DirHandle, key_of};
 
 /// A random name: the prefix, 32 lowercase hexadecimal digits and the suffix.
 fn random_name(prefix: &str, suffix: &str) -> String {
@@ -190,17 +194,45 @@ pub fn record_file(path: &Path, only_new: bool) -> io::Result<File> {
     file_at(path, SdKind::AdminFile, only_new)
 }
 
+/// Opens a directory by its path and holds it, for a caller that holds no handle of it yet.
+///
+/// # Errors
+///
+/// Returns the platform's error when the directory cannot be opened.
+pub fn hold_directory(directory: &Path) -> io::Result<ffi::Handle> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    // The flag lets the open of a directory succeed.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)?;
+    // text: hold_directory-1
+    ffi::Handle::new(file.into_raw_handle().cast(), "holding a directory")
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
 /// Writes a record whole through one handle: a replacement is made new beside the record, with the
 /// right to delete it as well as to read and write it, and shares read only. The bytes are written
 /// and flushed through that handle, the replacement is renamed over the record's name through the
-/// same handle (a bare name, in the replacement's own directory, so that no open of the directory by
-/// a path takes place), and where a step fails the same handle marks the replacement for removal: the
-/// object that this call made is the one that goes, whatever is at its name by then.
+/// same handle, with the new name given relative to `directory`, the handle that the caller holds
+/// of the directory that holds the record (the platform reads a bare name with no directory handle
+/// relative to the process's current directory, not to the file's own). No open of the directory by
+/// a path takes place. The record is then proved to be where it is read: the record's name is opened
+/// relative to the same directory handle, and the identity of what that opens must be the identity
+/// of the object that was written. A name that is not there, a failed read or another object is a
+/// failure. Where a step fails the same handle marks the replacement for removal: the object that
+/// this call made is the one that goes, wherever it is by then.
 ///
 /// # Errors
 ///
 /// Returns the first failure, with the failure of the mark where that failed too.
-pub fn replace_whole(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn replace_whole(
+    directory: &ffi::Handle,
+    path: &Path,
+    staging: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
     let mut file = file_with_access(
         staging,
         SdKind::AdminFile,
@@ -222,7 +254,15 @@ pub fn replace_whole(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()
         "the replacement's own handle",
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
-    let Err(failure) = written.and_then(|()| rename_by_handle(&handle, path)) else {
+    let Err(failure) = written.and_then(|()| {
+        let name: Vec<u16> = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("the record has no file name"))?
+            .encode_wide()
+            .collect();
+        rename_by_handle(&handle, directory, &name)?;
+        prove_in_place(directory, &handle, &name, path)
+    }) else {
         return Ok(());
     };
     match super::root::delete(&handle) {
@@ -237,17 +277,14 @@ pub fn replace_whole(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()
     }
 }
 
-/// Renames the file behind the handle to the name of `path` in the file's own directory, over what is
-/// there, through the handle: the platform is given the bare name and no directory handle.
-fn rename_by_handle(handle: &ffi::Handle, path: &Path) -> io::Result<()> {
+/// Renames the file behind the handle to `name` in the directory that `directory` holds, over what
+/// is there, through the file's own handle. The platform reads the name relative to the directory
+/// handle in `RootDirectory` (a bare name with no directory handle is relative to the process's
+/// current directory), so no path names the directory.
+fn rename_by_handle(handle: &ffi::Handle, directory: &ffi::Handle, name: &[u16]) -> io::Result<()> {
     // The rename replaces a file that is there, and the name goes at once whatever else has it open.
     const REPLACE_IF_EXISTS: u32 = 0x1;
     const POSIX_SEMANTICS: u32 = 0x2;
-    let name: Vec<u16> = path
-        .file_name()
-        .ok_or_else(|| io::Error::other("the record has no file name"))?
-        .encode_wide()
-        .collect();
     let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
     let size = header + name.len() * 2;
     let mut buffer = vec![0_u64; size.div_ceil(8)];
@@ -256,7 +293,7 @@ fn rename_by_handle(handle: &ffi::Handle, path: &Path) -> io::Result<()> {
     // copied behind the header; nothing else points into it.
     unsafe {
         (*info).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS;
-        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).RootDirectory = directory.raw();
         (*info).FileNameLength = (name.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
@@ -278,4 +315,91 @@ fn rename_by_handle(handle: &ffi::Handle, path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Proves that the record is where it is read after the rename: the name is opened relative to the
+/// same directory handle, for its attributes only, and the identity of what it opens is compared with
+/// the identity of the object that was written. No path is opened.
+fn prove_in_place(
+    directory: &ffi::Handle,
+    written: &ffi::Handle,
+    name: &[u16],
+    path: &Path,
+) -> io::Result<()> {
+    let wrote = key_of(written).map_err(|error| {
+        io::Error::other(format!(
+            "the rename of {} returned success, and a read of the identity of the record that was written failed: {error}",
+            path.display()
+        ))
+    })?;
+    let found = match DirHandle::open_beneath(directory, name, 0, true, FILE_OPEN) {
+        Ok(found) => found,
+        Err(failure)
+            if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "the rename of {} returned success, and the open of its name in the directory that holds it answered not found, so the record is not where it is read",
+                    path.display()
+                ),
+            ));
+        }
+        Err(failure) => {
+            return Err(io::Error::other(format!(
+                "the rename of {} returned success, and the open of its name in the directory that holds it failed: {failure}",
+                path.display()
+            )));
+        }
+    };
+    let read = key_of(&found).map_err(|error| {
+        io::Error::other(format!(
+            "the rename of {} returned success, and a read of the identity of what its name opens failed: {error}",
+            path.display()
+        ))
+    })?;
+    if read != wrote {
+        return Err(io::Error::other(format!(
+            "the rename of {} returned success, and its name in the directory that holds it opens the object {read}, not the record that was written, {wrote}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A replacement is put at the record's name in the directory that holds it, whatever the
+    /// process's current directory is: a bare name that no directory handle goes with would be read
+    /// relative to the current directory, where the record would then be put and not found. The name
+    /// is proved by opening it relative to the same handle, and a second write replaces the first.
+    #[test]
+    fn a_replacement_is_put_at_the_records_name_in_its_own_directory_and_not_in_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = hold_directory(dir.path()).unwrap();
+        let record = dir.path().join("manifest.json");
+        let current = std::env::current_dir().unwrap().join("manifest.json");
+        assert!(!current.try_exists().unwrap(), "{}", current.display());
+        for (staging, bytes) in [
+            ("manifest-one.new", "first"),
+            ("manifest-two.new", "second"),
+        ] {
+            replace_whole(
+                &directory,
+                &record,
+                &dir.path().join(staging),
+                bytes.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), bytes);
+            assert!(!dir.path().join(staging).try_exists().unwrap(), "{staging}");
+        }
+        assert!(
+            !current.try_exists().unwrap(),
+            "the record went to {}",
+            current.display()
+        );
+    }
 }
