@@ -52,6 +52,18 @@ pub enum StoreError {
     // text: manifest-3
     #[error("the installation record could not be written: {0}")]
     Io(#[from] io::Error),
+    /// The earlier-state record is not what this program reads.
+    // text: manifest-4
+    #[error("the earlier-state record is not one this program reads: {0}")]
+    PriorUnreadable(String),
+    /// The earlier-state record's file could not be read.
+    // text: manifest-5
+    #[error("the earlier-state record could not be read: {0}")]
+    PriorRead(io::Error),
+    /// The earlier-state record could not be written.
+    // text: manifest-6
+    #[error("the earlier-state record could not be written: {0}")]
+    PriorIo(io::Error),
 }
 
 /// How far an installation has got.
@@ -333,17 +345,17 @@ impl Prior {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Io`] when the file cannot be written.
+    /// Returns [`StoreError::PriorIo`] when the file cannot be written.
     pub fn write_once(&self, path: &Path) -> Result<bool, StoreError> {
         let bytes = self.to_bytes()?;
         match create(path, true) {
             Ok(mut file) => {
-                file.write_all(&bytes)?;
-                file.sync_all()?;
+                file.write_all(&bytes).map_err(StoreError::PriorIo)?;
+                file.sync_all().map_err(StoreError::PriorIo)?;
                 Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(StoreError::PriorIo(error)),
         }
     }
 
@@ -351,9 +363,10 @@ impl Prior {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Unreadable`] when the record cannot be serialized.
+    /// Returns [`StoreError::PriorUnreadable`] when the record cannot be serialized.
     pub fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
-        serde_json::to_vec_pretty(self).map_err(|error| StoreError::Unreadable(error.to_string()))
+        serde_json::to_vec_pretty(self)
+            .map_err(|error| StoreError::PriorUnreadable(error.to_string()))
     }
 
     /// Reads the record at a path.
@@ -362,10 +375,10 @@ impl Prior {
     ///
     /// Returns [`StoreError`] when the file cannot be read or is not a record of this version.
     pub fn load(path: &Path) -> Result<Prior, StoreError> {
-        let prior: Prior = serde_json::from_slice(&fs::read(path).map_err(StoreError::Read)?)
-            .map_err(|error| StoreError::Unreadable(error.to_string()))?;
+        let prior: Prior = serde_json::from_slice(&fs::read(path).map_err(StoreError::PriorRead)?)
+            .map_err(|error| StoreError::PriorUnreadable(error.to_string()))?;
         if prior.store != STORE_VERSION {
-            return Err(StoreError::Unreadable(format!(
+            return Err(StoreError::PriorUnreadable(format!(
                 "version {} of the earlier-state record",
                 prior.store
             )));
@@ -564,12 +577,18 @@ mod tests {
     fn a_record_that_cannot_be_read_is_not_said_to_be_unwritable() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("manifest.json");
-        for read in [
-            Manifest::load(&missing).unwrap_err().to_string(),
-            Prior::load(&missing).unwrap_err().to_string(),
+        for (read, noun) in [
+            (
+                Manifest::load(&missing).unwrap_err().to_string(),
+                "the installation record",
+            ),
+            (
+                Prior::load(&missing).unwrap_err().to_string(),
+                "the earlier-state record",
+            ),
         ] {
             assert!(
-                read.starts_with("the installation record could not be read: "),
+                read.starts_with(&format!("{noun} could not be read: ")),
                 "{read}"
             );
             assert!(!read.contains("written"), "{read}");

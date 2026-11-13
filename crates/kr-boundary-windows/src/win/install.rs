@@ -3785,7 +3785,7 @@ impl Run {
             });
         };
         let written = fresh::write_new_beneath(directory, &self.paths.prior, &bytes, &hold)
-            .map_err(StoreError::from)?;
+            .map_err(StoreError::PriorIo)?;
         let Some(identity) = written else {
             return Ok(false);
         };
