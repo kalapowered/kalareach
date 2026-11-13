@@ -261,12 +261,15 @@ runs `scripts/check-retained-release.sh` in the same run.
 Both comparisons also read the members of each schema's root `properties`, the bundle's entries, by
 name, because a consumer reads a type through its member: the plugin SDK's TypeScript reader
 compiles each validator from `kalareach-plugin-sdk#/properties/<root>`. A member that moves to
-another definition, gains a keyword or is removed is a difference at `$root.<member>`, and so is a
-change to an inline member (`identifiers` in the protocol schema, `vocabulary` in the SDK schema).
-An entry that is a reference is compared by its text and is not followed, so a definition that is
-renamed with its member following it is a difference at the member although the definition itself
-is the same. A member that only the commit has is not a difference. A recorded surface of a
-retained level holds no root, so this comparison does not reach it.
+another definition, gains a keyword or is removed is a difference at `$root.<member>`. An entry
+that is a reference is compared by its text and is not followed, so a definition that is renamed
+with its member following it is a difference at the member although the definition itself is the
+same. An inline member (`identifiers` in the protocol schema, `vocabulary` in the SDK schema) is
+compared as any other schema is: a change to its own keywords or members is a difference at the
+member, and a reference inside it follows its definition. Every reference inside a member has to be
+`#/$defs/NAME` with a NAME of letters, digits and underscores that the schema defines, and a schema
+with another one is refused. A member that only the commit has is not a difference. A recorded
+surface of a retained level holds no root, so this comparison does not reach it.
 
 The plugin SDK schema has one more exception, for a member that the SDK's own arrival table lists.
 The table is `arrivals` in `packages/plugin-sdk/schema/package-contract.json`, generated from
@@ -341,7 +344,10 @@ schemas: `type` is `object`, there is no `additionalProperties`, and its keys ar
 `properties`, `required`, `description`, `title` and the marker. Every use of it has to be one where
 a narrower object only narrows the place (a property, an item, an additional or pattern property, an
 `anyOf` or `allOf` branch, or a whole definition), because under a `oneOf`, a `not` or an `if` the
-new member can widen it. Every other difference is reported: a member or a
+new member can widen it. The report reads both schemas whole for this, as the check of a level does
+(see [A level is one surface](#a-level-is-one-surface)): the dialect, the form of every `$ref` and
+the keywords that the check knows have to be as stated there, and the object's `required` is a list
+of distinct texts. Every other difference is reported: a member or a
 variant added to a closed object, a member, a variant or a definition removed, and any change.
 `SessionSummary.root` is one: an earlier strict reader cannot read the summary of a command session.
 No client was released, so no shim carries it. A new section of the configuration document is one

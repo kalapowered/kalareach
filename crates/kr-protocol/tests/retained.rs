@@ -1059,6 +1059,21 @@ fn a_change_of_a_member_of_the_schemas_own_root_is_a_difference() {
             json!({ "$ref": "#/$defs/Renamed" });
     });
     assert_eq!(lines(&bundle(), &renamed), ["$root.a changed: $ref"]);
+    // An inline member that is a nullable pair stays one when its null branch has a description, so
+    // a reference that becomes an inline schema is a line at the member.
+    let nullable = |first: Value| {
+        edited(&|schema| {
+            schema["properties"]["n"] =
+                json!({ "anyOf": [first.clone(), { "type": "null", "description": "none" }] });
+        })
+    };
+    assert_eq!(
+        lines(
+            &nullable(json!({ "$ref": "#/$defs/A" })),
+            &nullable(json!({ "type": "integer" }))
+        ),
+        ["$root.n changed: a reference against an inline schema"]
+    );
     // Members that are not an object of members cannot be read by name, so the cut refuses them.
     for members in [json!(["a"]), json!("a"), json!(null)] {
         let schema = edited(&|schema| schema["properties"] = members.clone());
@@ -1076,6 +1091,64 @@ fn a_change_of_a_member_of_the_schemas_own_root_is_a_difference() {
         differences(&recorded, &cut(&without_b)),
         Vec::<Difference>::new()
     );
+}
+
+/// A reference inside a member of the schema's own root, nested or beside the entry's own, has to
+/// be `#/$defs/NAME` with a NAME of ASCII letters, digits and `_` that the schema defines. The
+/// comparison of an inline member follows a nested reference only to a definition that the surface
+/// holds and passes over any other, so a reference that moves from one pointer into a definition
+/// (`#/$defs/Pair/properties/text`) to another, or to a name that the schema lacks, would be no
+/// difference though a validator that reads the member accepts other values. The cut refuses such
+/// a reference, as it does in a definition and in a keyword of the root. A definition that the
+/// surface does not hold is not refused: the cut does not follow the entries.
+#[test]
+fn a_reference_inside_a_member_of_the_schemas_own_root_has_to_name_a_definition() {
+    let schema = |entry: &Value| {
+        json!({
+            "$defs": {
+                "A": { "type": "string" },
+                "Outside": { "type": "string" },
+                "Pair": { "type": "object", "properties": {
+                    "text": { "type": "string" }, "number": { "type": "number" } } },
+            },
+            "properties": { "a": entry },
+        })
+    };
+    for (entry, wanted) in [
+        (
+            json!({ "$ref": "#/$defs/Pair/properties/text" }),
+            SurfaceError::BadReference("#/$defs/Pair/properties/text".to_owned()),
+        ),
+        (
+            json!({ "type": "array", "items": { "$ref": "#/$defs/Pair/properties/number" } }),
+            SurfaceError::BadReference("#/$defs/Pair/properties/number".to_owned()),
+        ),
+        (
+            json!({ "$ref": "#/%24defs/A" }),
+            SurfaceError::BadReference("#/%24defs/A".to_owned()),
+        ),
+        (
+            json!({ "anyOf": [{ "$ref": "#/$defs/A" }, { "$ref": "https://example.test/#/$defs/A" }] }),
+            SurfaceError::BadReference("https://example.test/#/$defs/A".to_owned()),
+        ),
+        (
+            json!({ "$ref": "#/$defs/Missing" }),
+            SurfaceError::UnknownRoot("Missing".to_owned()),
+        ),
+        (
+            json!({ "$ref": "#/$defs/A", "properties": { "x": { "$ref": "#/$defs/Missing" } } }),
+            SurfaceError::UnknownRoot("Missing".to_owned()),
+        ),
+    ] {
+        assert_eq!(
+            Surface::cut(&schema(&entry), &["A"]),
+            Err(wanted),
+            "{entry}"
+        );
+    }
+    let outside = Surface::cut(&schema(&json!({ "$ref": "#/$defs/Outside" })), &["A"])
+        .expect("a definition outside the surface");
+    assert_eq!(outside.names().collect::<Vec<_>>(), ["A"]);
 }
 
 /// A reference of the schema's own root is followed only where its name is ASCII letters, digits

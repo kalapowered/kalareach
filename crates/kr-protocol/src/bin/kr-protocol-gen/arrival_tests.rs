@@ -1771,6 +1771,23 @@ fn a_changed_or_removed_member_of_the_roots_properties_is_a_line_for_every_compa
     );
     assert_eq!(outcome.passed.len(), 1);
     assert_eq!(outcome.lines, Vec::<String>::new());
+    // A reference inside a member that is no `#/$defs/NAME` of a definition cannot be compared by
+    // any of them: the schema is refused, so the pair is not read as equal.
+    let mut pointer = old.clone();
+    pointer["properties"]["vocabulary"]["properties"]["word"] =
+        json!({ "$ref": "#/$defs/Route/properties/method" });
+    assert!(crate::public_contract::compare(&old, &pointer).is_err());
+    assert!(
+        compare_sdk_for_a_level(
+            &old,
+            &pointer,
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", None),
+            &mut Vec::new(),
+        )
+        .is_err()
+    );
 }
 
 /// Where every use of `Method` widens with it, the new name passes: a use as a property (also one
@@ -2443,10 +2460,9 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
 /// use that the walk reads. A schema that names no dialect is refused as it is for the other
 /// rules. The keyword stands in both schemas, in the earlier one only and in the new one only, so
 /// that the section is the only difference that can be excused. (A `$ref` of another form in a
-/// keyword of the root other than `properties`, and in a definition where no definition has its
-/// text as a literal name, is refused when the schema is cut, before this rule reads it; among the
-/// root's `properties`, whose references the cut does not follow, and in a definition whose literal
-/// name the text is, the walk refuses it.)
+/// keyword of the root, among its `properties` included, and in a definition where no definition
+/// has its text as a literal name, is refused when the schema is cut, before this rule reads it;
+/// in a definition whose literal name the text is, the walk refuses it.)
 #[test]
 fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
     let schema = |with_push: bool| {
@@ -2476,8 +2492,21 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         (vec![], vec!["push".to_owned()]),
         "modelled keywords"
     );
+    // A bundle entry that is a reference of another form is refused when the schema is cut, before
+    // this rule reads it.
+    let mut encoded = schema(true);
+    encoded["properties"] = json!({ "c": { "$ref": "#/%24defs/ConfigurationDocument" } });
+    assert!(
+        crate::public_contract::compare_for_a_level(
+            &schema(false),
+            &encoded,
+            &|| Ok(std::collections::BTreeSet::new()),
+            &mut Vec::new(),
+        )
+        .is_err()
+    );
     type Edit = fn(&mut Value);
-    let rows: [(&str, Edit); 12] = [
+    let rows: [(&str, Edit); 11] = [
         ("an unmodelled keyword at the root", |schema| {
             schema["x-unmodelled"] = json!(true);
         }),
@@ -2505,13 +2534,6 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         ("a recursive reference at the root", |schema| {
             schema["$recursiveRef"] = json!("#");
         }),
-        (
-            "a bundle entry that is a reference of another form",
-            |schema| {
-                schema["properties"] =
-                    json!({ "c": { "$ref": "#/%24defs/ConfigurationDocument" } });
-            },
-        ),
         (
             "a bundle entry with a keyword beside its reference",
             |schema| {

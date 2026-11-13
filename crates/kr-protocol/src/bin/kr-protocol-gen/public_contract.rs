@@ -952,9 +952,9 @@ fn plain_closed_object(definition: &str, schema: &Value, name: &str) -> Result<(
     }
     if !has_plain_forms(node) {
         return Err(format!(
-            "{definition} has a required that is not a list of texts, or a description or a title \
-             that is not a text, in {name} SDK schema, and a member listed in the arrival table has \
-             to be a member of a plain closed object"
+            "{definition} has a required that is not a list of distinct texts, or a description or a \
+             title that is not a text, in {name} SDK schema, and a member listed in the arrival \
+             table has to be a member of a plain closed object"
         ));
     }
     Ok(())

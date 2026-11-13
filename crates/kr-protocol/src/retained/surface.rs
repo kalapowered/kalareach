@@ -32,9 +32,9 @@ pub enum SurfaceError {
     /// A root names no definition.
     #[error("the schema has no definition named {0}")]
     UnknownRoot(String),
-    /// A reference does not name a definition of the schema; one of the schema's own root is to a
-    /// definition by its plain name only (`#/$defs/NAME`, with a NAME of ASCII letters, digits and
-    /// `_`).
+    /// A reference does not name a definition of the schema; one of the schema's own root, or inside
+    /// a member of its `properties`, is to a definition by its plain name only (`#/$defs/NAME`,
+    /// with a NAME of ASCII letters, digits and `_`).
     #[error("{0} is not a reference to a definition")]
     BadReference(String),
     /// The text is not a surface document.
@@ -67,8 +67,12 @@ const ROOT_PLACE: &str = "$root";
 /// The members of the root's `properties`, the bundle's entries, are held too, and each is read by
 /// its name, as a consumer reads it (each is a reference to a definition, but for a few that are
 /// inline). The cut does not follow an entry's reference: the definitions it holds are the ones
-/// the roots reach, so an entry is compared by its own text. A surface that is read from a recorded
-/// document holds no root (the document records none), and compares none.
+/// the roots reach, so an entry that is a reference is compared by its own text, and an inline
+/// entry is compared as any schema is, where a reference inside it is followed to a definition that
+/// the surface holds and passed over otherwise. So that none can point where the comparison does
+/// not look, every reference inside a member is `#/$defs/NAME` with a plain NAME of a definition
+/// of the schema, though not necessarily one that the surface holds. A surface that is read from a
+/// recorded document holds no root (the document records none), and compares none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
     roots: Vec<String>,
@@ -93,11 +97,13 @@ impl Surface {
     ///
     /// Returns [`SurfaceError::UnknownRoot`] for a root the bundle lacks,
     /// [`SurfaceError::BadReference`] for a reference that is not `#/$defs/NAME` (and, for a
-    /// reference of its own root, with a NAME of ASCII letters, digits and `_`),
+    /// reference of its own root or inside one of its members, with a NAME of ASCII letters, digits
+    /// and `_`),
     /// [`SurfaceError::ReservedName`] for a definition it reaches with a name that
     /// begins with `$`, [`SurfaceError::RootReference`] for a reference of its own root to a
-    /// definition that the roots do not reach, and [`SurfaceError::NotASurface`] for a `properties`
-    /// of its own root that is not an object of members.
+    /// definition that the roots do not reach, [`SurfaceError::NotASurface`] for a `properties` of
+    /// its own root that is not an object of members, and [`SurfaceError::UnknownRoot`] for a
+    /// reference inside one of those members to a definition that the schema lacks.
     pub fn cut(schema: &Value, roots: &[&str]) -> Result<Self, SurfaceError> {
         let all = schema
             .get("$defs")
@@ -134,6 +140,14 @@ impl Surface {
             }
         }
         let members = own_members(schema)?;
+        for entry in members.values() {
+            for reference in references(entry) {
+                let target = plain_reference_name(&reference)?;
+                if !all.contains_key(&target) {
+                    return Err(SurfaceError::UnknownRoot(target));
+                }
+            }
+        }
         let mut roots: Vec<String> = roots.iter().map(|root| (*root).to_owned()).collect();
         roots.sort();
         roots.dedup();
