@@ -4922,6 +4922,7 @@ async fn standing_admission(
 ) -> (
     kr_ipc::client::LocalClient,
     kr_controller::authority::AdmittedMutation,
+    kr_ipc::testing::Serving,
 ) {
     let endpoint = temp
         .environment()
