@@ -1132,6 +1132,13 @@ fn a_new_method_does_not_pass_where_a_use_of_method_does_not_widen() {
             "an encoded reference in a not",
         ),
         (
+            json!({ "Name": { "type": "string", "not": { "$ref": "#/$defs/Method#" } },
+                    "Method#": {} }),
+            // Some validators remove a trailing `#`, so the reference is to `Method`: the old
+            // schema accepts "b" as a `Name`; the new one refuses it.
+            "a reference with a trailing #",
+        ),
+        (
             json!({
                 "Holder": { "type": "object", "properties": { "m": reference.clone() } },
                 "Choice": { "oneOf": [{ "$ref": "#/$defs/Holder" }, { "type": "object" }] },
@@ -1208,7 +1215,7 @@ fn with_methods(extra: &Value, names: &[&str]) -> Value {
 /// the first case the new schema accepts a text that the old one refuses, which no method's name says.
 /// `#`, `@`, `[` and `{` mark a branch, a numbered branch, an item and an additional property in a
 /// label, so a name that holds one can look like the label of another place. Where a name is in
-/// both lists, only the name that the new list adds is a new method.
+/// both lists, the new list adds only "c", which has the shape, and its line is reported too.
 #[test]
 fn a_name_that_is_not_the_shape_of_a_methods_is_no_new_method() {
     for name in [

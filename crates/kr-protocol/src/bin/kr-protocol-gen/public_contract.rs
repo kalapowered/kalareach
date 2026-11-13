@@ -206,9 +206,9 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
 
 /// Whether every `$ref` under `node` to a definition of `reaching` stands where a wider definition
 /// widens the place: `widening` says that the path to `node` has only such places. A reference that
-/// is not `#/$defs/NAME` with a name that a validator reads as it stands (a name with `%`, `~` or
-/// `/` is decoded), and a keyword that changes how references resolve (`$dynamicRef`,
-/// `$recursiveRef`, `$dynamicAnchor`, `$anchor`, `$id`), are refused wherever they stand: the walk
+/// is not `#/$defs/NAME` with a name of ASCII letters, digits and `_` (a validator may decode or
+/// strip any other name), and a keyword that changes how references resolve (`$dynamicRef`,
+/// `$recursiveRef`, `$dynamicAnchor`, `$anchor`, `$id`, `id`), are refused wherever they stand: the walk
 /// cannot say what they reach.
 fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
     match node {
@@ -219,12 +219,19 @@ fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool 
                     .as_str()
                     .and_then(|target| target.strip_prefix("#/$defs/"))
                 {
-                    Some(target) if !target.contains(['%', '~', '/']) => {
+                    Some(target)
+                        if !target.is_empty()
+                            && target
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') =>
+                    {
                         widening || !reaching.contains(target)
                     }
                     _ => false,
                 },
-                "$dynamicRef" | "$recursiveRef" | "$dynamicAnchor" | "$anchor" | "$id" => false,
+                "$dynamicRef" | "$recursiveRef" | "$dynamicAnchor" | "$anchor" | "$id" | "id" => {
+                    false
+                }
                 "properties" | "patternProperties" if member.is_object() => member
                     .as_object()
                     .into_iter()
