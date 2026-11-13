@@ -18,7 +18,7 @@ use kr_transport::window::AcceptedDeadline;
 use super::super::arrivals::{Arrival, Arrivals, Carried, request_of};
 use super::super::proxy::{Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
-use crate::given::Recorded;
+use crate::given::{Recorded, network_door};
 use crate::grants::policy::HeldBound;
 use crate::service::FeedStanding;
 
@@ -766,14 +766,14 @@ impl RemoteConnection {
             return Err(outcome_not_shown());
         }
         if reused {
-            return Ok(kept.copied().into_answer());
+            return Ok(network_door::kept(kept));
         }
         // The answer is a read of what an earlier submission produced, and is written under the
         // decision that read is ([`Self::read_of_retained`]). A create's answer is a read of the
         // reservation its token holds, whichever way the first attempt ended, and the session that
         // reservation holds is its subject.
         let reserved = if method == Method::SessionCreate {
-            match self.reserved_session(mutation).await.copied().into_answer() {
+            match network_door::kept(self.reserved_session(mutation).await) {
                 Ok(reserved) => reserved,
                 Err(()) => return Err(outcome_not_shown()),
             }
@@ -785,7 +785,7 @@ impl RemoteConnection {
             Ok(None) => {}
             Err(_) => return Err(outcome_not_shown()),
         }
-        Ok(kept.copied().into_answer())
+        Ok(network_door::kept(kept))
     }
 
     /// [`Self::kept_answer`] for a copy a service gave when it performed the action, which it read
@@ -907,12 +907,9 @@ impl RemoteConnection {
             // A session with no worker is closed where its closure is recorded, and the record is
             // what says so.
             Err(error @ ControllerError::UnknownSession { .. }) => {
-                return Err(self
-                    .controller
-                    .closed_or(session_id, error)
-                    .await
-                    .copied()
-                    .into_answer());
+                return Err(network_door::kept(
+                    self.controller.closed_or(session_id, error).await,
+                ));
             }
             Err(error) => return Err(error),
         };

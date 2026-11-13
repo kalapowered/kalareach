@@ -31,7 +31,7 @@ use super::a_recorded_answer_another_copy_wrote::{
 };
 use super::authority_changes::AuthorityCaller;
 use super::the_fence_at_every_effect::{
-    CountingSupervisor, admitted, carried, daemon, mutation_of, refused_for_a_fence,
+    CountingSupervisor, admitted, carried, daemon, mutation_of, refused_for_a_fence, told_now,
 };
 use crate::authority::AdmittedMutation;
 use crate::given::Given;
@@ -201,14 +201,19 @@ async fn a_privacy_change_that_meets_a_refusal_it_cannot_read_is_not_told_while_
     );
     plant_a_refusal_this_build_cannot_read(&temp, &actor_id, &mutation);
     let attempt = || {
-        controller.write_method(
-            &actor_id,
-            &mutation,
-            Method::PrivacySet,
+        told_now(
+            &controller,
             connection_id,
-            None,
-            Some(super::the_fence_at_every_effect::accepted(&controller)),
-            controller.admitted_revision(connection_id).ok(),
+            &mutation,
+            controller.write_method(
+                &actor_id,
+                &mutation,
+                Method::PrivacySet,
+                connection_id,
+                None,
+                Some(super::the_fence_at_every_effect::accepted(&controller)),
+                controller.admitted_revision(connection_id).ok(),
+            ),
         )
     };
     let control = attempt().await;
@@ -462,7 +467,8 @@ async fn a_create_another_copy_made(
             Some(super::the_fence_at_every_effect::accepted(controller)),
             controller.admitted_revision(connection_id).ok(),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     mutation
 }
 
@@ -913,6 +919,7 @@ async fn at_the_local_door(
             controller.admitted_revision(connection_id).ok(),
         )
         .await
+        .into_answer_for_test()
 }
 
 /// What the local door tells a copy that a service read from its record and withheld, whatever the

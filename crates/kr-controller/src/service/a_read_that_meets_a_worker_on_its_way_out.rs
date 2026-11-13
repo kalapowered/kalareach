@@ -1316,6 +1316,7 @@ async fn close(world: &Silent) -> SessionCloseResult {
             fake::admission(&world.controller, world.accepted).await,
         )
         .await
+        .into_answer_for_test()
         .expect("the worker accepts the close")
         .to_typed()
         .expect("decodes")
@@ -1744,6 +1745,7 @@ async fn a_replacement_daemon_settles_a_close_sent_again_at_its_own_door_from_wh
             fake::admission(&world.controller, world.accepted).await,
         )
         .await
+        .into_answer_for_test()
         .expect("the close sent again is answered")
         .to_typed()
         .expect("decodes");
