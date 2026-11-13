@@ -79,6 +79,7 @@ afterEach(() => {
 function conversation(count: number, each: number): { pane: HTMLElement; messages: HTMLElement[]; links: HTMLElement[][]; texts: HTMLElement[] } {
   const pane = document.createElement('div')
   boxes.set(pane, { left: 0, top: 0, right: 390, bottom: count * 100 })
+  clientBox(pane, 390, count * 100)
   const messages: HTMLElement[] = []
   const links: HTMLElement[][] = []
   const texts: HTMLElement[] = []
@@ -123,7 +124,28 @@ function click(target: EventTarget, over: Record<string, unknown> = {}): Event {
 }
 
 const fire = (type: string, event: Event): void => {
-  listening.get(type)?.(event)
+  ;(listening.get(type) ?? listening.get(`pane ${type}`))?.(event)
+}
+
+/** The pane's own client box, as a layout engine has it: the box less a border and a scroll bar's strip. */
+function clientBox(pane: HTMLElement, width: number, height: number, border = 0): void {
+  Object.defineProperties(pane, {
+    clientLeft: { configurable: true, value: border },
+    clientTop: { configurable: true, value: border },
+    clientWidth: { configurable: true, value: width },
+    clientHeight: { configurable: true, value: height }
+  })
+}
+
+/** Starts the handler on `pane`, and keeps the pane's own listeners where `fire` finds them. */
+function start(pane: HTMLElement): () => void {
+  vi.spyOn(pane, 'addEventListener').mockImplementation(((type: string, listener: EventListener) => {
+    listening.set(`pane ${type}`, listener)
+  }) as typeof pane.addEventListener)
+  vi.spyOn(pane, 'removeEventListener').mockImplementation(((type: string) => {
+    listening.delete(`pane ${type}`)
+  }))
+  return startLinkPress(pane)
 }
 
 /** The clock, as the handler reads it: the next readings are `times`, and the last one stays. */
@@ -138,7 +160,7 @@ describe('a tap on plain text beside a link, through the handler', () => {
 
   it('opens the link once for the press, and a second trusted click with no new press opens nothing', () => {
     const { pane, links, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
@@ -150,7 +172,7 @@ describe('a tap on plain text beside a link, through the handler', () => {
 
   it('opens nothing for a touch that moved beyond the slop, though no pointer cancel came', () => {
     const { pane, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     fire('pointermove', pointer(texts[3], { clientY: y - 14 }))
@@ -161,7 +183,7 @@ describe('a tap on plain text beside a link, through the handler', () => {
 
   it('opens nothing for a touch whose release is beyond the slop though no move was seen', () => {
     const { pane, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     fire('pointerup', pointer(texts[3], { clientY: y - 14, timeStamp: 120 }))
@@ -171,7 +193,7 @@ describe('a tap on plain text beside a link, through the handler', () => {
 
   it('opens nothing for a touch that moved and came back within the slop at the release', () => {
     const { pane, links, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     fire('pointermove', pointer(texts[3], { clientY: y - 14 }))
@@ -184,7 +206,7 @@ describe('a tap on plain text beside a link, through the handler', () => {
 
   it('opens nothing after a pointer cancel, and the pressed look goes with it', () => {
     const { pane, links, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     expect(links[3]?.[0]?.hasAttribute('data-pressed'), 'the pressed look during the press').toBe(true)
@@ -197,7 +219,7 @@ describe('a tap on plain text beside a link, through the handler', () => {
 
   it('opens nothing for a click that no press made', () => {
     const { pane, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('click', click(texts[3], { clientY: y }))
     expect(opened).toEqual([])
@@ -208,6 +230,7 @@ describe('a tap on plain text beside a link, through the handler', () => {
 function between(...wordsOf: Box[]): { pane: HTMLElement; text: HTMLElement; links: HTMLElement[] } {
   const pane = document.createElement('div')
   boxes.set(pane, { left: 0, top: 0, right: 390, bottom: 844 })
+  clientBox(pane, 390, 844)
   const message = document.createElement('div')
   message.className = 'm-node'
   boxes.set(message, { left: 0, top: 0, right: 390, bottom: 844 })
@@ -239,7 +262,7 @@ describe('a tap between two links, through the handler', () => {
     // point (51, 43), 50.25 px from its words. Link B's words start 47 px to the right of the point,
     // beyond the least size, and its own area does not hold it: B's words are nearer, so the point is no link's.
     const { pane, text, links } = between({ left: 0, top: 0, right: 8, bottom: 17 }, { left: 98, top: 43, right: 106, bottom: 60 })
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 51, clientY: 43 }))
     expect(links.map((link) => link.hasAttribute('data-pressed')), 'the links lit at the press').toEqual([false, false])
@@ -250,7 +273,7 @@ describe('a tap between two links, through the handler', () => {
 
   it('still gives the point to the link at the corner when no other link’s words are nearer', () => {
     const { pane, text, links } = between({ left: 0, top: 0, right: 8, bottom: 17 })
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 51, clientY: 43 }))
     expect(links[0]?.hasAttribute('data-pressed'), 'the link lit at the press').toBe(true)
@@ -260,12 +283,111 @@ describe('a tap between two links, through the handler', () => {
   })
 })
 
+describe('where the handler’s listeners stand', () => {
+  it('puts the click listener on the pane and the pointer listeners on the document', () => {
+    const { pane } = between({ left: 0, top: 0, right: 8, bottom: 17 })
+    const stop = start(pane)
+    // The click is on the pane itself: WebKit sends a click for a tap on the pane's bare area only to an
+    // element that has a click listener of its own, or lies under one other than the document's.
+    expect([...listening.keys()].filter((type) => type.startsWith('pane ')).sort()).toEqual(['pane click'])
+    // A press outside the pane ends the record, and a release or a cancel can come outside it.
+    expect([...listening.keys()].filter((type) => !type.startsWith('pane ')).sort()).toEqual(['pointerdown'])
+    fire('pointerdown', pointer(pane, { clientX: 51, clientY: 43 }))
+    expect([...listening.keys()].filter((type) => !type.startsWith('pane ')).sort()).toEqual(['pointercancel', 'pointerdown', 'pointermove', 'pointerup'])
+    stop()
+    expect([...listening.keys()]).toEqual([])
+  })
+
+  it('opens a link for a tap on the pane’s bare area, where no message lies', () => {
+    const { pane, links } = between({ left: 0, top: 0, right: 8, bottom: 17 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(pane, { clientX: 40, clientY: 30 }))
+    fire('pointerup', pointer(pane, { clientX: 40, clientY: 30, timeStamp: 120 }))
+    fire('click', click(pane, { clientX: 40, clientY: 30 }))
+    expect(opened).toEqual([links[0]])
+  })
+})
+
+describe('what a press lights', () => {
+  // The largest text size: the words of a link are 56 px tall and its button's box is 72 px tall, 8 px
+  // more above and below, where the browser still sends the click to the button.
+  const words = { left: 100, top: 100, right: 140, bottom: 156 }
+  const own = { left: 100, top: 92, right: 140, bottom: 164 }
+
+  it('is the link whose own element the press is on, though the words’ rectangles do not hold the point', () => {
+    const { pane, links } = between(words)
+    boxes.set(links[0], own)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], { clientX: 120, clientY: 95 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press 5 px above its words, on its own button').toBe(true)
+    fire('pointerup', pointer(links[0], { clientX: 120, clientY: 95, timeStamp: 120 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit after the release').toBe(false)
+  })
+
+  it('is no link on plain text that the words’ rectangles do not hold', () => {
+    const { pane, text, links } = between(words)
+    boxes.set(links[0], own)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(text, { clientX: 120, clientY: 95 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press on plain text above its words').toBe(false)
+  })
+
+  it('is nothing for a press on a control of the message', () => {
+    const { pane, text, links } = between({ left: 0, top: 0, right: 8, bottom: 17 })
+    const control = document.createElement('button')
+    text.append(control)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(control, { clientX: 4, clientY: 8 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press on a control').toBe(false)
+  })
+})
+
+describe('what the handler takes for the pane', () => {
+  it('is its client box: a press in the scroll bar’s strip lights nothing and its click opens nothing', () => {
+    // The pane's box is 390 wide and the scroll bar takes 15 px of it: the link at the end of a line ends at x 375.
+    const { pane, text, links } = between({ left: 340, top: 100, right: 375, bottom: 117 })
+    clientBox(pane, 375, 844)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(pane, { clientX: 372, clientY: 108 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press at x 372, inside the client box').toBe(true)
+    fire('pointerup', pointer(pane, { clientX: 372, clientY: 108, timeStamp: 120 }))
+    fire('click', click(pane, { clientX: 372, clientY: 108 }))
+    expect(opened).toEqual([links[0]])
+    opened = []
+    fire('pointerdown', pointer(pane, { clientX: 380, clientY: 108 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press at x 380, in the scroll bar’s strip').toBe(false)
+    fire('pointerup', pointer(pane, { clientX: 380, clientY: 108, timeStamp: 120 }))
+    fire('click', click(pane, { clientX: 380, clientY: 108 }))
+    expect(opened, 'links opened by a click in the strip').toEqual([])
+    expect(text.isConnected).toBe(true)
+  })
+
+  it('is placed by the pane’s border: the client box starts inside it', () => {
+    const { pane, links } = between({ left: 10, top: 10, right: 40, bottom: 27 })
+    boxes.set(pane, { left: 0, top: 0, right: 390, bottom: 844 })
+    clientBox(pane, 388, 842, 2)
+    start(pane)
+    clock(100)
+    // The words start 8 px inside the client box's left edge (x 2): a press at x 1 is on the border.
+    fire('pointerdown', pointer(pane, { clientX: 1, clientY: 18 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press on the border').toBe(false)
+    fire('pointerup', pointer(pane, { clientX: 1, clientY: 18, timeStamp: 120 }))
+    fire('pointerdown', pointer(pane, { clientX: 3, clientY: 18 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press just inside the border').toBe(true)
+  })
+})
+
 describe('the three seconds after the release', () => {
   const y = 328
 
   it('count from the release, not from when the handler saw it: a page that was busy for 4 s gives its click no link', () => {
     const { pane, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     // The release at 1010 ms, which the busy page's handler sees at 5000 ms; the click comes right after.
     clock(5000, 5001)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
@@ -276,7 +398,7 @@ describe('the three seconds after the release', () => {
 
   it('give the click a link when the page was busy for less: 1.7 s', () => {
     const { pane, links, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     // The release at 1010 ms, seen at 2710 ms; the click comes right after.
     clock(2710, 2711)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
@@ -287,7 +409,7 @@ describe('the three seconds after the release', () => {
 
   it('take a release stamped after the clock’s own reading as made at that reading', () => {
     const { pane, links, texts } = conversation(6, 3)
-    startLinkPress(pane)
+    start(pane)
     clock(1010, 1011)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 9000 }))
@@ -305,7 +427,7 @@ describe('the boxes the handler reads', () => {
     for (let row = 0; row < 200; row += 1) rows.append(document.createElement('div'))
     pane.append(rows)
     document.body.append(pane)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(rows, { clientY: 50 }))
     fire('pointerup', pointer(rows, { clientY: 50, timeStamp: 120 }))
@@ -316,7 +438,7 @@ describe('the boxes the handler reads', () => {
 
   it('are the pane, the messages and the near messages’ links for a conversation of 1200 links, not every link', () => {
     const { pane, messages, links, texts } = conversation(60, 20)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     // Message 30 is under the press; message 29 ends 38 px above it, inside the radius of 62.2 px that the rule weighs, and
     // message 31 starts 66 px below.
@@ -346,7 +468,7 @@ describe('the boxes the handler reads', () => {
       pane.append(message)
     }
     document.body.append(pane)
-    startLinkPress(pane)
+    start(pane)
     clock(100)
     fire('pointerdown', pointer(pane.querySelector('p') as HTMLElement, { clientY: 50 }))
     expect(reads, 'boxes read for a press on a conversation with no link').toEqual([])
