@@ -571,6 +571,18 @@ jobs:
           rustc --version
           cargo --version
 
+      # On Windows, libsodium-sys-stable's build script downloads libsodium's prebuilt libraries
+      # from a host of libsodium's own, in the middle of the compile, unless it is handed them. A
+      # lookup of that host that failed has stopped this job before any test ran. The archives are
+      # placed here instead, from the cache or once from that host, and the build reads them from
+      # disk. The script holds their digests and refuses other bytes, whatever the cache held. The
+      # action then closes the route to the host for the rest of the job. It comes before the cargo
+      # caches below because their key reads the directory's name, which holds the digests: a cache
+      # built with other archive bytes is not restored.
+      - name: Place libsodium's archives
+        id: libsodium
+        uses: ./.github/actions/libsodium-archive
+
       - name: Restore the cargo cache
         id: cargo-cache
         uses: ./.github/actions/cargo-cache-restore
@@ -586,15 +598,6 @@ jobs:
         with:
           name: windows-arm64
           paths: target/aarch64-pc-windows-msvc
-
-      # On Windows, libsodium-sys-stable's build script downloads libsodium's prebuilt libraries
-      # from a host of libsodium's own, in the middle of the compile, unless it is handed them. A
-      # lookup of that host that failed has stopped this job before any test ran. The archives are
-      # placed here instead, from the cache or once from that host, and the build reads them from
-      # disk. The action then closes the route to the host for the rest of the job.
-      - name: Place libsodium's archives
-        id: libsodium
-        uses: ./.github/actions/libsodium-archive
 
       # What this runner is, printed before anything asserts on it: a pass or a failure below then
       # names the Windows build, the console host, the shells it happened on and the privileges its

@@ -198,10 +198,12 @@ jobs:
           cargo --version
 
       # libsodium's prebuilt libraries come from files this places, not from a download in the
-      # middle of the compile. The crate's build script checks both archives against libsodium's
-      # public key, as it does for a download. What this builds is signed later, so it restores no
-      # cache that another job could have written: the prebuilt archive and its signature come from
-      # libsodium's host.
+      # middle of the compile. The script holds the size and the digest of the release tag's
+      # archive and of its signature, and a file with other bytes stops this job here. The crate's
+      # build script then checks both against libsodium's public key, as it does for a download.
+      # What this builds is signed later, so it restores no cache that another job could have
+      # written: the prebuilt archive and its signature come from libsodium's host, and the same
+      # digests hold them as they hold the continuous integration jobs'.
       - name: Place libsodium's archives
         uses: ./.github/actions/libsodium-archive
         with:
@@ -467,7 +469,8 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustc --version
 
-      # As in the build job: libsodium's prebuilt libraries come from files this places.
+      # As in the build job: libsodium's prebuilt libraries come from files this places, held to
+      # the same digests.
       - name: Place libsodium's archives
         uses: ./.github/actions/libsodium-archive
         with:
