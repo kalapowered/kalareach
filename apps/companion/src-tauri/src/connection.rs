@@ -971,13 +971,15 @@ pub async fn forward_events<R: Runtime>(
     loop {
         let heard = tokio::select! {
             heard = events.recv() => heard,
-            // The host refused a request on this connection as not permitted. A host that
-            // withdrew what the connection was admitted under refuses everything on it and does
-            // not close it, so whether this is that is asked of the host, over another connection,
-            // and nothing waits on the answer: events go on being forwarded meanwhile. The
-            // question is asked one at a time. Its own refusal raises no signal, and what other
-            // requests are refused while it is out is the same answer to it, not a new question.
-            () = session.denied(), if asking.is_none() => {
+            // The host refused a request on this connection as not permitted, or answered one with
+            // an outcome it does not know. A host that withdrew what the connection was admitted
+            // under refuses everything on it, tells a request it carried out meanwhile that what
+            // became of it is not shown, and does not close it, so whether this is that is asked
+            // of the host, over another connection, and nothing waits on the answer: events go on
+            // being forwarded meanwhile. The question is asked one at a time. Its own refusal
+            // raises no signal, and what other requests are answered so while it is out is the
+            // same answer to it, not a new question.
+            () = session.standing_in_doubt(), if asking.is_none() => {
                 let app = app.clone();
                 let session = Arc::clone(&session);
                 asking = Some(tauri::async_runtime::spawn(async move {
@@ -987,7 +989,7 @@ pub async fn forward_events<R: Runtime>(
             }
             () = question_ended(&mut asking), if asking.is_some() => {
                 asking = None;
-                let _ = tokio::time::timeout(std::time::Duration::ZERO, session.denied()).await;
+                let _ = tokio::time::timeout(std::time::Duration::ZERO, session.standing_in_doubt()).await;
                 continue;
             }
             () = session.closed() => {

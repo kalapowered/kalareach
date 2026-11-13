@@ -256,10 +256,11 @@ impl AppState {
     /// A revision of the whole host withdraws the connections the host admitted before it, and a
     /// revocation of one device is not one. The host refuses every request on a withdrawn connection
     /// and keeps it open, so a connection that is held and not asked for what it is refused goes on
-    /// being refused, and nothing ends it. The connection's supervision calls this
-    /// when the host refuses a request on it as not permitted, whichever path of the application
-    /// made the request, except a read sent with `read_unsignalled`: that one asks whether the
-    /// connection was withdrawn, and its refusal is its answer. The host is asked for its devices,
+    /// being refused, and nothing ends it. The connection's supervision calls this when the host
+    /// refuses a request on it as not permitted or answers one with an outcome it does not know,
+    /// whichever path of the application made the request, except a read sent with
+    /// `read_unsignalled`: that one asks whether the connection was withdrawn, and its refusal is
+    /// its answer. The host is asked for its devices,
     /// which it lists to any connection of this computer's that it admits and to no other: a
     /// refusal of that over this connection, and an answer over another, say it was withdrawn,
     /// where one request's refusal for its own reasons does not. The other takes its place, and the

@@ -1231,9 +1231,12 @@ async fn a_refusal_as_not_permitted_reaches_the_holder_unless_the_read_was_the_q
         .read::<_, SessionList>(Method::SessionList, &Empty {})
         .await
         .expect_err("a refusal");
-    tokio::time::timeout(std::time::Duration::from_secs(5), session.denied())
-        .await
-        .expect("the refusal was raised");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.standing_in_doubt(),
+    )
+    .await
+    .expect("the refusal was raised");
 
     // A read made to ask whether the host withdrew the connection is refused the same way, and
     // raises nothing: its refusal is the answer, and must not start the question again.
@@ -1243,11 +1246,82 @@ async fn a_refusal_as_not_permitted_reaches_the_holder_unless_the_read_was_the_q
         .await
         .expect_err("a refusal");
     assert!(
-        tokio::time::timeout(std::time::Duration::ZERO, session.denied())
+        tokio::time::timeout(std::time::Duration::ZERO, session.standing_in_doubt())
             .await
             .is_err(),
         "nothing was raised for the question's own refusal"
     );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-09.09: a request the host answers as an outcome it does not know, which is what it says
+/// of a request it carried out while the connection was withdrawn, is raised to the holder as a
+/// refusal as not permitted is, and the mutation's action stays unresolved. A refusal on the
+/// request's own account raises nothing, and neither word does for a read sent as the question.
+#[tokio::test]
+async fn an_unknown_outcome_reaches_the_holder_as_a_refusal_as_not_permitted_does() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let send = || {
+        session.mutate(
+            Method::SessionCreate,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+    };
+
+    // A refusal on the request's own account says nothing of the connection.
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::InvalidArgument);
+    send().await.expect_err("a refusal");
+    assert!(
+        tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
+            .await
+            .is_err(),
+        "an invalid argument raised nothing"
+    );
+
+    // An unknown outcome is raised, and the action it answers is neither settled nor forgotten.
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::OutcomeUnknown);
+    let error = send().await.expect_err("an unknown outcome");
+    assert!(
+        matches!(error, ClientError::OutcomeUnknown { .. }),
+        "{error}"
+    );
+    tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
+        .await
+        .expect("the unknown outcome was raised");
+    assert_eq!(session.submitted_actions().await.len(), 1);
+
+    // A read is raised on the same word, unless it is sent as the question.
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::OutcomeUnknown, 1));
+    session
+        .read::<_, SessionList>(Method::SessionList, &Empty {})
+        .await
+        .expect_err("an unknown outcome");
+    tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
+        .await
+        .expect("the unknown outcome of a read was raised");
+    for code in [ErrorCode::PermissionDenied, ErrorCode::OutcomeUnknown] {
+        *script.refuse_reads_with.lock().await = Some((code, 1));
+        session
+            .read_unsignalled::<_, SessionList>(Method::SessionList, &Empty {})
+            .await
+            .expect_err("a refusal");
+        assert!(
+            tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
+                .await
+                .is_err(),
+            "{code:?} raised nothing for the question's own answer"
+        );
+    }
 
     session.close();
     serving.abort();
@@ -1278,7 +1352,7 @@ async fn a_host_that_does_not_list_the_launch_surface_does_not_serve_it_and_rais
         kr_client::LaunchSurfaceRead::NotServed
     );
     assert!(
-        tokio::time::timeout(Duration::ZERO, session.denied())
+        tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
             .await
             .is_err(),
         "a host too old for the method did not withdraw the connection"
@@ -1308,7 +1382,7 @@ async fn a_launch_surface_refused_with_the_right_it_reads_under_is_a_refusal_and
         matches!(&refused, ClientError::Host(error) if error.code == ErrorCode::PermissionDenied),
         "{refused:?}"
     );
-    tokio::time::timeout(Duration::from_secs(5), session.denied())
+    tokio::time::timeout(Duration::from_secs(5), session.standing_in_doubt())
         .await
         .expect("the refusal of the right was raised");
 
@@ -1335,7 +1409,7 @@ async fn a_launch_surface_refused_once_and_then_answered_is_served() {
         kr_client::LaunchSurfaceRead::Served(launch_surface())
     );
     assert!(
-        tokio::time::timeout(Duration::ZERO, session.denied())
+        tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
             .await
             .is_err(),
         "nothing was raised"
@@ -1369,7 +1443,7 @@ async fn a_launch_surface_refused_as_not_permitted_and_then_as_unsupported_is_no
         kr_client::LaunchSurfaceRead::NotServed
     );
     assert!(
-        tokio::time::timeout(Duration::ZERO, session.denied())
+        tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
             .await
             .is_err(),
         "nothing was raised"
@@ -1505,7 +1579,7 @@ async fn a_refusal_that_arrives_after_the_question_was_given_up_raises_nothing()
         .await
         .expect("the renewal was applied, so the refusal before it was read");
 
-        let raised = tokio::time::timeout(Duration::ZERO, session.denied())
+        let raised = tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
             .await
             .is_ok();
         assert_eq!(

@@ -584,9 +584,9 @@ struct SessionState {
     events: broadcast::Sender<Notification>,
     /// True once the connection has ended, which a holder of the session may wait for.
     ended: tokio::sync::watch::Sender<bool>,
-    /// Raised each time the host refuses a request on the connection as not permitted, except a
-    /// read sent with [`Session::read_unsignalled`].
-    denied: tokio::sync::Notify,
+    /// Raised each time the host answers a request on the connection with a word that
+    /// [`suggests_withdrawal`] reads, except a read sent with [`Session::read_unsignalled`].
+    in_doubt: tokio::sync::Notify,
     /// The requests whose refusal is not raised: those a holder asks to learn whether the host
     /// withdrew the connection, whose refusal is its answer and not a new question.
     unsignalled: std::sync::Mutex<std::collections::BTreeSet<RequestId>>,
@@ -683,7 +683,7 @@ impl Session {
             outcomes: Mutex::new(Outcomes::default()),
             events,
             ended: tokio::sync::watch::channel(false).0,
-            denied: tokio::sync::Notify::new(),
+            in_doubt: tokio::sync::Notify::new(),
             unsignalled: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             outstanding: AtomicU64::new(0),
             max_outstanding: limits.max_outstanding_mutations.get(),
@@ -809,8 +809,9 @@ impl Session {
         self.read_signalling(method, params, true).await
     }
 
-    /// Reads as [`Self::read`] does, without raising [`Self::denied`] when the host refuses it as
-    /// not permitted, however late the refusal arrives.
+    /// Reads as [`Self::read`] does, without raising [`Self::standing_in_doubt`] when the host
+    /// refuses it as not permitted or answers it with an unknown outcome, however late the answer
+    /// arrives.
     ///
     /// For a holder that asks the host whether it withdrew this connection: the question's own
     /// refusal is its answer, and must not start the question again.
@@ -832,10 +833,10 @@ impl Session {
     /// A host that does not list a method refuses it as it refuses any method it does not list,
     /// `PERMISSION_DENIED`, and a grant that has lost its right is refused the same way. The two
     /// are told apart by asking for what the same right reads, `session.read`: where that is
-    /// refused too, the refusal is the grant's and is returned as it is, and that second call, which
-    /// signals, is what raises [`Self::denied`]; where it is answered, the first read is asked once
-    /// more, in case the host refused it for a reason that has passed, and a second refusal means
-    /// the host does not serve the read. The first reads do not signal, since a host too old for
+    /// refused too, the refusal is the grant's and is returned as it is, and that second call,
+    /// which signals, is what raises [`Self::standing_in_doubt`]; where it is answered, the first
+    /// read is asked once more, in case the host refused it for a reason that has passed, and a
+    /// second refusal means the host does not serve the read. The first reads do not signal, since a host too old for
     /// the method is not one that withdrew the connection. A host that lists the method and whose
     /// session's worker is of a release that does not serve it refuses it as an unsupported
     /// capability, which is the same answer: the read is not served. Any other failure is returned
@@ -1651,16 +1652,22 @@ impl Session {
         self.state.waiters().refusal.is_some()
     }
 
-    /// Resolves when the host refuses a request on this connection as not permitted, except a read
-    /// sent with [`Self::read_unsignalled`], whose refusal raises nothing.
+    /// Resolves when the host answers a request on this connection as not permitted or with an
+    /// outcome it does not know, except a read sent with [`Self::read_unsignalled`], whose answer
+    /// raises nothing.
     ///
-    /// A holder that owns the connection uses it to ask the host again, over another connection,
-    /// whether it was the connection the host refused: a host that has withdrawn what a connection
-    /// was admitted under refuses everything on it and does not close it, so nothing else says the
-    /// connection is dead. Refusals that arrive while nobody waits are kept as one, so a holder is
-    /// told once it asks, and told once for any number that arrived meanwhile.
-    pub async fn denied(&self) {
-        self.state.denied.notified().await;
+    /// Either word is what a host that has withdrawn what the connection was admitted under says:
+    /// it refuses everything on the connection as not permitted, and it tells a request it carried
+    /// out while the connection was withdrawn that what became of it is not shown. It does not
+    /// close the connection, so nothing else says the connection is dead. A holder that owns the
+    /// connection uses this to ask the host again, over another connection, whether it was the
+    /// connection the host withdrew; either word may also be the host's answer for the request's
+    /// own reasons, which that question tells apart. What became of the request's action is
+    /// decided by the answer alone, as ever, and not by this. Answers that arrive while nobody
+    /// waits are kept as one, so a holder is told once it asks, and told once for any number that
+    /// arrived meanwhile.
+    pub async fn standing_in_doubt(&self) {
+        self.state.in_doubt.notified().await;
     }
 
     /// Ends the session and the connection, waking every waiting call.
@@ -1804,6 +1811,22 @@ fn word_of(response: &Response) -> HostWord {
     }
 }
 
+/// Whether a response is one a host that withdrew what the connection was admitted under gives:
+/// a refusal as not permitted, or an unknown outcome, which is how it tells a request it carried
+/// out while the connection was withdrawn that what became of it is not shown.
+///
+/// This is about the connection and not about the action: what the response says of the action is
+/// [`word_of`]'s, and the two decisions are kept apart so that neither follows from the other.
+fn suggests_withdrawal(response: &Response) -> bool {
+    match &response.outcome {
+        Outcome::Ok(_) => false,
+        Outcome::Error(error) => {
+            error.code == kr_protocol::error::ErrorCode::PermissionDenied
+                || HostWord::of(error.code) == HostWord::Unknown
+        }
+    }
+}
+
 /// Takes the host's refusal of the connection: the first error answered with request identifier
 /// zero. The session ends with it, and every call, one waiting and one made later, is answered with
 /// that error in the form of a host's answer to the call, in place of a connection that ended.
@@ -1853,11 +1876,8 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&request_id);
-            if let Outcome::Error(error) = &response.outcome
-                && error.code == kr_protocol::error::ErrorCode::PermissionDenied
-                && !unsignalled
-            {
-                state.denied.notify_one();
+            if suggests_withdrawal(&response) && !unsignalled {
+                state.in_doubt.notify_one();
             }
             // Request identifier zero is no request of this client's, which numbers its own from
             // one: an error with it is the host's word on the connection itself, which it refuses.

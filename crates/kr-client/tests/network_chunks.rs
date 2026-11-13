@@ -837,7 +837,7 @@ async fn a_host_of_an_earlier_build_is_told_to_update_before_anything_is_reserve
         assert!(seen.headers.is_empty());
     });
     assert!(
-        tokio::time::timeout(Duration::ZERO, pair.session.denied())
+        tokio::time::timeout(Duration::ZERO, pair.session.standing_in_doubt())
             .await
             .is_err(),
         "a host too old for the method did not withdraw the connection"
