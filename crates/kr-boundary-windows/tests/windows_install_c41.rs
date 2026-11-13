@@ -568,3 +568,126 @@ fn a_removal_sweeps_staging_by_the_layouts_names_and_names_what_it_leaves() {
         "after the second removal the computer is as it was: {second}"
     );
 }
+
+/// The folder directly above the program directory, which an installation makes where it is not there.
+fn program_folder() -> PathBuf {
+    Paths::system()
+        .unwrap()
+        .program
+        .parent()
+        .expect("the program directory has a folder above it")
+        .to_path_buf()
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn the_folder_above_the_program_directory_that_a_run_made_goes_with_its_rollback_and_with_its_removal()
+ {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let folder = program_folder();
+    assert!(
+        !folder.exists(),
+        "the folder above the program directory stands before the run: {}",
+        folder.display()
+    );
+    let person = Person::make();
+    // A failed new installation: the rollback takes the folder that the run made.
+    let (code, text) = install_with(&person, &[("KR_BOUNDARY_FAIL_AFTER", "broker")]);
+    assert_ne!(code, Some(0), "{text}");
+    observed(&format!(
+        "after the rollback the folder {} stands: {}",
+        folder.display(),
+        folder.exists()
+    ));
+    for line in text.lines().filter(|line| line.contains("Program Files")) {
+        observed(&format!("rollback line: {line}"));
+    }
+    assert!(
+        !folder.exists(),
+        "the rollback left the folder that the run made: {text}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the rollback the computer is as it was: {text}"
+    );
+    // A good installation and the ordinary removal: the folder goes again.
+    let (code, text) = install_with(&person, &[]);
+    assert_eq!(code, Some(0), "the installation succeeds: {text}");
+    assert!(folder.exists(), "the installation made no folder: {text}");
+    let (code, removal) = ordinary_removal();
+    for line in removal
+        .lines()
+        .filter(|line| line.contains("Program Files"))
+    {
+        observed(&format!("removal line: {line}"));
+    }
+    assert_eq!(code, Some(0), "the removal succeeds: {removal}");
+    assert!(
+        !folder.exists(),
+        "the removal left the folder that the run made: {removal}"
+    );
+    assert!(
+        removal.contains("marked for removal, and a read of its name afterwards found it gone"),
+        "the removal does not say that a read of the folder's name found it gone: {removal}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the removal the computer is as it was: {removal}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn the_folder_that_a_run_made_stays_when_another_programs_entry_stands_in_it_at_the_removal() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let folder = program_folder();
+    assert!(
+        !folder.exists(),
+        "the folder above the program directory stands before the run: {}",
+        folder.display()
+    );
+    let person = Person::make();
+    let (code, text) = install_with(&person, &[]);
+    assert_eq!(code, Some(0), "the installation succeeds: {text}");
+    // Another program's entry is put into the folder that the run made.
+    let other = folder.join("other-programs-entry.txt");
+    std::fs::write(&other, b"not the installation's").unwrap();
+    let (code, removal) = ordinary_removal();
+    let folder_stands = folder.exists();
+    let other_stands = other.exists();
+    for line in removal
+        .lines()
+        .filter(|line| line.contains("Program Files"))
+    {
+        observed(&format!("removal line: {line}"));
+    }
+    // The case's own cleanup: the entry that the case put there and the folder that stays with it.
+    let _ = std::fs::remove_file(&other);
+    let _ = std::fs::remove_dir(&folder);
+    assert_eq!(
+        code,
+        Some(0),
+        "the removal ends without a failure: {removal}"
+    );
+    assert!(
+        removal.contains("a read found 1 entry in it"),
+        "the removal does not say that a read found one entry in the folder: {removal}"
+    );
+    assert!(
+        folder_stands && other_stands,
+        "the removal took away a folder that holds another program's entry: {removal}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the case's own cleanup the computer is as it was: {removal}"
+    );
+}
