@@ -1285,3 +1285,69 @@ async fn a_stream_the_handler_let_go_of_is_revoked_with_the_loss_of_the_control_
         .expect("the waiting task ends");
     listener.shutdown().await;
 }
+
+/// A connection's task that is cancelled while its handler holds a stream revokes the stream before
+/// the handler lets go of it. The listener ends its tasks where they stand, so nothing after the
+/// three arms that end a session runs: the order holds only because the guard that revokes is
+/// dropped before the handler's future, wherever the task ends. The case waits for the handler's
+/// own let-go, which is the condition, and reads the stream's state at that moment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_is_revoked_before_the_handler_lets_go_of_it_where_the_task_is_cancelled() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(ServingHandler {
+        client: client.record,
+        lost: AtomicUsize::new(0),
+        streams: Mutex::new(Vec::new()),
+        finish: tokio::sync::Notify::new(),
+        let_go: tokio::sync::Notify::new(),
+        let_go_done: AtomicUsize::new(0),
+        revoked_when_let_go: std::sync::Mutex::new(Vec::new()),
+    });
+    let listener = start_serving(&host, Arc::clone(&handler), EndHold::default()).await;
+    let connection = client
+        .endpoint
+        .connect(listener_addr(&listener), ALPN)
+        .await
+        .expect("a connection");
+    let authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let registry = Arc::new(StreamRegistry::new(
+        authorised.connection_id,
+        Arc::new(kr_transport::scheduler::StreamBudget::new(
+            SendLimits::default(),
+        )),
+        None,
+    ));
+    let _stream = registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a data stream");
+    let handle = first_stream(&handler).await;
+    assert!(
+        !handle.is_revoked(),
+        "the stream stands while its connection is served"
+    );
+
+    // The task ends where it stands: the handler is waiting, and holds the stream.
+    listener.end_connections();
+    wait_until(|| {
+        !handler
+            .revoked_when_let_go
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    })
+    .await;
+
+    assert_eq!(
+        *handler
+            .revoked_when_let_go
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [true],
+        "the stream is revoked before the handler lets go of it"
+    );
+    assert!(handle.is_revoked(), "the stream stays revoked");
+    listener.shutdown().await;
+}
