@@ -704,37 +704,88 @@ pub struct DataHolds {
     run: Option<DirHandle>,
 }
 
-/// What a run made of the data directory's place, each object held through the handle of the call
-/// that made it. The handle holds an identity and no right to delete: it is opened with full sharing
-/// and without the right to delete, so that no later open of the product or of the system meets a
-/// handle of the run that holds the right (an open that does not share delete would be refused by
-/// it). A cleanup opens the same object again through that handle, never through a path, with the
-/// right to delete, marks it, and closes every handle of it before it turns to the folder above, so
-/// that an object that was put at the path since (or a link) is never taken for what this run made.
-/// The handles are held until the first manifest is written: after that a removal finds the objects
-/// by the manifest.
+/// An object that a run made, held for its cleanup: the handle of the call that made it, the handle
+/// of the directory that holds it, and the bare name that it has there. The object's own handle holds
+/// an identity and no right to delete: it is opened with full sharing and without the right to
+/// delete, so that no later open of the product or of the system meets a handle of the run that holds
+/// the right (an open that does not share delete would be refused by it).
+#[derive(Debug)]
+struct MadeObject {
+    /// The handle of the call that made the object.
+    identity: ffi::Handle,
+    /// The handle of the directory that holds the object, which the run holds from before the call
+    /// that made the object.
+    holder: ffi::Handle,
+    /// The object's bare name in that directory.
+    name: OsString,
+}
+
+impl MadeObject {
+    /// Marks the object for removal and closes every handle of it that the run holds: the object is
+    /// opened by its bare name, relative to the handle of the directory that holds it and never
+    /// through a path, with the right to delete (open existing, no following of a reparse point,
+    /// full sharing); the identity of what that opens is compared with the identity of the object
+    /// that this run made; where it is the same, the mark is set on that same handle. Another object
+    /// at the name is marked by nothing. The handle of the open is closed before the object's own
+    /// handle and the directory's, so that the caller turns to the directory that holds this one
+    /// with none of this object's handles open. The words are the platform's refusal, or what was
+    /// found at the name.
+    fn take_away(self) -> Result<(), String> {
+        let MadeObject {
+            identity,
+            holder,
+            name,
+        } = self;
+        let units: Vec<u16> = name.encode_wide().collect();
+        let marked = (|| {
+            let at_name = DirHandle::open_beneath(&holder, &units, DELETE, true, FILE_OPEN)
+                .map_err(|failure| {
+                    if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND
+                    {
+                        "its name was not found in the directory that holds it, so nothing was marked"
+                            .to_owned()
+                    } else {
+                        remedy::platform_error(
+                            "the platform refused to open its name in the directory that holds it with the right to delete it",
+                            failure.code,
+                        )
+                    }
+                })?;
+            let made = file_key(&identity).map_err(|error| {
+                format!(
+                    "the identity of the object that this run made could not be read ({error}), so nothing was marked"
+                )
+            })?;
+            let found = file_key(&at_name).map_err(|error| {
+                format!(
+                    "the identity of the object at its name could not be read ({error}), so nothing was marked"
+                )
+            })?;
+            if found != made {
+                return Err("another object stands at its name, so nothing was marked".to_owned());
+            }
+            super::root::delete(&at_name).map_err(|failure| {
+                remedy::platform_error("the platform refused to mark it for removal", failure.code)
+            })
+        })();
+        // The handle of the open is closed, then the object's own, then the directory's.
+        drop((identity, holder));
+        marked
+    }
+}
+
+/// What a run made of the data directory's place, each object held with the handle of the directory
+/// that holds it. A cleanup takes each object away through its own directory's handle and the
+/// object's identity, never through a path, and turns to the folder above only once every handle of
+/// the data directory is closed, so that an object that was put at a path since (or a link) is never
+/// taken for what this run made. The handles are held until the first manifest is written: after
+/// that a removal finds the objects by the manifest.
 #[derive(Debug, Default)]
 struct Made {
     /// The folder above the data directory, where this run's own call made it.
-    parent: Option<ffi::Handle>,
+    parent: Option<MadeObject>,
     /// The data directory, where this run's own call made it.
-    directory: Option<ffi::Handle>,
-}
-
-/// Marks the object behind `identity` for removal: opens it again through that handle, with the right
-/// to delete, marks it through the new handle (the name goes when the object has no other handle and
-/// no entry) and closes the new handle. The words are the platform's refusal, of the reopen or of the
-/// mark.
-fn mark_for_removal(identity: &ffi::Handle) -> Result<(), String> {
-    let deleter = identity.reopen(DELETE | FILE_READ_ATTRIBUTES).map_err(|failure| {
-        remedy::platform_error(
-            "the platform refused to open it again through its own handle to mark it for removal",
-            failure.code,
-        )
-    })?;
-    super::root::delete(&deleter).map_err(|failure| {
-        remedy::platform_error("the platform refused to mark it for removal", failure.code)
-    })
+    directory: Option<MadeObject>,
 }
 
 impl Made {
@@ -743,35 +794,28 @@ impl Made {
         self.parent.is_none() && self.directory.is_none()
     }
 
-    /// Marks what this run made for removal: the data directory first, through its own handle, and
-    /// every handle of it is closed before the folder above it is marked, where this run made that
-    /// too, and only once the directory is gone. The caller has closed its own handles of both.
-    /// Returns what came of the directory and of the folder: each is [`Taken::NotMade`] where this
-    /// run did not make it, [`Taken::Marked`] where the platform marked it, and [`Taken::Stays`]
-    /// with the platform's refusal of the reopen or the mark (a folder that is not tried because
-    /// the directory in it stays says so).
+    /// Marks what this run made for removal, children before parents: the data directory first,
+    /// through its bare name in the folder above, with every handle of it closed before the folder
+    /// above it is marked, where this run made that too, and only once the directory is gone. The
+    /// caller has closed its own handles of both. Returns what came of the directory and of the
+    /// folder: each is [`Taken::NotMade`] where this run did not make it, [`Taken::Marked`] where
+    /// the platform marked it, and [`Taken::Stays`] with the platform's refusal, or what stands at
+    /// its name (a folder that is not tried because the directory in it stays says so).
     fn take_away(self) -> (Taken, Taken) {
         let Made { parent, directory } = self;
         let directory = match directory {
             None => Taken::NotMade,
-            Some(identity) => {
-                let taken = match mark_for_removal(&identity) {
-                    Ok(()) => Taken::Marked,
-                    Err(words) => Taken::Stays(words),
-                };
-                // The identity is the last handle of the directory that this run holds: it is
-                // closed before the folder is marked, which finds it empty only when the directory
-                // has gone.
-                drop(identity);
-                taken
-            }
+            Some(object) => match object.take_away() {
+                Ok(()) => Taken::Marked,
+                Err(words) => Taken::Stays(words),
+            },
         };
         let folder = match parent {
             None => Taken::NotMade,
             Some(_) if matches!(directory, Taken::Stays(_)) => {
                 Taken::Stays("the data directory in it stays".to_owned())
             }
-            Some(identity) => match mark_for_removal(&identity) {
+            Some(object) => match object.take_away() {
                 Ok(()) => Taken::Marked,
                 Err(words) => Taken::Stays(words),
             },
@@ -2872,9 +2916,8 @@ fn open_data_directory(
         None => match create_data_parent(paths.data_parent())? {
             Some(created) => {
                 // The folder is checked on the handle of the call that made it, not opened again
-                // by its path: that handle can delete it, and an open that does not share delete
-                // would meet it. The copy that this run holds beneath it cannot delete it.
-                let copy = created.duplicate(LIST | FILE_ADD_SUBDIRECTORY);
+                // by its path. The copy that this run holds beneath it cannot delete it.
+                let copy = created.identity.duplicate(LIST | FILE_ADD_SUBDIRECTORY);
                 made.parent = Some(created);
                 let held = copy?;
                 let stage = remedy::Stage::DataParentMade;
@@ -2901,37 +2944,58 @@ fn open_data_directory(
     let descriptor = data_descriptor()?;
     // A directory that is there is opened with no right to delete it (a running broker may hold it
     // without sharing delete), and a link is opened as the link and refused below. One that is not
-    // there is made with the descriptor, through a handle that can mark it for removal.
-    let (opened, created) =
-        match open_directory_relative(&held, name, FILE_OPEN, None, LIST | WRITE_DAC)? {
-            Some(found) => found,
-            None => match open_directory_relative(
+    // there is made with the descriptor, and the handle of the folder that holds it is copied first,
+    // for the cleanup, which opens the directory by its bare name relative to that copy.
+    let (opened, holder) = match open_directory_relative(
+        &held,
+        name,
+        FILE_OPEN,
+        None,
+        LIST | WRITE_DAC,
+    )? {
+        Some((found, _)) => (found, None),
+        None => {
+            let holder = held.duplicate(FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY)?;
+            match open_directory_relative(
                 &held,
                 name,
                 FILE_CREATE,
                 Some(&descriptor),
                 LIST | WRITE_DAC,
             )? {
-                Some(made_here) => made_here,
-                // Another program made it between the two calls: it is opened, and was not made here.
-                None => open_directory_relative(&held, name, FILE_OPEN, None, LIST | WRITE_DAC)?
-                    .ok_or_else(|| {
+                Some((made_here, _)) => (made_here, Some(holder)),
+                // Another program made it between the two calls: it is opened, and was not
+                // made here.
+                None => {
+                    let Some((found, _)) =
+                        open_directory_relative(&held, name, FILE_OPEN, None, LIST | WRITE_DAC)?
+                    else {
                         // text: make_data_directory-3
-                        Error::Failed(format!(
+                        return Err(Error::Failed(format!(
                             "something was at {} when this run tried to make it, and the open after that answered not found",
                             paths.data.display()
-                        ))
-                    })?,
-            },
-        };
-    // A directory that this run made is held through the handle of the call, which stays in `made`.
-    // The handle that the checks and the steps use is a copy that cannot delete it.
-    let handle = if created {
-        let copy = opened.duplicate(LIST | WRITE_DAC);
-        made.directory = Some(opened);
-        copy?
-    } else {
-        opened
+                        )));
+                    };
+                    (found, None)
+                }
+            }
+        }
+    };
+    let created = holder.is_some();
+    // A directory that this run made is held through the handle of the call, which stays in `made`
+    // with the folder's handle and its name. The handle that the checks and the steps use is a copy
+    // that cannot delete it.
+    let handle = match holder {
+        Some(holder) => {
+            let copy = opened.duplicate(LIST | WRITE_DAC);
+            made.directory = Some(MadeObject {
+                identity: opened,
+                holder,
+                name: name.to_owned(),
+            });
+            copy?
+        }
+        None => opened,
     };
     let verdict = data_directory_reason(paths, &handle);
     if created {
@@ -2980,17 +3044,11 @@ fn open_data_directory(
     Ok((held, data, inspected))
 }
 
-/// Makes the folder above the data directory with the protected list, in one call that returns the
-/// handle of the folder that it made. The handle is open with the right to delete the folder and
-/// shares read and write only, so that nothing renames or deletes the folder while it is held.
-/// Returns none where something was there already: a folder that appeared between the look and the
-/// call is opened and checked next, and was not made here.
-fn create_data_parent(parent: &Path) -> Result<Option<ffi::Handle>, Error> {
-    let descriptor = sd::descriptor(SdKind::DataParent, &Principals::default())?;
-    // The platform's own form of an absolute path on a drive: `\??\` before the path, which the
-    // call takes whole where it has no directory to be relative to.
+/// The platform's own form of an absolute path on a drive: `\??\` before the path, which a call
+/// that has no directory to be relative to takes whole.
+fn native_path(path: &Path) -> OsString {
     let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
-    let units: Vec<u16> = parent
+    let units: Vec<u16> = path
         .as_os_str()
         .encode_wide()
         .map(|unit| {
@@ -3002,17 +3060,46 @@ fn create_data_parent(parent: &Path) -> Result<Option<ffi::Handle>, Error> {
         })
         .collect();
     let rest = units.strip_prefix(verbatim.as_slice()).unwrap_or(&units);
-    let name = OsString::from_wide(
-        &[r"\??\".encode_utf16().collect::<Vec<u16>>(), rest.to_vec()].concat(),
-    );
-    Ok(open_directory_at(
-        None,
-        &name,
+    OsString::from_wide(&[r"\??\".encode_utf16().collect::<Vec<u16>>(), rest.to_vec()].concat())
+}
+
+/// Makes the folder above the data directory with the protected list, in one call that is relative to
+/// the handle of the folder that holds it, which the run opens and keeps for the cleanup, and that
+/// returns the handle of the folder that it made. The made folder's handle shares everything and
+/// holds no right to delete it. Returns none where something was there already: a folder that
+/// appeared between the look and the call is opened and checked next, and was not made here.
+fn create_data_parent(parent: &Path) -> Result<Option<MadeObject>, Error> {
+    let descriptor = sd::descriptor(SdKind::DataParent, &Principals::default())?;
+    let holder = match parent.parent().zip(parent.file_name()) {
+        Some((above, name)) => open_directory_at(
+            None,
+            &native_path(above),
+            FILE_OPEN,
+            None,
+            LIST | FILE_ADD_SUBDIRECTORY,
+        )?
+        .map(|(holder, _)| (holder, name)),
+        None => None,
+    };
+    let Some((holder, name)) = holder else {
+        // text: create_data_parent-1
+        return Err(Error::Failed(format!(
+            "{} was not made, because the folder that holds it was not found",
+            parent.display()
+        )));
+    };
+    Ok(open_directory_relative(
+        &holder,
+        name,
         FILE_CREATE,
         Some(&descriptor),
         LIST | FILE_ADD_SUBDIRECTORY,
     )?
-    .map(|(handle, _)| handle))
+    .map(|(identity, _)| MadeObject {
+        identity,
+        holder,
+        name: name.to_owned(),
+    }))
 }
 
 /// Reads the state of every kind of application control and refuses when any is in force. Anything
@@ -4972,4 +5059,119 @@ pub fn residue(prior: &Prior, paths: &Paths, manifest: &Manifest) -> Result<Resi
         stays,
         accounts: read.join("; "),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory made as the installation makes the objects it cleans up: relative to the held
+    /// handle of the directory that holds it, in a call that only makes it, with no right to delete
+    /// it, and held with that directory's handle and its bare name.
+    fn made_in(holder: ffi::Handle, name: &str) -> MadeObject {
+        let (identity, created) = open_directory_relative(
+            &holder,
+            OsStr::new(name),
+            FILE_CREATE,
+            None,
+            LIST | WRITE_DAC,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(created, "{name}");
+        MadeObject {
+            identity,
+            holder,
+            name: name.into(),
+        }
+    }
+
+    fn held(path: &Path) -> ffi::Handle {
+        fresh::hold_directory(path).unwrap()
+    }
+
+    #[test]
+    fn a_directory_that_a_run_made_is_taken_away_by_its_name_in_the_folder_that_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = made_in(held(dir.path()), "made");
+        assert!(std::fs::metadata(dir.path().join("made")).unwrap().is_dir());
+        object.take_away().unwrap();
+        assert!(!dir.path().join("made").try_exists().unwrap());
+    }
+
+    #[test]
+    fn another_object_at_the_name_is_not_marked_and_the_words_say_that_it_stands_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = made_in(held(dir.path()), "made");
+        // The object that the run made is moved away and another directory is put at its name.
+        std::fs::rename(dir.path().join("made"), dir.path().join("aside")).unwrap();
+        std::fs::create_dir(dir.path().join("made")).unwrap();
+        let words = object.take_away().unwrap_err();
+        assert!(
+            words.contains("another object stands at its name, so nothing was marked"),
+            "{words}"
+        );
+        assert!(std::fs::metadata(dir.path().join("made")).unwrap().is_dir());
+        assert!(
+            std::fs::metadata(dir.path().join("aside"))
+                .unwrap()
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn a_directory_that_holds_an_entry_stays_with_the_platforms_refusal_of_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = made_in(held(dir.path()), "made");
+        std::fs::write(dir.path().join("made").join("entry"), b"x").unwrap();
+        let words = object.take_away().unwrap_err();
+        assert!(
+            words.contains("the platform refused to mark it for removal"),
+            "{words}"
+        );
+        assert!(
+            std::fs::metadata(dir.path().join("made").join("entry"))
+                .unwrap()
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn the_data_directory_goes_before_the_folder_above_it_and_each_by_its_own_name() {
+        let top = tempfile::tempdir().unwrap();
+        let folder = made_in(held(top.path()), "above");
+        let above = top.path().join("above");
+        let data = made_in(held(&above), "data");
+        let made = Made {
+            parent: Some(folder),
+            directory: Some(data),
+        };
+        assert_eq!(made.take_away(), (Taken::Marked, Taken::Marked));
+        assert!(!above.try_exists().unwrap());
+    }
+
+    #[test]
+    fn a_folder_stays_where_the_data_directory_in_it_stays() {
+        let top = tempfile::tempdir().unwrap();
+        let folder = made_in(held(top.path()), "above");
+        let above = top.path().join("above");
+        let data = made_in(held(&above), "data");
+        std::fs::rename(above.join("data"), above.join("aside")).unwrap();
+        std::fs::create_dir(above.join("data")).unwrap();
+        let made = Made {
+            parent: Some(folder),
+            directory: Some(data),
+        };
+        let (directory, folder) = made.take_away();
+        assert_eq!(
+            directory,
+            Taken::Stays("another object stands at its name, so nothing was marked".to_owned())
+        );
+        assert_eq!(
+            folder,
+            Taken::Stays("the data directory in it stays".to_owned())
+        );
+        assert!(std::fs::metadata(above.join("data")).unwrap().is_dir());
+        assert!(std::fs::metadata(above.join("aside")).unwrap().is_dir());
+    }
 }
