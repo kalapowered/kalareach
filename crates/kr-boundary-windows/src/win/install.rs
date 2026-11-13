@@ -555,12 +555,17 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
     {
         return Err(ffi::last("reading the data directory's parent folder").into());
     }
-    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-    {
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(parent_refusal(
             paths,
-            "it is a reparse point or not a folder",
+            "it is a reparse point, such as a link or a mounted folder",
+            ParentCure::Link(stage),
+        ));
+    }
+    if tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(parent_refusal(
+            paths,
+            "it is not a folder",
             ParentCure::MoveAside,
         ));
     }
@@ -1723,7 +1728,11 @@ fn known_folder<'a>(given: &'a str, opened: &'a Result<String, String>) -> remed
 /// system gave and the final path of the folder that it opens, so that a known folder reached by
 /// another name is never taken for what its spelling says. After it, a folder strictly below a known
 /// folder is the installation's own.
-fn check_shape(paths: &Paths, stage: remedy::Stage) -> Result<(), Error> {
+///
+/// # Errors
+///
+/// Returns [`Error::Refused`] naming the known folder and the reason.
+pub fn check_shape(paths: &Paths, stage: remedy::Stage) -> Result<(), Error> {
     let data_parent = paths.data_parent();
     let program_data = data_parent.parent().unwrap_or(data_parent);
     let (files_path, data_path) = (
@@ -3484,7 +3493,11 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         }
         records::Begin::Remove(manifest) => manifest,
     };
-    let prior = approved.prior_record(|| Prior::load(&paths.prior).ok());
+    // A record that was approved and cannot be loaded is not used, and the last words say so.
+    let (prior, prior_error) = match approved.prior_record(|| Prior::load(&paths.prior)) {
+        Ok(prior) => (prior, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     // A removal that took `staging` and could not delete the manifest leaves a manifest with no
     // `staging`, and the channel makes its temporary directory there. Where the inspection did not
     // open `staging`, the removal makes it itself, empty, with a creation that fails when anything is
@@ -3746,13 +3759,20 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     }
     // A record that the inspection did not approve was not used: the Application Identity service
     // keeps what the installation gave it, and the last words say so.
-    let unread_prior = records::unread_prior(approved.prior, &records::look(&paths.prior));
+    let unread_prior = format!(
+        "{}{}",
+        records::unread_prior(approved.prior, &records::look(&paths.prior)),
+        prior_error
+            .as_deref()
+            .map(records::unloaded_prior)
+            .unwrap_or_default()
+    );
     if failures.is_empty() {
         // The records go last: a failed removal can be run again from them.
         let stayed = remove_approved_records(paths, &approved);
         if stayed.is_empty() {
             // text: remove_at-24
-            say("the installation is removed");
+            say(&format!("the installation is removed{unread_prior}"));
             Ok(())
         } else {
             // While the manifest stays, the removal runs again whole and reads it. Without it,

@@ -82,7 +82,11 @@ fn a_policy_that_is_not_empty_is_refused_for_what_the_read_showed_and_what_was_c
             text.contains("This run had already made or protected the data directory"),
             "{text}"
         );
-        assert!(text.ends_with("and the manifest records them."), "{text}");
+        assert!(
+            text.contains("and the manifest records them. The folder that holds the data directory is one that this run made unless it was already there, and no manifest records that folder."),
+            "{text}"
+        );
+        assert!(text.ends_with("no manifest records that folder."), "{text}");
         assert!(!text.contains("changes nothing"), "{text}");
         assert!(
             !text.contains("already enforces application control"),

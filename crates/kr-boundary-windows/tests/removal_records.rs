@@ -211,7 +211,7 @@ fn something_in_the_data_directory_that_is_not_a_record_keeps_only_the_data_dire
     );
 }
 
-use kr_boundary_windows::records::{Look, next_step, remove_with, unread_prior};
+use kr_boundary_windows::records::{Look, next_step, remove_with, unloaded_prior, unread_prior};
 use std::ffi::OsString;
 use std::io;
 
@@ -329,6 +329,31 @@ fn the_last_words_of_a_removal_say_what_an_unread_earlier_state_record_left() {
         ),
         ""
     );
+}
+
+/// A removal whose inspection approved the earlier-state record and could not load it did not put
+/// the Application Identity service's start value and running state back and did not compare the
+/// machine with a record: its last words say so, with the error of the load, and do not say that
+/// the machine is back as it was.
+#[test]
+fn the_last_words_of_a_removal_say_what_an_earlier_state_record_that_could_not_be_loaded_left() {
+    let said = unloaded_prior("the installation record is not one this program reads: bad field");
+    assert!(
+        said.contains(
+            "could not be loaded (the installation record is not one this program reads: bad field)"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("start value and running state were not put back"),
+        "{said}"
+    );
+    assert!(
+        said.contains("the machine was not compared with the record"),
+        "{said}"
+    );
+    assert!(said.starts_with(". "), "{said}");
+    assert!(!said.contains("matches"), "{said}");
 }
 
 /// A record that the inspection did not see, whose name cannot be looked at now, is left and named
@@ -469,17 +494,20 @@ fn the_earlier_state_record_is_loaded_only_where_the_inspection_approved_it() {
         prior: true,
         ..Approved::default()
     };
-    assert_eq!(approved.prior_record(|| Some(7)), Some(7));
-    // Approved, and the record cannot be read: no record, as before.
-    assert_eq!(approved.prior_record(|| None::<u32>), None);
+    assert_eq!(approved.prior_record(|| Ok::<_, String>(7)), Ok(Some(7)));
+    // Approved, and the record cannot be loaded: the error comes back, and is not thrown away.
+    assert_eq!(
+        approved.prior_record(|| Err::<u32, _>("not readable".to_owned())),
+        Err("not readable".to_owned())
+    );
 
     let unseen = Approved::default();
     let mut read = false;
     let loaded = unseen.prior_record(|| {
         read = true;
-        Some(7)
+        Ok::<_, String>(7)
     });
-    assert_eq!(loaded, None);
+    assert_eq!(loaded, Ok(None));
     assert!(
         !read,
         "a record that the inspection did not approve is not read"

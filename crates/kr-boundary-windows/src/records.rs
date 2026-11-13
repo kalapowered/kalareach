@@ -62,9 +62,19 @@ impl Approved {
     /// The earlier-state record, loaded only where the inspection approved it: a record that appeared
     /// after the inspection decides nothing (not the Application Identity service's start value, not
     /// whether that service is stopped, not the baseline of the residue check), and the removal acts
-    /// as with no record. It is left and named when the records are deleted.
-    pub fn prior_record<T>(&self, load: impl FnOnce() -> Option<T>) -> Option<T> {
-        if self.prior { load() } else { None }
+    /// as with no record. It is left and named when the records are deleted. Where the inspection
+    /// approved the record and it could not be loaded, the error comes back: the removal goes on as
+    /// with no record, and its last words say that nothing was put back, with the error.
+    ///
+    /// # Errors
+    ///
+    /// The error of `load`, where the record was approved and could not be loaded.
+    pub fn prior_record<T, E>(&self, load: impl FnOnce() -> Result<T, E>) -> Result<Option<T>, E> {
+        if self.prior {
+            load().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Approves every record that is in the data directory now, for a case that inspected nothing:
@@ -385,6 +395,18 @@ pub fn unread_prior(approved: bool, look: &Look) -> String {
         Look::Unread(error) if !approved => format!(". The look at the earlier-state record's name failed ({error}), so no record was read: if one is there, the Application Identity service's start value and running state were not put back, and the next removal inspects the record again"),
         _ => String::new(),
     }
+}
+
+/// What a removal adds to its last words where the earlier-state record was approved and could not be
+/// loaded: no record was used, so the Application Identity service's start value and running state
+/// were not put back, and the machine was not compared with a record. The text starts with a full
+/// stop, to follow last words that have none.
+#[must_use]
+// text: unloaded_prior
+pub fn unloaded_prior(error: &str) -> String {
+    format!(
+        ". The earlier-state record could not be loaded ({error}), so the Application Identity service's start value and running state were not put back, and the machine was not compared with the record"
+    )
 }
 
 /// What the person does about a data directory that stayed after the records went: while the

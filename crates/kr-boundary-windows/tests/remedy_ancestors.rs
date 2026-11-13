@@ -1075,9 +1075,10 @@ fn shape_words(text: &str) {
 }
 
 /// A known folder whose path is not its own final path is refused first, in the shared form with the
-/// layout ending, with what it leads to and no cause: a short name, a link or a mounted folder, a
-/// forward slash, a substituted letter, a network path, an extended prefix, a trailing backslash and
-/// another form of its letters all end here, for either tree.
+/// layout ending, with what it leads to and no cause: a short name, a link, a forward slash, a
+/// substituted letter, a volume's identifier and another form of its letters all end here, for
+/// either tree. A path that is its own final path in the forms that the system writes (the extended
+/// prefix, a trailing backslash) does not.
 #[test]
 fn a_known_folder_that_is_not_its_own_final_path_is_refused_with_what_it_leads_to() {
     // (the path that the system gave, the final path of the folder that it opens, what it leads to)
@@ -1234,6 +1235,49 @@ fn a_known_folder_on_a_network_share_gets_the_words_of_a_volume_that_is_not_used
             assert!(text.contains(&supported_layout(tree)), "{given}: {text}");
             shape_words(&text);
         }
+    }
+}
+
+/// A local known folder that is a link to a share is refused for where it leads, with the words of
+/// a link: the path that the system gave is on a local volume, so the words do not say that the
+/// folder's volume is on another computer, and the share that the link leads to is named once, in
+/// the form that a person can use. A path that names a share itself keeps the words of a volume.
+#[test]
+fn a_local_known_folder_that_is_a_link_to_a_share_gets_the_words_of_a_link() {
+    for tree in [Tree::Program, Tree::Data] {
+        let (files, data) = match tree {
+            Tree::Program => (
+                known(r"C:\Program Files", r"\\?\UNC\server\share\Files"),
+                known(PD, PD_FINAL),
+            ),
+            Tree::Data => (
+                known(PF, PF_FINAL),
+                known(r"C:\ProgramData", r"\\?\UNC\server\share\Data"),
+            ),
+        };
+        let text = shape_refusal(&files, &data, Stage::Before)
+            .unwrap_or_else(|| panic!("a link to a share for {tree:?} is refused"));
+        let (given, leads_to) = match tree {
+            Tree::Program => (r"C:\Program Files", r"\\server\share\Files"),
+            Tree::Data => (r"C:\ProgramData", r"\\server\share\Data"),
+        };
+        assert!(
+            text.starts_with(&format!("{given} is a folder above")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "the path that the system gives for it is not the final path of the folder that it opens: that folder's own path is {leads_to}."
+            )),
+            "{tree:?}: {text}"
+        );
+        assert!(
+            !text.contains("on a volume that the installation does not use"),
+            "{tree:?}: {text}"
+        );
+        assert!(!text.contains("another computer"), "{tree:?}: {text}");
+        assert!(text.contains(&supported_layout(tree)), "{tree:?}: {text}");
+        shape_words(&text);
     }
 }
 
