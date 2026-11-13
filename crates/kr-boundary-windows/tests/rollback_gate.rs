@@ -540,6 +540,38 @@ fn a_service_that_a_new_installation_refused_is_refused_at_the_first_look_and_ac
     assert!(!lay[step..step + words].contains("Outcome::Found"));
 }
 
+/// A service that a new installation refused (its result `refused`) is left alone by the ordinary
+/// removal's steps, and the check after them names it where a read of the service manager finds it
+/// standing; the manifest's word alone does not make the check say that it is gone or that it
+/// stays.
+#[test]
+fn a_service_that_a_new_installation_refused_is_named_by_the_check_after_the_removal() {
+    let source = install_source();
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    assert!(steps.contains(
+        "left_alone.service = !service_is_ours && manifest.find(ObjectKind::Service, SERVICE).is_some();"
+    ));
+    // The service is the removal's to act on only where a result shows it, and a refused one has none.
+    assert!(steps.contains("Some(object) if object.acted_on_by(rollback) => true,"));
+    let residue = code_of(body_of(&source, "pub fn residue("));
+    let decided = residue
+        .find("let service_not_theirs = !remedy::is_this_trees_to_remove(")
+        .expect("the check decides whether the service is the tree's to remove");
+    let read = residue
+        .find("match service::manager()?.open(SERVICE)? {")
+        .expect("the check reads the service manager");
+    let named = residue
+        .find("Some(_) if service_not_theirs => stands.push(")
+        .expect("a service that stands and was left alone is named");
+    let held = residue
+        .find("Some(service) if !service.marked_for_deletion()? => {")
+        .expect("a service that is the tree's to remove is held to gone");
+    assert!(decided < read && read < named && named < held);
+    assert!(residue.contains(
+        "\"the broker's service stands there and the manifest holds no result that the installation made it\""
+    ));
+}
+
 #[test]
 fn the_journal_files_go_only_where_the_service_never_ran_or_a_read_showed_that_it_ended() {
     let source = install_source();

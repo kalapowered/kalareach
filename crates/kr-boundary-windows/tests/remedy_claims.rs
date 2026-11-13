@@ -1018,6 +1018,35 @@ fn the_check_after_a_removal_holds_to_gone_only_what_the_tree_acted_on() {
     // A rollback acts on an object that its own run made, and on no other: an account whose create
     // failed (an intent), one that the run found, and one that no record holds are not its leftover.
     assert!(is_this_trees_to_remove(true, Some(Outcome::Made), false));
+    // A service that a new installation refused is held to gone by neither tree, and the check
+    // after the removal names it where a read finds it standing, with the clause that the manifest
+    // holds no result that the installation made it, and tells nobody to change it.
+    for rollback in [true, false] {
+        assert!(!is_this_trees_to_remove(
+            rollback,
+            Some(Outcome::Refused),
+            true
+        ));
+    }
+    let clause = "the broker's service stands there and the manifest holds no result that the installation made it";
+    let named = residue_tail("", &[], false, &[clause.to_owned()]);
+    assert!(named.contains(clause), "{named}");
+    assert!(
+        !named.contains("is not there or is marked for deletion"),
+        "{named}"
+    );
+    for step in [
+        "Remove",
+        "remove it",
+        "Stop",
+        "stop it",
+        "Delete",
+        "delete it",
+        "Change",
+    ] {
+        assert!(!named.contains(step), "{step} in {named}");
+    }
+    assert!(is_this_trees_to_remove(true, Some(Outcome::Made), false));
     assert!(!is_this_trees_to_remove(true, None, false));
     assert!(!is_this_trees_to_remove(true, Some(Outcome::Found), false));
     // The ordinary removal acts on what the manifest holds by result; what a step read and left
