@@ -817,7 +817,9 @@ fn a_failure_of_the_earlier_state_record_in_a_new_installation_is_rolled_back_cl
             disk_of_the_data_tree(&paths)
         ));
         assert!(
-            failure.contains(&format!("a failure forced for a case at the step {point}")),
+            failure.contains(&format!(
+                "the earlier-state record could not be written: a failure forced for a case at the step {point}"
+            )),
             "{point}: {failure}"
         );
         assert!(
