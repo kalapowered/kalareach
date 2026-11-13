@@ -222,6 +222,24 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
 /// `$defs` (the root must name the dialect of [`DIALECT`], and nothing below it may name another),
 /// and it refuses any form that it cannot read (see [`widens_at`]).
 fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
+    walk(schema, name, true)
+}
+
+/// Whether nothing in `schema` uses the definition `name`, in a schema that the walk reads whole
+/// (see [`is_used_only_where_it_widens`]): no `$ref` reaches it, from a definition or from a
+/// keyword of the root, and every keyword of every definition and of the root is one that the walk
+/// models, so that no keyword that the walk does not read can reach it in another form. The one use
+/// that stands is the bundle's own: an entry of the root's `properties` that is a bare reference
+/// (the schema lists its messages there, and a use as a property widens with its target).
+fn is_not_used(schema: &Value, name: &str) -> bool {
+    walk(schema, name, false)
+}
+
+/// The walk of [`is_used_only_where_it_widens`] and [`is_not_used`]: the dialect gate, the
+/// definitions that reach `name`, and every definition and root keyword read with `widening` as the
+/// state of a use: `true` where a use may stand where a wider definition widens, `false` where
+/// none may stand.
+fn walk(schema: &Value, name: &str, widening: bool) -> bool {
     // A root that names no dialect is read in whatever dialect the reader defaults to, and an older
     // one has no `const` and ignores what stands beside a `$ref`: the walk reads neither.
     if schema.get("$schema").and_then(Value::as_str) != Some(DIALECT) {
@@ -248,7 +266,7 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
             break;
         }
     }
-    schemas_widen(definitions, &reaching, true)
+    schemas_widen(definitions, &reaching, widening)
         && schema
             .as_object()
             .into_iter()
@@ -257,8 +275,23 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
                 "$defs" => true,
                 // The dialect is the walk's own, as checked above.
                 "$schema" => true,
-                _ => widens_at(keyword, member, &reaching, true),
+                // The bundle's entries stand where no other use does.
+                "properties" if !widening => member.as_object().is_some_and(|entries| {
+                    entries.values().all(|entry| match bare_reference(entry) {
+                        Some(reference) => reference_widens(reference, &reaching, true),
+                        None => schema_widens(entry, &reaching, false),
+                    })
+                }),
+                _ => widens_at(keyword, member, &reaching, widening),
             })
+}
+
+/// The `$ref` of an entry that has nothing else: a schema that is a bare reference.
+fn bare_reference(entry: &Value) -> Option<&Value> {
+    entry
+        .as_object()
+        .filter(|members| members.len() == 1)
+        .and_then(|members| members.get("$ref"))
 }
 
 /// The dialect that the walk is written for: the one that the root of a schema must name, and the
@@ -276,10 +309,16 @@ fn schemas_widen(
     reaching: &BTreeSet<&str>,
     widening: bool,
 ) -> bool {
-    named.values().all(|schema| {
-        (schema.is_object() || schema.is_boolean() || schema.is_array())
-            && widens_with(schema, reaching, widening)
-    })
+    named
+        .values()
+        .all(|schema| schema_widens(schema, reaching, widening))
+}
+
+/// Whether `schema`, a member of a map from names to schemas, is an object, a boolean or a list and
+/// stands where it may (see [`schemas_widen`]).
+fn schema_widens(schema: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
+    (schema.is_object() || schema.is_boolean() || schema.is_array())
+        && widens_with(schema, reaching, widening)
 }
 
 /// Whether every `$ref` under `node` to a definition of `reaching` stands where a wider definition
@@ -478,58 +517,6 @@ fn member_added_to_the_configuration_document(difference: &Difference) -> Option
         .filter(|member| !member.contains(['.', '#', '[', '{']))
 }
 
-/// Whether a reference (`$ref` or `$dynamicRef`) to the definition `name` occurs anywhere in a
-/// definition of `schema` or in a keyword of its own root. An entry of the root's `properties` that
-/// is a bare `$ref` is the bundle's own (the schema lists its messages there, and a use as a
-/// property widens with its target) and is not read; any other entry is.
-fn is_referred_to(schema: &Value, name: &str) -> bool {
-    fn refers(node: &Value, reference: &str) -> bool {
-        match node {
-            Value::Object(members) => {
-                ["$ref", "$dynamicRef"]
-                    .iter()
-                    .any(|keyword| members.get(*keyword).and_then(Value::as_str) == Some(reference))
-                    || members.values().any(|member| refers(member, reference))
-            }
-            Value::Array(items) => items.iter().any(|item| refers(item, reference)),
-            _ => false,
-        }
-    }
-    fn is_a_bare_reference(entry: &Value) -> bool {
-        entry.as_object().is_some_and(|members| {
-            members.len() == 1 && members.get("$ref").is_some_and(Value::is_string)
-        })
-    }
-    let reference = format!("#/$defs/{name}");
-    let root: serde_json::Map<String, Value> = schema
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(keyword, _)| keyword.as_str() != "$defs")
-        .map(
-            |(keyword, member)| match (keyword.as_str(), member.as_object()) {
-                ("properties", Some(entries)) => (
-                    keyword.clone(),
-                    Value::Object(
-                        entries
-                            .iter()
-                            .filter(|(_, entry)| !is_a_bare_reference(entry))
-                            .map(|(entry_name, entry)| (entry_name.clone(), entry.clone()))
-                            .collect(),
-                    ),
-                ),
-                _ => (keyword.clone(), member.clone()),
-            },
-        )
-        .collect();
-    refers(&Value::Object(root), &reference)
-        || schema["$defs"].as_object().is_some_and(|definitions| {
-            definitions
-                .values()
-                .any(|definition| refers(definition, &reference))
-        })
-}
-
 /// Whether `difference` is a new section of the configuration document that an earlier release
 /// ignores and counts: a stored file read by level, which records the level of the sections it
 /// holds, so an earlier release applies the rest and refuses to edit it.
@@ -545,11 +532,12 @@ fn is_referred_to(schema: &Value, name: &str) -> bool {
 ///   added member is a key that the earlier schema refused (an open document, a nullable pair or
 ///   a `$ref` with `properties` beside it gives the same label from a list where the member
 ///   restricts a value that the earlier schema accepted);
-/// * no definition of either schema, and no keyword of either root (but a bare reference among the
-///   root's `properties`, the bundle's own entry), refers to `ConfigurationDocument`, so no answer a
-///   host gives carries the document, and a reference that moved to a copy of it cannot hide the
-///   add: only the file and the registry's copy of it are read by a release that lacks the
-///   section.
+/// * nothing in either schema uses `ConfigurationDocument` but the bundle's own entry among the
+///   root's `properties`, and every keyword of every definition and of the root is one that the
+///   walk models ([`is_not_used`]), so no answer a host gives carries the document, no keyword that
+///   is not read can refer to it in another form, and a reference that moved to a copy of it cannot
+///   hide the add: only the file and the registry's copy of it are read by a release that lacks
+///   the section.
 ///
 /// Anything else about the document is compared as it is for every definition, so a change to an
 /// existing member, a default, `required`, a ceiling or a section the table does not list still
@@ -573,8 +561,8 @@ fn is_a_new_section(
         && !required
         && plain_closed_object(CONFIGURATION_DOCUMENT, old, "the earlier release's").is_ok()
         && plain_closed_object(CONFIGURATION_DOCUMENT, new, "this commit's").is_ok()
-        && !is_referred_to(old, CONFIGURATION_DOCUMENT)
-        && !is_referred_to(new, CONFIGURATION_DOCUMENT)
+        && is_not_used(old, CONFIGURATION_DOCUMENT)
+        && is_not_used(new, CONFIGURATION_DOCUMENT)
 }
 
 /// As [`compare`], for the check of a level: the differences that fail a commit that stays at the

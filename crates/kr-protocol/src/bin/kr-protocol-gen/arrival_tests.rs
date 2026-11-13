@@ -1516,8 +1516,8 @@ fn a_definition_named_like_the_roots_place_is_refused() {
 /// the use of the definition or above it, may change what a place accepts in a way that the walk
 /// does not read, so the line is reported. The keyword is the same in both schemas, so the target's
 /// difference is the only one. The method rule, the listed arrival and the read-only member each
-/// read the uses through the walk; the new section needs no reference at all, and its definition
-/// is read by its own keys.
+/// read the uses through the walk; the new section reads both schemas through the same walk, where
+/// no use stands, and its definition by its own keys.
 #[test]
 fn an_unmodelled_keyword_beside_a_use_or_above_it_excuses_nothing() {
     let place = |reference: &str, position: &str| {
@@ -1595,8 +1595,8 @@ fn an_unmodelled_keyword_beside_a_use_or_above_it_excuses_nothing() {
         if with_push {
             properties["push"] = json!({ "type": "object" });
         }
-        json!({ "$defs": { "ConfigurationDocument": { "type": "object", "properties": properties,
-            "additionalProperties": false, "x-unmodelled": true } } })
+        json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": { "type": "object",
+            "properties": properties, "additionalProperties": false, "x-unmodelled": true } } })
     };
     let (lines, passed) = section_lines(&document(false), &document(true));
     assert_eq!(
@@ -2131,7 +2131,7 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
         if with_push {
             properties["push"] = section.clone();
         }
-        json!({ "$defs": { "ConfigurationDocument": {
+        json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": {
             "type": "object", "properties": properties, "additionalProperties": false } } })
     };
     let (lines, passed) = section_lines(&closed(false), &closed(true));
@@ -2147,23 +2147,23 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
     };
     for (old, new, says) in [
         (
-            json!({ "$defs": { "ConfigurationDocument": open(false) } }),
-            json!({ "$defs": { "ConfigurationDocument": open(true) } }),
+            json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": open(false) } }),
+            json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": open(true) } }),
             // The old schema accepts `{"push": 5}`; the new one refuses it.
             "an open document",
         ),
         (
-            json!({ "$defs": { "ConfigurationDocument": {
+            json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": {
                 "anyOf": [open(false), { "type": "null" }] } } }),
-            json!({ "$defs": { "ConfigurationDocument": {
+            json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": {
                 "anyOf": [open(true), { "type": "null" }] } } }),
             // The same, in the one schema of a nullable pair: the old schema accepts `{"push": 5}`.
             "an open object in a nullable pair",
         ),
         (
-            json!({ "$defs": { "Base": open(false),
+            json!({ "$schema": DIALECT, "$defs": { "Base": open(false),
                 "ConfigurationDocument": { "$ref": "#/$defs/Base" } } }),
-            json!({ "$defs": { "Base": open(false), "ConfigurationDocument": {
+            json!({ "$schema": DIALECT, "$defs": { "Base": open(false), "ConfigurationDocument": {
                 "$ref": "#/$defs/Base", "properties": { "push": section.clone() } } } }),
             // The same, beside a reference to an open object: the old schema accepts `{"push": 5}`.
             "a reference with properties beside it",
@@ -2187,7 +2187,7 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
             "closed, then open",
         ),
     ] {
-        let wrap = |definition: Value| json!({ "$defs": { "ConfigurationDocument": definition } });
+        let wrap = |definition: Value| json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": definition } });
         let (lines, passed) = section_lines(&wrap(old), &wrap(new));
         assert!(
             lines.contains(&wanted[0]) && passed.is_empty(),
@@ -2286,6 +2286,111 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
         (vec![], vec!["push".to_owned()]),
         "the root's properties"
     );
+}
+
+/// A new section is excused only where every keyword of both schemas, at the place and on the path
+/// from the root to it, is one that the walk models: an unmodelled keyword anywhere (at the root, in
+/// another definition, inside the document) and a reference to the document under a keyword that the
+/// walk does not read as a reference (`$dynamicRef`, `$recursiveRef`) leave the section as a line, as
+/// does a use that the walk reads. A schema that names no dialect is refused as it is for the other
+/// rules. The keyword stands in both schemas, in the earlier one only and in the new one only, so
+/// that the section is the only difference that can be excused. (A `$ref` of another form is
+/// refused when the schema is cut, which is not this rule's.)
+#[test]
+fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
+    let schema = |with_push: bool| {
+        let mut properties = json!({ "version": { "type": "integer" } });
+        if with_push {
+            properties["push"] = json!({ "type": "object" });
+        }
+        json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": {
+            "type": "object", "properties": properties, "additionalProperties": false } } })
+    };
+    let wanted = "ConfigurationDocument.push added: a member".to_owned();
+    // Modelled keywords at the same places change nothing: annotations at the root, a definition
+    // that the document does not use and a keyword of a member.
+    let modelled = |schema: &mut Value| {
+        schema["title"] = json!("The bundle");
+        schema["description"] = json!("The messages of the bundle.");
+        schema["$defs"]["Other"] = json!({ "type": "object", "description": "Another one.",
+            "properties": { "name": { "type": "string", "format": "uri", "minLength": 1,
+                "tsType": "string" } }, "required": ["name"] });
+        schema["$defs"]["ConfigurationDocument"]["properties"]["version"]["minimum"] = json!(1);
+    };
+    let (mut old, mut new) = (schema(false), schema(true));
+    modelled(&mut old);
+    modelled(&mut new);
+    assert_eq!(
+        section_lines(&old, &new),
+        (vec![], vec!["push".to_owned()]),
+        "modelled keywords"
+    );
+    let rows: [(&str, fn(&mut Value)); 8] = [
+        ("an unmodelled keyword at the root", |schema| {
+            schema["x-unmodelled"] = json!(true);
+        }),
+        ("an unmodelled keyword in another definition", |schema| {
+            schema["$defs"]["Other"] = json!({ "type": "object", "x-unmodelled": true });
+        }),
+        (
+            "an unmodelled keyword in a member of the document",
+            |schema| {
+                schema["$defs"]["ConfigurationDocument"]["properties"]["version"]["x-unmodelled"] =
+                    json!(true);
+            },
+        ),
+        ("a use of the document", |schema| {
+            schema["$defs"]["Holder"] = json!({ "type": "object", "properties": {
+                "c": { "$ref": "#/$defs/ConfigurationDocument" } } });
+        }),
+        ("a dynamic reference with an encoded pointer", |schema| {
+            schema["$defs"]["Holder"] = json!({ "type": "object", "properties": {
+                "c": { "$dynamicRef": "#/%24defs/ConfigurationDocument" } } });
+        }),
+        ("a dynamic reference at the root", |schema| {
+            schema["$dynamicRef"] = json!("#/%24defs/ConfigurationDocument");
+        }),
+        ("a recursive reference at the root", |schema| {
+            schema["$recursiveRef"] = json!("#");
+        }),
+        ("a dynamic reference with an address", |schema| {
+            schema["$defs"]["Holder"] = json!({ "type": "object", "properties": {
+                "c": { "$dynamicRef": "https://example.com/bundle#/$defs/ConfigurationDocument" } } });
+        }),
+    ];
+    let mut excused = Vec::new();
+    for (says, edit) in rows {
+        for (in_the_old, in_the_new) in [(true, true), (true, false), (false, true)] {
+            let (mut old, mut new) = (schema(false), schema(true));
+            if in_the_old {
+                edit(&mut old);
+            }
+            if in_the_new {
+                edit(&mut new);
+            }
+            let (lines, passed) = section_lines(&old, &new);
+            if !lines.contains(&wanted) || !passed.is_empty() {
+                excused.push(format!("{says} (earlier {in_the_old}, new {in_the_new})"));
+            }
+        }
+    }
+    // A schema that names no dialect is read in whatever dialect the reader defaults to.
+    for (in_the_old, in_the_new) in [(true, true), (true, false), (false, true)] {
+        let (mut old, mut new) = (schema(false), schema(true));
+        if in_the_old {
+            old.as_object_mut().expect("object").remove("$schema");
+        }
+        if in_the_new {
+            new.as_object_mut().expect("object").remove("$schema");
+        }
+        let (lines, passed) = section_lines(&old, &new);
+        if !lines.contains(&wanted) || !passed.is_empty() {
+            excused.push(format!(
+                "no dialect (earlier {in_the_old}, new {in_the_new})"
+            ));
+        }
+    }
+    assert!(excused.is_empty(), "the section passed: {excused:#?}");
 }
 
 /// A listed member of the SDK's schema arrives only where every use of its definition widens with
