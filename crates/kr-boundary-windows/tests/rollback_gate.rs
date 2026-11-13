@@ -398,6 +398,31 @@ fn an_ending_says_deleted_or_gone_only_with_the_read_that_found_it() {
     assert!(!source.contains("the data directory in it stays"));
 }
 
+/// A read of a name that failed after a mark was set shows neither that the object is gone nor that
+/// it stays: its result is `Unconfirmed`, and no ending puts it under "stays".
+#[test]
+fn a_read_of_a_name_that_failed_after_a_mark_is_said_as_unknown_and_never_as_stays() {
+    let source = install_source();
+    let read_back = code_of(body_of(&source, "fn read_back("));
+    // Only an object that a read found at its name stays; a read that failed does not say so.
+    assert!(read_back.contains("Err(failure) => Taken::Unconfirmed("));
+    assert!(read_back.contains("Ok(_) => Taken::Stays("));
+    assert_eq!(read_back.matches("Taken::Stays(").count(), 1);
+    // The file's take-away reads no name where it holds no directory, and says so as unknown too.
+    let file = code_of(body_of(
+        &source,
+        "    fn take_away(self, holder: Option<&ffi::Handle>) -> Taken {",
+    ));
+    assert!(file.contains("return Taken::Unconfirmed("));
+    // Each ending that prints a folder or a directory by its result has an arm of its own for it.
+    let folder = code_of(body_of(&source, "fn remove_program_folder("));
+    assert!(folder.contains("Taken::Unconfirmed(why) => {"));
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    assert!(steps.contains("Taken::Unconfirmed(why) => {"));
+    // The data directory's folder is not tried while the directory's removal is not confirmed.
+    assert!(source.contains("Taken::Stays(_) | Taken::Unconfirmed(_)"));
+}
+
 #[test]
 fn the_journal_files_go_only_where_the_service_never_ran_or_a_read_showed_that_it_ended() {
     let source = install_source();
