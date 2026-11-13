@@ -98,16 +98,24 @@ fn frozen_cases<'a>(frozen: &'a Value, family: &str) -> &'a [Value] {
 }
 
 /// Every case the code makes must be the case the fixture holds at the same place, and the fixture
-/// must hold no more: a comparison that stops early or a fixture that was cut short fails here.
+/// must hold no more: a comparison that stops early, skips cases or a fixture that was cut short
+/// fails here.
 fn assert_cases_equal(family: &str, actual: &[Value], frozen: &[Value]) {
     assert_eq!(
         actual.len(),
         frozen.len(),
         "{family}: the fixture holds a different number of cases than the lengths ask for"
     );
+    let mut compared = 0;
     for (made, expected) in actual.iter().zip(frozen) {
         assert_eq!(made, expected, "{family}: the answer for {expected}");
+        compared += 1;
     }
+    assert_eq!(
+        compared,
+        frozen.len(),
+        "{family}: not every case was compared"
+    );
 }
 
 /// A bit of `byte`'s to flip at `position`, so that the flips cover every bit of a byte over a
