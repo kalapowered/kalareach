@@ -55,8 +55,8 @@ pub(super) enum LocalWrite {
     Derived(&'static str),
     /// A write that keeps no record of its action and reads none. The reason says why.
     Unrecorded(&'static str),
-    /// A local write the daemon does not serve because the worker does: the envelope refuses it
-    /// first, by name.
+    /// A local write the daemon does not serve, because the worker does, or because no request
+    /// carries it: the envelope refuses it first, by name.
     NotServed,
 }
 
@@ -124,6 +124,16 @@ impl LocalWrite {
             _ if crate::automation::AutomationModule::serves(method) => Self::Automation,
             _ if crate::attention::AttentionModule::serves(method) => Self::Attention,
             _ if crate::changeset::ChangeSetModule::serves(method) => Self::ChangeSet,
+            // Neither the daemon nor a worker's request table serves these: the palette is no
+            // action of a request, raw input is an ordered stream with no action identity, and the
+            // root editor's frames travel to the worker on its own stream.
+            Method::TerminalPaletteSet
+            | Method::InputWrite
+            | Method::RootEditorEnter
+            | Method::RootEditorLeave
+            | Method::RootEditorFence
+            | Method::RootEofDetach
+            | Method::RootCommandAccepted => Self::NotServed,
             _ if kr_protocol::worker_surface::serves(method) => Self::NotServed,
             _ => return None,
         })

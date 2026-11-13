@@ -31,9 +31,9 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// The fence check and the registration check run for each of them before it does anything. A
 /// method that takes an admission asks both inside the service that performs it, so this list is
 /// the only place a method is held to the fence by name, and a method that belongs here and is
-/// missing runs while the fence is owed. `every_local_write_method_the_daemon_performs_is_placed`
-/// walks the registry and fails for a method that is on neither this list nor the list of those
-/// that take an admission.
+/// missing runs while the fence is owed. `every_local_write_in_the_method_table_has_one_route`
+/// walks the registry and fails for a local write that has no route, and for a method here that
+/// has none.
 pub(super) const NO_ADMISSION: [Method; 12] = [
     Method::HostPolicyConfirm,
     Method::EnvironmentEnrol,
@@ -375,6 +375,38 @@ impl Controller {
                   began, and the admission it carries"
     )]
     pub(super) async fn write_method(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        connection_id: ConnectionId,
+        origin: Option<kr_protocol::local::BridgeOrigin>,
+        accepted: Option<AcceptedDeadline>,
+        admitted: Option<AuthorityRevision>,
+    ) -> Settled<ControlFrame> {
+        let settled = self
+            .route_write(
+                actor_id,
+                mutation,
+                method,
+                connection_id,
+                origin,
+                accepted,
+                admitted,
+            )
+            .await;
+        #[cfg(feature = "testing")]
+        self.after_a_route_answers.wait().await;
+        settled
+    }
+
+    /// The route the write takes, matched by its kind, and what the route came to.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a write is the actor, the request, the connection it arrived on and where that \
+                  began, and the admission it carries"
+    )]
+    async fn route_write(
         self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
