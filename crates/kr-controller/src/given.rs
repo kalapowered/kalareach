@@ -367,6 +367,23 @@ impl<T, E> Recorded<Result<T, E>> {
     }
 }
 
+impl<T> Recorded<Result<T, crate::error::ControllerError>> {
+    /// [`Self::checked`], for a record that may hold the conflict a reused identifier meets: that
+    /// answer is no copy of a result but the host's word about another request's use of the
+    /// identifier, so a check that stops it is the host's own refusal, which is true: this request
+    /// was not performed.
+    pub(crate) fn checked_or_reused(
+        self,
+        check: impl FnOnce() -> Result<(), crate::error::ControllerError>,
+    ) -> Given<Result<T, crate::error::ControllerError>> {
+        let reused = matches!(
+            self.0,
+            Err(crate::error::ControllerError::IdConflict { .. })
+        );
+        Given::checked(self.0, !reused, reused, check)
+    }
+}
+
 impl<T, E> Recorded<Result<Option<T>, E>> {
     /// The read, when a record was found. `Ok(None)` is the one exit that names no record: a read
     /// that failed stays inside the type, as the record that could not be read.
