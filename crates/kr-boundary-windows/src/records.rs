@@ -409,19 +409,48 @@ pub fn unloaded_prior(error: &str) -> String {
     )
 }
 
-/// What the person does about a data directory that stayed after the records went: while the
-/// manifest stays, the removal is run again and inspects it again; an empty directory with no manifest is a
-/// state that a new installation accepts and the next removal finishes; anything else in it was
-/// checked by no handle in this run, and a new installation refuses until it is gone: the removal
-/// is run again, reads the first entry that it finds on its own handle and says what to do about it.
+/// What a listing of a directory answered: nothing in it, an entry in it, or an error, which says
+/// nothing about what it holds.
+#[derive(Debug)]
+pub enum Held {
+    /// The listing returned no entry.
+    Nothing,
+    /// The listing returned an entry.
+    Entries,
+    /// The listing, or the read of its first entry, failed: nothing is known of what it holds.
+    Unlisted(io::Error),
+}
+
+/// Lists a directory as far as its first entry.
+#[must_use]
+pub fn held_in(directory: &Path) -> Held {
+    match fs::read_dir(directory) {
+        Ok(mut entries) => match entries.next() {
+            None => Held::Nothing,
+            Some(Ok(_)) => Held::Entries,
+            Some(Err(error)) => Held::Unlisted(error),
+        },
+        Err(error) => Held::Unlisted(error),
+    }
+}
+
+/// What the person does about a data directory that stayed after the records went, from what two
+/// reads answered: a look at the manifest's name and a listing of the directory. While something is
+/// at the manifest's name, the removal is run again and inspects the directory again; where the
+/// look failed, whether anything is at the name is not known, and the words say the same of the
+/// next run; an empty directory with no manifest is a state that a new installation accepts, and
+/// the next removal tries to remove it; where the listing failed, nothing is known of what the
+/// directory holds, and the next removal inspects it; anything else in it was checked by no handle
+/// in this run, and a new installation refuses until it is gone: the removal is run again, reads
+/// the first entry that it finds on its own handle and says what to do about it.
 #[must_use]
 // text: next_step
-pub fn next_step(manifest_stays: bool, data_is_empty: bool) -> &'static str {
-    if manifest_stays {
-        "Something is at the manifest's name, and it stays with them. If a program holds one of them open, close it. Then run the removal again, which inspects the data directory again and says what remains"
-    } else if data_is_empty {
-        "The directory is empty, and a new installation accepts an empty data directory: if a program holds it (a console that has it as its current directory, for one), close that program, then run the removal again, which removes it"
-    } else {
-        "A new installation refuses until they are gone, and nothing has checked them: run the removal again, which reads the first entry that it finds on its own handle and says what to do about it, then run the setup program again"
+pub fn next_step(manifest: &Look, held: &Held) -> String {
+    match (manifest, held) {
+        (Look::There, _) => "Something is at the manifest's name, and it stays with them. If a program holds one of them open, close it. Then run the removal again, which inspects the data directory again and says what remains".to_owned(),
+        (Look::Unread(error), _) => format!("The look at the manifest's name failed ({error}), so whether a manifest stays is not known. If a program holds one of the entries open, close it. Then run the removal again, which inspects the data directory again and says what remains"),
+        (Look::NotThere, Held::Unlisted(error)) => format!("The data directory could not be listed ({error}), so what it holds is not known: run the removal again, which inspects it"),
+        (Look::NotThere, Held::Nothing) => "The directory is empty, and a new installation accepts an empty data directory: if a program holds it (a console that has it as its current directory, for one), close that program, then run the removal again, which tries to remove it again".to_owned(),
+        (Look::NotThere, Held::Entries) => "A new installation refuses until they are gone, and nothing has checked them: run the removal again, which reads the first entry that it finds on its own handle and says what to do about it, then run the setup program again".to_owned(),
     }
 }

@@ -1146,7 +1146,7 @@ fn a_removal_where_nothing_is_installed_promises_no_repair() {
 
 /// A known folder that an administrator gave a network path is refused in both walks, for its
 /// volume: each walk asks the volume of the folder that it opens before it reads anything else of
-/// it, and a volume on another computer is not one that the installation uses. The data walk
+/// it, and a volume that is reached over the network is not one that the installation uses. The data walk
 /// refuses the share's root, and the program walk, which begins at the share's root as the program
 /// directory's top, refuses it the same way, from `entry` and from the removal. The comparisons
 /// that follow the volume check refuse a final path on a network share too, and the printing of a
@@ -1192,7 +1192,10 @@ fn a_known_folder_on_a_network_share_is_refused_in_both_walks() {
         text.contains("is on a volume that the installation does not use"),
         "{text}"
     );
-    assert!(text.contains("the volume is on another computer"), "{text}");
+    assert!(
+        text.contains("the volume is reached over the network"),
+        "{text}"
+    );
     assert!(text.contains(&format!(r"\\localhost\{name}\")), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
 
@@ -1213,7 +1216,10 @@ fn a_known_folder_on_a_network_share_is_refused_in_both_walks() {
             text.contains("is on a volume that the installation does not use"),
             "{text}"
         );
-        assert!(text.contains("the volume is on another computer"), "{text}");
+        assert!(
+            text.contains("the volume is reached over the network"),
+            "{text}"
+        );
         assert!(text.contains(&format!(r"\\localhost\{name}\")), "{text}");
     }
 }

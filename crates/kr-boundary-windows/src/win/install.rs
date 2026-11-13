@@ -566,7 +566,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
         return Err(parent_refusal(
             paths,
             "it is not a folder",
-            ParentCure::MoveAside,
+            ParentCure::NotAFolder,
         ));
     }
     if let Some(finding) = acl::changeable_by_others_on(&handle, false)? {
@@ -839,7 +839,7 @@ fn origin_of_opened(opened: &Opened, kind: EntryKind) -> Origin {
 fn origin_of_lost(lost: &Lost) -> Origin {
     match lost {
         Lost::Refused(code) => remedy::origin_of_open_error(*code, &lost.to_string()),
-        other => Origin::Unknown(other.to_string()),
+        other => Origin::Changed(other.to_string()),
     }
 }
 
@@ -3488,7 +3488,10 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             return Err(Error::Failed(format!(
                 "the data directory stays because {} could not be removed. {}",
                 stayed.join("; "),
-                records::next_step(false, data_is_empty(paths))
+                records::next_step(
+                    &records::look(&paths.manifest),
+                    &records::held_in(&paths.data)
+                )
             )));
         }
         records::Begin::Remove(manifest) => manifest,
@@ -3778,7 +3781,10 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             // While the manifest stays, the removal runs again whole and reads it. Without it,
             // an empty directory is finished by the next removal, and anything else in it is for
             // the person to remove.
-            let next = records::next_step(paths.manifest.exists(), data_is_empty(paths));
+            let next = records::next_step(
+                &records::look(&paths.manifest),
+                &records::held_in(&paths.data),
+            );
             // text: remove_at-25
             Err(Error::Failed(format!(
                 "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}{unread_prior}",
@@ -3792,11 +3798,6 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             failures.join("; ")
         )))
     }
-}
-
-/// Whether the data directory holds nothing.
-fn data_is_empty(paths: &Paths) -> bool {
-    fs::read_dir(&paths.data).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Removes the installation's own records, last of all, and then the data directory and, when it is

@@ -157,6 +157,57 @@ fn a_private_root_that_no_journal_names_takes_its_remedy_from_its_handle() {
     }
 }
 
+/// A refused entry's words say what the handle showed and no more: an entry that the handle shows
+/// to be a link, a second name, another kind or another owner is named for what the installation
+/// does not leave there, with no word about who made it; an entry that changed or moved while it
+/// was read is not said to have been unreadable; an entry that cannot be opened because a delete is
+/// pending is told to be freed by closing the program that holds it; and the words about the next
+/// run are for an installation or a repair, which are the runs that make the entries.
+#[test]
+fn the_words_of_a_refused_entry_say_what_the_handle_showed_and_nothing_of_who_made_it() {
+    let (remedy, foreign) = said(EntryKind::Staging, &Origin::Foreign, &Presence::Present);
+    assert_eq!(remedy, Remedy::MoveAside);
+    assert!(
+        foreign.contains("shows what the installation does not leave there: an owner that is not the system or the Administrators group, a reparse point, a second name for a file, or another kind of object than its layout gives at that name"),
+        "{foreign}"
+    );
+    assert!(!foreign.contains("did not make it"), "{foreign}");
+    assert!(
+        foreign.contains(
+            "An installation or a repair run next finds the entry absent and makes it new."
+        ),
+        "{foreign}"
+    );
+    assert!(!foreign.contains("The next run"), "{foreign}");
+
+    let (remedy, changed) = said(
+        EntryKind::JournalFile,
+        &Origin::Changed("the identifier names another object".to_owned()),
+        &Presence::Present,
+    );
+    assert_eq!(remedy, Remedy::MoveAside);
+    assert!(
+        changed.contains(
+            "it changed or moved while it was read (the identifier names another object)"
+        ),
+        "{changed}"
+    );
+    assert!(!changed.contains("could not be read"), "{changed}");
+    assert!(!changed.contains("did not make it"), "{changed}");
+
+    let (_, refused) = said(
+        EntryKind::JournalFile,
+        &Origin::Refused("Windows error 5".to_owned()),
+        &Presence::Present,
+    );
+    assert!(
+        refused.contains(
+            "if its delete is pending, close the program that holds it, and the entry goes"
+        ),
+        "{refused}"
+    );
+}
+
 /// An open that failed shows what its error shows: a list that refuses, a program that holds the
 /// entry, or nothing.
 #[test]
@@ -361,11 +412,55 @@ fn a_link_at_the_folder_above_the_data_directory_is_told_as_one_at_an_own_folder
     }
 }
 
+/// The folder above the data directory is said to be made new only on a condition that the run
+/// that follows can meet: the boundary is not installed (an installation then makes it; a removal
+/// makes nothing, and an installed boundary stops the run before). The folder that the handle shows
+/// with another owner is told by its owner; what is at a folder's name and is no folder is a thing
+/// that is moved aside, with nothing said of what it holds.
+#[test]
+fn the_folder_above_the_data_directory_is_said_to_be_made_new_only_where_the_boundary_is_not_installed()
+ {
+    for cure in [
+        ParentCure::Unreadable,
+        ParentCure::MoveAside,
+        ParentCure::NotAFolder,
+    ] {
+        let text = parent_advice(&cure);
+        assert!(
+            text.contains(
+                "Where the boundary is not installed, the installation then makes the folder new."
+            ),
+            "{cure:?}: {text}"
+        );
+        assert!(
+            !text.contains("again: the installation makes the folder new"),
+            "{cure:?}: {text}"
+        );
+    }
+    let owner = parent_advice(&ParentCure::MoveAside);
+    assert!(
+        owner.contains(
+            "The handle of this folder shows an owner that is not the system or the Administrators group"
+        ),
+        "{owner}"
+    );
+    assert!(!owner.contains("did not make"), "{owner}");
+    let file = parent_advice(&ParentCure::NotAFolder);
+    assert!(
+        file.contains("What is at this folder's name is not a folder"),
+        "{file}"
+    );
+    for held in ["can hold", "keeps everything in it", "files that"] {
+        assert!(!file.contains(held), "{held}: {file}");
+    }
+}
+
 #[test]
 fn a_folder_that_holds_the_data_directory_or_may_is_never_told_to_be_removed() {
     for cure in [
         ParentCure::Close,
         ParentCure::MoveAside,
+        ParentCure::NotAFolder,
         ParentCure::Link(Stage::Before),
         ParentCure::Unreadable,
         ParentCure::Correct(Presence::Present),

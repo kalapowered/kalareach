@@ -45,6 +45,9 @@ pub enum Origin {
     /// The handle could not be opened or read for another reason, so nothing is known of who made
     /// it. The text carries the platform's error.
     Unknown(String),
+    /// The open succeeded and showed another object, or the object in another place, than the
+    /// listing named: nothing is known of who made the entry. The text carries the reason.
+    Changed(String),
 }
 
 /// The origin that an open which failed with this platform error number shows: a sharing or lock
@@ -161,7 +164,9 @@ pub enum Remedy {
 #[must_use]
 pub fn choose(kind: EntryKind, origin: &Origin, manifest: &Presence) -> Remedy {
     match origin {
-        Origin::Foreign | Origin::Refused(_) | Origin::Unknown(_) => Remedy::MoveAside,
+        Origin::Foreign | Origin::Refused(_) | Origin::Unknown(_) | Origin::Changed(_) => {
+            Remedy::MoveAside
+        }
         Origin::Held(_) => Remedy::Unreadable,
         Origin::System if matches!(kind, EntryKind::Other | EntryKind::UnnamedRoot) => {
             Remedy::Remove
@@ -198,19 +203,24 @@ pub fn ending(
         Remedy::MoveAside => {
             let basis = match origin {
                 Origin::Refused(error) => format!(
-                    "Nothing shows who made {entry}: it could not be opened ({error}). A permission list that refuses the Administrators group gives that error, and no list of the installation's does; an entry with a delete pending gives it too."
+                    "Nothing shows who made {entry}: it could not be opened ({error}). A permission list that refuses the Administrators group gives that error, and no list of the installation's does; an entry with a delete pending gives it too, and a rename of such an entry fails: if its delete is pending, close the program that holds it, and the entry goes."
                 ),
                 Origin::Unknown(error) => format!(
                     "Nothing shows who made {entry}, because it could not be read ({error})."
                 ),
-                _ => format!("The handle of {entry} shows that the installation did not make it."),
+                Origin::Changed(error) => format!(
+                    "Nothing shows who made {entry}: it changed or moved while it was read ({error})."
+                ),
+                _ => format!(
+                    "The handle of {entry} shows what the installation does not leave there: an owner that is not the system or the Administrators group, a reparse point, a second name for a file, or another kind of object than its layout gives at that name."
+                ),
             };
             let next = match kind {
                 EntryKind::Manifest => {
                     "The directory then holds no manifest, and nothing records what else is in it: the next run reads those entries one at a time on their own handles, and for the first it finds says to remove it, when its handle shows the system's class, to move it aside, when its handle shows that the installation did not make it or shows nothing of who made it (its list refuses the check, it could not be read, or it changed or moved while it was read), or to close the program that holds it open."
                 }
                 EntryKind::Prior | EntryKind::Staging | EntryKind::Journal | EntryKind::Run => {
-                    "The next run finds the entry absent and makes it new."
+                    "An installation or a repair run next finds the entry absent and makes it new."
                 }
                 EntryKind::Replacement
                 | EntryKind::JournalFile
@@ -239,9 +249,12 @@ pub enum ParentCure {
     /// Another program holds the folder open: closing that program cures it, and a change of owner
     /// or list does not.
     Close,
-    /// The handle shows that the installation did not make the folder (a link, not a folder, or an
-    /// owner that is not the system's class): move it aside, and do not correct it into place.
+    /// The handle shows an owner that is not the system's class: move the folder aside, and do not
+    /// correct it into place.
     MoveAside,
+    /// The handle shows no directory bit: what is at the folder's name is not a folder, and it is
+    /// moved aside.
+    NotAFolder,
     /// The system's class owns it and its list is wrong: correct the list. Only a lookup of the
     /// data directory's name in it is known, which decides whether removal is offered: an entry at
     /// that name is not read, so it is said to be something that can hold an installation.
@@ -262,10 +275,11 @@ pub enum ParentCure {
 // text: parent_advice
 pub fn parent_advice(cure: &ParentCure) -> String {
     match cure {
-        ParentCure::Unreadable => "Nothing shows who made this folder, because it could not be opened to be checked. Do not correct its owner or its list, and do not remove it: either would hide what it is. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned(),
+        ParentCure::Unreadable => "Nothing shows who made this folder, because it could not be opened to be checked. Do not correct its owner or its list, and do not remove it: either would hide what it is. Move the folder aside (rename it, which keeps everything in it), then run the setup program again. Where the boundary is not installed, the installation then makes the folder new.".to_owned(),
         ParentCure::Close => "Close the program that holds it open, then run the setup program again: a change of its owner or its list does not close a handle. Do not remove it.".to_owned(),
         ParentCure::Link(stage) => own_link_words(*stage),
-        ParentCure::MoveAside => "The installation did not make this folder, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned(),
+        ParentCure::MoveAside => "The handle of this folder shows an owner that is not the system or the Administrators group, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again. Where the boundary is not installed, the installation then makes the folder new.".to_owned(),
+        ParentCure::NotAFolder => "What is at this folder's name is not a folder, and the layout gives a folder there. Move it aside (rename it), then run the setup program again. Where the boundary is not installed, the installation then makes the folder new.".to_owned(),
         ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again."),
         ParentCure::Correct(Presence::Present) => "Do not remove it: something is at the data directory's name in it, and that can hold the manifest, the journals and the private roots of an installation, which removing this folder would destroy. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
         ParentCure::Correct(Presence::Absent) => "Nothing is at the data directory's name in it. If nothing else needs what is in it, remove or rename the folder, then run the setup program again.".to_owned(),
@@ -294,10 +308,13 @@ pub fn rights_in_words(mask: u32) -> String {
     const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     let mut parts = Vec::new();
-    if mask & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0 {
+    if mask & GENERIC_ALL != 0 {
         parts.push("every right on it");
     } else if mask & GENERIC_WRITE != 0 {
         parts.push("the right to change it");
+    }
+    if mask & MAXIMUM_ALLOWED != 0 {
+        parts.push("the maximum-allowed bit, which this check counts as every right");
     }
     if mask & DELETE_CHILD != 0 {
         parts.push("the right to delete or rename an entry in it");
@@ -367,16 +384,26 @@ pub fn git_permissions_refusal(path: &str, finding: &Finding, replacement: bool)
 // text: rights_finding
 pub fn rights_finding(identity: &str, mask: u32) -> String {
     format!(
-        "{identity} is allowed {} (rights 0x{mask:x})",
+        "an entry of its list allows {identity} {} (rights 0x{mask:x})",
         rights_in_words(mask)
     )
 }
 
-/// The reason that a volume on another computer is not used: the words of the volume check's
+/// What the check says of an entry that it counted for a folder's own content or for a replacement:
+/// the identifier and the rights of the entry, which can hold on the object or, through
+/// inheritance, on what is made in it. An entry for inheritance alone is counted, and a deny entry
+/// is not read, so the words give the entry and claim no result.
+#[must_use]
+// text: entry_rights_finding
+pub fn entry_rights_finding(sid: &str, mask: u32) -> String {
+    format!("an entry of its list allows {sid} rights 0x{mask:x} (on it or on what is made in it)")
+}
+
+/// The reason that a volume that is reached over the network is not used: the words of the volume check's
 /// refusal and of the shape check's, which reads a share in a final path.
 // text: REMOTE_VOLUME
 pub const REMOTE_VOLUME: &str =
-    "the volume is on another computer, and only local volumes are supported";
+    "the volume is reached over the network, and only local volumes are supported";
 
 /// Whether a folder's final path, as the system gives it, is on a network share
 /// (`\\?\UNC\server\share`). The folders above a share are the server's, not the ones that the
@@ -869,7 +896,8 @@ pub fn data_ending(origin: &Origin, case_sensitive: bool) -> &'static str {
     match origin {
         Origin::Foreign => DATA_NOT_MADE,
         Origin::Held(_) => DATA_UNREADABLE,
-        Origin::Refused(_) | Origin::Unknown(_) => DATA_UNKNOWN,
+        // The data directory is opened by its own path, so no loss of a listed child reaches it.
+        Origin::Refused(_) | Origin::Unknown(_) | Origin::Changed(_) => DATA_UNKNOWN,
         Origin::System if case_sensitive => CASE_REMEDY,
         Origin::System => DATA_REMEDY,
     }
@@ -992,7 +1020,7 @@ pub fn shape_refusal(
         let leads_to;
         let fault = match known.opened {
             Err(error) => AncestorFault::Unreadable(error),
-            // A path that names a share is on another computer's volume whatever its spelling
+            // A path that names a share is on a volume that is reached over the network whatever its spelling
             // says: its words come before any comparison of the two paths, so that it never gets
             // words about a path that leads elsewhere.
             Ok(found) if is_on_a_network_share(found) && names_a_share(known.given) => {

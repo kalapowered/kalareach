@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use kr_boundary_windows::records::next_step;
+use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
     CASE_SENSITIVE_WHY, EntryKind, Origin, ParentCure, Presence, UNNAMED_ROOT_WHY, choose,
     data_ending, ending, parent_advice, program_keeping, program_open_advice,
@@ -196,7 +196,7 @@ fn a_root_that_no_journal_names_is_not_said_to_be_idle() {
 /// A data directory that stayed empty is said to be held only as a condition.
 #[test]
 fn an_empty_data_directory_that_stayed_is_not_said_to_be_held() {
-    let text = next_step(false, true);
+    let text = next_step(&Look::NotThere, &Held::Nothing);
     assert!(
         text.contains("if a program holds it (a console that has it as its current directory, for one), close that program"),
         "{text}"

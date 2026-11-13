@@ -3157,7 +3157,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         let text = refused.to_string();
         assert!(text.contains(words), "{text}");
         assert!(text.contains("Move it aside"), "{text}");
-        assert!(text.contains("did not make"), "{text}");
+        assert!(text.contains("does not leave there"), "{text}");
         assert!(!text.contains("Remove "), "{text}");
     };
 
@@ -3291,10 +3291,10 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .to_string();
     assert!(text.contains("manifest.json"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
-    // The text names the account that owns it, says that the installation did not make it and not
-    // to correct it into place, and says not to remove it.
+    // The text names the account that owns it, says what the handle shows that the installation
+    // does not leave there, says not to correct it into place, and says not to remove it.
     assert!(text.contains(&owner.to_text()), "{text}");
-    assert!(text.contains("did not make"), "{text}");
+    assert!(text.contains("does not leave there"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
     assert!(text.contains("do not remove it"), "{text}");
     give_to(&paths.manifest, "*S-1-5-32-544");

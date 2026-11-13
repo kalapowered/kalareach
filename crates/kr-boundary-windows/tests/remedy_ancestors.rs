@@ -4,9 +4,9 @@
 
 use kr_boundary_windows::remedy::{
     AncestorFault, KnownFolder, ParentCure, Presence, Stage, Subject, Tree, ancestor_refusal,
-    dos_path_of, identity_text, is_below, is_on_a_network_share, is_the_place_asked_for,
-    is_the_volumes_own_root, known_folder_unreadable, parent_advice, program_removal_advice,
-    rights_finding, rights_in_words, shape_refusal, supported_layout,
+    dos_path_of, entry_rights_finding, identity_text, is_below, is_on_a_network_share,
+    is_the_place_asked_for, is_the_volumes_own_root, known_folder_unreadable, parent_advice,
+    program_removal_advice, rights_finding, rights_in_words, shape_refusal, supported_layout,
 };
 
 const DELETE_CHILD: u32 = 0x0000_0040;
@@ -219,9 +219,33 @@ fn each_right_that_lets_an_account_replace_a_folder_is_said_in_words() {
     assert!(rights_in_words(WRITE_DAC).contains("change its list"));
     assert!(rights_in_words(WRITE_OWNER).contains("take its ownership"));
     assert!(rights_in_words(GENERIC_WRITE).contains("change it"));
-    for every in [GENERIC_ALL, MAXIMUM_ALLOWED] {
-        assert!(rights_in_words(every).contains("every right"), "{every:x}");
-    }
+    assert!(rights_in_words(GENERIC_ALL).contains("every right on it"));
+    // The maximum-allowed bit grants no right in an entry: the check counts it, and the words say
+    // that and nothing more.
+    let maximum = rights_in_words(MAXIMUM_ALLOWED);
+    assert!(
+        maximum.contains("the maximum-allowed bit, which this check counts as every right"),
+        "{maximum}"
+    );
+    assert!(!maximum.contains("every right on it"), "{maximum}");
+}
+
+/// The words for an entry of a list say what the list holds, not a result: a deny entry is not read
+/// by the check, so "is allowed" is not said, and an entry that counts through inheritance names
+/// both places.
+#[test]
+fn a_finding_names_the_entry_of_the_list_and_claims_no_result() {
+    let finding = rights_finding("S-1-5-11", DELETE);
+    assert_eq!(
+        finding,
+        "an entry of its list allows S-1-5-11 the right to delete it (rights 0x10000)"
+    );
+    assert!(!finding.contains("is allowed"), "{finding}");
+    let inherited = entry_rights_finding("S-1-5-11", DELETE | DELETE_CHILD);
+    assert_eq!(
+        inherited,
+        "an entry of its list allows S-1-5-11 rights 0x10040 (on it or on what is made in it)"
+    );
 }
 
 #[test]
@@ -343,7 +367,7 @@ fn the_refusal_of_a_list_names_the_real_sentence_and_says_what_a_supported_layou
     );
     assert_eq!(
         finding,
-        r"NT AUTHORITY\Authenticated Users (S-1-5-11) is allowed the right to delete or rename an entry in it, the right to delete it (rights 0x10040)"
+        r"an entry of its list allows NT AUTHORITY\Authenticated Users (S-1-5-11) the right to delete or rename an entry in it, the right to delete it (rights 0x10040)"
     );
     let text = ancestor_refusal(
         &Subject::shared(r"D:\ProgramData", AncestorFault::List(&finding)),
@@ -1191,7 +1215,7 @@ fn a_known_folder_equal_to_its_final_path_is_never_refused() {
 }
 
 /// A known folder whose final path is on a network share gets the words of a volume that the
-/// installation does not use, before any comparison of the two paths: it is on another computer
+/// installation does not use, before any comparison of the two paths: it is reached over the network
 /// whatever its given path says, and the text shows the folder once, never one path as two.
 #[test]
 fn a_known_folder_on_a_network_share_gets_the_words_of_a_volume_that_is_not_used() {
@@ -1220,7 +1244,7 @@ fn a_known_folder_on_a_network_share_gets_the_words_of_a_volume_that_is_not_used
             );
             assert!(
                 text.contains(
-                    "It is on a volume that the installation does not use (the volume is on another computer, and only local volumes are supported)."
+                    "It is on a volume that the installation does not use (the volume is reached over the network, and only local volumes are supported)."
                 ),
                 "{given}: {text}"
             );
@@ -1240,7 +1264,7 @@ fn a_known_folder_on_a_network_share_gets_the_words_of_a_volume_that_is_not_used
 
 /// A local known folder that is a link to a share is refused for where it leads, with the words of
 /// a link: the path that the system gave is on a local volume, so the words do not say that the
-/// folder's volume is on another computer, and the share that the link leads to is named once, in
+/// folder's volume is reached over the network, and the share that the link leads to is named once, in
 /// the form that a person can use. A path that names a share itself keeps the words of a volume.
 #[test]
 fn a_local_known_folder_that_is_a_link_to_a_share_gets_the_words_of_a_link() {
@@ -1275,7 +1299,7 @@ fn a_local_known_folder_that_is_a_link_to_a_share_gets_the_words_of_a_link() {
             !text.contains("on a volume that the installation does not use"),
             "{tree:?}: {text}"
         );
-        assert!(!text.contains("another computer"), "{tree:?}: {text}");
+        assert!(!text.contains("over the network"), "{tree:?}: {text}");
         assert!(text.contains(&supported_layout(tree)), "{tree:?}: {text}");
         shape_words(&text);
     }

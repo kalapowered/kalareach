@@ -211,7 +211,9 @@ fn something_in_the_data_directory_that_is_not_a_record_keeps_only_the_data_dire
     );
 }
 
-use kr_boundary_windows::records::{Look, next_step, remove_with, unloaded_prior, unread_prior};
+use kr_boundary_windows::records::{
+    Held, Look, held_in, next_step, remove_with, unloaded_prior, unread_prior,
+};
 use std::ffi::OsString;
 use std::io;
 
@@ -391,13 +393,15 @@ fn a_record_whose_look_failed_is_left_and_named_with_the_error() {
 /// reads the first entry that it finds and says what to do about it, and nothing says to remove an entry unread.
 #[test]
 fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
-    assert!(next_step(true, false).contains("run the removal again"));
+    let there = || Look::There;
+    let nothing = || Look::NotThere;
+    assert!(next_step(&there(), &Held::Entries).contains("run the removal again"));
     // The next removal can refuse a link at a replacement's name in its inspection, before it reads
     // the manifest, so the words promise another inspection and no read of the manifest and no
     // completion.
-    let kept = next_step(true, false);
+    let kept = next_step(&there(), &Held::Entries);
     assert!(kept.contains("inspects the data directory again"), "{kept}");
-    assert!(next_step(true, true).contains("inspects the data directory again"));
+    assert!(next_step(&there(), &Held::Nothing).contains("inspects the data directory again"));
     assert!(kept.contains("says what remains"), "{kept}");
     // A record can stay because the inspection did not see it, and nothing holds it then: closing
     // what holds a record is said only for the case that a program does.
@@ -408,10 +412,14 @@ fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
     );
     assert!(!kept.contains("reads the manifest"), "{kept}");
     assert!(!kept.contains("finishes"), "{kept}");
-    let empty = next_step(false, true);
+    let empty = next_step(&nothing(), &Held::Nothing);
     assert!(empty.contains("accepts an empty data directory"), "{empty}");
     assert!(!empty.contains("refuses"), "{empty}");
-    let full = next_step(false, false);
+    // A removal call that failed for a cause that is no holder fails the same way again, so the
+    // words promise a try and no removal.
+    assert!(empty.contains("which tries to remove it again"), "{empty}");
+    assert!(!empty.contains("which removes it"), "{empty}");
+    let full = next_step(&nothing(), &Held::Entries);
     assert!(full.contains("refuses until they are gone"), "{full}");
     assert!(full.contains("run the removal again"), "{full}");
     assert!(
@@ -420,6 +428,50 @@ fn the_words_after_a_directory_that_stayed_say_what_is_true_of_the_state() {
     );
     assert!(!full.contains("remove them"), "{full}");
     assert!(!full.contains("accepts"), "{full}");
+}
+
+/// A look or a listing that failed says nothing about the manifest's name or about what the
+/// directory holds: the words give the error and promise another inspection, and say neither that
+/// entries stay nor that the directory is empty.
+#[test]
+fn the_words_after_a_directory_that_stayed_do_not_read_a_failed_look_or_listing_as_an_answer() {
+    let failed = || io::Error::from(io::ErrorKind::PermissionDenied);
+    let unlisted = next_step(&Look::NotThere, &Held::Unlisted(failed()));
+    assert!(
+        unlisted.contains("could not be listed (permission denied)"),
+        "{unlisted}"
+    );
+    assert!(
+        unlisted.contains("so what it holds is not known"),
+        "{unlisted}"
+    );
+    assert!(unlisted.contains("which inspects it"), "{unlisted}");
+    for said in ["refuses", "until they are gone", "is empty", "stays"] {
+        assert!(!unlisted.contains(said), "{said}: {unlisted}");
+    }
+    let unread = next_step(&Look::Unread(failed()), &Held::Entries);
+    assert!(
+        unread.contains("look at the manifest's name failed (permission denied)"),
+        "{unread}"
+    );
+    assert!(
+        unread.contains("whether a manifest stays is not known"),
+        "{unread}"
+    );
+    assert!(
+        !unread.contains("Something is at the manifest's name"),
+        "{unread}"
+    );
+
+    // The listing of a directory that is not there, of an empty one and of one with an entry.
+    let case = Data::new();
+    assert!(matches!(
+        held_in(&case.data.join("not-there")),
+        Held::Unlisted(_)
+    ));
+    assert!(matches!(held_in(&case.data), Held::Nothing));
+    fs::write(case.manifest(), b"x").unwrap();
+    assert!(matches!(held_in(&case.data), Held::Entries));
 }
 
 /// Rule 2 at the records: the removal deletes a record only where its own inspection opened it. One
