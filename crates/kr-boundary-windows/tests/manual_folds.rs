@@ -2,18 +2,31 @@
 //! that can fold a failed read into a value without a method that the linter's list can name, each
 //! of which stands in `tests/manual_folds.txt` with its reason.
 //!
-//! The forms: a `match` arm on an error that does not use what it caught (`Err(_) =>`, or a name
-//! that the arm's text never mentions), an `if let Ok(` or `while let Ok(`, a `let Ok(` with an
-//! `else`, a `.err()`, a result that is discarded (`let _ =` or a binding that starts with an
-//! underscore), and a `matches!(` over an `Ok(`, an `Err(` or a lookup's answer. A place is found
-//! by its file, its form and the statement's own text (the first line, trimmed), never by a line
-//! number, so a place moves with its code and a new one cannot come in without a row.
+//! The forms: a `match` arm on an error that does not use what it caught (`Err(_) =>`, `Err(..) =>`,
+//! or a name that the arm's text never mentions, an underscore name included: `Err(_error) =>`), a
+//! wildcard arm (`_ =>`, `_ if .. =>`) of a `match` whose earlier arms at the same indentation match
+//! an `Ok(` or an `Err(`, an `if let Ok(` or `while let Ok(`, a `let Ok(` with an `else`, a `.err()`,
+//! a result that is discarded (`let _ =` or a binding that starts with an underscore), and a
+//! `matches!(` over an `Ok(`, an `Err(` or a lookup's answer. A place is found by its file, its form
+//! and the statement's own text (the first line, trimmed), never by a line number, so a place moves
+//! with its code and a new one cannot come in without a row.
 //!
-//! What it cannot see: a fold that is written another way (a `match` on a tuple, a closure that
-//! swallows an error, `Result::into_iter` and `for` over a result, `Option` made from a `Result` by
-//! a method outside the linter's list, an error that an arm uses only to build a value that hides
-//! it), a statement that spans lines in a way that puts its form after the first line, and what
-//! lies after a `#[cfg(test)]` line. The reviewer's read is what holds a row's reason true. They
+//! What it cannot see:
+//! - a form over several lines: a pattern or an arrow on a later line than the first of the
+//!   statement, a wildcard arm whose earlier arms are not at its indentation, and a `match` whose
+//!   result arms all stand after the wildcard;
+//! - a pattern in a tuple (`(Ok(a), Err(_)) =>`), which is read only as far as the first `Err(` on
+//!   its line, and a `match` whose arms name no `Ok(` or `Err(` (a wildcard on a value that was
+//!   made from a result is then not a place);
+//! - a fold that is written another way: a closure that swallows an error, `Result::into_iter` and
+//!   `for` over a result, an `Option` made from a `Result` by a method outside the linter's list,
+//!   and an error that an arm uses only to build a value that hides it;
+//! - what lies after a `#[cfg(test)]` line.
+//!
+//! A call whose result is discarded as a statement (`read_machine();`) is not looked for here: the
+//! compiler refuses it. Every `Result` is `#[must_use]`, and the `unused_must_use` lint of rustc
+//! (a warning that the checks' `-D warnings` turns into an error) refuses a statement that drops one;
+//! this crate sets no `allow` for it. The reviewer's read is what holds a row's reason true. They
 //! run on every platform.
 
 use std::collections::BTreeMap;
@@ -63,10 +76,12 @@ fn bindings(pattern: &str) -> Vec<String> {
                 let word: String = characters[from..index].iter().collect();
                 let next = characters.get(index).copied();
                 let after_path = from >= 2 && characters[from - 2..from] == [':', ':'];
+                // An underscore name (`_error`) is a name that the arm may leave unused; the
+                // wildcard alone is the pattern `_`, which the caller reads.
                 let lower = word
                     .chars()
                     .next()
-                    .is_some_and(|first| first.is_lowercase());
+                    .is_some_and(|first| first.is_lowercase() || (first == '_' && word.len() > 1));
                 if lower
                     && word != "ref"
                     && word != "mut"
@@ -97,6 +112,28 @@ fn mentions(text: &str, name: &str) -> bool {
             return true;
         }
         from = end;
+    }
+    false
+}
+
+/// Whether an arm at this indentation belongs to a `match` that has an earlier arm, at the same
+/// indentation, with a pattern of `Ok(` or `Err(`: the lines before the arm are read backwards until
+/// the line that is less indented (the `match` itself).
+fn arms_before_match_a_result(before: &[&str], indent: usize) -> bool {
+    for line in before.iter().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let here = indentation(line);
+        if here < indent {
+            return false;
+        }
+        if here == indent {
+            let pattern = line.trim_start().split("=>").next().unwrap_or("");
+            if pattern.contains("Ok(") || pattern.contains("Err(") {
+                return true;
+            }
+        }
     }
     false
 }
@@ -153,10 +190,17 @@ fn scan(file: &str, text: &str) -> Vec<Place> {
             }
             let names = bindings(pattern);
             let folds = pattern == "_"
+                || pattern == ".."
                 || (!names.is_empty() && names.iter().all(|name| !mentions(&arm, name)));
             if folds {
                 place("an error arm that does not use the error");
             }
+        }
+        // A wildcard arm catches an error without naming it, where the arms before it match a result.
+        if (line.starts_with("_ =>") || line.starts_with("_ if "))
+            && arms_before_match_a_result(&lines[..index], indentation(raw))
+        {
+            place("a wildcard arm of a match on a result");
         }
         if line.starts_with("let Ok(") {
             place("let Ok else");
@@ -304,6 +348,22 @@ fn the_scan_finds_each_form_and_the_check_names_what_the_list_lacks() {
     let _ = std::fs::remove_dir(path);
     let _kept = step();
     let there = matches!(look(path), Look::NotThere);
+    match step() {
+        Ok(value) => value,
+        Err(_error) => 0,
+    }
+    match step() {
+        Ok(value) => value,
+        Err(..) => 0,
+    }
+    match step() {
+        Ok(value) => value,
+        _ => 0,
+    }
+    match count {
+        1 => one(),
+        _ => other(),
+    }
     // Err(_) => 1,
 }
 #[cfg(test)]
@@ -324,6 +384,9 @@ mod tests {
             "a result that is discarded",
             "a result that is discarded",
             "matches over a read",
+            "an error arm that does not use the error",
+            "an error arm that does not use the error",
+            "a wildcard arm of a match on a result",
         ],
         "{places:#?}"
     );
