@@ -2325,7 +2325,7 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         (vec![], vec!["push".to_owned()]),
         "modelled keywords"
     );
-    let rows: [(&str, fn(&mut Value)); 10] = [
+    let rows: [(&str, fn(&mut Value)); 11] = [
         ("an unmodelled keyword at the root", |schema| {
             schema["x-unmodelled"] = json!(true);
         }),
@@ -2365,6 +2365,13 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
             |schema| {
                 schema["properties"] = json!({ "c": { "$ref": "#/$defs/ConfigurationDocument",
                 "description": "The document." } });
+            },
+        ),
+        (
+            "a root property that uses the document in an anyOf",
+            |schema| {
+                schema["properties"] = json!({ "c": { "anyOf": [
+                { "$ref": "#/$defs/ConfigurationDocument" }, { "type": "null" }] } });
             },
         ),
         ("a dynamic reference with an address", |schema| {
