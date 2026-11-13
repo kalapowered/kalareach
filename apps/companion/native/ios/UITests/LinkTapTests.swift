@@ -337,8 +337,8 @@ final class LinkTapTests: HarnessTestCase {
 
     // MARK: The taps
 
-    /// Taps the outer boundary of the area that the page gives a link: the corners and the middle of each side, at the
-    /// area's own edge (half a point inside it) and one step (two points) outside it, and the words' middle. The area is
+    /// Taps the outer boundary of the area that the page gives a link: the corners and the middle of each side, one point
+    /// inside the area's own edge and one step (three points) outside it, and the words' middle. The area is
     /// what the rule gives: the words grown to the least size and to 22 points beside them, held to the link's view (the
     /// pane and the message that clips it), a cut on one side given to the other. A tap inside opens the link once. A
     /// tap outside opens nothing by the page; where the platform's own adjustment opens the link there, or the tap lands

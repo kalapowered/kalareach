@@ -255,7 +255,8 @@ export const SLOP = 10
  * screen whose density factor takes WebKit's corner above this number (above about 1.07). The cases log
  * the press-to-click distance of every tap, on a click that names plain text apart from one that names a
  * link's own element or another control, since only the first is decided here (a click that names an
- * element stands, and the browser's adjustment chose it), and hold both to `CLICK_AWAY`.
+ * element stands, and the browser's adjustment chose it). The browser cases assert both distances against
+ * `CLICK_AWAY`; the iOS session and the Android probe only log them.
  */
 export const TOUCH_ADJUSTMENT = 16 * Math.SQRT2
 
@@ -271,10 +272,11 @@ const STAND = { kind: 'stand' } as const
 /**
  * Whether a press of this pointer type can get an open from `decide`: a touch or a pen. A mouse's or a
  * trackpad's click on plain text opens nothing, as on a desktop, so a press of those lights nothing by
- * the rule either, and keeps no look by it. This one test serves every path that lights or keeps a look
- * or opens: the pointer down (which link the press lights), each scroll or resize while a lit press lives
- * (whether a release would still open it) and the click (`decide`). A press on a link's own element is
- * kept besides by the element lying under the point, for every pointer type.
+ * the rule either, and keeps no look by it. This one test is asked at the pointer down (which link the
+ * press lights), at each move of a mouse's or a trackpad's press (its look follows the pointer, since only
+ * the element can open), at each scroll or resize while a lit press lives (whether a release would still
+ * open it) and at the click (`decide`). A press on a link's own element is kept besides by the element
+ * lying under the point, for every pointer type.
  */
 export function opensByRule(pointerType: string): boolean {
   return pointerType === 'touch' || pointerType === 'pen'
