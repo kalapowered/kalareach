@@ -1219,6 +1219,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_the_automation_admission: ReadPause::default(),
             #[cfg(feature = "testing")]
+            after_the_catalogue_answer: ReadPause::default(),
+            #[cfg(feature = "testing")]
             before_a_connection_is_registered: ReadPause::default(),
             #[cfg(feature = "testing")]
             before_a_connection_is_deregistered: DeregistrationHold::default(),

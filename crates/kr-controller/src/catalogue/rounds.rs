@@ -611,9 +611,24 @@ impl Controller {
                 removal,
             )
             .await;
+        #[cfg(feature = "testing")]
+        self.after_the_catalogue_answer.wait().await;
         if self.catalogue.admission_revision().await.ok() != before {
             self.admissions_due();
         }
         answer
+    }
+
+    /// Arms the pause the next catalogue or plugin mutation stops at once the catalogue has
+    /// answered it, before the wait for the admission revision that follows. Returns the end that
+    /// says the mutation has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_catalogue_answer(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.after_the_catalogue_answer.arm()
     }
 }

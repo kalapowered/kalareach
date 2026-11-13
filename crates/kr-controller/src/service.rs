@@ -694,6 +694,11 @@ pub struct Controller {
     /// a fence can land in between. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_automation_admission: ReadPause,
+    /// Where this host's own tests stop a catalogue or plugin mutation that the catalogue has
+    /// answered, before the wait for the admission revision that follows the answer, so that a
+    /// fence can land in between. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_catalogue_answer: ReadPause,
     /// Where this host's own tests stop a network connection the transport has authorised, before
     /// the host registers it, so that a revocation can land in between. Compiled away in every
     /// shipped build.

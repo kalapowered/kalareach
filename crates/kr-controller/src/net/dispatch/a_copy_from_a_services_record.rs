@@ -930,3 +930,83 @@ async fn a_kept_answer_is_shown_only_to_a_device_that_may_read_it() {
     }
     world.serving.abort();
 }
+
+/// KR-REQ-09.09: a receipt that another submission of the action left, found by the catalogue,
+/// goes back to a device only under the authority it arrived under. Two copies of a catalogue
+/// mutation are served at once: the first is stopped at the door before its effect, the second
+/// performs and records a receipt, and the first, let go, finds that receipt. A fence that lands in
+/// the wait the catalogue makes after it has answered the first is told as an outcome that is not
+/// shown. This is a control, not a change: the door's own check after the wait (`kept_answer`)
+/// already told the copy so, and the case holds it there for the wait that follows the
+/// catalogue's answer. The copy that is given the recorded refusal when no fence lands is the case
+/// of the catalogue's mutations above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catalogue_receipt_a_fence_overtakes_in_the_last_wait_is_not_shown() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let (connection, recording) = paired_connection(controller, 61, EVERY_RIGHT);
+    let adding = ParamsValue::from_typed(&kr_protocol::catalogue::CatalogueAddParams {
+        environment_id: world.environment_id,
+        catalogue_id: "a-repository".to_owned(),
+        kind: kr_protocol::catalogue::CatalogueKind::Local,
+        metadata_url: String::new(),
+        targets_url: String::new(),
+        root: String::new(),
+        budgets: kr_protocol::catalogue::CatalogueBudgets {
+            metadata_bytes: kr_protocol::scalars::U64::new(1),
+            metadata_entries: kr_protocol::scalars::U64::new(1),
+            retained_generations: kr_protocol::scalars::U64::new(1),
+            retained_metadata_bytes: kr_protocol::scalars::U64::new(1),
+            payload_cache_bytes: kr_protocol::scalars::U64::new(1),
+            full_offline_mirror: false,
+        },
+        ceiling: Vec::new(),
+        owner_confirmation: Nullable::null(),
+    })
+    .expect("encodes");
+    let mutation = mutation_of(&world, &connection, Method::CatalogueAdd, 91, adding);
+
+    let (arrived, go) = controller.before_the_effect.arm();
+    let first = connection.answer_now(ControlFrame::Mutation(Box::new(mutation.clone())));
+    tokio::pin!(first);
+    tokio::select! {
+        arrived = tokio::time::timeout(WAIT_BOUND, arrived) => {
+            arrived
+                .expect("the first copy reaches the place it is stopped at")
+                .expect("the pause is armed");
+        }
+        early = &mut first => panic!("the first copy was answered before its effect: {early:?}"),
+    }
+    let performed = connection
+        .answer_now(ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("the second copy is answered");
+    let recorded = refusal_of(&performed);
+    assert!(
+        super::is_definite(&recorded),
+        "the case needs a catalogue that refuses and records a receipt: {recorded:?}"
+    );
+
+    let (at_the_wait, let_go) = controller.pause_after_the_catalogue_answer();
+    go.send(()).expect("the first copy goes on");
+    tokio::select! {
+        reached = tokio::time::timeout(WAIT_BOUND, at_the_wait) => {
+            reached
+                .expect("the first copy reaches the catalogue's last wait")
+                .expect("the pause is armed");
+        }
+        early = &mut first => {
+            panic!("the first copy was answered before the catalogue's last wait: {early:?}")
+        }
+    }
+    controller.raise_the_unverified_withdrawal_refusal().await;
+    let_go
+        .send(())
+        .expect("the first copy goes on from the wait");
+    let answered = first.await.expect("the first copy is answered");
+    let routed = refusal_of(&answered);
+    assert_eq!(routed.code, ErrorCode::OutcomeUnknown, "{routed:?}");
+    let told = written(&connection, &recording, answered).await;
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    world.serving.abort();
+}
