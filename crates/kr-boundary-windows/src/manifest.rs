@@ -275,8 +275,7 @@ impl Prior {
     ///
     /// Returns [`StoreError::Io`] when the file cannot be written.
     pub fn write_once(&self, path: &Path) -> Result<bool, StoreError> {
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|error| StoreError::Unreadable(error.to_string()))?;
+        let bytes = self.to_bytes()?;
         match create(path, true) {
             Ok(mut file) => {
                 file.write_all(&bytes)?;
@@ -286,6 +285,15 @@ impl Prior {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// The bytes that [`Prior::write_once`] writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Unreadable`] when the record cannot be serialized.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        serde_json::to_vec_pretty(self).map_err(|error| StoreError::Unreadable(error.to_string()))
     }
 
     /// Reads the record at a path.
@@ -307,8 +315,10 @@ impl Prior {
 }
 
 /// A failure that a case forces at a named step, once, in the test build only. The steps are
-/// `"protect"` and `"record"` (the installation's first two steps after it made the data directory)
-/// and `"replacement"` (inside the write of a record, after its replacement file was made).
+/// `"protect"` and `"record"` (the installation's first two steps after it made the data directory),
+/// `"replacement"` (inside the write of a record, after its replacement file was made), `"proof"`
+/// (the first read of the proof, after the replacement was renamed over the record), and `"prior"`
+/// and `"prior-flush"` (the write and the flush of the earlier-state record, after it was made).
 #[cfg(feature = "testing")]
 pub mod forced {
     use std::sync::{Mutex, PoisonError};
