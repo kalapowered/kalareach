@@ -3040,7 +3040,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .staging
         .join(format!("policy-{}.xml", "ef".repeat(16)));
     owned_file(&named, b"x");
-    refused_with("no manifest records this directory");
+    refused_with("the manifest holds no record of this directory");
     std::fs::remove_file(&named).unwrap();
     std::fs::remove_file(&paths.manifest).unwrap();
     refused_with("no manifest records this directory");
