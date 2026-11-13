@@ -33,9 +33,13 @@ pub enum Presence {
 pub enum Origin {
     /// One name, no link, and an owner of the system's class (the system or the Administrators).
     System,
-    /// The installation did not make it: another account owns it, it is a link, it is not the kind
-    /// of object the installation makes there, or a file has more than one name.
+    /// The installation did not make it: it is a link, it is not the kind of object the
+    /// installation makes there, or a file has more than one name. The owner is not read for these.
     Foreign,
+    /// The owner was read, and it is an account that the installation does not set: not the system
+    /// and not the Administrators group. The text is the owner's identifier as the handle showed
+    /// it. The owner alone does not show who made the entry, only who owns it now.
+    Owned(String),
     /// A program holds it open, so the handle could not be had. The text carries the platform's
     /// error. Closing the program cures it, and nothing says who made the entry.
     Held(String),
@@ -186,9 +190,11 @@ pub fn choose(
         return Remedy::MoveAside;
     }
     match origin {
-        Origin::Foreign | Origin::Refused(_) | Origin::Unknown(_) | Origin::Changed(_) => {
-            Remedy::MoveAside
-        }
+        Origin::Foreign
+        | Origin::Owned(_)
+        | Origin::Refused(_)
+        | Origin::Unknown(_)
+        | Origin::Changed(_) => Remedy::MoveAside,
         Origin::Held(_) => Remedy::Unreadable,
         Origin::System if matches!(kind, EntryKind::Other | EntryKind::UnnamedRoot) => {
             Remedy::Remove
@@ -947,9 +953,19 @@ fn own_link_words(stage: Stage) -> String {
 /// class as its owner: what the administrator does. Nothing the installation recorded is removed.
 const DATA_REMEDY: &str = "Leave the system and the Administrators group as the only entries of its list, then run the setup program again. Nothing in it is removed.";
 
-/// The words the refusal of a data directory ends with when its handle shows that the installation
-/// did not make it (another account owns it, or it is a link or not a directory).
-const DATA_NOT_MADE: &str = "The handle of this directory shows what the installation does not leave there: an owner that is not the system or the Administrators group, a reparse point, or an object that is not a directory. It can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
+/// The words that tell an administrator to move the data directory aside. They stand only at an
+/// installation where reads that succeeded found no service, no account and no rule of the
+/// installation, and where the handle shows that the installation did not make the directory.
+const DATA_NOT_MADE: &str = "The reads of this run found no service, no account and no rule of the installation. The directory can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
+
+/// What the handle of a data directory shows when it is a link or not a directory.
+const DATA_KIND: &str = "The handle of this directory shows a reparse point or an object that is not a directory, which the installation does not leave there.";
+
+/// The words that end the refusal of a data directory at a removal or a repair, or where a part of
+/// the installation may be on the computer, when the handle shows a link or another kind of object:
+/// the records in it are not used, and no step is named.
+const DATA_KIND_STANDS: &str =
+    "The setup program does not use the records in it. It names no step for it.";
 
 /// The words the refusal of a data directory that separates names by case ends with, when the
 /// system's class owns it.
@@ -963,25 +979,51 @@ pub const CASE_SENSITIVE_WHY: &str = "it separates names that differ only by cas
 /// the system: said only where a read of the directory's owner and list succeeded.
 const DATA_CAN_BE_CHANGED: &str = "Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system.";
 
+/// What the reads of one run showed of the rest of the installation, where the data directory is
+/// refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// An installation, and every read of the service, of the two accounts and of the policy
+    /// succeeded and found nothing of the installation.
+    NothingFound,
+    /// A removal or a repair, or an installation where a read found a part of the installation or
+    /// failed: the records in the directory may be the only record of what is on the computer.
+    MayBeInstalled,
+}
+
 /// The words that end the refusal of the data directory itself, from what its own handle showed
-/// (`origin`) and whether the reason is the directory's case-sensitive flag. One refusal gets one
-/// remedy. Only a directory that the system's class owns is told what to correct, and the words
-/// that tell the administrator to move it aside stand only where a read that succeeded shows that
-/// the installation did not make it. Where a read failed, nothing is established about who made the
-/// directory or what it holds: the words name the failed read and its error and give no step and no
-/// forecast.
+/// (`origin`), whether the reason is the directory's case-sensitive flag, and what the reads of the
+/// run showed of the rest of the installation (`standing`). One refusal gets one remedy. Only a
+/// directory that the system's class owns is told what to correct. The words that tell the
+/// administrator to move it aside stand only at an installation where the handle shows that the
+/// installation did not set what it found (a link, another kind of object, or an owner outside the
+/// system's class) and every read found nothing of the installation: where a part of the
+/// installation may be on the computer, the records in the directory are the only record of it, so
+/// no ending takes the directory away. An owner that was read is named, with the one step that
+/// rests on the administrator's own knowledge. Where a read failed, nothing is established about who
+/// made the directory or what it holds: the words name the failed read and its error and give no
+/// step and no forecast.
 #[must_use]
 // text: data_ending
-pub fn data_ending(origin: &Origin, case_sensitive: bool) -> String {
-    match origin {
-        Origin::Foreign => format!("{DATA_CAN_BE_CHANGED} {DATA_NOT_MADE}"),
-        Origin::System if case_sensitive => format!("{DATA_CAN_BE_CHANGED} {CASE_REMEDY}"),
-        Origin::System => format!("{DATA_CAN_BE_CHANGED} {DATA_REMEDY}"),
-        Origin::Held(failure) | Origin::Refused(failure) | Origin::Unknown(failure) => format!(
-            "A read of it failed ({failure}), so nothing shows who made it. The setup program names no step for it."
+pub fn data_ending(origin: &Origin, case_sensitive: bool, standing: Standing) -> String {
+    match (origin, standing) {
+        (Origin::Foreign, Standing::NothingFound) => format!("{DATA_KIND} {DATA_NOT_MADE}"),
+        (Origin::Foreign, Standing::MayBeInstalled) => format!("{DATA_KIND} {DATA_KIND_STANDS}"),
+        (Origin::Owned(owner), Standing::NothingFound) => format!(
+            "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. {DATA_NOT_MADE}"
         ),
+        (Origin::Owned(owner), Standing::MayBeInstalled) => format!(
+            "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. The setup program does not use the records in it while that account owns it. If you made that change, give the ownership back to the Administrators group, then run the setup program again."
+        ),
+        (Origin::System, _) if case_sensitive => format!("{DATA_CAN_BE_CHANGED} {CASE_REMEDY}"),
+        (Origin::System, _) => format!("{DATA_CAN_BE_CHANGED} {DATA_REMEDY}"),
+        (Origin::Held(failure) | Origin::Refused(failure) | Origin::Unknown(failure), _) => {
+            format!(
+                "A read of it failed ({failure}), so nothing shows who made it. The setup program names no step for it."
+            )
+        }
         // The data directory is opened by its own path, so no loss of a listed child reaches it.
-        Origin::Changed(reason) => format!(
+        (Origin::Changed(reason), _) => format!(
             "It changed or moved while it was read ({reason}), so nothing shows who made it. The setup program names no step for it."
         ),
     }

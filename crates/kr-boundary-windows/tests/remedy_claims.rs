@@ -6,7 +6,7 @@ use std::path::Path;
 
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CASE_SENSITIVE_WHY, EntryKind, Origin, ParentCure, Presence, choose, data_ending,
+    CASE_SENSITIVE_WHY, EntryKind, Origin, ParentCure, Presence, Standing, choose, data_ending,
     data_made_ending, ending, parent_advice, program_keeping, program_open_advice,
     unnamed_root_why,
 };
@@ -108,61 +108,96 @@ fn the_words_for_an_entry_at_the_data_directorys_name_claim_nothing_of_it() {
     assert!(unknown.contains("it can hold the manifest"), "{unknown}");
 }
 
-/// The endings of the data directory itself correct its owner and its list, or turn its flag off,
-/// only where the system's class owns it, and say that nothing in it is removed: they do not say
-/// that a manifest or a journal is there. The words that tell an administrator to move the
-/// directory aside stand only where a read that succeeded shows that the installation did not make
-/// it; where a read failed, nothing is established about who made it, so the ending names that read
-/// and its error and gives no step and no forecast.
+/// The endings of the data directory say only what its handle and the run's reads showed. They name
+/// what to correct only where the system's class owns it and say that nothing in it is removed: they
+/// do not say that a manifest or a journal is there. The words that tell an administrator to move
+/// the directory aside stand only at an installation where the handle shows what the installation
+/// does not set (a link, another kind of object or an owner outside the class) and every read
+/// found nothing of the installation; at a removal and a repair, and where a part of the
+/// installation may be there, no ending takes the directory away and none forecasts that the
+/// installation makes it new. An owner that was read is named. Where a read failed, the ending names
+/// that read and its error and gives no step and no forecast.
 #[test]
 fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
+    let owner = "S-1-5-21-1-2-3-1001";
     for origin in [
         Origin::System,
         Origin::Foreign,
+        Origin::Owned(owner.to_owned()),
         Origin::Held("the open of it: Windows error 32".to_owned()),
         Origin::Refused("the open of it: Windows error 5".to_owned()),
         Origin::Unknown("the owner: Windows error 1117".to_owned()),
         Origin::Changed("it was another object".to_owned()),
     ] {
+        let not_set = matches!(origin, Origin::Foreign | Origin::Owned(_));
         for case_sensitive in [false, true] {
-            let text = data_ending(&origin, case_sensitive);
-            let what = format!("{origin:?} {case_sensitive}: {text}");
-            assert!(!text.contains("stay where they are"), "{what}");
-            assert!(!text.contains("The manifest and the journal"), "{what}");
-            assert_eq!(
-                text.contains("Nothing in it is removed."),
-                origin == Origin::System,
-                "{what}"
-            );
-            assert_eq!(
-                text.contains("Move it aside"),
-                origin == Origin::Foreign,
-                "{what}"
-            );
-            if let Origin::Held(read) | Origin::Refused(read) | Origin::Unknown(read) = &origin {
-                assert!(text.contains(read.as_str()), "{what}");
-                for claim in [
-                    "Move it aside",
-                    "move it aside",
-                    "rename",
-                    "do not remove",
-                    "Do not",
-                    "Close the program",
-                    "again",
-                    "can hold",
-                    "Whoever",
-                    "another account",
-                    "Turn the flag",
-                    "Leave the system",
-                ] {
-                    assert!(!text.contains(claim), "{claim}: {what}");
+            for standing in [Standing::NothingFound, Standing::MayBeInstalled] {
+                let text = data_ending(&origin, case_sensitive, standing);
+                let what = format!("{origin:?} {case_sensitive} {standing:?}: {text}");
+                assert!(!text.contains("stay where they are"), "{what}");
+                assert!(!text.contains("The manifest and the journal"), "{what}");
+                assert_eq!(
+                    text.contains("Nothing in it is removed."),
+                    origin == Origin::System,
+                    "{what}"
+                );
+                let moved = not_set && standing == Standing::NothingFound;
+                assert_eq!(text.contains("Move it aside"), moved, "{what}");
+                assert_eq!(
+                    text.contains("the installation makes the directory new"),
+                    moved,
+                    "{what}"
+                );
+                assert_eq!(
+                    text.contains("found no service, no account and no rule of the installation"),
+                    moved,
+                    "{what}"
+                );
+                if let Origin::Owned(read) = &origin {
+                    assert!(text.contains(read.as_str()), "{what}");
+                }
+                if not_set && standing == Standing::MayBeInstalled {
+                    for claim in ["move it aside", "Move", "rename", "makes the directory new"] {
+                        assert!(!text.contains(claim), "{claim}: {what}");
+                    }
+                    assert!(text.contains("does not use the records in it"), "{what}");
+                    assert_eq!(
+                        text.contains("give the ownership back to the Administrators group"),
+                        matches!(origin, Origin::Owned(_)),
+                        "{what}"
+                    );
+                    assert_eq!(
+                        text.contains("while that account owns it"),
+                        matches!(origin, Origin::Owned(_)),
+                        "{what}"
+                    );
+                }
+                if let Origin::Held(read) | Origin::Refused(read) | Origin::Unknown(read) = &origin
+                {
+                    assert!(text.contains(read.as_str()), "{what}");
+                    for claim in [
+                        "Move it aside",
+                        "move it aside",
+                        "rename",
+                        "do not remove",
+                        "Do not",
+                        "Close the program",
+                        "again",
+                        "can hold",
+                        "Whoever",
+                        "another account",
+                        "Turn the flag",
+                        "Leave the system",
+                    ] {
+                        assert!(!text.contains(claim), "{claim}: {what}");
+                    }
                 }
             }
         }
     }
-    let flag = data_ending(&Origin::System, true);
+    let flag = data_ending(&Origin::System, true, Standing::MayBeInstalled);
     assert!(flag.contains("setCaseSensitiveInfo"), "{flag}");
-    let owner = data_ending(&Origin::System, false);
+    let owner = data_ending(&Origin::System, false, Standing::MayBeInstalled);
     assert!(
         owner.contains(
             "Leave the system and the Administrators group as the only entries of its list"
