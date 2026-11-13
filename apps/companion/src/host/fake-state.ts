@@ -1345,6 +1345,17 @@ export class ScriptedRecords {
   }
 
   /**
+   * Makes one entry the whole of a session's conversation, as a session that began with it has. The
+   * session must not have been opened by a page yet: a page that holds the earlier entries keeps them.
+   */
+  beginWith(sessionId: string, kind: string, text: string): void {
+    const agent = this.#agentOf(sessionId)
+    agent.entries = []
+    agent.forgotten = 0
+    this.#observe(agent, kind, text)
+  }
+
+  /**
    * Ends a session's agent and starts another in its place, as quitting and launching it again
    * does. The ended one's history goes with it. Answers the new instance's identity.
    */
