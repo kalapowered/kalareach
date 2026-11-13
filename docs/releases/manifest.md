@@ -123,6 +123,13 @@ versions [the cryptography reference](../crypto/README.md#release-manifest) and
 documents stops the manifest. A crate in a pinned library's graph without a registry checksum
 stops it too.
 
+On Windows MSVC `libsodium-sys-stable` links libsodium's prebuilt archive of the release tag the
+crate bundles, `libsodium-1.0.22-msvc.zip`, and not the archive that upstream replaces in place.
+`scripts/place-libsodium-archive.sh` fixes it and its signature by size and SHA-256, for a test job
+and a release job alike, and [the cryptography reference](../crypto/README.md#release-manifest)
+names both digests and the rule for moving them. A Windows release job that is handed other bytes
+stops before it builds.
+
 ## The release record
 
 `share/release-record.json` lists what the release was qualified against, by digest, and the

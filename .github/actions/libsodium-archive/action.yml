@@ -1,20 +1,28 @@
 name: Place libsodium's archives
 description: >-
-  Restores or fetches the signed archives that libsodium-sys-stable's build script reads on
-  Windows, and points the build at them with SODIUM_DIST_DIR, so that compiling the workspace
-  downloads nothing. The route to libsodium's download host is then closed for the rest of the
-  job, so a step that goes back to downloading fails at once and by name. The archives are cached
-  under a key that names the crate's version. Only the job that builds first on the default
-  branch saves them, with its own cache-save step and only after a build that ran the crate's
-  build script, which checks their signatures. The script this runs says what is placed and why.
+  Restores or fetches the archives that libsodium-sys-stable's build script reads on Windows,
+  and points the build at them with SODIUM_DIST_DIR, so that compiling the workspace downloads
+  nothing. The archive is libsodium's prebuilt MSVC archive of its release tag, and the script
+  this runs holds its size and SHA-256, and its signature's: every job gets those bytes or the
+  script's refusal, whether the files were fetched or restored. The route to libsodium's download
+  host is then closed for the rest of the job, so a step that goes back to downloading fails at
+  once and by name. The archives are cached under a key, and in a directory, whose name holds the
+  first twelve characters of each digest. Only the job that builds first on the default branch
+  saves them, with its own cache-save step and only after a build that ran the crate's build
+  script, which checks their signatures. The script this runs says what is placed and why.
+
+  A job that also restores a cargo cache runs this action before that restore. The cargo cache's
+  key reads SODIUM_DIST_DIR, whose value is the directory's name, so a cargo cache built with other
+  archive bytes is never restored for these. A job that restores no cargo cache needs no particular
+  place for it. The key is a second line: the script compares every file whatever a cache held.
 
 inputs:
   restore:
     description: >-
-      'false' leaves the Actions cache out: nothing is restored, and the prebuilt archive and its
-      signature are fetched from libsodium's host on every run (the source archive comes from the
-      crate's own files). A job that signs a release sets it, so that nothing a cache holds is
-      linked into what it signs.
+      'false' leaves the Actions cache out: nothing is restored, and the archive and its signature
+      are fetched from libsodium's host on every run (the source archive comes from the crate's
+      own files), held to the same digests. A job that signs a release sets it, so that nothing a
+      cache holds is linked into what it signs.
     required: false
     default: 'true'
 
@@ -41,11 +49,13 @@ runs:
         # A cache is found by its key and by the text of its path. The path is written from the
         # home directory so that every runner, whatever drive its temporary directory is on,
         # names the same cache; the build script is given the directory as the platform spells it.
-        echo "path=~/libsodium-archive" >> "$GITHUB_OUTPUT"
+        # The directory is named by the key, which holds the digests, so that the build's
+        # environment names the bytes it was given.
+        echo "path=~/$key" >> "$GITHUB_OUTPUT"
         if command -v cygpath > /dev/null 2>&1; then
-            echo "dir=$(cygpath -m "$HOME")/libsodium-archive" >> "$GITHUB_OUTPUT"
+            echo "dir=$(cygpath -m "$HOME")/$key" >> "$GITHUB_OUTPUT"
         else
-            echo "dir=$HOME/libsodium-archive" >> "$GITHUB_OUTPUT"
+            echo "dir=$HOME/$key" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Restore
