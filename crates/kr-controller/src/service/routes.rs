@@ -759,16 +759,16 @@ impl Controller {
                 self.agent_tools_change(actor_id, mutation, method, carried)
                     .await,
             ),
-            (LocalWrite::Authority, _) => framed(
-                self.authority_change(
+            (LocalWrite::Authority, _) => self
+                .authority_change(
                     actor_id,
                     super::authority_changes::AuthorityCaller::Owner,
                     mutation,
                     method,
                     carried,
                 )
-                .await,
-            ),
+                .await
+                .map(|outcome| respond(request_id, outcome)),
             // The policy an organisation signed, applied under the registry's guard and kept in the
             // store of applied policies: no action is claimed and no answer is kept, since the same
             // policy again is accepted and puts its list in force again.

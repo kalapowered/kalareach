@@ -652,6 +652,7 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
         hold: &crate::grants::ClaimHold,
+        withdrew: &mut Option<super::barrier::HostWithdrawal>,
     ) -> Result<ParamsValue> {
         let params: OrganisationWithdrawParams = parse(&mutation.params)?;
         let organisation_id = params.organisation_id;
@@ -694,9 +695,10 @@ impl Controller {
                          after a withdrawal: {error}"
                     );
                 }
-                let completed = self
-                    .complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
+                let (completed, proof) = self
+                    .complete_revocation_proving(Audience::Host, None, CanonicalSet::new(), own)
                     .await?;
+                *withdrew = proof;
                 // The organisation's list goes with its enrolment. A withdrawal only widens the
                 // adapters the host admits, so a put that does not land waits for the next pass.
                 let deadline = tokio::time::Instant::now() + super::WORKER_EXCHANGE;
@@ -748,25 +750,28 @@ impl Controller {
     ) -> Result<ParamsValue> {
         self.answered_from_the_barrier_with(self.publish_debts(&[]), marker)
             .await
+            .map(|(answer, _)| answer)
     }
 
-    /// The answer to an organisation change whose fence `own` is raised now.
+    /// The answer to an organisation change whose fence `own` is raised now, and the proof that
+    /// the change's own debt withdrew the whole host when it did.
     async fn answered_from_the_barrier_with(
         &self,
         own: super::barrier::OwnBarrier,
         marker: OrganisationChangeMarker,
-    ) -> Result<ParamsValue> {
-        let completed = self
-            .complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
+    ) -> Result<(ParamsValue, Option<super::barrier::HostWithdrawal>)> {
+        let (completed, withdrew) = self
+            .complete_revocation_proving(Audience::Host, None, CanonicalSet::new(), own)
             .await?;
-        match marker {
-            OrganisationChangeMarker::Withdrawn { .. } => encode(&completed),
+        let answer = match marker {
+            OrganisationChangeMarker::Withdrawn { .. } => encode(&completed)?,
             OrganisationChangeMarker::ExclusiveOn => encode(&OrganisationExclusiveSetResult {
                 exclusive: true,
                 authority_revision: completed.authority_revision,
                 barrier: Nullable::some(completed.barrier),
-            }),
-        }
+            })?,
+        };
+        Ok((answer, withdrew))
     }
 
     /// The rights ceiling this host's configuration has in force, which narrows every paired
@@ -879,6 +884,7 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
         hold: &crate::grants::ClaimHold,
         intent: ExclusiveIntent,
+        withdrew: &mut Option<super::barrier::HostWithdrawal>,
     ) -> Result<ParamsValue> {
         let ExclusiveIntent { plan, confirmed } = intent;
         let digest = plan
@@ -988,8 +994,11 @@ impl Controller {
             (written, self.publish_debts(&[(debt, Reach::Host)]))
         };
         written?;
-        self.answered_from_the_barrier_with(own, OrganisationChangeMarker::ExclusiveOn)
-            .await
+        let (answer, proof) = self
+            .answered_from_the_barrier_with(own, OrganisationChangeMarker::ExclusiveOn)
+            .await?;
+        *withdrew = proof;
+        Ok(answer)
     }
 
     /// Whether the chain's head is still current, and this host still trusts the clock that said

@@ -15,6 +15,8 @@ use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 use kr_protocol::error::{ProtocolError, RetryCategory};
 use kr_protocol::receipt::ReceiptState;
 
+use crate::service::HostWithdrawal;
+
 pub(crate) mod local_door;
 pub(crate) mod network_door;
 
@@ -191,12 +193,38 @@ impl<T, E> Given<Result<T, E>> {
 #[must_use = "the local door tells a write only through `told`"]
 pub(crate) struct Settled<T> {
     given: Given<T>,
+    /// Evidence that the write's own effect raised the barrier that withdrew every connection of
+    /// the host, this write's own included.
+    withdrew: Option<HostWithdrawal>,
 }
 
 impl<T> Settled<T> {
     /// A write that came to `given`.
     pub(crate) const fn of(given: Given<T>) -> Self {
-        Self { given }
+        Self {
+            given,
+            withdrew: None,
+        }
+    }
+
+    /// A write that came to `given`, and that withdrew the whole host through its own barrier
+    /// when `withdrew` says so.
+    pub(crate) const fn withdrawing(given: Given<T>, withdrew: Option<HostWithdrawal>) -> Self {
+        Self { given, withdrew }
+    }
+
+    /// The same write, its answer reshaped by `reshape`.
+    pub(crate) fn map<U>(self, reshape: impl FnOnce(T) -> U) -> Settled<U> {
+        Settled {
+            given: self.given.map(reshape),
+            withdrew: self.withdrew,
+        }
+    }
+
+    /// What the write came to, for the network door, which asks of an answer what it asks of every
+    /// one and has no connection of its own to withdraw.
+    pub(crate) fn into_given(self) -> Given<T> {
+        self.given
     }
 
     /// The answer, without where it came from, for a case that asks what a write came to.
