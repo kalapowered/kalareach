@@ -120,7 +120,9 @@ use capabilities::DesktopReading;
 use create::PendingCreate;
 use inhibition::DemandScan;
 use workers::{UNACCOUNTED_WORKER, WORKER_EXCHANGE};
-pub(crate) use workflow_sessions::{NodeSession, WorkflowAdmission, WorkflowClose, WorkflowCreate};
+pub(crate) use workflow_sessions::{
+    AtTheHostsOwnWorkflow, NodeSession, WorkflowAdmission, WorkflowClose, WorkflowCreate,
+};
 
 /// A wall clock, read in UTC milliseconds.
 #[derive(Clone)]

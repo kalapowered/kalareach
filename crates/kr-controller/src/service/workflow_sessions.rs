@@ -101,6 +101,18 @@ pub(crate) fn close_action_of(node_action: ActionId) -> ActionId {
     ActionId::new(Uuid::from_bytes(bytes))
 }
 
+/// What the host's own workflow holds to take an answer whole ([`crate::given::host_context`]): it
+/// can be made only in this module, so no other service takes a copy's answer out of its
+/// provenance by that way.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AtTheHostsOwnWorkflow(());
+
+impl AtTheHostsOwnWorkflow {
+    const fn here() -> Self {
+        Self(())
+    }
+}
+
 impl Controller {
     /// Creates a session for a workflow node, through the same path a connection's create takes.
     ///
@@ -140,7 +152,7 @@ impl Controller {
             .await;
         // The answer goes to the workflow runner inside the daemon, which acts for the node under
         // the node's own admission, so it takes the answer whole whatever its origin.
-        let created = crate::given::host_context::whole(created)?;
+        let created = crate::given::host_context::whole(AtTheHostsOwnWorkflow::here(), created)?;
         parse(&created)
     }
 
