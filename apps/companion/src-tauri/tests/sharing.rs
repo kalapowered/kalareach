@@ -1645,6 +1645,59 @@ async fn a_refusal_to_a_repeat_of_the_confirmation_request_is_not_the_hosts_answ
     scene.stop().await;
 }
 
+/// KR-REQ-18.15: the words that the repeats of the confirmation request end with say what the last
+/// connection asked for came to. The first repeat's connection is refused by the host at its
+/// admission and each later one does not reach the host: the words are the unreached ones, and do
+/// not keep the host's from the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_words_the_repeats_of_a_confirmation_request_end_with_are_the_last_tries() {
+    let mut scene = Scene::start().await;
+    let (body, giving) = scene.hand_over_body().await;
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reopen: Reopen = {
+        let opened = Arc::clone(&opened);
+        Arc::new(move || {
+            let opened = Arc::clone(&opened);
+            Box::pin(async move {
+                Err(if opened.fetch_add(1, Ordering::SeqCst) == 0 {
+                    companion_tauri::connection::Unopened::of_refused_connection(
+                        kr_protocol::error::ProtocolError::new(
+                            kr_protocol::error::ErrorCode::PermissionDenied,
+                            "the host withdrew this device",
+                        ),
+                    )
+                } else {
+                    companion_tauri::connection::Unopened::Unreached(
+                        companion_tauri::CommandError::unavailable("no connection"),
+                    )
+                })
+            })
+        })
+    };
+    let faults = Arc::new(Faults::default());
+    let inner = local_connection(&scene.host, Some(&faults)).await;
+    scene.issuer.state().connected(inner.reopening(reopen));
+    scene.issuer_faults = faults;
+    scene.issuer_faults.request.store(true, Ordering::SeqCst);
+
+    let unknown = scene
+        .issuer
+        .call("transfer_ask", body)
+        .await
+        .expect_err("nothing is known of the request");
+    let words = unknown["message"].as_str().unwrap_or_default();
+    assert!(
+        words.contains("the host did not answer") && !words.contains("withdrew"),
+        "the last try's words: {unknown}"
+    );
+    assert!(
+        opened.load(Ordering::SeqCst) >= 2,
+        "more than one repeat was asked for"
+    );
+    giving.close();
+    scene.stop().await;
+}
+
 #[allow(dead_code, reason = "the types a page's parameters are written from")]
 const _: fn(&GrantId, &InvitationId, &GrantCreateParams) = |_, _, _| {};
 #[allow(dead_code, reason = "the actor a local caller is")]

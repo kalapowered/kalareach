@@ -137,6 +137,19 @@ impl VoiceCallState {
         });
     }
 
+    /// Changes what the problem of `kind` that still stands says, when one stands, and records
+    /// nothing when none does: a later check that came to something else says so in the place of
+    /// what an earlier one said, and a check that finds nothing to correct adds no problem.
+    pub fn restate(&mut self, kind: ProblemKind, words: String) {
+        if let Some(standing) = self
+            .problems
+            .iter_mut()
+            .find(|each| each.kind == kind && !each.over)
+        {
+            standing.words = words;
+        }
+    }
+
     /// Says that what a problem of this kind said no longer holds. It stays in the record: the
     /// call met it.
     pub fn pass(&mut self, kind: ProblemKind) {

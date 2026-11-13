@@ -3216,8 +3216,7 @@ pub async fn terminal_view_open<R: tauri::Runtime>(
     };
     let links = std::sync::Arc::clone(state.paired_links());
     let grant = links.opening_grant(session_id, &opening)?;
-    let dial = crate::standing::Dial::new(context.device, context.host)
-        .for_views(links.view_words(session_id, &opening));
+    let dial = crate::standing::Dial::new(context.device, context.host);
     let publish: crate::terminal::Publish = {
         let (links, opening) = (std::sync::Arc::clone(&links), opening.clone());
         std::sync::Arc::new(move |view_state| {

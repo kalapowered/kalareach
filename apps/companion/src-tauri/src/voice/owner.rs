@@ -168,6 +168,11 @@ const HOST_BACK_ACCEPTING: &str = "The phone is in contact with the person's com
 const NOTHING_WAS_DONE: &str = "Nothing was done on the person's computer: this version does not \
     act on spoken requests. Say so.";
 
+/// What a person is told while the check of a host path that was lost does not reach the host, in the
+/// place of what an earlier check said.
+const HOST_NOT_REACHED: &str =
+    "The host could not be reached. So it is not known whether the host still has the call.";
+
 /// What the model is told when the phone has lost the host.
 const HOST_LOST: &str = "The phone has lost contact with the person's computer. The call goes on, \
     but nothing can be read from or done on the computer until it is back. Do not say or imply \
@@ -1873,7 +1878,13 @@ impl Owner {
                             Some(Instant::now() + self.shared.timings.tick * PROBE_PAUSE_TICKS);
                         self.view(|state| state.meet(ProblemKind::HostPath, problem));
                     }
-                    Probe::Unreached => {}
+                    // The last check did not reach the host: a problem that an earlier check
+                    // raised does not stand for what this one found.
+                    Probe::Unreached => {
+                        self.view(|state| {
+                            state.restate(ProblemKind::HostPath, HOST_NOT_REACHED.to_owned());
+                        });
+                    }
                 }
                 self.probing = false;
                 None

@@ -2369,6 +2369,63 @@ async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_retur
     scene.stop_host().await;
 }
 
+/// The host connection is lost during the call, and the first check of the host path finds the
+/// connection refused at its admission: the call says why, in the host's words. The next check opens
+/// a connection and its context read is lost: the call says what that check came to, that the host
+/// could not be reached, and not that the connection was not opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_of_the_host_path_that_does_not_reach_the_host_says_so_in_place_of_an_earlier_one()
+{
+    let mut scene = scene().await;
+    scene.start().await;
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+
+    scene
+        .link
+        .refuse_the_connection(Some(kr_protocol::error::ErrorCode::PermissionDenied));
+    scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("a connection")
+        .session()
+        .close();
+    let refused = scene
+        .state_where("the connection that was not opened", |state| {
+            problem_words(state, "host_path")
+                .iter()
+                .any(|words| words.contains("The connection to the host was not opened"))
+        })
+        .await;
+    assert_eq!(refused["host"], "lost");
+
+    // The next check opens a connection, and the answer to its context read is lost.
+    scene.link.refuse_the_connection(None);
+    scene
+        .link
+        .lose_the_answer_to(Some(HostMethod::VoiceContext));
+    let replaced = scene
+        .state_where("what the later check came to", |state| {
+            problem_words(state, "host_path")
+                .iter()
+                .any(|words| words.contains("could not be reached"))
+        })
+        .await;
+    assert!(
+        !problem_words(&replaced, "host_path")
+            .iter()
+            .any(|words| words.contains("was not opened")),
+        "the earlier check's words do not stand: {replaced}"
+    );
+    assert_eq!(replaced["host"], "lost", "the host is not known to be back");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
 /// A page that names the call while it is still being set up reaches the call's owner: the call is
 /// given up before native code is permitted, and the media never carries the person's voice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

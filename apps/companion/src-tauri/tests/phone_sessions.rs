@@ -2719,11 +2719,13 @@ async fn kr_req_19_08_an_ambient_command_whose_connection_the_host_refuses_at_ad
 
 /// KR-REQ-19.08: a device that the host revokes between its handshake and its admission is refused
 /// at admission once, and then answered as an unpaired peer, which ends each later connection as a
-/// connection lost. The opening stands, and the words the person reads stay the host's first, not a
-/// statement that the host was not reached. The revocation is the host's own: the device's record
-/// is withdrawn at the host while it holds the connection before it registers it.
+/// connection lost. The opening stands, as it does when the host's refusal is not read, and the
+/// words the person reads are what the last try came to: the host's after the try that it refused,
+/// and after each later try that did not reach it, that it was not reached. The revocation is the
+/// host's own: the device's record is withdrawn at the host while it holds the connection before it
+/// registers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_19_08_a_device_revoked_before_its_admission_keeps_the_hosts_words_at_its_first_open()
+async fn kr_req_19_08_a_device_revoked_before_its_admission_is_told_the_hosts_words_and_then_what_each_try_came_to()
  {
     let adopted = Adopted::start(1).await;
     let session = adopted.workers[0].session_id;
@@ -2754,15 +2756,18 @@ async fn kr_req_19_08_a_device_revoked_before_its_admission_keeps_the_hosts_word
         .to_owned();
     assert!(first.contains("withdrawn"), "the host's words: {first}");
 
-    // Each ask that follows is answered as an unpaired peer's: it does not reach the host.
+    // Each ask that follows is answered as an unpaired peer's: it does not reach the host, and the
+    // words say that and not what the host said to the try before.
     let before = control.asked();
     asked_since(&control, before, 3).await;
-    for told in told_of(companion, "revoked") {
+    let told = told_of(companion, "revoked");
+    assert!(!told.is_empty(), "the watch told what its tries came to");
+    for told in told {
         assert_eq!(told["state"], "reconnecting", "{told}");
-        assert_eq!(
+        assert_ne!(
             told["reason"],
             first.as_str(),
-            "the first words stay: {told}"
+            "the host's earlier words are not kept: {told}"
         );
     }
     adopted.stop().await;
@@ -3325,19 +3330,46 @@ async fn connection_down_where(companion: &Companion, holds: impl Fn(&str) -> bo
     .expect("the connection's reason is told")
 }
 
-/// KR-REQ-19.08: the words a person reads while the main connection is not made are the host's for a
-/// connection that it did not admit, and they stay while the tries that follow do not reach the
-/// host. A connection that opens clears them, and any other cause (the host's bound) replaces them.
+/// Waits until the page is told a standing of `opening` that `holds`, among those it was told after
+/// the first `from` of them.
+async fn told_after(
+    companion: &Companion,
+    opening: &str,
+    from: usize,
+    holds: impl Fn(&Value) -> bool,
+) -> Value {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            if let Some(standing) = told_of(companion, opening)
+                .into_iter()
+                .skip(from)
+                .find(|standing| holds(standing))
+            {
+                return standing;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the page is told")
+}
+
+/// The words the host's refusal of a connection at its admission gives in these cases.
+fn is_the_hosts(reason: &str) -> bool {
+    reason.contains("the host refused the connection")
+}
+
+/// KR-REQ-19.08: what a person reads while the main connection is not made is what the last try
+/// came to. After the host refused a connection at its admission they are the host's; after a try
+/// that did not reach the host they say so, and a connection that opens clears them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_19_08_the_main_connection_keeps_the_hosts_words_while_later_tries_do_not_reach_the_host()
- {
+async fn kr_req_19_08_the_main_connection_says_what_its_last_try_came_to() {
     use kr_protocol::error::ErrorCode;
     use tauri::Manager as _;
 
     let adopted = Adopted::start(1).await;
     let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
     let companion = &phone.companion;
-    let host_words = |reason: &str| reason.contains("the host refused the connection");
     let end_main_connection = || {
         companion
             .app
@@ -3351,17 +3383,19 @@ async fn kr_req_19_08_the_main_connection_keeps_the_hosts_words_while_later_trie
     // The host refuses the connection it is asked for at its admission: the words are the host's.
     control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
     end_main_connection();
-    let first = connection_down_where(companion, host_words).await;
+    connection_down_where(companion, is_the_hosts).await;
 
-    // The tries that follow do not reach the host: the host's words stay.
+    // The next try does not reach the host: the words say so, and the host's earlier words are gone.
     control.refuse_the_connection(None);
     control.unreachable(true);
+    let silent = connection_down_where(companion, |reason| !is_the_hosts(reason)).await;
+    assert!(silent.contains("could not be reached"), "{silent}");
     let before = control.asked();
     asked_since(&control, before, 3).await;
     assert_eq!(
         connection_reason(companion),
-        (false, Some(first.clone())),
-        "the host's words stay while the tries do not reach it"
+        (false, Some(silent)),
+        "the tries that do not reach the host say the same"
     );
 
     // A connection that opens clears them.
@@ -3369,31 +3403,23 @@ async fn kr_req_19_08_the_main_connection_keeps_the_hosts_words_while_later_trie
     connected(companion).await;
     assert_eq!(connection_reason(companion), (true, None));
 
-    // Silent from the start, the words are that the host was not reached.
-    control.unreachable(true);
-    end_main_connection();
-    let silent = connection_down_where(companion, |reason| !host_words(reason)).await;
-    assert_ne!(silent, first);
-
-    // The host's bound replaces the host's words: it is another cause.
-    control.unreachable(false);
-    connected(companion).await;
+    // The host's bound is another cause, and the words are its own.
     control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
     end_main_connection();
-    connection_down_where(companion, host_words).await;
+    connection_down_where(companion, is_the_hosts).await;
     control.refuse_the_connection(Some(ErrorCode::ResourceUnavailable));
-    let bound = connection_down_where(companion, |reason| !host_words(reason)).await;
-    assert!(!bound.is_empty(), "the bound says why");
+    let bound = connection_down_where(companion, |reason| !is_the_hosts(reason)).await;
+    assert!(!bound.contains("could not be reached"), "{bound}");
     control.refuse_the_connection(None);
     adopted.stop().await;
 }
 
-/// KR-REQ-19.08: a raw view that is opened again after its connection was refused at the host's
-/// admission says the host's words, and keeps them while the tries that follow do not reach the host.
-/// A view that opens clears them, and the host's bound replaces them.
+/// KR-REQ-19.08: a raw view that is opened again says what its last try came to. After a connection
+/// that the host refused at its admission it says the host's words; after a try that did not reach
+/// the host it says so, and after one whose connection was made and ended before the open was
+/// answered it says the connection was lost; neither keeps the host's earlier words.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_19_08_a_view_opened_again_keeps_the_hosts_words_while_later_tries_do_not_reach_the_host()
- {
+async fn kr_req_19_08_a_view_opened_again_says_what_its_last_try_came_to() {
     use kr_protocol::error::ErrorCode;
 
     let adopted = Adopted::start(1).await;
@@ -3404,75 +3430,120 @@ async fn kr_req_19_08_a_view_opened_again_keeps_the_hosts_words_while_later_trie
     )
     .await;
     let companion = &phone.companion;
-    open(companion, session, None, "kept-words").expect("opens");
-    let reason_of = |state: &Value| {
-        state["reason"]
-            .as_str()
-            .expect("the view says why")
-            .to_owned()
+    open(companion, session, None, "last-try").expect("opens");
+    let ended_with = |channel: u32| {
+        let companion = &phone.companion;
+        async move {
+            companion
+                .state_where(channel, |state| state["state"] == "ended")
+                .await["reason"]
+                .as_str()
+                .expect("the view says why")
+                .to_owned()
+        }
     };
 
     control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
-    open_view(companion, session, "kept-words", 90).expect("a handle comes back");
-    let first = reason_of(
-        &companion
-            .state_where(90, |state| state["state"] == "ended")
-            .await,
-    );
-    assert!(
-        first.contains("the host refused the connection"),
-        "the host's words: {first}"
-    );
+    open_view(companion, session, "last-try", 90).expect("a handle comes back");
+    let first = ended_with(90).await;
+    assert!(is_the_hosts(&first), "the host's words: {first}");
 
-    // The page opens a view again, and the host is not reached.
+    // The next try does not reach the host: the host's earlier words are not kept.
     control.refuse_the_connection(None);
     control.unreachable(true);
-    open_view(companion, session, "kept-words", 91).expect("a handle comes back");
-    let second = reason_of(
-        &companion
-            .state_where(91, |state| state["state"] == "ended")
-            .await,
-    );
+    open_view(companion, session, "last-try", 91).expect("a handle comes back");
+    let silent = ended_with(91).await;
     assert!(
-        second.contains("the host refused the connection"),
-        "the host's words stay while a try does not reach the host: {second}"
+        silent.contains("could not be reached") && !is_the_hosts(&silent),
+        "the host was not reached: {silent}"
     );
 
-    // The host's bound is another cause, and replaces them.
+    // The host refuses a connection again, and then a connection is made and ends before the open
+    // is answered: the connection was lost, and the host's words are not kept.
+    control.unreachable(false);
+    control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
+    open_view(companion, session, "last-try", 92).expect("a handle comes back");
+    assert!(is_the_hosts(&ended_with(92).await));
+    control.refuse_the_connection(None);
+    control.end_connections(true);
+    open_view(companion, session, "last-try", 95).expect("a handle comes back");
+    let lost = ended_with(95).await;
+    assert!(
+        !is_the_hosts(&lost),
+        "the host's earlier words are not kept: {lost}"
+    );
+    control.end_connections(false);
+
+    // The host's bound is another cause.
     control.unreachable(false);
     control.refuse_the_connection(Some(ErrorCode::ResourceUnavailable));
-    open_view(companion, session, "kept-words", 92).expect("a handle comes back");
-    let bound = reason_of(
-        &companion
-            .state_where(92, |state| state["state"] == "ended")
-            .await,
-    );
+    open_view(companion, session, "last-try", 93).expect("a handle comes back");
+    let bound = ended_with(93).await;
     assert!(
-        !bound.contains("the host refused the connection"),
-        "the bound replaces the host's words: {bound}"
+        !is_the_hosts(&bound) && !bound.contains("could not be reached"),
+        "the words are the bound's own: {bound}"
     );
 
-    // A view that opens clears them: the next try that does not reach the host says so.
-    control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
-    open_view(companion, session, "kept-words", 93).expect("a handle comes back");
-    companion
-        .state_where(93, |state| state["state"] == "ended")
-        .await;
+    // A view that opens clears them.
     control.refuse_the_connection(None);
-    open_view(companion, session, "kept-words", 94).expect("a handle comes back");
+    open_view(companion, session, "last-try", 94).expect("a handle comes back");
     companion
         .state_where(94, |state| state["state"] == "showing")
         .await;
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: the words a phone's watch tells while it waits are what its last try came to. A
+/// connection the host refused at its admission, then this computer's budget used, then a try that
+/// does not reach the host: the words are the unreached ones, not the host's from before the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_the_watch_after_a_full_budget_says_what_its_last_try_came_to() {
+    use kr_protocol::error::ErrorCode;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let host = companion
+        .device()
+        .host_in_use()
+        .expect("a host in use")
+        .host_device_id;
+
+    control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
+    let standing = open(companion, session, None, "budget").expect("the first open stands");
+    assert!(is_the_hosts(
+        standing["reason"].as_str().unwrap_or_default()
+    ));
+
+    // Every place the other kinds may take is held: the watch waits for one, and says that.
+    let places = companion_tauri::places::budget();
+    let mut held = Vec::new();
+    while let Some(place) = places.try_take(host, companion_tauri::places::Kind::Other) {
+        held.push(place);
+    }
+    let told = told_of(companion, "budget").len();
+    let waiting = told_after(companion, "budget", told, |standing| {
+        standing["state"] == "reconnecting" && standing["capacity"] == true
+    })
+    .await;
+    assert!(!is_the_hosts(
+        waiting["reason"].as_str().unwrap_or_default()
+    ));
+
+    // A place is free, and the try that follows does not reach the host.
+    control.refuse_the_connection(None);
     control.unreachable(true);
-    open_view(companion, session, "kept-words", 95).expect("a handle comes back");
-    let silent = reason_of(
-        &companion
-            .state_where(95, |state| state["state"] == "ended")
-            .await,
-    );
+    let told = told_of(companion, "budget").len();
+    drop(held);
+    let silent = told_after(companion, "budget", told, |standing| {
+        standing["state"] == "reconnecting" && standing["capacity"] == false
+    })
+    .await;
+    let reason = silent["reason"].as_str().expect("the words");
     assert!(
-        !silent.contains("the host refused the connection"),
-        "a view that opened cleared the host's words: {silent}"
+        reason.contains("could not be reached") && !is_the_hosts(reason),
+        "the words are the last try's: {silent}"
     );
     adopted.stop().await;
 }

@@ -384,25 +384,6 @@ async fn open_local(
     Ok((Wire::Local(Box::new(client)), target, Some(serves)))
 }
 
-/// What a view's opening says of a connection that was not opened, after the tries of the opening's
-/// views before it: the host's words for a connection that it did not admit stay while a try does
-/// not reach the host ([`crate::connection::Waiting`]), and any other cause says its own
-/// ([`not_opened`]).
-fn not_opened_on(dial: &crate::standing::Dial, unopened: Unopened) -> OpenFailure {
-    match dial.view_words_after(&unopened) {
-        Some(words) => host_words_not_opened(&words),
-        None => not_opened(unopened),
-    }
-}
-
-/// A view whose connection the host did not admit is lost, with the host's words as the reason.
-fn host_words_not_opened(words: &crate::connection::HostWords) -> OpenFailure {
-    OpenFailure {
-        reason: format!("No connection was made for this view: {words}"),
-        lost: true,
-    }
-}
-
 /// What a view's opening says of a connection that was not opened, by the cause and not by the code
 /// of an error: the cause says whether the host was reached, had no room or refused, and whether
 /// that is for now ([`Unopened::for_now`]), in which case the view is lost and the opening's link
@@ -418,7 +399,10 @@ fn not_opened(unopened: Unopened) -> OpenFailure {
             ),
             lost: true,
         },
-        Unopened::NotAdmitted(words) => host_words_not_opened(&words),
+        Unopened::NotAdmitted(words) => OpenFailure {
+            reason: format!("No connection was made for this view: {words}"),
+            lost: true,
+        },
         Unopened::BudgetFull | Unopened::HostFull => OpenFailure {
             reason: format!(
                 "No connection was made for this view: {}",
@@ -452,11 +436,7 @@ async fn open_paired(
 ) -> Result<(Wire, ActionTarget), OpenFailure> {
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 
-    let transport = dial
-        .transport()
-        .await
-        .map_err(|unopened| not_opened_on(dial, unopened))?;
-    dial.view_opened();
+    let transport = dial.transport().await.map_err(not_opened)?;
     let mut wire =
         Wire::Paired(Paired::over(transport, grant_id).map_err(|lost| OpenFailure::lost(&lost))?);
     let opened = wire
@@ -473,8 +453,7 @@ async fn open_paired(
             // The refusal the wire kept as the host's answer to the connection is told by its
             // cause, as a refusal of a first call on any connection is; any other is the refusal of
             // this request.
-            not_opened_on(
-                dial,
+            not_opened(
                 Unopened::of_kept_refusal(wire.kept_refusal(), &refusal).unwrap_or_else(|| {
                     Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal))
                 }),

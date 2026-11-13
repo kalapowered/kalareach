@@ -417,7 +417,7 @@ impl Asked {
 /// refusal. Its code is the host's decision about one connection, which says nothing about a
 /// request that needs a connection, so it is not kept: only [`Unopened::of_refused_connection`]
 /// makes these words, and no one reads a code from them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct HostWords(String);
 
 impl HostWords {
@@ -430,51 +430,11 @@ impl HostWords {
     pub(crate) fn said(words: impl Into<String>) -> Self {
         Self(words.into())
     }
-
-    /// The words, as the host said them.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl std::fmt::Display for HostWords {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
-    }
-}
-
-/// Which words a person reads while a host is not reached: the one rule, kept beside the cause, that
-/// every dialer whose waiting state shows a reason follows.
-///
-/// The host's words for a connection that it did not admit stay while the tries that follow do not
-/// reach the host: a device that the host revoked between its handshake and its admission is
-/// answered as an unpaired peer afterwards, which ends each later connection as a connection lost,
-/// and the words that say why are the host's first. A connection that opens clears them
-/// ([`Self::opened`]). Any other cause (the host has no room, this computer's budget is used, a
-/// refusal) replaces them, because it says something else.
-#[derive(Debug, Default)]
-pub struct Waiting {
-    kept: Option<HostWords>,
-}
-
-impl Waiting {
-    /// Takes in what a try that did not give a connection came to, and says whose words the person
-    /// reads: the host's, when the try or one before it was a connection that the host did not
-    /// admit and nothing has replaced them since, and otherwise none, so that the dialer says the
-    /// cause's own.
-    pub fn after(&mut self, cause: &Unopened) -> Option<&HostWords> {
-        match cause {
-            Unopened::NotAdmitted(words) => self.kept = Some(words.clone()),
-            Unopened::Unreached(_) if self.kept.is_some() => {}
-            _ => self.kept = None,
-        }
-        self.kept.as_ref()
-    }
-
-    /// Notes that a connection opened: the words of an earlier try are no longer the reason.
-    pub fn opened(&mut self) {
-        self.kept = None;
     }
 }
 
@@ -791,8 +751,8 @@ fn absent_host(error: kr_client::error::ClientError) -> CommandError {
 pub enum Attempt {
     /// The host answered, and this is the connection to it.
     Reached(Connection),
-    /// The host did not answer, and why: the cause of the try.
-    Failed(Unopened),
+    /// The host did not answer, and why.
+    Failed(CommandError),
     /// There is nothing to keep a connection to, so the task that keeps it ends.
     Nothing,
 }
@@ -816,13 +776,11 @@ pub async fn keep<R, A, F>(
     F: std::future::Future<Output = Attempt> + Send,
 {
     let mut backoff = kr_client::reconnect::ReconnectLoop::new();
-    let mut waiting = Waiting::default();
     loop {
         let state = app.state::<AppState>();
         match attempt().await {
             Attempt::Nothing => return,
             Attempt::Reached(connection) => {
-                waiting.opened();
                 let session = connection.session();
                 // Before the connection is announced to anything, so that nothing the host sends
                 // on it can come before the subscription: an event sent to a connection nobody
@@ -900,12 +858,8 @@ pub async fn keep<R, A, F>(
                     ended.await;
                 }
             }
-            Attempt::Failed(cause) => {
-                let reason = match waiting.after(&cause) {
-                    Some(words) => words.to_string(),
-                    None => cause.into_error().message,
-                };
-                if !state.disconnected_for(choice, reason) {
+            Attempt::Failed(error) => {
+                if !state.disconnected_for(choice, error.message) {
                     return;
                 }
                 let _ = app.emit(CONNECTION_EVENT, state.connection_state());
@@ -945,7 +899,7 @@ where
 pub async fn this_machines_host() -> Attempt {
     match connect_local().await {
         Ok(connection) => Attempt::Reached(connection),
-        Err(error) => Attempt::Failed(Unopened::Unreached(error)),
+        Err(error) => Attempt::Failed(error),
     }
 }
 
@@ -1257,59 +1211,6 @@ mod tests {
                 "{code:?}: the host's words"
             );
         }
-    }
-
-    /// KR-REQ-19.08: the words a person reads while a host is not reached are the host's for a
-    /// connection that it did not admit, and stay while the tries that follow do not reach the host;
-    /// a connection that opens clears them, and any other cause replaces them.
-    #[test]
-    fn a_keeper_holds_the_hosts_words_until_a_connection_opens_or_another_cause_replaces_them() {
-        let not_admitted = |words: &str| Unopened::NotAdmitted(HostWords::said(words));
-        let silent = || Unopened::unreached("the host did not answer");
-        let mut waiting = Waiting::default();
-
-        assert_eq!(
-            waiting.after(&silent()),
-            None,
-            "nothing is kept before the host spoke"
-        );
-        let first = HostWords::said("the authority was withdrawn");
-        assert_eq!(
-            waiting.after(&not_admitted("the authority was withdrawn")),
-            Some(&first)
-        );
-        assert_eq!(
-            waiting.after(&silent()),
-            Some(&first),
-            "a try that did not reach the host"
-        );
-        assert_eq!(waiting.after(&silent()), Some(&first), "and another");
-        let later = HostWords::said("the daemon stopped");
-        assert_eq!(
-            waiting.after(&not_admitted("the daemon stopped")),
-            Some(&later),
-            "a later admission refusal is the host's newer words"
-        );
-        for replaced_by in [
-            Unopened::HostFull,
-            Unopened::BudgetFull,
-            Unopened::Refused(Asked::HostInfo, CommandError::refused("no")),
-        ] {
-            waiting.after(&not_admitted("the authority was withdrawn"));
-            assert_eq!(waiting.after(&replaced_by), None, "{replaced_by:?}");
-            assert_eq!(
-                waiting.after(&silent()),
-                None,
-                "{replaced_by:?}: nothing is kept again"
-            );
-        }
-        waiting.after(&not_admitted("the authority was withdrawn"));
-        waiting.opened();
-        assert_eq!(
-            waiting.after(&silent()),
-            None,
-            "a connection that opened cleared them"
-        );
     }
 
     #[test]
