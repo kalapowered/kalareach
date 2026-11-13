@@ -154,6 +154,7 @@ data_unread-1 | {read} failed ({failure}) and showed nothing of what it is | X i
 handle_duplicate-1 | copying a handle | copying a handle: Windows error N | read: DuplicateHandle's own error code
 handle_duplicate-2 | copying a handle | copying a handle: (the handle's own error) | read: the copy that DuplicateHandle returned was null or not a valid handle
 handle_reopen-1 | opening an object again through its own handle | opening an object again through its own handle: Windows error N | read: ReOpenFile's own error code (a sharing violation, or no right to delete the object); the cleanup then says the platform refused to open it again to mark it for removal
+replace_whole-1 | the replacement's own handle | the replacement's own handle: (the handle's own error) | read: the handle that the creating call returned was not a valid handle
 made_after-1 | {words} {ending} | The refusal's own words, then what this run removed of what it made and what stayed (data_made_ending's words) | read: the platform's answer for the mark for removal through the handle of each call that made an object; the refusal's words are the step's own
 made_after-2 | {words}. {ending} | The failure's own words, then what this run removed of what it made and what stayed (data_made_ending's words) | read: the platform's answer for the mark for removal through the handle of each call that made an object; the failure's words are the step's own
 data_made_refusal-1 | This run made it, and it is refused because | X is the boundary's data directory; this run made it, and it is refused because (reason); then what the run removed or could not remove | read: the open call's own answer that it made the directory (`FILE_CREATED`), and the check on the handle that it opened; the ending is data_made_ending's, from the platform's own answers of the marks for removal
@@ -635,7 +636,7 @@ listed | pub fn | frame/invocation.rs | 2 | names, keys, limits, encodings and p
 listed | pub fn | journal/limits.rs | 5 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | journal/replay.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | journal/rows.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
-listed | pub fn | manifest.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
+listed | pub fn | manifest.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person; and, in the test build only, the words of a failure that a case forces (`forced::failure_at`), which reach no person
 listed | pub fn | operation.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | operation/grammar.rs | 4 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | operation/settings.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
