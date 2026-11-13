@@ -8,17 +8,17 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NONE_MAPPED,
-    GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_INCOMPLETE,
+    ERROR_IO_PENDING, ERROR_NONE_MAPPED, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 use windows_sys::Win32::Security::{
     CopySid, EqualSid, GetLengthSid, LookupAccountNameW, SID_NAME_USE,
 };
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
-use windows_sys::Win32::System::IO::OVERLAPPED;
-use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
 
 /// A failed call: the platform's error number and what was being done.
@@ -250,6 +250,88 @@ pub fn error(code: u32, what: impl Into<String>) -> Error {
 pub fn last(what: impl Into<String>) -> Error {
     // SAFETY: reads the calling thread's last error.
     error(unsafe { GetLastError() }, what)
+}
+
+/// What the read of an overlapped operation's result gave. It has three answers, and none is
+/// folded into another: a failed transfer is not a transfer that has not completed.
+#[derive(Debug)]
+pub enum Completion {
+    /// The operation completed; this many bytes were transferred.
+    Done(u32),
+    /// The operation has not completed.
+    Incomplete,
+    /// The operation completed with a failure; the error carries the platform's number.
+    Failed(Error),
+}
+
+/// Reads the result of an overlapped operation without waiting for it, as [`Completion`]. The only
+/// place of the crate that reads one.
+///
+/// # Safety
+///
+/// `file` must be an open handle, and `record` the record of an operation that was started on it.
+#[must_use]
+pub unsafe fn overlapped_result(file: HANDLE, record: &OVERLAPPED) -> Completion {
+    let mut transferred = 0_u32;
+    // SAFETY: the handle is open and the record is the one of an operation on it; the call does not
+    // wait.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the wrapper: it tells a failed transfer from one that is not complete"
+    )]
+    let ok = unsafe { GetOverlappedResult(file, record, &raw mut transferred, 0) };
+    if ok != 0 {
+        return Completion::Done(transferred);
+    }
+    // SAFETY: reads the calling thread's last error.
+    let code = unsafe { GetLastError() };
+    if code == ERROR_IO_INCOMPLETE {
+        return Completion::Incomplete;
+    }
+    // text: ffi_overlapped_result-1
+    Completion::Failed(error(code, "reading the result of a transfer"))
+}
+
+/// What a connect on a named pipe's server end gave. It has three answers, and none is folded into
+/// another: a failure is not a client that is there.
+#[derive(Debug)]
+pub enum Connect {
+    /// A client is connected: it was before the call, or the call completed at once.
+    Connected,
+    /// The connect is pending; the operation's event is set when a client connects.
+    Pending,
+    /// The call failed; the error carries the platform's number.
+    Failed(Error),
+}
+
+/// Starts an overlapped connect on a named pipe's server end, as [`Connect`]. The only place of the
+/// crate that connects one.
+///
+/// # Safety
+///
+/// `pipe` must be an open handle to the server end of a named pipe made for overlapped use, and
+/// `record` must stay alive and in place until the operation has completed, or been cancelled and
+/// seen to end, or is kept for the life of the process.
+#[must_use]
+pub unsafe fn connect_named_pipe(pipe: HANDLE, record: &mut OVERLAPPED) -> Connect {
+    // SAFETY: the pipe is open; the caller keeps the record alive and in place until the operation
+    // has completed, or been cancelled, or is kept for the life of the process.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the wrapper: it tells a pending connect and a client that is there from a failure"
+    )]
+    let connected = unsafe { ConnectNamedPipe(pipe, record) };
+    if connected != 0 {
+        return Connect::Connected;
+    }
+    // SAFETY: reads the calling thread's last error.
+    let code = unsafe { GetLastError() };
+    match code {
+        ERROR_IO_PENDING => Connect::Pending,
+        ERROR_PIPE_CONNECTED => Connect::Connected,
+        // text: ffi_connect_named_pipe-1
+        other => Connect::Failed(error(other, "connecting a client to the pipe")),
+    }
 }
 
 /// A lock taken even when a thread that held it panicked. What these locks guard is a hook, a list of

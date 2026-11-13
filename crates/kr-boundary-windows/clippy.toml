@@ -42,4 +42,8 @@ disallowed-methods = [
     { path = "windows_sys::Win32::System::Threading::WaitForMultipleObjects", reason = "it answers a failure as a number that a caller can take for a timeout or for an object; wait with ffi::wait_any, which answers the object, timed out or failed" },
     { path = "windows_sys::Win32::System::Pipes::PeekNamedPipe", reason = "it answers a failure as an error that a caller can take for the end of the pipe; read with ffi::pipe_read, which answers data, ended or failed" },
     { path = "windows_sys::Win32::Storage::FileSystem::ReadFile", reason = "it answers a failure as an error that a caller can take for the end of the pipe; read a pipe with ffi::pipe_read, which answers data, ended or failed, and a transfer with the pipe module's own wait" },
+    { path = "windows_sys::Win32::System::IO::GetOverlappedResult", reason = "it answers a failed transfer and a transfer that is not complete the same way, as zero; read the result with ffi::overlapped_result, which tells done, not complete and failed apart" },
+    { path = "windows_sys::Win32::System::Pipes::ConnectNamedPipe", reason = "it answers a failure, a connect that is pending and a client that is already there as the same zero with an error to read; connect with ffi::connect_named_pipe, which tells them apart" },
+    { path = "windows_sys::Win32::System::Pipes::WaitNamedPipeW", reason = "its answer is only a wake-up: the open that follows decides, so a call carries an expectation that says so at its one place" },
+    { path = "windows_sys::Win32::System::IO::GetQueuedCompletionStatus", reason = "its answer is only a wake-up: the job's own count and the retained processes decide, so a call carries an expectation that says so at its one place" },
 ]

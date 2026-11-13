@@ -246,6 +246,15 @@ pub fn run_captured_until(
                         Ok(None) => Ok(Outcome::TimedOut),
                         Err(error) => Err(LaunchError::Platform(error)),
                     },
+                    // The end is not proved; a wait for the child that failed is told with it.
+                    Err(LaunchError::EndUncertain(reason)) => {
+                        Err(LaunchError::EndUncertain(match waited {
+                            Err(error) => format!(
+                                "{reason}; the wait for the program had also failed: {error}"
+                            ),
+                            Ok(_) => reason,
+                        }))
+                    }
                     Err(uncertain) => Err(uncertain),
                 }
             }
@@ -272,7 +281,13 @@ pub fn run_captured_until(
         _ => Err("a reader of the program's output failed".to_owned()),
     };
     let (outcome, out, err) = match (result, readers) {
-        (Err(error @ LaunchError::EndUncertain(_)), _) => return Err(error),
+        // The end is not proved; a read of a pipe that failed is told with it.
+        (Err(LaunchError::EndUncertain(reason)), Err(read)) => {
+            return Err(LaunchError::EndUncertain(format!(
+                "{reason}; the reads of the program's pipes: {read}"
+            )));
+        }
+        (Err(error @ LaunchError::EndUncertain(_)), Ok(_)) => return Err(error),
         (Err(error), Err(reason)) => {
             return Err(LaunchError::EndUncertain(format!(
                 "{reason}; the run had also failed: {error}"
