@@ -21,6 +21,7 @@
     "gesture_detaches"
   ],
   "covers": [
+    "KR-REQ-07.86",
     "KR-REQ-07.87",
     "KR-REQ-07.72",
     "KR-REQ-07.73",

@@ -889,9 +889,11 @@ fn drivable() -> (Vec<(QualificationCase, Package)>, Vec<String>) {
     (cases_to_run, failures)
 }
 
-/// KR-REQ-26.05: over a home holding each plugin stack the qualification runs the managed shells
-/// under, the installer adds its marked entry and nothing else, adds no `exec kr`, and takes what it
-/// added out again; and a managed session started over the installed home qualifies under the stack.
+/// KR-REQ-26.05, KR-REQ-07.86: over a home holding each plugin stack the qualification runs the
+/// managed shells under, the installer adds its marked entry and nothing else, adds no `exec kr`, and
+/// takes what it added out again; and a managed session started over the installed home qualifies
+/// under the stack, with the person's own startup files run in the order the case records and each
+/// of them once, which is the normal profile order and a PowerShell profile exactly once.
 #[test]
 #[ignore = "needs this tree's built shell packages, the fetched stacks and a built kr; it runs with --include-ignored where they are"]
 fn installing_over_each_plugin_stack_adds_only_the_marked_entry_and_removes_cleanly() {
