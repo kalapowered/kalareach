@@ -704,14 +704,14 @@ fn a_root_that_is_not_there_is_refused_before_a_change_by_every_run() {
     assert!(paths.manifest.exists(), "the removal changed nothing");
 }
 
-/// A known folder that goes after the shape check is refused by the walk that reads it next: the
-/// program walk, read on its own, with the program tree's known folder on a drive that is not there,
-/// says that the root of the volume is not there, with the error, names no cause, and changes
-/// nothing. A run reaches the walk this way only when a volume goes between the two reads, so the
-/// case calls the walk after the folder is already gone.
+/// A volume that is not there is refused by the program walk, read on its own, with the program
+/// tree's known folder on a drive letter that nothing holds: it says that the root of the volume is
+/// not there, with the error, names no cause, and changes nothing. A run reaches the walk this way
+/// only when a volume goes between the two reads, so the case calls the walk after the drive is
+/// already gone.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
-fn a_known_folder_taken_away_after_the_shape_check_is_refused_by_the_program_walk() {
+fn a_volume_that_is_not_there_is_refused_by_the_program_walk_as_a_root_that_is_not_there() {
     if needs_the_system() {
         return;
     }
@@ -741,6 +741,83 @@ fn a_known_folder_taken_away_after_the_shape_check_is_refused_by_the_program_wal
         assert!(!text.contains(word), "{word}: {text}");
     }
     assert!(!paths.program_top.exists(), "nothing was made");
+}
+
+/// A known folder that goes after the shape check passed, while its volume stays, is refused by the
+/// program walk that reads it next: the walk, read on its own, says that the known folder could not
+/// be opened or read to be checked, with the error, and not that its volume or the root of its
+/// volume is gone, and it changes nothing. A run reaches the walk this way only when the folder goes
+/// between the two reads, so the case removes the known folder after the shape check and calls the
+/// walk.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_program_tree_known_folder_taken_away_after_the_shape_check_is_refused_by_the_program_walk() {
+    if needs_the_system() {
+        return;
+    }
+    let mut clean = Cleanup::default();
+    let top = inherited_folder(&mut clean);
+    let data_parent = inherited_folder(&mut clean);
+    parent_of(&data_parent);
+    let paths = paths_with(&data_parent, &top.join("Boundary"), &top);
+    install::check_shape(&paths, remedy::Stage::Before)
+        .expect("both known folders are there, so the shape check passes");
+    std::fs::remove_dir(&top).expect("the known folder is taken away, and its volume stays");
+    let text = install::check_program_parents(&paths, remedy::Stage::Before)
+        .expect_err("a known folder that is gone")
+        .to_string();
+    for needle in [
+        format!(
+            "{} is a folder above the boundary's program directory",
+            top.display()
+        ),
+        "It is refused because it could not be opened or read to be checked".to_owned(),
+        "Nothing was changed".to_owned(),
+    ] {
+        assert!(text.contains(&needle), "{needle}: {text}");
+    }
+    for word in ["volume", "root", "holds it open"] {
+        assert!(!text.contains(word), "{word}: {text}");
+    }
+    assert!(!top.exists(), "nothing was made");
+}
+
+/// A known folder that goes after the shape check passed, while its volume stays, is refused by the
+/// data walk that reads it next, in the same words: the walk, read on its own, says that the folder
+/// above the data directory's parent could not be opened or read to be checked, with the error, and
+/// changes nothing.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_data_tree_known_folder_taken_away_after_the_shape_check_is_refused_by_the_data_walk() {
+    if needs_the_system() {
+        return;
+    }
+    let mut clean = Cleanup::default();
+    let program_data = inherited_folder(&mut clean);
+    let top = inherited_folder(&mut clean);
+    let parent = program_data.join("KalaReach");
+    let paths = paths_with(&parent, &top.join("Boundary"), &top);
+    install::check_shape(&paths, remedy::Stage::Before)
+        .expect("both known folders are there, so the shape check passes");
+    std::fs::remove_dir(&program_data)
+        .expect("the known folder is taken away, and its volume stays");
+    let text = install::check_data_parent(&paths)
+        .expect_err("a known folder that is gone")
+        .to_string();
+    for needle in [
+        format!(
+            "{} is a folder above the boundary's data directory",
+            program_data.display()
+        ),
+        "It is refused because it could not be opened or read to be checked".to_owned(),
+        "Nothing was changed".to_owned(),
+    ] {
+        assert!(text.contains(&needle), "{needle}: {text}");
+    }
+    for word in ["volume", "root", "holds it open"] {
+        assert!(!text.contains(word), "{word}: {text}");
+    }
+    assert!(!parent.exists(), "nothing was made");
 }
 
 /// A link that points nowhere at the program directory's name is a link, and gets the link's own

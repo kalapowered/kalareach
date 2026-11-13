@@ -246,6 +246,10 @@ pub enum ParentCure {
     /// data directory's name in it is known, which decides whether removal is offered: an entry at
     /// that name is not read, so it is said to be something that can hold an installation.
     Correct(Presence),
+    /// A reparse point (a link or a mounted folder) is at the folder's place: the folder is the
+    /// installation's own, so the words are those of an own folder of the program tree that is a
+    /// reparse point, with what the setup program does and does not change.
+    Link(Stage),
     /// The folder could not be opened to be checked, for a reason that is no program holding it
     /// open (that is [`ParentCure::Close`]): nothing shows who made it, so it is neither corrected
     /// nor removed, and moving it aside keeps everything in it.
@@ -260,6 +264,7 @@ pub fn parent_advice(cure: &ParentCure) -> String {
     match cure {
         ParentCure::Unreadable => "Nothing shows who made this folder, because it could not be opened to be checked. Do not correct its owner or its list, and do not remove it: either would hide what it is. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned(),
         ParentCure::Close => "Close the program that holds it open, then run the setup program again: a change of its owner or its list does not close a handle. Do not remove it.".to_owned(),
+        ParentCure::Link(stage) => own_link_words(*stage),
         ParentCure::MoveAside => "The installation did not make this folder, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned(),
         ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again."),
         ParentCure::Correct(Presence::Present) => "Do not remove it: something is at the data directory's name in it, and that can hold the manifest, the journals and the private roots of an installation, which removing this folder would destroy. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
@@ -381,6 +386,13 @@ pub fn is_on_a_network_share(final_path: &str) -> bool {
     final_path.to_ascii_lowercase().starts_with(r"\\?\unc\")
 }
 
+/// Whether a path as the system gave it names a network share: a path that begins with two
+/// backslashes and is not a local device path (`\\?\C:\`, `\\.\`), or the extended form of one.
+fn names_a_share(given: &str) -> bool {
+    is_on_a_network_share(given)
+        || (given.starts_with(r"\\") && !given.starts_with(r"\\?\") && !given.starts_with(r"\\.\"))
+}
+
 /// Whether a drive's root, as the path that was supplied names it, is the root of the volume itself:
 /// the final path of the opened root, as the system gives it, has no other drive letter and no folder
 /// after it, and is not on a network share. A substituted or redirected letter opens as a folder of
@@ -406,7 +418,8 @@ fn plain_path(text: &str) -> String {
 /// the forms that the system itself writes for one folder, on both sides: with or without the `\\?\`
 /// prefix of the extended form, in any case of ASCII letters, with or without a trailing backslash
 /// (the root of a drive keeps its backslash: `E:` is not `E:\`). A forward slash, a short name, a
-/// link, a mounted folder or an alias above the folder leads somewhere else.
+/// link or an alias above the folder leads somewhere else. A volume mounted at the folder gives the
+/// folder's own path, so it is the place asked for here, and the walks refuse it as a reparse point.
 #[must_use]
 pub fn is_the_place_asked_for(supplied: &str, final_path: &str) -> bool {
     /// The path without the extended prefix and without a trailing backslash that is not a drive's own.
@@ -786,7 +799,8 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
     };
     match fault {
         AncestorFault::Link => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is a reparse point, such as a link or a mounted folder. The installation does not go through a reparse point at or above its trees: the folders above the place that it leads to are not the ones that it read. This layout is not supported. {changes} The setup program makes this folder itself, as a plain folder, in the system's own known folder. It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share. {kept}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it is a reparse point, such as a link or a mounted folder. {} {kept}",
+            own_link_words(stage)
         ),
         AncestorFault::NotAFolder => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} Remove or rename what is in its place if nothing else needs it, then run the setup program again. {kept}"
@@ -808,6 +822,17 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
         | AncestorFault::Overlap(_)
         | AncestorFault::List(_) => shared_refusal(folder, tree, fault, stage),
     }
+}
+
+/// What the setup program does and does not do about a reparse point (a link or a mounted folder)
+/// at a folder that it makes itself, in either tree: the one form that the program tree's folders
+/// and the folder that holds the data directory share. It tells the administrator to change
+/// nothing that other programs share and to remove nothing.
+fn own_link_words(stage: Stage) -> String {
+    let changes = stage.changes();
+    format!(
+        "The installation does not go through a reparse point at or above its trees: the folders above the place that it leads to are not the ones that it read. This layout is not supported. {changes} The setup program makes this folder itself, as a plain folder, in the system's own known folder. It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share."
+    )
 }
 
 /// The words the refusal of the data directory itself ends with when its handle shows the system's
@@ -937,14 +962,15 @@ pub struct KnownFolder<'a> {
 ///
 /// 1. a known folder that could not be opened is refused with the words of a folder that could not
 ///    be opened;
-/// 2. a known folder whose final path is on a network share is refused with the words of a volume
-///    that the installation does not use;
+/// 2. a known folder whose path names a network share, and whose final path is on one, is refused
+///    with the words of a volume that the installation does not use;
 /// 3. a known folder whose path is not its own final path is refused with what it leads to: a link
-///    or a mounted folder at it, a short name, a forward slash, a substituted letter and another
-///    form of its letters all end here, and the root and overlap tests never read a spelling. A
-///    path that is its own final path in the forms that the system writes (with or without the
-///    extended prefix, in any case of ASCII letters, with or without a trailing backslash) is not
-///    refused for that;
+///    at it (a local path whose folder opens on a share included), a short name, a forward slash,
+///    a substituted letter and another form of its letters all end here, and the root and overlap
+///    tests never read a spelling. A path that is its own final path in the forms that the system
+///    writes (with or without the extended prefix, in any case of ASCII letters, with or without a
+///    trailing backslash) is not refused for that, and neither is a volume mounted at the folder,
+///    whose final path is the folder's own: the walks refuse that one for its reparse point;
 /// 4. the final paths alone are then compared: a known folder that is the root of a volume (so no
 ///    folder is above it), and known folders that overlap (the same folder, or one at or below the
 ///    other tree's own folder, `<known>\KalaReach`).
@@ -966,11 +992,15 @@ pub fn shape_refusal(
         let leads_to;
         let fault = match known.opened {
             Err(error) => AncestorFault::Unreadable(error),
-            // A share is another computer's volume whatever its path says: its words come before
-            // any comparison of the two paths, so that a share never gets words about a path that
-            // leads elsewhere.
-            Ok(found) if is_on_a_network_share(found) => AncestorFault::Volume(REMOTE_VOLUME),
-            // The words that a path leads elsewhere are for two paths that, as shown, differ.
+            // A path that names a share is on another computer's volume whatever its spelling
+            // says: its words come before any comparison of the two paths, so that it never gets
+            // words about a path that leads elsewhere.
+            Ok(found) if is_on_a_network_share(found) && names_a_share(known.given) => {
+                AncestorFault::Volume(REMOTE_VOLUME)
+            }
+            // The words that a path leads elsewhere are for two paths that, as shown, differ. A
+            // local path whose folder opens on a share is one of them: the path itself is on a local
+            // volume, and what it leads to is the share.
             Ok(found) if !is_the_place_asked_for(known.given, found) => {
                 leads_to = dos_path_of(found);
                 AncestorFault::Leads(&leads_to)
@@ -1322,7 +1352,9 @@ pub fn code_integrity_refusal(policies: &[serde_json::Value]) -> Option<String> 
 
 /// The refusal for an effective application control policy that is not empty: the collections that
 /// it enforces and the collections that hold rules, as the read of the policy showed them, and
-/// what this run had already changed before it read the policy.
+/// what this run had already changed before it read the policy: the data directory and the
+/// directories in it, which the manifest records, and the folder that holds the data directory,
+/// which no manifest records.
 #[must_use]
 // text: application_control_set
 pub fn application_control_set(enforced: &[&str], ruled: &[&str]) -> String {
@@ -1334,7 +1366,7 @@ pub fn application_control_set(enforced: &[&str], ruled: &[&str]) -> String {
         facts.push(format!("it holds rules in {}", ruled.join(", ")));
     }
     format!(
-        "The effective application control policy is not empty: {}. The installation does not go on beside a policy that it did not write. This run had already made or protected the data directory and the directories in it before it read the policy, and the manifest records them.",
+        "The effective application control policy is not empty: {}. The installation does not go on beside a policy that it did not write. This run had already made or protected the data directory and the directories in it before it read the policy, and the manifest records them. The folder that holds the data directory is one that this run made unless it was already there, and no manifest records that folder.",
         facts.join(" and ")
     )
 }

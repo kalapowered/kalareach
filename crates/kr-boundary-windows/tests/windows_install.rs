@@ -1016,7 +1016,7 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     assert!(
         refused
             .to_string()
-            .contains("it is a reparse point or not a folder"),
+            .contains("it is a reparse point, such as a link or a mounted folder"),
         "{refused}"
     );
     let _ = std::fs::remove_dir(&link);
@@ -1886,13 +1886,19 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
         .unwrap_err()
         .to_string();
     assert!(
-        text.contains("it is a reparse point or not a folder"),
+        text.contains("it is a reparse point, such as a link or a mounted folder"),
         "{text}"
     );
-    assert!(text.contains("Move the folder aside"), "{text}");
+    assert!(
+        text.contains(
+            "It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share."
+        ),
+        "{text}"
+    );
     never(
         &text,
         &[
+            "Move the folder aside",
             "remove or rename the folder",
             "remove the folder",
             "Correct its list instead",
@@ -3009,15 +3015,25 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     );
     let text = refusal("differ only by case");
     assert!(text.contains("Turn the flag off"), "{text}");
-    for other in [
-        "Remove ",
-        "Do not remove",
-        "Move it aside",
-        "emptied",
-        "removed",
-    ] {
-        assert!(!text.contains(other), "one remedy: {text}");
+    // One remedy: the text gives no other instruction. A statement of what the refusal did
+    // ("Nothing in it is removed.") is no instruction, so the words are matched as instructions:
+    // at the start of a sentence, or as a refusal to remove.
+    let lowered = text.to_lowercase();
+    for sentence in lowered.split(". ") {
+        for other in ["remove ", "empty ", "delete ", "move "] {
+            assert!(
+                !sentence.trim_start().starts_with(other),
+                "one remedy, an instruction {other:?}: {text}"
+            );
+        }
     }
+    for other in ["do not remove", "move it aside", "move the folder aside"] {
+        assert!(!lowered.contains(other), "one remedy, {other:?}: {text}");
+    }
+    assert!(
+        text.ends_with("Nothing in it is removed."),
+        "the refusal says what it did, in the last sentence: {text}"
+    );
     let _ = Command::new("fsutil")
         .args(["file", "setCaseSensitiveInfo"])
         .arg(&paths.data)

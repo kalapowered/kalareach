@@ -6,8 +6,9 @@
 use std::path::Path;
 
 use kr_boundary_windows::remedy::{
-    EntryKind, Origin, ParentCure, Presence, Remedy, Shape, choose, ending, origin_of_open_error,
-    origin_of_shape, parent_advice, program_removal_advice,
+    AncestorFault, EntryKind, Origin, ParentCure, Presence, Remedy, Shape, Stage, Subject, Tree,
+    ancestor_refusal, choose, ending, origin_of_open_error, origin_of_shape, parent_advice,
+    program_removal_advice,
 };
 
 const RECORDS: [EntryKind; 9] = [
@@ -309,11 +310,63 @@ fn each_state_of_the_parent_folder_is_told_one_remedy() {
     assert!(!text.contains("give it to"), "{text}");
 }
 
+/// A reparse point at the folder that holds the data directory is told in the words of an own
+/// folder of the program tree that is a reparse point: what the setup program does and does not
+/// change, with no move, no removal and no change of a folder that other programs share. The two
+/// trees share one form, so the stage names what the run had changed in both.
+#[test]
+fn a_link_at_the_folder_above_the_data_directory_is_told_as_one_at_an_own_folder_of_the_program_tree()
+ {
+    let stages = [
+        Stage::Before,
+        Stage::After,
+        Stage::AfterRepair {
+            broker_stopped: true,
+        },
+        Stage::DataParentMade,
+        Stage::Rollback,
+    ];
+    for stage in stages {
+        let parent = parent_advice(&ParentCure::Link(stage));
+        let program = ancestor_refusal(
+            &Subject::at(
+                r"C:\Program Files\Kala",
+                r"C:\Program Files",
+                AncestorFault::Link,
+            ),
+            Tree::Program,
+            stage,
+        );
+        assert!(
+            program.contains(&parent),
+            "the program tree's own-folder link form holds the data parent's words ({stage:?}):\n{parent}\n{program}"
+        );
+        for said in [
+            "This layout is not supported.",
+            "The setup program makes this folder itself, as a plain folder, in the system's own known folder.",
+            "It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share.",
+        ] {
+            assert!(parent.contains(said), "{stage:?}: {parent}");
+        }
+        for never in [
+            "Move the folder aside",
+            "rename",
+            "Remove",
+            "remove",
+            "Correct its list",
+            "did not make this folder",
+        ] {
+            assert!(!parent.contains(never), "{stage:?} {never}: {parent}");
+        }
+    }
+}
+
 #[test]
 fn a_folder_that_holds_the_data_directory_or_may_is_never_told_to_be_removed() {
     for cure in [
         ParentCure::Close,
         ParentCure::MoveAside,
+        ParentCure::Link(Stage::Before),
         ParentCure::Unreadable,
         ParentCure::Correct(Presence::Present),
         ParentCure::Correct(Presence::Unknown("Windows error 5".to_owned())),
