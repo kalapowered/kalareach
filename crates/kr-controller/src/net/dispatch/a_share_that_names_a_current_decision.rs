@@ -608,7 +608,7 @@ async fn shared_by(
             carried,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
 }
 
 /// A share's result, or a panic naming its refusal.
@@ -771,7 +771,7 @@ async fn two_actors_that_send_one_action_identifier_write_two_shares() {
         .await
         .expect("this host holds the claim")
         .copied()
-        .into_answer()
+        .into_answer_for_test()
     else {
         panic!("a retry is answered with a response");
     };
@@ -2554,7 +2554,7 @@ impl Served {
                 carried,
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect("the share is written")
             .to_typed()
             .expect("a share result");
@@ -2593,7 +2593,7 @@ impl Served {
                 carried,
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect("the share is written")
             .to_typed()
             .expect("a share result")

@@ -1464,7 +1464,7 @@ impl RemoteConnection {
                         );
                     }
                     drop(hold);
-                    Given::Fresh(outcome)
+                    Given::fresh(outcome)
                 });
                 noting(
                     &mut origin,
@@ -2000,7 +2000,7 @@ fn settled_by_a_service<Ended>(
 ) -> Given<ControlFrame> {
     match outcome {
         Ok(Ok(given)) => given.map(|answer| framed(request_id, answer)),
-        Ok(Err(_)) | Err(_) => Given::Fresh(failure(request_id, outcome_unknown())),
+        Ok(Err(_)) | Err(_) => Given::fresh(failure(request_id, outcome_unknown())),
     }
 }
 

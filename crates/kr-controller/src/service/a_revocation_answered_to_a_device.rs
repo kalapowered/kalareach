@@ -191,7 +191,7 @@ async fn a_retry_of_an_unfinished_revocation_is_told_what_its_actor_may_know() {
             .await
             .expect("this host holds the claim")
             .copied()
-            .into_answer()
+            .into_answer_for_test()
         else {
             panic!("a retry is answered with a response");
         };
@@ -310,7 +310,7 @@ async fn a_device_that_revokes_through_the_daemon_is_told_of_its_own_sessions_on
         "the attempt that revokes answers for itself"
     );
     let answer = answer
-        .into_answer()
+        .into_answer_for_test()
         .expect("the device revokes what it delegated");
     let revoked: RevocationResult = answer.to_typed().expect("decodes");
     assert!(revoked.revoked_grants.contains(&delegated.grant.grant_id));
@@ -328,7 +328,7 @@ async fn a_device_that_revokes_through_the_daemon_is_told_of_its_own_sessions_on
         .await;
     assert!(again.is_copied(), "a repeat is answered from the record");
     let again = again
-        .into_answer()
+        .into_answer_for_test()
         .expect("a repeat of the action is answered");
     assert_eq!(
         again.to_typed::<RevocationResult>().expect("decodes"),
@@ -374,7 +374,7 @@ async fn a_device_is_refused_what_only_the_owner_at_this_machine_does() {
                 carried,
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a device does not make what the owner at this machine makes");
         assert_eq!(
             refused.code(),
