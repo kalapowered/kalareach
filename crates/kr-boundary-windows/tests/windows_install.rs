@@ -172,6 +172,13 @@ fn appid_state() -> (bool, u32) {
     )
 }
 
+/// Whether neither of the broker's two pipes has a name: no listener holds one.
+fn the_brokers_pipes_are_gone() -> bool {
+    [Pipe::Persons, Pipe::Administrators]
+        .iter()
+        .all(|kind| std::fs::metadata(kind.name()).is_err())
+}
+
 /// What a machine with no installation on it does not have: the broker's service (a service marked
 /// for deletion counts only when `strict`), the two accounts and their entries among the hidden
 /// accounts, the data directory and the folder above it, the program directory, the pipe's name,
@@ -209,10 +216,7 @@ fn machine_problems(strict: bool, policy_stays: bool) -> Vec<String> {
     if paths.program.exists() {
         left.push("the program directory".to_owned());
     }
-    if [Pipe::Persons, Pipe::Administrators]
-        .iter()
-        .any(|kind| std::fs::metadata(kind.name()).is_ok())
-    {
+    if !the_brokers_pipes_are_gone() {
         left.push("the broker's pipe".to_owned());
     }
     if !policy_stays && !channel().effective().unwrap().1.is_unconfigured() {
@@ -4042,6 +4046,7 @@ fn a_client_that_holds_only_the_pipes_grant_connects_and_a_request_and_its_answe
         return;
     }
     let mut listener = Listener::bind(Pipe::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let server = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
         move || {
@@ -4168,6 +4173,7 @@ fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
     }
     let mut listener =
         Listener::bind(Pipe::Persons, &[system], std::sync::Arc::clone(&stop)).unwrap();
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     // A broker that accepts and never answers: it holds the connection until it is told to stop.
     let server = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
@@ -4211,6 +4217,7 @@ fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and
     }
     let mut listener =
         Listener::bind(Pipe::Persons, &[system], std::sync::Arc::clone(&stop)).unwrap();
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     // A broker that accepts and never answers, and keeps the connection until told to stop.
     let server = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
@@ -4295,6 +4302,7 @@ fn stand_in_broker(
     require_clean_machine();
     let mut listener =
         Listener::bind(Pipe::Persons, &[system], std::sync::Arc::clone(&stop)).unwrap();
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let thread = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
@@ -5221,12 +5229,17 @@ fn needs_the_system() -> bool {
 }
 
 /// Sets the stop when it is dropped, so that no thread of a case waits on for a client however the
-/// case ends.
+/// case ends, and waits for the thread that holds a listener to end at the stop and drop it (for
+/// twenty seconds at most), so that the broker's pipe is free for the case after it.
 struct StopWhenDropped(std::sync::Arc<kr_boundary_windows::win::pipe::Stop>);
 
 impl Drop for StopWhenDropped {
     fn drop(&mut self) {
         self.0.set();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !the_brokers_pipes_are_gone() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }
 
