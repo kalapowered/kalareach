@@ -59,7 +59,10 @@ pub fn on_relay(relay: &str, resolver: &str) -> kr_transport::config::EndpointCo
 
 /// Everything the page could have been sent, as the text it would have received.
 #[derive(Default)]
-pub struct Capture(Mutex<Vec<String>>);
+pub struct Capture {
+    texts: Mutex<Vec<String>>,
+    kept: tokio::sync::Notify,
+}
 
 impl Capture {
     pub fn keep(&self, value: &impl serde::Serialize) {
@@ -68,11 +71,73 @@ impl Capture {
 
     /// Keeps text exactly as the page would receive it.
     pub fn keep_text(&self, text: impl Into<String>) {
-        self.0.lock().expect("the capture").push(text.into());
+        self.texts.lock().expect("the capture").push(text.into());
+        self.kept.notify_waiters();
     }
 
     pub fn texts(&self) -> Vec<String> {
-        self.0.lock().expect("the capture").clone()
+        self.texts.lock().expect("the capture").clone()
+    }
+
+    /// Waits until a kept text is one `wanted` accepts, and returns it. It decides by what was
+    /// kept and wakes when more is, so it ends when the text is kept and never by a time.
+    pub async fn text_where(&self, wanted: impl Fn(&str) -> bool) -> String {
+        loop {
+            let kept = self.kept.notified();
+            tokio::pin!(kept);
+            kept.as_mut().enable();
+            if let Some(found) = self.texts().into_iter().find(|text| wanted(text)) {
+                return found;
+            }
+            kept.await;
+        }
+    }
+}
+
+/// Tauri's event listeners, held busy for as long as this lives. An emit that asks which of the
+/// listeners its event is for holds them while it asks, and the filter it asks with can take as
+/// long as a test lets it. An emit that comes meanwhile finds them busy and is queued, and a queued
+/// emit is delivered by the next emit that reaches a listener.
+pub struct ListenersHeld {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    emit: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The event that [`ListenersHeld`] emits, to which the application has one listener.
+const HOLDING_EVENT: &str = "kr://test-listeners-held";
+
+impl ListenersHeld {
+    /// Holds `app`'s listeners, and returns once they are held.
+    pub fn take(app: &tauri::AppHandle<tauri::test::MockRuntime>) -> Self {
+        use tauri::{Emitter as _, Listener as _};
+
+        // A listener for the application, not for any target, so that the filter is asked about it.
+        app.listen(HOLDING_EVENT, |_| {});
+        let (entered, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let app = app.clone();
+        let emit = std::thread::spawn(move || {
+            let _ = app.emit_filter(HOLDING_EVENT, (), |_| {
+                let _ = entered.send(());
+                let _ = released.lock().expect("the release").recv();
+                false
+            });
+        });
+        held.recv().expect("the emit holds the listeners");
+        Self {
+            release: Some(release),
+            emit: Some(emit),
+        }
+    }
+}
+
+impl Drop for ListenersHeld {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(emit) = self.emit.take() {
+            let _ = emit.join();
+        }
     }
 }
 

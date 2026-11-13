@@ -1480,6 +1480,37 @@ async fn the_page_is_told_when_the_ceremony_this_phone_offers_changes() {
     .expect("the page is told which ceremony the phone offers");
 }
 
+/// The suite hears the ceremony the phone starts to offer when another emit holds the event
+/// listeners at the moment the owner tells the page. The owner tells a change once, and nothing
+/// after it makes another emit, so an event that waited for one would wait for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_suite_hears_the_ceremony_told_while_another_emit_holds_the_listeners() {
+    let data = tempfile::tempdir().expect("a directory");
+    let ceremony = Arc::new(ChangingCeremony {
+        kind: Mutex::new(CeremonyKind::None),
+    });
+    let companion = Companion::start(
+        data.path(),
+        support::parts(
+            Arc::new(MemoryStore::new()),
+            Arc::new(CountingRoom::default()),
+        ),
+        ceremony.clone(),
+        StubIntake::holding("", false),
+    );
+    let held = support::ListenersHeld::take(companion.app.handle());
+    *ceremony.kind.lock().expect("the kind") = CeremonyKind::FaceId;
+    tokio::time::timeout(
+        WATCHDOG,
+        companion
+            .heard
+            .text_where(|text| text.contains("\"ceremony\":\"face_id\"")),
+    )
+    .await
+    .expect("the owner's change reached the suite while the listeners were held");
+    drop(held);
+}
+
 /// KR-REQ-10.32: this computer counts its tries with a code in its own data directory, under its
 /// own secret store. Five charged attempts leave the sixth refused without a room being opened,
 /// and a second instance over the same directory and store refuses it too. The same code through
