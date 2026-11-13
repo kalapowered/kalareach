@@ -3019,7 +3019,14 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         unrecorded.record(ObjectKind::Directory, &path.display().to_string(), None);
     }
     unrecorded.save(&paths.manifest).unwrap();
-    refused_with("its manifest does not record this directory");
+    // The manifest was read and holds no record of the directory: the words say that, and name no
+    // step, since the setup program has none for this state.
+    let text = refusal("its manifest does not record this directory");
+    assert!(text.contains("holds no record of"), "{text}");
+    assert!(
+        text.contains("The setup program names no step for this state."),
+        "{text}"
+    );
     let mut no_staging = Manifest::begin();
     for path in [&paths.data, &paths.journal, &paths.run] {
         no_staging.record(ObjectKind::Directory, &path.display().to_string(), None);
@@ -4334,7 +4341,6 @@ fn stand_in_broker(
     require_clean_machine();
     let mut listener =
         Listener::bind(Pipe::Persons, &[system], std::sync::Arc::clone(&stop)).unwrap();
-    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let thread = std::thread::spawn({
         let stop = std::sync::Arc::clone(&stop);
@@ -4386,6 +4392,7 @@ fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_e
     // The proof for the second class is answered after the installation's deadline, as a later cycle
     // would answer it: the installation stops reading at the deadline and takes no answer after it.
     let (server, asked, stop) = stand_in_broker(Duration::from_millis(500), Duration::from_secs(5));
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let mut connection = connect_here(Pipe::Persons).unwrap();
     let cycle = install::ProofCycle::begin(bound, margin, || Ok(())).unwrap();
     let began = Instant::now();
@@ -4409,6 +4416,7 @@ fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_e
     // that late could be answered only by a cycle of the broker's that the installation did not ask
     // for.
     let (server, asked, stop) = stand_in_broker(Duration::from_millis(3200), Duration::ZERO);
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let mut connection = connect_here(Pipe::Persons).unwrap();
     let cycle = install::ProofCycle::begin(bound, margin, || Ok(())).unwrap();
     let refused = cycle.prove(&mut connection).unwrap_err().to_string();
@@ -4424,6 +4432,7 @@ fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_e
     // Both inside the cycle: accepted.
     let (server, asked, stop) =
         stand_in_broker(Duration::from_millis(200), Duration::from_millis(200));
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let mut connection = connect_here(Pipe::Persons).unwrap();
     install::ProofCycle::begin(bound, margin, || Ok(()))
         .unwrap()
