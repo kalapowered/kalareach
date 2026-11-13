@@ -1003,6 +1003,7 @@ pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
             Ok(pipe) => break pipe,
             Err(failure) if failure.code == ERROR_PIPE_BUSY => {
                 let left = BUSY_WAIT.saturating_sub(began.elapsed());
+                let turn = Instant::now();
                 if left.is_zero() {
                     return Err(error(
                         ERROR_PIPE_BUSY,
@@ -1015,7 +1016,12 @@ pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
                     clippy::disallowed_methods,
                     reason = "its answer is only a wake-up: the open on the next turn of the loop decides, and its own error is what is returned"
                 )]
-                let _woken = unsafe { WaitNamedPipeW(name.as_ptr(), left.as_millis() as u32) };
+                let woken = unsafe { WaitNamedPipeW(name.as_ptr(), left.as_millis() as u32) };
+                // A call that failed at once would turn the loop with no pause until its bound: it
+                // waits out a short pause instead. The answer decides nothing but this pace.
+                if woken == 0 && turn.elapsed() < RETRY_PAUSE {
+                    std::thread::sleep(RETRY_PAUSE);
+                }
             }
             Err(failure) => return Err(failure),
         }

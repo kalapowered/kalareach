@@ -15,6 +15,11 @@
 # listed, and so are the iterator methods that skip what fails (`flatten`, `flat_map`, `filter_map`).
 # A `for` loop over a `Result` is refused by the compiler's own lint, which `-D warnings` makes an
 # error, and `Result::into_iter` has no path that this list can name.
+#
+# The waits and the completion calls are listed with their `Ex` forms (alertable waits, a signal and a
+# wait in one call, the completion routines). `MsgWaitForMultipleObjects` and its `Ex` form are in
+# `Win32_UI_WindowsAndMessaging`, which this package's features leave out, so no call to them compiles
+# and no path to them resolves: a call needs that feature, and then both go in this list.
 
 disallowed-methods = [
     { path = "std::path::Path::exists", reason = "it answers false when the look failed; look with records::look, or with std::fs::metadata and keep the error" },
@@ -42,6 +47,12 @@ disallowed-methods = [
     { path = "windows_sys::Win32::System::Threading::WaitForMultipleObjects", reason = "it answers a failure as a number that a caller can take for a timeout or for an object; wait with ffi::wait_any, which answers the object, timed out or failed" },
     { path = "windows_sys::Win32::System::Pipes::PeekNamedPipe", reason = "it answers a failure as an error that a caller can take for the end of the pipe; read with ffi::pipe_read, which answers data, ended or failed" },
     { path = "windows_sys::Win32::Storage::FileSystem::ReadFile", reason = "it answers a failure as an error that a caller can take for the end of the pipe; read a pipe with ffi::pipe_read, which answers data, ended or failed, and a transfer with the pipe module's own wait" },
+    { path = "windows_sys::Win32::System::Threading::WaitForSingleObjectEx", reason = "it answers a failure as a number that a caller can take for a timeout or for the object, and a wait that a completion routine ended as a third; wait with ffi::wait, which answers signalled, timed out or failed" },
+    { path = "windows_sys::Win32::System::Threading::WaitForMultipleObjectsEx", reason = "it answers a failure as a number that a caller can take for a timeout or for an object, and a wait that a completion routine ended as a third; wait with ffi::wait_any, which answers the object, timed out or failed" },
+    { path = "windows_sys::Win32::System::Threading::SignalObjectAndWait", reason = "it signals one object and waits on another, and answers a failure as a number that a caller can take for a timeout or for the object; signal with a call whose answer is checked, then wait with ffi::wait or ffi::wait_any" },
+    { path = "windows_sys::Win32::System::IO::GetOverlappedResultEx", reason = "it answers a failed transfer, a transfer that is not complete and a wait that a completion routine ended the same way, as zero; read the result with ffi::overlapped_result, which tells done, not complete and failed apart" },
+    { path = "windows_sys::Win32::System::IO::GetQueuedCompletionStatusEx", reason = "its answer is only a wake-up: the job's own count and the retained processes decide, so a call carries an expectation that says so at its one place" },
+    { path = "windows_sys::Win32::Storage::FileSystem::ReadFileEx", reason = "it starts a read whose completion routine the platform calls later, and answers a failure as zero with an error to read; read a pipe with ffi::pipe_read, and a transfer with the pipe module's own wait" },
     { path = "windows_sys::Win32::System::IO::GetOverlappedResult", reason = "it answers a failed transfer and a transfer that is not complete the same way, as zero; read the result with ffi::overlapped_result, which tells done, not complete and failed apart" },
     { path = "windows_sys::Win32::System::Pipes::ConnectNamedPipe", reason = "it answers a failure, a connect that is pending and a client that is already there as the same zero with an error to read; connect with ffi::connect_named_pipe, which tells them apart" },
     { path = "windows_sys::Win32::System::Pipes::WaitNamedPipeW", reason = "its answer is only a wake-up: the open that follows decides, so a call carries an expectation that says so at its one place" },

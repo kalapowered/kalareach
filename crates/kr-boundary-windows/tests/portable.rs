@@ -954,6 +954,20 @@ fn the_removal_compares_the_present_mode_with_the_records_and_lets_another_mode_
     );
     assert!(left.is_empty() && stays.is_some(), "{left:?}");
 
+    // A collection that is empty after the write and still has the installation's mode (a domain
+    // policy can keep it so) is a difference, not a mode that stays: the removal does not finish on
+    // it, and no mode is named as one that stays.
+    let enabled = Policy::parse(
+        r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="Enabled"></RuleCollection></AppLockerPolicy>"#,
+    )
+    .unwrap();
+    let (expected, stays) = policy::expected_after(&baseline, &enabled);
+    assert!(stays.is_none(), "{stays:?}");
+    assert!(
+        !enabled.differences(&expected).is_empty(),
+        "an empty collection that has the installation's mode is a difference"
+    );
+
     // What each way of leaving the collection writes: the record's mode, nothing (as found) where the
     // mode is already the record's, where another stays and where the record was not read, and not
     // configured otherwise.
