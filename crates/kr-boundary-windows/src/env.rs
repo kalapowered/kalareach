@@ -165,7 +165,12 @@ impl EnvBlock {
     /// The name and value of each entry, in the block's order.
     #[must_use]
     pub fn pairs(&self) -> Vec<(String, String)> {
-        self.0
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an entry of the block in hand with no `=` has no name and no value and is left out; the block is split here and no read of the machine fails into it"
+        )]
+        let pairs = self
+            .0
             .split(|unit| *unit == 0)
             .take_while(|entry| !entry.is_empty())
             .filter_map(|entry| {
@@ -173,7 +178,8 @@ impl EnvBlock {
                 text.split_once('=')
                     .map(|(name, value)| (name.to_owned(), value.to_owned()))
             })
-            .collect()
+            .collect();
+        pairs
     }
 
     pub(crate) fn from_pairs(mut pairs: Vec<(&'static str, String)>) -> EnvBlock {

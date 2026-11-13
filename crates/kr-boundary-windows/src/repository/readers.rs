@@ -165,10 +165,6 @@ fn failed(form: &ReaderForm, rule: &'static str, what: &str) -> Refusal {
 ///
 /// Returns a refusal when the argument is missing, is given to a reader that takes none, or is
 /// outside the grammar of its type.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-)]
 pub fn reader_line(reader: Reader, argument: Option<&str>) -> Result<OperationLine, Refusal> {
     let form = form(reader);
     let bad = || {
@@ -178,6 +174,10 @@ pub fn reader_line(reader: Reader, argument: Option<&str>) -> Result<OperationLi
             "the argument is missing or outside its form",
         )
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+    )]
     let last = match (form.argument, argument) {
         (Argument::Nothing, None) => None,
         (Argument::Revision, Some(spec)) if qualified_revision(spec).is_ok() => {
@@ -231,10 +231,6 @@ fn result_code(form: &ReaderForm, output: &Output<'_>) -> Result<u32, Refusal> {
 /// # Errors
 ///
 /// Returns a refusal for an unresolved revision, a deadline, or output that is not one line.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-)]
 pub fn parse_r1(output: &Output<'_>, name: &str) -> Result<String, Refusal> {
     let form = form(Reader::R1);
     match output.exit {
@@ -244,6 +240,10 @@ pub fn parse_r1(output: &Output<'_>, name: &str) -> Result<String, Refusal> {
             return Err(refuse(RULE_UNRESOLVED, &format!("unresolved {name}")));
         }
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+    )]
     let line = output
         .stdout
         .strip_suffix(b"\n")
@@ -335,27 +335,33 @@ fn listing<'a>(form: &ReaderForm, stdout: &'a [u8]) -> Result<Vec<&'a [u8]>, Ref
     Ok(records)
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-)]
 fn mode_of(text: &[u8]) -> Option<u32> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+    )]
     let text = std::str::from_utf8(text).ok()?;
-    MODES
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+    )]
+    let mode = MODES
         .contains(&text)
         .then(|| u32::from_str_radix(text, 8).ok())
-        .flatten()
+        .flatten();
+    mode
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-)]
 fn oid_of(text: &[u8]) -> Option<String> {
-    std::str::from_utf8(text)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+    )]
+    let oid = std::str::from_utf8(text)
         .ok()
         .filter(|text| is_oid(text))
-        .map(str::to_owned)
+        .map(str::to_owned);
+    oid
 }
 
 /// Reads R3's listing: `<mode> SP <type> SP <oid> TAB <path> NUL` for every file below a commit's
@@ -505,10 +511,6 @@ pub fn blob_request(oids: &[String]) -> Result<Vec<u8>, Refusal> {
 /// different number of answers, an answer out of order or of another type, a size over
 /// [`MAX_BLOB_BYTES`], a total over [`MAX_BLOB_TOTAL_BYTES`], or bytes that do not frame to the
 /// sizes.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-)]
 pub fn parse_r5<'a>(requested: &[String], output: &Output<'a>) -> Result<Vec<&'a [u8]>, Refusal> {
     let form = form(Reader::R5);
     result_code(form, output)?;
@@ -544,6 +546,10 @@ pub fn parse_r5<'a>(requested: &[String], output: &Output<'a>) -> Result<Vec<&'a
         if kind == b"missing" && size.is_none() {
             return Err(failed(form, RULE_READER_MISSING, "an object is missing"));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+        )]
         let size = match (kind, size) {
             (b"blob", Some(size)) => std::str::from_utf8(size)
                 .ok()
@@ -551,6 +557,10 @@ pub fn parse_r5<'a>(requested: &[String], output: &Output<'a>) -> Result<Vec<&'a
                 .ok_or_else(|| framing("an answer's size is malformed"))?,
             _ => return Err(framing("an answer is not a blob")),
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+        )]
         let size = size
             .parse::<usize>()
             .ok()

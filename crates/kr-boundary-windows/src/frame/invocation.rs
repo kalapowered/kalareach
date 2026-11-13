@@ -463,10 +463,6 @@ impl Notes {
     /// most [`MAX_NOTES`] stay and no more than the frame has room for. `cut` counts every note
     /// that was left out and every note that was shortened.
     #[must_use]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a text that cannot be written as JSON counts as too large and is refused; nothing was read from the machine"
-    )]
     pub fn bounded<I, S>(notes: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -479,6 +475,10 @@ impl Notes {
             let text = printable(note, MAX_NOTE_BYTES);
             let shortened = text.len() < note.len();
             // The note, its quotes, any escapes and the comma after it.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a note that cannot be written as JSON counts as too large and is left out; nothing was read from the machine"
+            )]
             let size = serde_json::to_vec(&text).map_or(usize::MAX, |json| json.len() + 1);
             if kept.items.len() < MAX_NOTES && size <= room {
                 room -= size;

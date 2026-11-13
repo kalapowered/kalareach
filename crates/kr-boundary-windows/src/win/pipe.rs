@@ -283,16 +283,17 @@ pub mod testing {
         REFILLS_TO_FAIL.store(count, Ordering::SeqCst);
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "an atomic counter of the testing seams, not a read"
-    )]
     pub(super) fn take_refill_failure() -> bool {
-        REFILLS_TO_FAIL
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an atomic counter of the testing seams, not a read"
+        )]
+        let taken = REFILLS_TO_FAIL
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
-            .is_ok()
+            .is_ok();
+        taken
     }
 
     /// What a bind does between making the pipe's first instance and opening the broker's own client

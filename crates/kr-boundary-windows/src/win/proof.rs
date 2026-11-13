@@ -578,10 +578,6 @@ pub mod testing {
 /// Proves that the policy refuses an unlisted program to a class's token and runs a listed one,
 /// all before the deadline.
 #[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the words keep the error of the read"
-)]
 pub fn prove(
     manifest: &Manifest,
     class: Class,
@@ -657,6 +653,10 @@ pub fn prove(
         if over || Instant::now() >= search_until {
             // The log's last words come from the time kept for them, and the query stays within the
             // deadline like everything else.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the words keep the error of the read"
+            )]
             let log = applocker::latest(&scratch.0, &environment, deadline, Some(stop))
                 .unwrap_or_else(|error| format!("unreadable: {error}"));
             if let Some(failed) = stopped(stop) {

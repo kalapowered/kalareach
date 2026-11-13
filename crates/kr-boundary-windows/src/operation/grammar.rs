@@ -128,10 +128,6 @@ pub fn message(text: &str, max_bytes: usize, one_line: bool) -> Result<(), &'sta
 
 /// A decimal count: digits only, no sign, no leading zero, within the bounds.
 #[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-)]
 pub fn count(text: &str, min: u32, max: u32) -> Option<u32> {
     // An empty text has no digits to parse and is refused by the parse below.
     let canonical = text.len() <= 10
@@ -140,9 +136,15 @@ pub fn count(text: &str, min: u32, max: u32) -> Option<u32> {
     if !canonical {
         return None;
     }
-    text.parse::<u32>()
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a text in hand is parsed here: that it is not a number is the whole answer, and nothing was read from the machine"
+    )]
+    let value = text
+        .parse::<u32>()
         .ok()
-        .filter(|value| (min..=max).contains(value))
+        .filter(|value| (min..=max).contains(value));
+    value
 }
 
 /// What a revision may start with, for the readers: the qualified forms the broker resolves.

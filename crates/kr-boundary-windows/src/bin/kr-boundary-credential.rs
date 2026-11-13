@@ -6,14 +6,14 @@
 use std::io::{self, Read as _};
 use std::process::ExitCode;
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "standard input that cannot be read ends the helper with exit code 1: the failure is the answer"
-)]
 fn main() -> ExitCode {
     let operation = std::env::args().nth(1).unwrap_or_default();
     // Git writes the request on standard input and waits for the helper to read it.
     let mut request = Vec::new();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "standard input that cannot be read ends the helper with exit code 1: the failure is the answer"
+    )]
     if io::stdin()
         .take(64 * 1024)
         .read_to_end(&mut request)
