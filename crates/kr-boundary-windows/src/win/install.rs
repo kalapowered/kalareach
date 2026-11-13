@@ -751,41 +751,30 @@ fn data_descriptor() -> Result<sd::OwnedSd, Error> {
     Ok(sd::descriptor(SdKind::DataParent, &Principals::default())?)
 }
 
-/// The refusal of a data directory that is there and is not the installation's own. The remedy comes
-/// from what the directory's own handle showed, and one refusal gives one remedy.
+/// The refusal of a data directory that is there and is not the installation's own. The ending
+/// comes from what the directory's own handle showed, and one refusal gives one ending: a step only
+/// where a read that succeeded shows what it is, and no step where a read failed.
 fn data_refusal(paths: &Paths, why: &str, origin: &Origin) -> Error {
-    let remedy = remedy::data_ending(origin, why == remedy::CASE_SENSITIVE_WHY);
+    let ending = remedy::data_ending(origin, why == remedy::CASE_SENSITIVE_WHY);
     // text: data_refusal-1
     Error::Refused(format!(
-        "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system. {remedy}",
+        "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. {ending}",
         paths.data.display()
     ))
 }
 
-/// The refusal of a data directory that could not be opened or read: a program that holds it open,
-/// a list that refuses the check, or another failure, each with the one remedy its error shows. Any
+/// The refusal of a data directory when a call on it failed, the open of it or a read of its open
+/// handle (`read` names which): the words name that read and its error, and nothing more. The failed
+/// read showed nothing of who made the directory or of what it holds, so the words give no step and
+/// no forecast; in particular they never tell the administrator to move the directory aside, which
+/// at a removal or a repair would take away the records that the installation keeps in it. Any
 /// other kind of failure is returned as it is.
-fn data_failure(paths: &Paths, error: Error) -> Error {
-    match error {
-        Error::Win(failure) => {
-            let why = format!("it could not be checked ({failure})");
-            let origin = remedy::origin_of_open_error(failure.code, &failure.to_string());
-            data_refusal(paths, &why, &origin)
-        }
-        other => other,
-    }
-}
-
-/// The refusal of a data directory whose check on its open handle could not finish, because a read
-/// of it failed: the words name the read and its error, and nothing more. The failed read showed
-/// nothing of who made the directory or of what it holds, so the words give no step and no forecast.
-/// Any other kind of failure is returned as it is.
-fn data_unread(paths: &Paths, error: Error) -> Error {
+fn data_unread(paths: &Paths, read: &str, error: Error) -> Error {
     match error {
         Error::Win(failure) => {
             // text: data_unread-1
             Error::Refused(format!(
-                "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). The setup program goes no further with it, because a read of it failed ({failure}) and showed nothing of what it is.",
+                "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). The setup program goes no further with it, because {read} failed ({failure}) and showed nothing of what it is.",
                 paths.data.display()
             ))
         }
@@ -2462,14 +2451,14 @@ fn inspect_existing_data(
         .ok_or_else(|| Error::Failed("the data directory has no name".to_owned()))?;
     let Some((handle, _)) =
         open_directory_relative(parent, name, FILE_OPEN, None, LIST | WRITE_DAC)
-            .map_err(|error| data_failure(paths, error))?
+            .map_err(|error| data_unread(paths, "the open of it", error))?
     else {
         return Ok(None);
     };
     match data_directory_reason(paths, &handle) {
         Ok(None) => {}
         Ok(Some((why, origin))) => return Err(data_refusal(paths, &why, &origin)),
-        Err(error) => return Err(data_unread(paths, error)),
+        Err(error) => return Err(data_unread(paths, "a read of it", error)),
     }
     let data = held_directory(handle)?;
     let inspected = inspect_data_directory(paths, &data)?;
@@ -2561,7 +2550,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
         match verdict {
             Ok(None) => {}
             Ok(Some((why, origin))) => return Err(data_refusal(paths, &why, &origin)),
-            Err(error) => return Err(data_unread(paths, error)),
+            Err(error) => return Err(data_unread(paths, "a read of it", error)),
         }
     }
     let data = held_directory(made)?;

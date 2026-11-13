@@ -110,15 +110,19 @@ fn the_words_for_an_entry_at_the_data_directorys_name_claim_nothing_of_it() {
 
 /// The endings of the data directory itself correct its owner and its list, or turn its flag off,
 /// only where the system's class owns it, and say that nothing in it is removed: they do not say
-/// that a manifest or a journal is there.
+/// that a manifest or a journal is there. The words that tell an administrator to move the
+/// directory aside stand only where a read that succeeded shows that the installation did not make
+/// it; where a read failed, nothing is established about who made it, so the ending names that read
+/// and its error and gives no step and no forecast.
 #[test]
 fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
     for origin in [
         Origin::System,
         Origin::Foreign,
-        Origin::Held("e".to_owned()),
-        Origin::Refused("e".to_owned()),
-        Origin::Unknown("e".to_owned()),
+        Origin::Held("the open of it: Windows error 32".to_owned()),
+        Origin::Refused("the open of it: Windows error 5".to_owned()),
+        Origin::Unknown("the owner: Windows error 1117".to_owned()),
+        Origin::Changed("it was another object".to_owned()),
     ] {
         for case_sensitive in [false, true] {
             let text = data_ending(&origin, case_sensitive);
@@ -130,6 +134,30 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
                 origin == Origin::System,
                 "{what}"
             );
+            assert_eq!(
+                text.contains("Move it aside"),
+                origin == Origin::Foreign,
+                "{what}"
+            );
+            if let Origin::Held(read) | Origin::Refused(read) | Origin::Unknown(read) = &origin {
+                assert!(text.contains(read.as_str()), "{what}");
+                for claim in [
+                    "Move it aside",
+                    "move it aside",
+                    "rename",
+                    "do not remove",
+                    "Do not",
+                    "Close the program",
+                    "again",
+                    "can hold",
+                    "Whoever",
+                    "another account",
+                    "Turn the flag",
+                    "Leave the system",
+                ] {
+                    assert!(!text.contains(claim), "{claim}: {what}");
+                }
+            }
         }
     }
     let flag = data_ending(&Origin::System, true);
