@@ -1504,7 +1504,7 @@ fn the_line_for_a_known_folder_that_cannot_be_read_names_the_folder_and_the_erro
 fn the_words_for_a_parent_with_no_data_directory_claim_nothing_of_its_contents() {
     let text = parent_advice(&ParentCure::Correct(Presence::Absent));
     assert!(
-        text.contains("It holds no data directory of the boundary."),
+        text.contains("Nothing is at the data directory's name in it."),
         "{text}"
     );
     assert!(
