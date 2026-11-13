@@ -1130,7 +1130,7 @@ async fn start_serving(
 /// the listener sees first. The handler holds each stream while it serves, so a handler that
 /// returns or is dropped takes its streams out of the registry before the connection's cleanup
 /// runs; where the reader is held, the loss is declared by nothing but the listener's own end of
-/// the session, and the streams are revoked when the handler has gone, before the cleanup.
+/// the session, which revokes the streams before it drops the handler, and so before the cleanup.
 ///
 /// The cleanup's hold blocks the thread that runs it, so these cases run on a runtime of several
 /// threads.
@@ -1168,9 +1168,8 @@ async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
         .expect("a data stream");
     let handle = first_stream(&handler).await;
 
-    // The reader is held where the connection or the handler ends the session first, so that the
-    // listener has dropped the handler, and the handler's streams with it, before the loss is
-    // declared.
+    // The reader is held where the connection or the handler ends the session first, so that it
+    // declares nothing: the loss is declared by the listener's own end of the session.
     let held =
         (first != First::Loss).then(|| (hold.hold_the_declaration(), hold.hold_the_cleanup()));
     match first {
