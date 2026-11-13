@@ -9480,3 +9480,92 @@ async fn a_report_that_cannot_be_kept_changes_nothing_else() {
     );
     host.clients.abort();
 }
+
+/// KR-REQ-09.09, 09.12: the result of an automation run whose effect has run is told only while the
+/// authority it ended with stands. A fence this host comes to owe once the route has answered keeps
+/// the run from the caller, who is told that what became of the action is not shown; the run stands
+/// (the workflow has one run and one receipt), and the same trigger asked once the fence is gone is
+/// answered with the run the first attempt made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_automation_run_is_not_shown_when_a_fence_lands_after_the_route_answers_and_the_run_stands()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    host.issue(grant_id(1), &[ActionRight::ChangesetCreate]);
+    let document = definition(
+        workflow_id(1),
+        grant_id(1),
+        "capture-on-trigger",
+        capture_node(workspace),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let environment_id = host.environment_id;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = WorkflowRunParams {
+        workflow_id: document.workflow_id,
+        revision: document.revision,
+        event_id: "evt-fenced".to_owned(),
+        event_type: "manual".to_owned(),
+        event_payload: Nullable::null(),
+    };
+    let (arrived, release) = host.controller.pause_after_a_route_answers();
+    let telling = tokio::spawn({
+        let params = params.clone();
+        async move {
+            let told = control
+                .mutate(
+                    Method::WorkflowRun,
+                    action,
+                    ActionTarget::environment(environment_id),
+                    &params,
+                )
+                .await;
+            (control, told)
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
+        .await
+        .expect("the route answers")
+        .expect("the pause is armed");
+    host.controller.hold_fence(true);
+    release.send(()).expect("the door goes on");
+    let (mut control, told) = telling.await.expect("the door tells it");
+    host.controller.hold_fence(false);
+    let told = failure(told.expect("the call reaches the daemon"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let run: WorkflowRunResult = typed(
+        &control
+            .mutate(
+                Method::WorkflowRun,
+                action,
+                ActionTarget::environment(environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the same trigger is answered once the fence is gone"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(document.workflow_id),
+                    revision: Nullable::some(document.revision),
+                    run_id: Nullable::some(run.run_id),
+                    causal_root_id: Nullable::some(run.causal_root_id),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    assert_eq!(read.runs.len(), 1, "one trigger, one run");
+    assert_eq!(read.node_receipts.len(), 1, "the run's node ran once");
+    host.clients.abort();
+}
