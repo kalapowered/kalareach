@@ -369,7 +369,7 @@ pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<Str
     {
         #[expect(
             clippy::disallowed_methods,
-            reason = "an entry that cannot be read is not deleted here: the removal of the directory below fails for it and the result names what stayed"
+            reason = "an entry that cannot be read is not deleted here: where it is still in the directory the removal of the directory below fails for it and the result names what stayed, and where it is gone by then that removal can succeed; the removal's own result decides"
         )]
         for entry in entries.flatten() {
             if entry.path().extension().and_then(|text| text.to_str()) == Some("journal") {

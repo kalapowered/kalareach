@@ -464,10 +464,6 @@ impl Value {
     fn admit(self, value: Option<&[u8]>, rule: &'static str) -> Result<(), &'static str> {
         let text = value.map(std::str::from_utf8);
         let line = |text: &str| !text.chars().any(char::is_control);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-        )]
         let ok = match (self, text) {
             (Self::Words(words), Some(Ok(text))) => {
                 words.iter().any(|word| text.eq_ignore_ascii_case(word))
@@ -487,7 +483,14 @@ impl Value {
                     true
                 }
             }
-            (Self::Path, Some(Ok(text))) => grammar::path(text).is_ok(),
+            (Self::Path, Some(Ok(text))) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a path that does not parse is refused: `ok` is false and `admit` returns the rule's refusal, so a failed parse ends in a refusal"
+                )]
+                let parsed = grammar::path(text).is_ok();
+                parsed
+            }
             (Self::Refspec, Some(Ok(text))) => refspec(text),
             (Self::RemoteName, Some(Ok(text))) => is_branch_name(text),
             (Self::BranchRef, Some(Ok(text))) => {

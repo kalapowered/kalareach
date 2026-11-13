@@ -95,14 +95,30 @@ fn fail(detail: impl Into<String>) -> Proof {
     }
 }
 
-/// The account of a class, from the manifest: its name and its identifier text.
-fn account_of(manifest: &Manifest, class: Class) -> Option<(String, String)> {
+/// The account of a class, from the manifest: the name that the system gives the account that has
+/// the recorded identifier now (an account that was renamed is found by its identifier, not by the
+/// name that the installation gave it), and the identifier's text. The reason where the manifest
+/// records no identifier for it, no account has the identifier, or the lookup failed.
+fn account_of(manifest: &Manifest, class: Class) -> Result<(String, String), String> {
     let name = match class {
         Class::Checkout => super::install::CHECKOUT,
         Class::Connect => super::install::CONNECT,
     };
-    let object = manifest.find(ObjectKind::Account, name)?;
-    Some((name.to_owned(), object.detail.clone()?))
+    let Some(recorded) = manifest
+        .find(ObjectKind::Account, name)
+        .and_then(|object| object.detail.clone())
+    else {
+        return Err("the manifest records no account for this class".to_owned());
+    };
+    match super::account::find_by_id(&recorded) {
+        Ok(Some((_, now))) => Ok((now, recorded)),
+        Ok(None) => Err(format!(
+            "no account has the identifier that the manifest records for {name}"
+        )),
+        Err(error) => Err(format!(
+            "a lookup of the account that has the identifier recorded for {name} failed ({error})"
+        )),
+    }
 }
 
 /// What to run for [`run_captured`].
@@ -274,9 +290,17 @@ pub fn run_captured_until(
             read_failure(&out),
             read_failure(&err)
         )),
+        // Open is said only of a pipe that a look showed open; a deadline that came before any read
+        // of a pipe shows nothing of it.
+        (Ok(out), Ok(err)) if out.open || err.open => Err(format!(
+            "a pipe of the program was still open after the end of its job (standard output: {}; standard error: {})",
+            pipe_state(&out),
+            pipe_state(&err)
+        )),
         (Ok(out), Ok(err)) => Err(format!(
-            "a pipe of the program was still open after the end of its job (standard output ended {}, standard error ended {})",
-            out.ended, err.ended
+            "the end of a pipe of the program was not observed, since the deadline came before a read showed it (standard output: {}; standard error: {})",
+            pipe_state(&out),
+            pipe_state(&err)
         )),
         _ => Err("a reader of the program's output failed".to_owned()),
     };
@@ -337,8 +361,6 @@ fn end_by(deadline: Instant, stop: Option<&Stop>) -> Instant {
     }
 }
 
-/// Whether the end of a job is proved and nothing reported otherwise: the job's own count and its
-/// retained processes agree, and no child told the owner that it was not seen to end.
 /// What a reader of a pipe found, for the words of a proof that a read failed.
 fn read_failure(piped: &super::launch::Piped) -> String {
     piped
@@ -347,6 +369,20 @@ fn read_failure(piped: &super::launch::Piped) -> String {
         .map_or_else(|| "no failure".to_owned(), ToString::to_string)
 }
 
+/// How a pipe stood at the reader's last look, for the words of a proof that its end is not shown:
+/// ended, open at a look that showed it, or not shown either way.
+fn pipe_state(piped: &super::launch::Piped) -> &'static str {
+    if piped.ended {
+        "ended"
+    } else if piped.open {
+        "still open at its last look"
+    } else {
+        "not seen to end"
+    }
+}
+
+/// Whether the end of a job is proved and nothing reported otherwise: the job's own count and its
+/// retained processes agree, and no child told the owner that it was not seen to end.
 fn settled(job: &Job, ended: Ended) -> Result<(), LaunchError> {
     if ended.proved() && job.unproved_reasons().is_empty() {
         Ok(())
@@ -600,8 +636,9 @@ pub fn prove(
     deadline: Instant,
     stop: &Stop,
 ) -> Proof {
-    let Some((account, sid)) = account_of(manifest, class) else {
-        return fail("the manifest records no account for this class");
+    let (account, sid) = match account_of(manifest, class) {
+        Ok(found) => found,
+        Err(reason) => return fail(reason),
     };
     let Some(git) = manifest.git.as_ref() else {
         return fail("the manifest records no Git installation");
@@ -888,8 +925,9 @@ pub fn release(
     deadline: Instant,
     stop: &Stop,
 ) -> Proof {
-    let Some((account, _)) = account_of(manifest, class) else {
-        return fail("the manifest records no account for this class");
+    let (account, _) = match account_of(manifest, class) {
+        Ok(found) => found,
+        Err(reason) => return fail(reason),
     };
     let Some(git) = manifest.git.as_ref() else {
         return fail("the manifest records no Git installation");
