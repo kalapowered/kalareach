@@ -2312,6 +2312,113 @@ async fn a_registration_held_for_a_binding_that_goes_is_given_up_for_the_binding
     world.holding(2).await;
 }
 
+/// What the cases of a binding whose registration the plugin runtime holds begin from: the session
+/// the programs are run in, the binding that keeps the connection open, the binding whose
+/// registration the host holds at its gate, and the words the link's account names that
+/// registration's end in.
+struct Held {
+    /// The attachment the programs were typed at, which stays for as long as they run.
+    _typing: Typist,
+    /// The binding of the second package's program, which is registered.
+    kept_binding: kr_protocol::ids::BrokerBindingId,
+    /// The binding of the first package's program, whose registration the host holds.
+    binding: kr_protocol::ids::BrokerBindingId,
+    /// What the account says when the link gives that registration up.
+    given_up: String,
+    /// What the account says when the link has removed what the runtime holds of the binding.
+    removal: String,
+}
+
+impl World {
+    /// Runs the second package's program and registers its binding, which keeps the connection to
+    /// the runtime open whatever happens to the first package's; then closes the host's gate, runs
+    /// the first package's program, and returns once the host holds that binding's registration at
+    /// the gate. The release of that package is then revoked by its repository, which under the
+    /// policy that only warns changes nothing.
+    ///
+    /// With `after_a_health_answer` the programs are run after the runtime has answered a health
+    /// question, so that the next is some way off.
+    async fn hold_a_registration(
+        &self,
+        created: &SessionCreateResult,
+        after_a_health_answer: bool,
+    ) -> Held {
+        let mut typing = self.attach_typist(created).await;
+        let _kept_agent = self.start_second_agent(&mut typing).await;
+        self.registering(1).await;
+        self.components_are(1, ComponentState::Registered).await;
+        let kept_binding = self.reported().await[0].0;
+        typing.send("\u{1a}").await;
+        typing.send("bg\n").await;
+        if after_a_health_answer {
+            let answered = self.traced("ended health").await;
+            self.until_traced("ended health", answered + 1).await;
+        }
+
+        self.close_the_gate();
+        let _agent = self.start_agent(&mut typing, "").await;
+        let binding = until_found(
+            PATIENCE,
+            "the first package's binding's registration to be sent",
+            || async {
+                let look = self.looked().await;
+                match look
+                    .reports
+                    .iter()
+                    .find(|(binding, report)| *binding != kept_binding && registering(report))
+                {
+                    Some((binding, _)) => Ok(*binding),
+                    None => Err(reports_in_words(
+                        &look.reports,
+                        kept_binding,
+                        counting_in_words(look.counted),
+                    )),
+                }
+            },
+            || self.rounds_in_words(),
+        )
+        .await;
+        until("the host to hold that registration at its gate", || async {
+            self.a_registration_reached_the_gate().then_some(())
+        })
+        .await;
+        self.revoke_the_first_release().await;
+        let label = label_of(binding);
+        Held {
+            _typing: typing,
+            kept_binding,
+            binding,
+            given_up: format!("ended register {label} gone"),
+            removal: format!("ended unbind {label} "),
+        }
+    }
+
+    /// Waits until the first package's binding is registered, and the runtime holds it and the
+    /// binding that keeps the connection open, and no more.
+    async fn registered_once(&self, held: &Held) {
+        until_found(
+            PATIENCE,
+            "the first package's binding to be registered again",
+            || async {
+                let look = self.looked().await;
+                match look.reports.iter().find(|(binding, report)| {
+                    *binding == held.binding && report.state == ComponentState::Registered
+                }) {
+                    Some(_) => Ok(()),
+                    None => Err(reports_in_words(
+                        &look.reports,
+                        held.kept_binding,
+                        counting_in_words(look.counted),
+                    )),
+                }
+            },
+            || self.link_traces_after_a_look(),
+        )
+        .await;
+        self.holding(2).await;
+    }
+}
+
 /// A binding that stops being wanted and is wanted again, twice, while the plugin runtime holds its
 /// registrations, is registered once the runtime has answered: the link removes one registration
 /// for each call it gave up, and not one for the binding.
@@ -2336,62 +2443,15 @@ async fn a_binding_whose_two_registrations_were_given_up_is_registered_when_it_i
     };
     let world = World::start_with_two_packages(&component).await;
     let created = world.session().await;
-    let mut typing = world.attach_typist(&created).await;
+    let held = world.hold_a_registration(&created, true).await;
 
-    // The second package's program is run and registered: the connection stays open whatever
-    // happens to the first package's binding. It goes to the background of the session.
-    let _kept_agent = world.start_second_agent(&mut typing).await;
-    world.registering(1).await;
-    world.components_are(1, ComponentState::Registered).await;
-    let kept_binding = world.reported().await[0].0;
-    typing.send("\u{1a}").await;
-    typing.send("bg\n").await;
-
-    // Begun after the runtime has answered a health question, so that the next is some way off.
-    let answered = world.traced("ended health").await;
-    world.until_traced("ended health", answered + 1).await;
-
-    // The first package's program is run with the gate closed: its registration is held.
-    world.close_the_gate();
-    let _agent = world.start_agent(&mut typing, "").await;
-    let binding = until_found(
-        PATIENCE,
-        "the first package's binding's registration to be sent",
-        || async {
-            let look = world.looked().await;
-            match look
-                .reports
-                .iter()
-                .find(|(binding, report)| *binding != kept_binding && registering(report))
-            {
-                Some((binding, _)) => Ok(*binding),
-                None => Err(reports_in_words(
-                    &look.reports,
-                    kept_binding,
-                    counting_in_words(look.counted),
-                )),
-            }
-        },
-        || world.rounds_in_words(),
-    )
-    .await;
-    until("the host to hold that registration at its gate", || async {
-        world.a_registration_reached_the_gate().then_some(())
-    })
-    .await;
-    let label = label_of(binding);
-    let given_up = format!("ended register {label} gone");
-    let removal = format!("ended unbind {label} ");
-
-    // The release's repository revokes it, which under the policy that only warns changes nothing,
-    // and the policy then disables at the next admission: the binding is not wanted, and its
-    // registration is given up. The host goes on with it and makes the binding live, and nothing
-    // waits for the answer.
-    world.revoke_the_first_release().await;
+    // The policy disables at the next admission and the binding is not wanted: its registration is
+    // given up. The host goes on with it and makes the binding live, and nothing waits for the
+    // answer.
     world
         .name_the_policy(Some("disable_at_next_admission"))
         .await;
-    world.until_traced(&given_up, 1).await;
+    world.until_traced(&held.given_up, 1).await;
     world.open_the_gate();
     world.holding(2).await;
 
@@ -2407,36 +2467,62 @@ async fn a_binding_whose_two_registrations_were_given_up_is_registered_when_it_i
     world
         .name_the_policy(Some("disable_at_next_admission"))
         .await;
-    world.until_traced(&given_up, 2).await;
+    world.until_traced(&held.given_up, 2).await;
 
     // The runtime answers, and the link removes what it gave up. The host holds one registration
     // of the binding live and one being made, which the gate still holds.
-    let removed = world.traced(&removal).await;
-    world.until_traced(&removal, removed + 1).await;
+    let removed = world.traced(&held.removal).await;
+    world.until_traced(&held.removal, removed + 1).await;
     world.open_the_gate();
 
     // The binding is wanted again, and is registered, as the broker wants.
     world.name_the_policy(None).await;
-    until_found(
-        PATIENCE,
-        "the first package's binding to be registered again",
-        || async {
-            let look = world.looked().await;
-            match look.reports.iter().find(|(held, report)| {
-                *held == binding && report.state == ComponentState::Registered
-            }) {
-                Some(_) => Ok(()),
-                None => Err(reports_in_words(
-                    &look.reports,
-                    kept_binding,
-                    counting_in_words(look.counted),
-                )),
-            }
-        },
-        || world.link_traces_after_a_look(),
-    )
-    .await;
-    world.holding(2).await;
+    world.registered_once(&held).await;
+}
+
+/// A binding revoked and restored once while the plugin runtime holds its registration ends with
+/// one registration in the runtime, whether the runtime makes the registration the link gave up
+/// before the binding is restored or after.
+///
+/// With `answer_first` the host makes the binding live, and the binding is restored while it is:
+/// the registration it is then sent is refused, and the link removes the one that is live. Without
+/// it the binding is restored while the host still holds its registration at the gate: the
+/// registration it is then sent is refused, the link removes the one being made, and the host goes
+/// on with it and finds it removed.
+async fn revoked_and_restored_once(answer_first: bool) {
+    let Some(component) = well_behaved() else {
+        return;
+    };
+    let world = World::start_with_two_packages(&component).await;
+    let created = world.session().await;
+    let held = world.hold_a_registration(&created, false).await;
+    world
+        .name_the_policy(Some("disable_at_next_admission"))
+        .await;
+    world.until_traced(&held.given_up, 1).await;
+    if answer_first {
+        world.open_the_gate();
+        world.holding(2).await;
+        world.name_the_policy(None).await;
+    } else {
+        world.name_the_policy(None).await;
+        // Refused while the host holds the first, before the gate is opened.
+        let refused = held.given_up.replace("gone", "refused");
+        world.until_traced(&refused, 1).await;
+        world.open_the_gate();
+    }
+    world.registered_once(&held).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_binding_revoked_and_restored_after_the_runtime_made_its_registration_is_registered_once()
+{
+    revoked_and_restored_once(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_binding_revoked_and_restored_before_the_runtime_answers_is_registered_once() {
+    revoked_and_restored_once(false).await;
 }
 
 /// A registration the plugin runtime holds unanswered is named in the worker's own account of
