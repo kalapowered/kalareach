@@ -1392,6 +1392,123 @@ pub fn intent_words(what: &str, name: &str, mark: &str, read: &IntentRead) -> St
     }
 }
 
+/// What the manifest holds of the folder directly above the program directory, which the removal
+/// takes away only where the installation made it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderRecord {
+    /// The result `made`, with the identity of the folder that the call returned.
+    Made,
+    /// The step's record and the identity, and no result: a run that died between the two writes.
+    Intent,
+    /// No identity: nothing shows which folder the installation made, with a result or without.
+    NoIdentity,
+    /// The result `found`: the folder stood there before the installation.
+    Found,
+}
+
+impl FolderRecord {
+    /// The record of an object of the manifest: its result and whether it holds an identity.
+    #[must_use]
+    pub fn of(outcome: Option<Outcome>, has_identity: bool) -> FolderRecord {
+        match (outcome, has_identity) {
+            (Some(Outcome::Found), _) => FolderRecord::Found,
+            (_, false) => FolderRecord::NoIdentity,
+            (Some(Outcome::Made), true) => FolderRecord::Made,
+            (None, true) => FolderRecord::Intent,
+        }
+    }
+
+    /// Whether the removal reads the folder: only a record with an identity that is not `found`.
+    #[must_use]
+    pub fn is_read(self) -> bool {
+        matches!(self, FolderRecord::Made | FolderRecord::Intent)
+    }
+}
+
+/// What a read of the folder at its name showed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FolderRead {
+    /// The read answered that nothing is at the name.
+    NotThere,
+    /// An object is at the name whose identity is not the one that the manifest records.
+    Other,
+    /// The folder with the recorded identity holds this many entries.
+    Holds(usize),
+    /// The folder with the recorded identity holds nothing.
+    Empty,
+    /// A read failed, with its words.
+    Failed(String),
+}
+
+/// What the removal does with the folder after the record and the read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderAct {
+    /// Removes it: it is the one that the manifest records, and it is empty.
+    Remove,
+    /// Leaves it, with no failure.
+    Leave,
+    /// Leaves it, and the removal fails so that its records stay and it can be run again.
+    LeaveAndFail,
+}
+
+/// What the removal does with the folder above the program directory: it removes the folder where
+/// the manifest records its identity and the read found that folder at its name, empty, and leaves
+/// every other folder (one that stood before the installation, also where it is empty; one that
+/// holds an entry; one with another identity).
+#[must_use]
+pub fn folder_act(record: FolderRecord, read: Option<&FolderRead>) -> FolderAct {
+    match (record, read) {
+        (FolderRecord::Made | FolderRecord::Intent, Some(FolderRead::Empty)) => FolderAct::Remove,
+        (_, Some(FolderRead::Failed(_))) => FolderAct::LeaveAndFail,
+        _ => FolderAct::Leave,
+    }
+}
+
+/// The words of the removal for the folder above the program directory before it acts: the
+/// record, the read, and what the removal does. They say what the manifest holds and what was read,
+/// and give no step.
+#[must_use]
+// text: program_folder_words
+pub fn folder_words(folder: &str, record: FolderRecord, read: Option<&FolderRead>) -> String {
+    let held = match record {
+        FolderRecord::Made => "the manifest records that the installation made it",
+        FolderRecord::Intent => {
+            "the manifest records its identity and the step that was to make it, and no result of that step"
+        }
+        FolderRecord::NoIdentity => {
+            return format!(
+                "{folder}: the manifest records no identity of it, so nothing shows which folder the installation made and the removal left it"
+            );
+        }
+        FolderRecord::Found => {
+            return format!(
+                "{folder}: the manifest records that it stood there before the installation, so the removal left it, also where it is empty"
+            );
+        }
+    };
+    match read {
+        None => format!("{folder}: {held}, and no read of it was made"),
+        Some(FolderRead::NotThere) => format!(
+            "{folder}: {held}, and a read found none at its name, so there is nothing to remove"
+        ),
+        Some(FolderRead::Other) => format!(
+            "{folder}: {held}, and a read found an object at its name with another identity than the manifest records, so the removal left it"
+        ),
+        Some(FolderRead::Holds(1)) => {
+            format!("{folder}: {held}, and a read found 1 entry in it, so the removal left it")
+        }
+        Some(FolderRead::Holds(count)) => format!(
+            "{folder}: {held}, and a read found {count} entries in it, so the removal left it"
+        ),
+        Some(FolderRead::Empty) => format!(
+            "{folder}: {held}, and a read found it with that identity and nothing in it, so the removal removes it"
+        ),
+        Some(FolderRead::Failed(why)) => format!(
+            "{folder}: {held}, and a read of it failed ({why}), so the removal left it as it is and its records stay"
+        ),
+    }
+}
+
 /// Whether the program path of a service, as the service manager answers it, is the installation's
 /// broker: the path that the installation gives the service when it makes it, in quotation marks,
 /// compared without regard to the case of ASCII letters.

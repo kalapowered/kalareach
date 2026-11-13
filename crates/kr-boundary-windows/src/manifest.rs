@@ -96,6 +96,12 @@ pub enum ObjectKind {
     PolicyRule,
     /// The Application Identity service's start type; the detail is what the installation set.
     AppIdentity,
+    /// The folder directly above the program directory; the identifier is its path and the detail its
+    /// identity (the volume's serial number and the file's identifier, as [`crate::filekey::FileKey`]
+    /// prints them), written once the run's own call has made it. A folder with the result `made`
+    /// is the installation's to remove where it is empty; one that stood before the run is `found`
+    /// and is never removed, also where it is empty.
+    ProgramFolder,
     /// The Application Identity service was stopped and the installation started it: the identifier
     /// is its name. It is recorded after the service manager accepted the start, and never before,
     /// so its presence is a result and no intent.
