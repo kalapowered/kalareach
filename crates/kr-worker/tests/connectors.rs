@@ -204,6 +204,9 @@ fn a_table_that_names_another_package_is_refused() {
 }
 
 /// An installation that describes a native bridge it was not granted is refused.
+///
+/// KR-ACC-016, the part about native bridge grants: a bridge is read only from an installation
+/// that was granted the native bridge install capability, and the refusal names it.
 #[test]
 fn a_bridge_the_installation_was_not_granted_is_refused() {
     let store = Store::new("ungranted");

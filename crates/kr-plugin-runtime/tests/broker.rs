@@ -83,6 +83,10 @@ fn token() -> ActionToken {
 /// is display-only, is refused the upstream-action and interpreter requirements, and observation
 /// does not create an approval. Not shown here: the broker's decoding trust, and the live gate that
 /// applies these rules to a binding.
+///
+/// KR-ACC-016, the part about broker grants: a binding is held to the grants it has, so an
+/// observation grant is refused the upstream action and the interpreter, an acting grant is refused
+/// observation, and only the interpreter grant may create an approval.
 #[test]
 fn kr_req_11_24_the_three_grants_are_separate() {
     let display_only = BrokerGrants::granted([BrokerGrant::Observation]);
