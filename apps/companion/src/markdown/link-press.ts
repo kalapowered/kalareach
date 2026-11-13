@@ -18,8 +18,8 @@
  * - A press is live or dead. The pressed look shows on the lit link only while the press lives, and a
  *   dead press opens nothing. It lives from the pointer down to the pointer up, and dies at the first of:
  *   a move past the slop, a pointer cancel, the next primary pointer down (in the pane or outside it),
- *   and a scroll of any box or of the visual viewport, or a resize of the viewport, after which the rule
- *   no longer names the lit link at the press's point. At its death the look ends at once. The open at
+ *   and a scroll of any box or of the visual viewport, or a resize of the viewport, after which a release
+ *   at the press's point would no longer open the lit link (`releaseOpens`). At its death the look ends at once. The open at
  *   the click runs the same rule at the press's own point, so for a touch or a pen what lights at the
  *   press is what opens at the release. A layout that moves under a held finger with no scroll (an image
  *   that loads above the link, text that grows above it) ends nothing: the click's own check refuses the
@@ -98,13 +98,11 @@ export function startLinkPress(element: HTMLElement): () => void {
     if (press !== null && event.pointerId === press.pointer && away(event)) die()
   }
   // The scroll of any box (scroll events do not bubble, so the capture phase on the document hears them
-  // all) and the visual viewport's scroll and resize move the page under a held finger: the rule is asked
-  // again at the press's point. A press on a link's own element also holds while that element lies under
-  // the point, since the browser's click goes to it whatever the words' rectangles say.
+  // all) and the visual viewport's scroll and resize move the page under a held finger: the look is kept
+  // only where a release at the press's point would still open the lit link (`releaseOpens`).
   const recheck = (): void => {
     if (press === null || press.start === null) return
-    if (keepsPress(press, (point) => layoutNear(element, point.x, point.y))) return
-    if (press.own && lies(press.start.link, press.at)) return
+    if (releaseOpens(element, press)) return
     die()
   }
   const stop = (): void => {
@@ -199,10 +197,35 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
   return near === null ? null : { id: near.id, destination: near.destination, own: false }
 }
 
-/** Whether `point` lies in the box of `link`'s own element. */
-function lies(link: HTMLElement, point: { x: number; y: number }): boolean {
+/**
+ * Whether a release at the press's point would open the link that the press lit. This is the one
+ * predicate of every path that lights or keeps a look, and each of them asks it of the same two things:
+ *
+ * - the press's own element: the browser sends its click to the link's element, for every pointer type,
+ *   while the press's point lies in the part of that element that its view leaves (`liesInView`: the
+ *   element's rectangle held to every box that clips it, not the raw rectangle);
+ * - the nearest-words rule at the press's point, for a pointer that `opensByRule` (a touch or a pen)
+ *   only: a mouse's click on plain text opens nothing.
+ *
+ * The paths: `pressedLink` at the pointer down (the element under the press, or the rule for a touch or
+ * a pen), `recheck` at each scroll or resize while a lit press lives (this function), and `decide` at the
+ * click (the rule, with the same pointer test, and the element's own click by the browser).
+ */
+function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
+  if (press.start === null) return false
+  if (press.own && liesInView(pane, press.start.link, press.at)) return true
+  return opensByRule(press.pointerType) && keepsPress(press, (point) => layoutNear(pane, point.x, point.y))
+}
+
+/** Whether `point` lies in the part of `link`'s own element that every box clipping it leaves in view. */
+function liesInView(pane: HTMLElement, link: HTMLElement, point: { x: number; y: number }): boolean {
+  const view = viewOf(link, clipsOf(pane), screenOf())
   const box = link.getBoundingClientRect()
-  return point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom
+  const left = Math.max(box.left, view.left)
+  const right = Math.min(box.right, view.right)
+  const top = Math.max(box.top, view.top)
+  const bottom = Math.min(box.bottom, view.bottom)
+  return left < right && top < bottom && point.x >= left && point.x <= right && point.y >= top && point.y <= bottom
 }
 
 /** What a click's target is: a link, another control of the message, or neither (plain text). */
@@ -290,18 +313,29 @@ function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement
     }
     return answer
   }
-  // The pane clips every link in it, whatever its computed overflow says: what holds content and can be
-  // tapped is its client box, with no border and no scroll bar's strip.
-  const clips = new Map<Element, Clip | null>([[pane, { x: true, y: true, box: clientBoxOf(pane) }]])
-  const viewport = window.visualViewport
-  const screen: Rect =
-    viewport === null || viewport === undefined
-      ? OPEN
-      : { left: viewport.offsetLeft, top: viewport.offsetTop, right: viewport.offsetLeft + viewport.width, bottom: viewport.offsetTop + viewport.height }
+  const clips = clipsOf(pane)
+  const screen = screenOf()
   const links = Array.from(all)
     .filter((link) => nearMessage(link) && near(link.getBoundingClientRect()))
     .map((link) => ({ id: link, destination: link.title, words: wordsOf(link), view: viewOf(link, clips, screen) }))
   return { links, reach }
+}
+
+/**
+ * What is known of the boxes that clip the links of `pane` in one read, so that each is read once. The
+ * pane clips every link in it, whatever its computed overflow says: what holds content and can be
+ * tapped is its client box, with no border and no scroll bar's strip.
+ */
+function clipsOf(pane: HTMLElement): Map<Element, Clip | null> {
+  return new Map<Element, Clip | null>([[pane, { x: true, y: true, box: clientBoxOf(pane) }]])
+}
+
+/** What the visual viewport shows of the page, in the layout viewport's coordinates. */
+function screenOf(): Rect {
+  const viewport = window.visualViewport
+  return viewport === null || viewport === undefined
+    ? OPEN
+    : { left: viewport.offsetLeft, top: viewport.offsetTop, right: viewport.offsetLeft + viewport.width, bottom: viewport.offsetTop + viewport.height }
 }
 
 /**

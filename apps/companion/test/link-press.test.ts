@@ -594,6 +594,14 @@ function scrolled(by: number): void {
   }
 }
 
+/** Moves every box of the made page left by `by`, as a sideways scroll of the pane does. */
+function scrolledSideways(by: number): void {
+  for (const element of document.querySelectorAll('.m-node, .md-link, .md-link-label')) {
+    const box = boxes.get(element)
+    if (box !== undefined) boxes.set(element, { ...box, left: box.left - by, right: box.right - by })
+  }
+}
+
 const isLit = (link: HTMLElement | undefined): boolean => link?.hasAttribute('data-pressed') === true
 
 describe('a press for a pointer that can open, and the look it gives', () => {
@@ -758,6 +766,66 @@ describe('a scroll under a held press', () => {
     scrolled(200)
     fire('scroll', {} as Event)
     expect(isLit(links[3]?.[0]), 'the look after a scroll of 200 px more').toBe(false)
+  })
+
+  it('ends the look of a mouse press on a link’s own element at a sideways scroll of 15 px, though the nearest-words rule still holds the point', () => {
+    // The words at x 100 to 140, the press 2 px inside their right end. After the scroll the element ends
+    // 13 px before the point, inside the 22 px that the rule reaches beside the words, but a mouse's click
+    // on plain text opens nothing, so nothing can open from the point.
+    const { pane, text, links } = between({ left: 100, top: 100, right: 140, bottom: 117 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], { clientX: 138, clientY: 108, pointerType: 'mouse' }))
+    expect(isLit(links[0]), 'the look of the press').toBe(true)
+    scrolledSideways(15)
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after a sideways scroll of 15 px').toBe(false)
+    fire('pointerup', pointer(text, { clientX: 138, clientY: 108, pointerType: 'mouse', timeStamp: 120 }))
+    fire('click', click(text, { clientX: 138, clientY: 108 }))
+    expect(opened).toEqual([])
+  })
+
+  it('ends the look of a mouse press on a link’s own element at a vertical scroll of 20 px that leaves the point past the button, under the rule’s added reach', () => {
+    // The largest text size: the button (y 96 to 120) is taller than the words (y 100 to 117). The press is at
+    // y 108.5. After the scroll the button ends at y 100 and the area of the words still reaches y 110.5.
+    const { pane, links } = between({ left: 100, top: 100, right: 140, bottom: 117 })
+    boxes.set(links[0], { left: 100, top: 96, right: 140, bottom: 120 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], { clientX: 120, clientY: 108.5, pointerType: 'mouse' }))
+    expect(isLit(links[0]), 'the look of the press').toBe(true)
+    scrolled(20)
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after a scroll of 20 px').toBe(false)
+  })
+
+  it('ends the look of a press on a link’s own element when an outer scroll takes the point out of the part of the element that is in view', () => {
+    // The link (y 150 to 167) is cut at y 155 by its box. The press is at y 152, in view. An outer scroll
+    // of 10 px moves the link and its box together: the link's own rectangle still holds y 152, the part of
+    // it in view (to y 145) does not.
+    const { pane, text, links } = between({ left: 100, top: 150, right: 140, bottom: 167 })
+    clip(text, { left: 0, top: 100, right: 390, bottom: 155 }, 'hidden')
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], { clientX: 120, clientY: 152, pointerType: 'mouse' }))
+    expect(isLit(links[0]), 'the look of the press').toBe(true)
+    scrolled(10)
+    clip(text, { left: 0, top: 90, right: 390, bottom: 145 }, 'hidden')
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after an outer scroll that hides the point').toBe(false)
+  })
+
+  it('keeps the look of a touch press on a link’s own element while the rule still names it, and the release on plain text opens it', () => {
+    const { pane, text, links } = between({ left: 100, top: 100, right: 140, bottom: 117 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], { clientX: 138, clientY: 108 }))
+    scrolledSideways(15)
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after a sideways scroll of 15 px').toBe(true)
+    fire('pointerup', pointer(text, { clientX: 138, clientY: 108, timeStamp: 120 }))
+    fire('click', click(text, { clientX: 138, clientY: 108 }))
+    expect(opened).toEqual([links[0]])
   })
 })
 
