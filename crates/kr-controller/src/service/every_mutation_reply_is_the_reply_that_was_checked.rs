@@ -152,8 +152,21 @@ fn bound(temp: &kr_ipc::testing::TempHost) -> Listener {
     Listener::bind(&endpoint).expect("binds the endpoint")
 }
 
-/// The one reply the sink noted for `request_id`.
-fn noted(controller: &Controller, request_id: RequestId) -> ControlFrame {
+/// The one reply `told` or `declined` made for `request_id` and whether it was told, which the
+/// sink must have consumed unchanged: the two are noted apart, one where a reply is made and one
+/// where it is consumed.
+fn made(controller: &Controller, request_id: RequestId) -> (bool, ControlFrame) {
+    let mut made: Vec<(bool, ControlFrame)> = controller
+        .replies_made()
+        .into_iter()
+        .filter(|(noted_for, _, _)| *noted_for == request_id)
+        .map(|(_, told, frame)| (told, frame))
+        .collect();
+    assert_eq!(
+        made.len(),
+        1,
+        "one reply was made for request {request_id:?}: {made:?}"
+    );
     let mut written: Vec<ControlFrame> = controller
         .replies_written()
         .into_iter()
@@ -165,7 +178,67 @@ fn noted(controller: &Controller, request_id: RequestId) -> ControlFrame {
         1,
         "the sink consumed one reply for request {request_id:?}: {written:?}"
     );
-    written.remove(0)
+    let (told, frame) = made.remove(0);
+    assert_eq!(
+        frame,
+        written.remove(0),
+        "the sink consumed the reply that was made for request {request_id:?}"
+    );
+    (told, frame)
+}
+
+/// The reply the sink consumed for `request_id`, after it has been held equal to the one made.
+fn noted(controller: &Controller, request_id: RequestId) -> ControlFrame {
+    made(controller, request_id).1
+}
+
+/// Parameters that decode for `method`, so that the request passes the envelope and reaches the
+/// route of its kind, where the reply is told; none for a method this builds none for, which the
+/// envelope declines for its empty parameters.
+fn params_for_a_route(
+    temp: &kr_ipc::testing::TempHost,
+    controller: &Controller,
+    method: Method,
+) -> Option<ParamsValue> {
+    use kr_protocol::organisation::{HostPolicyConfirmParams, OrganisationExclusiveSetParams};
+    use kr_protocol::privacy::PrivacyRetainedDeleteParams;
+    use kr_protocol::sharing::{DeviceRevokeParams, GrantRevokeParams};
+
+    use super::a_recorded_answer_another_copy_wrote::{a_workflow_install, capability_request};
+
+    match method {
+        Method::PrivacySet => {
+            Some(ParamsValue::from_typed(&PrivacySetParams { enabled: false }).expect("encodes"))
+        }
+        Method::PrivacyRetainedDelete => Some(
+            ParamsValue::from_typed(&PrivacyRetainedDeleteParams {
+                reference: "no such copy".to_owned(),
+            })
+            .expect("encodes"),
+        ),
+        Method::HostPolicyConfirm => {
+            Some(ParamsValue::from_typed(&HostPolicyConfirmParams {}).expect("encodes"))
+        }
+        Method::OrganisationExclusiveSet => Some(
+            ParamsValue::from_typed(&OrganisationExclusiveSetParams { exclusive: false })
+                .expect("encodes"),
+        ),
+        Method::GrantRevoke => Some(
+            ParamsValue::from_typed(&GrantRevokeParams {
+                grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+            })
+            .expect("encodes"),
+        ),
+        Method::DeviceRevoke => Some(
+            ParamsValue::from_typed(&DeviceRevokeParams {
+                device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+            })
+            .expect("encodes"),
+        ),
+        Method::WorkflowInstall => Some(a_workflow_install(temp, controller).params),
+        Method::EnvironmentCapabilitiesCheck => Some(capability_request(temp, None, None).params),
+        _ => None,
+    }
 }
 
 fn code_of(frame: &ControlFrame) -> Option<ErrorCode> {
@@ -186,21 +259,41 @@ async fn every_mutation_reply_is_the_reply_that_was_checked() {
     let listener = bound(&temp);
     let mut caller = Caller::negotiated(&temp, &controller, &listener, StreamKind::Control).await;
     let mut asked = 0_usize;
+    let mut told = Vec::new();
+    let mut reaching = Vec::new();
     for method in Method::ALL.iter().copied() {
         if LocalWrite::of(method).is_none() {
             continue;
         }
-        let mutation = caller.mutation(&temp, method, ParamsValue::empty());
+        let params = params_for_a_route(&temp, &controller, method);
+        if params.is_some() {
+            reaching.push(method);
+        }
+        let mutation = caller.mutation(&temp, method, params.unwrap_or_else(ParamsValue::empty));
         let request_id = mutation.request_id;
         let read = caller.ask(mutation).await;
+        let (was_told, made) = made(&controller, request_id);
         assert_eq!(
-            read,
-            noted(&controller, request_id),
-            "{method:?}: the caller is read the reply the sink consumed"
+            read, made,
+            "{method:?}: the caller is read the reply that was made and the sink consumed"
         );
+        if was_told {
+            told.push(method);
+        }
         asked += 1;
     }
     assert!(asked > 50, "a mutation for each local write: {asked}");
+    // The replies of the requests that reach a route are told, and not declined by the envelope.
+    for method in &reaching {
+        assert!(
+            told.contains(method),
+            "{method:?} carries parameters that reach its route, so its reply is told"
+        );
+    }
+    assert!(
+        reaching.len() >= 8,
+        "the walk reaches the routes of several kinds: {reaching:?}"
+    );
 
     // A mutation on a stream that does not carry it is declined, and the caller reads that.
     let mutation = caller.mutation(&temp, Method::UploadChunk, ParamsValue::empty());
@@ -248,7 +341,7 @@ async fn a_mutation_before_the_hello_is_answered_with_the_constant_for_it() {
         )
     );
     assert!(
-        controller.replies_written().is_empty(),
+        controller.replies_made().is_empty() && controller.replies_written().is_empty(),
         "no reply to a mutation was made before the hello"
     );
     caller.serving.abort();

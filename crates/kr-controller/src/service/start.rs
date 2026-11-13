@@ -1215,6 +1215,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             replies_written: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
+            replies_made: std::sync::Mutex::new(Vec::new()),
+            #[cfg(feature = "testing")]
             after_a_copy_looked_for_a_claim: ReadPause::default(),
             #[cfg(feature = "testing")]
             after_the_worker_answered: ReadPause::default(),
