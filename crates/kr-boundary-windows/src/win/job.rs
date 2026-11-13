@@ -387,8 +387,9 @@ impl Job {
     ///
     /// A job that is not seen empty at the bound is reported with the reason, beside what its
     /// children reported, and its end is not proved. A refused call to end the job does not by
-    /// itself keep the end from being proved: the observation decides, and the refusal is in the
-    /// report when the observation fails.
+    /// itself keep the end from being proved: the observation decides. The refusal, and a wait or a
+    /// read of the count that failed before the reads that proved the end, are in the report either
+    /// way, so that a proved end hides no error.
     pub fn end(&mut self, retained: &[&Child], deadline: Instant) -> Ended {
         self.state = State::Ended;
         // SAFETY: the handle is open.
@@ -428,7 +429,31 @@ impl Job {
             };
             let remaining = deadline.saturating_duration_since(Instant::now());
             if (all_exited && active_zero) || remaining.is_zero() {
-                if !(all_exited && active_zero) {
+                if all_exited && active_zero {
+                    // Later reads that succeeded prove the end. The errors that came before them, and
+                    // the refused call to end the job, are still said, apart from the reasons that
+                    // make an end uncertain.
+                    let mut kept = Vec::new();
+                    if let Some(error) = terminate_error {
+                        kept.push(format!("the call to end the job failed ({error})"));
+                    }
+                    if let Some(failure) = wait_failed {
+                        kept.push(format!(
+                            "an earlier wait for a retained process failed ({failure})"
+                        ));
+                    }
+                    if let Some(earlier) = count_failed {
+                        kept.push(format!(
+                            "an earlier read of the job's count failed ({earlier})"
+                        ));
+                    }
+                    if !kept.is_empty() {
+                        self.reports.add(format!(
+                            "the job was seen empty by the reads that came last, though {}",
+                            kept.join("; ")
+                        ));
+                    }
+                } else {
                     let call = terminate_error.map_or_else(
                         || "the call to end the job succeeded".to_owned(),
                         |error| error.to_string(),
@@ -438,7 +463,10 @@ impl Job {
                         (Ok(count), Some(earlier)) => {
                             format!("{count}; an earlier read of it failed ({earlier})")
                         }
-                        (Err(error), _) => format!("not read ({error})"),
+                        (Err(error), None) => format!("not read ({error})"),
+                        (Err(error), Some(earlier)) => {
+                            format!("not read ({error}); an earlier read of it failed ({earlier})")
+                        }
                     };
                     let waited =
                         wait_failed.map_or_else(String::new, |failure| format!("; {failure}"));
