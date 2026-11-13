@@ -397,14 +397,19 @@ impl Broker {
         executable: MatchedExecutable,
         now: TimestampMs,
     ) -> Result<Vec<BrokerError>> {
-        self.state().bind_admitted(
+        let bound = self.state().bind_admitted(
             binding_id,
             application_instance_id,
             package_digest,
             frame,
             executable,
             now,
-        )
+        );
+        #[cfg(feature = "testing")]
+        if bound.is_err() {
+            crate::plugin_link_trace::bind_refused(application_instance_id);
+        }
+        bound
     }
 
     /// Derives one live binding again as [`Self::bind`] derives it, for an installation whose
@@ -587,6 +592,8 @@ impl BrokerState {
             refused.iter().map(ToString::to_string).collect(),
         );
         self.bindings.insert(binding_id, binding);
+        #[cfg(feature = "testing")]
+        crate::plugin_link_trace::bound(binding_id, application_instance_id);
         self.component_states.remove(&binding_id);
         self.component_notes.remove(&binding_id);
         self.failing_components.remove(&binding_id);
@@ -881,6 +888,8 @@ impl BrokerState {
                 continue;
             };
             let binding_id = BrokerBindingId::new(kr_ipc::new_uuid());
+            #[cfg(feature = "testing")]
+            crate::plugin_link_trace::binding_the_unbound(application_instance_id);
             // A bind refused here is tried again with the next snapshot.
             let _ = self.bind_admitted(
                 binding_id,
@@ -897,6 +906,8 @@ impl BrokerState {
     pub(super) fn forget(&mut self, bindings: Vec<BrokerBindingId>, now: TimestampMs) {
         for binding_id in bindings {
             if let Some(binding) = self.bindings.remove(&binding_id) {
+                #[cfg(feature = "testing")]
+                crate::plugin_link_trace::forgot(binding_id, binding.application_instance_id);
                 self.owed_rows.insert(binding_id);
                 self.revoked_settled(&binding.plugin_id, binding_id);
                 self.component_states.remove(&binding_id);

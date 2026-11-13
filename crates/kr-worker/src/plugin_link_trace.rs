@@ -5,7 +5,9 @@
 //! and finds it never came can say what it saw of the report but not what the link was doing. This
 //! is the link's own record of that: each pass, each call with its name, its limit and how it
 //! ended, each loss with its kind, each wait before the next try, and each report it made to a
-//! binding.
+//! binding. The broker's own part in what the link is given is in it too: each instance adopted
+//! or ended, and each binding made, refused or forgotten, with the last six digits of the
+//! identifiers and the process identifier of an adopted program.
 //!
 //! It exists only where the `testing` feature is on, and then it does nothing unless a file named
 //! by [`switch_beside`] lies next to the worker's program, which only the cases that look into the
@@ -15,8 +17,9 @@
 //! [`MARKER`]; the reason before the marker is exactly what the worker sends without it.
 //!
 //! A record is a ring of [`ENTRIES`] entries in memory and is written nowhere. An entry holds a
-//! time on the monotonic clock, fixed words, counts, the last six digits of a binding's identifier
-//! and a time limit: no error text, no path, no payload and no value of the environment.
+//! time on the monotonic clock, fixed words, counts, the last six digits of an identifier, a
+//! process identifier and a time limit: no error text, no path, no payload and no value of the
+//! environment.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -25,9 +28,10 @@ use std::time::{Duration, Instant};
 
 use kr_plugin_service::error::ServiceError;
 use kr_protocol::admission::{ComponentReport, ComponentState};
-use kr_protocol::ids::BrokerBindingId;
+use kr_protocol::identity::ProcessStartIdentity;
+use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId};
 use kr_protocol::limits::MAX_REPORT_DETAIL_BYTES;
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{Nullable, Uuid};
 
 /// What is added to a worker's program file name to name the file that turns the record on.
 const SWITCH_SUFFIX: &str = ".link-trace";
@@ -239,6 +243,34 @@ enum Event {
         step: Step,
         binding: u32,
     },
+    /// A program found running was recorded as an instance.
+    Adopted {
+        instance: u32,
+        pid: u64,
+    },
+    /// A binding was made for an instance.
+    Bound {
+        binding: u32,
+        instance: u32,
+    },
+    /// An instance nothing had bound is being bound to the package that now recognises its
+    /// program.
+    BindingTheUnbound {
+        instance: u32,
+    },
+    /// A request to bind an instance was refused.
+    BindRefused {
+        instance: u32,
+    },
+    /// A binding left the broker.
+    Forgot {
+        binding: u32,
+        instance: u32,
+    },
+    /// An instance ended, or was given back.
+    InstanceEnded {
+        instance: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,9 +296,9 @@ pub struct Began {
     at: Instant,
 }
 
-/// The last six hexadecimal digits of a binding's identifier, which is how the cases name one.
-const fn label(binding: BrokerBindingId) -> u32 {
-    let id = binding.get();
+/// The last six hexadecimal digits of an identifier, which is how the cases name a binding and
+/// an instance.
+const fn label(id: Uuid) -> u32 {
     let bytes = id.as_bytes();
     let last = bytes.len() - 1;
     u32::from_be_bytes([0, bytes[last - 2], bytes[last - 1], bytes[last]])
@@ -324,7 +356,7 @@ impl LinkTrace {
 
     /// Notes that a call began, with the limit it is given.
     pub fn began(&self, call: Call, binding: Option<BrokerBindingId>, limit: Duration) -> Began {
-        let binding = binding.map(label);
+        let binding = binding.map(|binding| label(binding.get()));
         self.push(Event::Began {
             call,
             binding,
@@ -363,7 +395,52 @@ impl LinkTrace {
     pub fn reported(&self, binding: BrokerBindingId, step: Step) {
         self.push(Event::Reported {
             step,
-            binding: label(binding),
+            binding: label(binding.get()),
+        });
+    }
+
+    /// Notes that a program found running was recorded as an instance.
+    pub fn adopted(&self, instance: ApplicationInstanceId, process: &ProcessStartIdentity) {
+        self.push(Event::Adopted {
+            instance: label(instance.get()),
+            pid: process.pid.get(),
+        });
+    }
+
+    /// Notes that a binding was made for an instance.
+    pub fn bound(&self, binding: BrokerBindingId, instance: ApplicationInstanceId) {
+        self.push(Event::Bound {
+            binding: label(binding.get()),
+            instance: label(instance.get()),
+        });
+    }
+
+    /// Notes that an instance nothing had bound is being bound.
+    pub fn binding_the_unbound(&self, instance: ApplicationInstanceId) {
+        self.push(Event::BindingTheUnbound {
+            instance: label(instance.get()),
+        });
+    }
+
+    /// Notes that a request to bind an instance was refused.
+    pub fn bind_refused(&self, instance: ApplicationInstanceId) {
+        self.push(Event::BindRefused {
+            instance: label(instance.get()),
+        });
+    }
+
+    /// Notes that a binding left the broker.
+    pub fn forgot(&self, binding: BrokerBindingId, instance: ApplicationInstanceId) {
+        self.push(Event::Forgot {
+            binding: label(binding.get()),
+            instance: label(instance.get()),
+        });
+    }
+
+    /// Notes that an instance ended, or was given back.
+    pub fn instance_ended(&self, instance: ApplicationInstanceId) {
+        self.push(Event::InstanceEnded {
+            instance: label(instance.get()),
         });
     }
 
@@ -460,6 +537,22 @@ fn phrase(entry: &Entry) -> String {
         Event::Reported { step, binding } => {
             format!("{at} reported {} {binding:06x}", step.word())
         }
+        Event::Adopted { instance, pid } => {
+            format!("{at} adopted instance {instance:06x} process {pid}")
+        }
+        Event::Bound { binding, instance } => {
+            format!("{at} bound {binding:06x} to instance {instance:06x}")
+        }
+        Event::BindingTheUnbound { instance } => {
+            format!("{at} binding the unbound instance {instance:06x}")
+        }
+        Event::BindRefused { instance } => {
+            format!("{at} bind refused for instance {instance:06x}")
+        }
+        Event::Forgot { binding, instance } => {
+            format!("{at} forgot {binding:06x} of instance {instance:06x}")
+        }
+        Event::InstanceEnded { instance } => format!("{at} ended instance {instance:06x}"),
     }
 }
 
@@ -553,8 +646,20 @@ fn asked(program: &Path) -> bool {
 /// Starts this worker's record where the file that asks for it lies beside this worker's program.
 pub fn start_if_asked() {
     if std::env::current_exe().is_ok_and(|program| asked(&program)) {
-        let _ = ON.set(LinkTrace::new());
+        start();
     }
+}
+
+/// Starts this worker's record now, for a case of the broker that wants the account of what the
+/// broker did to say what it saw.
+pub fn start() {
+    let _ = ON.set(LinkTrace::new());
+}
+
+/// The whole record, oldest entry first, where it is on.
+#[must_use]
+pub fn account() -> Option<String> {
+    ON.get().map(|trace| trace.tail(usize::MAX))
 }
 
 /// Notes the start of a pass of the link.
@@ -595,6 +700,48 @@ pub fn retry(wait: Duration) {
 pub fn reported(binding: BrokerBindingId, state: ComponentState, reason: Option<&str>) {
     if let Some(trace) = ON.get() {
         trace.reported(binding, Step::of(state, reason));
+    }
+}
+
+/// Notes that a program found running was recorded as an instance.
+pub fn adopted(instance: ApplicationInstanceId, process: &ProcessStartIdentity) {
+    if let Some(trace) = ON.get() {
+        trace.adopted(instance, process);
+    }
+}
+
+/// Notes that a binding was made for an instance.
+pub fn bound(binding: BrokerBindingId, instance: ApplicationInstanceId) {
+    if let Some(trace) = ON.get() {
+        trace.bound(binding, instance);
+    }
+}
+
+/// Notes that an instance nothing had bound is being bound.
+pub fn binding_the_unbound(instance: ApplicationInstanceId) {
+    if let Some(trace) = ON.get() {
+        trace.binding_the_unbound(instance);
+    }
+}
+
+/// Notes that a request to bind an instance was refused.
+pub fn bind_refused(instance: ApplicationInstanceId) {
+    if let Some(trace) = ON.get() {
+        trace.bind_refused(instance);
+    }
+}
+
+/// Notes that a binding left the broker.
+pub fn forgot(binding: BrokerBindingId, instance: ApplicationInstanceId) {
+    if let Some(trace) = ON.get() {
+        trace.forgot(binding, instance);
+    }
+}
+
+/// Notes that an instance ended, or was given back.
+pub fn instance_ended(instance: ApplicationInstanceId) {
+    if let Some(trace) = ON.get() {
+        trace.instance_ended(instance);
     }
 }
 
@@ -758,6 +905,39 @@ mod tests {
             tail.ends_with("retry in 500") || tail.contains("retry in 500"),
             "{tail}"
         );
+    }
+
+    #[test]
+    fn a_tail_names_what_the_broker_did_to_an_instance_and_its_bindings_by_their_last_six_digits() {
+        let trace = LinkTrace::new();
+        let binding = "00000000-0000-0000-0000-000000abcdef"
+            .parse::<BrokerBindingId>()
+            .expect("an identifier");
+        let instance = "00000000-0000-0000-0000-000000123456"
+            .parse::<ApplicationInstanceId>()
+            .expect("an identifier");
+        let process = ProcessStartIdentity::new(
+            4242,
+            kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+            7,
+        );
+        trace.adopted(instance, &process);
+        trace.binding_the_unbound(instance);
+        trace.bound(binding, instance);
+        trace.bind_refused(instance);
+        trace.forgot(binding, instance);
+        trace.instance_ended(instance);
+        let tail = trace.tail(usize::MAX);
+        for phrase in [
+            "adopted instance 123456 process 4242",
+            "binding the unbound instance 123456",
+            "bound abcdef to instance 123456",
+            "bind refused for instance 123456",
+            "forgot abcdef of instance 123456",
+            "ended instance 123456",
+        ] {
+            assert!(tail.contains(phrase), "{phrase} is not in {tail}");
+        }
     }
 
     #[test]

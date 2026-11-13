@@ -19,7 +19,7 @@ use std::time::Duration;
 use kr_plugin_sdk::matching::MatchConfidence;
 use kr_protocol::broker::IntegrationMode;
 use kr_protocol::identity::ProcessStartIdentity;
-use kr_protocol::ids::{ApplicationInstanceId, SessionId};
+use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId, SessionId};
 use kr_protocol::projection::{AgentInstanceEvent, AgentInstanceSummary};
 use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
@@ -373,6 +373,59 @@ fn kr_req_12_07_a_program_the_integration_did_not_launch_is_adopted_without_a_la
         AgentPlacement::Unbound,
         "and nothing is placed under an instance that has ended"
     );
+}
+
+/// Every binding the broker holds, with the instance each is for.
+fn bindings_held(setup: &Setup) -> Vec<(BrokerBindingId, ApplicationInstanceId)> {
+    setup
+        .broker
+        .live_bindings()
+        .into_iter()
+        .map(|live| (live.binding_id, live.application_instance_id))
+        .collect()
+}
+
+/// KR-REQ-11.13: a program is bound by its adoption and by nothing else while it is adopted. A
+/// snapshot of admissions that the worker applies between the moment the adoption records its
+/// instance and the moment it binds it binds nothing of that instance, so the broker never holds
+/// a binding for the program that the adoption then forgets, and the program ends with exactly
+/// one binding, the one its adoption made.
+#[test]
+fn kr_req_11_13_a_snapshot_applied_during_an_adoption_binds_nothing_of_the_instance_adopted() {
+    kr_worker::plugin_link_trace::start();
+    let setup = Setup::new();
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let (arrived, release) = setup.adoptions.pause_before_binding();
+
+    let (during, told, after) = std::thread::scope(|scope| {
+        let adopting = scope.spawn(|| setup.adopt(&foreground));
+        arrived
+            .recv_timeout(LIVENESS)
+            .expect("the adoption reaches the moment between recording and binding its instance");
+        // The next snapshot the control daemon hands over: a later round, so a newer frame.
+        setup.admit_only(2, &[0]);
+        let during = bindings_held(&setup);
+        release.send(()).expect("the adoption is let go");
+        let told = adopting.join().expect("the adoption ends");
+        (during, told, bindings_held(&setup))
+    });
+
+    let account = kr_worker::plugin_link_trace::account().unwrap_or_default();
+    assert!(
+        during.is_empty(),
+        "a snapshot bound an instance whose adoption had not bound it: during the adoption \
+         {during:?}, after it {after:?}; the broker's account: {account}"
+    );
+    assert_eq!(told.len(), 1, "the program is adopted: {told:?}");
+    let instance = told[0].application_instance_id;
+    assert_eq!(
+        after.iter().map(|(_, bound)| *bound).collect::<Vec<_>>(),
+        [instance],
+        "the program ends with one binding, for the instance adopted: {after:?}; the broker's \
+         account: {account}"
+    );
+    started.end();
 }
 
 /// KR-REQ-11.13, KR-REQ-12.23: a program two admitted packages both recognise equally well is

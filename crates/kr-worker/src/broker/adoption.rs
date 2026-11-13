@@ -141,12 +141,16 @@ pub struct Adoptions {
     following: Option<Mutex<crate::application::Following>>,
     /// Where the next identification stops before it reads the image, for this host's own tests.
     #[cfg(feature = "testing")]
-    reading_pause: Mutex<Option<ReadingPause>>,
+    reading_pause: Mutex<Option<Pause>>,
+    /// Where the next adoption stops between recording the instance and binding it, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    binding_pause: Mutex<Option<Pause>>,
 }
 
-/// The two ends of one armed pause before an image is read, taken on the identifying thread.
+/// The two ends of one armed pause, taken on the thread that stops at it.
 #[cfg(feature = "testing")]
-type ReadingPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+type Pause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 impl std::fmt::Debug for Adoptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -172,6 +176,8 @@ impl Adoptions {
             following: None,
             #[cfg(feature = "testing")]
             reading_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            binding_pause: Mutex::new(None),
         }
     }
 
@@ -209,13 +215,19 @@ impl Adoptions {
     pub fn pause_before_reading(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        let (arrived, watch) = std::sync::mpsc::channel();
-        let (release, go) = std::sync::mpsc::channel();
-        *self
-            .reading_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
-        (watch, release)
+        arm(&self.reading_pause)
+    }
+
+    /// Stops the next adoption between the moment its instance is recorded and the moment it is
+    /// bound, for this host's own tests: whatever else the broker does in that interval.
+    ///
+    /// Returns the end that says the adoption has arrived there and the end that lets it go on. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_binding(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        arm(&self.binding_pause)
     }
 
     /// Looks at the foreground once, adopts each program it finds there, and returns what was
@@ -435,17 +447,7 @@ impl Adoptions {
             return None;
         }
         #[cfg(feature = "testing")]
-        {
-            let armed = self
-                .reading_pause
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some((arrived, go)) = armed {
-                let _ = arrived.send(());
-                let _ = go.recv_timeout(READING_PAUSE_LIMIT);
-            }
-        }
+        stop_if_armed(&self.reading_pause);
         // Bounded by the file's size, and stopped when the session closes.
         let hashed = crate::broker::image::read_identity(
             &running_image(pid, &executable),
@@ -510,6 +512,8 @@ impl Adoptions {
             }
             // Adopted and bound in one step: a bind refused leaves nothing adopted. A program that
             // several packages recognise equally well is adopted bound to none of them.
+            #[cfg(feature = "testing")]
+            stop_if_armed(&self.binding_pause);
             if let Recognition::Package(admitted) = &recognition {
                 let bound = self.broker.bind(
                     kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
@@ -541,9 +545,36 @@ impl Adoptions {
     }
 }
 
-/// How long a paused reading waits to be let go before it goes on by itself.
+/// How long a paused step waits to be let go before it goes on by itself.
 #[cfg(feature = "testing")]
-const READING_PAUSE_LIMIT: Duration = Duration::from_secs(5);
+const PAUSE_LIMIT: Duration = Duration::from_secs(5);
+
+/// Arms `slot`: the next step that stops at it tells the first end it has arrived and waits for the
+/// second.
+#[cfg(feature = "testing")]
+fn arm(
+    slot: &Mutex<Option<Pause>>,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (arrived, watch) = std::sync::mpsc::channel();
+    let (release, go) = std::sync::mpsc::channel();
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+    (watch, release)
+}
+
+/// Stops at `slot` where it is armed, once.
+#[cfg(feature = "testing")]
+fn stop_if_armed(slot: &Mutex<Option<Pause>>) {
+    let armed = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some((arrived, go)) = armed {
+        let _ = arrived.send(());
+        let _ = go.recv_timeout(PAUSE_LIMIT);
+    }
+}
 
 /// Watches one session's foreground until the session closes or goes.
 ///

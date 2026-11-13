@@ -1345,6 +1345,8 @@ impl Broker {
             None,
             semantic,
         );
+        #[cfg(feature = "testing")]
+        crate::plugin_link_trace::adopted(application_instance_id, &process);
         if let Some(instance) = state.instances.get_mut(&application_instance_id) {
             instance.observed = Some(process);
         }
@@ -1669,6 +1671,8 @@ impl Broker {
         let Some(ended) = state.instances.remove(&application_instance_id) else {
             return false;
         };
+        #[cfg(feature = "testing")]
+        crate::plugin_link_trace::instance_ended(application_instance_id);
         let server = ServerOf::of(&ended);
         if let Some(agent) = ended.process {
             release_agent_job(&state.instances, &agent.process);
@@ -1704,6 +1708,8 @@ impl Broker {
         }
         state.launches.remove(&application_instance_id);
         let removed = state.instances.remove(&application_instance_id);
+        #[cfg(feature = "testing")]
+        crate::plugin_link_trace::instance_ended(application_instance_id);
         let server = removed.as_ref().map_or(ServerOf::None, ServerOf::of);
         if let Some(agent) = removed.and_then(|instance| instance.process) {
             release_agent_job(&state.instances, &agent.process);
