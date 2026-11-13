@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 
-use crate::public_contract::{SdkContract, SdkVersion, compare_sdk_for_a_level};
+use crate::public_contract::{DIALECT, SdkContract, SdkVersion, compare_sdk_for_a_level};
 
 /// A contract file as a release commits it: its SDK version and, when the release has the table,
 /// the members that arrived.
@@ -21,7 +21,7 @@ fn contract(version: &str, arrivals: Option<&[(&str, &str, &str)]>) -> SdkContra
 }
 
 fn sdk_schema() -> Value {
-    json!({ "$defs": {
+    json!({ "$schema": DIALECT, "$defs": {
         "Route": {
             "type": "object",
             "properties": { "method": { "type": "string" } },
@@ -789,8 +789,8 @@ fn level_lines(old: &Value, new: &Value) -> Vec<String> {
 /// `old` to `new`, each given whole.
 fn method_definition_lines(old: &Value, new: &Value) -> Vec<String> {
     level_lines(
-        &json!({ "$defs": { "Method": old } }),
-        &json!({ "$defs": { "Method": new } }),
+        &json!({ "$schema": DIALECT, "$defs": { "Method": old } }),
+        &json!({ "$schema": DIALECT, "$defs": { "Method": new } }),
     )
 }
 
@@ -960,13 +960,13 @@ fn a_definition_that_a_reference_moves_to_does_not_give_the_line_of_a_new_method
         ("false", json!(false)),
         ("null", json!(null)),
     ] {
-        let old = json!({ "$defs": {
+        let old = json!({ "$schema": DIALECT, "$defs": {
             "Method": { "oneOf": [method("a")] },
             "Request": { "type": "object", "properties": {
                 "method": { "$ref": "#/$defs/Method" },
             } },
         } });
-        let new = json!({ "$defs": {
+        let new = json!({ "$schema": DIALECT, "$defs": {
             "Method": { "oneOf": [method("a"), method(name)] },
             "Code": { "oneOf": [method("a"), { "const": constant }] },
             "Request": { "type": "object", "properties": {
@@ -985,11 +985,11 @@ fn a_definition_that_a_reference_moves_to_does_not_give_the_line_of_a_new_method
     }
     // A branch of the new definition that is a text constant, and a name that `Method` does not
     // add, is a difference: `Request.method` now accepts "b".
-    let old = json!({ "$defs": {
+    let old = json!({ "$schema": DIALECT, "$defs": {
         "Method": { "oneOf": [method("a")] },
         "Request": { "type": "object", "properties": { "method": { "$ref": "#/$defs/Method" } } },
     } });
-    let new = json!({ "$defs": {
+    let new = json!({ "$schema": DIALECT, "$defs": {
         "Method": { "oneOf": [method("a"), method("c")] },
         "Code": { "oneOf": [method("a"), method("b")] },
         "Request": { "type": "object", "properties": { "method": { "$ref": "#/$defs/Code" } } },
@@ -999,11 +999,11 @@ fn a_definition_that_a_reference_moves_to_does_not_give_the_line_of_a_new_method
     // "x" of the new definition has the label of the method "x.b", which `Method` adds.
     let mut with_member = method("x");
     with_member["properties"] = json!({ "b": { "type": "string" } });
-    let old = json!({ "$defs": {
+    let old = json!({ "$schema": DIALECT, "$defs": {
         "Method": { "oneOf": [method("x")] },
         "Request": { "type": "object", "properties": { "method": { "$ref": "#/$defs/Method" } } },
     } });
-    let new = json!({ "$defs": {
+    let new = json!({ "$schema": DIALECT, "$defs": {
         "Method": { "oneOf": [method("x"), method("x.b")] },
         "Code": { "oneOf": [with_member] },
         "Request": { "type": "object", "properties": { "method": { "$ref": "#/$defs/Code" } } },
@@ -1399,7 +1399,7 @@ fn a_new_method_does_not_pass_where_the_root_uses_method_without_widening() {
         assert_eq!(lines, vec![added("b")], "{says}");
     }
     let properties = json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$schema": DIALECT,
         "properties": { "m": reference, "n": { "$ref": "#/$defs/Holder" } },
     });
     let lines = level_lines(
@@ -1407,6 +1407,84 @@ fn a_new_method_does_not_pass_where_the_root_uses_method_without_widening() {
         &with_root(&properties, &["a", "b"]),
     );
     assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// A root that names no dialect is read in the dialect that the reader defaults to, and an older
+/// dialect has no `const`: `Method` of one name accepts every text and `Method` of two names none,
+/// so the old schema accepts `{"m": "a"}` as a `Holder` and the new one refuses it. Without the
+/// dialect in either schema, or in both, the new method is a difference.
+#[test]
+fn a_new_method_does_not_pass_where_a_root_names_no_dialect() {
+    let holder = json!({ "Holder": { "type": "object",
+        "properties": { "m": { "$ref": "#/$defs/Method" } } } });
+    let with_dialect = |names: &[&str]| with_methods(&holder, names);
+    let without_dialect = |names: &[&str]| {
+        let mut schema = with_methods(&holder, names);
+        schema.as_object_mut().expect("an object").remove("$schema");
+        schema
+    };
+    assert_eq!(
+        level_lines(&with_dialect(&["a"]), &with_dialect(&["a", "b"])),
+        Vec::<String>::new(),
+        "the control names the dialect"
+    );
+    for (old, new, says) in [
+        (
+            without_dialect(&["a"]),
+            without_dialect(&["a", "b"]),
+            "neither",
+        ),
+        (
+            without_dialect(&["a"]),
+            with_dialect(&["a", "b"]),
+            "the old only",
+        ),
+        (
+            with_dialect(&["a"]),
+            without_dialect(&["a", "b"]),
+            "the new only",
+        ),
+    ] {
+        let lines = level_lines(&old, &new);
+        assert!(
+            lines.contains(&added("b")),
+            "no dialect in {says}: {lines:?}"
+        );
+    }
+}
+
+/// A listed member of the SDK's schema arrives only where both schemas name the dialect that the
+/// comparison reads them in: its definition's uses are read by that dialect's keywords.
+#[test]
+fn a_listed_member_does_not_arrive_where_a_schema_names_no_dialect() {
+    let protocol = protocol_schema();
+    let without = |schema: &Value| {
+        let mut schema = schema.clone();
+        schema.as_object_mut().expect("an object").remove("$schema");
+        schema
+    };
+    let (old, new) = (sdk_schema(), with_hidden(&sdk_schema()));
+    for (old, new, says) in [
+        (without(&old), without(&new), "neither"),
+        (without(&old), new.clone(), "the old only"),
+        (old.clone(), without(&new), "the new only"),
+    ] {
+        let outcome = compare(
+            &old,
+            &new,
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", Some(LISTED)),
+        );
+        assert!(
+            outcome
+                .lines
+                .contains(&"Route.hidden added: a member".to_owned()),
+            "no dialect in {says}: {:?}",
+            outcome.lines
+        );
+        assert!(outcome.passed.is_empty(), "{says}");
+    }
 }
 
 /// A change of a keyword of the root beside a new method is a difference of its own: the old
@@ -1494,7 +1572,7 @@ fn with_methods(extra: &Value, names: &[&str]) -> Value {
     let mut definitions = extra.clone();
     definitions["Method"] =
         json!({ "oneOf": names.iter().map(|name| method(name)).collect::<Vec<_>>() });
-    json!({ "$defs": definitions })
+    json!({ "$schema": DIALECT, "$defs": definitions })
 }
 
 /// A name that has not the shape of a method's name (lower-case letters, digits and underscores in
@@ -1685,7 +1763,7 @@ fn equal_branches_beside_one_that_differs_compare_by_number() {
 /// table cannot list it into the SDK's, whichever release the protocol schema is of.
 #[test]
 fn a_member_of_a_definition_the_protocol_schema_shares_fails() {
-    let old = json!({ "$defs": {
+    let old = json!({ "$schema": DIALECT, "$defs": {
         "Frame": {
             "type": "object",
             "additionalProperties": false,

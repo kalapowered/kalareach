@@ -212,9 +212,14 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
 /// counted: under some of them (a `oneOf`, a `not`, an `if`, a `contains` with `maxContains`) a
 /// wider definition can make the place refuse a value that it accepted, and the walk does not tell
 /// those from the rest. The walk reads every definition and the keywords of the schema beside
-/// `$defs` (the root may name the dialect of [`DIALECT`] and no other), and it refuses any form
-/// that it cannot read (see [`widens_at`]).
+/// `$defs` (the root must name the dialect of [`DIALECT`], and nothing below it may name another),
+/// and it refuses any form that it cannot read (see [`widens_at`]).
 fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
+    // A root that names no dialect is read in whatever dialect the reader defaults to, and an older
+    // one has no `const` and ignores what stands beside a `$ref`: the walk reads neither.
+    if schema.get("$schema").is_none() {
+        return false;
+    }
     let Some(definitions) = schema["$defs"].as_object() else {
         return true;
     };
@@ -248,8 +253,9 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
             })
 }
 
-/// The dialect that the walk is written for, and the only one that a schema may name (at its root).
-const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+/// The dialect that the walk is written for: the one that the root of a schema must name, and the
+/// only one that a schema may name.
+pub(crate) const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// Whether every member of `named`, a map from names to schemas, is a schema that stands where it
 /// may (see [`widens_at`]). A member must be an object, a boolean or a list (under `dependencies`,

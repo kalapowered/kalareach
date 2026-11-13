@@ -10,7 +10,7 @@ use kr_protocol::hello::PackageVersion;
 use kr_protocol::update::CompatibilityLevel;
 
 use crate::in_level::{Head, Outcome, WorkerSurface, check};
-use crate::public_contract::SdkContract;
+use crate::public_contract::{DIALECT, SdkContract};
 use crate::releases::{agree_with_origin, inventory, kept};
 
 /// What one commit of the fixture repository holds: the files the checks read.
@@ -45,7 +45,7 @@ fn sdk_schema(description: &str, extra_member: bool) -> Value {
     if extra_member {
         manifest["properties"]["added"] = json!({ "type": "string" });
     }
-    json!({ "$defs": {
+    json!({ "$schema": DIALECT, "$defs": {
         "Manifest": manifest,
         "ConnectorManifest": {
             "type": "object",
@@ -79,7 +79,7 @@ fn schema(lease: bool, peer_member: &str, outside_member: &str) -> Value {
     if lease {
         mutation["properties"]["lease"] = json!({ "type": "string" });
     }
-    json!({ "$defs": {
+    json!({ "$schema": DIALECT, "$defs": {
         "ControlFrame": {
             "type": "object",
             "properties": { "mutation": { "$ref": "#/$defs/ForwardedMutation" } },
