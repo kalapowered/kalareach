@@ -19,9 +19,13 @@ use windows_sys::Win32::Security::Authentication::Identity::{
     LsaEnumerateAccountRights, LsaFreeMemory, LsaNtStatusToWinError, LsaOpenPolicy,
     LsaRemoveAccountRights, POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
 };
+use windows_sys::Win32::Security::Authentication::Identity::{
+    LsaQueryInformationPolicy, POLICY_ACCOUNT_DOMAIN_INFO, POLICY_VIEW_LOCAL_INFORMATION,
+    PolicyAccountDomainInformation,
+};
 use windows_sys::Win32::UI::Shell::DeleteProfileW;
 
-use super::ffi::{Result, Sid, error, last, wide};
+use super::ffi::{Named, Result, Sid, error, last, wide};
 use super::registry;
 
 /// The rights that refuse an account sign-in at the screen and by Remote Desktop, and the two
@@ -55,14 +59,95 @@ fn random_password() -> String {
 /// Returns the platform's error when the lookup failed for any other reason: nothing is then
 /// known about the account.
 pub fn find(name: &str) -> Result<Option<Sid>> {
-    // The name is qualified with this computer's name, so that the platform looks it up among this
-    // computer's own accounts and asks no domain. A plain name that no local account has is passed
-    // on to a domain's controller, and an error of that lookup would be taken for the account's.
-    let qualified = format!("{}\\{name}", super::token::computer_name()?);
+    // The name is qualified with the name of the domain of this computer's own accounts, as the
+    // system gives it, so that the platform looks it up among those accounts and asks no other
+    // domain. A plain name that no local account has is passed on to a domain's controller, and an
+    // error of that lookup would be taken for the account's.
+    let qualified = format!("{}\\{name}", account_domain()?);
     match Sid::of_account(&qualified) {
         Ok(sid) => Ok(Some(sid)),
         Err(failure) if failure.code == ERROR_NONE_MAPPED => Ok(None),
         Err(failure) => Err(failure),
+    }
+}
+
+/// The account that has an identifier, found by that identifier: `Some` with its own name where
+/// an account of that identifier is there, however it has been renamed since, and `None` where the
+/// system answers that no account has it. The identifier is the one a manifest records.
+///
+/// # Errors
+///
+/// Returns the platform's error when the text is not an identifier or the lookup failed for any
+/// other reason, and an error where the identifier belongs to something that is not a user
+/// account: nothing is then known about the account.
+pub fn find_by_id(recorded: &str) -> Result<Option<(Sid, String)>> {
+    let sid = Sid::parse(recorded)?;
+    match sid.lookup_account()? {
+        None => Ok(None),
+        Some(Named {
+            name, user: true, ..
+        }) => Ok(Some((sid, name))),
+        Some(Named { .. }) => {
+            // text: account_find_by_id-1
+            Err(error(
+                0,
+                format!("the identifier {recorded} does not belong to a user account"),
+            ))
+        }
+    }
+}
+
+/// The name that the system gives the domain of this computer's own accounts, the domain part of
+/// an account's qualified name. It is the computer's name on a workstation or a member server and
+/// the domain's own name on a domain controller, so it is read from the system's policy and never
+/// taken to be the computer's name.
+///
+/// # Errors
+///
+/// Returns the platform's error when the policy cannot be opened or read, and an error for an empty
+/// name: no name is then given.
+pub fn account_domain() -> Result<String> {
+    let handle = policy_with(POLICY_VIEW_LOCAL_INFORMATION as u32)?;
+    let mut buffer: *mut std::ffi::c_void = null_mut();
+    // SAFETY: the handle is open and the buffer is an out-parameter that this function frees.
+    let status = unsafe {
+        LsaQueryInformationPolicy(handle, PolicyAccountDomainInformation, &raw mut buffer)
+    };
+    // SAFETY: converts a status the platform returned.
+    let code = unsafe { LsaNtStatusToWinError(status) };
+    let domain = if code == 0 {
+        // SAFETY: the platform returned the structure that the class names; the name's buffer is
+        // inside the allocation and is read before it is freed.
+        let text = unsafe {
+            let information = &*buffer.cast::<POLICY_ACCOUNT_DOMAIN_INFO>();
+            let name = &information.DomainName;
+            let text = if name.Buffer.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(name.Buffer, usize::from(name.Length) / 2)
+            };
+            String::from_utf16_lossy(text)
+        };
+        // SAFETY: the buffer is the platform's allocation and is freed once.
+        unsafe { LsaFreeMemory(buffer) };
+        Some(text)
+    } else {
+        None
+    };
+    // SAFETY: the handle is open and is closed once.
+    unsafe { LsaClose(handle) };
+    match domain {
+        Some(text) if !text.is_empty() => Ok(text),
+        // text: account_domain-1
+        Some(_) => Err(error(
+            0,
+            "the name of the domain of this computer's accounts is empty",
+        )),
+        // text: account_domain-2
+        None => Err(error(
+            code,
+            "reading the name of the domain of this computer's accounts",
+        )),
     }
 }
 
@@ -126,6 +211,10 @@ fn unicode(text: &mut Vec<u16>) -> LSA_UNICODE_STRING {
 }
 
 fn policy() -> Result<isize> {
+    policy_with((POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES) as u32)
+}
+
+fn policy_with(access: u32) -> Result<isize> {
     let attributes = LSA_OBJECT_ATTRIBUTES {
         Length: size_of::<LSA_OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: null_mut(),
@@ -136,14 +225,7 @@ fn policy() -> Result<isize> {
     };
     let mut handle: isize = 0;
     // SAFETY: the attributes are this function's own and the handle is an out-parameter.
-    let status = unsafe {
-        LsaOpenPolicy(
-            null(),
-            &raw const attributes,
-            (POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES) as u32,
-            &raw mut handle,
-        )
-    };
+    let status = unsafe { LsaOpenPolicy(null(), &raw const attributes, access, &raw mut handle) };
     if status != 0 {
         // SAFETY: converts a status the platform returned.
         // text: account_policy-1
