@@ -172,6 +172,7 @@ async fn until(what: &str, mut holds: impl FnMut() -> bool) {
 struct Worker {
     runtime: Arc<SessionRuntime>,
     service: Arc<WorkerService>,
+    _serving: kr_ipc::testing::Serving,
     session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
     project: PathBuf,
@@ -259,7 +260,7 @@ impl Worker {
             )
             .expect("a worker service"),
         );
-        tokio::spawn(Arc::clone(&service).serve(listener));
+        let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
         let mut registry =
             Registry::open(environment.registry_database(), environment_id).expect("the registry");
         registry
@@ -299,6 +300,7 @@ impl Worker {
         Self {
             runtime,
             service,
+            _serving: serving,
             session_id,
             endpoint,
             project,

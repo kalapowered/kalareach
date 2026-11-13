@@ -318,6 +318,15 @@ impl Serving {
     }
 }
 
+impl Serving {
+    /// Cancels the task of `handle` when this is dropped, as a fixture that keeps the handle too
+    /// needs.
+    #[must_use]
+    pub fn guarding<T>(handle: &tokio::task::JoinHandle<T>) -> Self {
+        Self(handle.abort_handle())
+    }
+}
+
 impl Drop for Serving {
     fn drop(&mut self) {
         self.0.abort();

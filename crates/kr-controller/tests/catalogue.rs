@@ -1089,7 +1089,8 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         .expect("the daemon starts");
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
-    tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(listener));
+    let _serving =
+        kr_ipc::testing::Serving::spawn(std::sync::Arc::clone(&controller).serve_clients(listener));
 
     let mut client = kr_ipc::client::LocalClient::connect(&endpoint, LocalClientKind::Cli, build)
         .await
@@ -1277,7 +1278,8 @@ async fn a_daemon_seeds_its_catalogue_only_when_it_is_asked_to() {
         .expect("the daemon starts");
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
-    tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(listener));
+    let _serving =
+        kr_ipc::testing::Serving::spawn(std::sync::Arc::clone(&controller).serve_clients(listener));
     let mut client = kr_ipc::client::LocalClient::connect(&endpoint, LocalClientKind::Cli, build)
         .await
         .expect("connects");
