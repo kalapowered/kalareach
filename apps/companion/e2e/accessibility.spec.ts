@@ -1712,11 +1712,16 @@ test.describe('a link in a box inside a message that clips it', () => {
           expect((await tapAndRead(page, edge + inward, words.y)).opened, `links opened by a tap ${String(inward)} px inside the box`).toEqual([BOXED_HREF])
         }
         // Outside the box, left of its edge: the words that the box hides take no part, and the target of the part in
-        // view is held to the box, so no tap there is the link's, though the full words' target would hold it.
+        // view is held to the box, so the page adds no click there, though the full words' target would hold the point.
+        // Where the browser's own click names the link (WebKit's adjustment reaches the part in view from there) it
+        // decides, and the look and the open are the browser's.
         for (const outward of [3, 6, 12, 20]) {
           const outside = await tapAndRead(page, edge - outward, words.y)
-          expect(outside.lit, `the pressed look ${String(outward)} px outside the box’s edge`).toEqual([null])
-          expect(outside.opened, `links opened by a tap ${String(outward)} px outside the box’s edge`).toEqual([])
+          expect(handlers(outside.clicks), `clicks that the page added ${String(outward)} px outside the box’s edge`).toEqual([])
+          if (browsers(outside.clicks).every((click) => click.named.startsWith('text'))) {
+            expect(outside.lit, `the pressed look ${String(outward)} px outside the box’s edge`).toEqual([null])
+            expect(outside.opened, `links opened by a tap ${String(outward)} px outside the box’s edge`).toEqual([])
+          }
         }
         const inside = Math.max(reach, (await boxOf(page, BOXED_HREF)).right - edge)
         const made = await tapAndRead(page, edge + inside + 14, words.y)
