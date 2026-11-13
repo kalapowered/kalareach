@@ -1305,25 +1305,104 @@ pub fn rollback_ending(marked: &[String], records_deleted: bool) -> String {
     )
 }
 
-/// The words for an object that an undoing step did not act on, because no result shows that the
-/// run, or an installation, made it: what the manifest or the run's own record holds of the step
-/// that was to make it, and that the step left it as it is. A rollback leaves an object that its
-/// run did not make, one that its run found and one with no result; the removal leaves one with no
+/// The words for an object that a rollback did not act on, because its own run holds no result that
+/// it made it: what the run's record holds of the step, and that the rollback left the object as it
+/// is. A rollback leaves an object that its run did not make, one that its run found and one with no
 /// result. They say what the record holds and nothing of the object itself.
 #[must_use]
 // text: left_alone
-pub fn left_alone(what: &str, name: &str, outcome: Option<Outcome>, rollback: bool) -> String {
-    match (rollback, outcome) {
-        (true, None) => format!(
+pub fn left_alone(what: &str, name: &str, outcome: Option<Outcome>) -> String {
+    match outcome {
+        None => format!(
             "{what} {name}: this run recorded the step that was to make it and holds no result that the step made it, so the rollback left it as it is"
         ),
-        (true, Some(_)) => format!(
+        Some(_) => format!(
             "{what} {name}: this run found it where it looked and did not make it, so the rollback left it as it is"
         ),
-        (false, _) => format!(
-            "{what} {name}: the manifest records the step that was to make it and no result of that step, so nothing shows that the installation made it, and the removal left it as it is"
+    }
+}
+
+/// The words for a step that a rollback did not take, because its own run holds no result that it
+/// changed the thing: the rollback left it as it is. They name the record and nothing of the thing.
+#[must_use]
+// text: rollback_not_changed
+pub fn rollback_not_changed(what: &str) -> String {
+    format!(
+        "{what}: this run's record holds no result that this run changed it, so the rollback left it as it is"
+    )
+}
+
+/// What a read showed of an object that the manifest records as an intent and no result, which a
+/// run that died leaves: the removal decides by this read and not by the absence of the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntentRead {
+    /// The read answered that nothing of that name is there.
+    NotThere,
+    /// Something is there and carries the installation's own mark.
+    Marked,
+    /// Something is there and does not carry it.
+    Unmarked,
+    /// A read failed, with the platform's words.
+    Failed(String),
+}
+
+/// What the removal does with an object whose record is an intent with no result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntentAct {
+    /// Removes it as it removes an object that the installation made.
+    Remove,
+    /// Leaves it, with no failure: nothing is there, or what is there is not the installation's.
+    Leave,
+    /// Leaves it, and the removal fails so that its records stay and it can be run again.
+    LeaveAndFail,
+}
+
+impl IntentRead {
+    /// What the removal does after this read.
+    #[must_use]
+    pub fn act(&self) -> IntentAct {
+        match self {
+            IntentRead::Marked => IntentAct::Remove,
+            IntentRead::NotThere | IntentRead::Unmarked => IntentAct::Leave,
+            IntentRead::Failed(_) => IntentAct::LeaveAndFail,
+        }
+    }
+}
+
+/// The words of the removal for an object whose record is an intent with no result: the record, the
+/// read, and what the removal does. `mark` says what the installation's mark is for this kind of
+/// object. They say what was read and no more, and give no step.
+#[must_use]
+// text: intent_words
+pub fn intent_words(what: &str, name: &str, mark: &str, read: &IntentRead) -> String {
+    let record = "the manifest records the step that was to make it and no result of that step";
+    match read {
+        IntentRead::NotThere => format!(
+            "{what} {name}: {record}, and a read found none of that name there, so there is nothing to remove"
+        ),
+        IntentRead::Marked => format!(
+            "{what} {name}: {record}, and a read found it with the installation's mark ({mark}), so the removal removes it as it removes one that the installation made"
+        ),
+        IntentRead::Unmarked => format!(
+            "{what} {name}: {record}, and a read found it without the installation's mark ({mark}), so the removal left it as it is"
+        ),
+        IntentRead::Failed(why) => format!(
+            "{what} {name}: {record}, and a read of it failed ({why}), so the removal left it as it is and its records stay"
         ),
     }
+}
+
+/// Whether the program path of a service, as the service manager answers it, is the installation's
+/// broker: the path that the installation gives the service when it makes it, in quotation marks,
+/// compared without regard to the case of ASCII letters.
+#[must_use]
+pub fn service_program_is(program: &str, broker: &str) -> bool {
+    let trimmed = program.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    unquoted.eq_ignore_ascii_case(broker)
 }
 
 /// The entry of the rollback's list for one object that this run made, or none where the cleanup
