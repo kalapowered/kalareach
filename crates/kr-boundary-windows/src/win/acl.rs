@@ -65,7 +65,7 @@ pub fn set_protected(path: &Path, descriptor: &OwnedSd) -> Result<()> {
         )
     };
     if got == 0 || present == 0 {
-        return Err(error(1, "the descriptor has no permission list"));
+        return Err(error(0, "the descriptor has no permission list"));
     }
     let path_text = wide_path(path);
     // SAFETY: the path is NUL-terminated and the list belongs to the descriptor, which outlives the
@@ -134,7 +134,7 @@ pub fn set_protected_when_empty(path: &Path, descriptor: &OwnedSd) -> Result<Res
         )
     };
     if got == 0 || present == 0 {
-        return Err(error(1, "the descriptor has no permission list"));
+        return Err(error(0, "the descriptor has no permission list"));
     }
     let held = match DirHandle::open_anchor_with(path, LIST | WRITE_DAC)? {
         Ok(held) => held,

@@ -9,7 +9,7 @@ use kr_boundary_windows::records::next_step;
 use kr_boundary_windows::remedy::{
     CONFIG_NOT_EMPTY_WHY, Finding, appid_start_type_left, application_control_set,
     code_integrity_refusal, empty_config_advice, foreign_rules_refusal, git_permissions_refusal,
-    git_program_not_reached, payload_file_not_reached, smart_app_control_refusal,
+    git_program_not_reached, payload_file_not_reached, platform_error, smart_app_control_refusal,
 };
 
 /// A read that failed for any reason but "not found" says that the read failed, with its error, and
@@ -317,4 +317,17 @@ fn a_code_integrity_entry_with_a_missing_or_invalid_field_is_refused_as_not_unde
         None
     );
     assert_eq!(said(json!([])), None);
+}
+
+/// A platform error is said with the number that a call returned; a failure that no call returned
+/// (code 0) is said without a number, and is never called a Windows error.
+#[test]
+fn a_failure_that_no_call_returned_has_no_windows_error_number() {
+    assert_eq!(
+        platform_error("opening the service", 5),
+        "opening the service: Windows error 5"
+    );
+    let none = platform_error("the descriptor has no permission list", 0);
+    assert_eq!(none, "the descriptor has no permission list");
+    assert!(!none.contains("Windows error"), "{none}");
 }

@@ -16,19 +16,26 @@ use windows_sys::Win32::Security::{
 };
 
 /// A failed call: the platform's error number and what was being done.
-#[derive(Debug, thiserror::Error)]
-#[error("{what}: Windows error {code}")]
+#[derive(Debug)]
 pub struct Error {
-    /// The platform's error number.
+    /// The platform's error number, or 0 for a failure that no call returned.
     pub code: u32,
     /// What the failed call was doing.
     pub what: String,
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(&crate::remedy::platform_error(&self.what, self.code))
+    }
+}
+
+impl std::error::Error for Error {}
+
 /// The result of a call into the platform.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// An error with an explicit number.
+/// An error with an explicit number; the number 0 is for a failure that no call returned.
 #[must_use]
 pub fn error(code: u32, what: impl Into<String>) -> Error {
     Error {
