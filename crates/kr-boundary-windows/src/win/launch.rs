@@ -74,34 +74,74 @@ pub const REFUSED_BY_POLICY: u32 = 1260;
 pub enum LaunchError {
     /// The platform refused to create the process, with this error number. The application-control
     /// policy's refusal is [`REFUSED_BY_POLICY`]. Nothing was started.
+    // text: launch-1
     #[error("the program could not be started: Windows error {0}")]
     NotStarted(u32),
     /// The job could not be applied at creation. Nothing was started.
+    // text: launch-2
     #[error("the job could not be applied at creation, and nothing was started: {0}")]
     Job(ffi::Error),
-    /// A standard handle was not usable. Nothing was started.
-    #[error("a standard handle is not usable: {0}")]
-    Handle(&'static str),
+    /// The program's path is not absolute. Nothing was started.
+    // text: launch-3
+    #[error("the program's path is not absolute, and nothing was started")]
+    PathNotAbsolute,
+    /// A pipe end that was to be a standard handle is not inheritable. Nothing was started.
+    // text: launch-4
+    #[error("a pipe end is not inheritable, and nothing was started")]
+    PipeEndNotInheritable,
+    /// The child had not been suspended exactly once when it was to be resumed. It was ended.
+    // text: launch-5
+    #[error("the child was not suspended exactly once, and it was ended")]
+    NotSuspendedOnce,
     /// The deadline had passed before the program was started. Nothing was started.
+    // text: launch-6
     #[error("the deadline passed before the program was started")]
     DeadlinePassed,
     /// The service was stopping before the program was started. Nothing was started.
+    // text: launch-7
     #[error("the service was stopping before the program was started")]
     Stopped,
     /// The process was made but is not in the job. It was ended.
+    // text: launch-8
     #[error("the new process was not in its job and was ended")]
     NotInJob,
     /// The permit to resume was made for another child, or for another invocation. The child was
     /// ended.
+    // text: launch-9
     #[error("the permit to resume is for another child, and the child was ended")]
     PermitForAnotherChild,
     /// A child or a job could not be shown to have ended. Nothing may be released or removed on
     /// the strength of this end.
+    // text: launch-10
     #[error("the end is not proved: {0}")]
     EndUncertain(String),
     /// Another call failed.
+    // text: launch-11
     #[error(transparent)]
     Platform(#[from] ffi::Error),
+}
+
+impl LaunchError {
+    /// How a message that names the program says what became of it: "could not be started" where
+    /// the error says that nothing was started, and "failed" for any other error, which is of a
+    /// program that may have been made or of a call that does not say.
+    #[must_use]
+    // text: outcome_words
+    pub fn outcome_words(&self) -> &'static str {
+        match self {
+            LaunchError::NotStarted(_)
+            | LaunchError::Job(_)
+            | LaunchError::PathNotAbsolute
+            | LaunchError::PipeEndNotInheritable
+            | LaunchError::DeadlinePassed
+            | LaunchError::Stopped => "could not be started",
+            LaunchError::NotSuspendedOnce
+            | LaunchError::NotInJob
+            | LaunchError::PermitForAnotherChild
+            | LaunchError::EndUncertain(_)
+            | LaunchError::Platform(_) => "failed",
+        }
+    }
 }
 
 /// The token a child runs under.
@@ -129,7 +169,7 @@ impl VerifiedPath {
         if path.is_absolute() {
             Ok(VerifiedPath(path))
         } else {
-            Err(LaunchError::Handle("the program's path is not absolute"))
+            Err(LaunchError::PathNotAbsolute)
         }
     }
 
@@ -160,7 +200,7 @@ impl OwnedPipeEnd {
         if is_inheritable(&handle)? {
             Ok(OwnedPipeEnd(handle))
         } else {
-            Err(LaunchError::Handle("the pipe end is not inheritable"))
+            Err(LaunchError::PipeEndNotInheritable)
         }
     }
 }
@@ -525,7 +565,7 @@ impl SuspendedChild {
             return Err(if previous == u32::MAX {
                 LaunchError::Platform(last("resuming the child"))
             } else {
-                LaunchError::Handle("the child was not suspended exactly once")
+                LaunchError::NotSuspendedOnce
             });
         }
         let this = ManuallyDrop::new(self);
@@ -699,7 +739,7 @@ pub fn pipe() -> Result<(Handle, OwnedPipeEnd), ffi::Error> {
     Ok((read, OwnedPipeEnd(write)))
 }
 
-/// A copy of the broker's own primary token, which can start a process.
+/// A copy of this process's own primary token, which can start a process.
 fn own_token() -> Result<Handle, ffi::Error> {
     let mut process_token: HANDLE = null_mut();
     // SAFETY: the current process pseudo-handle is always valid; the out-parameter is local.
@@ -711,9 +751,11 @@ fn own_token() -> Result<Handle, ffi::Error> {
         )
     };
     if opened == 0 {
-        return Err(last("opening the broker's own token"));
+        // text: launch-12
+        return Err(last("opening this process's token"));
     }
-    let process_token = Handle::new(process_token, "the broker's own token")?;
+    // text: launch-13
+    let process_token = Handle::new(process_token, "this process's token")?;
     let mut copy: HANDLE = null_mut();
     // SAFETY: the token is open and the out-parameter is local.
     let duplicated = unsafe {
@@ -727,9 +769,11 @@ fn own_token() -> Result<Handle, ffi::Error> {
         )
     };
     if duplicated == 0 {
-        return Err(last("copying the broker's own token"));
+        // text: launch-14
+        return Err(last("copying this process's token"));
     }
-    Handle::new(copy, "the copy of the broker's own token")
+    // text: launch-15
+    Handle::new(copy, "the copy of this process's token")
 }
 
 /// The attribute list of a launch, freed when dropped.

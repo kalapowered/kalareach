@@ -610,11 +610,13 @@ pub fn main() -> ExitCode {
         // SAFETY: reads the calling thread's last error.
         let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         if code == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT {
+            // text: broker-1
             eprintln!(
                 "kr-boundary-broker runs as a Windows service and is started by the service manager"
             );
         } else {
-            eprintln!("kr-boundary-broker could not connect to the service manager: error {code}");
+            // text: broker-2
+            eprintln!("kr-boundary-broker could not start the service dispatcher: error {code}");
         }
         return ExitCode::from(2);
     }

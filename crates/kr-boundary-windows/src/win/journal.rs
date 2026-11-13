@@ -56,8 +56,10 @@ const EXTENSION: &str = "journal";
 /// Why a row was not written, or a file could not be taken up.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
-    /// The file could not be made, opened, written or flushed.
-    #[error("the journal's file: {0}")]
+    /// The journal's directory could not be listed, or a file in it could not be made, opened,
+    /// read, written or flushed.
+    // text: journal-1
+    #[error("the journal's directory or a file in it: {0}")]
     Io(#[from] std::io::Error),
     /// The row could not be framed.
     #[error("the row could not be framed: {0}")]

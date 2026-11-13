@@ -76,15 +76,19 @@ pub const ROOT_BOUNDS: Bounds = Bounds {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum VolumeRefusal {
     /// The file system is not NTFS.
+    // text: walk-1
     #[error("the volume uses {0}, and only NTFS volumes are supported")]
     NotNtfs(String),
     /// The volume is reached over the network.
+    // text: walk-2
     #[error("{}", crate::remedy::REMOTE_VOLUME)]
     Remote,
     /// The volume is on removable media.
+    // text: walk-3
     #[error("the volume is on removable media, and only fixed volumes are supported")]
     Removable,
     /// The device is not an ordinary disk.
+    // text: walk-4
     #[error("the volume is not on an ordinary disk (device type {0})")]
     NotADisk(u32),
 }
@@ -165,6 +169,16 @@ fn volume_serial_of(handle: &Handle) -> Result<u64> {
     Ok(info.VolumeSerialNumber)
 }
 
+/// What an open that was refused says: the platform's error number, or, for the number 0, that the
+/// name is too long for the platform and no call was made.
+fn refused_words(code: u32) -> String {
+    if code == 0 {
+        "the name is too long for the platform".to_owned()
+    } else {
+        format!("Windows error {code}")
+    }
+}
+
 /// Why a child could not be shown to be where the listing said it was.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Lost {
@@ -172,13 +186,17 @@ pub enum Lost {
     #[error("the object is gone")]
     Gone,
     /// The identifier now names another object, or one on another volume.
+    // text: walk-5
     #[error("the identifier names another object")]
     IdentityChanged,
     /// The object is no longer directly beneath its directory.
+    // text: walk-6
     #[error("the object is no longer directly beneath its directory")]
     MovedOut,
-    /// The platform refused the open, with this error number.
-    #[error("the object could not be opened (Windows error {0})")]
+    /// The platform refused the open, with this error number; the number 0 is the check of the
+    /// name's length, which no call answered.
+    // text: walk-7
+    #[error("the object could not be opened ({})", refused_words(*.0))]
     Refused(u32),
 }
 
@@ -601,9 +619,11 @@ pub enum AnchorRefusal {
     #[error("the directory is a reparse point")]
     ReparsePoint,
     /// The object is not a directory.
+    // text: walk-8
     #[error("the object is not a directory")]
     NotADirectory,
     /// The volume is not accepted.
+    // text: walk-9
     #[error("{0}")]
     Volume(VolumeRefusal),
 }
@@ -730,10 +750,8 @@ impl DirHandle {
     ) -> Result<Handle> {
         let bytes = name.len() * 2;
         if bytes > usize::from(u16::MAX) {
-            return Err(error(
-                ERROR_FILE_NOT_FOUND,
-                "a name too long for the platform",
-            ));
+            // text: walk-10
+            return Err(error(0, "a name too long for the platform"));
         }
         let mut units = name.to_vec();
         let text = UNICODE_STRING {

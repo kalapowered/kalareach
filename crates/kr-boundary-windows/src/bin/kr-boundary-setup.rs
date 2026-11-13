@@ -9,6 +9,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(windows))]
 fn main() -> std::process::ExitCode {
+    // text: setup-8
     eprintln!("kr-boundary-setup installs the Windows execution boundary and runs on Windows only");
     std::process::ExitCode::from(2)
 }

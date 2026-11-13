@@ -36,6 +36,7 @@ const RECORD_BEFORE_WRITE: &str = "newest-record-before-write=";
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A program could not be started.
+    // text: applocker-1
     #[error("{what} could not be started: {source}")]
     Start {
         /// What was being started.
@@ -43,7 +44,17 @@ pub enum Error {
         /// The reason.
         source: std::io::Error,
     },
+    /// The file that carries the policy to PowerShell could not be made or written.
+    // text: applocker-2
+    #[error("{what} failed: {source}")]
+    File {
+        /// What was being done.
+        what: &'static str,
+        /// The reason.
+        source: std::io::Error,
+    },
     /// A program ended with a failure.
+    // text: applocker-3
     #[error("{what} failed with {status}: {output}")]
     Failed {
         /// What was run.
@@ -54,6 +65,7 @@ pub enum Error {
         output: String,
     },
     /// A program did not end by its deadline.
+    // text: applocker-4
     #[error("{what} did not end by its deadline")]
     TimedOut {
         /// What was run.
@@ -62,10 +74,13 @@ pub enum Error {
         by_the_deadline: bool,
     },
     /// The deadline the query was given had passed before it was made.
+    // text: applocker-5
     #[error("the deadline passed before the event log was asked")]
     DeadlinePassed,
-    /// A program of the proof could not be started through the launcher.
-    #[error("{what} could not be started: {source}")]
+    /// A program of the proof was not started through the launcher, or its run through the
+    /// launcher failed: the words say which, from what the launcher's error says.
+    // text: applocker-6
+    #[error("{what} {}: {source}", .source.outcome_words())]
     Launch {
         /// What was being started.
         what: &'static str,
@@ -76,6 +91,7 @@ pub enum Error {
         by_the_deadline: bool,
     },
     /// The answer could not be read.
+    // text: applocker-7
     #[error("{0}")]
     Unreadable(String),
 }
@@ -303,7 +319,7 @@ impl Channel {
             ".xml",
             super::sd::SdKind::AdminFile,
         )
-        .map_err(|source| Error::Start {
+        .map_err(|source| Error::File {
             what: "making the policy file",
             source,
         })?;
@@ -313,7 +329,7 @@ impl Channel {
         drop(made);
         if let Err(source) = written {
             let _ = std::fs::remove_file(&file);
-            return Err(Error::Start {
+            return Err(Error::File {
                 what: "writing the policy file",
                 source,
             });

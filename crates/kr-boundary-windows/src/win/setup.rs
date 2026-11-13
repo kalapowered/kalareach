@@ -17,8 +17,10 @@ pub fn main() -> ExitCode {
         Ok(command) => command,
         Err(rejected) => {
             if let Some(message) = rejected.message {
+                // text: setup-1
                 eprintln!("kr-boundary-setup: {message}");
             }
+            // text: setup-2
             eprintln!("{}", setup_args::USAGE);
             return ExitCode::from(setup_args::USAGE_EXIT);
         }
@@ -26,6 +28,7 @@ pub fn main() -> ExitCode {
     let paths = match Paths::system() {
         Ok(paths) => paths,
         Err(install::Error::KnownFolder(failure)) => {
+            // text: setup-3
             eprintln!(
                 "kr-boundary-setup: {}",
                 crate::remedy::known_folder_unreadable(
@@ -67,14 +70,19 @@ pub fn main() -> ExitCode {
         Command::Remove => install::confirm(None, "remove the boundary")
             .and_then(|()| install::remove(&paths, false)),
         Command::Status => install::entry(&paths).map(|entry| match entry {
-            Entry::Fresh => println!("not installed"),
+            // text: setup-5
+            Entry::Fresh => println!(
+                "no manifest is recorded, and no service, account or program directory of the installation's names was found"
+            ),
+            // text: setup-6
             Entry::Installed(manifest) => println!(
-                "installed: {} recorded objects, {} enrolled",
+                "the manifest records a finished installation: {} recorded objects, {} enrolled",
                 manifest.objects.len(),
                 manifest.persons.len()
             ),
+            // text: setup-7
             Entry::Partial(manifest) => println!(
-                "partial: an installation began and did not finish ({} recorded objects)",
+                "partial: the manifest records an installation that has not finished ({} recorded objects)",
                 manifest.objects.len()
             ),
         }),
@@ -82,6 +90,7 @@ pub fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            // text: setup-4
             eprintln!("kr-boundary-setup: {error}");
             ExitCode::from(1)
         }

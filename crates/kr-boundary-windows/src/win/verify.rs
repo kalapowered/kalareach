@@ -23,7 +23,7 @@ use windows_sys::Win32::Security::WinTrust::{
     WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData, WinVerifyTrust,
 };
 
-use super::ffi::{Result, error, wide_path};
+use super::ffi::{Result, error, system_form, wide_path};
 
 /// The signer every shipped program carries. A build for a test machine sets another name in the
 /// environment variable `KR_BOUNDARY_PUBLISHER`, and no release build does.
@@ -66,11 +66,15 @@ pub fn signer(file: &File, shown_path: &Path) -> Result<String> {
         let result = if status == 0 {
             subject_of(data.hWVTStateData)
         } else {
+            // The status is the verification's own answer, said in the system's form: a status
+            // that means the check could not be made is not said to be an unsigned file.
+            // text: verify-1
             Err(error(
-                status as u32,
+                0,
                 format!(
-                    "{} does not carry a signature that holds",
-                    shown_path.display()
+                    "{}: Windows did not verify its signature ({})",
+                    shown_path.display(),
+                    system_form(status as u32)
                 ),
             ))
         };

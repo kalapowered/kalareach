@@ -783,7 +783,7 @@ fn payloads_that_are_unsigned_wrongly_signed_or_links_are_refused() {
     let case = Case::new();
     let before = snapshot();
     for (directory, why) in [
-        ("payload-unsigned", "does not carry a signature that holds"),
+        ("payload-unsigned", "Windows did not verify its signature"),
         ("payload-other", "is signed by CN=Other Test Publisher"),
     ] {
         let (code, output) = case.payload(directory, &[]);

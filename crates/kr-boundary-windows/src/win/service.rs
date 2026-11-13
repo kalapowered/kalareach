@@ -31,7 +31,7 @@ use super::ffi::{Result, error, from_wide, last, wide};
 pub struct Manager(SC_HANDLE);
 
 /// One service, open with every right.
-pub struct Service(SC_HANDLE);
+pub struct Service(SC_HANDLE, String);
 
 impl Drop for Manager {
     fn drop(&mut self) {
@@ -124,7 +124,7 @@ impl Manager {
                 Err(failure)
             }
         } else {
-            Ok(Some(Service(handle)))
+            Ok(Some(Service(handle, name.to_owned())))
         }
     }
 
@@ -158,7 +158,7 @@ impl Manager {
         if handle.is_null() {
             Err(last(format!("making the service {name}")))
         } else {
-            Ok(Service(handle))
+            Ok(Service(handle, name.to_owned()))
         }
     }
 }
@@ -408,10 +408,12 @@ impl Service {
                 return Ok(());
             }
             if Instant::now() >= end {
+                // text: service-1
                 return Err(error(
                     0,
                     format!(
-                        "the service is in state {}, not {}",
+                        "the service {} is in state {}, not {}",
+                        self.1,
                         status.state,
                         if stopped { "stopped" } else { "running" }
                     ),
