@@ -946,9 +946,27 @@ pub fn data_ending(origin: &Origin, case_sensitive: bool) -> &'static str {
 }
 
 /// Why a private root is refused when no journal names it: what the journals say, and nothing of
-/// what the broker is doing.
-// text: UNNAMED_ROOT_WHY
-pub const UNNAMED_ROOT_WHY: &str = "no journal that could be read names it as unfinished work";
+/// what the broker is doing. `damaged` holds the invocations whose journal is damaged, each with
+/// its identifier and what is wrong with it: those journals were read only up to the damage.
+#[must_use]
+// text: unnamed_root_why
+pub fn unnamed_root_why(damaged: &[(&str, &str)]) -> String {
+    if damaged.is_empty() {
+        return "no journal that could be read names it as unfinished work".to_owned();
+    }
+    let each: Vec<String> = damaged
+        .iter()
+        .map(|(id, damage)| {
+            format!(
+                "the journal of the invocation {id} is damaged ({damage}), and its rows after the damage were not read"
+            )
+        })
+        .collect();
+    format!(
+        "no journal names it as unfinished work in the rows that were read; {}",
+        each.join("; ")
+    )
+}
 
 /// What a refusal in the program directory says is kept: the program directory or the entry in it
 /// is not removed, and the manifest is said to record the installation and stay only where one was

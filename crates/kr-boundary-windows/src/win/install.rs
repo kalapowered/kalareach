@@ -396,7 +396,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
         return Err(anchor_refusal(paths, &refusal, false));
     }
     for name in [CHECKOUT, CONNECT] {
-        if account::find(name).is_some() {
+        if account::find(name)?.is_some() {
             // text: entry-1
             return Err(Error::Refused(format!(
                 "an account named {name} exists, and no manifest of the installation records it"
@@ -1498,13 +1498,13 @@ fn inspect_layout(
     // also when the broker began its invocation between the two reads. Read the other way round, a
     // root made between the two reads would be listed and not named, and a root in use would be
     // refused.
-    let named_roots = if layout == Layout::Run && !children.is_empty() {
+    let named = if layout == Layout::Run && !children.is_empty() {
         let named = roots_named_by_the_journal(paths)?;
         #[cfg(feature = "testing")]
         testing::after_a_read("journal");
         named
     } else {
-        BTreeSet::new()
+        NamedRoots::default()
     };
     for child in children {
         let shown = OsString::from_wide(&child.name);
@@ -1524,18 +1524,23 @@ fn inspect_layout(
                 &origin,
             ));
         };
-        if layout == Layout::Run && !named_roots.contains(&text) {
+        if layout == Layout::Run && !named.roots.contains(&text) {
             // Its own handle decides: only a root that the system's class owns is named to remove.
             let origin = match held.open_child(&child, LIST | READ_CONTROL)? {
                 Ok(opened) => origin_of_opened(&opened, EntryKind::UnnamedRoot),
                 Err(Lost::Gone) => continue,
                 Err(lost) => origin_of_lost(&lost),
             };
+            let damaged: Vec<(&str, &str)> = named
+                .damaged
+                .iter()
+                .map(|(id, damage)| (id.as_str(), damage.as_str()))
+                .collect();
             return Err(unnamed_root_refusal(
                 paths,
                 dir,
                 &shown,
-                remedy::UNNAMED_ROOT_WHY,
+                &remedy::unnamed_root_why(&damaged),
                 &origin,
             ));
         }
@@ -2123,13 +2128,26 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
     Ok(())
 }
 
-/// The names of the private roots that a journal names as unfinished work, read as the removal
-/// reads the journal.
-fn roots_named_by_the_journal(paths: &Paths) -> Result<BTreeSet<String>, Error> {
+/// What the journal's read names: the private roots that it names as unfinished work, and the
+/// invocations whose journal is damaged, each with its identifier and what is wrong with it. A
+/// damaged journal gives only the rows before the damage.
+#[derive(Default)]
+struct NamedRoots {
+    roots: BTreeSet<String>,
+    damaged: Vec<(String, String)>,
+}
+
+/// The journal, read as the removal reads it.
+fn roots_named_by_the_journal(paths: &Paths) -> Result<NamedRoots, Error> {
     use crate::journal::rows::Row;
-    let mut named = BTreeSet::new();
-    if !paths.journal.exists() {
-        return Ok(named);
+    let mut named = NamedRoots::default();
+    match records::look(&paths.journal) {
+        records::Look::NotThere => return Ok(named),
+        records::Look::Unread(error) => {
+            // text: roots_named_by_the_journal-2
+            return Err(Error::Failed(format!("reading the journal: {error}")));
+        }
+        records::Look::There => {}
     }
     let unfinished = super::journal::replay(&paths.journal, "")
         // text: roots_named_by_the_journal-1
@@ -2137,8 +2155,11 @@ fn roots_named_by_the_journal(paths: &Paths) -> Result<BTreeSet<String>, Error> 
     for invocation in unfinished {
         for row in &invocation.rows {
             if let Row::RootIntent { name } | Row::RootMade { name, .. } = row {
-                named.insert(name.as_str().to_owned());
+                named.roots.insert(name.as_str().to_owned());
             }
+        }
+        if let Some(damage) = invocation.damage {
+            named.damaged.push((invocation.id, damage));
         }
     }
     Ok(named)
@@ -3078,7 +3099,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // The accounts.
     let mut sids = Vec::new();
     for name in [CHECKOUT, CONNECT] {
-        let sid = match account::find(name) {
+        let sid = match account::find(name)? {
             Some(sid) if existing => sid,
             _ => {
                 run.record(ObjectKind::Account, name, None)?;
@@ -3770,7 +3791,9 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         let name = object.id.clone();
         keep(
             (|| -> Result<(), Error> {
-                let found = account::find(&name);
+                // A lookup that failed ends this step before anything of the account is changed:
+                // only a lookup that answered "no such account" goes on without a right to take away.
+                let found = account::find(&name)?;
                 if let Some(sid) = &found {
                     account::revoke_all_rights(sid)?;
                     account::delete_profile(sid)?;
@@ -3986,8 +4009,12 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
     };
     left.extend(effective.differences(&expected));
     for name in [CHECKOUT, CONNECT] {
-        if account::find(name).is_some() {
-            left.push(format!("the account {name} is still there"));
+        match account::find(name) {
+            Ok(Some(_)) => left.push(format!("the account {name} is still there")),
+            Ok(None) => {}
+            Err(error) => left.push(format!(
+                "a lookup of the account {name} failed ({error}), so whether it is gone is not known"
+            )),
         }
         if account::hidden_from_sign_in(name)? {
             left.push(format!("the sign-in list still has a value for {name}"));

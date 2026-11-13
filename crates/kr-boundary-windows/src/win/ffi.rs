@@ -309,7 +309,8 @@ impl Sid {
     ///
     /// # Errors
     ///
-    /// Returns the platform's error when there is no such account.
+    /// Returns the platform's error when the lookup fails: the error is "no mapping" where no
+    /// account has the name.
     pub fn of_account(name: &str) -> Result<Sid> {
         let wide_name = wide(name);
         let mut sid_length = 0_u32;

@@ -83,8 +83,8 @@ fn snapshot() -> Snapshot {
         appid_start: appid.configuration().unwrap().0,
         appid_running: appid.status().unwrap().running(),
         accounts: [
-            account::find(CHECKOUT).is_some(),
-            account::find(CONNECT).is_some(),
+            account::find(CHECKOUT).unwrap().is_some(),
+            account::find(CONNECT).unwrap().is_some(),
         ],
         // A service that is deleted but still listed because a handle to it is open is gone.
         service: manager
