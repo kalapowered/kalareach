@@ -818,6 +818,9 @@ fn check(code: std::os::raw::c_int, name: &'static str) -> Result<()> {
 mod known_answers;
 
 #[cfg(test)]
+mod wycheproof;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

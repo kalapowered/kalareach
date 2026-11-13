@@ -1,0 +1,544 @@
+{
+  "acceptable_cases": [
+    {
+      "comment": "identity public key universal forgery",
+      "flags": [
+        "SmallOrderPublicKey"
+      ],
+      "tc_id": 152,
+      "verdict": "reject"
+    },
+    {
+      "comment": "canonical Ed25519 torsion point 1 of 7 (order 8)",
+      "flags": [
+        "SmallOrderPublicKey"
+      ],
+      "tc_id": 153,
+      "verdict": "reject"
+    },
+    {
+      "comment": "canonical Ed25519 torsion point 2 of 7 (order 4)",
+      "flags": [
+        "SmallOrderPublicKey"
+      ],
+      "tc_id": 154,
+      "verdict": "reject"
+    },
+    {
+      "comment": "canonical Ed25519 torsion point 3 of 7 (order 8)",
+      "flags": [
+        "SmallOrderPublicKey"
+      ],
+      "tc_id": 155,
+      "verdict": "reject"
+    },
+    {
+      "comment": "canonical Ed25519 torsion point 4 of 7 (order 2)",
+      "flags": [
+        "SmallOrderPublicKey"
+      ],
+      "tc_id": 156,
+      "verdict": "reject"
+    },
+    {
+      "comment": "canonical Ed25519 torsion point 5 of 7 (order 8)",
+      "flags": [
+        "SmallOrderPublicKey"
+      ],
+      "tc_id": 157,
+      "verdict": "reject"
+    },
+    {
+      "comment": "canonical Ed25519 torsion point 6 of 7 (order 4)",
+      "flags": [
+        "SmallOrderPublicKey"
+      ],
+      "tc_id": 158,
+      "verdict": "reject"
+    },
+    {
+      "comment": "canonical Ed25519 torsion point 7 of 7 (order 8)",
+      "flags": [
+        "SmallOrderPublicKey"
+      ],
+      "tc_id": 159,
+      "verdict": "reject"
+    },
+    {
+      "comment": "prime-order point 1 plus nonidentity torsion point 1",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 160,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 1 plus nonidentity torsion point 2",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 161,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 1 plus nonidentity torsion point 3",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 162,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 1 plus nonidentity torsion point 4",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 163,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 1 plus nonidentity torsion point 5",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 164,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 1 plus nonidentity torsion point 6",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 165,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 1 plus nonidentity torsion point 7",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 166,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 2 plus nonidentity torsion point 1",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 167,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 2 plus nonidentity torsion point 2",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 168,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 2 plus nonidentity torsion point 3",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 169,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 2 plus nonidentity torsion point 4",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 170,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 2 plus nonidentity torsion point 5",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 171,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 2 plus nonidentity torsion point 6",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 172,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 2 plus nonidentity torsion point 7",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 173,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 3 plus nonidentity torsion point 1",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 174,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 3 plus nonidentity torsion point 2",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 175,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 3 plus nonidentity torsion point 3",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 176,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 3 plus nonidentity torsion point 4",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 177,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 3 plus nonidentity torsion point 5",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 178,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 3 plus nonidentity torsion point 6",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 179,
+      "verdict": "accept"
+    },
+    {
+      "comment": "prime-order point 3 plus nonidentity torsion point 7",
+      "flags": [
+        "MixedOrderPublicKey"
+      ],
+      "tc_id": 180,
+      "verdict": "accept"
+    }
+  ],
+  "accepted_tc_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    71,
+    72,
+    73,
+    74,
+    75,
+    76,
+    77,
+    78,
+    79,
+    80,
+    81,
+    82,
+    83,
+    84,
+    86,
+    87,
+    88,
+    89,
+    90,
+    91,
+    92,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    99,
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
+    124,
+    125,
+    126,
+    127,
+    128,
+    129,
+    130,
+    131,
+    132,
+    133,
+    134,
+    135,
+    136,
+    137,
+    138,
+    139,
+    140,
+    141,
+    142,
+    143,
+    144,
+    145,
+    146,
+    147,
+    148,
+    149,
+    150,
+    160,
+    161,
+    162,
+    163,
+    164,
+    165,
+    166,
+    167,
+    168,
+    169,
+    170,
+    171,
+    172,
+    173,
+    174,
+    175,
+    176,
+    177,
+    178,
+    179,
+    180,
+    181,
+    182,
+    183,
+    184,
+    185,
+    186,
+    187,
+    188,
+    189,
+    190,
+    191,
+    192,
+    193,
+    194,
+    195,
+    196,
+    197,
+    198,
+    199,
+    200,
+    201,
+    202,
+    203,
+    204,
+    205,
+    206,
+    207,
+    208,
+    209
+  ],
+  "description": "The verdict of libsodium's 1.0.22 release build on each case of Wycheproof's ed25519_test.json that the interface can express (a 64-byte signature), recorded once. The set calls a case valid, invalid or acceptable. Every valid case is accepted and every invalid case that fits is refused, so no verdict contradicts the set's valid and invalid. The set leaves the 29 acceptable cases to the verifier: libsodium's verdict on each is listed in acceptable_cases.",
+  "name": "ed25519-verdicts",
+  "not_expressible": [
+    {
+      "flags": [
+        "TruncatedSignature"
+      ],
+      "reason": "the signature is 0 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 30
+    },
+    {
+      "flags": [
+        "TruncatedSignature"
+      ],
+      "reason": "the signature is 32 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 31
+    },
+    {
+      "flags": [
+        "TruncatedSignature"
+      ],
+      "reason": "the signature is 62 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 32
+    },
+    {
+      "flags": [
+        "SignatureWithGarbage"
+      ],
+      "reason": "the signature is 66 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 33
+    },
+    {
+      "flags": [
+        "SignatureWithGarbage"
+      ],
+      "reason": "the signature is 96 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 34
+    },
+    {
+      "flags": [
+        "SignatureWithGarbage"
+      ],
+      "reason": "the signature is 65 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 35
+    },
+    {
+      "flags": [
+        "SignatureWithGarbage"
+      ],
+      "reason": "the signature is 65 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 36
+    },
+    {
+      "flags": [
+        "SignatureWithGarbage"
+      ],
+      "reason": "the signature is 65 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 37
+    },
+    {
+      "flags": [
+        "CompressedSignature"
+      ],
+      "reason": "the signature is 63 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 38
+    },
+    {
+      "flags": [
+        "CompressedSignature"
+      ],
+      "reason": "the signature is 63 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 39
+    },
+    {
+      "flags": [
+        "CompressedSignature"
+      ],
+      "reason": "the signature is 63 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 40
+    },
+    {
+      "flags": [
+        "CompressedSignature"
+      ],
+      "reason": "the signature is 63 bytes and the interface takes 64",
+      "set_result": "invalid",
+      "tc_id": 41
+    }
+  ],
+  "rejected_tc_ids": [
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70,
+    85,
+    151,
+    152,
+    153,
+    154,
+    155,
+    156,
+    157,
+    158,
+    159,
+    210
+  ],
+  "upstream": {
+    "commit": "65ca494727a52944c204441c860b039e6786b99b",
+    "file": "testvectors_v1/ed25519_test.json",
+    "repository": "https://github.com/C2SP/wycheproof",
+    "sha256": "ea80ffebac085e21cb9d3e903e7fa2b448d96702da5b31f061d0b83b430b74b3"
+  }
+}
