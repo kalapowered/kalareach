@@ -38,7 +38,7 @@ use crate::messages;
 use crate::notice::NOTICE;
 use crate::policy::{self, Policy};
 use crate::records::{self, Records, is_hex32, is_manifest_replacement};
-use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Purpose, Shape};
+use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Purpose, Shape, Taken};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -745,34 +745,38 @@ impl Made {
 
     /// Marks what this run made for removal: the data directory first, through its own handle, and
     /// every handle of it is closed before the folder above it is marked, where this run made that
-    /// too, and only once the directory is gone. The caller has closed its own handles of both. Returns
-    /// whether the directory that this run made is gone (or was not made by it), and each object that
-    /// stays, with the platform's answer: a refused reopen or mark, or a folder that stays because the
-    /// directory in it stays.
-    fn take_away(self, paths: &Paths) -> (bool, Vec<String>) {
+    /// too, and only once the directory is gone. The caller has closed its own handles of both.
+    /// Returns what came of the directory and of the folder: each is [`Taken::NotMade`] where this
+    /// run did not make it, [`Taken::Marked`] where the platform marked it, and [`Taken::Stays`]
+    /// with the platform's refusal of the reopen or the mark (a folder that is not tried because
+    /// the directory in it stays says so).
+    fn take_away(self) -> (Taken, Taken) {
         let Made { parent, directory } = self;
-        let mut stayed = Vec::new();
-        let mut directory_gone = true;
-        if let Some(identity) = directory {
-            if let Err(words) = mark_for_removal(&identity) {
-                directory_gone = false;
-                stayed.push(format!("{} ({words})", paths.data.display()));
+        let directory = match directory {
+            None => Taken::NotMade,
+            Some(identity) => {
+                let taken = match mark_for_removal(&identity) {
+                    Ok(()) => Taken::Marked,
+                    Err(words) => Taken::Stays(words),
+                };
+                // The identity is the last handle of the directory that this run holds: it is
+                // closed before the folder is marked, which finds it empty only when the directory
+                // has gone.
+                drop(identity);
+                taken
             }
-            // The identity is the last handle of the directory that this run holds: it is closed
-            // before the folder is marked, which finds it empty only when the directory has gone.
-            drop(identity);
-        }
-        if let Some(identity) = parent {
-            if !directory_gone {
-                stayed.push(format!(
-                    "{} (the data directory in it stays)",
-                    paths.data_parent().display()
-                ));
-            } else if let Err(words) = mark_for_removal(&identity) {
-                stayed.push(format!("{} ({words})", paths.data_parent().display()));
+        };
+        let folder = match parent {
+            None => Taken::NotMade,
+            Some(_) if matches!(directory, Taken::Stays(_)) => {
+                Taken::Stays("the data directory in it stays".to_owned())
             }
-        }
-        (directory_gone, stayed)
+            Some(identity) => match mark_for_removal(&identity) {
+                Ok(()) => Taken::Marked,
+                Err(words) => Taken::Stays(words),
+            },
+        };
+        (directory, folder)
     }
 
     /// The error of a step that failed after this run made something of the data directory's place,
@@ -783,8 +787,13 @@ impl Made {
         if self.is_empty() {
             return error;
         }
-        let (directory_gone, stayed) = self.take_away(paths);
-        let ending = remedy::data_made_ending(directory_gone, &stayed);
+        let (directory, folder) = self.take_away();
+        let ending = remedy::data_made_ending(
+            &directory,
+            &paths.data.display().to_string(),
+            &folder,
+            &paths.data_parent().display().to_string(),
+        );
         let words = error.to_string();
         if matches!(error, Error::Refused(_)) {
             // text: made_after-1
@@ -2908,7 +2917,10 @@ fn open_data_directory(
                 None => open_directory_relative(&held, name, FILE_OPEN, None, LIST | WRITE_DAC)?
                     .ok_or_else(|| {
                         // text: make_data_directory-3
-                        Error::Failed("the data directory was made and is gone again".to_owned())
+                        Error::Failed(format!(
+                            "something was at {} when this run tried to make it, and the open after that answered not found",
+                            paths.data.display()
+                        ))
                     })?,
             },
         };
@@ -4574,7 +4586,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 if let Some(why) = &unread {
                     // text: remove_at-22-unread
                     say(&format!(
-                        "the earlier state could not be read ({why}), so nothing was written back from it and nothing was compared with it"
+                        "the earlier state's policy could not be read ({why}), so no mode was written back from it and the policy was not compared with it"
                     ));
                 }
                 if let Some(shared) = shared {

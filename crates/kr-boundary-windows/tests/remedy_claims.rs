@@ -6,7 +6,7 @@ use std::path::Path;
 
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CASE_SENSITIVE_WHY, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Standing,
+    CASE_SENSITIVE_WHY, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Standing, Taken,
     choose, data_ending, data_made_ending, ending, parent_advice, program_keeping,
     program_open_advice, unnamed_root_why,
 };
@@ -274,26 +274,32 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
 /// leaves nothing to move, to correct or to run against.
 #[test]
 fn the_ending_of_a_directory_this_run_made_says_what_was_removed_and_gives_no_step() {
-    let gone = data_made_ending(true, &[]);
+    let gone = data_made_ending(&Taken::Marked, DATA, &Taken::Marked, ABOVE);
     assert!(gone.contains("removed what it made"), "{gone}");
     let stayed = data_made_ending(
-        false,
-        &["C:\\Kala (e)".to_owned(), "C:\\Kala\\Data (f)".to_owned()],
+        &Taken::Stays("e".to_owned()),
+        DATA,
+        &Taken::Stays("the data directory in it stays".to_owned()),
+        ABOVE,
     );
     assert!(stayed.contains("could not remove what it made"), "{stayed}");
     assert!(
-        stayed.contains("C:\\Kala (e); C:\\Kala\\Data (f)"),
+        stayed.contains(&format!(
+            "{DATA} (e); {ABOVE} (the data directory in it stays)"
+        )),
         "{stayed}"
     );
     // The directory is gone and the folder above it stays: the words say that, and not that the
     // directory stays or that nothing is left.
-    let folder_stays = data_made_ending(true, &["C:\\Kala (f)".to_owned()]);
+    let folder_stays = data_made_ending(&Taken::Marked, DATA, &Taken::Stays("f".to_owned()), ABOVE);
     assert!(
         folder_stays.contains("removed the data directory that it made"),
         "{folder_stays}"
     );
     assert!(
-        folder_stays.contains("could not remove the folder above it that it also made: C:\\Kala (f). That folder stays."),
+        folder_stays.contains(&format!(
+            "could not remove the folder above it that it also made: {ABOVE} (f). That folder stays."
+        )),
         "{folder_stays}"
     );
     for wrong in ["could not remove what it made", "nothing of it is left"] {
@@ -307,6 +313,52 @@ fn the_ending_of_a_directory_this_run_made_says_what_was_removed_and_gives_no_st
             "again",
         ] {
             assert!(!text.contains(step), "{text}");
+        }
+    }
+}
+
+const DATA: &str = r"C:\Kala\Data";
+const ABOVE: &str = r"C:\Kala";
+
+/// Every pair of what the cleanup came to for the directory and for the folder above it: the words
+/// say that the data directory was removed only where this run made it and marked it, name each
+/// object that stays and nothing else, and say that nothing is left only where nothing stays. A run
+/// that made only the folder, and whose mark was refused, is never told that it removed a data
+/// directory: it made none.
+#[test]
+fn the_ending_of_what_a_run_made_claims_each_object_only_where_the_cleanup_came_to_it() {
+    let each = |why: &str| [Taken::NotMade, Taken::Marked, Taken::Stays(why.to_owned())];
+    for directory in each("d") {
+        for folder in each("f") {
+            let text = data_made_ending(&directory, DATA, &folder, ABOVE);
+            let label = format!("{directory:?} {folder:?}: {text}");
+            let directory_stays = matches!(directory, Taken::Stays(_));
+            let folder_stays = matches!(folder, Taken::Stays(_));
+            assert_eq!(
+                text.contains("removed the data directory"),
+                directory == Taken::Marked && folder_stays,
+                "{label}"
+            );
+            assert_eq!(
+                text.contains("nothing of it is left"),
+                !directory_stays && !folder_stays,
+                "{label}"
+            );
+            assert_eq!(
+                text.contains(&format!("{DATA} (d)")),
+                directory_stays,
+                "{label}"
+            );
+            assert_eq!(
+                text.contains(&format!("{ABOVE} (f)")),
+                folder_stays,
+                "{label}"
+            );
+            assert_eq!(
+                text.contains("could not remove what it made"),
+                directory_stays || (directory != Taken::Marked && folder_stays),
+                "{label}"
+            );
         }
     }
 }
