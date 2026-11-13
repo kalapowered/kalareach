@@ -615,9 +615,10 @@ as they are, and a build that does not reproduce them is the build that is wrong
 | `published-vectors.json` | RFC 8032 section 7.1 tests 1, 2, 3, 1024 and SHA(abc); the two examples of RFC 7748 section 5.2 and its results after 1, 1,000 and 1,000,000 iterations; appendix A.3.1 of the XChaCha20-Poly1305 draft |
 | `wycheproof/` | The X25519, Ed25519 and XChaCha20-Poly1305 files of the Wycheproof project at a named commit, unchanged and with their Apache License 2.0 text, and `ed25519-verdicts.json`, libsodium's verdict on each Ed25519 case |
 
-libsodium runs its widest ChaCha20 and Salsa20 code only on a call of 1,024 bytes or more. A test that
-stops below that length never reaches it, and a round trip cannot find a wrong keystream, because the same
-keystream takes off what it put on. The cipher cases therefore run up to a mebibyte and compare the whole
+libsodium picks its ChaCha20 and Salsa20 code by the processor and then by the length of the call. The
+release's widest loop takes 512 bytes at a time, and the AVX-512 code in the stable branch's snapshot, which
+upstream's Windows prebuilt holds, takes 1,024. A test that stops below those lengths never reaches that code,
+and a round trip cannot find a wrong keystream, because the same keystream takes off what it put on. The cipher cases therefore run up to a mebibyte and compare the whole
 sealed output. The tests that read these files are in `crates/kr-crypto/src/sodium/`.
 
 Only domain-separated transcripts are signed. `fixtures/cbor/digests.json` also publishes a complete

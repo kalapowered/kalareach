@@ -220,7 +220,7 @@ const XCHACHA20_POLY1305_NOT_EXPRESSIBLE: [u64; 9] = [307, 308, 309, 310, 311, 3
 /// KR-REQ-20.01: XChaCha20-Poly1305 behind this boundary agrees with every case of Wycheproof's
 /// 315 that its interface can express, which is every case whose nonce is 24 bytes: the 246 the
 /// set calls valid seal to the set's ciphertext and tag and open to its message, and the 60 it
-/// calls invalid (changed tags, edge ciphertexts) are refused.
+/// calls invalid (changed tags) are refused.
 #[test]
 fn xchacha20_poly1305_agrees_with_every_wycheproof_case() {
     let file = wycheproof("xchacha20_poly1305_test.json", XCHACHA20_POLY1305_SHA256);
