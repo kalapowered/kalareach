@@ -6086,7 +6086,7 @@ fn undo_recorded(
                 if stayed.is_empty() {
                     // text: remove_at-24
                     say(&format!(
-                        "the removal ended without a failure and its records are deleted{unread_prior}"
+                        "the removal ended without a failure and its records are deleted (a read of the name of each afterwards found it gone){unread_prior}"
                     ));
                     Ok(())
                 } else {
