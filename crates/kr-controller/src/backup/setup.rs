@@ -673,7 +673,7 @@ impl BackupSetup {
                 return Ok(Step::Held(if same_setup(record, params) {
                     Recorded::read(Ok(enabled(record))).checked(|| admission.retained())
                 } else {
-                    // What the saved setup says, told with no check at the base.
+                    // What the saved setup says: this answer asks no authority check.
                     Recorded::read(Ok(declined(BackupEnableCause::AlreadySetUp {}))).copied()
                 }));
             }
