@@ -286,7 +286,12 @@ async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
     );
     go.send(()).expect("the effect commits");
 
-    attempt.await.expect("the effect ends").expect("it commits");
+    // The connection that ended inside the commit has no registration left when the answer is told,
+    // so the caller is not shown the result of an effect that did commit.
+    assert_eq!(
+        code(attempt.await.expect("the effect ends")),
+        ErrorCode::OutcomeUnknown
+    );
     assert!(
         withdrawal.join().expect("the withdrawal ends").is_some(),
         "the withdrawal completed after the commit, and found the clock established"
