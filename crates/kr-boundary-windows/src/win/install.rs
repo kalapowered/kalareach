@@ -159,9 +159,27 @@ pub const STEPS: [&str; 7] = [
 
 /// Fails the step named in the environment, for the test build only. A build that ships has no
 /// such seam.
+///
+/// Where `KR_BOUNDARY_DAMAGE_MANIFEST` is `garbage` or `absent`, the step first damages the
+/// manifest, and then returns the injected failure, so that a case shows that the rollback works
+/// from what the run holds and reads nothing of the manifest from the disk. The damage reaches the
+/// file through the run's own handle of the data directory (which the run holds to its end): the
+/// manifest's name is opened relative to that handle, for writing and overwriting (`garbage`: the
+/// bytes of a text that does not parse replace the whole content, in the same object, so the
+/// manifest's identity is the one the run holds) or with the right to delete it (`absent`: the
+/// object is marked for removal on that handle). The handles that the run holds of the manifest
+/// share read, write and delete, so neither open meets a sharing violation.
 #[cfg(feature = "testing")]
-fn inject(step: &str) -> Result<(), Error> {
+fn inject(run: &Run, step: &str) -> Result<(), Error> {
     if std::env::var("KR_BOUNDARY_FAIL_AFTER").as_deref() == Ok(step) {
+        if let Some(how) = std::env::var_os("KR_BOUNDARY_DAMAGE_MANIFEST") {
+            damage_manifest(run, &how.to_string_lossy()).map_err(|why| {
+                // text: inject-2
+                Error::Failed(format!(
+                    "the manifest could not be damaged as the test asked ({why})"
+                ))
+            })?;
+        }
         // text: inject-1
         return Err(Error::Failed(format!(
             "a failure was injected after the {step} step"
@@ -170,9 +188,57 @@ fn inject(step: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Damages the manifest through the run's handle of the data directory, as `how` says: `garbage`
+/// or `absent`.
+#[cfg(feature = "testing")]
+fn damage_manifest(run: &Run, how: &str) -> Result<(), String> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OVERWRITE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_DATA, WriteFile};
+    let directory = run
+        .directory
+        .as_ref()
+        .ok_or("the run holds no handle of the data directory")?;
+    let name: Vec<u16> = run
+        .paths
+        .manifest
+        .file_name()
+        .ok_or("the manifest has no name")?
+        .encode_wide()
+        .collect();
+    match how {
+        "garbage" => {
+            let handle =
+                DirHandle::open_beneath(directory, &name, FILE_WRITE_DATA, true, FILE_OVERWRITE)
+                    .map_err(|error| error.to_string())?;
+            let bytes = b"this is not a manifest {";
+            let mut written = 0_u32;
+            // SAFETY: the handle is open for writing and the buffer lives through the call.
+            let done = unsafe {
+                WriteFile(
+                    handle.raw(),
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &raw mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if done == 0 || written as usize != bytes.len() {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            Ok(())
+        }
+        "absent" => {
+            let handle = DirHandle::open_beneath(directory, &name, DELETE, true, FILE_OPEN)
+                .map_err(|error| error.to_string())?;
+            super::root::delete(&handle).map_err(|error| error.to_string())
+        }
+        other => Err(format!("{other} is neither garbage nor absent")),
+    }
+}
+
 #[cfg(not(feature = "testing"))]
 #[allow(clippy::unnecessary_wraps)]
-fn inject(_step: &str) -> Result<(), Error> {
+fn inject(_run: &Run, _step: &str) -> Result<(), Error> {
     Ok(())
 }
 
@@ -765,19 +831,27 @@ impl MadeObject {
         } = self;
         let units: Vec<u16> = name.encode_wide().collect();
         let marked = (|| {
-            let at_name = DirHandle::open_beneath(&holder, &units, DELETE, true, FILE_OPEN)
-                .map_err(|failure| {
-                    if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND
-                    {
-                        "its name was not found in the directory that holds it, so nothing was marked"
-                            .to_owned()
+            let at_name = match DirHandle::open_beneath(&holder, &units, DELETE, true, FILE_OPEN) {
+                Ok(at_name) => at_name,
+                Err(failure)
+                    if failure.code == ERROR_FILE_NOT_FOUND
+                        || failure.code == ERROR_PATH_NOT_FOUND =>
+                {
+                    // A file of this run that is not at its name has nothing that stays; a
+                    // directory that is not at its name is said not to have been marked.
+                    return if directory {
+                        Err("its name was not found in the directory that holds it, so nothing was marked".to_owned())
                     } else {
-                        remedy::platform_error(
-                            "the platform refused to open its name in the directory that holds it with the right to delete it",
-                            failure.code,
-                        )
-                    }
-                })?;
+                        Ok(())
+                    };
+                }
+                Err(failure) => {
+                    return Err(remedy::platform_error(
+                        "the platform refused to open its name in the directory that holds it with the right to delete it",
+                        failure.code,
+                    ));
+                }
+            };
             let made = file_key(&identity).map_err(|error| {
                 format!(
                     "the identity of the object that this run made could not be read ({error}), so nothing was marked"
@@ -3932,7 +4006,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         }
         run.keep_prior(prior)?;
     }
-    inject("directories")?;
+    inject(run, "directories")?;
 
     // The program directory and its files.
     let manager = service::manager()?;
@@ -4048,7 +4122,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         let _ = fs::remove_file(&file.path);
     }
 
-    inject("payload")?;
+    inject(run, "payload")?;
 
     // The accounts.
     let mut sids = Vec::new();
@@ -4078,7 +4152,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         sids.push(sid);
     }
 
-    inject("accounts")?;
+    inject(run, "accounts")?;
 
     // The service.
     run.record(ObjectKind::Service, SERVICE, None)?;
@@ -4097,7 +4171,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     broker_service.set_security(&service_security(&run.manifest.persons))?;
     run.save()?;
 
-    inject("service")?;
+    inject(run, "service")?;
 
     // The Application Identity service first. A policy written before the service has applied one is
     // not enforced, and the service applies its first about two minutes after it starts.
@@ -4123,7 +4197,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // applied one is not enforced.
     let was_running = appid.status()?.running();
     if was_running {
-        inject("appid")?;
+        inject(run, "appid")?;
         // text: lay_down-13
         say(
             "the Application Identity service is already running, so the policy is written and the platform's report of it is awaited",
@@ -4132,7 +4206,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         let before_start = applocker::newest_record(&paths.staging, &log_env, within(QUERY_BOUND))?;
         Identity(&appid).start()?;
         let first_deadline = within(FIRST_APPLIED_BOUND);
-        inject("appid")?;
+        inject(run, "appid")?;
         // text: lay_down-14
         say(messages::APPLICATION_CONTROL_STARTING);
         let (waited, _) = wait_for_applied(
@@ -4164,7 +4238,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     note_call(&format!("policy written after record {before_write}"));
     // text: lay_down-16
     say("the policy is written");
-    inject("policy")?;
+    inject(run, "policy")?;
     let (_, applied_record) = wait_for_applied(
         before_write,
         within(if was_running {
@@ -4198,7 +4272,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     })?;
     // text: lay_down-19
     say("the broker is running");
-    inject("broker")?;
+    inject(run, "broker")?;
     let mut session = open_session()?;
     cycle.prove(&mut session)?;
     run.manifest.state = InstallState::Installed;
