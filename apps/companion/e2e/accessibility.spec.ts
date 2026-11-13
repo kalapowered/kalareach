@@ -772,11 +772,14 @@ const LAST = 'https://example.org/last-line'
 const LAST_LINE = 'The last words of the conversation end with [a link](https://example.org/last-line)'
 const CLOSE = ['[the first close link](https://example.org/close-1)  \n[the second close link](https://example.org/close-2)']
 
-/** The pane's box as the page lays it out now. */
+/** The pane's own client box as the page lays it out now: what holds content and can be tapped, with no scroll bar's strip. */
 async function paneBox(page: Page): Promise<{ left: number; top: number; right: number; bottom: number }> {
   return page.evaluate(() => {
-    const box = (document.querySelector('.m-pane') as HTMLElement).getBoundingClientRect()
-    return { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+    const pane = document.querySelector('.m-pane') as HTMLElement
+    const box = pane.getBoundingClientRect()
+    const left = box.left + pane.clientLeft
+    const top = box.top + pane.clientTop
+    return { left, top, right: left + pane.clientWidth, bottom: top + pane.clientHeight }
   })
 }
 
@@ -1000,5 +1003,183 @@ test.describe('the area in which a tap opens a link', () => {
         expect(wrong, 'taps on the axis between the two links that opened the other link or none').toEqual([])
       })
     }
+  }
+})
+
+/** Reads the rectangle of a link's first line of words where the page has it now, with no scrolling. */
+async function wordsNow(page: Page, href: string): Promise<Words> {
+  return page.evaluate((target) => {
+    const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
+    if (!link) throw new Error(`the page shows no link ${target}`)
+    const range = document.createRange()
+    range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
+    const box = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)[0]
+    if (!box) throw new Error(`the link ${target} has no words`)
+    return { x: box.left + box.width / 2, y: box.top + box.height / 2, left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+  }, href)
+}
+
+/**
+ * Scrolls the pane until the words of a link lie wholly outside one of its edges, `outside` px from it
+ * (above the top, below the bottom, or left of the left edge), or until the edge cuts the words through
+ * their middle when `outside` is 0. Returns the edge's position and the words where they are now.
+ */
+async function wordsOutside(page: Page, href: string, edge: 'top' | 'bottom' | 'left', outside: number): Promise<{ edge: number; words: Words }> {
+  await wordsOf(page, href)
+  // A screen that has just been resized (the keyboard) lays the pane out again: wait until its box holds still.
+  await page.waitForFunction(
+    () =>
+      new Promise<boolean>((resolve) => {
+        const pane = document.querySelector<HTMLElement>('.m-pane') as HTMLElement
+        const read = (): string => `${String(pane.getBoundingClientRect().bottom)} ${String(pane.clientHeight)}`
+        const first = read()
+        requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(() => resolve(read() === first))))
+      })
+  )
+  const box = await paneBox(page)
+  const at = edge === 'top' ? box.top : edge === 'bottom' ? box.bottom : box.left
+  const view = page.viewportSize()
+  if (edge === 'bottom') expect(at, 'the pane’s bottom edge against the screen’s bottom').toBeLessThanOrEqual(view?.height ?? 0)
+  await page.evaluate(
+    ({ target, edgeAt, side, beyond }) => {
+      const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
+      const pane = document.querySelector<HTMLElement>('.m-pane')
+      if (!link || !pane) throw new Error('the page shows no such link')
+      const range = document.createRange()
+      range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
+      const first = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)[0]
+      if (!first) throw new Error('the link has no words')
+      if (side === 'left') {
+        pane.scrollLeft += first.left - (beyond === 0 ? edgeAt - first.width / 2 : edgeAt - beyond - first.width)
+        return
+      }
+      const wanted = beyond === 0 ? edgeAt - first.height / 2 : side === 'top' ? edgeAt - beyond - first.height : edgeAt + beyond
+      pane.scrollTop += first.top - wanted
+    },
+    { target: href, edgeAt: at, side: edge, beyond: outside }
+  )
+  const words = await wordsNow(page, href)
+  const gap =
+    edge === 'left'
+      ? outside === 0
+        ? (words.left + words.right) / 2 - at
+        : at - words.right
+      : outside === 0
+        ? (words.top + words.bottom) / 2 - at
+        : edge === 'top'
+          ? at - words.bottom
+          : words.top - at
+  expect(Math.abs(gap - outside), `where the scroll left the words of the link against the ${edge} edge`).toBeLessThan(1.5)
+  return { edge: at, words }
+}
+
+/** The box of a link's own element, which can reach past its words (the line's room at the largest text size). */
+async function boxOf(page: Page, href: string): Promise<{ left: number; top: number; right: number; bottom: number }> {
+  return page.evaluate((target) => {
+    const box = (document.querySelector(`.m-node .md-link[title="${target}"]`) as HTMLElement).getBoundingClientRect()
+    return { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+  }, href)
+}
+
+/** The link that a mouse's press at a point lights, or null: the pressed look at the press. */
+async function litAt(page: Page, x: number, y: number): Promise<string | null> {
+  await page.mouse.move(x, y)
+  await page.mouse.down()
+  const lit = await page.evaluate(() => document.querySelector('.md-link[data-pressed]')?.getAttribute('title') ?? null)
+  await page.mouse.up()
+  return lit
+}
+
+// KR-REQ-13.19: the pane scrolls, so its box is the part of the conversation that is in view, and a
+// link takes part only by what is in view of its words. Words that the scroll has taken wholly out of
+// view (above the pane's top, below its bottom, scrolled up or with the keyboard making the pane
+// short) have no area: a tap on the plain text near the edge lights and opens nothing, as on a
+// desktop. Words that the edge cuts through keep what is in view of them and their reach, and nothing
+// is given back past the edge's own line.
+const HIDING = [...Array.from({ length: 12 }, () => PLAIN), ...NEXT_LINE, ...Array.from({ length: 12 }, () => PLAIN)]
+/** A run of characters with no place to break, wider than the pane, and a link on the line after it. */
+const WIDE = `${'w'.repeat(150)} [a side link](https://example.org/side) and plain words after it on the same line.`
+const SIDE = 'https://example.org/side'
+test.describe('a link that the scroll has taken out of view or cut', () => {
+  test.use({ hasTouch: true })
+  for (const surface of SURFACES) {
+    for (const [size, ratio] of SIZES) {
+      for (const edge of ['top', 'bottom'] as const) {
+        for (const outside of [10, 30]) {
+          test(`has no area when its words are ${String(outside)} px beyond the pane's ${edge} on ${surface} at ${size} text size`, async ({ page }) => {
+            await pressPage(page, surface, { scale: ratio, only: HIDING })
+            // The bottom edge is the one the keyboard moves: the pane is made short.
+            if (edge === 'bottom') await page.setViewportSize({ width: 390, height: 540 })
+            const { edge: at, words } = await wordsOutside(page, LEAD, edge, outside)
+            const wrong: string[] = []
+            for (const inward of [1, 3, 6, 12, 24, 36, 44, 52]) {
+              const y = edge === 'top' ? at + inward : at - inward
+              const lit = await litAt(page, words.x, y)
+              const made = await tapAndRead(page, words.x, y)
+              if (lit !== null || made.opened.length > 0) wrong.push(`${String(inward)} px inside the ${edge} (the edge at ${String(at)}): lit ${String(lit)}, opened ${made.opened.join(',') || 'nothing'}`)
+            }
+            expect(wrong, 'taps on the plain text near the pane’s edge that lit or opened the link whose words are out of view').toEqual([])
+          })
+        }
+
+        test(`keeps what is in view of a link whose line the pane's ${edge} cuts through, and gives nothing back past the edge, on ${surface} at ${size} text size`, async ({ page }) => {
+          await pressPage(page, surface, { scale: ratio, only: HIDING })
+          if (edge === 'bottom') await page.setViewportSize({ width: 390, height: 540 })
+          const { edge: at, words } = await wordsOutside(page, LEAD, edge, 0)
+          const height = words.bottom - words.top
+          const reach = Math.max(FINGER[surface], height) / 2
+          const sign = edge === 'top' ? 1 : -1
+          // On the words that are in view, and on the plain text in the half of the reach that is in view: the link.
+          for (const inward of [1, Math.min(height / 2 - 1, reach - 1)]) {
+            const y = at + sign * inward
+            expect((await tapAndRead(page, words.x, y)).opened, `links opened by a tap ${String(inward)} px inside the ${edge}`).toEqual([LEAD])
+          }
+          // Past the reach of the words' middle and past the link's own box (the browser's own click goes to
+          // that, and the engines adjust a touch by about 8 px more), where the old rule gave back what the
+          // edge cut: nothing.
+          const own = await boxOf(page, LEAD)
+          const inside = Math.max(reach, edge === 'top' ? own.bottom - at : at - own.top)
+          const far = at + sign * (inside + 14)
+          expect(await litAt(page, words.x, far), `the pressed look ${String(inside + 14)} px inside the ${edge}`).toBeNull()
+          expect((await tapAndRead(page, words.x, far)).opened, 'links opened past the reach').toEqual([])
+        })
+      }
+    }
+
+    // The pane does scroll sideways: a run of characters with no place to break (a long address in the
+    // text, a link whose label has no break) is wider than the pane, and the lines after it start at its left.
+    for (const outside of [10, 30]) {
+      test(`has no area when its words are ${String(outside)} px beyond the pane's left edge, where the pane scrolls sideways, on ${surface}`, async ({ page }) => {
+        await pressPage(page, surface, { only: [PLAIN, WIDE, PLAIN] })
+        const room = await page.evaluate(() => {
+          const pane = document.querySelector<HTMLElement>('.m-pane') as HTMLElement
+          return { scroll: pane.scrollWidth, client: pane.clientWidth }
+        })
+        expect(room.scroll, 'the pane’s scroll width against its client width, with an unbroken run of characters in a message').toBeGreaterThan(room.client + 100)
+        const { edge: at, words } = await wordsOutside(page, SIDE, 'left', outside)
+        const wrong: string[] = []
+        for (const inward of [1, 3, 6, 12, 24, 36, 44, 52]) {
+          const x = at + inward
+          const lit = await litAt(page, x, words.y)
+          const made = await tapAndRead(page, x, words.y)
+          if (lit !== null || made.opened.length > 0) wrong.push(`${String(inward)} px inside the left edge: lit ${String(lit)}, opened ${made.opened.join(',') || 'nothing'}`)
+        }
+        expect(wrong, 'taps on the plain text near the pane’s left edge that lit or opened the link whose words are out of view').toEqual([])
+      })
+    }
+
+    test(`keeps what is in view of a link whose line the pane's left edge cuts through, and gives nothing back past the edge, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: [PLAIN, WIDE, PLAIN] })
+      const { edge: at, words } = await wordsOutside(page, SIDE, 'left', 0)
+      const width = words.right - words.left
+      const reach = (width + FINGER[surface]) / 2
+      for (const inward of [1, Math.min(width / 2 - 1, reach - 1)]) {
+        expect((await tapAndRead(page, at + inward, words.y)).opened, `links opened by a tap ${String(inward)} px inside the left edge`).toEqual([SIDE])
+      }
+      const inside = Math.max(reach, (await boxOf(page, SIDE)).right - at)
+      const far = at + inside + 14
+      expect(await litAt(page, far, words.y), `the pressed look ${String(inside + 14)} px inside the left edge`).toBeNull()
+      expect((await tapAndRead(page, far, words.y)).opened, 'links opened past the reach').toEqual([])
+    })
   }
 })
