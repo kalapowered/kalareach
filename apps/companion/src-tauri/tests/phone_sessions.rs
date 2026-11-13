@@ -4527,8 +4527,11 @@ impl kr_client::uploads::Content for HeldAtTheSecondChunk {
 }
 
 /// An upload that the close of its connection interrupts between two chunks, with an opener still
-/// held, ends in an error and publishes nothing. The place is free when the close returns, and
-/// the opener that was taken before the close refuses every open after it.
+/// held, ends in an error and publishes nothing, and the opener that was taken before the close
+/// refuses every open after it. The place that the close gives back is not read here: the main
+/// link is kept by a task that dials again, and the budget holds other connections, so a count
+/// read after the close moves with them. The cases beside `Placed` read it, on a connection that
+/// nothing else holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_no_stream_to_open() {
     use kr_client::chunks::ChunkRoute;
@@ -4543,9 +4546,6 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
     let rights = [ActionRight::SessionView, ActionRight::FilesUpload];
     let (phone, _control) = phone_governed(&adopted, pairing(&rights)).await;
     let companion = &phone.companion;
-    let host = host_of(companion);
-    let places = companion_tauri::places::budget();
-    let held_before = places.held_on(host);
     let session = companion
         .app
         .state::<companion_tauri::AppState>()
@@ -4601,7 +4601,7 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
     // opener above both held.
     tokio::time::timeout(WATCHDOG, async {
         while !gate.reached.load(std::sync::atomic::Ordering::Acquire) {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -4613,12 +4613,6 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
     );
 
     transport.close();
-
-    assert_eq!(
-        places.held_on(host) + 1,
-        held_before,
-        "the place is free when the close returns"
-    );
     gate.release();
     let (sent, route) = tokio::time::timeout(WATCHDOG, sending)
         .await
