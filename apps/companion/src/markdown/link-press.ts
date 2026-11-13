@@ -123,6 +123,8 @@ export function startLinkPress(element: HTMLElement): () => void {
       () => layoutNear(element, x, y)
     )
     if (decision.kind !== 'open') return
+    // One press gives one open: the click that follows needs a press of its own.
+    press = null
     activate(decision.link, event)
   }
 
