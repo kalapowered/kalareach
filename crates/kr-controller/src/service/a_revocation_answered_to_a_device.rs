@@ -304,7 +304,8 @@ async fn a_device_that_revokes_through_the_daemon_is_told_of_its_own_sessions_on
             Method::GrantRevoke,
             carried,
         )
-        .await;
+        .await
+        .into_given();
     assert!(
         !answer.is_copied(),
         "the attempt that revokes answers for itself"
@@ -325,7 +326,8 @@ async fn a_device_that_revokes_through_the_daemon_is_told_of_its_own_sessions_on
             Method::GrantRevoke,
             carried,
         )
-        .await;
+        .await
+        .into_given();
     assert!(again.is_copied(), "a repeat is answered from the record");
     let again = again
         .into_answer_for_test()

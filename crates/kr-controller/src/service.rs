@@ -95,6 +95,7 @@ pub use backup_production::{Held as ProductionHeld, ProducerBounds, StopBackupPr
 
 pub(crate) use admission::{EnvelopeRefused, Unauthorised};
 pub use barrier::DEBT_PASS_INTERVAL;
+pub(crate) use barrier::HostWithdrawal;
 pub use capabilities::{CAPABILITY_REVISION_FILE, DESKTOP_REREAD_INTERVAL};
 pub use close::{CLOSE_EXCHANGE, CLOSURE_WATCH_TIMEOUT};
 pub use create::{CREATE_WAIT, RENDEZVOUS_TIMEOUT};
