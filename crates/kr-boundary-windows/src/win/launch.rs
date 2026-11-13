@@ -605,7 +605,9 @@ impl Child {
     ///
     /// Returns the exit code, or `None` when the bound ran out first or the stop came first; the
     /// caller looks at the stop to tell the two apart. The stop is waited on first, so a child
-    /// that ended at the same moment does not win over a stop that is set.
+    /// that ended at the same moment does not win over a stop that is set. The stop's wait is made
+    /// in slices of one second at most, and each slice reads the stop's kept failure, so a stop
+    /// that could not be set ends this wait within a slice, whatever the bound.
     ///
     /// # Errors
     ///
@@ -1089,5 +1091,76 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant, stop: Option<&Stop>) -> Piped
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "testing")]
+mod tests {
+    use std::sync::Arc;
+
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+    use super::*;
+
+    /// A child that does not end while a case runs: this process, opened for the wait alone.
+    fn a_child_that_does_not_end() -> Child {
+        let pid = std::process::id();
+        // SAFETY: opening this process for a wait.
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        Child {
+            process: Handle::new(process, "opening the case's own process").unwrap(),
+            pid,
+            creation_time: 0,
+        }
+    }
+
+    /// A wait for a child that does not end, with a bound of fifteen minutes or none, ends within
+    /// two slices of a stop that could not be set, and says nothing of the child's end.
+    #[test]
+    fn a_wait_for_a_child_or_the_stop_ends_within_two_slices_of_a_stop_that_could_not_be_set() {
+        for bound in [
+            Duration::from_secs(900),
+            Duration::from_secs(u64::from(u32::MAX)),
+        ] {
+            let child = a_child_that_does_not_end();
+            let stop = Stop::new().unwrap();
+            let late = Arc::clone(&stop);
+            let failer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                late.fail_the_set_for_a_case();
+            });
+            let started = Instant::now();
+            let waited = child.wait_or_stop(bound, &stop);
+            let took = started.elapsed();
+            failer.join().unwrap();
+            assert!(matches!(waited, Ok(None)), "{bound:?}: {waited:?}");
+            assert!(
+                took < 2 * super::super::stop::STOP_SLICE,
+                "{bound:?}: {took:?}"
+            );
+            assert!(
+                stop.reason().contains("the stop could not be set"),
+                "{}",
+                stop.reason()
+            );
+        }
+    }
+
+    /// The bound is kept by the slices: a child that does not end and a stop that is not set end
+    /// the wait at the bound, about two and a half seconds, with no answer and no failure.
+    #[test]
+    fn a_wait_for_a_child_or_the_stop_waits_its_bound_when_nothing_comes() {
+        let child = a_child_that_does_not_end();
+        let stop = Stop::new().unwrap();
+        let started = Instant::now();
+        let waited = child.wait_or_stop(Duration::from_millis(2500), &stop);
+        let took = started.elapsed();
+        assert!(matches!(waited, Ok(None)), "{waited:?}");
+        assert!(
+            took >= Duration::from_millis(2450) && took < Duration::from_millis(3500),
+            "{took:?}"
+        );
+        assert!(stop.unread().is_none());
     }
 }
