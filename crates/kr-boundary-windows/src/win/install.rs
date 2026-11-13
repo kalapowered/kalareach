@@ -2218,11 +2218,7 @@ fn inspect_data_directory(
         Layout::Run,
     )?;
     let manifest = Manifest::load(&paths.manifest)?;
-    let records = |path: &Path| {
-        manifest
-            .find(ObjectKind::Directory, &path.display().to_string())
-            .is_some()
-    };
+    let records = |path: &Path| manifest.records_directory(&path.display().to_string());
     if !records(&paths.data) {
         return Err(unrecorded_refusal(
             paths,
@@ -3924,9 +3920,7 @@ impl Run {
         // A manifest is a few kilobytes; a longer object is not this run's record.
         const LIMIT: u64 = 1 << 20;
         let Some(directory) = &self.directory else {
-            return Err(remedy::NotProved::Unread(
-                "the run holds no handle of the data directory".to_owned(),
-            ));
+            return Err(remedy::NotProved::NotRead);
         };
         let name: Vec<u16> = self
             .paths
@@ -3980,8 +3974,13 @@ impl Run {
     /// administrator's removal: a read of the manifest's name that finds the record as this run
     /// holds it leaves it; any other answer (never saved, damaged, another object) is followed by
     /// the proved write of the record as it stands in memory. Says which of the three came to pass.
-    fn keep_record(&self) -> remedy::RecordLeft {
+    fn keep_record(&mut self) -> remedy::RecordLeft {
         let manifest = self.paths.manifest.display().to_string();
+        // The removal's inspection refuses a record that does not record the data directory, and a
+        // run that failed before its first directory record holds none: the record that is left
+        // records the directory that this run made its record in.
+        self.manifest
+            .record_directory_where_missing(&self.paths.data.display().to_string());
         let found = match self.manifest_on_disk() {
             Ok(()) => return remedy::RecordLeft::Proved { manifest },
             Err(found) => found,
@@ -4007,6 +4006,9 @@ impl Run {
                 stays.push(path.display().to_string());
             }
         };
+        if let Some(folder) = paths.program.parent() {
+            add(laid.program_folder.is_some(), folder);
+        }
         add(laid.made.parent.is_some(), paths.data_parent());
         add(laid.made.directory.is_some(), &paths.data);
         add(laid.staging.is_some(), &paths.staging);
@@ -6207,7 +6209,7 @@ fn undo_recorded(
             }
         }
     } else {
-        match &tree {
+        match &mut tree {
             DataTree::ByName => {
                 // text: remove_at-26
                 Err(Error::Failed(format!(
@@ -6838,6 +6840,11 @@ mod tests {
         // The record is on disk as the run holds it: it is read and left.
         let top = tempfile::tempdir().unwrap();
         let mut run = laid_run(top.path());
+        run.manifest.record(
+            ObjectKind::Directory,
+            &run.paths.data.display().to_string(),
+            None,
+        );
         run.save().unwrap();
         crate::manifest::forced::fail_the_next("manager");
         let error = roll_back(&mut run).unwrap_err().to_string();
@@ -6857,10 +6864,7 @@ mod tests {
         );
         crate::manifest::forced::fail_the_next("manager");
         let error = roll_back(&mut run).unwrap_err().to_string();
-        assert!(
-            error.contains("so this run wrote its record again"),
-            "{error}"
-        );
+        assert!(error.contains("so this run wrote its record at"), "{error}");
         assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), run.manifest);
         // The record is gone: it is written again.
         std::fs::remove_file(&run.paths.manifest).unwrap();
@@ -6876,7 +6880,25 @@ mod tests {
         crate::manifest::forced::fail_the_next("manager");
         let error = roll_back(&mut run).unwrap_err().to_string();
         assert!(
-            error.contains("writing this run's record again failed"),
+            error.contains("writing this run's record failed"),
+            "{error}"
+        );
+        // No read was made, and the words do not say that one failed; a write that failed shows
+        // neither that a record is on disk nor that none is.
+        assert!(
+            error.contains("No read of the manifest's name was made"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("A read of the manifest's name afterwards failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("a record of this run could not be confirmed on disk"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("no record of this run is on disk"),
             "{error}"
         );
         assert!(
@@ -6889,6 +6911,29 @@ mod tests {
         );
         assert!(!error.contains("records are kept"), "{error}");
         assert!(!error.contains("stays where it is"), "{error}");
+    }
+
+    /// A new installation that fails before its first directory record and whose rollback then has a
+    /// failed step leaves a record that the removal's inspection accepts: it records the data
+    /// directory.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_record_left_by_a_run_that_failed_before_its_first_record_records_the_data_directory() {
+        let _one = ffi::locked(&FORCED);
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        let data = run.paths.data.display().to_string();
+        assert!(!run.manifest.records_directory(&data));
+        crate::manifest::forced::fail_the_next("manager");
+        let error = roll_back(&mut run).unwrap_err().to_string();
+        assert!(error.contains("so this run wrote its record at"), "{error}");
+        assert!(
+            error.contains("the administrator's removal takes the rest"),
+            "{error}"
+        );
+        let left = Manifest::load(&run.paths.manifest).unwrap();
+        assert!(left.records_directory(&data), "{left:?}");
+        assert_eq!(left, run.manifest);
     }
 
     /// A failed early read in an early step of a rollback is kept in its result and the later steps still

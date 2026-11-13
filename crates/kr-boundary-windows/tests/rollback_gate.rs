@@ -294,6 +294,21 @@ fn a_rollback_that_ends_with_a_failed_step_leaves_a_record_before_it_ends() {
     let keep = code_of(body_of(&source, "fn keep_record("));
     assert!(keep.contains("self.manifest_on_disk()"));
     assert!(keep.contains("self.save()"));
+    // The record that is left holds the data directory's entry, which the removal's inspection
+    // needs, before the read that decides whether the record on disk is the run's own; and the
+    // inspection reads that entry through the same call.
+    let entry = keep
+        .find(".record_directory_where_missing(")
+        .expect("the record that is left records the data directory");
+    assert!(entry < keep.find("self.manifest_on_disk()").unwrap());
+    assert!(source.contains("manifest.records_directory(&path.display().to_string())"));
+    assert!(steps.contains("match &mut tree {"));
+    // The read of the manifest's name is not said to have failed where none was made.
+    let on_disk = code_of(body_of(&source, "fn manifest_on_disk("));
+    assert!(on_disk.contains("return Err(remedy::NotProved::NotRead);"));
+    // What stays names the folder above the program directory where the run holds it.
+    let held = code_of(body_of(&source, "fn held_paths("));
+    assert!(held.contains("laid.program_folder.is_some()"));
     // The program directory's check in a rollback is told whether the manifest is on disk by a
     // read, and not that it is.
     let roll = code_of(body_of(&source, "fn roll_back("));
