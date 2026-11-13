@@ -18,10 +18,9 @@ use super::writes::LocalWrite;
 const NOT_SERVED: &str = "is not a mutation this daemon serves";
 
 /// The local writes that neither a daemon module nor a worker's request table serves, and that the
-/// envelope refuses by name: the terminal palette, raw input and the root editor's frames.
-const NOT_ON_THE_WORKERS_TABLE: [Method; 7] = [
+/// envelope refuses by name: the terminal palette and the root editor's frames.
+const NOT_ON_THE_WORKERS_TABLE: [Method; 6] = [
     Method::TerminalPaletteSet,
-    Method::InputWrite,
     Method::RootEditorEnter,
     Method::RootEditorLeave,
     Method::RootEditorFence,
