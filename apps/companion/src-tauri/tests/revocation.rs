@@ -2613,18 +2613,173 @@ impl Drop for EndsTheKeeper<'_> {
     }
 }
 
+/// What the host is made to say to one connection: its answer to the next mutation sent is
+/// replaced by the word the host gives a request it carried out while the connection was
+/// withdrawn, that what became of the action is not shown. The device lists the application asks
+/// over the connection, to find out whether it was withdrawn, are counted when they are answered.
+#[derive(Debug, Default)]
+struct Tells {
+    next: std::sync::atomic::AtomicBool,
+    told: Mutex<Option<kr_protocol::ids::RequestId>>,
+    listing: Mutex<std::collections::BTreeSet<kr_protocol::ids::RequestId>>,
+    listed: std::sync::atomic::AtomicUsize,
+}
+
+/// A transport that carries every frame as it is, except what [`Tells`] says.
+#[derive(Debug)]
+struct TellsNotShown {
+    inner: Arc<dyn kr_client::transport::ControlTransport>,
+    tells: Arc<Tells>,
+}
+
+impl kr_client::transport::ControlTransport for TellsNotShown {
+    fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
+        self.inner.connection_id()
+    }
+
+    fn limits(&self) -> kr_protocol::hello::ReceiveLimits {
+        self.inner.limits()
+    }
+
+    fn initial_action_window(&self) -> kr_protocol::hello::ActionWindow {
+        self.inner.initial_action_window()
+    }
+
+    fn reach(&self) -> Option<kr_client::transport::Reach> {
+        self.inner.reach()
+    }
+
+    fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
+        self.inner.ended_by_this_device()
+    }
+
+    fn send<'a>(
+        &'a self,
+        frame: &'a kr_protocol::envelope::ControlFrame,
+    ) -> kr_client::transport::TransportFuture<'a, ()> {
+        use kr_protocol::envelope::ControlFrame;
+
+        match frame {
+            ControlFrame::Mutation(request)
+                if self
+                    .tells
+                    .next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst) =>
+            {
+                *self.tells.told.lock().expect("the record") = Some(request.request_id);
+            }
+            ControlFrame::Request(request)
+                if request.method.method() == Some(kr_protocol::method::Method::DeviceList) =>
+            {
+                self.tells
+                    .listing
+                    .lock()
+                    .expect("the record")
+                    .insert(request.request_id);
+            }
+            _ => {}
+        }
+        self.inner.send(frame)
+    }
+
+    fn claim_receiver(&self) -> kr_client::Result<()> {
+        self.inner.claim_receiver()
+    }
+
+    fn stream_opener(&self) -> Option<Arc<dyn kr_client::transport::StreamOpener>> {
+        self.inner.stream_opener()
+    }
+
+    fn recv(
+        &self,
+    ) -> kr_client::transport::TransportFuture<'_, Option<kr_protocol::envelope::ControlFrame>>
+    {
+        use kr_protocol::envelope::{ControlFrame, Outcome};
+
+        Box::pin(async move {
+            let frame = self.inner.recv().await?;
+            Ok(frame.map(|frame| match frame {
+                ControlFrame::Response(mut response) => {
+                    let told = self
+                        .tells
+                        .told
+                        .lock()
+                        .expect("the record")
+                        .take_if(|sent| *sent == response.request_id);
+                    if told.is_some() {
+                        response.outcome = Outcome::Error(
+                            kr_controller::error::ControllerError::outcome_not_shown()
+                                .to_protocol_error(),
+                        );
+                    }
+                    if self
+                        .tells
+                        .listing
+                        .lock()
+                        .expect("the record")
+                        .remove(&response.request_id)
+                    {
+                        self.tells
+                            .listed
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    ControlFrame::Response(response)
+                }
+                other => other,
+            }))
+        })
+    }
+
+    fn revoke_streams(&self) {
+        self.inner.revoke_streams();
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+}
+
+/// A connection to the host on this machine over its socket, as the application makes one, that
+/// the host says what `tells` says to.
+async fn told_connection(
+    endpoint: &kr_ipc::paths::Endpoint,
+    tells: &Arc<Tells>,
+) -> companion_tauri::error::Result<companion_tauri::connection::Connection> {
+    let build_id = companion_tauri::connection::build_id()?;
+    let transport = IpcTransport::connect(endpoint, build_id)
+        .await
+        .map_err(companion_tauri::error::CommandError::from)?;
+    let environment_id = transport.context().environment_id;
+    let local_user = transport.context().peer.uid.get();
+    let session = kr_client::Session::start(Arc::new(TellsNotShown {
+        inner: transport.shared(),
+        tells: Arc::clone(tells),
+    }))?;
+    Ok(companion_tauri::connection::Connection::assembled(
+        session,
+        environment_id,
+        companion_tauri::connection::Standing::Owner,
+        Some(local_user),
+        None,
+    ))
+}
+
 /// The application's own keeping of its connection to the host on this machine, with this rig's
-/// host in place of the user's: the connection is reached, and reached again when it ends.
-async fn keeps_its_connection(
-    rig: &Rig,
+/// host in place of the user's: the connection is reached, and reached again when it ends. When
+/// `tells` is given, the host says what it says to the connection the application keeps.
+async fn keeps_its_connection<'r>(
+    rig: &'r Rig,
     reopens: Arc<std::sync::atomic::AtomicUsize>,
-) -> EndsTheKeeper<'_> {
+    tells: Option<&Arc<Tells>>,
+) -> EndsTheKeeper<'r> {
     use companion_tauri::connection::Attempt;
 
     let endpoint = rig.host.endpoint().clone();
+    let tells = tells.cloned();
     companion_tauri::connection::reach_host_on_this_machine(rig.app.app.handle(), move || {
         let endpoint = endpoint.clone();
         let reopens = Arc::clone(&reopens);
+        let tells = tells.clone();
         async move {
             // Another connection is slow to open, as one to a host that is busy is: refusals that
             // come while it is being opened meet a question that is already out.
@@ -2641,7 +2796,11 @@ async fn keeps_its_connection(
                     })
                 }
             });
-            match local_connection(&endpoint).await {
+            let reached = match &tells {
+                Some(tells) => told_connection(&endpoint, tells).await,
+                None => local_connection(&endpoint).await,
+            };
+            match reached {
                 Ok(connection) => Attempt::Reached(connection.reopening(reopen)),
                 Err(error) => Attempt::Failed(error),
             }
@@ -2677,7 +2836,7 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
     let rig = Rig::start().await;
     rig.host_polls().await;
     let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let _keeper = keeps_its_connection(&rig, Arc::clone(&reopens)).await;
+    let _keeper = keeps_its_connection(&rig, Arc::clone(&reopens), None).await;
     let state = rig.app.app.state::<AppState>();
     let first = state.session().expect("connected");
     let _: HostInfoResult = first
@@ -2728,6 +2887,120 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
         reopens.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "one other connection was opened to ask"
+    );
+}
+
+/// A mutation sent over `session` whose answer the host is made to give as not shown: it is a
+/// request the host refuses on its own account, so that nothing is carried out for it.
+async fn a_mutation_the_host_tells_as_not_shown(
+    session: &kr_client::Session,
+    tells: &Tells,
+    environment_id: EnvironmentId,
+) -> kr_client::ClientError {
+    tells.next.store(true, std::sync::atomic::Ordering::SeqCst);
+    session
+        .mutate(
+            kr_protocol::method::Method::SessionCreate,
+            kr_protocol::envelope::ActionTarget::environment(environment_id),
+            None,
+            &json!({}),
+            &json!({}),
+            kr_protocol::scalars::DurationMs::new(30_000),
+        )
+        .await
+        .expect_err("the host's answer is that what became of the action is not shown")
+}
+
+/// KR-REQ-09.09: a connection the host withdrew is replaced when the host answers a mutation on it
+/// that what became of the action is not shown, which is what it says of a request it carried out
+/// while the connection was withdrawn, and not only when it refuses a request as not permitted. The
+/// answer is made on the wire; the host really has withdrawn the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_the_host_withdrew_is_replaced_when_a_mutation_on_it_is_told_not_shown() {
+    use kr_protocol::hostinfo::HostInfoResult;
+    use kr_protocol::method::Method;
+
+    let rig = Rig::start().await;
+    rig.host_polls().await;
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tells = Arc::new(Tells::default());
+    let _keeper = keeps_its_connection(&rig, Arc::clone(&reopens), Some(&tells)).await;
+    let state = rig.app.app.state::<AppState>();
+    let first = state.session().expect("connected");
+    let _: HostInfoResult = first
+        .read(Method::HostInfo, &json!({}))
+        .await
+        .expect("the host answers on the connection it admitted");
+
+    the_host_narrows_its_rights_ceiling(&rig).await;
+
+    let told = a_mutation_the_host_tells_as_not_shown(
+        &first,
+        &tells,
+        state.connection().expect("connected").environment_id(),
+    )
+    .await;
+    assert_eq!(told.code(), kr_protocol::error::ErrorCode::OutcomeUnknown);
+    let second = eventually("the application holds a connection the host admits", || {
+        state
+            .session()
+            .ok()
+            .filter(|session| !Arc::ptr_eq(session, &first))
+    })
+    .await;
+    assert_eq!(state.connection_state().replaced, 1);
+    let _: HostInfoResult = second
+        .read(Method::HostInfo, &json!({}))
+        .await
+        .expect("the connection the application then holds is one the host admits");
+    assert_eq!(
+        reopens.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one other connection was opened to ask"
+    );
+}
+
+/// KR-REQ-09.09: a mutation the host answers as not shown on a connection it did not withdraw
+/// makes the application ask the host, over the connection itself, whether it withdrew it, and the
+/// host's answer to that leaves the connection where it is: the application opens no other and
+/// replaces nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mutation_told_not_shown_on_a_connection_the_host_did_not_withdraw_leaves_it_in_place() {
+    use kr_protocol::hostinfo::HostInfoResult;
+    use kr_protocol::method::Method;
+
+    let rig = Rig::start().await;
+    rig.host_polls().await;
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tells = Arc::new(Tells::default());
+    let _keeper = keeps_its_connection(&rig, Arc::clone(&reopens), Some(&tells)).await;
+    let state = rig.app.app.state::<AppState>();
+    let first = state.session().expect("connected");
+    let _: HostInfoResult = first
+        .read(Method::HostInfo, &json!({}))
+        .await
+        .expect("the host answers on the connection it admitted");
+
+    let told = a_mutation_the_host_tells_as_not_shown(
+        &first,
+        &tells,
+        state.connection().expect("connected").environment_id(),
+    )
+    .await;
+    assert_eq!(told.code(), kr_protocol::error::ErrorCode::OutcomeUnknown);
+    eventually("the host is asked about the connection and answers", || {
+        (tells.listed.load(std::sync::atomic::Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
+    assert!(
+        Arc::ptr_eq(&state.session().expect("connected"), &first),
+        "the connection the host did not withdraw stays"
+    );
+    assert_eq!(state.connection_state().replaced, 0);
+    assert_eq!(
+        reopens.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no other connection was opened"
     );
 }
 
@@ -2800,7 +3073,7 @@ async fn revoking_the_phone_leaves_this_computers_own_connection_admitted_and_an
     let rig = Rig::start().await;
     rig.host_polls().await;
     let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let _keeper = keeps_its_connection(&rig, Arc::clone(&reopens)).await;
+    let _keeper = keeps_its_connection(&rig, Arc::clone(&reopens), None).await;
     let state = rig.app.app.state::<AppState>();
     let held = state.session().expect("connected");
     let _: HostInfoResult = held
