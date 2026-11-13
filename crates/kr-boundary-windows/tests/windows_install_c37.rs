@@ -197,6 +197,19 @@ fn snapshot() -> Snapshot {
     }
 }
 
+/// Fails unless the machine holds nothing of an installation.
+fn assert_clean(before: &Snapshot) {
+    assert!(
+        !before.service
+            && before.accounts == [false, false]
+            && !before.data_dir
+            && !before.data_parent
+            && !before.program_dir
+            && before.pipes_gone,
+        "the machine is not clean: {before:?}"
+    );
+}
+
 /// Runs the setup program with the payload of the guest's runner and "yes" on its input, from the
 /// given working directory, with the given variables. Returns its exit code and its output.
 fn run_setup(
@@ -250,15 +263,7 @@ fn a_late_failure_with_a_damaged_manifest(how: &str) -> String {
         "the case must run elevated"
     );
     let before = snapshot();
-    assert!(
-        !before.service
-            && before.accounts == [false, false]
-            && !before.data_dir
-            && !before.data_parent
-            && !before.program_dir
-            && before.pipes_gone,
-        "the machine is not clean: {before:?}"
-    );
+    assert_clean(&before);
     let id = &uuid::Uuid::new_v4().simple().to_string()[..6];
     let person_name = format!("krperson{id}");
     let person = account::create(&person_name).expect("the person's account is made");
@@ -446,15 +451,7 @@ fn the_program_parent_after(failing: bool) {
         "the case must run elevated"
     );
     let before = snapshot();
-    assert!(
-        !before.service
-            && before.accounts == [false, false]
-            && !before.data_dir
-            && !before.data_parent
-            && !before.program_dir
-            && before.pipes_gone,
-        "the machine is not clean: {before:?}"
-    );
+    assert_clean(&before);
     let paths = Paths::system().unwrap();
     let parent = make_the_program_parent_by_hand(&paths);
     let id = &uuid::Uuid::new_v4().simple().to_string()[..6];
@@ -526,4 +523,83 @@ fn a_program_parent_made_by_hand_stands_after_the_rollback_of_a_late_failure() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_program_parent_made_by_hand_stands_after_a_good_installation_and_its_removal() {
     the_program_parent_after(false);
+}
+
+/// The directory that holds the setup program and its signed payloads.
+fn bin_directory() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("KR_BOUNDARY_BIN")
+            .expect("KR_BOUNDARY_BIN names the directory with the setup program and its payloads"),
+    )
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_repair_whose_proof_read_fails_after_the_rename_keeps_the_new_record_and_the_removal_then_runs_to_its_end()
+ {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        token::current_is_administrator().unwrap(),
+        "the case must run elevated"
+    );
+    let before = snapshot();
+    assert_clean(&before);
+    let paths = Paths::system().unwrap();
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..6];
+    let first_name = format!("krperson{id}a");
+    let second_name = format!("krperson{id}b");
+    let first = account::create(&first_name).expect("the first person's account is made");
+    let second = account::create(&second_name).expect("the second person's account is made");
+    let (first_text, second_text) = (first.to_text().unwrap(), second.to_text().unwrap());
+
+    // A good installation for the first person.
+    let (code, text) = run_setup(&["install", "--person", &first_text], &[], None);
+    println!("--- kr-boundary-setup install -> {code:?}\n{text}");
+    assert_eq!(code, Some(0), "the installation succeeds: {text}");
+    let installed = Manifest::load(&paths.manifest).unwrap();
+    assert!(installed.persons.contains(&first_text));
+    assert!(!installed.persons.contains(&second_text));
+
+    // A repair that enrols the second person, whose first write of the manifest renames for real
+    // and then cannot read what stands at the record's name.
+    let options = Options {
+        payload: bin_directory().join("payload"),
+        person: Some(second_text.clone()),
+    };
+    forced::fail_the_next("proof");
+    let result = install::install(&paths, &options, true);
+    forced::fail_the_next("none");
+    let failure = result
+        .expect_err("the forced failure of the read stops the repair")
+        .to_string();
+    observed(&format!("repair: install returned: {failure}"));
+    assert!(
+        failure.contains("was not marked for removal and was left where the rename put it"),
+        "the failure does not say that the record was left: {failure}"
+    );
+
+    // The record at its name is readable and is the new one: it lists the second person, whom the
+    // earlier record did not.
+    let kept = Manifest::load(&paths.manifest)
+        .expect("the manifest at its name is readable after the failed read");
+    assert!(
+        kept.persons.contains(&second_text),
+        "the manifest at its name is not the one that the repair wrote: {kept:?}"
+    );
+    assert!(
+        kept.persons.contains(&first_text),
+        "the new manifest lost the first person: {kept:?}"
+    );
+
+    // The administrator's removal runs to its end and the computer is as it was.
+    let (code, text) = run_setup(&["remove"], &[], None);
+    println!("--- kr-boundary-setup remove -> {code:?}\n{text}");
+    let _ = account::delete(&first_name);
+    let _ = account::delete(&second_name);
+    assert_eq!(code, Some(0), "the removal succeeds: {text}");
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the removal the computer is as it was: {text}"
+    );
 }
