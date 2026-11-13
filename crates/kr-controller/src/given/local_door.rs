@@ -143,6 +143,8 @@ impl<'a> Standing<'a> {
 /// "Not shown" is `OUTCOME_UNKNOWN`. Every reply made here may be a result, so it is written under
 /// the local owner's lease.
 pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>) -> DoorReply {
+    #[cfg(feature = "testing")]
+    standing.controller.stop_before_a_reply_is_told().await;
     let Settled { given, withdrew } = settled;
     let origin = given.origin();
     let answer = given.into_answer();
@@ -165,14 +167,15 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
                 Err(refusal) => refused_with(request_id, &refusal),
             }
         }
-        Origin::Fresh => match own_withdrawal_or_standing(controller, connection_id, withdrew).await
-        {
-            Ok(()) => answer,
-            // The check's refusal says nothing was done, which is true of a refusal and false of a
-            // result, or of any word that does not say so.
-            Err(_) if may_have_taken_effect(&answer) => not_shown(),
-            Err(refusal) => refused_with(request_id, &refusal),
-        },
+        Origin::Fresh => {
+            match own_withdrawal_or_standing(controller, connection_id, withdrew).await {
+                Ok(()) => answer,
+                // The check's refusal says nothing was done, which is true of a refusal and false of a
+                // result, or of any word that does not say so.
+                Err(_) if may_have_taken_effect(&answer) => not_shown(),
+                Err(refusal) => refused_with(request_id, &refusal),
+            }
+        }
     };
     DoorReply {
         frame,
@@ -246,6 +249,8 @@ impl<'a> ReplySink<'a> {
             request_id,
             carries_a_result,
         } = reply;
+        #[cfg(feature = "testing")]
+        controller.note_a_reply_written(request_id, &frame);
         if carries_a_result {
             controller
                 .write_answer(self.writer, self.kind, &frame, method, request_id)

@@ -909,8 +909,11 @@ async fn at_the_local_door(
     mutation: &MutationRequest,
     method: Method,
 ) -> kr_protocol::envelope::ControlFrame {
-    controller
-        .write_method(
+    told_now(
+        controller,
+        connection_id,
+        mutation,
+        controller.write_method(
             actor_id,
             mutation,
             method,
@@ -918,9 +921,9 @@ async fn at_the_local_door(
             None,
             Some(super::the_fence_at_every_effect::accepted(controller)),
             controller.admitted_revision(connection_id).ok(),
-        )
-        .await
-        .into_answer_for_test()
+        ),
+    )
+    .await
 }
 
 /// What the local door tells a copy that a service read from its record and withheld, whatever the
