@@ -218,6 +218,14 @@ export const CLICK_WITHIN = 3000
 /** How far a press may move, and how far its click may lie from it, and still be one tap, in CSS pixels: the platforms' touch slop is 8 to 10. */
 export const SLOP = 10
 
+/**
+ * How far the engine may report a tap's click from the press, in CSS pixels. Chromium moves the click of a
+ * tap on plain text toward a nearby link by up to 10 px before it sends it (measured: a press 22 px under a
+ * short link's words, at the edge of its area, came as a click 10.007 px from the press), and rounds the
+ * point; the slop is the platforms' limit for a finger that moves, and this is twice it.
+ */
+export const CLICK_AWAY = 2 * SLOP
+
 const STAND = { kind: 'stand' } as const
 
 /**
@@ -227,8 +235,8 @@ const STAND = { kind: 'stand' } as const
  * A click that names a link or a control stands alone. A trusted click that names neither, a click on
  * plain text, also opens a link when a touch or a pen pressed that link's words or the room beside
  * them: the press did not move beyond the slop; the click has a detail of 1, comes after the pointer's
- * up and within `CLICK_WITHIN` of it, and lies within the slop of the press, since the engine reports
- * the point of the same tap, rounded or adjusted by a pixel or two; and the nearest-words rule, run again
+ * up and within `CLICK_WITHIN` of it, and lies within `CLICK_AWAY` of the press, since the engine reports
+ * the point of the same tap, rounded or moved toward a nearby link; and the nearest-words rule, run again
  * at the press's own point in the layout as it is now, names the same element, opening the same
  * destination, as it did at the press's start. The look at the press and the open at the click are
  * therefore one function of one point. A mouse's click on plain text opens nothing, as on a desktop.
@@ -242,7 +250,7 @@ export function decide<L>(press: Press<L> | null, click: Click, layout: (at: Poi
   if (press === null || (press.pointerType !== 'touch' && press.pointerType !== 'pen')) return STAND
   if (press.moved || press.start === null || press.upAt === null) return STAND
   if (click.at < press.upAt || click.at - press.upAt > CLICK_WITHIN) return STAND
-  if (Math.hypot(click.point.x - press.at.x, click.point.y - press.at.y) > SLOP) return STAND
+  if (Math.hypot(click.point.x - press.at.x, click.point.y - press.at.y) > CLICK_AWAY) return STAND
   const { links, reach, bounds } = layout(press.at)
   const index = linkAt(press.at, links, reach, bounds)
   const chosen = index === null ? undefined : links[index]
