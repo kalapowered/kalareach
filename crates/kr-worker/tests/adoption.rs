@@ -385,13 +385,12 @@ fn bindings_held(setup: &Setup) -> Vec<(BrokerBindingId, ApplicationInstanceId)>
         .collect()
 }
 
-/// KR-REQ-11.13: a program is bound by its adoption and by nothing else while it is adopted. A
-/// snapshot of admissions that the worker applies between the moment the adoption records its
-/// instance and the moment it binds it binds nothing of that instance, so the broker never holds
-/// a binding for the program that the adoption then forgets, and the program ends with exactly
-/// one binding, the one its adoption made.
+/// KR-REQ-11.13: a snapshot of admissions applied between an adoption recording its instance and
+/// binding it binds the instance, and the adoption leaves it with that binding: the broker holds
+/// one binding for the program throughout, the program is adopted once, and nothing that has
+/// registered the binding is left with one that is gone.
 #[test]
-fn kr_req_11_13_a_snapshot_applied_during_an_adoption_binds_nothing_of_the_instance_adopted() {
+fn kr_req_11_13_a_snapshot_applied_during_an_adoption_leaves_the_program_the_binding_it_made() {
     kr_worker::plugin_link_trace::start();
     let setup = Setup::new();
     let started = setup.start();
@@ -403,7 +402,8 @@ fn kr_req_11_13_a_snapshot_applied_during_an_adoption_binds_nothing_of_the_insta
         arrived
             .recv_timeout(LIVENESS)
             .expect("the adoption reaches the moment between recording and binding its instance");
-        // The next snapshot the control daemon hands over: a later round, so a newer frame.
+        // The next snapshot the control daemon hands over: a later round, so a newer frame than
+        // the one the adoption decided at.
         setup.admit_only(2, &[0]);
         let during = bindings_held(&setup);
         release.send(()).expect("the adoption is let go");
@@ -412,18 +412,21 @@ fn kr_req_11_13_a_snapshot_applied_during_an_adoption_binds_nothing_of_the_insta
     });
 
     let account = kr_worker::plugin_link_trace::account().unwrap_or_default();
-    assert!(
-        during.is_empty(),
-        "a snapshot bound an instance whose adoption had not bound it: during the adoption \
-         {during:?}, after it {after:?}; the broker's account: {account}"
+    assert_eq!(
+        during.len(),
+        1,
+        "the snapshot binds the instance recorded: {during:?}; the broker's account: {account}"
     );
-    assert_eq!(told.len(), 1, "the program is adopted: {told:?}");
+    assert_eq!(told.len(), 1, "the program is adopted once: {told:?}");
     let instance = told[0].application_instance_id;
+    assert_eq!(
+        after, during,
+        "the program ends with the binding the snapshot made; the broker's account: {account}"
+    );
     assert_eq!(
         after.iter().map(|(_, bound)| *bound).collect::<Vec<_>>(),
         [instance],
-        "the program ends with one binding, for the instance adopted: {after:?}; the broker's \
-         account: {account}"
+        "and that binding is for the instance adopted: {after:?}"
     );
     started.end();
 }

@@ -510,12 +510,14 @@ impl Adoptions {
             {
                 return Vec::new();
             }
-            // Adopted and bound in one step: a bind refused leaves nothing adopted. A program that
-            // several packages recognise equally well is adopted bound to none of them.
+            // Adopted and bound in one step: a bind refused leaves nothing adopted, unless a
+            // snapshot applied meanwhile has bound the instance, which keeps that binding. A
+            // program that several packages recognise equally well is adopted bound to none of
+            // them.
             #[cfg(feature = "testing")]
             stop_if_armed(&self.binding_pause);
             if let Recognition::Package(admitted) = &recognition {
-                let bound = self.broker.bind(
+                let bound = self.broker.bind_adopted(
                     kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
                     application_instance_id,
                     admitted.package_digest,
@@ -527,7 +529,6 @@ impl Adoptions {
                     now,
                 );
                 if bound.is_err() {
-                    let _ = self.broker.end(application_instance_id);
                     return Vec::new();
                 }
             }

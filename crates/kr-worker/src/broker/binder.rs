@@ -385,7 +385,8 @@ impl Broker {
     /// Returns [`BrokerError::PreconditionFailed`] when the admissions held are not at `frame`,
     /// [`BrokerError::PermissionDenied`] when they do not admit `package_digest`,
     /// [`BrokerError::UnknownSubject`] when the instance is not registered,
-    /// [`BrokerError::InvalidArgument`] when the identifier is bound to another package,
+    /// [`BrokerError::InvalidArgument`] when the identifier is bound to another package or the
+    /// instance is bound already by another binding, since an instance has one binding,
     /// [`BrokerError::StoreFault`] when the store fails under the record's write, and
     /// [`BrokerError::LedgerUnavailable`] while the journal is faulted.
     pub fn bind(
@@ -410,6 +411,58 @@ impl Broker {
             crate::plugin_link_trace::bind_refused(application_instance_id);
         }
         bound
+    }
+
+    /// Binds the instance an adoption has just recorded, as [`Self::bind`] binds it, and gives the
+    /// adoption up where that cannot be done.
+    ///
+    /// A snapshot of admissions applied between the adoption recording its instance and binding it
+    /// binds that instance itself, and the frame the adoption decided at is then no longer the one
+    /// held. An instance that is bound by then is left with the binding it has: it is the later
+    /// decision, and the link may be registering it already, so ending the instance to bind it
+    /// again at the next look would take the binding away in the middle of its registration. An
+    /// instance that is not bound ends, with nothing of the adoption left, and the next look
+    /// adopts the program again. The refusal and the end are one step under the broker's lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::bind`] refused with, where the instance has ended because of it.
+    pub fn bind_adopted(
+        &self,
+        binding_id: BrokerBindingId,
+        application_instance_id: ApplicationInstanceId,
+        package_digest: Digest256,
+        frame: FrameId,
+        executable: MatchedExecutable,
+        now: TimestampMs,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let refused = match state.bind_admitted(
+            binding_id,
+            application_instance_id,
+            package_digest,
+            frame,
+            executable,
+            now,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(refused) => refused,
+        };
+        #[cfg(feature = "testing")]
+        crate::plugin_link_trace::bind_refused(application_instance_id);
+        if state
+            .bindings
+            .values()
+            .any(|held| held.application_instance_id == application_instance_id)
+        {
+            return Ok(());
+        }
+        let ended = state.end_instance(application_instance_id);
+        drop(state);
+        if ended {
+            self.notices_ready.notify_one();
+        }
+        Err(refused)
     }
 
     /// Derives one live binding again as [`Self::bind`] derives it, for an installation whose
@@ -520,6 +573,18 @@ impl BrokerState {
             return Err(BrokerError::invalid(format!(
                 "binding {binding_id} runs another package, and an identifier names one package \
                  for as long as it is bound"
+            )));
+        }
+        // Every bind goes through here, so this is where an instance comes to have one binding:
+        // what a binding is registered for, observed through and granted by is its instance's, and
+        // a second binding for the instance would split that between two.
+        if let Some(held) = self.bindings.values().find(|held| {
+            held.application_instance_id == application_instance_id && held.binding_id != binding_id
+        }) {
+            return Err(BrokerError::invalid(format!(
+                "{application_instance_id} is bound already, by binding {}, and an instance has \
+                 one binding",
+                held.binding_id
             )));
         }
         let granted = capabilities(&package.grants);

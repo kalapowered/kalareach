@@ -262,6 +262,58 @@ type Refusal = (
     fn(&BrokerError) -> bool,
 );
 
+/// KR-REQ-11.13: an instance has one binding. Another binding for an instance that is bound is
+/// refused whichever package it names, the binding the instance has stands as it was, and the
+/// same binding made again is that one binding made again.
+#[test]
+fn kr_req_11_13_an_instance_has_one_binding() {
+    let worker = Worker::open();
+    let claude = worker.claude_code();
+    let gemini = worker.package(&fixture::Shape::gemini_cli(&[]));
+    let frame = worker.admit(
+        1,
+        vec![testing::admitted(&claude), testing::admitted(&gemini)],
+    );
+    worker.register(1);
+    worker.register(2);
+    worker
+        .bind(1, 1, claude.package_digest, frame)
+        .expect("the first binding of the instance binds");
+
+    for package in [&claude, &gemini] {
+        let refused = worker
+            .bind(2, 1, package.package_digest, frame)
+            .expect_err("a second binding for the instance is refused");
+        assert!(
+            matches!(refused, BrokerError::InvalidArgument(_)),
+            "{refused}"
+        );
+    }
+    let held = |worker: &Worker| -> Vec<(BrokerBindingId, ApplicationInstanceId)> {
+        worker
+            .broker
+            .live_bindings()
+            .into_iter()
+            .map(|live| (live.binding_id, live.application_instance_id))
+            .collect()
+    };
+    assert_eq!(held(&worker), [(binding(1), instance(1))]);
+
+    worker
+        .bind(1, 1, claude.package_digest, frame)
+        .expect("the same binding made again binds");
+    worker
+        .bind(2, 2, gemini.package_digest, frame)
+        .expect("another instance has a binding of its own");
+    let mut now = held(&worker);
+    now.sort();
+    assert_eq!(
+        now,
+        [(binding(1), instance(1)), (binding(2), instance(2))],
+        "one binding for each instance"
+    );
+}
+
 /// KR-REQ-11.13: a binding is made only from the admissions this worker holds, at the frame they
 /// are at, for a package they admit; nothing a caller describes is bound. The binding and its row
 /// carry the release it holds and where that came from, the frame, the program it was made for

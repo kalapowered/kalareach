@@ -1667,25 +1667,11 @@ impl Broker {
     /// Returns true when an instance was registered under `application_instance_id` and its
     /// record was removed.
     pub fn end(&self, application_instance_id: ApplicationInstanceId) -> bool {
-        let mut state = self.state();
-        let Some(ended) = state.instances.remove(&application_instance_id) else {
-            return false;
-        };
-        #[cfg(feature = "testing")]
-        crate::plugin_link_trace::instance_ended(application_instance_id);
-        let server = ServerOf::of(&ended);
-        if let Some(agent) = ended.process {
-            release_agent_job(&state.instances, &agent.process);
+        let ended = self.state().end_instance(application_instance_id);
+        if ended {
+            self.notices_ready.notify_one();
         }
-        state.tokens.withdraw(application_instance_id);
-        let claims = state.profiles.release(application_instance_id);
-        state.hold_until_retired(application_instance_id, server, claims);
-        state.capabilities.forget(application_instance_id);
-        state.forget_instance(application_instance_id, kr_ipc::now_ms());
-        state.application_changed();
-        drop(state);
-        self.notices_ready.notify_one();
-        true
+        ended
     }
 
     /// Gives back everything one launch took, because it failed before it was committed.
@@ -4642,6 +4628,27 @@ impl BrokerState {
         self.settle_owed_rows(now);
         self.reinstall(now);
         Ok(finished)
+    }
+
+    /// Ends an instance under this lock, with what it holds. See [`Broker::end`]. Returns true when
+    /// an instance was registered under the identifier.
+    pub(super) fn end_instance(&mut self, application_instance_id: ApplicationInstanceId) -> bool {
+        let Some(ended) = self.instances.remove(&application_instance_id) else {
+            return false;
+        };
+        #[cfg(feature = "testing")]
+        crate::plugin_link_trace::instance_ended(application_instance_id);
+        let server = ServerOf::of(&ended);
+        if let Some(agent) = ended.process {
+            release_agent_job(&self.instances, &agent.process);
+        }
+        self.tokens.withdraw(application_instance_id);
+        let claims = self.profiles.release(application_instance_id);
+        self.hold_until_retired(application_instance_id, server, claims);
+        self.capabilities.forget(application_instance_id);
+        self.forget_instance(application_instance_id, kr_ipc::now_ms());
+        self.application_changed();
+        true
     }
 
     /// Refuses an identifier another path already holds.
