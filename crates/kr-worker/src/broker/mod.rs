@@ -1721,6 +1721,9 @@ impl Broker {
     /// interpreted carries that package's meaning. The same package may bind it again, which
     /// replaces its grants and trust and drops its actions and its fault state.
     ///
+    /// The rule that an instance has one binding is [`Broker::bind`]'s, for the bindings a shipped
+    /// build makes; a test's own descriptor may be bound to an instance beside another binding.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Trust`] when a trust record breaks a rule,
