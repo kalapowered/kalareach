@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { childArguments, childEnvironment, refusal } from './desktop.mjs'
+import { buildPlan, childArguments, childEnvironment, refusal } from './desktop.mjs'
 
 let failures = 0
 
@@ -133,22 +133,26 @@ for (const argv of [
 ]) {
   held(`\`pnpm desktop ${argv.join(' ')}\` is refused on Windows, since its link has no options that leave the static runtime out`, 'true', refused(argv, 'win32'))
 }
-// A target given by the environment is held to the same rule, in any spelling of the name on Windows.
-for (const [platform, name, value, expected] of [
-  ['win32', 'CARGO_BUILD_TARGET', 'i686-pc-windows-msvc', 'true'],
-  ['win32', 'cargo_build_target', 'i686-pc-windows-msvc', 'true'],
-  ['win32', 'CARGO_BUILD_TARGET', 'x86_64-pc-windows-msvc', 'false'],
-  ['win32', 'CARGO_BUILD_TARGET', 'aarch64-pc-windows-msvc', 'false'],
-  ['win32', 'CARGO_BUILD_TARGET', '', 'false'],
-  ['darwin', 'CARGO_BUILD_TARGET', 'x86_64-pc-windows-msvc', 'true'],
-  ['linux', 'CARGO_BUILD_TARGET', 'aarch64-pc-windows-msvc', 'true'],
-  ['darwin', 'CARGO_BUILD_TARGET', 'aarch64-apple-darwin', 'false'],
-  ['linux', 'CARGO_BUILD_TARGET', 'x86_64-unknown-linux-gnu', 'false']
+// The command line tool does not read `CARGO_BUILD_TARGET`, and cargo builds for it into the directory of
+// that target, so the bundle would be made from the program of another build: it is refused on every
+// platform, with any value, an empty one included, and in any spelling of the name on Windows.
+for (const [platform, name, value] of [
+  ['win32', 'CARGO_BUILD_TARGET', 'i686-pc-windows-msvc'],
+  ['win32', 'cargo_build_target', 'x86_64-pc-windows-msvc'],
+  ['win32', 'CARGO_BUILD_TARGET', 'aarch64-pc-windows-msvc'],
+  ['win32', 'Cargo_Build_Target', ''],
+  ['darwin', 'CARGO_BUILD_TARGET', 'x86_64-pc-windows-msvc'],
+  ['darwin', 'CARGO_BUILD_TARGET', 'aarch64-apple-darwin'],
+  ['linux', 'CARGO_BUILD_TARGET', 'x86_64-unknown-linux-gnu'],
+  ['linux', 'CARGO_BUILD_TARGET', '']
 ]) {
   const answer = refusal(['build'], platform, { PATH: 'x', [name]: value })
-  held(`${name}=${JSON.stringify(value)} on ${platform} is refused: ${expected}`, expected, String(answer !== null))
-  if (expected === 'true') held(`the refusal for ${name} names the variable`, 'true', String(answer.includes('CARGO_BUILD_TARGET')))
+  held(`${name}=${JSON.stringify(value)} on ${platform} is refused`, 'true', String(answer !== null))
+  held(`the refusal for ${name} on ${platform} names the variable`, 'true', String(answer?.includes('CARGO_BUILD_TARGET') ?? false))
 }
+// Names that only look like it are no matter, and neither is the variable's absence.
+held('a variable that contains it is no matter', 'false', refused(['build'], 'linux', { CARGO_BUILD_TARGET_DIR: 'x', MY_CARGO_BUILD_TARGET: 'y' }))
+held('on macOS the name is read as it is spelled', 'false', refused(['build'], 'darwin', { cargo_build_target: 'x' }))
 
 // What follows a bare `--` goes to cargo, whose own `--config` can set the environment and the flags of the
 // build (the variable that the entry gives, `env.STATIC_VCRUNTIME` forced to `true`, among them) and whose
@@ -178,9 +182,10 @@ held(
   JSON.stringify(childArguments(['build', '--config', '{"build":{"runner":"cargo-xwin"}}', '--', '--locked']))
 )
 
-// On Windows an environment that gives the compiler flags replaces the link options that keep the static
-// runtime out of the link, in every spelling of the name, and with any value, an empty one included
-// (cargo then takes no flags from its configuration either).
+// On Windows an environment that gives the compiler flags is refused, in every spelling of the name and
+// with any value, an empty one included. `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` replace the link
+// options that keep the static runtime out of the link (an empty value leaves cargo no flags from its
+// configuration either); the other two add to them or are ignored, and are refused as a second source.
 for (const name of [
   'RUSTFLAGS',
   'rustflags',
@@ -199,6 +204,21 @@ for (const name of [
 }
 for (const env of [{}, { PATH: 'x', RUSTC_WRAPPER: 'sccache', CARGO_BUILD_JOBS: '4', CARGO_TARGET_DIR: 'x', STATIC_VCRUNTIME: 'true' }]) {
   held('an environment with no compiler flags is run on Windows', 'false', refused(['build'], 'win32', env))
+}
+
+// What a run does is what the plan says: the arguments and the environment that the command line tool is
+// started with, and nothing of them for a run that is refused.
+{
+  const plan = buildPlan(['build', '--bundles', 'nsis'], 'win32', { PATH: 'C:\\x', STATIC_VCRUNTIME: 'true' })
+  held('a plan for Windows starts the build with cargo as its runner', JSON.stringify(['build', '--runner', 'cargo', '--bundles', 'nsis']), JSON.stringify(plan.args))
+  held('a plan for Windows starts the build with the variable false', 'false', plan.env?.STATIC_VCRUNTIME)
+  held('a plan for Windows keeps the rest of the environment', 'C:\\x', plan.env?.PATH)
+  held('a plan for Windows says the value it replaced', 'true', String(plan.said?.includes('`true`') ?? false))
+  held('a plan for a run that is allowed has no problem', 'null', String(plan.problem))
+  const refusedPlan = buildPlan(['build', '--no-bundle'], 'darwin', { PATH: '/usr/bin' })
+  held('a refused run has its reason and starts nothing', 'true', String(typeof refusedPlan.problem === 'string' && refusedPlan.args === undefined && refusedPlan.env === undefined))
+  const mac = buildPlan(['build', '--no-sign'], 'darwin', { PATH: '/usr/bin' })
+  held('a plan for macOS gives cargo as the runner and the environment as it is', JSON.stringify([['build', '--runner', 'cargo', '--no-sign'], { PATH: '/usr/bin' }, null]), JSON.stringify([mac.args, mac.env, mac.said]))
 }
 
 // On Windows the build gets `STATIC_VCRUNTIME=false`, whatever the caller's environment held.
@@ -266,7 +286,7 @@ for (const platform of ['darwin', 'linux']) {
   for (const [argv, said] of [
     [['dev'], 'runs `tauri build` and nothing else'],
     [['build', '--no-bundle'], '`--no-bundle` leaves none to read'],
-    [['build', '--runner', 'cargo-xwin'], 'a runner other than cargo']
+    [['build', '--runner', 'cargo-xwin'], 'gives the build cargo as its runner']
   ]) {
     const run = spawnSync(process.execPath, [command, ...argv], { encoding: 'utf8' })
     held(`\`pnpm desktop ${argv.join(' ')}\` ends with 2`, '2', String(run.status))
