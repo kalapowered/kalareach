@@ -207,7 +207,6 @@ const PRESS_MESSAGES: readonly string[] = [
 
 /** More messages for the cases of a tap: plain words on the line under a link, and a link in the middle of a line. */
 const NEXT_LINE = ['[the lead link](https://example.org/lead)  \nplain words on the next line, inside the reach of the link above.']
-const MIDDLE = ['Some words before [a middle link](https://example.org/middle) and words that follow it to the end of the line.']
 /** A link that starts a paragraph, with plain words after it that lie inside the link's reach. */
 const TEXT_AFTER_LINK = ['[docs](https://example.org/docs) and more words follow the link on this line, which ends the paragraph.']
 const DOCS = 'https://example.org/docs'
@@ -227,13 +226,42 @@ interface Clicked {
   readonly detail: number
   /** What the click names: `link <destination>`, `control <label>` or `text <tag>`. */
   readonly named: string
+  readonly x: number
+  readonly y: number
 }
 
-/** Records every click in the page from now on, in `window.clicks`. */
+/** What a pointer down found: the link lit then (null for none), what it landed on and where. */
+interface Look {
+  readonly lit: string | null
+  readonly target: string
+  readonly x: number
+  readonly y: number
+}
+
+/**
+ * Records every click in the page from now on, in `window.clicks`, and the link that is lit at each
+ * pointer down (null for none), in `window.looks`. The look is read by a listener that was added after
+ * the pane's own, so the pane's handler has set it by then.
+ */
 async function watchClicks(page: Page): Promise<void> {
   await page.evaluate(() => {
     const clicks: Clicked[] = []
     ;(window as unknown as { clicks: Clicked[] }).clicks = clicks
+    const looks: Look[] = []
+    ;(window as unknown as { looks: Look[] }).looks = looks
+    document.addEventListener(
+      'pointerdown',
+      (event) => {
+        const target = event.target instanceof Element ? event.target : null
+        looks.push({
+          lit: document.querySelector('.md-link[data-pressed]')?.getAttribute('title') ?? null,
+          target: `${target?.tagName.toLowerCase() ?? '-'}${target?.className ? `.${String(target.className)}` : ''}`,
+          x: event.clientX,
+          y: event.clientY
+        })
+      },
+      true
+    )
     const nameOf = (target: EventTarget | null): string => {
       if (!(target instanceof Element)) return 'none'
       const link = target.closest('.md-link')
@@ -246,7 +274,7 @@ async function watchClicks(page: Page): Promise<void> {
       window.addEventListener(
         'click',
         (event) => {
-          clicks.push({ phase, trusted: event.isTrusted, detail: event.detail, named: nameOf(event.target) })
+          clicks.push({ phase, trusted: event.isTrusted, detail: event.detail, named: nameOf(event.target), x: event.clientX, y: event.clientY })
         },
         phase === 'capture'
       )
@@ -256,6 +284,7 @@ async function watchClicks(page: Page): Promise<void> {
 
 const clicksSeen = (page: Page): Promise<Clicked[]> =>
   page.evaluate(() => (window as unknown as { clicks: Clicked[] }).clicks.slice())
+const looksSeen = (page: Page): Promise<Look[]> => page.evaluate(() => (window as unknown as { looks: Look[] }).looks.slice())
 
 /** The clicks the browser made itself, seen before any handler: what the page was given. */
 const browsers = (clicks: readonly Clicked[]): Clicked[] => clicks.filter((click) => click.phase === 'capture' && click.trusted)
@@ -308,6 +337,11 @@ async function pressPage(
     { messages: options.only ?? [...PRESS_MESSAGES, ...(options.extra ?? [])], session: SESSION, shipped: options.shipped ?? false }
   )
   await page.locator('.m-node .md-link').last().waitFor({ state: 'attached' })
+  // iOS and Android draw a scroll indicator over the content and give it no taps. The desktop engine's
+  // overlay scroll bar keeps a strip at the pane's right edge that takes the hit and sends no click (a tap
+  // there gets none whichever listeners the page has), and no property of the pane tells the page where
+  // it is, so the cases show the page without it.
+  await page.addStyleTag({ content: '.m-pane { scrollbar-width: none; }' })
   await watchClicks(page)
 }
 
@@ -388,18 +422,40 @@ async function tapNow(page: Page, x: number, y: number): Promise<void> {
   await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
 }
 
-/** What one tap did: the clicks the page saw, and the links the page opened, since the tap began. */
+/**
+ * What one tap did: the clicks the page saw, the links the page opened, and the link lit at the press
+ * (null for none), since the tap began. A tap that gets no click from the browser fails here: no point
+ * is left out.
+ */
 async function tapAndRead(
   page: Page,
   x: number,
   y: number,
   tapper: (page: Page, x: number, y: number) => Promise<void> = tap
-): Promise<{ clicks: Clicked[]; opened: string[] }> {
+): Promise<{ clicks: Clicked[]; opened: string[]; lit: (string | null)[]; presses: Look[] }> {
   const clicksBefore = (await clicksSeen(page)).length
   const openedBefore = (await openedLinks(page)).length
+  const looksBefore = (await looksSeen(page)).length
   await tapper(page, x, y)
-  await expect.poll(async () => browsers((await clicksSeen(page)).slice(clicksBefore)).length, `a click for a tap at ${String(Math.round(x))}, ${String(Math.round(y))}`).toBeGreaterThan(0)
-  return { clicks: (await clicksSeen(page)).slice(clicksBefore), opened: (await openedLinks(page)).slice(openedBefore) }
+  try {
+    await expect.poll(async () => browsers((await clicksSeen(page)).slice(clicksBefore)).length, `a click for a tap at ${String(Math.round(x))}, ${String(Math.round(y))}`).toBeGreaterThan(0)
+  } catch (error) {
+    // Say what the point is: the element there and the boxes around it.
+    const where = await page.evaluate(
+      ([px, py]) => {
+        const box = (element: Element | null): string => {
+          const r = element?.getBoundingClientRect()
+          return r === undefined ? '-' : `${String(r.left)}..${String(r.right)} x ${String(r.top)}..${String(r.bottom)}`
+        }
+        const hit = document.elementFromPoint(px ?? 0, py ?? 0)
+        const pane = document.querySelector<HTMLElement>('.m-pane')
+        return `element ${hit?.tagName ?? '-'}.${hit?.className ?? ''} (${box(hit)}), its parent ${hit?.parentElement?.tagName ?? '-'}.${hit?.parentElement?.className ?? ''} (${box(hit?.parentElement ?? null)}), pane box ${box(pane)}, client ${String(pane?.clientWidth)} x ${String(pane?.clientHeight)}, scroll bar ${String((pane?.offsetWidth ?? 0) - (pane?.clientWidth ?? 0))}`
+      },
+      [x, y]
+    )
+    throw new Error(`${(error as Error).message}; ${where}`, { cause: error })
+  }
+  return { clicks: (await clicksSeen(page)).slice(clicksBefore), opened: (await openedLinks(page)).slice(openedBefore), lit: (await looksSeen(page)).slice(looksBefore).map((look) => look.lit), presses: (await looksSeen(page)).slice(looksBefore) }
 }
 
 const openedLinks = (page: Page): Promise<string[]> => page.evaluate(() => window.krTestHost?.openedLinks.slice() ?? [])
@@ -768,6 +824,8 @@ const EDGES = [
   ['at the start of a line', 'https://example.org/at-start', ['[1](https://example.org/at-start) then plain words after the link at the start of the line.']],
   ['at the end of a line', 'https://example.org/at-end', ['Plain words before the link at the end of the line, [2](https://example.org/at-end)']]
 ] as const
+/** A link in the middle of a line whose label does not wrap at the largest text size, so that the area is one line's. */
+const AREA_MIDDLE = ['Some words before [mid link](https://example.org/middle) and words that follow it to the end of the line.']
 const LAST = 'https://example.org/last-line'
 const LAST_LINE = 'The last words of the conversation end with [a link](https://example.org/last-line)'
 const CLOSE = ['[the first close link](https://example.org/close-1)  \n[the second close link](https://example.org/close-2)']
@@ -811,64 +869,164 @@ function ringPoints(words: Words, pane: { left: number; top: number; right: numb
   return points
 }
 
-/**
- * The area the page's handler gives a link, measured by the pressed look: the extent, along the line
- * through the words' middle and along the column through it, of the points at which a press lights
- * the link. What lights at a press is what opens at a tap.
- */
-async function areaOf(page: Page, href: string, words: Words): Promise<{ left: number; right: number; top: number; bottom: number; width: number; height: number }> {
-  return page.evaluate(
-    ({ target, x, y }) => {
-      const pane = (document.querySelector('.m-pane') as HTMLElement).getBoundingClientRect()
-      const lit = (px: number, py: number): boolean => {
-        const element = document.elementFromPoint(px, py)
-        if (!element) return false
-        const init = { bubbles: true, cancelable: true, clientX: px, clientY: py, pointerId: 77, pointerType: 'touch', isPrimary: true, button: 0 }
-        element.dispatchEvent(new PointerEvent('pointerdown', init))
-        const answer = document.querySelector('.md-link[data-pressed]')?.getAttribute('title') === target
-        document.dispatchEvent(new PointerEvent('pointercancel', init))
-        return answer
-      }
-      const extent = (from: number, to: number, at: (n: number) => boolean): [number, number] => {
-        let low = Number.POSITIVE_INFINITY
-        let high = Number.NEGATIVE_INFINITY
-        for (let n = Math.floor(from); n < Math.ceil(to); n += 1) {
-          if (at(n + 0.5)) {
-            low = Math.min(low, n)
-            high = Math.max(high, n + 1)
-          }
-        }
-        return [low, high]
-      }
-      const [left, right] = extent(pane.left, pane.right, (n) => lit(n, y))
-      const [top, bottom] = extent(pane.top, pane.bottom, (n) => lit(x, n))
-      return { left, right, top, bottom, width: right - left, height: bottom - top }
-    },
-    { target: href, x: words.x, y: words.y }
-  )
+/** What a tap at one point did, as the area measure reads it: which link it opened, which it lit, and what it met. */
+interface Sampled {
+  readonly opened: string | null
+  readonly lit: string | null
+  readonly note: string
+}
+
+/** What the area measure found. Sizes are in px; the lists are points as offsets from the words' middle. */
+interface Area {
+  readonly left: number
+  readonly right: number
+  readonly top: number
+  readonly bottom: number
+  readonly width: number
+  readonly height: number
+  readonly taps: number
+  /** Taps that opened another link. */
+  readonly different: string[]
+  /** Taps whose click named plain text, so the page's handler decided, at which the look at the press and the open at the release differed. */
+  readonly unlike: string[]
+  /** Taps whose click the browser sent to an element, at which the look lit another link than that one. */
+  readonly conflicts: string[]
+  /** Points inside the area that lights at which the tap opened nothing. */
+  readonly holes: string[]
+  /** Points between the area that lights and the browser's own adjustment further out at which the tap opened nothing. */
+  readonly gaps: string[]
+  /** How far the area that opens reaches past the area that lights on each side (px): the browser's own touch adjustment opens a link that the look did not light. */
+  readonly ring: { readonly left: number; readonly right: number; readonly top: number; readonly bottom: number }
+  /** The taps near the two ends of the area that opens, with what each lit and opened (L lit, O opened), to read a short side by. */
+  readonly edges: string[]
 }
 
 /**
- * The points of `ringPoints` at which a tap opened no link, as text. A tap on the pane's own bare
- * area (no message there) gets no click from WebKit, so no handler of the page can act on it: those
- * points are left out in WebKit and counted in the case's annotations. Chromium gives a click there.
+ * The area in which a tap opens a link, measured by taps that open: the extent, along the line through
+ * the words' middle and along the column through it, of the points at which a touch's tap opens `href`,
+ * and the extent in which the look lights it. Every tap is a real tap in the pane at a whole pixel
+ * (WebKit reports whole pixels) and every one gets the browser's click. Each extent is found from taps
+ * 4 px apart and refined to the pixel at each end, inside the pane. At a point where the click names plain
+ * text the page's handler decides, and the look at the press is the open at the release (`unlike`). Where
+ * the browser's click names an element, the browser decides: the look must have lit nothing or that same
+ * link (`conflicts`), and the ring that the open reaches past the look is measured (`ring`).
  */
-async function missedInRing(page: Page, words: Words, size: number): Promise<string[]> {
+async function areaOf(page: Page, href: string, words: Words, size: number): Promise<Area> {
   const pane = await paneBox(page)
-  const webkit = page.context().browser()?.browserType().name() === 'webkit'
-  const missed: string[] = []
-  const bare: string[] = []
-  for (const point of ringPoints(words, pane, size)) {
-    const onThePane = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.classList.contains('m-pane') ?? false, [point.x, point.y])
-    const label = `${String(Math.round(point.x - words.x))}, ${String(Math.round(point.y - words.y))}`
-    if (webkit && onThePane) {
-      bare.push(label)
-      continue
-    }
-    const opened = await tapAt(page, point.x, point.y)
-    if (opened === null) missed.push(label)
+  const different: string[] = []
+  const unlike: string[] = []
+  const conflicts: string[] = []
+  const holes: string[] = []
+  const gaps: string[] = []
+  const edges: string[] = []
+  let taps = 0
+  const sample = async (x: number, y: number): Promise<Sampled> => {
+    taps += 1
+    const made = await tapAndRead(page, x, y)
+    const opened = made.opened[made.opened.length - 1] ?? null
+    const lit = made.lit[0] ?? null
+    const where = `${String(Math.round(x - words.x))}, ${String(Math.round(y - words.y))}`
+    const press = made.presses[0]
+    const capture = made.clicks.filter((click) => click.phase === 'capture')
+    const detail = `the press landed on ${press?.target ?? '-'} at ${String(press?.x)}, ${String(press?.y)}; clicks ${capture.map((click) => `${click.trusted ? 'trusted' : 'made'} detail ${String(click.detail)} ${click.named} at ${String(click.x)}, ${String(click.y)}`).join('; ')}`
+    const named = capture.find((click) => click.trusted && !click.named.startsWith('text'))?.named ?? null
+    if (opened !== null && opened !== href) different.push(`${where}: opened ${opened}`)
+    if (named !== null) {
+      // The browser's own click names a link or a control: the look lit nothing or that same link.
+      if (lit !== null && named !== `link ${lit}`) conflicts.push(`${where}: lit ${lit}; ${detail}`)
+    } else if (lit !== opened) unlike.push(`${where}: lit ${String(lit)}, opened ${String(opened)}; ${detail}`)
+    return { opened, lit, note: `pressed ${press?.target ?? '-'}, click ${capture.map((click) => click.named).join('; ')}` }
   }
-  if (bare.length > 0) test.info().annotations.push({ type: 'points on the pane’s bare area, which WebKit gives no click', description: bare.join(' | ') })
+  const scan = async (
+    axis: 'x' | 'y',
+    from: number,
+    to: number,
+    min: number,
+    max: number,
+    middle: number
+  ): Promise<{ open: [number, number]; lit: [number, number] }> => {
+    const cache = new Map<number, Sampled>()
+    const probe = async (n: number): Promise<Sampled> => {
+      let found = cache.get(n)
+      if (found === undefined) {
+        found = axis === 'x' ? await sample(n, words.y) : await sample(words.x, n)
+        cache.set(n, found)
+      }
+      return found
+    }
+    const inside: number[] = []
+    for (let n = Math.max(from, min); n <= Math.min(to, max); n += 4) if ((await probe(n)).opened === href) inside.push(n)
+    const first = inside[0]
+    const last = inside[inside.length - 1]
+    if (first === undefined || last === undefined) return { open: [Number.NaN, Number.NaN], lit: [Number.NaN, Number.NaN] }
+    let low = first
+    let high = last
+    while (low - 1 >= min && (await probe(low - 1)).opened === href) low -= 1
+    while (high + 1 <= max && (await probe(high + 1)).opened === href) high += 1
+    // The look's extent from the words' middle outward, then to the pixel.
+    const middleAt = Math.round(middle)
+    let litLow = middleAt
+    let litHigh = middleAt
+    while (litLow - 4 >= min && (await probe(litLow - 4)).lit === href) litLow -= 4
+    while (litLow - 1 >= min && (await probe(litLow - 1)).lit === href) litLow -= 1
+    while (litHigh + 4 <= max && (await probe(litHigh + 4)).lit === href) litHigh += 4
+    while (litHigh + 1 <= max && (await probe(litHigh + 1)).lit === href) litHigh += 1
+    // A coarse point between the ends where nothing opened is a hole inside the area that lights, and a gap outside it
+    // (between the look's area and the browser's own adjustment, where it opens a link further out).
+    for (let n = first; n <= last; n += 4) {
+      if (inside.includes(n)) continue
+      const text = `${axis} ${String(Math.round(n - middle))}: ${(await probe(n)).note}`
+      if (n >= litLow && n <= litHigh) holes.push(text)
+      else gaps.push(text)
+    }
+    for (const n of [...cache.keys()].sort((x, y) => x - y)) {
+      if (Math.abs(n - low) <= 5 || Math.abs(n - high) <= 5) {
+        const found = cache.get(n)
+        edges.push(`${axis} ${String(Math.round(n - middle))}${found?.lit === href ? 'L' : '-'}${found?.opened === href ? 'O' : '-'}`)
+      }
+    }
+    return { open: [low, high + 1], lit: [litLow, litHigh + 1] }
+  }
+  // Taps are at whole pixels, inside the pane; an area of `size` px holds at least `size` of them.
+  const reach = size + 20
+  const across = await scan('x', Math.floor(words.left - reach), Math.ceil(words.right + reach), Math.ceil(pane.left), Math.ceil(pane.right) - 1, words.x)
+  const down = await scan('y', Math.floor(words.top - reach), Math.ceil(words.bottom + reach), Math.ceil(pane.top), Math.ceil(pane.bottom) - 1, words.y)
+  const [left, right] = across.open
+  const [top, bottom] = down.open
+  return {
+    left,
+    right,
+    top,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+    taps,
+    different,
+    unlike,
+    conflicts,
+    holes,
+    gaps,
+    ring: { left: across.lit[0] - left, right: right - across.lit[1], top: down.lit[0] - top, bottom: bottom - down.lit[1] },
+    edges
+  }
+}
+
+/**
+ * The points of `ringPoints` at which a tap did not open `href` or, where the handler decided, lit and
+ * opened unlike each other, as text. Every point gets a tap and every tap gets the browser's click: none is left out.
+ */
+async function missedInRing(page: Page, words: Words, size: number, href: string): Promise<string[]> {
+  const pane = await paneBox(page)
+  const missed: string[] = []
+  for (const point of ringPoints(words, pane, size)) {
+    const made = await tapAndRead(page, point.x, point.y)
+    const opened = made.opened[made.opened.length - 1] ?? null
+    const label = `${String(Math.round(point.x - words.x))}, ${String(Math.round(point.y - words.y))}`
+    if (opened !== href) missed.push(`${label}: opened ${String(opened)}`)
+    // Where the browser itself sends the click to the link's button the browser decides; elsewhere the handler does, and the look is the open.
+    const browser = made.clicks.some((click) => click.phase === 'capture' && click.trusted && click.named.startsWith('link'))
+    if (!browser && (made.lit[0] ?? null) !== opened) missed.push(`${label}: lit ${String(made.lit[0] ?? null)}, opened ${String(opened)}`)
+  }
   return missed
 }
 
@@ -889,13 +1047,15 @@ test.describe('the area in which a tap opens a link', () => {
   for (const surface of SURFACES) {
     for (const [size, ratio] of SIZES) {
       test(`is at least the least size around a link's words on ${surface} at ${size} text size`, async ({ page }) => {
-        await pressPage(page, surface, { scale: ratio, only: [PLAIN, PLAIN, ...MIDDLE, PLAIN, PLAIN] })
+        await pressPage(page, surface, { scale: ratio, only: [PLAIN, PLAIN, ...AREA_MIDDLE, PLAIN, PLAIN] })
         const words = await wordsOf(page, MIDDLE_LINK)
-        const missed = await missedInRing(page, words, FINGER[surface])
+        const missed = await missedInRing(page, words, FINGER[surface], MIDDLE_LINK)
         expect(missed, 'points of the least size about the words that opened no link').toEqual([])
-        const area = await areaOf(page, MIDDLE_LINK, words)
-        test.info().annotations.push({ type: 'area', description: `middle ${surface} ${size}: ${String(area.width)} x ${String(area.height)} px (least ${String(FINGER[surface])})` })
-        expect(Math.min(area.width, area.height), 'the area’s least side, measured by the pressed look').toBeGreaterThanOrEqual(FINGER[surface])
+        const area = await areaOf(page, MIDDLE_LINK, words, FINGER[surface])
+        test.info().annotations.push({ type: 'area', description: `middle ${surface} ${size}: ${String(area.width)} x ${String(area.height)} px (least ${String(FINGER[surface])}), ${String(area.taps)} taps` })
+        expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(FINGER[surface])
+        expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, or left a hole').toEqual({ different: [], unlike: [], conflicts: [], holes: [] })
+        test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
       })
 
       for (const [where, href, markdown] of EDGES) {
@@ -916,11 +1076,13 @@ test.describe('the area in which a tap opens a link', () => {
           const size = FINGER[surface]
           const room = where === 'at the end of a line' ? pane.right - words.right : words.left - pane.left
           expect(room, `the room the pane gives beside the words ${where}`).toBeLessThan(2)
-          const missed = await missedInRing(page, words, size)
+          const missed = await missedInRing(page, words, size, href)
           expect(missed, 'points of the least size, held inside the pane, that opened no link').toEqual([])
-          const area = await areaOf(page, href, words)
-          test.info().annotations.push({ type: 'area', description: `${where} ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)})` })
-          expect(Math.min(area.width, area.height), 'the area’s least side, measured by the pressed look').toBeGreaterThanOrEqual(size)
+          const area = await areaOf(page, href, words, size)
+          test.info().annotations.push({ type: 'area', description: `${where} ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)}), ${String(area.taps)} taps` })
+          expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(size)
+          expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, or left a hole').toEqual({ different: [], unlike: [], conflicts: [], holes: [] })
+          test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
           // What lights at a press is what opens: the pressed look at the far point of the area, none past it.
           const inside = ringPoints(words, pane, size)
           const far = where === 'at the end of a line' ? inside[0] : inside[inside.length - 1]
@@ -954,14 +1116,16 @@ test.describe('the area in which a tap opens a link', () => {
         if (settled.bottom - settled.top < size) {
           expect(pane.bottom - settled.bottom, 'the room under the words of the conversation’s last line').toBeLessThan((size - (settled.bottom - settled.top)) / 2)
         }
-        const missed = await missedInRing(page, settled, size)
+        const missed = await missedInRing(page, settled, size, LAST)
         expect(missed, 'points of the least size, held inside the pane, that opened no link').toEqual([])
-        const area = await areaOf(page, LAST, settled)
+        const area = await areaOf(page, LAST, settled, size)
         test.info().annotations.push({
           type: 'area',
-          description: `last line ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)}); room under the words ${String(Math.round((pane.bottom - settled.bottom) * 10) / 10)}`
+          description: `last line ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)}), ${String(area.taps)} taps; room under the words ${String(Math.round((pane.bottom - settled.bottom) * 10) / 10)}`
         })
-        expect(Math.min(area.width, area.height), 'the area’s least side, measured by the pressed look').toBeGreaterThanOrEqual(size)
+        expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(size)
+        expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, or left a hole').toEqual({ different: [], unlike: [], conflicts: [], holes: [] })
+        test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
         const inside = ringPoints(settled, pane, size)
         const top = inside[0]
         await page.mouse.move(top?.x ?? 0, top?.y ?? 0)
