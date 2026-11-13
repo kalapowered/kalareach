@@ -148,6 +148,60 @@ describe('a tap on plain text beside a link, through the handler', () => {
     expect(opened.length, 'links opened by a second click').toBe(1)
   })
 
+  it('opens nothing for a touch that moved beyond the slop, though no pointer cancel came', () => {
+    const { pane, texts } = conversation(6, 3)
+    startLinkPress(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointermove', pointer(texts[3], { clientY: y - 14 }))
+    fire('pointerup', pointer(texts[3], { clientY: y - 14, timeStamp: 120 }))
+    fire('click', click(texts[3], { clientY: y }))
+    expect(opened).toEqual([])
+  })
+
+  it('opens nothing for a touch whose release is beyond the slop though no move was seen', () => {
+    const { pane, texts } = conversation(6, 3)
+    startLinkPress(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointerup', pointer(texts[3], { clientY: y - 14, timeStamp: 120 }))
+    fire('click', click(texts[3], { clientY: y }))
+    expect(opened).toEqual([])
+  })
+
+  it('opens nothing for a touch that moved and came back within the slop at the release', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    startLinkPress(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointermove', pointer(texts[3], { clientY: y - 14 }))
+    fire('pointermove', pointer(texts[3], { clientY: y }))
+    fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
+    fire('click', click(texts[3], { clientY: y }))
+    expect(opened, 'a press that went past the slop is not a tap').toEqual([])
+    expect(links.length).toBe(6)
+  })
+
+  it('opens nothing after a pointer cancel, and the pressed look goes with it', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    startLinkPress(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    expect(links[3]?.[0]?.hasAttribute('data-pressed'), 'the pressed look during the press').toBe(true)
+    fire('pointercancel', pointer(texts[3], { clientY: y }))
+    expect(links[3]?.[0]?.hasAttribute('data-pressed'), 'the pressed look after the cancel').toBe(false)
+    fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
+    fire('click', click(texts[3], { clientY: y }))
+    expect(opened).toEqual([])
+  })
+
+  it('opens nothing for a click that no press made', () => {
+    const { pane, texts } = conversation(6, 3)
+    startLinkPress(pane)
+    clock(100)
+    fire('click', click(texts[3], { clientY: y }))
+    expect(opened).toEqual([])
+  })
 })
 
 describe('the three seconds after the release', () => {
