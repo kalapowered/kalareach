@@ -419,6 +419,31 @@ impl Controller {
             .clone()
     }
 
+    /// Every reply `told` or `declined` has made so far, with the request it answers and whether
+    /// it was told (and not declined).
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn replies_made(&self) -> Vec<(RequestId, bool, ControlFrame)> {
+        self.replies_made
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Notes a reply `told` or `declined` made, where it is made.
+    #[cfg(feature = "testing")]
+    pub(crate) fn note_a_reply_made(
+        &self,
+        request_id: RequestId,
+        told: bool,
+        frame: &ControlFrame,
+    ) {
+        self.replies_made
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((request_id, told, frame.clone()));
+    }
+
     /// Notes a reply the sink consumed.
     #[cfg(feature = "testing")]
     pub(crate) fn note_a_reply_written(&self, request_id: RequestId, frame: &ControlFrame) {
@@ -976,7 +1001,7 @@ impl Controller {
         let request_id = mutation.request_id;
         let method = mutation.method.method();
         if !crate::transfer::carries(sink.kind(), method) {
-            let reply = declined(Declined::WrongEndpoint, request_id);
+            let reply = declined(self, Declined::WrongEndpoint, request_id);
             return sink.write(self, reply, method).await;
         }
         // Receipt time, before anything this daemon waits for.
@@ -1041,16 +1066,16 @@ impl Controller {
     ) -> DoorReply {
         let request_id = mutation.request_id;
         if let Err(refusal) = self.authorised(connection_id) {
-            return declined(Declined::Unauthorised(refusal), request_id);
+            return declined(self, Declined::Unauthorised(refusal), request_id);
         }
         let Some(method) = mutation.method.method() else {
-            return declined(Declined::NotInRegistry, request_id);
+            return declined(self, Declined::NotInRegistry, request_id);
         };
         // On a host that is exclusively organisation-managed the local owner answers to a
         // membership lease like a member, so a held method is refused here, before a retained
         // answer is looked for, once no lease is live.
         if let Err(refusal) = self.local_hold(method) {
-            return declined(Declined::Lease(refusal), request_id);
+            return declined(self, Declined::Lease(refusal), request_id);
         }
         // The arrival is recorded as soon as the door has the mutation, so that a copy that arrives
         // on another connection while this arrival looks for a retained answer, or reads the other
@@ -1129,7 +1154,7 @@ impl Controller {
                 return told(Settled::of(conflict), &standing).await;
             }
             Err(SpendError::Failed(failed)) => {
-                return declined(Declined::Spend(failed), request_id);
+                return declined(self, Declined::Spend(failed), request_id);
             }
         };
         let accepted = match self.check_envelope(connection_id, &mutation, method, received_at) {
@@ -1177,7 +1202,7 @@ impl Controller {
                     // No claim, and no arrival that may carry the action out: a first admission,
                     // which has no window.
                     crate::transfer::Settling::No => {
-                        return declined(Declined::Envelope(error), request_id);
+                        return declined(self, Declined::Envelope(error), request_id);
                     }
                 }
             }
@@ -1205,11 +1230,11 @@ impl Controller {
                     held = self.project.held_answer(actor_id, &mutation, method).await;
                 }
                 let Some(held) = held else {
-                    return declined(Declined::Envelope(error), request_id);
+                    return declined(self, Declined::Envelope(error), request_id);
                 };
                 return told(Settled::of(held.copied()), &standing).await;
             }
-            Err(error) => return declined(Declined::Envelope(error), request_id),
+            Err(error) => return declined(self, Declined::Envelope(error), request_id),
         };
         // From here this arrival carries the action out, and a copy that finds no claim yet asks
         // whether it may.

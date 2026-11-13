@@ -1490,6 +1490,85 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_after_a_fenc
     refused_for_a_fence(&refused.to_protocol_error());
 }
 
+/// KR-REQ-09.09, the disclosed checks at the local door: what the service withholds for a fence that
+/// landed after another copy's answer was in hand is not shown to the caller, and where nothing is
+/// owed a copy is given what the first was told. The fence lands once the answer is in hand, at
+/// the pause the service's last check starts with, and before the record is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_check_another_copy_answered_is_not_shown_at_the_door_after_a_fence_lands() {
+    use super::the_end_of_a_write_is_told_under_its_authority::not_shown;
+    use super::the_fence_at_every_effect::told_now;
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = capability_request(&temp, None, None);
+    // The door's future is large: it is kept off this case's own stack.
+    let at_the_door = || {
+        Box::pin(told_now(
+            &controller,
+            connection_id,
+            &mutation,
+            controller.write_method(
+                &actor_id,
+                &mutation,
+                Method::EnvironmentCapabilitiesCheck,
+                connection_id,
+                None,
+                Some(accepted(&controller)),
+                controller.admitted_revision(connection_id).ok(),
+            ),
+        ))
+    };
+    let first = at_the_door().await;
+    assert!(
+        refusal(&first).is_none(),
+        "the first copy is answered: {first:?}"
+    );
+    let control = at_the_door().await;
+    assert_eq!(
+        control, first,
+        "with nothing owed a copy is given what the first was told"
+    );
+
+    let late_after_the_hold =
+        answered_after_a_fence_lands_at_the_check(&controller, at_the_door()).await;
+    not_shown(&late_after_the_hold);
+    controller.hold_fence(false);
+
+    // The fence lands before the record of answers is read.
+    let (arrived, release) = controller.before_a_capability_check_looks.arm();
+    let late = tokio::spawn({
+        let (controller, actor_id, mutation) =
+            (Arc::clone(&controller), actor_id.clone(), mutation.clone());
+        async move {
+            told_now(
+                &controller,
+                connection_id,
+                &mutation,
+                controller.write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::EnvironmentCapabilitiesCheck,
+                    connection_id,
+                    None,
+                    Some(accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                ),
+            )
+            .await
+        }
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the wait finishes")
+        .expect("the late copy reaches the place it is stopped at");
+    controller.hold_fence(true);
+    release.send(()).expect("the late copy goes on");
+    let before_the_record = late.await.expect("the late copy finishes");
+    controller.hold_fence(false);
+    not_shown(&before_the_record);
+}
+
 /// KR-REQ-09.09, the disclosed checks: the answer another copy gave is read back under the start's
 /// hold on the registration, and the hold ends before the cleanup of old answers, which waits for
 /// locks and for storage. A fence can land once it has ended, so the answer is asked once more with
