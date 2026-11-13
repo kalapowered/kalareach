@@ -951,10 +951,11 @@ exec cat >/dev/null
 /// Everything it touches is on the internal disk: it runs from a copy there, in an environment tree
 /// of its own, and so does the stand-in. It keeps its keys in that tree rather than in a keychain.
 struct FixtureDaemon {
-    tree: kr_ipc::testing::TempHost,
     fixture: PathBuf,
     log: PathBuf,
     child: std::process::Child,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    tree: kr_ipc::testing::TempHost,
 }
 
 impl FixtureDaemon {

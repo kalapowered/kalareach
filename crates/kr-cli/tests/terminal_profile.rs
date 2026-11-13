@@ -199,12 +199,13 @@ fn command_in(directory: &Path) -> Vec<String> {
 /// What a person has on their machine: a home, the directories programs are found in, and the
 /// installation's own directories.
 struct Person {
-    /// The host's directories, which hold the record.
-    tree: kr_ipc::testing::TempHost,
     /// The home directory.
     home: PathBuf,
     /// A directory a stand-in for a program is put in.
     programs: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    /// The host's directories, which hold the record.
+    tree: kr_ipc::testing::TempHost,
 }
 
 impl Person {

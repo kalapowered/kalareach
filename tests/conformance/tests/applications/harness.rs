@@ -217,7 +217,6 @@ impl Launch {
 
 /// The session, its worker and the typing terminal.
 pub struct Session {
-    _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -229,6 +228,8 @@ pub struct Session {
     keys: Keys,
     capture: Arc<Mutex<Capture>>,
     reader: tokio::task::JoinHandle<()>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 /// What the typing terminal has been sent, and what stopped it being sent the whole stream.

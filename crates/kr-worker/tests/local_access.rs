@@ -138,7 +138,6 @@ fn closed(sequence: u64) -> LocalAccess {
 
 /// A worker its daemon launched: born closed, told nothing yet.
 struct World {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -147,6 +146,8 @@ struct World {
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
     machine: Machine,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 async fn world(script: &str, with_floor: bool) -> World {

@@ -39,9 +39,10 @@ const EVENT_PAYLOAD_LEN: usize = 400;
 /// It answers the opening frame, then plays the script it was given: for each frame the client
 /// sends, the batch the test wants pushed in reply, written in order down one socket.
 struct Host {
-    _tree: kr_ipc::testing::TempHost,
     endpoint: kr_ipc::paths::Endpoint,
     serving: tokio::task::JoinHandle<()>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _tree: kr_ipc::testing::TempHost,
 }
 
 impl Host {

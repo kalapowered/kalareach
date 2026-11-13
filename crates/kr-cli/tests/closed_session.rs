@@ -112,13 +112,14 @@ impl WorkerSupervisor for Counting {
 
 /// A host tree, its daemon, and the sessions this test created in it.
 struct Host {
-    temp: kr_ipc::testing::TempHost,
     work: PathBuf,
     home: PathBuf,
     controller: Option<Arc<Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     starts: Arc<AtomicUsize>,
     created: Mutex<Vec<String>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Host {

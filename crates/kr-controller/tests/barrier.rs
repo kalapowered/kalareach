@@ -123,7 +123,6 @@ fn submission(byte: u8, actor_id: &ActorId) -> Submission {
 struct Worker {
     /// First, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
-    _temp: kr_ipc::testing::TempHost,
     runtime: Arc<SessionRuntime>,
     service: Arc<WorkerService>,
     session_id: SessionId,
@@ -131,6 +130,8 @@ struct Worker {
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
     environment_id: EnvironmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Worker {
@@ -942,12 +943,13 @@ impl WorkerSupervisor for CountingSupervisor {
 }
 
 struct Daemon {
-    _temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     registry_path: std::path::PathBuf,
     started: Arc<std::sync::atomic::AtomicUsize>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 async fn daemon_host() -> Daemon {
@@ -1862,7 +1864,6 @@ impl WorkerSupervisor for RendezvousSupervisor {
 struct Hosted {
     /// First, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
-    _temp: Arc<kr_ipc::testing::TempHost>,
     controller: Arc<Controller>,
     client_endpoint: kr_ipc::paths::Endpoint,
     endpoint: kr_ipc::paths::Endpoint,
@@ -1871,6 +1872,8 @@ struct Hosted {
     session_id: SessionId,
     runtime: Arc<SessionRuntime>,
     service: Arc<WorkerService>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: Arc<kr_ipc::testing::TempHost>,
 }
 
 impl Hosted {
@@ -1895,13 +1898,14 @@ impl Hosted {
 
 /// One daemon, and the rendezvous every worker it starts is verified through.
 struct HostedDaemon {
-    temp: Arc<kr_ipc::testing::TempHost>,
     environment: kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,
     controller: Arc<Controller>,
     client_endpoint: kr_ipc::paths::Endpoint,
     rendezvous_endpoint: kr_ipc::paths::Endpoint,
     launches: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<WorkerLaunch>>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: Arc<kr_ipc::testing::TempHost>,
 }
 
 /// Starts a daemon whose supervisor starts nothing and hands this process each launch it is asked

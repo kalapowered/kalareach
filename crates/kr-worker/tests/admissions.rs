@@ -37,12 +37,13 @@ const PER_PART: Duration = Duration::from_secs(5);
 const REPLACEMENT: Duration = Duration::from_secs(5);
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     endpoint: kr_ipc::paths::Endpoint,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
     environment_id: EnvironmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

@@ -24,13 +24,14 @@ use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
     environment_id: kr_protocol::ids::EnvironmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

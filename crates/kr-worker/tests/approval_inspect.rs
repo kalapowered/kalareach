@@ -142,7 +142,6 @@ fn request_frame(id: u64, padding: usize) -> Vec<u8> {
 }
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
@@ -155,6 +154,8 @@ struct Host {
     connection: GatewayConnectionId,
     /// What carries an answer out.
     upstream: Arc<CountingUpstream>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 /// A transport that answers at once and counts what it was asked to carry.

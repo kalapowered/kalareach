@@ -50,7 +50,6 @@ const CANONICAL: (u64, u64) = (80, 24);
 const SMALLER: (u64, u64) = (40, 10);
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -60,6 +59,8 @@ struct Host {
     controller: Arc<kr_ipc::verify::ControllerIdentity>,
     /// The boot the daemon proves its generation against.
     boot: kr_protocol::identity::BootIdentity,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Host {

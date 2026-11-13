@@ -210,7 +210,6 @@ fn approval_table() -> DeclarativeTable {
 
 /// A worker serving one session, with one plugin whose native requests the broker holds.
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
@@ -221,6 +220,8 @@ struct Host {
     boot: kr_protocol::identity::BootIdentity,
     /// The plugin's native connection, which its requests arrive on.
     connection: GatewayConnectionId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Host {

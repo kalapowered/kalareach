@@ -55,11 +55,12 @@ impl WorkerSupervisor for SlowSupervisor {
 }
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     registry_path: std::path::PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

@@ -339,13 +339,14 @@ enum SignIn {
 /// A host: its tree, its daemon, the storage service it is configured for, and directories of its
 /// own for the commands it runs.
 struct Rig {
-    temp: kr_ipc::testing::TempHost,
     served: Served,
     timer: Arc<HeldTimer>,
     controller: Option<Arc<Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: PathBuf,
     home: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Rig {

@@ -55,12 +55,13 @@ impl WorkerSupervisor for RefusingSupervisor {
 }
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
     work: tempfile::TempDir,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Host {

@@ -68,7 +68,6 @@ fn corpus(name: &str) -> Corpus {
 
 /// A session whose program writes a corpus a piece at a time.
 struct Live {
-    _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     endpoint: kr_ipc::paths::Endpoint,
@@ -79,6 +78,8 @@ struct Live {
     released: usize,
     columns: u16,
     rows: u16,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Live {

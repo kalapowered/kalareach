@@ -192,7 +192,6 @@ impl ServiceSigner for Owner {
 
 /// A daemon on a host tree, the service it selects, and the keys a test seals with.
 struct Rig {
-    host: kr_ipc::testing::TempHost,
     served: Served,
     timer: Arc<HeldTimer>,
     controller: Arc<Controller>,
@@ -202,6 +201,8 @@ struct Rig {
     owner: Arc<Owner>,
     sender: StoredEnvelopeKeyPair,
     device: StoredEnvelopeKeyPair,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: kr_ipc::testing::TempHost,
 }
 
 impl Rig {

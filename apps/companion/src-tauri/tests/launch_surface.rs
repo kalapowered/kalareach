@@ -29,10 +29,11 @@ use tauri::Manager as _;
 
 /// A worker serving one session, and the host tree it is published in.
 struct Worker {
-    temp: kr_ipc::testing::TempHost,
     session_id: SessionId,
     service: Arc<WorkerService>,
     serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Worker {

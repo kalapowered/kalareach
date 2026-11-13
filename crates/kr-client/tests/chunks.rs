@@ -165,13 +165,14 @@ struct Staged {
 }
 
 struct Host {
-    tree: TempHost,
     script: Script,
     seen: Mutex<Seen>,
     /// Woken each time an attachment-chunk connection ends on the host's side.
     ended: tokio::sync::Notify,
     staged: Mutex<HashMap<TransferId, Staged>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    tree: TempHost,
 }
 
 impl Drop for Host {

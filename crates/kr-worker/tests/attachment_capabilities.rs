@@ -87,7 +87,6 @@ fn asking_for_everything(session_id: SessionId) -> SessionAttachParams {
 
 /// One worker service with a real session behind it, and the daemon identity to forward through.
 struct Wired {
-    _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -95,6 +94,8 @@ struct Wired {
     endpoint: kr_ipc::paths::Endpoint,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Wired {

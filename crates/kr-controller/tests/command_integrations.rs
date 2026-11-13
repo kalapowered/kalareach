@@ -83,7 +83,6 @@ impl WorkerSupervisor for RendezvousSupervisor {
 
 /// A daemon whose environment has the Gemini CLI package installed, enabled and granted.
 struct Daemon {
-    _temp: kr_ipc::testing::TempHost,
     _generation_home: tempfile::TempDir,
     client_endpoint: kr_ipc::paths::Endpoint,
     rendezvous_endpoint: kr_ipc::paths::Endpoint,
@@ -92,6 +91,8 @@ struct Daemon {
     controller: Arc<Controller>,
     /// The hash of the installed package's manifest, as the signed index pins it.
     package_digest: String,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 /// Starts a daemon whose environment has the package installed, with its configuration turning on

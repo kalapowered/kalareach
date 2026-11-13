@@ -30,10 +30,11 @@ const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
 /// A worker on a real endpoint that states `stated` in its answer and records what it is sent.
 struct Worker {
-    _tree: kr_ipc::testing::TempHost,
     endpoint: kr_ipc::paths::Endpoint,
     /// What the client sent after its hello, once the connection has ended.
     sent_after_hello: tokio::task::JoinHandle<Vec<ControlFrame>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _tree: kr_ipc::testing::TempHost,
 }
 
 impl Worker {
