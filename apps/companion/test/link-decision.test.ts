@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { SLOP, decide, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
+import { CLICK_AWAY, decide, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
 
 /** Links are named by strings here: the decision only compares them. */
 type Id = string
@@ -144,6 +144,17 @@ describe('the nearest-words rule at the press’s point, run again at the click'
     expect(decide(press(), click(), layoutOf(moved, LOWER))).toEqual(OPEN_UPPER)
   })
 
+  it('stands when the pane scrolled between the press and the click so that the link’s words are out of view', () => {
+    // The pane's view now starts 40 px below the link's words: a link out of view never opens.
+    const scrolled = () => ({ links: [UPPER], reach: IOS, bounds: { left: 0, top: 140, right: 390, bottom: 984 } })
+    expect(decide(press({ at: { x: 60, y: 145 } }), click({ point: { x: 60, y: 145 } }), scrolled)).toEqual(STAND)
+  })
+
+  it('stands when an arriving message moved the link away from the press’s point', () => {
+    const moved = link('upper', words(16, 180, 120))
+    expect(decide(press(), click(), layoutOf(moved, LOWER))).toEqual(STAND)
+  })
+
   it('reads the layout at the press’s point', () => {
     const at: { x: number; y: number }[] = []
     decide(press(), click({ point: { x: 64, y: 130 } }), (point) => {
@@ -160,8 +171,8 @@ describe('where the click lies against the press', () => {
     expect(decide(press({ at: { x: 60, y: 130.5 } }), click({ point: { x: 60, y: 131 } }), layoutOf(UPPER))).toEqual(OPEN_UPPER)
   })
 
-  it('opens it for a click at the slop from the press, and stands for a click farther', () => {
-    expect(decide(press(), click({ point: { x: 60 + SLOP, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
-    expect(decide(press(), click({ point: { x: 60 + SLOP + 0.5, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
+  it('opens it for a click at the allowed distance from the press, and stands for a click farther', () => {
+    expect(decide(press(), click({ point: { x: 60 + CLICK_AWAY, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
+    expect(decide(press(), click({ point: { x: 60 + CLICK_AWAY + 0.5, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
   })
 })
