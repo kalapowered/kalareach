@@ -677,10 +677,20 @@ impl DataChild {
 pub struct DataHolds {
     paths: Paths,
     _parent: ffi::Handle,
+    /// Set where this run made the data directory: whether it made the folder above it too.
+    made: Option<Made>,
     data: DirHandle,
     staging: Option<DirHandle>,
     journal: Option<DirHandle>,
     run: Option<DirHandle>,
+}
+
+/// What a run made of the data directory's place: the directory, and whether the folder above it
+/// too. A rollback that cannot read the directory again removes what the run made while it is
+/// empty.
+#[derive(Clone, Copy, Debug)]
+struct Made {
+    parent: bool,
 }
 
 impl std::fmt::Debug for DataHolds {
@@ -856,7 +866,7 @@ fn data_directory_reason(
 fn refuse_made_data_directory(
     paths: &Paths,
     parent: ffi::Handle,
-    made: ffi::Handle,
+    made: Option<ffi::Handle>,
     why: &str,
     parent_made: bool,
 ) -> Error {
@@ -2602,7 +2612,7 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
             return Err(refuse_made_data_directory(
                 paths,
                 held,
-                made,
+                Some(made),
                 &why,
                 parent_made,
             ));
@@ -2614,7 +2624,21 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
             Err(error) => return Err(data_unread(paths, "a read of it", error)),
         }
     }
-    let data = held_directory(made)?;
+    // The reads of the directory's identity, its attributes and its final path are inside the
+    // cleanup's reach where this run made it: a failed read leaves nothing of the run behind.
+    let data = match held_directory(made) {
+        Ok(data) => data,
+        Err(error) if created => {
+            return Err(refuse_made_data_directory(
+                paths,
+                held,
+                None,
+                &format!("a read of it failed ({error})"),
+                parent_made,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let inspected = if created {
         Inspected {
             manifest: None,
@@ -2630,6 +2654,9 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
     Ok(DataHolds {
         paths: paths.clone(),
         _parent: held,
+        made: created.then_some(Made {
+            parent: parent_made,
+        }),
         data,
         staging: inspected.staging,
         journal: inspected.journal,
@@ -2946,6 +2973,8 @@ fn sha256_of(path: &Path) -> Result<String, Error> {
 struct Run {
     paths: Paths,
     manifest: Manifest,
+    /// What this run made of the data directory's place, once it made it.
+    made: Option<Made>,
 }
 
 impl Run {
@@ -3077,6 +3106,7 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
     let mut run = Run {
         paths: paths.clone(),
         manifest,
+        made: None,
     };
     if !run.manifest.persons.contains(&person) {
         run.manifest.persons.push(person);
@@ -3096,14 +3126,38 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
         match remove_at(paths, true, remedy::Stage::Rollback) {
             // text: install-6
             Ok(()) => say("the removal after the failure finished"),
-            // text: install-7
-            Err(error) => say(&format!(
-                "the removal after the failure also failed: {error}"
-            )),
+            Err(error) => {
+                // text: install-7
+                say(&format!(
+                    "the removal after the failure also failed: {error}"
+                ));
+                if let Some(made) = run.made {
+                    remove_what_the_run_made(paths, made);
+                }
+            }
         }
         return Err(failure);
     }
     Ok(())
+}
+
+/// What a rollback that did not finish does with the data directory that this run made: the
+/// directory goes while it is empty, and the folder above it too where the run made that. The
+/// removal's own inspection may be what failed (a read of the directory that cannot be repeated),
+/// and the identity that it would show cannot be read then, so the removal goes by the path that the
+/// run made and only while nothing is in it.
+fn remove_what_the_run_made(paths: &Paths, made: Made) {
+    let stayed = records::remove_made(&paths.data, made.parent.then(|| paths.data_parent()));
+    if stayed.is_empty() {
+        // text: install-8
+        say("the data directory that this run made is not there now");
+    } else {
+        // text: install-9
+        say(&format!(
+            "the data directory that this run made stays: {}",
+            stayed.join("; ")
+        ));
+    }
 }
 
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
@@ -3119,6 +3173,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             Purpose::Install
         },
     )?;
+    run.made = holds.made;
     holds.protect()?;
     run.record(
         ObjectKind::Directory,
