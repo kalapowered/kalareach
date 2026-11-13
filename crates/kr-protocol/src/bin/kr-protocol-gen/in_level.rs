@@ -29,9 +29,9 @@
 //!   method is a name that this commit's `Method` adds to the earlier release's, where both are a
 //!   list of plain string constants and nothing else, each name stands once in the shape of a
 //!   method's name (lower-case words of letters, digits and underscores, with single dots
-//!   between), the earlier release's names are all still there, and every use of `Method` in the
-//!   schema is one that a wider `Method` only widens (a property, an item, an `anyOf`, an `allOf`;
-//!   not a `oneOf`, a `not` or an `if`) (a host of the same level answers
+//!   between), the earlier release's names are all still there, and every use of `Method` in a
+//!   definition is one that a wider `Method` only widens (a property, an item, an `anyOf`, an
+//!   `allOf`; not a `oneOf`, a `not` or an `if`). A host of the same level answers
 //!   a method it does not list with `PERMISSION_DENIED`, and a client that meets that refusal for
 //!   a method that is new asks the host a method its level has before it takes the refusal for a
 //!   lack of rights);

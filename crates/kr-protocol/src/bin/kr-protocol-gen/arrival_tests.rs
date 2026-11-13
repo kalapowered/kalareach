@@ -1113,6 +1113,25 @@ fn a_new_method_does_not_pass_where_a_use_of_method_does_not_widen() {
             "an if",
         ),
         (
+            json!({ "Call": { "type": "object", "properties": { "method": { "oneOf": [
+                { "$dynamicRef": "#/$defs/Method" }, { "const": "b", "type": "string" } ] } } } }),
+            // A `$dynamicRef` to a definition without an anchor is a `$ref`: the old schema
+            // accepts "b" as a `Call.method`; the new one refuses it.
+            "a dynamic reference in a oneOf",
+        ),
+        (
+            json!({ "Name": { "type": "string", "not": { "$dynamicRef": "#/$defs/Method" } } }),
+            // The old schema accepts "b" as a `Name`; the new one refuses it.
+            "a dynamic reference in a not",
+        ),
+        (
+            json!({ "Name": { "type": "string", "not": { "$ref": "#/$defs/M%65thod" } },
+                    "M%65thod": {} }),
+            // A validator decodes the name, so the reference is to `Method`: the old schema
+            // accepts "b" as a `Name`; the new one refuses it.
+            "an encoded reference in a not",
+        ),
+        (
             json!({
                 "Holder": { "type": "object", "properties": { "m": reference.clone() } },
                 "Choice": { "oneOf": [{ "$ref": "#/$defs/Holder" }, { "type": "object" }] },
@@ -1149,6 +1168,7 @@ fn a_new_method_passes_where_every_use_of_method_widens() {
         "Property": { "type": "object", "properties": {
             "method": reference(), "not": reference(), "oneOf": reference() } },
         "Items": { "type": "array", "items": reference() },
+        "Tuple": { "type": "array", "prefixItems": [reference(), { "type": "integer" }] },
         "Open": { "type": "object", "additionalProperties": reference() },
         "Pattern": { "type": "object", "patternProperties": { "^m": reference() } },
         "Either": { "anyOf": [reference(), { "type": "integer" }] },
@@ -1185,9 +1205,10 @@ fn with_methods(extra: &Value, names: &[&str]) -> Value {
 /// A name that has not the shape of a method's name (lower-case letters, digits and underscores in
 /// words, with single dots between) is no new method, whether it is the line's name or any other
 /// name of the old list or the new one: the definition is then not the list the rule is for. In
-/// each case the new schema accepts a text that the old one refuses, which no method's name says.
-/// `#`, `[`, `{` and `@` are the characters that labels are made of, so a name that holds one can
-/// look like the label of a nested or numbered branch.
+/// the first case the new schema accepts a text that the old one refuses, which no method's name says.
+/// `#`, `@`, `[` and `{` mark a branch, a numbered branch, an item and an additional property in a
+/// label, so a name that holds one can look like the label of another place. Where a name is in
+/// both lists, only the name that the new list adds is a new method.
 #[test]
 fn a_name_that_is_not_the_shape_of_a_methods_is_no_new_method() {
     for name in [

@@ -170,12 +170,13 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
     Some(names)
 }
 
-/// Whether every use of the definition `name` in `schema` is one where a wider definition makes the
-/// place that uses it accept more: a use as a property, an item, an additional or pattern property,
-/// in an `anyOf` or an `allOf`, or as a whole definition, through any chain of definitions that
-/// reach it. A use in a `oneOf` (a value that matched one branch can then match two), in a `not`, in
-/// an `if` or under any other keyword is not one: a wider definition there can make the place
-/// refuse a value that it accepted, or accept one that it refused.
+/// Whether every use of the definition `name` in a definition of `schema` is one where a wider
+/// definition makes the place that uses it accept at least what it accepted: a use as a property, an
+/// item (`items`, `prefixItems`), an additional or pattern property, in an `anyOf` or an `allOf`, or
+/// as a whole definition, through any chain of definitions that reach it. A use under any other
+/// keyword is not counted: under some of them (a `oneOf`, a `not`, an `if`, a `contains` with
+/// `maxContains`) a wider definition can make the place refuse a value that it accepted, and the
+/// walk does not tell those from the rest.
 fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
     let Some(definitions) = schema["$defs"].as_object() else {
         return true;
@@ -204,19 +205,26 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
 }
 
 /// Whether every `$ref` under `node` to a definition of `reaching` stands where a wider definition
-/// widens the place: `widening` says that the path to `node` has only such places.
+/// widens the place: `widening` says that the path to `node` has only such places. A reference that
+/// is not `#/$defs/NAME` with a name that a validator reads as it stands (a name with `%`, `~` or
+/// `/` is decoded), and a keyword that changes how references resolve (`$dynamicRef`,
+/// `$recursiveRef`, `$dynamicAnchor`, `$anchor`, `$id`), are refused wherever they stand: the walk
+/// cannot say what they reach.
 fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
     match node {
         Value::Object(members) => members
             .iter()
             .all(|(keyword, member)| match keyword.as_str() {
-                "$ref" => {
-                    widening
-                        || member
-                            .as_str()
-                            .and_then(|target| target.strip_prefix("#/$defs/"))
-                            .is_none_or(|target| !reaching.contains(target))
-                }
+                "$ref" => match member
+                    .as_str()
+                    .and_then(|target| target.strip_prefix("#/$defs/"))
+                {
+                    Some(target) if !target.contains(['%', '~', '/']) => {
+                        widening || !reaching.contains(target)
+                    }
+                    _ => false,
+                },
+                "$dynamicRef" | "$recursiveRef" | "$dynamicAnchor" | "$anchor" | "$id" => false,
                 "properties" | "patternProperties" if member.is_object() => member
                     .as_object()
                     .into_iter()
@@ -241,11 +249,11 @@ fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool 
 ///   describes, so it accepts exactly its names;
 /// * every name of the earlier list is in the new one;
 /// * the line is about a name that the new list adds;
-/// * every use of `Method` in both schemas is one where a wider `Method` only widens the place that
+/// * every use of `Method` in a definition of both schemas is one where a wider `Method` only widens the place that
 ///   uses it ([`is_used_only_where_it_widens`]).
 ///
-/// Then the new schema accepts what the earlier one did, and at each place that uses `Method`
-/// that name besides, and nothing else.
+/// Then every place that uses `Method` accepts what it accepted, and a value that it accepts anew
+/// holds a new name at a use of `Method`.
 ///
 /// The label of a line says where it is and not which list it came from: other lists have the
 /// place `Method` as its `oneOf` does (its `anyOf`, the inner list of a nullable pair, a
@@ -344,8 +352,8 @@ fn is_a_new_section(
 /// level. A method a daemon serves keeps the level, because a host of the same level answers a
 /// method it does not list with `PERMISSION_DENIED` and a client that meets that refusal for a
 /// method that is new tells it from a lack of rights, so a new variant of `Method` is not a
-/// difference here, where `Method` is a list of plain text constants in both schemas (see
-/// `is_an_added_method`). It is one for `--public-contract`, which reports it.
+/// difference here, where the rule of `is_an_added_method` holds. It is one for
+/// `--public-contract`, which reports it.
 ///
 /// A new section of the configuration document passes too, where `sections` (called once, and only
 /// when the schemas differ by a member added to the document) names it: the sections the build
