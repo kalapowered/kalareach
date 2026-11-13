@@ -68,8 +68,27 @@ fn a_definite_refusal(temp: &kr_ipc::testing::TempHost) -> (Method, MutationRequ
 /// route has answered and before the answer is told.
 async fn told_after_the_route_answers(
     controller: &Arc<Controller>,
-    (method, mutation): (Method, MutationRequest),
+    request: (Method, MutationRequest),
     meanwhile: impl FnOnce(ConnectionId),
+) -> ControlFrame {
+    told_after_the_route_answers_and(
+        controller,
+        request,
+        Duration::from_secs(30),
+        async |connection_id| {
+            meanwhile(connection_id);
+        },
+    )
+    .await
+}
+
+/// [`told_after_the_route_answers`], for a step that has to be waited for, and a route that may take
+/// up to `within` to answer.
+async fn told_after_the_route_answers_and(
+    controller: &Arc<Controller>,
+    (method, mutation): (Method, MutationRequest),
+    within: Duration,
+    meanwhile: impl AsyncFnOnce(ConnectionId),
 ) -> ControlFrame {
     let (connection_id, actor_id) = admitted(controller).await;
     let (arrived, release) = controller.pause_after_a_route_answers();
@@ -93,11 +112,11 @@ async fn told_after_the_route_answers(
             .await
         }
     });
-    tokio::time::timeout(Duration::from_secs(30), arrived)
+    tokio::time::timeout(within, arrived)
         .await
         .expect("the route answers")
         .expect("the pause is armed");
-    meanwhile(connection_id);
+    meanwhile(connection_id).await;
     release.send(()).expect("the door goes on");
     telling.await.expect("the door tells it")
 }
@@ -255,6 +274,120 @@ async fn the_four_modules_first_admissions_are_told_under_the_authority_they_end
         results >= 2,
         "two of the four answer with a result: {results}"
     );
+}
+
+/// KR-REQ-09.09, 09.12: the report `privacy.set` answers with states what earlier exports left, so
+/// it is a record even when the change is the request's own: the door tells it while the
+/// registration stands under the revision the request was admitted under and no fence is owed, and
+/// does not show it once another device's withdrawal has restamped the registration, a fence is
+/// owed, or the connection is withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_report_privacy_set_answers_is_not_shown_once_authority_has_moved_after_the_route_answers()
+ {
+    use kr_protocol::privacy::PrivacySetParams;
+
+    let (temp, controller, _clock) = daemon().await;
+    let setting = |enabled: bool| {
+        (
+            Method::PrivacySet,
+            mutation_of(
+                &temp,
+                Method::PrivacySet,
+                ParamsValue::from_typed(&PrivacySetParams { enabled }).expect("encodes"),
+            ),
+        )
+    };
+    let control = told_after_the_route_answers(&controller, setting(true), |_| {}).await;
+    assert!(
+        refusal(&control).is_none(),
+        "with nothing in between the report is told: {control:?}"
+    );
+    let restamped = told_after_the_route_answers(&controller, setting(false), |_| {
+        controller
+            .admitted_write()
+            .values_mut()
+            .for_each(|connection| {
+                connection.admitted_revision = kr_protocol::ids::AuthorityRevision::new(
+                    connection.admitted_revision.get() + 1,
+                );
+            });
+    })
+    .await;
+    not_shown(&restamped);
+    let fenced = told_after_the_route_answers(&controller, setting(true), |_| {
+        controller.hold_fence(true);
+    })
+    .await;
+    not_shown(&fenced);
+    controller.hold_fence(false);
+    let gone = told_after_the_route_answers(&controller, setting(false), |connection_id| {
+        controller.deregister(connection_id);
+    })
+    .await;
+    not_shown(&gone);
+}
+
+/// What the door tells of the revocation of a device that holds a delegation tree at the most it
+/// may hold, which with the device names more than one notice carries, so that the request's own
+/// barrier withdraws the whole host. With `another_withdrawal_follows` another device's withdrawal
+/// completes once the route has answered and before the answer is told.
+///
+/// Revoking a device that holds a tree of this size writes and reads every grant of it, which takes
+/// minutes in a debug build, so each leg is a case of its own.
+async fn told_a_device_revocation_at_the_most_a_notice_names(
+    another_withdrawal_follows: bool,
+) -> ControlFrame {
+    use kr_protocol::sharing::DeviceRevokeParams;
+
+    use super::a_copy_meets_a_restamp::another_devices_withdrawal;
+    use super::one_barrier_for_every_restriction::{a_device_holding, a_paired_device};
+
+    let limit = u32::try_from(crate::grants::MAX_GRANTS_PER_TREE).expect("fits");
+    let (temp, controller, _clock) = daemon().await;
+    let (_root, pairing) = a_device_holding(&controller, limit);
+    let device_id = pairing.recipient_device_id;
+    a_paired_device(&controller, device_id, pairing);
+    let revoking = (
+        Method::DeviceRevoke,
+        mutation_of(
+            &temp,
+            Method::DeviceRevoke,
+            ParamsValue::from_typed(&DeviceRevokeParams { device_id }).expect("encodes"),
+        ),
+    );
+    told_after_the_route_answers_and(
+        &controller,
+        revoking,
+        Duration::from_secs(30 * 60),
+        async |_| {
+            if another_withdrawal_follows {
+                another_devices_withdrawal(&controller).await;
+            }
+        },
+    )
+    .await
+}
+
+/// KR-REQ-09.09, 09.12, 10.45: a device's revocation that names more than one notice carries (the
+/// device and a delegation tree at the most it may hold) withdraws the whole host through its own
+/// barrier, the request's connection included, and its result is still told: its own barrier is the
+/// proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revocation_at_the_most_a_notice_names_is_told_though_it_withdrew_the_whole_host()
+{
+    let told = told_a_device_revocation_at_the_most_a_notice_names(false).await;
+    assert!(
+        refusal(&told).is_none(),
+        "the request's own withdrawal of the whole host is proved, and its result told: {told:?}"
+    );
+}
+
+/// KR-REQ-09.09, 09.12, 10.45: another withdrawal that completes between that revocation's effect
+/// and its reply moves the revision its own barrier set, and the result is not shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revocation_at_the_most_a_notice_names_is_not_shown_when_another_withdrawal_follows()
+ {
+    not_shown(&told_a_device_revocation_at_the_most_a_notice_names(true).await);
 }
 
 /// What the door tells of `settled` for `connection_id`, admitted under `admitted`.
