@@ -32,7 +32,7 @@
 
 import { useEffect, type RefObject } from 'react'
 
-import { SLOP, contestRadius, decide, linkAt, type Layout, type Named, type PaneLink, type Press, type Rect } from './link-target'
+import { SLOP, contestRadius, decide, keepsPress, linkAt, opensByRule, type Layout, type Named, type PaneLink, type Press, type Rect } from './link-target'
 
 /** The message controls that are not links. */
 const OTHER_CONTROLS = 'button:not(.md-link), a[href], input, select, textarea, summary'
@@ -40,6 +40,8 @@ const OTHER_CONTROLS = 'button:not(.md-link), a[href], input, select, textarea, 
 /** What the pane keeps of the press that is going on or that ended last. */
 interface Recorded extends Press<HTMLElement> {
   readonly pointer: number
+  /** Whether the press went down on the link's own element, which the browser's click opens. */
+  readonly own: boolean
   moved: boolean
   upAt: number | null
 }
@@ -69,13 +71,35 @@ export function startLinkPress(element: HTMLElement): () => void {
   const away = (event: PointerEvent): boolean =>
     press !== null && Math.hypot(event.clientX - press.at.x, event.clientY - press.at.y) > SLOP
 
+  // A press is live or dead. It lives from a primary pointer down to the pointer's up, and it dies at the
+  // first of: a move past the slop, a pointer cancel, the next primary pointer down, and a scroll or a
+  // resize after which the link it lit no longer wins its point. At its death the look ends at once and
+  // the record goes, so a dead press opens nothing. The listeners below stand only while a press lives.
+  const die = (): void => {
+    press = null
+    light(null)
+    stop()
+  }
   const move = (event: PointerEvent): void => {
-    if (press !== null && event.pointerId === press.pointer && away(event)) press.moved = true
+    if (press !== null && event.pointerId === press.pointer && away(event)) die()
+  }
+  // The scroll of any box (scroll events do not bubble, so the capture phase on the document hears them
+  // all) and the visual viewport's scroll and resize move the page under a held finger: the rule is asked
+  // again at the press's point. A press on a link's own element also holds while that element lies under
+  // the point, since the browser's click goes to it whatever the words' rectangles say.
+  const recheck = (): void => {
+    if (press === null || press.start === null) return
+    if (keepsPress(press, (point) => layoutNear(element, point.x, point.y))) return
+    if (press.own && lies(press.start.link, press.at)) return
+    die()
   }
   const stop = (): void => {
     document.removeEventListener('pointermove', move)
     document.removeEventListener('pointerup', up)
     document.removeEventListener('pointercancel', cancel)
+    document.removeEventListener('scroll', recheck, true)
+    window.visualViewport?.removeEventListener('scroll', recheck)
+    window.visualViewport?.removeEventListener('resize', recheck)
   }
   const up = (event: PointerEvent): void => {
     if (press === null || event.pointerId !== press.pointer) return
@@ -89,17 +113,13 @@ export function startLinkPress(element: HTMLElement): () => void {
   }
   const cancel = (event: PointerEvent): void => {
     if (press === null || event.pointerId !== press.pointer) return
-    press = null
-    light(null)
-    stop()
+    die()
   }
   const down = (event: PointerEvent): void => {
     // A second finger, a pen's barrel and a mouse's other buttons are not the press that is going on.
     if (!event.isPrimary || event.button !== 0) return
     // Every primary press ends the one before it, in the pane or outside it.
-    press = null
-    stop()
-    light(null)
+    die()
     if (!here(event.target)) return
     const found = pressedLink(element, event)
     press = {
@@ -107,6 +127,7 @@ export function startLinkPress(element: HTMLElement): () => void {
       pointerType: event.pointerType,
       at: { x: event.clientX, y: event.clientY },
       start: found === null ? null : { link: found.id, destination: found.destination },
+      own: found?.own === true,
       moved: false,
       upAt: null
     }
@@ -114,6 +135,11 @@ export function startLinkPress(element: HTMLElement): () => void {
     document.addEventListener('pointermove', move)
     document.addEventListener('pointerup', up)
     document.addEventListener('pointercancel', cancel)
+    if (found !== null) {
+      document.addEventListener('scroll', recheck, true)
+      window.visualViewport?.addEventListener('scroll', recheck)
+      window.visualViewport?.addEventListener('resize', recheck)
+    }
   }
   const click = (event: MouseEvent): void => {
     if (!here(event.target)) return
@@ -141,18 +167,28 @@ export function startLinkPress(element: HTMLElement): () => void {
 
 /**
  * The link that a press lights and a tap on it opens. A press on a link's own element is that link's,
- * whatever the words' rectangles say: the browser sends its click to that element. A press on another
- * control is the control's. Elsewhere it is the link whose words are nearest, where a target holds the point.
+ * whatever the words' rectangles say: the browser sends its click to that element, for every pointer
+ * type. A press on another control is the control's. A press on plain text is the link whose words are
+ * nearest, where a target holds the point, and only for a pointer that `opensByRule`: a mouse's click on
+ * plain text opens nothing, so its press lights nothing.
  */
-function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement; destination: string } | null {
+function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement; destination: string; own: boolean } | null {
   const target = event.target instanceof Element ? event.target : null
   const named = namedBy(target)
   if (named === 'control') return null
   if (named === 'link') {
     const own = target?.closest<HTMLElement>('.md-link') ?? null
-    return own === null ? null : { id: own, destination: own.title }
+    return own === null ? null : { id: own, destination: own.title, own: true }
   }
-  return linkNear(pane, event.clientX, event.clientY)
+  if (!opensByRule(event.pointerType)) return null
+  const near = linkNear(pane, event.clientX, event.clientY)
+  return near === null ? null : { id: near.id, destination: near.destination, own: false }
+}
+
+/** Whether `point` lies in the box of `link`'s own element. */
+function lies(link: HTMLElement, point: { x: number; y: number }): boolean {
+  const box = link.getBoundingClientRect()
+  return point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom
 }
 
 /** What a click's target is: a link, another control of the message, or neither (plain text). */
@@ -182,37 +218,44 @@ function activate(target: HTMLElement, from: MouseEvent): void {
 
 /** The link whose words are nearest to (`x`, `y`), where a target of a link holds the point. */
 function linkNear(pane: HTMLElement, x: number, y: number): PaneLink<HTMLElement> | null {
-  const { links, reach, bounds } = layoutNear(pane, x, y)
-  const index = linkAt({ x, y }, links, reach, bounds)
+  const { links, reach } = layoutNear(pane, x, y)
+  const index = linkAt({ x, y }, links, reach)
   return index === null ? null : (links[index] ?? null)
 }
 
 /** What a layout is where the pane holds no link in a message: nothing to press. */
-const NO_LINKS: Layout<HTMLElement> = { links: [], reach: { least: 0, beside: 0 }, bounds: { left: 0, top: 0, right: 0, bottom: 0 } }
+const NO_LINKS: Layout<HTMLElement> = { links: [], reach: { least: 0, beside: 0 } }
+
+/** The part of a box that clips a link, by axis: where `x` or `y` is false the box leaves that axis alone. */
+interface Clip {
+  readonly x: boolean
+  readonly y: boolean
+  readonly box: Rect
+}
+
+/** The room that nothing clips. */
+const OPEN: Rect = { left: -Infinity, top: -Infinity, right: Infinity, bottom: Infinity }
 
 /**
  * The links of `pane` that the rule weighs at (`x`, `y`), laid out as they are now: every link whose
  * words lie within `contestRadius` of the point, which holds the links whose areas can hold it and every
- * link whose words can be nearer to it than theirs. The least size is the stylesheet's `--target`: 44
- * points on iOS and 48 dp on Android, and half of it lies beside the words.
+ * link whose words can be nearer to it than theirs, each with its view (`viewOf`). The least size is the
+ * stylesheet's `--target`: 44 points on iOS and 48 dp on Android, and half of it lies beside the words.
  *
  * Where the pane holds no link in a message (the terminal and the output views, a conversation with no
  * link) this reads no box at all. Otherwise it reads the pane's box, the box of each message that holds
- * a link, and the box of each link of the messages that lie within the radius of the point; of those
- * links only the ones within the radius have their words read. The reads grow with the number of
- * messages that hold links and with the links of the messages near the point, so a message of some
- * thousand links reads every one of its link boxes at each press and each click.
+ * a link, and the box of each link of the messages that are near the point; of those links only the ones
+ * within the radius have their words read, and their clipping ancestors, each ancestor once for all of
+ * them. The reads grow with the number of messages that hold links and with the links of the messages
+ * near the point, so a message of some thousand links reads every one of its link boxes at each press
+ * and each click. Besides those boxes, each press and each click finds the message of every link of
+ * the pane with `closest`: a walk of the tree, not a layout read.
  */
 function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement> {
   const all = pane.querySelectorAll<HTMLElement>('.m-node .md-link')
   if (all.length === 0) return NO_LINKS
   const least = parseFloat(getComputedStyle(pane).getPropertyValue('--target'))
-  // What holds content and can be tapped: the pane's client box, with no border and no scroll bar's strip.
-  const box = pane.getBoundingClientRect()
-  const left = box.left + pane.clientLeft
-  const top = box.top + pane.clientTop
-  const bounds = { left, top, right: left + pane.clientWidth, bottom: top + pane.clientHeight }
-  if (!Number.isFinite(least) || least <= 0) return { links: [], reach: { least: 0, beside: 0 }, bounds }
+  if (!Number.isFinite(least) || least <= 0) return NO_LINKS
   const reach = { least, beside: least / 2 }
   const radius = contestRadius(reach)
   // A box that lies farther from the point than the radius holds no link that the rule weighs there.
@@ -228,10 +271,63 @@ function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement
     }
     return answer
   }
+  // The pane clips every link in it, whatever its computed overflow says: what holds content and can be
+  // tapped is its client box, with no border and no scroll bar's strip.
+  const clips = new Map<Element, Clip | null>([[pane, { x: true, y: true, box: clientBoxOf(pane) }]])
+  const viewport = window.visualViewport
+  const screen: Rect =
+    viewport === null || viewport === undefined
+      ? OPEN
+      : { left: viewport.offsetLeft, top: viewport.offsetTop, right: viewport.offsetLeft + viewport.width, bottom: viewport.offsetTop + viewport.height }
   const links = Array.from(all)
     .filter((link) => nearMessage(link) && near(link.getBoundingClientRect()))
-    .map((link) => ({ id: link, destination: link.title, words: wordsOf(link) }))
-  return { links, reach, bounds }
+    .map((link) => ({ id: link, destination: link.title, words: wordsOf(link), view: viewOf(link, clips, screen) }))
+  return { links, reach }
+}
+
+/**
+ * What every box that clips `link` leaves of the page, by axis: the visual viewport `screen`, narrowed by
+ * the client box of each ancestor from the link up to the document's root whose computed overflow on that
+ * axis is not `visible`. The intersection is taken whole, so a later fit never gives back what an earlier
+ * box cut. `clips` holds what is known of each ancestor in this read, so that each is read once.
+ *
+ * The walk follows the element tree. It does not model a link taken out of the flow: an absolutely
+ * positioned link is clipped by the boxes between it and its containing block, a fixed one by none, and
+ * the walk clips both by every ancestor; a transformed box clips by its bounding box; a clip-path or a
+ * mask is not read. In this page's messages links are inline, so none of these holds.
+ */
+function viewOf(link: HTMLElement, clips: Map<Element, Clip | null>, screen: Rect): Rect {
+  let view = screen
+  for (let ancestor = link.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
+    let clip = clips.get(ancestor)
+    if (clip === undefined) {
+      const style = getComputedStyle(ancestor)
+      const x = style.overflowX !== 'visible'
+      const y = style.overflowY !== 'visible'
+      clip = x || y ? { x, y, box: clientBoxOf(ancestor) } : null
+      clips.set(ancestor, clip)
+    }
+    if (clip === null) continue
+    view = {
+      left: clip.x ? Math.max(view.left, clip.box.left) : view.left,
+      right: clip.x ? Math.min(view.right, clip.box.right) : view.right,
+      top: clip.y ? Math.max(view.top, clip.box.top) : view.top,
+      bottom: clip.y ? Math.min(view.bottom, clip.box.bottom) : view.bottom
+    }
+    // Nothing of the link is in view of an empty view, whatever the boxes further up leave.
+    if (view.left >= view.right || view.top >= view.bottom) break
+  }
+  return view
+}
+
+/** What a box holds of content that can be tapped: its client box, with no border and no scroll bar's strip. */
+function clientBoxOf(element: Element): Rect {
+  // The root's client box is the viewport's, wherever the page has scrolled.
+  if (element === document.documentElement) return { left: 0, top: 0, right: element.clientWidth, bottom: element.clientHeight }
+  const box = element.getBoundingClientRect()
+  const left = box.left + element.clientLeft
+  const top = box.top + element.clientTop
+  return { left, top, right: left + element.clientWidth, bottom: top + element.clientHeight }
 }
 
 /** The rectangles of a link's words, one for each line its label covers. */

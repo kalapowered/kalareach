@@ -15,12 +15,14 @@
  * too; the room that gives back goes to a link only where no other link's words are nearer. At an
  * equal distance the earlier link in the message takes the point.
  *
- * The pane scrolls, so its box is the part of the conversation that is in view, and a link takes part
- * only by what is in view of its words. A line of words wholly outside the pane has no area and no
- * distance: it never takes a point and keeps no other link's area from growing. The room that a cut is
- * given back applies only on an axis on which the words are wholly in view; words that the pane's edge
- * cuts keep the part of their target that is in view, and nothing is given back on that axis. A point
- * outside the pane's box (a scroll bar's strip) is no link's.
+ * The page scrolls, zooms and clips, so each link has a view: the part of the page that every box which
+ * clips it leaves of it (the caller reads those boxes: the pane, the scrollers inside and outside it,
+ * and the visual viewport). A link takes part only by what is in view of its words. A line of words
+ * wholly outside the link's view has no area and no distance: it never takes a point and keeps no other
+ * link's area from growing. The room that a cut is given back applies only on an axis on which the
+ * words are wholly in view, and is fitted once against the whole view, never box by box; words that the
+ * view cuts through keep the part of their target that is in view, and nothing is given back on that
+ * axis. A point outside a link's view (a scroll bar's strip, another scroller's edge) is not that link's.
  */
 
 /** A point in the page's coordinates. */
@@ -41,6 +43,12 @@ export interface Rect {
 export interface Link {
   /** The rectangles of the link's words, one for each line its label covers. */
   readonly words: readonly Rect[]
+  /**
+   * What every box that clips the link leaves of the page, in the page's coordinates: the intersection
+   * of the client boxes of its clipping ancestors and of the visual viewport. It may be empty (a left
+   * edge at or past the right edge).
+   */
+  readonly view: Rect
 }
 
 /** How far a link's target reaches past its words. */
@@ -57,22 +65,25 @@ const EQUAL = 1e-6
 /**
  * The index of the link that takes a press at `point`, or null when none does.
  *
- * `links` are the links of the message in the order they have there. `bounds` is the room the pane
- * gives: no target reaches past it.
+ * `links` are the links of the message in the order they have there, each with its own view: no target
+ * reaches past it, and the words are weighed by what is in it.
  */
-export function linkAt(point: Point, links: readonly Link[], reach: Reach, bounds: Rect): number | null {
-  const seen = links.map(({ words }) => words.filter((rect) => inView(rect, bounds)))
-  const distances = seen.map((parts) => Math.min(...parts.map((rect) => distanceTo(rect, point))))
+export function linkAt(point: Point, links: readonly Link[], reach: Reach): number | null {
+  // The rectangles of the words that have something in view, with what is in view of each.
+  const seen = links.map(({ words, view }) => words.filter((rect) => inView(rect, view)).map((rect) => ({ rect, part: within(rect, view) })))
+  const distances = seen.map((parts) => Math.min(...parts.map(({ part }) => distanceTo(part, point))))
   const closest = Math.min(...distances)
   let chosen: number | null = null
   let nearest = Number.POSITIVE_INFINITY
   for (let index = 0; index < links.length; index += 1) {
     const parts = seen[index] ?? []
+    const view = links[index]?.view
     const distance = distances[index] ?? Number.POSITIVE_INFINITY
-    const own = parts.some((rect) => holds(within(targetOf(rect, reach), bounds), point))
-    // What the pane's edge cut from one side is given back on the other, but not where it takes a
-    // point from the link whose words are nearer.
-    const given = !own && distance <= closest + EQUAL && parts.some((rect) => holds(fitted(rect, reach, bounds), point))
+    if (view === undefined) continue
+    const own = parts.some(({ rect }) => holds(within(targetOf(rect, reach), view), point))
+    // What the view cut from one side is given back on the other, but not where it takes a point
+    // from the link whose words are nearer.
+    const given = !own && distance <= closest + EQUAL && parts.some(({ rect }) => holds(fitted(rect, reach, view), point))
     if (!own && !given) continue
     if (distance < nearest - EQUAL) {
       chosen = index
@@ -87,7 +98,7 @@ export function linkAt(point: Point, links: readonly Link[], reach: Reach, bound
  * whose area holds it: the farthest a point of an area lies from the words that it belongs to.
  *
  * A target reaches `beside` past the words on each side (or `(least - width) / 2`, where that is more),
- * and `(least - height) / 2` above and below them. Where the pane cuts a side of a target, the opposite
+ * and `(least - height) / 2` above and below them. Where the view cuts a side of a target, the opposite
  * side grows by what was cut; the words are wholly in view on an axis where that happens, so what is cut
  * is at most the reach on the cut side, and the area ends at most twice that reach past the words on the
  * other side: across, `2 * max(beside, least / 2)`, which is `least` for a reach of half the least size;
@@ -95,7 +106,8 @@ export function linkAt(point: Point, links: readonly Link[], reach: Reach, bound
  * of an area is at the corner of that rectangle: `hypot(least, least)` for the reach of the least size
  * and half of it beside. Words nearer to a point than the words of such a link are within the same radius
  * of it, so a layout that holds every link whose words are within this radius of a point holds every
- * link that the rule weighs there.
+ * link that the rule weighs there. (A link's view only takes from this: what is in view of words is part
+ * of them, and a point outside a view is no more distant from the words than from their part in view.)
  */
 export function contestRadius(reach: Reach): number {
   return Math.hypot(2 * Math.max(reach.beside, reach.least / 2), reach.least)
@@ -153,8 +165,13 @@ function clamp(low: number, high: number, min: number, max: number): readonly [n
   return [Math.max(low, min), Math.min(high, max)]
 }
 
-/** Whether any of `rect` is in view in `bounds`: a rectangle that only touches an edge has nothing in view. */
+/**
+ * Whether any of `rect` is in view in `bounds`: a rectangle that only touches an edge has nothing in
+ * view, and a view that is empty (its left edge at or past its right edge, or its top at or past its
+ * bottom) shows nothing, though a rectangle spans the gap.
+ */
 function inView(rect: Rect, bounds: Rect): boolean {
+  if (bounds.left >= bounds.right || bounds.top >= bounds.bottom) return false
   return rect.right > bounds.left && rect.left < bounds.right && rect.bottom > bounds.top && rect.top < bounds.bottom
 }
 
@@ -183,7 +200,6 @@ export interface PaneLink<L> extends Link {
 export interface Layout<L> {
   readonly links: readonly PaneLink<L>[]
   readonly reach: Reach
-  readonly bounds: Rect
 }
 
 /** What the page keeps of a press: written at a primary pointer down, read by the click that follows. */
@@ -229,31 +245,49 @@ export const CLICK_AWAY = 2 * SLOP
 const STAND = { kind: 'stand' } as const
 
 /**
+ * Whether a press of this pointer type can get an open from `decide`: a touch or a pen. A mouse's or a
+ * trackpad's click on plain text opens nothing, as on a desktop, so a press of those lights nothing by
+ * the rule either. One predicate serves both the look at the press and the open at the click.
+ */
+export function opensByRule(pointerType: string): boolean {
+  return pointerType === 'touch' || pointerType === 'pen'
+}
+
+/**
+ * Whether the nearest-words rule, run at the press's own point in the layout that `layout` gives now,
+ * still names the link that the press lit, opening what it opened then. A press that lit nothing has
+ * nothing to keep and does not keep it.
+ */
+export function keepsPress<L>(press: Press<L>, layout: (at: Point) => Layout<L>): boolean {
+  if (press.start === null) return false
+  const { links, reach } = layout(press.at)
+  const index = linkAt(press.at, links, reach)
+  const chosen = index === null ? undefined : links[index]
+  return chosen !== undefined && chosen.id === press.start.link && chosen.destination === press.start.destination
+}
+
+/**
  * What a click does besides what the browser does with it. The click itself always stands: it goes
  * where the browser sent it, and this adds one thing, a click on a link.
  *
  * A click that names a link or a control stands alone. A trusted click that names neither, a click on
- * plain text, also opens a link when a touch or a pen pressed that link's words or the room beside
- * them: the press did not move beyond the slop; the click has a detail of 1, comes after the pointer's
- * up and within `CLICK_WITHIN` of it, and lies within `CLICK_AWAY` of the press, since the engine reports
- * the point of the same tap, rounded or moved toward a nearby link; and the nearest-words rule, run again
- * at the press's own point in the layout as it is now, names the same element, opening the same
- * destination, as it did at the press's start. The look at the press and the open at the click are
- * therefore one function of one point. A mouse's click on plain text opens nothing, as on a desktop.
- * The press is the record of the latest primary pointer down: a later press, or a pointer cancel,
- * leaves none.
+ * plain text, also opens a link when a press that `opensByRule` pressed that link's words or the room
+ * beside them: the press did not move beyond the slop; the click has a detail of 1, comes after the
+ * pointer's up and within `CLICK_WITHIN` of it, and lies within `CLICK_AWAY` of the press, since the
+ * engine reports the point of the same tap, rounded or moved toward a nearby link; and the
+ * nearest-words rule, run again at the press's own point in the layout as it is now, names the same
+ * element, opening the same destination, as it did at the press's start (`keepsPress`). For a touch or
+ * a pen, the look at the press and the open at the click are therefore one function of one point. The
+ * press is the record of the latest primary pointer down: a later press, or a pointer cancel, leaves
+ * none.
  *
  * `layout` is read only when the other conditions hold, at the press's point.
  */
 export function decide<L>(press: Press<L> | null, click: Click, layout: (at: Point) => Layout<L>): Decision<L> {
   if (click.names !== 'neither' || !click.trusted || click.detail !== 1) return STAND
-  if (press === null || (press.pointerType !== 'touch' && press.pointerType !== 'pen')) return STAND
+  if (press === null || !opensByRule(press.pointerType)) return STAND
   if (press.moved || press.start === null || press.upAt === null) return STAND
   if (click.at < press.upAt || click.at - press.upAt > CLICK_WITHIN) return STAND
   if (Math.hypot(click.point.x - press.at.x, click.point.y - press.at.y) > CLICK_AWAY) return STAND
-  const { links, reach, bounds } = layout(press.at)
-  const index = linkAt(press.at, links, reach, bounds)
-  const chosen = index === null ? undefined : links[index]
-  if (chosen === undefined || chosen.id !== press.start.link || chosen.destination !== press.start.destination) return STAND
-  return { kind: 'open', link: chosen.id }
+  return keepsPress(press, layout) ? { kind: 'open', link: press.start.link } : STAND
 }
