@@ -927,16 +927,22 @@ pub fn shape_refusal(
 }
 
 /// The setup program's line for a known folder that cannot be read: which folder, the platform's
-/// error and that nothing was changed, and at a removal the limit that it has. No words tell
-/// anyone to remove what stays by hand: the policy's rules are shared with other programs.
+/// error in the system's own form (`status`: its code in hexadecimal and, where the system has one,
+/// its message) and that nothing was changed, and at a removal the limit that it has. What stays is
+/// said on a condition, since nothing was read of an installation. No words tell anyone to remove
+/// what stays by hand: the policy's rules are shared with other programs.
 #[must_use]
-pub fn known_folder_unreadable(error: &str, removal: bool) -> String {
+pub fn known_folder_unreadable(folder: &str, status: &str, removal: bool) -> String {
     let limit = if removal {
-        " A removal reads what to remove from the manifest in the data directory and checks the program directory before it deletes anything, so it cannot go on while that folder cannot be read. The broker's service, its two accounts and its rules in the policy stay. If the volume is gone for good, the setup program cannot remove them."
+        format!(
+            " A removal reads what to remove from the manifest in the data directory and checks the program directory before it deletes anything, so it cannot go on while that folder cannot be read. If the boundary is installed, the broker's service, its two accounts and its rules in the policy stay. If the volume of the {folder} folder is gone for good, the setup program cannot remove them."
+        )
     } else {
-        ""
+        String::new()
     };
-    format!("{error}. Nothing was changed.{limit} {SHARED_CLOSING}")
+    format!(
+        "The system's {folder} folder could not be read: {status}. Nothing was changed.{limit} {SHARED_CLOSING}"
+    )
 }
 
 /// A state of the broker's service, as the service manager reports it, said apart from the
