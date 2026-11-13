@@ -72,7 +72,7 @@ use super::proof;
 use super::registry;
 use super::sd::{self, Principals, SdKind};
 use super::service;
-use super::walk::{AnchorRefusal, DirHandle, Kind, LIST, Lost, Opened};
+use super::walk::{AnchorRefusal, Child, DirHandle, Kind, LIST, Lost, Opened};
 use super::{account, boot, pipe, token, verify};
 
 /// The broker's service name.
@@ -720,6 +720,30 @@ struct MadeObject {
     holder: ffi::Handle,
     /// The object's bare name in that directory.
     name: OsString,
+    /// Whether the object is a directory, which can hold entries that keep it from going.
+    directory: bool,
+}
+
+/// What the directory behind `identity` holds, read through its own handle and no path, for the
+/// words of a directory that stays.
+fn names_held_by(identity: &ffi::Handle) -> String {
+    let listed = identity
+        .duplicate(LIST)
+        .map_err(Error::from)
+        .and_then(held_directory)
+        .and_then(|held| Ok(held.children()?));
+    match listed {
+        Ok(children) if children.is_empty() => "a listing of it shows nothing in it".to_owned(),
+        Ok(children) => format!(
+            "it holds {}",
+            children
+                .iter()
+                .map(Child::display)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Err(error) => format!("a listing of it failed ({error})"),
+    }
 }
 
 impl MadeObject {
@@ -737,6 +761,7 @@ impl MadeObject {
             identity,
             holder,
             name,
+            directory,
         } = self;
         let units: Vec<u16> = name.encode_wide().collect();
         let marked = (|| {
@@ -767,7 +792,17 @@ impl MadeObject {
                 return Err("another object stands at its name, so nothing was marked".to_owned());
             }
             super::root::delete(&at_name).map_err(|failure| {
-                remedy::platform_error("the platform refused to mark it for removal", failure.code)
+                let words = remedy::platform_error(
+                    "the platform refused to mark it for removal",
+                    failure.code,
+                );
+                // A directory that holds an entry stays: the entries are named, read through the
+                // object's own handle.
+                if directory {
+                    format!("{words}; {}", names_held_by(&identity))
+                } else {
+                    words
+                }
             })
         })();
         // The handle of the open is closed, then the object's own, then the directory's.
@@ -1004,6 +1039,7 @@ impl DataHolds {
                     identity: handle,
                     holder,
                     name: name.clone(),
+                    directory: true,
                 });
                 copy?
             }
@@ -3074,6 +3110,7 @@ fn open_data_directory(
                 identity: opened,
                 holder,
                 name: name.to_owned(),
+                directory: true,
             });
             copy?
         }
@@ -3181,6 +3218,7 @@ fn create_data_parent(parent: &Path) -> Result<Option<MadeObject>, Error> {
         identity,
         holder,
         name: name.to_owned(),
+        directory: true,
     }))
 }
 
@@ -3490,6 +3528,7 @@ fn identity_in(directory: &ffi::Handle, name: &OsStr) -> Result<MadeObject, ffi:
         identity,
         holder,
         name: name.to_owned(),
+        directory: false,
     })
 }
 
@@ -3722,6 +3761,8 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
             if existing { "repair" } else { "installation" }
         ));
         if existing {
+            // text: install-4-repair
+            say("a repair has no rollback: what it did before it stopped stays as it is");
             return Err(failure);
         }
         // text: install-5
@@ -5060,18 +5101,23 @@ fn undo_recorded(
             ));
             Ok(())
         } else {
-            // While the manifest stays, the removal runs again whole and reads it. Without it,
-            // an empty directory is finished by the next removal, and anything else in it is for
-            // the person to remove.
-            let next = records::next_step(
-                &records::look(&paths.manifest),
-                &records::held_in(&paths.data),
-            );
-            // text: remove_at-25
-            Err(Error::Failed(format!(
-                "the removal's steps ended without a failure, but the removal of its records left: {}. {next}{unread_prior}",
-                stayed.join("; ")
-            )))
+            if matches!(tree, DataTree::Laid(_)) {
+                // text: remove_at-27
+                Err(Error::Failed(remedy::rollback_laid_stays(&stayed)))
+            } else {
+                // While the manifest stays, the removal runs again whole and reads it. Without
+                // it, an empty directory is finished by the next removal, and anything else in
+                // it is for the person to remove.
+                let next = records::next_step(
+                    &records::look(&paths.manifest),
+                    &records::held_in(&paths.data),
+                );
+                // text: remove_at-25
+                Err(Error::Failed(format!(
+                    "the removal's steps ended without a failure, but the removal of its records left: {}. {next}{unread_prior}",
+                    stayed.join("; ")
+                )))
+            }
         }
     } else {
         // text: remove_at-26
@@ -5365,6 +5411,7 @@ mod tests {
             identity,
             holder,
             name: name.into(),
+            directory: true,
         }
     }
 
