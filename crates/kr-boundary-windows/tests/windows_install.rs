@@ -4241,7 +4241,10 @@ fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and
     let again = install::ask(&mut connection, &Request::Status {})
         .expect_err("the connection takes no more")
         .to_string();
-    assert!(again.contains("did not end"), "{again}");
+    assert!(
+        again.contains("was not seen to end when it was cancelled"),
+        "{again}"
+    );
     drop(connection);
     stop.set();
     server.join().unwrap();
