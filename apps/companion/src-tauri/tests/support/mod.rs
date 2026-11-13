@@ -126,27 +126,35 @@ pub struct ListenersHeld {
 const HOLDING_EVENT: &str = "kr://test-listeners-held";
 
 impl ListenersHeld {
-    /// Holds `app`'s listeners, and returns once they are held.
+    /// Holds `app`'s listeners, and returns once they are held. The application's start tells the
+    /// page from tasks of its own, so a listener or an emit made here can meet the listeners busy.
+    /// Tauri then queues it and does not do it at once, and the emit's filter is never asked. A try
+    /// that did not hold the listeners is made again; the start tells the page a few times only.
     pub fn take(app: &tauri::AppHandle<tauri::test::MockRuntime>) -> Self {
         use tauri::{Emitter as _, Listener as _};
 
-        // A listener for the application, not for any target, so that the filter is asked about it.
-        app.listen(HOLDING_EVENT, |_| {});
-        let (entered, held) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let released = Mutex::new(released);
-        let app = app.clone();
-        let emit = std::thread::spawn(move || {
-            let _ = app.emit_filter(HOLDING_EVENT, (), |_| {
-                let _ = entered.send(());
-                let _ = released.lock().expect("the release").recv();
-                false
+        loop {
+            // A listener for the application, not for any target, so that the filter is asked about it.
+            app.listen(HOLDING_EVENT, |_| {});
+            let (entered, held) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let app = app.clone();
+            let emit = std::thread::spawn(move || {
+                let _ = app.emit_filter(HOLDING_EVENT, (), |_| {
+                    let _ = entered.send(());
+                    let _ = released.recv();
+                    false
+                });
             });
-        });
-        held.recv().expect("the emit holds the listeners");
-        Self {
-            release: Some(release),
-            emit: Some(emit),
+            // The filter says it is asked, inside the listeners' lock, before it waits. An emit
+            // that was queued drops the filter unasked, which ends the channel.
+            if held.recv().is_ok() {
+                return Self {
+                    release: Some(release),
+                    emit: Some(emit),
+                };
+            }
+            let _ = emit.join();
         }
     }
 }
@@ -867,9 +875,12 @@ impl Companion {
         }
     }
 
-    /// Everything the page was sent: every event and every answer.
+    /// Everything the page was sent: every event and every answer. An event may be here twice,
+    /// once as a listener heard it and once as the backend handed it over: the listener misses an
+    /// event that is queued behind another emit, and the tap misses an emit that is not tapped.
     pub fn sent(&self) -> Vec<String> {
         let mut sent = self.heard.texts();
+        sent.extend(self.told.texts());
         sent.extend(self.answered.texts());
         sent
     }

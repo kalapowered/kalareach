@@ -1,17 +1,19 @@
 //! What the backend tells the page, handed to a suite as it is told.
 //!
-//! A listener that a suite adds in Rust hears an event only if no other emit holds the event
-//! listeners when the event is told. Tauri queues an emit that finds them busy and delivers it with
-//! the next emit that reaches a listener, so an event that the backend tells once, with nothing
-//! after it, can wait for good. The page does not meet that: an event reaches the page's own
-//! listeners before the Rust ones, on a path that has no queue. A suite that waits for an event the
-//! backend tells therefore reads it here, where the backend hands it over.
+//! A listener that a suite adds in Rust may not hear an event when it is told. Tauri queues an
+//! emit that finds the event listeners busy, and delivers it with the next emit that reaches a
+//! listener, so an event that the backend tells once, with nothing after it, can wait for good. The
+//! page does not meet that: an event reaches the page's own listeners before the Rust ones, on a
+//! path that has no queue. A suite that waits for an event the backend tells therefore reads it
+//! here, where the backend hands it over. Only the events that a suite waits for are handed over:
+//! the pairing, confirmations, standing, connection and settings events, where a computer's own
+//! application tells them. The emits that only a phone's application makes are not.
 
 use serde::Serialize;
 use tauri::Manager as _;
 
-/// What a suite does with each event the backend tells the page: the event's name, and its payload
-/// as the page receives it. An application that has no tap managed tells no one.
+/// What a suite does with each event the backend hands over: the event's name, and its payload as
+/// the page receives it. An application that has no tap managed hands nothing over.
 pub struct Tap(Heard);
 
 /// What a [`Tap`] calls for each event: the event's name and its payload.
