@@ -169,6 +169,10 @@ pub(super) struct Debts {
     /// A daemon that restarts keeps none, and a revision with no entry is announced as the whole
     /// host's, which fences every caller under a grant.
     reaches: BTreeMap<u64, Option<std::sync::Arc<Named>>>,
+    /// How many barriers have advanced the revision in this run, whatever they captured: a debt
+    /// published at one count and captured by a barrier that finds another has had a barrier
+    /// advance between the two ([`Withdrawn::proof_for`]).
+    advanced: u64,
     /// The revision the next barrier advances the registry to at least, when the authority feed
     /// holds revisions above it ([`Controller::catch_up_with_the_feed`]). Memory alone: the
     /// registry's fence debt is what a stop leaves owed.
@@ -224,6 +228,9 @@ pub(super) struct Published {
 #[must_use = "a change's debts wait for the debt pass unless its own barrier is raised"]
 pub(crate) struct OwnBarrier {
     debts: Vec<crate::grants::store::DebtId>,
+    /// How many barriers had advanced the revision when the debts were published
+    /// ([`Debts::advanced`]).
+    advanced_at_publication: u64,
     held: Arc<std::sync::Mutex<Debts>>,
     pass: Arc<tokio::sync::Notify>,
 }
@@ -232,6 +239,9 @@ impl OwnBarrier {
     /// Covers the debts `other` covers as well, for a change that published in two steps.
     pub(crate) fn and(mut self, mut other: Self) -> Self {
         self.debts.append(&mut other.debts);
+        self.advanced_at_publication = self
+            .advanced_at_publication
+            .min(other.advanced_at_publication);
         self
     }
 }
@@ -293,6 +303,8 @@ impl std::fmt::Debug for HostWithdrawal {
 /// each reaches.
 struct Withdrawn {
     revision: AuthorityRevision,
+    /// How many barriers had advanced the revision before this one did ([`Debts::advanced`]).
+    advanced_before: u64,
     captured: BTreeMap<crate::grants::store::DebtId, Reach>,
 }
 
@@ -302,8 +314,17 @@ impl Withdrawn {
     }
 
     /// The proof that `own` withdrew the whole host, when this first step shows it: a host-wide
-    /// debt among the request's own, and no host-wide debt that is not.
-    fn proof_for(&self, own: &[crate::grants::store::DebtId]) -> Option<HostWithdrawal> {
+    /// debt among the request's own, no host-wide debt that is not, and no barrier of any kind
+    /// that advanced the revision between the publication of the request's debts and this one,
+    /// whether the debt pass's or another request's.
+    fn proof_for(
+        &self,
+        own: &[crate::grants::store::DebtId],
+        advanced_at_publication: u64,
+    ) -> Option<HostWithdrawal> {
+        if self.advanced_before != advanced_at_publication {
+            return None;
+        }
         let mut own_host = None;
         for (debt, reach) in &self.captured {
             if *reach != Reach::Host {
@@ -1012,6 +1033,7 @@ impl Controller {
         debts: &[(crate::grants::store::DebtId, Reach)],
     ) -> OwnBarrier {
         let mut held = self.debts();
+        let advanced_at_publication = held.advanced;
         for (debt, reach) in debts {
             held.pending.remove(debt);
             held.published.insert(
@@ -1025,6 +1047,7 @@ impl Controller {
         drop(held);
         OwnBarrier {
             debts: debts.iter().map(|(debt, _)| *debt).collect(),
+            advanced_at_publication,
             held: Arc::clone(&self.debts),
             pass: Arc::clone(&self.debt_pass),
         }
@@ -1145,7 +1168,7 @@ impl Controller {
             .as_ref()
             .ok()
             .and_then(Option::as_ref)
-            .and_then(|withdrawn| withdrawn.proof_for(&own.debts));
+            .and_then(|withdrawn| withdrawn.proof_for(&own.debts, own.advanced_at_publication));
         drop(own);
         match withdrawn? {
             Some(withdrawn) => Ok((self.tell(&withdrawn.debts()).await?, proof)),
@@ -1153,14 +1176,29 @@ impl Controller {
         }
     }
 
-    /// Whether the revision in force is still the one `withdrew` set: no later barrier, of this
-    /// request or of any other, has moved it. An unreadable registry counts as moved.
-    pub(crate) async fn withdrawal_stands(&self, withdrew: &HostWithdrawal) -> bool {
-        self.registry
-            .lock()
-            .await
-            .authority_revision()
-            .is_ok_and(|revision| revision == withdrew.revision)
+    /// Whether the withdrawal `withdrew` proves still stands at this moment: the revision in force
+    /// is the one it set, so no later barrier has moved it, and no fence is owed. Both are read
+    /// under the registry's lock, which a restriction holds from the writing of its debt to the
+    /// publication of it, so a debt published while this waited for the lock is seen, and one
+    /// published after it is another request's. An unreadable registry counts as moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fence's refusal while a fence is owed, and a refusal that the authority has
+    /// withdrawn when a later barrier moved the revision.
+    pub(crate) async fn withdrawal_stands(&self, withdrew: &HostWithdrawal) -> Result<()> {
+        let registry = self.registry.lock().await;
+        let in_force = registry.authority_revision();
+        self.check_fence()?;
+        if in_force.is_ok_and(|revision| revision == withdrew.revision) {
+            Ok(())
+        } else {
+            Err(ControllerError::PermissionDenied {
+                detail: "the authority this connection was admitted under has been withdrawn; \
+                         open a new connection"
+                    .to_owned(),
+            })
+        }
     }
 
     /// The published debts one barrier takes: the ones `first` names, then the rest while what they
@@ -1400,7 +1438,13 @@ impl Controller {
                     Some(floor) => registry.advance_authority_revision_to(floor)?,
                     None => registry.advance_authority_revision()?,
                 };
-                self.debts().floor = None;
+                let advanced_before = {
+                    let mut debts = self.debts();
+                    debts.floor = None;
+                    let before = debts.advanced;
+                    debts.advanced += 1;
+                    before
+                };
                 let revision = registry.authority_revision()?;
                 let host_wide = captured.values().any(|reach| *reach == Reach::Host);
                 let reach = Self::reach_of(&captured);
@@ -1458,10 +1502,10 @@ impl Controller {
                 while debts.reaches.len() > KEPT_REVISION_REACHES {
                     debts.reaches.pop_first();
                 }
-                Some((revision, captured))
+                Some((revision, advanced_before, captured))
             }
         };
-        let Some((revision, captured)) = captured else {
+        let Some((revision, advanced_before, captured)) = captured else {
             return Ok(None);
         };
         // The host policy decides a paired device's request against the revision in force, so it
@@ -1475,7 +1519,11 @@ impl Controller {
         // waiting for its peer is stopped by its connection closing, not by the next check. Only a
         // connection whose registration went is closed, so a narrower reach closes only its own.
         self.fence_network_connections().await;
-        Ok(Some(Withdrawn { revision, captured }))
+        Ok(Some(Withdrawn {
+            revision,
+            advanced_before,
+            captured,
+        }))
     }
 
     /// A barrier's second step: every worker is told the revision in force, the policy and the

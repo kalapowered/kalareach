@@ -193,18 +193,7 @@ async fn own_withdrawal_or_standing(
     withdrew: Option<HostWithdrawal>,
 ) -> Result<(), ControllerError> {
     match withdrew {
-        Some(withdrew) => {
-            controller.check_fence()?;
-            if controller.withdrawal_stands(&withdrew).await {
-                Ok(())
-            } else {
-                Err(ControllerError::PermissionDenied {
-                    detail: "the authority this connection was admitted under has been \
-                             withdrawn; open a new connection"
-                        .to_owned(),
-                })
-            }
-        }
+        Some(withdrew) => controller.withdrawal_stands(&withdrew).await,
         None => controller
             .authorised(connection_id)
             .map_err(ControllerError::from)
