@@ -258,6 +258,10 @@ fn the_supported_layout_says_where_each_tree_installs() {
     assert!(data.contains("the boundary's data directory"), "{data}");
     assert!(data.contains("system's ProgramData folder"), "{data}");
     assert!(data.contains("fixed, local NTFS volume"), "{data}");
+    assert!(
+        data.contains("the path that the system gives for that folder is its own final path"),
+        "{data}"
+    );
     assert!(!data.contains("program directory"), "{data}");
     let program = supported_layout(Tree::Program);
     assert!(
@@ -1258,6 +1262,18 @@ fn the_shape_refusal_says_what_the_run_changed() {
         rollback.contains("whatever that installation had already made is still there"),
         "{rollback}"
     );
+    // A known folder that leads elsewhere, and one that could not be opened, say the same.
+    for files in [
+        known(r"C:\PF", r"\\?\C:\ProgramData\KalaReach"),
+        unopened(PF, "Windows error 3"),
+    ] {
+        let text = shape_refusal(&files, &known(PD, PD_FINAL), Stage::Rollback).expect("refused");
+        assert!(!text.contains("Nothing was changed."), "{text}");
+        assert!(
+            text.contains("whatever that installation had already made is still there"),
+            "{text}"
+        );
+    }
 }
 
 /// The setup program's line for a known folder that cannot be read says the error and that nothing
