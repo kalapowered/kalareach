@@ -951,14 +951,6 @@ const DATA_REMEDY: &str = "Leave the system and the Administrators group as the 
 /// did not make it (another account owns it, or it is a link or not a directory).
 const DATA_NOT_MADE: &str = "The handle of this directory shows what the installation does not leave there: an owner that is not the system or the Administrators group, a reparse point, or an object that is not a directory. It can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
 
-/// The words the refusal of a data directory ends with when its list refuses the open, or the open
-/// failed for a reason that shows nothing: the installation's lists never refuse the administrator,
-/// so it did not make a directory whose list does, and nothing is known of one that cannot be read.
-const DATA_UNKNOWN: &str = "Nothing shows that the installation made this directory, because its own list refuses the check or it could not be read, and it can hold files that another account wrote. Do not correct its owner or its list, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
-
-/// The words the refusal of a data directory ends with when a program holds it open.
-const DATA_UNREADABLE: &str = "Nothing shows who made this directory, because it could not be read. Do not correct its owner or its list, and do not remove it: either would hide what it is. Close the program that holds it open, then run the setup program again, which reads it again.";
-
 /// The words the refusal of a data directory that separates names by case ends with, when the
 /// system's class owns it.
 const CASE_REMEDY: &str = "Turn the flag off (`fsutil.exe file setCaseSensitiveInfo <the directory> disable`), then run the setup program again. Nothing in it is removed.";
@@ -967,20 +959,31 @@ const CASE_REMEDY: &str = "Turn the flag off (`fsutil.exe file setCaseSensitiveI
 // text: CASE_SENSITIVE_WHY
 pub const CASE_SENSITIVE_WHY: &str = "it separates names that differ only by case, and the installation compares names without regard to case";
 
+/// What an owner or a list that others can use does to the data directory while the broker runs as
+/// the system: said only where a read of the directory's owner and list succeeded.
+const DATA_CAN_BE_CHANGED: &str = "Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system.";
+
 /// The words that end the refusal of the data directory itself, from what its own handle showed
 /// (`origin`) and whether the reason is the directory's case-sensitive flag. One refusal gets one
-/// remedy. Only a directory that the system's class owns is told what to correct, and no remedy
-/// says what the directory holds, which no read of it showed.
+/// remedy. Only a directory that the system's class owns is told what to correct, and the words
+/// that tell the administrator to move it aside stand only where a read that succeeded shows that
+/// the installation did not make it. Where a read failed, nothing is established about who made the
+/// directory or what it holds: the words name the failed read and its error and give no step and no
+/// forecast.
 #[must_use]
 // text: data_ending
-pub fn data_ending(origin: &Origin, case_sensitive: bool) -> &'static str {
+pub fn data_ending(origin: &Origin, case_sensitive: bool) -> String {
     match origin {
-        Origin::Foreign => DATA_NOT_MADE,
-        Origin::Held(_) => DATA_UNREADABLE,
+        Origin::Foreign => format!("{DATA_CAN_BE_CHANGED} {DATA_NOT_MADE}"),
+        Origin::System if case_sensitive => format!("{DATA_CAN_BE_CHANGED} {CASE_REMEDY}"),
+        Origin::System => format!("{DATA_CAN_BE_CHANGED} {DATA_REMEDY}"),
+        Origin::Held(failure) | Origin::Refused(failure) | Origin::Unknown(failure) => format!(
+            "A read of it failed ({failure}), so nothing shows who made it. The setup program names no step for it."
+        ),
         // The data directory is opened by its own path, so no loss of a listed child reaches it.
-        Origin::Refused(_) | Origin::Unknown(_) | Origin::Changed(_) => DATA_UNKNOWN,
-        Origin::System if case_sensitive => CASE_REMEDY,
-        Origin::System => DATA_REMEDY,
+        Origin::Changed(reason) => format!(
+            "It changed or moved while it was read ({reason}), so nothing shows who made it. The setup program names no step for it."
+        ),
     }
 }
 
