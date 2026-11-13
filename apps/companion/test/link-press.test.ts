@@ -864,6 +864,25 @@ describe('the look of a mouse press on a link’s own element as the pointer mov
     expect(isLit(links[0]), 'the look after a scroll that put the element’s edge past the pointer').toBe(true)
   })
 
+  it('keeps the press at a scroll while the pointer is outside the element, lights the look again where the pointer is back, and the engine’s click on the element opens it once', () => {
+    const { pane, text, links } = between(words)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], mouse(138)))
+    fire('pointermove', pointer(text, mouse(143)))
+    expect(isLit(links[0]), 'the look with the pointer outside the element').toBe(false)
+    scrolledSideways(1)
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after a scroll of 1 px with the pointer still outside').toBe(false)
+    fire('pointermove', pointer(links[0], mouse(138)))
+    expect(isLit(links[0]), 'the look with the pointer back in the element').toBe(true)
+    fire('pointerup', pointer(links[0], mouse(138, { timeStamp: 120 })))
+    fire('click', click(links[0], { clientX: 138, clientY: 108 }))
+    expect(opened, 'the handler adds no click for a mouse').toEqual([])
+    links[0].click()
+    expect(opened, 'the engine’s own click on the element').toEqual([links[0]])
+  })
+
   for (const pointerType of ['touch', 'pen']) {
     it(`keeps the look of a ${pointerType} press for a move within the slop, where the press’s own element ends: nothing changes for it`, () => {
       const { pane, text, links } = between(words)
