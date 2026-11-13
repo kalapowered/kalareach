@@ -136,7 +136,7 @@ describe('a tap on plain text beside a link, through the handler', () => {
   // The first link of message 3 has its words at x 10 to 26 and y 320 to 337; the tap is 6 px before it.
   const y = 328
 
-  it('opens the link once for the press', () => {
+  it('opens the link once for the press, and a second trusted click with no new press opens nothing', () => {
     const { pane, links, texts } = conversation(6, 3)
     startLinkPress(pane)
     clock(100)
@@ -144,6 +144,8 @@ describe('a tap on plain text beside a link, through the handler', () => {
     fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
     fire('click', click(texts[3], { clientY: y }))
     expect(opened).toEqual([links[3]?.[0]])
+    fire('click', click(texts[3], { clientY: y }))
+    expect(opened.length, 'links opened by a second click').toBe(1)
   })
 
 })
