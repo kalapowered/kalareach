@@ -518,49 +518,69 @@ fn a_rollback_with_a_failed_step_and_an_intact_manifest_leaves_a_record_for_the_
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
-fn a_removal_sweeps_staging_by_the_layouts_names_and_names_what_it_leaves() {
+fn a_removal_sweeps_the_entries_of_staging_that_stand_under_the_layouts_names() {
     let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     require_elevated();
     let before = snapshot();
     assert_clean(&before);
     let person = Person::make();
-    // A run that died leaves its staging directory. A file and a directory under the layout's
-    // names stand there, and a file that nobody's run made.
+    // A run that died leaves its staging directory. A file and a directory under the layout's names
+    // stand there, as a failed run leaves them.
     let _ = a_run_that_died_at(&person, "account");
     let paths = Paths::system().unwrap();
     let hex = uuid::Uuid::new_v4().simple().to_string();
     let policy = paths.staging.join(format!("policy-{hex}.xml"));
     let proof = paths.staging.join(format!("proof-{hex}"));
-    let notes = paths.staging.join("notes.txt");
     std::fs::write(&policy, b"<AppLockerPolicy/>").unwrap();
     std::fs::create_dir(&proof).unwrap();
     std::fs::write(proof.join("inside.txt"), b"x").unwrap();
+
+    let (code, text) = ordinary_removal();
+    observed(&format!(
+        "after the removal: policy file stands {}, proof directory stands {}, exit {code:?}",
+        policy.exists(),
+        proof.exists()
+    ));
+    assert_eq!(code, Some(0), "the removal succeeds: {text}");
+    assert!(
+        !policy.exists() && !proof.exists(),
+        "the removal left an entry that stands under the layout's names: {text}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the removal the computer is as it was: {text}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_removal_refuses_a_staging_directory_that_holds_a_name_that_the_layout_does_not_give() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let person = Person::make();
+    let _ = a_run_that_died_at(&person, "account");
+    let paths = Paths::system().unwrap();
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    let policy = paths.staging.join(format!("policy-{hex}.xml"));
+    let notes = paths.staging.join("notes.txt");
+    std::fs::write(&policy, b"<AppLockerPolicy/>").unwrap();
     std::fs::write(&notes, b"put here by hand").unwrap();
 
     let (code, text) = ordinary_removal();
-    let (policy_stands, proof_stands, notes_stand) =
-        (policy.exists(), proof.exists(), notes.exists());
+    let (policy_stands, notes_stand) = (policy.exists(), notes.exists());
     observed(&format!(
-        "after the removal: policy file stands {policy_stands}, proof directory stands {proof_stands}, notes.txt stands {notes_stand}, exit {code:?}"
+        "after the removal: policy file stands {policy_stands}, notes.txt stands {notes_stand}, exit {code:?}"
     ));
-    for line in text.lines().filter(|line| line.contains("notes.txt")) {
-        observed(&format!("removal line: {line}"));
-    }
     // The case's own cleanup, so that the second removal can end the run's records.
     let _ = std::fs::remove_file(&notes);
-    let _ = std::fs::remove_dir_all(&proof);
     let _ = std::fs::remove_file(&policy);
+    assert_ne!(code, Some(0), "the removal ended without a failure: {text}");
     assert!(
-        !policy_stands && !proof_stands,
-        "the removal left an entry that stands under the layout's names: {text}"
-    );
-    assert!(
-        notes_stand,
-        "the removal took away a file that does not stand under the layout's names: {text}"
-    );
-    assert!(
-        text.contains("notes.txt"),
-        "the removal does not name the file that it left in staging: {text}"
+        text.contains("notes.txt") && notes_stand,
+        "the removal does not refuse because of the file that it did not make: {text}"
     );
     let (second_code, second) = ordinary_removal();
     assert_eq!(
