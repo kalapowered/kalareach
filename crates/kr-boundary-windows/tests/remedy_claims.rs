@@ -795,6 +795,7 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
         NotProved::Absent,
         NotProved::Differs,
         NotProved::Unread("Windows error 5".to_owned()),
+        NotProved::NotRead,
     ] {
         let saved = rollback_failed(
             &failures,
@@ -805,7 +806,8 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
             "",
         );
         assert!(saved.contains(&found.words()), "{saved}");
-        assert!(saved.contains("wrote its record again at M"), "{saved}");
+        assert!(saved.contains("wrote its record at M"), "{saved}");
+        assert!(!saved.contains("again"), "{saved}");
         assert!(
             saved.contains("the administrator's removal takes the rest"),
             "{saved}"
@@ -820,13 +822,35 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
             ". The earlier-state record was not read",
         );
         assert!(
-            unsaved.contains("writing this run's record again failed (Windows error 112)"),
+            unsaved.contains("writing this run's record failed (Windows error 112)"),
+            "{unsaved}"
+        );
+        // A write that failed does not show that no record is on disk: it may have published the
+        // record before its proof failed, and an earlier record may stand.
+        assert!(
+            unsaved.contains("a record of this run could not be confirmed on disk"),
             "{unsaved}"
         );
         assert!(
-            unsaved.contains("no record of this run is on disk"),
+            unsaved.contains("may have published it before its proof failed"),
             "{unsaved}"
         );
+        assert!(
+            !unsaved.contains("no record of this run is on disk"),
+            "{unsaved}"
+        );
+        assert!(!unsaved.contains("again"), "{unsaved}");
+        // Where no read was made, the words do not say that one failed.
+        if found == NotProved::NotRead {
+            assert!(
+                found
+                    .words()
+                    .starts_with("No read of the manifest's name was made"),
+                "{}",
+                found.words()
+            );
+            assert!(!found.words().contains("failed"), "{}", found.words());
+        }
         assert!(unsaved.contains("did not take away: D; F"), "{unsaved}");
         assert!(
             unsaved.ends_with(". The earlier-state record was not read"),

@@ -21,6 +21,30 @@ fn installed() -> Policy {
     Policy::installed(CHECKOUT_SID, CONNECT_SID)
 }
 
+/// The removal's inspection refuses a data directory that its manifest does not record, so the
+/// record that a failed rollback leaves for the administrator's removal holds that entry: a record of
+/// a run that failed before its first directory record gains it once, and a record that holds it is
+/// left as it is.
+#[test]
+fn a_record_left_for_the_removal_records_the_data_directory_once() {
+    const DATA: &str = r"C:\ProgramData\KalaReach";
+    let mut manifest = Manifest::begin();
+    assert!(!manifest.records_directory(DATA));
+    assert!(manifest.record_directory_where_missing(DATA));
+    assert!(manifest.records_directory(DATA));
+    assert!(!manifest.record_directory_where_missing(DATA));
+    assert_eq!(manifest.of_kind(ObjectKind::Directory).count(), 1);
+    let again = Manifest::parse(&manifest.to_bytes().unwrap()).unwrap();
+    assert!(again.records_directory(DATA));
+    // The entry is an intent with no result, as every directory entry is, and its name matches
+    // without regard to the case of ASCII letters, as the inspection reads it.
+    assert_eq!(
+        again.find(ObjectKind::Directory, DATA).unwrap().outcome,
+        None
+    );
+    assert!(again.records_directory(&DATA.to_ascii_lowercase()));
+}
+
 #[test]
 fn the_policy_is_read_back_as_it_was_written() {
     let written = installed();
