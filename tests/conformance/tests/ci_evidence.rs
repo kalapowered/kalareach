@@ -901,3 +901,320 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
         }
     }
 }
+
+/// The variable that names the one directory every test artefact of a run is kept in.
+const ARTIFACTS_VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
+
+/// How a value may begin and still lie in a temporary folder: `/tmp`, or the platform's or the
+/// runner's own temporary folder, spelled as each shell and the workflow syntax spell it.
+const TEMPORARY_FOLDERS: [&str; 9] = [
+    "/tmp/",
+    "$RUNNER_TEMP",
+    "${RUNNER_TEMP",
+    "$env:RUNNER_TEMP",
+    "${{ runner.temp }}",
+    "$TMPDIR",
+    "${TMPDIR",
+    "$env:TEMP",
+    "$env:TMP",
+];
+
+/// The assignments the build's own scripts make that the case cannot follow to a temporary folder,
+/// each with the reason it is allowed: the file, the text of the line, and why.
+const UNFOLLOWED_ASSIGNMENTS: [(&str, &str, &str); 1] = [(
+    "scripts/store-android.sh",
+    "KR_TEST_ARTIFACTS_DIR=\"$leg/e2e\"",
+    "the store build keeps the logs of its release check beside the signed bundle, in the directory \
+     the caller names, and that check takes no screenshot",
+)];
+
+/// The tools that take a screenshot, by the name a workflow step runs them under.
+const SCREENSHOT_TOOLS: [&str; 11] = [
+    "check-test-evidence.sh",
+    "desktop-controls-macos.sh",
+    "android-app-launch.sh",
+    "ios-app-launch.sh",
+    "e2e-permissions.sh",
+    "e2e-pairing-device.sh",
+    "e2e-mobile.sh",
+    "e2e-voice-device.sh",
+    "e2e-push-device.sh",
+    "e2e-update.sh",
+    "playwright",
+];
+
+/// `value` with the quotes around it taken off.
+fn unquoted(value: &str) -> &str {
+    value.trim().trim_matches(['"', '\''])
+}
+
+/// The value at the start of `rest`: a quoted one to its closing quote, an unquoted one to the next
+/// space, a command substitution inside either read whole.
+fn leading_value(rest: &str) -> String {
+    let quoted = rest.starts_with('"');
+    let mut value = String::new();
+    let mut depth = 0_usize;
+    let mut characters = rest.chars().skip(usize::from(quoted)).peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '$' if characters.peek() == Some(&'(') => {
+                depth += 1;
+                value.push(character);
+                value.extend(characters.next());
+            }
+            ')' if depth > 0 => {
+                depth -= 1;
+                value.push(character);
+            }
+            '"' if depth == 0 => break,
+            ' ' | '\t' if depth == 0 && !quoted => break,
+            _ => value.push(character),
+        }
+    }
+    value
+}
+
+/// The value a line gives the variable: an entry of a workflow's `env` (`NAME: value`) or an
+/// assignment (`NAME=value`, after `export`, in front of a command, or inside the quoted line a
+/// PowerShell step writes to the job's environment file). A comment gives none.
+fn artifacts_assignment(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.starts_with('#') || line.starts_with("//") {
+        return None;
+    }
+    if let Some(rest) = line.strip_prefix(&format!("{ARTIFACTS_VARIABLE}:")) {
+        return Some(unquoted(without_comment(rest)).to_owned());
+    }
+    let at = line.find(&format!("{ARTIFACTS_VARIABLE}="))?;
+    Some(leading_value(&line[at + ARTIFACTS_VARIABLE.len() + 1..]))
+}
+
+/// What a script falls back on where the variable is unset: the text of each `${NAME:-default}` on
+/// a line, less the empty ones, which only pass on what the caller gave.
+fn artifacts_defaults(line: &str) -> Vec<String> {
+    let opening = format!("${{{ARTIFACTS_VARIABLE}:-");
+    line.match_indices(&opening)
+        .map(|(at, _)| {
+            let mut depth = 0_usize;
+            let mut default = String::new();
+            for character in line[at + opening.len()..].chars() {
+                match character {
+                    '{' => depth += 1,
+                    '}' if depth == 0 => break,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                default.push(character);
+            }
+            default
+        })
+        .filter(|default| !default.is_empty())
+        .collect()
+}
+
+/// The name of the variable a value begins with, in a shell's (`$name`, `${name`) or PowerShell's
+/// (`$name`) spelling, and nothing for `$env:` and `$(`.
+fn leading_variable(value: &str) -> Option<&str> {
+    let rest = value
+        .strip_prefix("${")
+        .or_else(|| value.strip_prefix('$'))?;
+    let end = rest
+        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
+/// Every non-empty value `text` gives the variable `name`, in a shell's spelling (`name=value`) or
+/// PowerShell's (`$name = value`).
+fn values_of(text: &str, name: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = ["local ", "export ", "readonly "]
+                .iter()
+                .find_map(|word| line.strip_prefix(word))
+                .unwrap_or(line);
+            let rest = line
+                .strip_prefix(&format!("{name}="))
+                .or_else(|| line.strip_prefix(&format!("${name} = ")))
+                .or_else(|| line.strip_prefix(&format!("${name}=")))?;
+            let value = if let Some(command) = rest.strip_prefix("Join-Path ") {
+                command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            } else if let Some(command) = rest.strip_prefix("(Get-Item ") {
+                command.split(')').next().unwrap_or_default().to_owned()
+            } else {
+                leading_value(rest)
+            };
+            (!value.is_empty()).then_some(value)
+        })
+        .collect()
+}
+
+/// Whether `value`, as a script or a workflow writes it, lies in a temporary folder: it begins
+/// with one, or with the default the variable falls back on, or with a command that makes a
+/// directory in one, or with another variable of `text` whose every value does; and a value made
+/// from the variable's own value is the one checked where that was set.
+fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
+    let value = unquoted(value);
+    if depth == 0 || value.is_empty() {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix(&format!("${{{ARTIFACTS_VARIABLE}:-")) {
+        let default: String = rest
+            .chars()
+            .take_while(|character| *character != '}')
+            .collect();
+        return default.is_empty() || lies_in_a_temporary_folder(&default, text, depth - 1);
+    }
+    if value.contains(ARTIFACTS_VARIABLE) {
+        return true;
+    }
+    if TEMPORARY_FOLDERS
+        .iter()
+        .any(|folder| value.starts_with(folder))
+    {
+        return true;
+    }
+    if value.starts_with("$(") && value.contains("mktemp") {
+        let template = value
+            .split("mktemp")
+            .nth(1)
+            .and_then(|after| after.split('"').nth(1));
+        return template
+            .is_some_and(|template| lies_in_a_temporary_folder(template, text, depth - 1));
+    }
+    leading_variable(value).is_some_and(|name| {
+        let values = values_of(text, name);
+        !values.is_empty()
+            && values
+                .iter()
+                .all(|value| lies_in_a_temporary_folder(value, text, depth - 1))
+    })
+}
+
+/// Every file under `directory` whose name ends in one of `endings`.
+fn files_ending(directory: &Path, endings: &[&str], found: &mut Vec<PathBuf>) {
+    let mut entries: Vec<PathBuf> = fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("{} is read: {error}", directory.display()))
+        .map(|entry| entry.expect("an entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            files_ending(&path, endings, found);
+        } else if endings
+            .iter()
+            .any(|ending| path.to_string_lossy().ends_with(ending))
+        {
+            found.push(path);
+        }
+    }
+}
+
+/// KR-REQ-27.03, the part about the build's directory: every workflow and script of the repository
+/// that gives the artefacts directory a value, or a default, puts it in a temporary folder (`/tmp`,
+/// or the platform's or the runner's own), and a job that runs a screenshot tool does not leave it
+/// unset. The values are read as text, so a value spelled in a way this does not know is one it
+/// refuses; the one assignment it cannot follow is named, with its reason.
+#[test]
+fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder() {
+    let root = repository();
+    let mut workflows = Vec::new();
+    files_ending(&root.join(".github"), &[".yml", ".yaml"], &mut workflows);
+    let mut scripts = Vec::new();
+    files_ending(
+        &root.join("scripts"),
+        &[".sh", ".bash", ".py", ".mjs", ".js", ".ps1"],
+        &mut scripts,
+    );
+    let mut outside = Vec::new();
+    let mut seen = 0_usize;
+    for path in workflows.iter().chain(&scripts) {
+        let name = path
+            .strip_prefix(&root)
+            .expect("under the repository")
+            .to_string_lossy()
+            .into_owned();
+        let text =
+            fs::read_to_string(path).unwrap_or_else(|error| panic!("{name} is read: {error}"));
+        for (number, line) in text.lines().enumerate() {
+            let mut values: Vec<String> = artifacts_assignment(line).into_iter().collect();
+            seen += values.len();
+            if let Some(excused) = UNFOLLOWED_ASSIGNMENTS
+                .iter()
+                .find(|(file, needle, _)| *file == name && line.contains(needle))
+            {
+                assert!(!excused.2.is_empty(), "an exception names its reason");
+                values.clear();
+            }
+            for default in artifacts_defaults(line) {
+                seen += 1;
+                values.push(default);
+            }
+            for value in values {
+                if !lies_in_a_temporary_folder(&value, &text, 6) {
+                    outside.push(format!("{name}:{}: {value}", number + 1));
+                }
+            }
+        }
+    }
+    assert!(seen >= 30, "the case found only {seen} values to read");
+    assert!(
+        outside.is_empty(),
+        "values outside a temporary folder:\n{}",
+        outside.join("\n")
+    );
+
+    // The one assignment the case does not follow is made by a store build whose release check
+    // takes no screenshot: that has to stay true, or the exception hides one.
+    let check = fs::read_to_string(root.join("scripts/e2e-android-release.sh")).expect("the check");
+    for word in ["screenshot", ".png", "screencap"] {
+        assert!(
+            !check.to_lowercase().contains(word),
+            "the store build's release check takes a screenshot ({word}), outside a temporary folder"
+        );
+    }
+
+    // A job that runs a screenshot tool has the variable from its workflow, its job or a step.
+    let mut jobs_with_a_tool = 0_usize;
+    for path in &workflows {
+        let name = path
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        let text = fs::read_to_string(path).expect("a workflow");
+        let before_jobs: Vec<&str> = text
+            .lines()
+            .take_while(|line| without_comment(line) != "jobs:")
+            .collect();
+        let set_for_all = before_jobs
+            .iter()
+            .any(|line| artifacts_assignment(line).is_some());
+        if !text.lines().any(|line| without_comment(line) == "jobs:") {
+            continue;
+        }
+        for job_name in jobs_of(&text) {
+            let body = job(&text, &job_name);
+            if !SCREENSHOT_TOOLS.iter().any(|tool| body.contains(tool)) {
+                continue;
+            }
+            jobs_with_a_tool += 1;
+            assert!(
+                set_for_all
+                    || body
+                        .lines()
+                        .any(|line| artifacts_assignment(line).is_some()),
+                "{name}: the job {job_name} runs a screenshot tool and leaves {ARTIFACTS_VARIABLE} unset"
+            );
+        }
+    }
+    assert!(
+        jobs_with_a_tool >= 3,
+        "the case found {jobs_with_a_tool} jobs that run a screenshot tool"
+    );
+}
