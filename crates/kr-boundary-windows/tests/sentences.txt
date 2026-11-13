@@ -44,6 +44,8 @@ parent_advice | It holds no data directory of the boundary | read: symlink_metad
 parent_advice | If nothing else needs what is in it, remove or rename the folder | conditional correction of the installation's own folder
 rights_in_words | the rights of an identity, in words | read: the access mask of the entry in the list of the handle
 identity_text | the name and the identifier of an identity | read: the entry's identifier and the account lookup of it
+git_permissions_refusal | X can be changed (or replaced) by others: finding | read: Finding::Granted: the owner read outside the system's class, no permission list, or an allow entry for an account outside it with a right that counts
+git_permissions_refusal | The setup program cannot tell whether X can be changed (or replaced) by others: finding | read: Finding::Unevaluated: an entry of a type that the check does not interpret, an entry too small for its identifier, or no owner; no right is known to be given
 rights_finding | X is allowed the right to ... (rights 0x...) | read: the list of the handle (acl::replaceable_by_others_on, changeable_by_others_on)
 REMOTE_VOLUME | the volume is on another computer, and only local volumes are supported | read: the volume's device characteristics say remote (walk::check_volume), or the final path of a known folder is a network path
 hello_failure | the failure of the greeting, and other elevated sessions may hold the administrators' pipe | read: the greeting's frame error; may
@@ -141,8 +143,8 @@ refuse_code_integrity-5 | the code-integrity policies could not be read | read: 
 refuse_code_integrity-6 | a code-integrity policy beyond the system's is present: N | read: an entry with IsSystemPolicy false
 refuse_code_integrity-7 | Smart App Control is enforcing | read: an entry that is enforced and named VerifiedAndReputable
 qualify_git-1 | the words of remedy::git_program_not_reached | read: see git_program_not_reached
-qualify_git-2 | X can be changed by others: finding | read: acl::changeable_by_others returned the finding
-qualify_git-3 | X can be replaced by others: finding | read: acl::replaceable_by_others returned the finding
+qualify_git-2 | the words of remedy::git_permissions_refusal, for a file | read: see git_permissions_refusal; acl::changeable_by_others returned the finding
+qualify_git-3 | the words of remedy::git_permissions_refusal, for a folder above the files | read: see git_permissions_refusal; acl::changeable_by_others (replacement only) returned the finding
 qualify_git-4 | Git could not be run: error | read: starting git returned an error, printed
 qualify_git-5 | Git did not report its version: it ended with S and wrote T | read: git's exit status and standard output
 stage_payload-1 | the words of remedy::payload_file_not_reached | read: see payload_file_not_reached
