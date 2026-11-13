@@ -185,7 +185,7 @@ fn the_steps_act_on_an_account_the_service_and_the_identity_service_only_behind_
     assert!(steps.contains(".any(|object| !rollback || object.acted_on_by(true));"));
     assert!(steps.contains("&& (!rollback || object.acted_on_by(true))"));
     assert!(steps.contains("let broker_is_there = match service_is_ours"));
-    assert!(steps.contains("if service_is_ours\n                && let Some(manager) = &manager"));
+    assert!(steps.contains("if service_is_ours && let Some(manager) = &manager {"));
     assert_eq!(count(&steps, "manager.open(SERVICE)"), 2);
     // The Application Identity service: the rollback's stop needs this run's own start on record.
     let stop = steps.find("Identity(&appid).stop()?").unwrap();
@@ -373,4 +373,37 @@ fn the_program_directory_and_the_sweeps_go_through_the_handles_that_the_run_or_t
     assert!(ending.contains("run.sweep(Layout::Staging);"));
     let lay = code_of(body_of(&source, "fn lay_down("));
     assert!(lay.contains("sweep_staging(staging);"));
+}
+
+#[test]
+fn the_journal_files_go_only_where_the_service_never_ran_or_a_read_showed_that_it_ended() {
+    let source = install_source();
+    // The start of the broker is recorded as an intent before the request and as a result after the
+    // manager accepted it.
+    let lay = code_of(body_of(&source, "fn lay_down("));
+    let at = |needle: &str| {
+        lay.find(needle)
+            .unwrap_or_else(|| panic!("lay_down has no {needle}"))
+    };
+    let intent = at("run.record(ObjectKind::ServiceStarted, SERVICE, None)?;");
+    let start = at("broker_service.start()?;");
+    let result = at("run.conclude(ObjectKind::ServiceStarted, SERVICE, Outcome::Made)?;");
+    assert!(intent < start && start < result);
+    // The removal's gate: the service's end is a read of the service manager (no service of its
+    // name, or stopped after the stop request), and the sweep and the ending follow from it.
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    let stopped = steps
+        .find("service.wait_for(true, Duration::from_secs(60))?;\n                service_ended = true;")
+        .expect("the service's end is set only after the wait for the stopped state");
+    let gate = steps
+        .find("let journal_files_may_go = service_ended || !broker_may_have_run;")
+        .expect("the gate");
+    let sweep_laid = steps.find("run.sweep(Layout::Journal)").unwrap();
+    let sweep_named = steps.find("records::finish_journal_and_run(").unwrap();
+    assert!(stopped < gate && gate < sweep_laid && gate < sweep_named);
+    assert!(steps.contains("if journal_files_may_go {"));
+    assert!(steps.contains("if seen.journal && !journal_files_may_go {"));
+    assert!(steps.contains(
+        "broker_is_there || manifest.find(ObjectKind::ServiceStarted, SERVICE).is_some();"
+    ));
 }
