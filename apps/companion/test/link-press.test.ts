@@ -1078,6 +1078,20 @@ describe('a scroll under a held press', () => {
       expect(opened, 'the click on the button opens no link').toEqual([])
     })
 
+    it('asks what lies under the press’s first point, not under where the finger has moved to within the slop', () => {
+      const { pane, text, links } = between(words)
+      const button = placed(text, 'm-other', beside)
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, press))
+      fire('pointermove', pointer(text, { clientX: 90, clientY: 85 }))
+      expect(isLit(links[0]), 'the look after a move of 9 px, within the slop').toBe(true)
+      scrolled(4)
+      fire('scroll', {} as Event)
+      expect(boxes.get(button)?.top, 'the button’s top after 4 px').toBe(93)
+      expect(isLit(links[0]), 'the look where the button lies under the first point and not under the finger').toBe(false)
+    })
+
     it('ends the look where another link comes under the point', () => {
       const { pane, text, links } = between(words)
       // A link that no message holds, so the rule does not weigh it.
