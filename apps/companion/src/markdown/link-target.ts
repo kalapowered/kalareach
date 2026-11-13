@@ -265,7 +265,10 @@ const STAND = { kind: 'stand' } as const
 /**
  * Whether a press of this pointer type can get an open from `decide`: a touch or a pen. A mouse's or a
  * trackpad's click on plain text opens nothing, as on a desktop, so a press of those lights nothing by
- * the rule either. One predicate serves both the look at the press and the open at the click.
+ * the rule either, and keeps no look by it. This one test serves every path that lights or keeps a look
+ * or opens: the pointer down (which link the press lights), each scroll or resize while a lit press lives
+ * (whether a release would still open it) and the click (`decide`). A press on a link's own element is
+ * kept besides by the element lying under the point, for every pointer type.
  */
 export function opensByRule(pointerType: string): boolean {
   return pointerType === 'touch' || pointerType === 'pen'
