@@ -16,8 +16,12 @@ same table, read from that file, so that neither can change without the other.
 
 import importlib.util
 import re
+import sys
 import unittest
 from pathlib import Path
+
+# Loading the driver by path must leave no compiled copy beside it.
+sys.dont_write_bytecode = True
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -27,11 +31,22 @@ pairing = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pairing)
 
 
-def pages_table() -> dict[str, str]:
-    """The addresses the page's own cases say as words, as they are written there."""
-    source = (ROOT / "apps" / "companion" / "test" / "service-address.test.ts").read_text(encoding="utf-8")
+def table_in(source: str) -> dict[str, str]:
+    """The addresses the page's cases say as words, as the page's test file writes them.
+
+    A row is a line that opens with `[` at the table's indent. Every such row must be read as a pair
+    of single-quoted strings, so a row written another way (a comment inside it, double quotes, a
+    trailing comma) stops the run and is never dropped."""
     table = source[source.index("const SAID") : source.index("describe(")]
-    return dict(re.findall(r"\[\s*'([^']*)',\s*'([^']*)'\s*\]", table))
+    pairs = re.findall(r"\[\s*'([^']*)',\s*'([^']*)'\s*\]", table)
+    rows = len(re.findall(r"^  \[", table, flags=re.MULTILINE))
+    if rows != len(pairs):
+        raise SystemExit(f"the page's table has {rows} rows and {len(pairs)} were read as pairs of strings")
+    return dict(pairs)
+
+
+def pages_table() -> dict[str, str]:
+    return table_in((ROOT / "apps" / "companion" / "test" / "service-address.test.ts").read_text(encoding="utf-8"))
 
 
 class SpokenAddress(unittest.TestCase):
