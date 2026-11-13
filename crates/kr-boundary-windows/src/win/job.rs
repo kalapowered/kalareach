@@ -391,10 +391,11 @@ impl Job {
         let terminated = unsafe { TerminateJobObject(self.handle.raw(), 1) } != 0;
         // text: job_end-1
         let terminate_error = (!terminated).then(|| last("ending the job"));
+        // A process that is not seen to have ended is one that has not, or one whose wait failed: the
+        // first failure of any turn of the loop is kept for the report, and a later turn that reads
+        // the process does not drop it.
+        let mut wait_failed = None;
         loop {
-            // A process that is not seen to have ended is one that has not, or one whose wait failed:
-            // the first failure is kept for the report.
-            let mut wait_failed = None;
             let all_exited = retained.iter().all(|child| {
                 // text: job_end-2
                 match ffi::wait(
@@ -448,14 +449,18 @@ impl Job {
         let mut key = 0_usize;
         let mut overlapped = null_mut();
         // SAFETY: the port is open and the out-parameters are this function's own.
-        unsafe {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "its answer is only a wake-up: whether a message came or the time ran out, the next read of the job's count and of the retained processes decides"
+        )]
+        let _woken = unsafe {
             GetQueuedCompletionStatus(
                 self.port.raw(),
                 &raw mut bytes,
                 &raw mut key,
                 &raw mut overlapped,
                 super::ffi::milliseconds(up_to, u32::MAX),
-            );
-        }
+            )
+        };
     }
 }

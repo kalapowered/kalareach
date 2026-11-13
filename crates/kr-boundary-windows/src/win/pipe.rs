@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, LocalFree,
+    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED,
+    HANDLE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
@@ -34,9 +35,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WRITE_DAC, WriteFile,
 };
-use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     GetNamedPipeServerProcessId, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
@@ -319,15 +320,21 @@ fn wait(
                 io::ErrorKind::TimedOut,
                 format!("the other end did not answer before the deadline{note}"),
             ),
-            Ok(ffi::Waited::Signalled(_)) => stopping(stop),
+            // At a stop the cancel's own failed wait is told beside the stop, as it is beside the
+            // other reasons.
+            Ok(ffi::Waited::Signalled(_)) => stopping_with(stop, &note),
         });
     }
-    let mut transferred = 0_u32;
-    // SAFETY: the transfer has completed, so the result can be read without waiting.
-    if unsafe { GetOverlappedResult(pipe, transfer.record(), &raw mut transferred, 0) } == 0 {
-        return Err(io::Error::last_os_error());
+    // The transfer's event was signalled, so the result is read without waiting. A transfer that
+    // failed keeps its own number, and one that is not complete is no transfer that was done.
+    // SAFETY: the pipe is open and the record is the one of the transfer that completed on it.
+    match unsafe { ffi::overlapped_result(pipe, &transfer.overlapped) } {
+        ffi::Completion::Done(transferred) => Ok((transferred, transfer)),
+        ffi::Completion::Failed(failure) => Err(io::Error::from_raw_os_error(failure.code as i32)),
+        ffi::Completion::Incomplete => Err(io::Error::other(
+            "the transfer's event was signalled, but the transfer has not completed",
+        )),
     }
-    Ok((transferred, transfer))
 }
 
 /// The error of a wait on a transfer that failed: nothing is known of the transfer, and the
@@ -343,11 +350,28 @@ impl std::fmt::Display for WaitFailed {
 
 impl std::error::Error for WaitFailed {}
 
+/// Whether a platform error number is one that a client that has gone gives on the server end of a
+/// pipe: the pipe is broken, not connected or closing. Any other number shows nothing of a client.
+fn client_went(code: i32) -> bool {
+    [ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED]
+        .iter()
+        .any(|gone| *gone as i32 == code)
+}
+
 /// The error of a transfer that the stop ended. It is not `Interrupted`: the frame reader, `read_exact`
 /// and `write_all` retry that kind, each retry starts a transfer that the set stop ends again at
 /// once, and the connection would never let go of the thread that serves it.
 fn stopping(stop: &Stop) -> io::Error {
-    io::Error::new(io::ErrorKind::ConnectionAborted, stop.reason())
+    stopping_with(stop, "")
+}
+
+/// [`stopping`] with what else failed while the transfer was ended (the cancel's own failed wait),
+/// told after the stop's reason; empty where nothing else did.
+fn stopping_with(stop: &Stop, also: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        format!("{}{also}", stop.reason()),
+    )
 }
 
 fn stuck_error() -> io::Error {
@@ -764,13 +788,12 @@ impl Listener {
             };
             let mut gone = false;
             let mut stuck = false;
-            // SAFETY: the pipe is open and the record lives in `transfer`, which `wait` completes,
-            // or cancels, or keeps when the cancel does not end it.
-            let connected = unsafe { ConnectNamedPipe(pipe.raw(), transfer.record()) };
-            if connected == 0 {
-                // SAFETY: reads the calling thread's last error.
-                let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-                if code == ERROR_IO_PENDING {
+            // The record lives in `transfer`, which `wait` completes, or cancels, or keeps when the
+            // cancel does not end it.
+            // SAFETY: the pipe is open, made for overlapped use, and `transfer` keeps the record.
+            match unsafe { ffi::connect_named_pipe(pipe.raw(), &mut transfer.overlapped) } {
+                ffi::Connect::Connected => {}
+                ffi::Connect::Pending => {
                     match wait(pipe.raw(), transfer, &self.stop, None, &mut stuck) {
                         Ok(_) => {}
                         // The wait on a client failed: nothing is known of any client, so the
@@ -792,10 +815,24 @@ impl Listener {
                             self.next = Some(pipe);
                             return Ok(None);
                         }
-                        Err(_) => gone = true,
+                        // A client that went shows as the number of a pipe that is broken, not
+                        // connected or closing; any other failed completion shows nothing of a
+                        // client, so the listener ends with it.
+                        Err(error) if error.raw_os_error().is_some_and(client_went) => gone = true,
+                        Err(error) => {
+                            self.next = Some(pipe);
+                            // text: pipe_accept-complete-1
+                            return Err(ffi::error(
+                                0,
+                                format!("the completion of a wait for a client failed ({error})"),
+                            ));
+                        }
                     }
-                } else if code != ERROR_PIPE_CONNECTED {
-                    gone = true;
+                }
+                ffi::Connect::Failed(failure) if client_went(failure.code as i32) => gone = true,
+                ffi::Connect::Failed(failure) => {
+                    self.next = Some(pipe);
+                    return Err(failure);
                 }
             }
             if gone {
@@ -937,9 +974,11 @@ pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
                 }
                 // SAFETY: the name is NUL-terminated; the call waits until an instance listens or
                 // the time ends.
-                unsafe {
-                    WaitNamedPipeW(name.as_ptr(), left.as_millis() as u32);
-                }
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "its answer is only a wake-up: the open on the next turn of the loop decides, and its own error is what is returned"
+                )]
+                let _woken = unsafe { WaitNamedPipeW(name.as_ptr(), left.as_millis() as u32) };
             }
             Err(failure) => return Err(failure),
         }
