@@ -1137,9 +1137,11 @@ async fn a_lease_presented_across_another_devices_revocation_is_not_shown_and_it
 /// KR-REQ-09.09, KR-REQ-17.54: the answer to a presentation of the lease for the host's own local
 /// owner derives from an older event, so the door does not show it when the authority it was
 /// admitted under has gone by the time it is told: a fence this host comes to owe after the route
-/// answered, or a withdrawal of the whole host that the request did not raise (the one the debt pass
-/// makes for a debt it publishes). Each leaves the lease installed; the same lease presented again,
-/// on a connection under the authority now in force, is answered as the first presentation was.
+/// answered, or the host's own withdrawal of every connection (`revoke_authority`, which raises its
+/// own barrier). Each leaves the lease installed; the same lease presented again, on a connection
+/// under the authority now in force, is answered as the first presentation was. The case does not
+/// make a lease that ends sooner publish a debt of its own, so the debt pass's barrier for a
+/// request's own debt (plan row 17) is held by the barrier-level cases and not by this one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_presented_while_a_fence_is_owed_or_the_host_withdraws_is_not_shown_and_is_answered_again()
  {
@@ -2013,10 +2015,11 @@ async fn making_the_host_exclusive_never_commits_after_the_last_device_that_coul
     let (client, answer) = enabling.await.expect("the change ends");
     drop(client);
     let refused = answer.expect_err("no device is left that could recover the host");
-    // The revocation owes a fence, and the door tells a refusal that says nothing was done as the
-    // fence's own once the route has answered: the refusal, not the change, is what is not shown.
+    // The change owes a host debt of its own, and the door tells a refusal that says nothing was
+    // done as the check's own once the route has answered: the fence while the debt is owed, or the
+    // withdrawn registration once the debt pass has raised its barrier. Which of the two the door
+    // meets is the debt pass's timing, so the case holds the code and not the text.
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
-    assert!(refused.message.contains("fence"), "{refused:?}");
     assert!(!fixture.listed().await.exclusive);
     fixture.host.stop().await;
 }
