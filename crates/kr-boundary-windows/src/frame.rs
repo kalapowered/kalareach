@@ -193,6 +193,7 @@ pub enum Request {
 
 /// The words with which the persons' pipe refuses a request that changes the broker's state or asks
 /// for a proof: those are served on the administrators' pipe only.
+// text: ADMINISTRATORS_ONLY
 pub const ADMINISTRATORS_ONLY: &str = "this pipe answers hello and status only; ask for a state change or a proof on the administrators' pipe";
 
 /// Why the broker refused a request.
