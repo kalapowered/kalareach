@@ -3465,7 +3465,15 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     )?;
     // Until the first manifest is written a removal finds nothing of what this run made, so a failure
     // of the next two steps takes it away through the handles that made it.
+    #[cfg(feature = "testing")]
+    if let Err(error) = crate::manifest::forced::failure_at("protect").map_err(Error::Failed) {
+        return Err(holds.undo(error));
+    }
     if let Err(error) = holds.protect() {
+        return Err(holds.undo(error));
+    }
+    #[cfg(feature = "testing")]
+    if let Err(error) = crate::manifest::forced::failure_at("record").map_err(Error::Failed) {
         return Err(holds.undo(error));
     }
     if let Err(error) = run.record(
