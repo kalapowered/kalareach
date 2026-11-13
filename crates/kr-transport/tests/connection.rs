@@ -1117,6 +1117,10 @@ async fn a_data_stream_does_not_survive_the_control_stream() {
     }
 }
 
+/// KR-REQ-23.21, the ceiling on the number of bulk streams: over a real connection, a connection
+/// whose ceiling is two admits two transfer streams and refuses the third by name, an interactive
+/// stream is not counted against the ceiling, and a transfer that ends frees its slot. The queued
+/// bytes of bulk streams are not asserted here.
 #[tokio::test]
 async fn a_connection_admits_no_more_bulk_streams_than_it_allows() {
     let (host, client) = paired_pair().await;
