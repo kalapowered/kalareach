@@ -246,7 +246,7 @@ fn what_is_put_in_an_approved_empty_directory_after_the_inspection_is_not_delete
     let text = install::remove(&paths, false)
         .expect_err("the directory holds something now")
         .to_string();
-    assert!(text.contains("the data directory stays because"), "{text}");
+    assert!(text.contains("the data directory stays:"), "{text}");
     // Nothing has checked what was put in the directory, so the words say that the next removal reads
     // the first entry that it finds, and never to remove them unread.
     assert!(text.contains("run the removal again"), "{text}");

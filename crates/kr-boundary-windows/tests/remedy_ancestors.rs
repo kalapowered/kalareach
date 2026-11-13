@@ -300,6 +300,9 @@ fn every_fault_of_a_folder_that_the_installation_does_not_make_has_the_one_form(
                 );
                 assert!(text.ends_with(CLOSING), "{what}");
                 assert_eq!(text.matches(CLOSING).count(), 1, "{what}");
+                // A walk's refusal names a place on the path of the tree; where the open found
+                // nothing at the name, or an object that is no folder, it is not called a folder.
+                assert!(!text.contains("is a folder above"), "{what}");
                 let layout = supported_layout(tree);
                 let kept = text.contains("Do not remove the program directory.");
                 assert_eq!(kept, tree == Tree::Program, "{what}");
@@ -376,7 +379,7 @@ fn the_refusal_of_a_list_names_the_real_sentence_and_says_what_a_supported_layou
     );
     assert!(text.contains(r"D:\ProgramData"), "{text}");
     assert!(
-        text.contains("a folder above the boundary's data directory"),
+        text.contains("the path above the boundary's data directory"),
         "{text}"
     );
     assert!(text.contains(&finding), "{text}");
@@ -400,7 +403,7 @@ fn the_refusal_of_a_folder_above_the_program_directory_names_that_tree() {
         Stage::Before,
     );
     assert!(
-        text.contains("a folder above the boundary's program directory"),
+        text.contains("the path above the boundary's program directory"),
         "{text}"
     );
     assert!(!text.contains("data directory"), "{text}");
@@ -459,10 +462,22 @@ fn a_refusal_after_the_runs_changes_does_not_say_that_nothing_was_changed() {
             after.contains("had already made changes"),
             "{fault:?}: {after}"
         );
+        // The manifest does not record the earlier-state record or the folder that holds the data
+        // directory, and the words do not say that it records what this run made.
         assert!(
-            after.contains("the manifest records them"),
+            after.contains("The manifest records the objects that it laid down; it does not record the earlier-state record or the folder that holds the data directory, which this run may have made."),
             "{fault:?}: {after}"
         );
+        assert!(
+            !after.contains("and the manifest records them"),
+            "{fault:?}: {after}"
+        );
+        let rolled = ancestor_refusal(&subject, Tree::Program, Stage::Rollback);
+        assert!(
+            rolled.contains("had removed nothing when it read the folder."),
+            "{fault:?}: {rolled}"
+        );
+        assert!(!rolled.contains("still there"), "{fault:?}: {rolled}");
         assert!(!after.contains("stays stopped"), "{fault:?}: {after}");
         let made = ancestor_refusal(&subject, Tree::Data, Stage::DataParentMade);
         assert!(!made.contains("Nothing was changed"), "{fault:?}: {made}");
@@ -544,8 +559,9 @@ fn no_stage_says_that_a_folder_is_empty_and_the_data_parents_stage_says_what_the
     }
 }
 
-/// A removal that undoes a failed installation has changed nothing when it reads a folder, and does
-/// not say "Nothing was changed" of the installation that failed.
+/// A removal that undoes a failed installation had removed nothing when it reads a folder, and does
+/// not say "Nothing was changed" of the installation that failed, nor that what that installation
+/// made is still there, which no read showed.
 #[test]
 fn the_removal_that_undoes_a_failed_installation_does_not_say_that_nothing_was_changed() {
     for fault in every_fault() {
@@ -557,14 +573,11 @@ fn the_removal_that_undoes_a_failed_installation_does_not_say_that_nothing_was_c
         assert!(!text.contains("Nothing was changed"), "{fault:?}: {text}");
         assert!(
             text.contains(
-                "This removal, which undoes the installation that failed, had changed nothing"
+                "This removal, which undoes the installation that failed, had removed nothing"
             ),
             "{fault:?}: {text}"
         );
-        assert!(
-            text.contains("whatever that installation had already made is still there"),
-            "{fault:?}: {text}"
-        );
+        assert!(!text.contains("still there"), "{fault:?}: {text}");
     }
 }
 
@@ -617,7 +630,7 @@ fn a_volume_that_cannot_be_asked_is_refused_for_its_volume_and_names_no_cause() 
             Stage::Before,
         );
         assert!(
-            text.contains(&format!(r"Z:\ is a folder above the boundary's {own}")),
+            text.contains(&format!(r"Z:\ is on the path above the boundary's {own}")),
             "{text}"
         );
         assert!(
@@ -685,10 +698,11 @@ fn a_drive_letter_that_is_no_volumes_root_is_refused_with_the_letter_and_the_rea
             Stage::Before,
         );
         assert!(
-            text.contains(r"X:\ is a drive letter that is not the root of its volume"),
+            text.contains(r"X:\ is a drive letter whose root opens as C:\Shared\Backing"),
             "{text}"
         );
-        assert!(text.contains(r"it leads to C:\Shared\Backing"), "{text}");
+        assert!(!text.contains("not the root of its volume"), "{text}");
+        assert!(text.contains(r"unread"), "{text}");
         assert!(text.contains("Nothing was changed"), "{text}");
         assert!(text.contains(&supported_layout(tree)), "{text}");
         assert!(!text.contains("substitution"), "{text}");
@@ -730,7 +744,7 @@ fn a_folder_on_a_volume_that_is_not_used_is_refused_for_its_volume() {
             Stage::Before,
         );
         assert!(
-            text.contains(&format!(r"Y:\ is a folder above the boundary's {own}")),
+            text.contains(&format!(r"Y:\ is on the path above the boundary's {own}")),
             "{text}"
         );
         assert!(
@@ -888,7 +902,7 @@ fn the_known_folder_gets_the_words_of_a_shared_folder_and_the_products_own_folde
         Stage::Before,
     );
     assert!(
-        text.contains(r"C:\Program Files is a folder above the boundary's program directory"),
+        text.contains(r"C:\Program Files is on the path above the boundary's program directory"),
         "{text}"
     );
     assert!(text.contains("S-1-5-32-545 is allowed to add"), "{text}");
@@ -972,7 +986,7 @@ fn a_link_at_the_boundarys_own_folder_sends_the_administrator_nowhere_else() {
     );
     assert!(
         text.contains(
-            r"C:\Program Files\KalaReach is a folder above the boundary's program directory"
+            r"C:\Program Files\KalaReach is on the path above the boundary's program directory"
         ),
         "{text}"
     );
@@ -1008,7 +1022,7 @@ fn a_final_path_below_the_known_folder_that_is_not_the_one_asked_for_names_no_ca
     );
     assert!(
         text.starts_with(&format!(
-            "{own} is a folder above the boundary's program directory"
+            "{own} is on the path above the boundary's program directory"
         )),
         "{text}"
     );
@@ -1147,7 +1161,7 @@ fn a_known_folder_that_is_not_its_own_final_path_is_refused_with_what_it_leads_t
                 Tree::Data => "above the boundary's data directory",
             };
             assert!(
-                text.starts_with(&format!("{given} is a folder {above}")),
+                text.starts_with(&format!("{given} is on the path {above}")),
                 "{given}: {text}"
             );
             assert!(
@@ -1239,7 +1253,7 @@ fn a_known_folder_on_a_network_share_gets_the_words_of_a_volume_that_is_not_used
                 Tree::Data => "above the boundary's data directory",
             };
             assert!(
-                text.starts_with(&format!("{given} is a folder {above}")),
+                text.starts_with(&format!("{given} is on the path {above}")),
                 "{given}: {text}"
             );
             assert!(
@@ -1286,7 +1300,7 @@ fn a_local_known_folder_that_is_a_link_to_a_share_gets_the_words_of_a_link() {
             Tree::Data => (r"C:\ProgramData", r"\\server\share\Data"),
         };
         assert!(
-            text.starts_with(&format!("{given} is a folder above")),
+            text.starts_with(&format!("{given} is on the path above")),
             "{text}"
         );
         assert!(
@@ -1318,7 +1332,7 @@ fn a_short_name_for_a_known_folder_never_makes_the_other_known_folder_the_instal
     )
     .expect("refused");
     assert!(
-        text.starts_with(r"C:\SHARED~1 is a folder above the boundary's data directory"),
+        text.starts_with(r"C:\SHARED~1 is on the path above the boundary's data directory"),
         "{text}"
     );
     assert!(
@@ -1367,7 +1381,7 @@ fn a_known_folder_that_cannot_be_opened_gets_the_shared_words_for_that() {
         let text = shape_refusal(&files, &data, Stage::Before).expect("refused");
         assert!(
             text.starts_with(&format!(
-                "{folder} is a folder above the boundary's {tree} directory"
+                "{folder} is on the path above the boundary's {tree} directory"
             )),
             "{text}"
         );
@@ -1449,7 +1463,7 @@ fn the_root_and_the_overlap_compare_the_final_paths_alone() {
         .unwrap_or_else(|| panic!("{files} and {data} are refused"));
         assert!(
             text.starts_with(&format!(
-                "{folder} is a folder above the boundary's {tree} directory"
+                "{folder} is on the path above the boundary's {tree} directory"
             )),
             "{files} {data}: {text}"
         );
@@ -1496,7 +1510,7 @@ fn the_good_layout_and_a_sibling_pass() {
 }
 
 /// A refusal of the shape says what the run changed: for the removal that undoes a failed
-/// installation, nothing of its own, with what that installation made still there.
+/// installation, that it had removed nothing.
 #[test]
 fn the_shape_refusal_says_what_the_run_changed() {
     let (files, data) = (known(r"D:\", r"\\?\D:\"), known(PD, PD_FINAL));
@@ -1505,9 +1519,10 @@ fn the_shape_refusal_says_what_the_run_changed() {
     let rollback = shape_refusal(&files, &data, Stage::Rollback).expect("refused");
     assert!(!rollback.contains("Nothing was changed."), "{rollback}");
     assert!(
-        rollback.contains("whatever that installation had already made is still there"),
+        rollback.contains("had removed nothing when it read the folder."),
         "{rollback}"
     );
+    assert!(!rollback.contains("still there"), "{rollback}");
     // A known folder that leads elsewhere, and one that could not be opened, say the same.
     for files in [
         known(r"C:\PF", r"\\?\C:\ProgramData\KalaReach"),
@@ -1516,9 +1531,10 @@ fn the_shape_refusal_says_what_the_run_changed() {
         let text = shape_refusal(&files, &known(PD, PD_FINAL), Stage::Rollback).expect("refused");
         assert!(!text.contains("Nothing was changed."), "{text}");
         assert!(
-            text.contains("whatever that installation had already made is still there"),
+            text.contains("had removed nothing when it read the folder."),
             "{text}"
         );
+        assert!(!text.contains("still there"), "{text}");
     }
 }
 

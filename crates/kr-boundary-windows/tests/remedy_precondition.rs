@@ -88,6 +88,12 @@ fn a_policy_that_is_not_empty_is_refused_for_what_the_read_showed_and_what_was_c
         );
         assert!(text.ends_with("no manifest records that folder."), "{text}");
         assert!(!text.contains("changes nothing"), "{text}");
+        // The read shows that the policy is not empty, and nothing of who wrote it.
+        assert!(
+            text.contains("The installation does not go on beside a policy that is not empty."),
+            "{text}"
+        );
+        assert!(!text.contains("did not write"), "{text}");
         assert!(
             !text.contains("already enforces application control"),
             "{text}"
@@ -151,6 +157,16 @@ fn the_start_type_line_says_what_the_three_values_show() {
     assert!(
         unrecorded.contains("recorded no start type for it"),
         "{unrecorded}"
+    );
+    // A record that is no start type is said to be none, with what it holds.
+    let not_a_start = appid_start_type_left(3, Some("running"), 2);
+    assert!(
+        not_a_start.contains("the installation's record for it is not a start type (running)"),
+        "{not_a_start}"
+    );
+    assert!(
+        !not_a_start.contains("recorded no start type"),
+        "{not_a_start}"
     );
     let odd = appid_start_type_left(3, Some("start=x"), 2);
     assert!(
