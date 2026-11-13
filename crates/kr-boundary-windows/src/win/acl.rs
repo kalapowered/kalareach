@@ -479,10 +479,9 @@ unsafe fn finding_in(
                     mask & mask_of_interest,
                 ))));
             }
-            return Ok(Some(Finding::Granted(format!(
-                "{} is allowed rights 0x{:x} on it",
-                sid.to_text(),
-                mask & mask_of_interest
+            return Ok(Some(Finding::Granted(crate::remedy::entry_rights_finding(
+                &sid.to_text(),
+                mask & mask_of_interest,
             ))));
         }
     }

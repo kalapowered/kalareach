@@ -5,7 +5,7 @@
 
 use std::io::{Error, ErrorKind};
 
-use kr_boundary_windows::records::next_step;
+use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
     CONFIG_NOT_EMPTY_WHY, Finding, appid_start_type_left, application_control_set,
     code_integrity_refusal, empty_config_advice, foreign_rules_refusal, git_permissions_refusal,
@@ -167,13 +167,16 @@ fn the_start_type_line_says_what_the_three_values_show() {
 /// and the words never say that the file there is a manifest.
 #[test]
 fn the_removals_next_step_says_what_the_lookup_found_at_the_manifests_name() {
-    let stays = next_step(true, false);
+    let stays = next_step(&Look::There, &Held::Entries);
     assert!(
         stays.starts_with("Something is at the manifest's name, and it stays with them."),
         "{stays}"
     );
     assert!(!stays.contains("The manifest stays"), "{stays}");
-    for text in [next_step(false, true), next_step(false, false)] {
+    for text in [
+        next_step(&Look::NotThere, &Held::Nothing),
+        next_step(&Look::NotThere, &Held::Entries),
+    ] {
         assert!(!text.contains("manifest stays"), "{text}");
     }
 }
