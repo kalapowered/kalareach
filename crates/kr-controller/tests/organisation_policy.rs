@@ -312,6 +312,67 @@ async fn kr_req_18_06_an_applied_policy_leaves_a_package_outside_its_allowlist_o
     fixture.host.stop().await;
 }
 
+/// KR-REQ-09.09, KR-REQ-18.06: what `organisation.policy.apply` answers is made from the policies
+/// the host holds, so the door tells it only while the authority the request was admitted under
+/// stands. With a valid policy applied, the adapter lists are told; the same policy applied again
+/// while this host comes to owe a fence after the route has answered is not shown, although the
+/// repeat changed nothing and the list is in force; and once the fence is gone the same policy is
+/// answered with the same lists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_adapter_lists_a_policy_apply_answers_are_not_shown_when_a_fence_lands_after_the_read()
+{
+    let fixture = Fixture::start().await;
+    let _repository = install_the_example(&fixture).await;
+    let policy = fixture
+        .organisation
+        .policy(2, 1, Some(&[CODEX]), fixture.now());
+    let applied = apply(&fixture, policy.clone(), None)
+        .await
+        .expect("the host applies the organisation's policy");
+    assert_eq!(applied.adapter_allowlist, allowed(&[CODEX]));
+    assert_eq!(applied.effective_adapter_allowlist, allowed(&[CODEX]));
+
+    let environment = fixture.host.environment_id;
+    let controller = fixture.host.controller();
+    let mut client = fixture.host.client().await;
+    let (arrived, release) = controller.pause_after_a_route_answers();
+    let telling = tokio::spawn({
+        let policy = policy.clone();
+        async move {
+            let told: Result<OrganisationPolicyApplyResult, ProtocolError> = calls::mutate_as(
+                environment,
+                &mut client,
+                ActionId::new(kr_ipc::new_uuid()),
+                Method::OrganisationPolicyApply,
+                &OrganisationPolicyApplyParams {
+                    policy,
+                    authority: Nullable::null(),
+                },
+            )
+            .await;
+            told
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the route answers")
+        .expect("the pause is armed");
+    controller.hold_fence(true);
+    release.send(()).expect("the door goes on");
+    let refused = telling
+        .await
+        .expect("the door tells it")
+        .expect_err("lists made from the policies held are not shown under a fence");
+    assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
+    controller.hold_fence(false);
+
+    let again = apply(&fixture, policy, None)
+        .await
+        .expect("the same policy is answered once the fence is gone");
+    assert_eq!(again, applied, "it is answered with the same lists");
+    fixture.host.stop().await;
+}
+
 /// KR-REQ-18.06: the policy a host applied is still in force after the host restarts, and so is
 /// the floor under it: the same revision with another list, and a lower revision, are refused
 /// by name, the same revision with the same list is a repeat that succeeds, and a higher one

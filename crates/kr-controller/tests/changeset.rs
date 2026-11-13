@@ -1548,3 +1548,120 @@ async fn an_apply_that_loses_its_claim_to_another_copy_is_told_so_only_under_its
     host.clients.abort();
     let _ = host.clients.await;
 }
+
+/// KR-REQ-09.09, 09.12: the result of a capture whose effect has run is told only while the
+/// authority it ended with stands. A fence this host comes to owe once the route has answered keeps
+/// the version from the caller, who is told that what became of the action is not shown; the
+/// version stands, and the same request asked once the fence is gone is answered with the version
+/// the first attempt captured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_version_captured_is_not_shown_when_a_fence_lands_after_the_route_answers_and_the_version_stands()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let _source = repository(host.work(), "source");
+    let adopted: ProjectAdoptResult = typed(
+        &control
+            .mutate(
+                Method::ProjectAdopt,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &ProjectAdoptParams {
+                    destination: host.destination("source"),
+                    label: "source".to_owned(),
+                    flow: AdoptionFlow::ExistingCheckout,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.adopt succeeds"),
+    );
+    let created: WorkspaceCreateResult = typed(
+        &control
+            .mutate(
+                Method::WorkspaceCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkspaceCreateParams {
+                    project_repository_id: adopted.project.project_repository_id,
+                    label: "the user's own tree".to_owned(),
+                    kind: WorkspaceKind::SharedExisting,
+                    isolation: Nullable::null(),
+                    policy: include_everything(),
+                    base_revision: Nullable::null(),
+                    base_change_set_id: Nullable::null(),
+                    destination: Nullable::null(),
+                    preview_only: false,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workspace.create succeeds"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    let environment_id = host.environment_id;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = capture_params(workspace, Nullable::null(), "taken under a fence");
+
+    let (arrived, release) = host.controller.pause_after_a_route_answers();
+    let telling = tokio::spawn({
+        let params = params.clone();
+        async move {
+            let told = control
+                .mutate(
+                    Method::ChangesetCapture,
+                    action,
+                    ActionTarget::environment(environment_id),
+                    &params,
+                )
+                .await;
+            (control, told)
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
+        .await
+        .expect("the route answers")
+        .expect("the pause is armed");
+    host.controller.hold_fence(true);
+    release.send(()).expect("the door goes on");
+    let (mut control, told) = telling.await.expect("the door tells it");
+    host.controller.hold_fence(false);
+    let told = failure(told.expect("the call reaches the daemon"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let captured: ChangesetCaptureResult = typed(
+        &control
+            .mutate(
+                Method::ChangesetCapture,
+                action,
+                ActionTarget::environment(environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the same request is answered once the fence is gone"),
+    );
+    let read: ChangesetReadResult = typed(
+        &control
+            .request(
+                Method::ChangesetRead,
+                &ChangesetReadParams {
+                    change_set_id: captured.version.change_set_id,
+                    version: Nullable::some(captured.version.version),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.read succeeds"),
+    );
+    assert_eq!(
+        read.version.content_digest, captured.version.content_digest,
+        "the version the first attempt captured stands"
+    );
+    host.clients.abort();
+    let _ = host.clients.await;
+}
