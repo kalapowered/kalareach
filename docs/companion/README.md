@@ -1275,9 +1275,11 @@ app bundle and the `.dmg` disk image. On Linux it bundles the `.deb`, `.rpm` and
 On Windows it bundles the MSI and NSIS installers. All options are forwarded to `tauri build` as
 given. The command gives it cargo as its runner, and it refuses `--runner`, `--no-bundle`,
 `--bundles` with no value, a first word other than `build`, and cargo's own `--config` and
-`--target` after a bare `--`. It also errors if `--target` or `CARGO_BUILD_TARGET` names a Windows
-target triple on a non-Windows machine, or an MSVC target other than `x86_64-pc-windows-msvc` and
-`aarch64-pc-windows-msvc` on Windows.
+`--target` after a bare `--`. It also errors if `--target` names a Windows target triple on a
+non-Windows machine, or an MSVC target other than `x86_64-pc-windows-msvc` and
+`aarch64-pc-windows-msvc` on Windows, and if `CARGO_BUILD_TARGET` is set, since the Tauri command
+line does not read it and would bundle the program of another build. The package's build script
+refuses an MSVC build for any other architecture, however its target was chosen.
 
 What each platform needs:
 
@@ -1302,8 +1304,8 @@ being linked because then there are two heaps and two copies of the runtime stat
 line sets `STATIC_VCRUNTIME=true` in the environment for the desktop build unless it's already
 `false`. The build script refuses a build that asks for the static runtime. To avoid this error this
 command sets it to `false` on Windows, whatever the environment holds. If it was already set to
-something else it prints the previous value and that it's replacing it. Each Windows build prints
-tauri-build's warning that `STATIC_VCRUNTIME` is deprecated, which is expected while the
+something else it prints the previous value and that it's replacing it. Each build, on any platform,
+prints tauri-build's warning that `STATIC_VCRUNTIME` is deprecated, which is expected while the
 variable is set.
 
 On Windows the build takes its rustflags from the repository's `.cargo/config.toml` file alone, as
@@ -1324,10 +1326,11 @@ runtime's are. Then it installs the NSIS installer in a temporary directory with
 make it silent. After installing it lists all the files and uses `dumpbin` on the installed
 executable again. Then it uninstalls it. Then it extracts the MSI installer using the administrative
 install option which doesn't actually install or register anything. Then it lists the files and
-again runs `dumpbin` on the executable. In the last two `dumpbin` runs it also classifies each
-import by name as beside the executable, a Windows API set, a Windows system library or the Visual
-C++ runtime, and that does not fail the job. The Visual C++ runtime comes from the runner, because
-neither installer carries it. It never runs the application. It doesn't upload anything.
+again runs `dumpbin` on the executable. In the last two `dumpbin` runs it also reports each import
+as beside the executable or a Windows system library, by a check for the file, as a Windows API set
+or the Visual C++ runtime, by its name, or as not found, and none of these fails the job. The Visual
+C++ runtime comes from the runner, because neither installer carries it. It never runs the
+application. It doesn't upload anything.
 
 The installers bring the program alone, so the Visual C++ runtime must already be on the machine. No
 Windows bundle is released until that is settled.
