@@ -25,15 +25,20 @@
 //!   connection (`LinkError::Refused`, `LinkError::ConnectionRefused`) and the cause that names it
 //!   (`Asked::Connection`), which only the functions above handle;
 //! - the client's accessor of the refusal that a connection kept (`connection_refusal(`), which is
-//!   asked for in `connection.rs` and nowhere else. No exception excuses it.
+//!   asked for in `connection.rs` and nowhere else. No exception excuses it;
+//! - the two other names that reach that refusal with its code, the wire's `kept_refusal(` and the
+//!   cause's `refusal_kept_by(`: each in its definition and its one caller, and nowhere else.
 //!
 //! An exception names one file, one function, one needle and how many lines of that function it
 //! excuses, and says why. It ends where its function ends: a line stands in the function whose
 //! braces hold it. Where a file holds two functions of one name the exception names the type of the
-//! `impl` too (`Type::name`, and `(free)::name` for a function that is in no `impl`). A line that is
+//! `impl` too (`Type::name`, and `(free)::name` for a function that is in no `impl`), and where one
+//! type holds both it names the function's own header, as the source has it, so that it covers one
+//! function. A line that is
 //! not excused, an exception that excuses more or fewer lines than it names, and one that excuses
-//! none, each fail the case. Comments (line, doc and block) and the contents of string and character
-//! literals are not read as code; only a code's wire name is looked for in a literal. The rule has
+//! none, each fail the case. Comments (line, doc and block) and the contents of string, raw string
+//! (`r`, `br` and `cr` with any number of `#`) and character literals are not read as code; only a
+//! code's wire name is looked for in a literal. The rule has
 //! cases of its own: the forms that must fail, and the honest forms that must pass.
 //!
 //! **What a rule over source text cannot see**, and does not try to:
@@ -81,6 +86,12 @@ const WORDS: &str = "words compared or searched";
 /// and nowhere else, and no exception excuses it.
 const ACCESSOR: &str = "connection_refusal(";
 
+/// The other two names that reach a connection's kept refusal with its code: the wire's record of it
+/// and the cause's carrier of it. Each is named in its definition and its one caller, and nowhere
+/// else.
+const KEPT: &str = "kept_refusal(";
+const KEPT_BY: &str = "refusal_kept_by(";
+
 /// The handling of a refused connection that only the functions of `HOME` do, each its own needle.
 const HANDLING: [&str; 5] = [
     "LinkError::Refused",
@@ -115,9 +126,13 @@ struct Hit {
     function: String,
     /// The type of the `impl` the function stands in, or none.
     owner: String,
-    /// Whether another function of the file has the same name in another `impl`, so that an
-    /// exception names the type too (`Type::name`).
+    /// Whether another function of the file has the same name, so that an exception names the type
+    /// too (`Type::name`), or, when the type cannot tell the two apart, the function's own header.
     shared: bool,
+    /// Whether another function of the file has the same name under the same owner.
+    twin: bool,
+    /// The function's declaration line, as the source has it.
+    header: String,
     needle: &'static str,
     line: usize,
     text: String,
@@ -136,7 +151,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 61] = [
+const EXCEPTIONS: [Exception; 64] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -223,7 +238,7 @@ const EXCEPTIONS: [Exception; 61] = [
     },
     Exception {
         file: "device_probe.rs",
-        function: "after_unlocking",
+        function: "fn after_unlocking<R: tauri::Runtime>(app: &tauri::AppHandle<R>, told: Told) -> Vec<Check> {",
         needle: WORDS,
         lines: 1,
         reason: "the probe's own check that this device's store says it is locked, which is no refusal of a host",
@@ -237,14 +252,14 @@ const EXCEPTIONS: [Exception; 61] = [
     },
     Exception {
         file: "error.rs",
-        function: "from",
+        function: "fn from(error: kr_client::ClientError) -> Self {",
         needle: CATEGORY,
         lines: 1,
         reason: "gives a command error the retry hint of the code it carries; it chooses no words",
     },
     Exception {
         file: "error.rs",
-        function: "from",
+        function: "fn from(error: kr_client::ClientError) -> Self {",
         needle: USED,
         lines: 1,
         reason: "gives a command error the retry hint of the code it carries; it chooses no words",
@@ -304,6 +319,13 @@ const EXCEPTIONS: [Exception; 61] = [
         needle: USED,
         lines: 1,
         reason: "decides whether to present the lease again over a connection that is open; it chooses no words",
+    },
+    Exception {
+        file: "lease.rs",
+        function: "failed_on",
+        needle: KEPT_BY,
+        lines: 1,
+        reason: "returns the refusal that the session kept, as the link error that carries it, to the dialers that give it its meaning (`Unopened::of_link`) at every stop of the lease's keeper; it reads no code or words",
     },
     Exception {
         file: "mailbox.rs",
@@ -538,10 +560,24 @@ const EXCEPTIONS: [Exception; 61] = [
     },
     Exception {
         file: "terminal/view.rs",
+        function: "open_paired",
+        needle: KEPT,
+        lines: 1,
+        reason: "hands the refusal that the view's wire kept to the one function that tells a refusal of a connection from a refusal of a request",
+    },
+    Exception {
+        file: "terminal/view.rs",
         function: "response",
         needle: USED,
         lines: 1,
         reason: "the refusal of a request of the view, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "terminal/wire.rs",
+        function: "kept_refusal",
+        needle: KEPT,
+        lines: 1,
+        reason: "the wire's own record of the host's refusal of the connection, which only the view's opening hands to the one function that gives it its meaning",
     },
     Exception {
         file: "voice/host.rs",
@@ -615,6 +651,28 @@ fn after_quoted(chars: &[char], start: usize, quote: char) -> usize {
     chars.len()
 }
 
+/// Where the raw string that starts at `at` opens, and with how many `#`: a raw string (`r"`, `r#"`),
+/// a raw byte string (`br"`) or a raw C string (`cr"`), when the letters do not end a longer name.
+/// The index is the one of its opening quote.
+fn raw_string_at(chars: &[char], at: usize) -> Option<(usize, usize)> {
+    if at
+        .checked_sub(1)
+        .is_some_and(|before| is_word(chars[before]))
+    {
+        return None;
+    }
+    let letters = match (chars[at], chars.get(at + 1)) {
+        ('r', _) => 1,
+        ('b' | 'c', Some('r')) => 2,
+        _ => return None,
+    };
+    let hashes = chars[at + letters..]
+        .iter()
+        .take_while(|c| **c == '#')
+        .count();
+    (chars.get(at + letters + hashes) == Some(&'"')).then_some((at + letters + hashes, hashes))
+}
+
 /// `text` without its comments (line, doc and block comments, the block ones nested) and, unless
 /// `keep_literals`, without the contents of its string and character literals, with every line
 /// break kept so that the numbers of the lines stay.
@@ -654,18 +712,9 @@ fn stripped(text: &str, keep_literals: bool) -> String {
                 }
                 out.push(' ');
             }
-            ('r', Some('"' | '#'))
-                if !at
-                    .checked_sub(1)
-                    .is_some_and(|before| is_word(chars[before])) =>
-            {
-                let hashes = chars[at + 1..].iter().take_while(|c| **c == '#').count();
-                if chars.get(at + 1 + hashes) != Some(&'"') {
-                    out.push('r');
-                    at += 1;
-                    continue;
-                }
-                let body = at + 2 + hashes;
+            ('r' | 'b' | 'c', Some(_)) if raw_string_at(&chars, at).is_some() => {
+                let (opening, hashes) = raw_string_at(&chars, at).expect("a raw string");
+                let body = opening + 1;
                 let closing: Vec<char> = std::iter::once('"')
                     .chain(std::iter::repeat_n('#', hashes))
                     .collect();
@@ -975,8 +1024,10 @@ fn needles(code: &str, text: &str, previous: &str, next: &str) -> Vec<&'static s
             note(WORDS);
         }
     }
-    if line.contains(ACCESSOR) {
-        note(ACCESSOR);
+    for needle in [ACCESSOR, KEPT, KEPT_BY] {
+        if names(line, needle) {
+            note(needle);
+        }
     }
     for needle in HANDLING {
         if line.contains(needle) {
@@ -984,6 +1035,13 @@ fn needles(code: &str, text: &str, previous: &str, next: &str) -> Vec<&'static s
         }
     }
     found
+}
+
+/// Whether `line` names `function` (given with its opening parenthesis) as a name of its own, and not
+/// as the end of a longer one: `of_kept_refusal(` does not name `kept_refusal(`.
+fn names(line: &str, function: &str) -> bool {
+    line.match_indices(function)
+        .any(|(at, _)| !line[..at].chars().next_back().is_some_and(is_word))
 }
 
 /// What a pair of braces holds that gives a line its function and its `impl`.
@@ -1030,6 +1088,7 @@ fn scan(file: &str, text: &str) -> Vec<Hit> {
     let lines = code_lines(text);
     let mut hits = Vec::new();
     let mut declared: Vec<(String, String)> = Vec::new();
+    let mut header = String::new();
     let mut scopes: Vec<(Scope, i32)> = Vec::new();
     let mut pending: Option<Scope> = None;
     let (mut depth, mut parens) = (0_i32, 0_i32);
@@ -1057,6 +1116,7 @@ fn scan(file: &str, text: &str) -> Vec<Hit> {
     for (position, line) in lines.iter().enumerate() {
         if let Some(name) = function_named(&line.code) {
             declared.push((owner_in(&scopes), name.clone()));
+            header = line.code.trim().to_owned();
             pending = Some(Scope::Function(name));
             parens = 0;
         } else if pending.is_none()
@@ -1101,6 +1161,8 @@ fn scan(file: &str, text: &str) -> Vec<Hit> {
                 function: function.clone(),
                 owner: owner.clone(),
                 shared: false,
+                twin: false,
+                header: header.clone(),
                 needle,
                 line: line.number,
                 text: line.code.trim().to_owned(),
@@ -1109,14 +1171,16 @@ fn scan(file: &str, text: &str) -> Vec<Hit> {
         previous = &line.code;
     }
     for hit in &mut hits {
-        let mut owners: Vec<&String> = declared
+        let owners: Vec<&String> = declared
             .iter()
             .filter(|(_, name)| *name == hit.function)
             .map(|(owner, _)| owner)
             .collect();
-        owners.sort();
-        owners.dedup();
-        hit.shared = owners.len() > 1;
+        let mut distinct = owners.clone();
+        distinct.sort();
+        distinct.dedup();
+        hit.shared = distinct.len() > 1;
+        hit.twin = owners.iter().filter(|owner| ***owner == hit.owner).count() > 1;
     }
     hits.retain(|hit| {
         let home = hit.file == HOME.0;
@@ -1126,10 +1190,13 @@ fn scan(file: &str, text: &str) -> Vec<Hit> {
     hits
 }
 
-/// The name an exception gives a hit's function: the bare name, and the type too where the file
-/// holds two functions of that name.
+/// The name an exception gives a hit's function: the bare name; the type too where the file holds two
+/// functions of that name under different types; and the function's own header where it holds two
+/// under one type, so that an exception covers one function.
 fn named_function(hit: &Hit) -> String {
-    if hit.shared && hit.owner.is_empty() {
+    if hit.twin {
+        hit.header.clone()
+    } else if hit.shared && hit.owner.is_empty() {
         format!("(free)::{}", hit.function)
     } else if hit.shared {
         format!("{}::{}", hit.owner, hit.function)
@@ -1605,6 +1672,91 @@ fn comments_and_literals_are_not_read_as_code() {
         [COMPARED],
         "code after a block comment is read"
     );
+}
+
+/// KR-REQ-19.08: the wire's record of a connection's kept refusal and the cause's carrier of it are
+/// each named in their definition and their one caller and nowhere else, and a name that only ends
+/// in one of them is not one of them.
+#[test]
+fn the_other_names_that_reach_a_connections_kept_refusal_are_each_named_in_one_place() {
+    let wire = "fn a(wire: &Wire) -> Option<ProtocolError> {\n    wire.kept_refusal()\n}\n";
+    assert_eq!(read_by(wire), [KEPT]);
+    let carried = "fn a(session: &Session) -> Option<LinkError> {\n    Unopened::refusal_kept_by(session)\n}\n";
+    assert_eq!(read_by(carried), [KEPT_BY]);
+    let classified = "fn a(wire: &Wire, refusal: &ProtocolError) -> Option<Unopened> {\n    Unopened::of_kept_refusal(wire.recorded(), refusal)\n}\n";
+    assert_eq!(read_by(classified), ["of_kept_refusal("]);
+    let counted = |needle| {
+        EXCEPTIONS
+            .iter()
+            .filter(|exception| exception.needle == needle)
+            .count()
+    };
+    assert_eq!(counted(KEPT), 2, "its definition and its one caller");
+    assert_eq!(
+        counted(KEPT_BY),
+        1,
+        "its one caller: the definition is `HOME`'s"
+    );
+}
+
+/// KR-REQ-19.08: a raw byte string and a raw C string, with or without `#`, are read as raw strings,
+/// so that none of them hides the code after it.
+#[test]
+fn raw_byte_and_raw_c_strings_hide_nothing() {
+    let later = "fn later(session: &Session) {\n    let _ = session.connection_refusal();\n}\n";
+    for literal in [
+        r##"const Q: &[u8] = br#"""#;"##,
+        r#"const Q: &[u8] = br"\";"#,
+        r#"const Q: &CStr = cr"\";"#,
+        r##"const Q: &CStr = cr#"""#;"##,
+        r##"const Q: &str = r#"""#;"##,
+        r#"const Q: &[u8] = b"\"";"#,
+    ] {
+        let snippet = format!("{literal}\n{later}");
+        assert_eq!(read_by(&snippet), [ACCESSOR], "{literal}");
+    }
+    let named = "fn a() { let br = 1; let cr = 2; let _ = br + cr; }\nfn later(session: &Session) {\n    let _ = session.connection_refusal();\n}\n";
+    assert_eq!(
+        read_by(named),
+        [ACCESSOR],
+        "a name that ends in r is no raw string"
+    );
+    let inside = r##"const Q: &[u8] = br#"session.connection_refusal()"#;"##;
+    assert!(
+        read_by(inside).is_empty(),
+        "a raw byte string's contents are not code"
+    );
+}
+
+/// KR-REQ-19.08: where one type holds two functions of one name, an exception names the function's
+/// own header and covers that function only.
+#[test]
+fn two_functions_of_one_name_under_one_type_are_excused_one_by_one() {
+    let snippet = "impl From<A> for Failure {\n    fn from(error: A) -> Self {\n        let code = error.code();\n        Self { code }\n    }\n}\n\nimpl From<B> for Failure {\n    fn from(error: B) -> Self {\n        let code = error.code();\n        Self { code }\n    }\n}\n";
+    let hits = scan("snippet.rs", snippet);
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    let excuse = |function| Exception {
+        file: "snippet.rs",
+        function,
+        needle: USED,
+        lines: 1,
+        reason: "a test",
+    };
+    let both = [
+        excuse("fn from(error: A) -> Self {"),
+        excuse("fn from(error: B) -> Self {"),
+    ];
+    assert!(problems(&hits, &both).is_empty());
+    let one = problems(&hits, &[excuse("fn from(error: A) -> Self {")]);
+    assert_eq!(one.len(), 1, "{one:?}");
+    assert!(
+        one[0].contains("error: B"),
+        "the other function stays found: {one:?}"
+    );
+    for bare in ["from", "Failure::from"] {
+        let wrong = problems(&hits, &[excuse(bare)]);
+        assert_eq!(wrong.len(), 3, "`{bare}` excuses neither: {wrong:?}");
+    }
 }
 
 /// KR-REQ-19.08: an exception excuses the needle, the function and the number of lines it names and
