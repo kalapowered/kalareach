@@ -97,9 +97,9 @@ objc2-local-authentication = { workspace = true, features = ["std", "LAContext",
 
 [target.'cfg(target_os = "ios")'.dependencies]
 # The role of the scene the system asks the application to show, which decides whether it takes the
-# main window.
-objc2-foundation = { workspace = true, features = ["std", "NSString"] }
-objc2-ui-kit = { workspace = true, features = ["std", "UIScene", "UISceneSession"] }
+# main window, and the windows of the scenes that are connected, which are moved to it.
+objc2-foundation = { workspace = true, features = ["std", "NSArray", "NSEnumerator", "NSSet", "NSString"] }
+objc2-ui-kit = { workspace = true, features = ["std", "UIApplication", "UIScene", "UISceneDefinitions", "UISceneSession", "UIWindow", "UIWindowScene"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows Hello, the owner's confirmation on Windows.

@@ -22,6 +22,8 @@
 //! records are made once in setup and outlive the window; only what is tied to the window is made
 //! again.
 
+use objc2_foundation::MainThreadMarker;
+use objc2_ui_kit::{UIApplication, UIScene, UIWindowScene};
 use tauri::{AppHandle, Manager as _, RunEvent};
 
 use crate::scene_role;
@@ -36,12 +38,11 @@ pub(crate) fn on_run_event(app: &AppHandle, event: &RunEvent) {
         } => api.prevent_exit(),
         RunEvent::SceneRequested { scene, .. } => {
             // Only the application's own scene is the phone's screen. A scene of another role (an
-            // external display's) is left without a window: the main window would be made in it, the
-            // check for an existing window would then stop the phone's scene from getting one when it
-            // returns, and the phone would stay blank.
+            // external display's) is left without a window, which keeps the system's mirroring.
             let role = scene.session().role().to_string();
             if scene_role::takes_the_main_window(&role) {
                 open_main_window_once(app);
+                bring_windows_here(app, scene);
             } else {
                 tracing::info!("a scene of another role was requested, so it was given no window");
                 #[cfg(debug_assertions)]
@@ -73,6 +74,58 @@ fn trace(app: &AppHandle, event: &RunEvent) {
         "KalaReach scene probe (rust): {what}, windows={}",
         app.webview_windows().len()
     );
+}
+
+/// Puts every window that sits in a scene of another role into the scene that was just given back.
+///
+/// The windowing library puts a new window in the first connected scene that has none, whatever its
+/// role, and the application's own scene is one of two such scenes when an external display's scene
+/// is connected without a window: the main window can then land on the display, and the phone stays
+/// blank while the existing-window check refuses to open another. A window cannot be asked for in a
+/// given scene, so it is moved after the fact. Nothing moves when every window is in a scene of the
+/// application's own role, which is the case unless a display is connected.
+fn bring_windows_here(app: &AppHandle, scene: &UIScene) {
+    let (Some(mtm), Some(here)) = (
+        MainThreadMarker::new(),
+        scene.downcast_ref::<UIWindowScene>(),
+    ) else {
+        return;
+    };
+    let mut moved = 0_usize;
+    for other in UIApplication::sharedApplication(mtm)
+        .connectedScenes()
+        .iter()
+    {
+        let Some(other) = other.downcast_ref::<UIWindowScene>() else {
+            continue;
+        };
+        if scene_role::takes_the_main_window(&other.session().role().to_string()) {
+            continue;
+        }
+        for window in other.windows().iter() {
+            window.setWindowScene(Some(here));
+            moved += 1;
+        }
+    }
+    if moved > 0 {
+        tracing::info!(
+            moved,
+            "windows in a scene of another role were moved to the application's scene"
+        );
+    }
+    #[cfg(debug_assertions)]
+    {
+        let here_id = scene.session().persistentIdentifier().to_string();
+        let main_id = app
+            .get_webview_window("main")
+            .and_then(|window| window.as_ref().window().scene_identifier().ok());
+        eprintln!(
+            "KalaReach scene probe (rust): windows moved={moved}, the main window is in the application scene: {}",
+            main_id.as_deref() == Some(here_id.as_str())
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = app;
 }
 
 /// Opens the main window if the application has none, with what is tied to it.
