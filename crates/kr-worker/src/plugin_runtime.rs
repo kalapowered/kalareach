@@ -683,10 +683,10 @@ impl Link {
     /// for it, and the registrations the broker wants now would wait behind them. Returns false where
     /// the runtime was lost on the way.
     ///
-    /// A binding is unbound once for each call given up for it, since the runtime holds one
-    /// registration of an identifier at a time and may hold one of them live while another is
-    /// still being made. It stops at an unbind that finds nothing, because the calls left held
-    /// nothing either.
+    /// A binding is unbound once for each call given up for it, since the runtime may hold one
+    /// registration of the identifier live while another is still being made, and an unbind takes
+    /// out one. One that finds nothing is answered all the same: a call may never have reached the
+    /// runtime.
     async fn unbind_abandoned(&mut self, broker: &Weak<Broker>) -> bool {
         while let Some((binding_id, given_up)) = self.abandoned.pop_first() {
             for _ in 0..given_up {
@@ -704,9 +704,7 @@ impl Link {
                 #[cfg(feature = "testing")]
                 link_trace::ended(began, link_trace::Outcome::of(&unbound));
                 match unbound {
-                    Ok(true)
-                    | Err(ServiceError::Protocol { .. } | ServiceError::Disabled { .. }) => {}
-                    Ok(false) => break,
+                    Ok(_) | Err(ServiceError::Protocol { .. } | ServiceError::Disabled { .. }) => {}
                     Err(error) => {
                         #[cfg(feature = "testing")]
                         link_trace::lost(link_trace::Why::of(&error));
