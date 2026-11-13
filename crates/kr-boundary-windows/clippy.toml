@@ -24,4 +24,8 @@ disallowed-methods = [
     { path = "std::result::Result::is_err_and", reason = "it turns an answer into a statement about the error; match on the Result" },
     { path = "std::result::Result::map_or", reason = "it turns a failed read into a value; match on the Result and carry the error" },
     { path = "std::result::Result::map_or_else", reason = "it turns a failed read into a value; match on the Result and carry the error" },
+    { path = "windows_sys::Win32::System::Threading::WaitForSingleObject", reason = "it answers a failure as a number that a caller can take for a timeout or for the object; wait with ffi::wait, which answers signalled, timed out or failed" },
+    { path = "windows_sys::Win32::System::Threading::WaitForMultipleObjects", reason = "it answers a failure as a number that a caller can take for a timeout or for an object; wait with ffi::wait_any, which answers the object, timed out or failed" },
+    { path = "windows_sys::Win32::System::Pipes::PeekNamedPipe", reason = "it answers a failure as an error that a caller can take for the end of the pipe; read with ffi::pipe_read, which answers data, ended or failed" },
+    { path = "windows_sys::Win32::Storage::FileSystem::ReadFile", reason = "it answers a failure as an error that a caller can take for the end of the pipe; read a pipe with ffi::pipe_read, which answers data, ended or failed, and a transfer with the pipe module's own wait" },
 ]

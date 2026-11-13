@@ -28,17 +28,17 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, FILETIME, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
-    HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    FILETIME, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+    SetHandleInformation,
 };
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, SECURITY_ATTRIBUTES, SecurityImpersonation, TOKEN_ASSIGN_PRIMARY,
     TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, DETACHED_PROCESS,
@@ -46,8 +46,7 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
-    WaitForSingleObject,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
 };
 
 use crate::env::EnvBlock;
@@ -499,22 +498,17 @@ fn end_unresumed(process: &Handle, pid: u32, reports: &Reports, deadline: Option
         )
         .clamp(END_FLOOR_MS, END_WAIT_MS)
     });
-    // SAFETY: as above.
-    let waited = unsafe { WaitForSingleObject(process.raw(), wait_ms) };
-    if waited != WAIT_OBJECT_0 {
+    // text: launch_end_unresumed-2
+    let waited = ffi::wait(process.raw(), wait_ms, "the wait for its end");
+    if !matches!(waited, Ok(ffi::Waited::Signalled(_))) {
         let call = terminate_error.map_or_else(
             || "the call succeeded".to_owned(),
             |error| error.to_string(),
         );
         // A wait that failed did not wait the bound: the words say which of the two happened.
-        let wait = if waited == WAIT_TIMEOUT {
-            format!("was not seen to end within {wait_ms} ms")
-        } else if waited == WAIT_FAILED {
-            // text: launch_end_unresumed-2
-            let why = last("the wait for its end");
-            format!("was not seen to end: {why}")
-        } else {
-            format!("was not seen to end: the wait for its end gave the answer {waited:#x}")
+        let wait = match &waited {
+            Ok(_) => format!("was not seen to end within {wait_ms} ms"),
+            Err(why) => format!("was not seen to end: {why}"),
         };
         reports.add(format!(
             "the suspended child (process {pid}) {wait} ({call})"
@@ -596,17 +590,14 @@ impl Child {
     /// Returns the platform's error when the wait or the exit code fails.
     pub fn wait(&self, bound: Duration) -> Result<Option<u32>, ffi::Error> {
         let milliseconds = ffi::milliseconds(bound, u32::MAX);
-        // SAFETY: the process handle is open.
-        match unsafe { WaitForSingleObject(self.process.raw(), milliseconds) } {
-            WAIT_OBJECT_0 => self.exit_code(),
-            WAIT_TIMEOUT => Ok(None),
-            // text: launch_wait-1
-            WAIT_FAILED => Err(last("waiting for the child to end")),
-            // text: launch_wait-2
-            other => Err(ffi::error(
-                0,
-                format!("waiting for the child to end gave the answer {other:#x}"),
-            )),
+        // text: launch_wait-1
+        match ffi::wait(
+            self.process.raw(),
+            milliseconds,
+            "waiting for the child to end",
+        )? {
+            ffi::Waited::Signalled(_) => self.exit_code(),
+            ffi::Waited::TimedOut => Ok(None),
         }
     }
 
@@ -622,18 +613,15 @@ impl Child {
     pub fn wait_or_stop(&self, bound: Duration, stop: &Stop) -> Result<Option<u32>, ffi::Error> {
         let milliseconds = ffi::milliseconds(bound, u32::MAX);
         let handles = [stop.event(), self.process.raw()];
-        // SAFETY: both handles are open for the length of the wait.
-        match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) } {
-            answer if answer == WAIT_OBJECT_0 + 1 => self.exit_code(),
+        // text: launch_wait_or_stop-1
+        match ffi::wait_any(
+            &handles,
+            milliseconds,
+            "waiting for the child to end or the stop",
+        )? {
+            ffi::Waited::Signalled(1) => self.exit_code(),
             // The stop came first, or the bound ran out.
-            WAIT_OBJECT_0 | WAIT_TIMEOUT => Ok(None),
-            // text: launch_wait_or_stop-1
-            WAIT_FAILED => Err(last("waiting for the child to end or the stop")),
-            // text: launch_wait_or_stop-2
-            other => Err(ffi::error(
-                0,
-                format!("waiting for the child to end or the stop gave the answer {other:#x}"),
-            )),
+            ffi::Waited::Signalled(_) | ffi::Waited::TimedOut => Ok(None),
         }
     }
 
@@ -1035,8 +1023,12 @@ pub struct Piped {
     /// What the pipe held, up to a limit.
     pub bytes: Vec<u8>,
     /// Whether the pipe reached its end: every writer had closed its handle. When it did not, a
-    /// process that is not shown to have ended still holds the child's output.
+    /// process that is not shown to have ended still holds the child's output, unless a read
+    /// failed (`failed`), which shows nothing of the pipe.
     pub ended: bool,
+    /// The error of a look at the pipe or a read of it that failed, where one did: the pipe's end
+    /// is then neither shown nor refuted.
+    pub failed: Option<ffi::Error>,
 }
 
 /// Reads a pipe to its end or to a deadline, whichever comes first, keeping up to a limit of what
@@ -1061,51 +1053,33 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant, stop: Option<&Stop>) -> Piped
             return Piped {
                 bytes: kept,
                 ended: false,
+                failed: None,
             };
         }
-        let mut available = 0_u32;
-        // SAFETY: the pipe is open and only the available-bytes out-parameter is used.
-        let peeked = unsafe {
-            PeekNamedPipe(
-                pipe.raw(),
-                null_mut(),
-                0,
-                null_mut(),
-                &raw mut available,
-                null_mut(),
-            )
-        };
-        if peeked == 0 {
-            // A pipe with no writer left answers with a broken pipe: that is its end. Any other
-            // failure leaves the end unproved.
-            // SAFETY: reads the calling thread's last error.
-            let ended =
-                unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_BROKEN_PIPE;
-            return Piped { bytes: kept, ended };
+        // A pipe with no writer left answers with a broken pipe: that is its end. Any other
+        // failure of the look or the read is the error, which neither shows nor refutes the end.
+        match ffi::pipe_read(pipe, &mut chunk) {
+            Ok(ffi::PipeRead::Empty) => {
+                std::thread::sleep(PIPE_POLL.min(limit.saturating_duration_since(Instant::now())));
+            }
+            Ok(ffi::PipeRead::Data(read)) => {
+                let room = CAPTURE_LIMIT.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..(read as usize).min(room)]);
+            }
+            Ok(ffi::PipeRead::Ended) => {
+                return Piped {
+                    bytes: kept,
+                    ended: true,
+                    failed: None,
+                };
+            }
+            Err(failure) => {
+                return Piped {
+                    bytes: kept,
+                    ended: false,
+                    failed: Some(failure),
+                };
+            }
         }
-        if available == 0 {
-            std::thread::sleep(PIPE_POLL.min(limit.saturating_duration_since(Instant::now())));
-            continue;
-        }
-        let mut read = 0_u32;
-        let wanted = available.min(chunk.len() as u32);
-        // SAFETY: the pipe is open, `wanted` bytes are waiting and the buffer is at least that long.
-        let ok = unsafe {
-            ReadFile(
-                pipe.raw(),
-                chunk.as_mut_ptr().cast(),
-                wanted,
-                &raw mut read,
-                null_mut(),
-            )
-        };
-        if ok == 0 || read == 0 {
-            // SAFETY: reads the calling thread's last error.
-            let ended = ok == 0
-                && unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_BROKEN_PIPE;
-            return Piped { bytes: kept, ended };
-        }
-        let room = CAPTURE_LIMIT.saturating_sub(kept.len());
-        kept.extend_from_slice(&chunk[..(read as usize).min(room)]);
     }
 }

@@ -14,7 +14,7 @@ use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -26,9 +26,8 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-use super::ffi::{Handle, Result, error, last};
+use super::ffi::{self, Handle, Result, Waited, error, last};
 use super::launch::Child;
 
 /// What the job holds a process tree to.
@@ -393,9 +392,23 @@ impl Job {
         // text: job_end-1
         let terminate_error = (!terminated).then(|| last("ending the job"));
         loop {
+            // A process that is not seen to have ended is one that has not, or one whose wait failed:
+            // the first failure is kept for the report.
+            let mut wait_failed = None;
             let all_exited = retained.iter().all(|child| {
-                // SAFETY: the retained process handle is open.
-                unsafe { WaitForSingleObject(child.process.raw(), 0) == WAIT_OBJECT_0 }
+                // text: job_end-2
+                match ffi::wait(
+                    child.process.raw(),
+                    0,
+                    "waiting for a retained process to be seen ended",
+                ) {
+                    Ok(Waited::Signalled(_)) => true,
+                    Ok(Waited::TimedOut) => false,
+                    Err(failure) => {
+                        wait_failed.get_or_insert(failure);
+                        false
+                    }
+                }
             });
             let counted = self.active_processes();
             let (active_zero, count_read) = match &counted {
@@ -413,9 +426,11 @@ impl Job {
                         Ok(count) => format!("{count}"),
                         Err(error) => format!("not read ({error})"),
                     };
+                    let waited =
+                        wait_failed.map_or_else(String::new, |failure| format!("; {failure}"));
                     self.reports.add(format!(
                         "the job was not seen empty within the bound (exited {all_exited}, \
-                         active count {count}; {call})"
+                         active count {count}; {call}{waited})"
                     ));
                 }
                 return Ended {

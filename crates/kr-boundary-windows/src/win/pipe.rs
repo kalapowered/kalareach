@@ -22,8 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, LocalFree, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
@@ -33,8 +32,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WRITE_DAC,
-    WriteFile,
+    PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WRITE_DAC, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -44,12 +42,12 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentThread, INFINITE, OpenProcess, OpenThreadToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, SetEvent,
 };
 
 use crate::pipe_access;
 
-use super::ffi::{Handle, Result, Sid, error, last, wide};
+use super::ffi::{self, Handle, Result, Sid, error, last, wide};
 use super::sd::{Summary, summary_of_handle};
 
 /// One of the broker's two pipes. Each has a name, a permission list, a most number of instances
@@ -161,22 +159,11 @@ impl Stop {
         if self.unread.get().is_some() {
             return true;
         }
-        // SAFETY: the event handle is open for the length of the wait.
-        let waited = unsafe { WaitForSingleObject(self.event.raw(), milliseconds) };
-        match waited {
-            WAIT_OBJECT_0 => true,
-            WAIT_TIMEOUT => false,
-            other => {
-                let failure = if other == WAIT_FAILED {
-                    // text: pipe_stop_waited-1
-                    last("waiting on the stop event")
-                } else {
-                    // text: pipe_stop_waited-2
-                    error(
-                        0,
-                        format!("waiting on the stop event gave the answer {other:#x}"),
-                    )
-                };
+        // text: pipe_stop_waited-1
+        match ffi::wait(self.event.raw(), milliseconds, "waiting on the stop event") {
+            Ok(ffi::Waited::Signalled(_)) => true,
+            Ok(ffi::Waited::TimedOut) => false,
+            Err(failure) => {
                 let _ = self.unread.set(failure.to_string());
                 self.set();
                 true
@@ -363,7 +350,7 @@ impl Transfer {
 }
 
 /// Cancels a transfer and waits for it, for at most [`CANCEL_GRACE_MS`]. Returns whether it ended.
-fn cancel(pipe: HANDLE, transfer: &mut Transfer) -> bool {
+fn cancel(pipe: HANDLE, transfer: &mut Transfer) -> ffi::Result<bool> {
     #[cfg(feature = "testing")]
     let skipped = testing::take_skip();
     #[cfg(not(feature = "testing"))]
@@ -374,8 +361,13 @@ fn cancel(pipe: HANDLE, transfer: &mut Transfer) -> bool {
             CancelIoEx(pipe, transfer.record());
         }
     }
-    // SAFETY: the event handle is open.
-    unsafe { WaitForSingleObject(transfer.event.raw(), CANCEL_GRACE_MS) == WAIT_OBJECT_0 }
+    // text: pipe_cancel-1
+    let ended = ffi::wait(
+        transfer.event.raw(),
+        CANCEL_GRACE_MS,
+        "waiting for a cancelled transfer to end",
+    )?;
+    Ok(matches!(ended, ffi::Waited::Signalled(_)))
 }
 
 /// Waits for a transfer, up to the deadline and until the stop event is set. When it does not
@@ -397,31 +389,26 @@ fn wait(
         // One less than the longest wait, which means "forever".
         super::ffi::milliseconds(left, INFINITE - 1)
     });
-    // SAFETY: both handles are open for the length of the wait.
-    let signalled = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
-    // The error of a failed wait is read before another call can replace it.
-    let failed = (signalled == WAIT_FAILED).then(io::Error::last_os_error);
-    if signalled != WAIT_OBJECT_0 + 1 {
-        if !cancel(pipe, &mut transfer) {
+    // text: pipe_wait-1
+    let waited = ffi::wait_any(&handles, milliseconds, "waiting for the other end");
+    if !matches!(waited, Ok(ffi::Waited::Signalled(1))) {
+        // A transfer that is not seen to end after the cancel stays with the process, and the
+        // cancel's own failed wait is told beside the reason.
+        let cancelled = cancel(pipe, &mut transfer);
+        if !matches!(cancelled, Ok(true)) {
             *stuck = true;
             std::mem::forget(transfer);
         }
-        return Err(if let Some(error) = failed {
-            io::Error::new(
-                error.kind(),
-                format!("waiting for the other end failed ({error})"),
-            )
-        } else if signalled == WAIT_TIMEOUT {
-            io::Error::new(
+        let note = cancelled
+            .err()
+            .map_or_else(String::new, |failure| format!("; and {failure}"));
+        return Err(match waited {
+            Err(failure) => io::Error::other(WaitFailed(format!("{failure}{note}"))),
+            Ok(ffi::Waited::TimedOut) => io::Error::new(
                 io::ErrorKind::TimedOut,
-                "the other end did not answer before the deadline",
-            )
-        } else if signalled == WAIT_OBJECT_0 {
-            stopping(stop)
-        } else {
-            io::Error::other(format!(
-                "waiting for the other end gave the answer {signalled:#x}"
-            ))
+                format!("the other end did not answer before the deadline{note}"),
+            ),
+            Ok(ffi::Waited::Signalled(_)) => stopping(stop),
         });
     }
     let mut transferred = 0_u32;
@@ -432,6 +419,19 @@ fn wait(
     Ok((transferred, transfer))
 }
 
+/// The error of a wait on a transfer that failed: nothing is known of the transfer, and the
+/// listener, which waits for a client, ends with it and does not take it for a client that went.
+#[derive(Debug)]
+struct WaitFailed(String);
+
+impl std::fmt::Display for WaitFailed {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WaitFailed {}
+
 /// The error of a transfer that the stop ended. It is not `Interrupted`: the frame reader, `read_exact`
 /// and `write_all` retry that kind, each retry starts a transfer that the set stop ends again at
 /// once, and the connection would never let go of the thread that serves it.
@@ -440,7 +440,7 @@ fn stopping(stop: &Stop) -> io::Error {
 }
 
 fn stuck_error() -> io::Error {
-    io::Error::other("a transfer on this connection did not end when it was cancelled")
+    io::Error::other("a transfer on this connection was not seen to end when it was cancelled")
 }
 
 /// The most bytes one transfer asks for: a read or a write of more is short, as the traits allow.
@@ -459,28 +459,17 @@ impl Read for Connection {
         }
         let length = buffer.len().min(MAX_TRANSFER);
         let mut transfer = Transfer::new(vec![0; length])?;
+        let record = transfer.record();
         // SAFETY: the buffer and the record live in `transfer`, which `wait` completes, or cancels
         // and drops, or keeps for the life of the process when the cancel does not end the
         // transfer.
-        let started = unsafe {
-            ReadFile(
-                self.pipe.raw(),
-                transfer.buffer.as_mut_ptr(),
-                length as u32,
-                null_mut(),
-                transfer.record(),
-            )
-        };
-        if started == 0 {
-            let failure = io::Error::last_os_error();
-            if failure.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
-                // A client that closed its end reads as the end of the stream.
-                return if failure.raw_os_error() == Some(109) {
-                    Ok(0)
-                } else {
-                    Err(failure)
-                };
-            }
+        match unsafe {
+            ffi::read_overlapped(self.pipe.raw(), &mut transfer.buffer[..length], record)
+        } {
+            Ok(ffi::ReadStarted::Going) => {}
+            // A client that closed its end reads as the end of the stream.
+            Ok(ffi::ReadStarted::Ended) => return Ok(0),
+            Err(failure) => return Err(io::Error::other(failure)),
         }
         match wait(
             self.pipe.raw(),
@@ -873,6 +862,20 @@ impl Listener {
                 if code == ERROR_IO_PENDING {
                     match wait(pipe.raw(), transfer, &self.stop, None, &mut stuck) {
                         Ok(_) => {}
+                        // The wait on a client failed: nothing is known of any client, so the
+                        // listener ends with the error and does not take it for one that went.
+                        Err(error)
+                            if error
+                                .get_ref()
+                                .is_some_and(|inner| inner.is::<WaitFailed>()) =>
+                        {
+                            self.next = Some(pipe);
+                            // text: pipe_accept-wait-1
+                            return Err(ffi::error(
+                                0,
+                                format!("waiting for a client failed ({error})"),
+                            ));
+                        }
                         Err(_) if self.stop.is_set() => {
                             // The instance stays with the listener until the listener ends.
                             self.next = Some(pipe);
