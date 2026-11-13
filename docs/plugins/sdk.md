@@ -28,9 +28,6 @@ member under a range that admits an earlier SDK version. It refuses the table un
 prerelease part (`>=0.1.7-alpha, <0.2.0`, `>=0.1.7, <0.2.0-rc.1`) as well, because it cannot decide
 such a range: state the range with release versions only. A condition's place begins with the
 table's `params` member, since the host reads it in the request's parameters. The package check
-declares `"sdk_range": ">=0.1.7, <0.2.0"`, and the package check refuses a table that carries the
-member under a range that admits an earlier SDK version. A condition's place begins with the
-table's `params` member, since the host reads it in the request's parameters. The package check
 also refuses a table whose route states more than eight conditions, whose condition names a place
 of no segment, of more than eight, outside `params` (a place in the reply, or the request's
 `method`), or of `params` alone (an object, which no value a condition lists equals), or whose
@@ -38,16 +35,10 @@ condition lists no value or more than eight, with a finding of its own: such a t
 as one that states no condition. Those three bounds, eight conditions, eight segments and eight
 values, do not change within SDK 0.1.x. A request of a route that states conditions whose `params`
 is not an object is neither hidden nor a selection: the host does not take the thread its reply
-names, and what the terminal is in stays unknown until a later selection that it can read is
-answered. Only the server's refusal of such a request, or a frame that never went, ends that sooner
-and leaves the binding as it was; a success reply, a reply the host cannot read and a lost outcome
-do not. A notification of such a method changes nothing.
-
-Independent of `hidden_when`, the host no longer holds rich work back while the terminal's request
-to leave a conversation other than the bound one is in flight, and no longer holds it when such a
-request is lost, unless a selection is in flight or its reply is kept: that selection may be the
-conversation the leave names, so the leave stays in order with it. That applies to every table, a
-table with no conditions included.
+names, and what the terminal is in stays unknown until a selection that the terminal asks for after
+it is adopted. Only the server's refusal of such a request, or a frame that never went, ends that
+sooner and leaves the binding as it was; a success reply, a reply the host cannot read and a lost
+outcome do not. A notification of such a method changes nothing.
 
 Independent of `hidden_when`, the host no longer holds rich work back while the terminal's request
 to leave a conversation other than the bound one is in flight, and no longer holds it when such a

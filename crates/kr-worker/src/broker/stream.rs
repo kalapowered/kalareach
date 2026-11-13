@@ -47,11 +47,11 @@
 //! parameters are not an object: a server may take a positional array, which names no member), is
 //! neither hidden nor a selection. Its reply is never applied as a selection, and from its
 //! admission what the terminal is in is unknown, as for a selection whose outcome is lost: rich
-//! mutations wait until a later selection that can be read is answered. Only the server's refusal,
-//! or the knowledge that the frame never went, says that no thread was started, and then the
-//! binding is as it was; a success reply, a reply that cannot be read and a lost outcome keep it
-//! unknown. A notification of such a method, which has no reply, changes nothing. A member
-//! repeated inside the parameters takes its last occurrence here and in the server alike.
+//! mutations wait until a selection that the terminal asks for after it is adopted. Only the
+//! server's refusal, or the knowledge that the frame never went, says that no thread was started,
+//! and then the binding is as it was; a success reply, a reply that cannot be read and a lost
+//! outcome keep it unknown. A notification of such a method, which has no reply, changes nothing.
+//! A member repeated inside the parameters takes its last occurrence here and in the server alike.
 //!
 //! A leave names the conversation it ends. One that names a conversation other than the bound one
 //! is not kept open either, unless a request that selects is open or the reply to one is kept: that
