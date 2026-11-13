@@ -2351,7 +2351,8 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         (vec![], vec!["push".to_owned()]),
         "modelled keywords"
     );
-    let rows: [(&str, fn(&mut Value)); 11] = [
+    type Edit = fn(&mut Value);
+    let rows: [(&str, Edit); 11] = [
         ("an unmodelled keyword at the root", |schema| {
             schema["x-unmodelled"] = json!(true);
         }),
