@@ -8,8 +8,8 @@ use std::io::{Error, ErrorKind};
 use kr_boundary_windows::records::next_step;
 use kr_boundary_windows::remedy::{
     CONFIG_NOT_EMPTY_WHY, Finding, appid_start_type_left, application_control_set,
-    empty_config_advice, foreign_rules_refusal, git_permissions_refusal, git_program_not_reached,
-    payload_file_not_reached,
+    code_integrity_refusal, empty_config_advice, foreign_rules_refusal, git_permissions_refusal,
+    git_program_not_reached, payload_file_not_reached, smart_app_control_refusal,
 };
 
 /// A read that failed for any reason but "not found" says that the read failed, with its error, and
@@ -238,4 +238,83 @@ fn the_refusal_for_a_rule_that_the_installation_did_not_make_names_no_author_and
         }
         assert!(text.contains("did not make"), "{text}");
     }
+}
+
+/// Smart App Control's state is said to be on or evaluating only for the values that mean that (1
+/// and 2); a value that the setup program does not know is refused as unknown, with the value, and
+/// is not called a state.
+#[test]
+fn a_smart_app_control_value_that_is_not_known_is_refused_as_unknown() {
+    assert_eq!(smart_app_control_refusal(Some(0)), None);
+    for known in [1, 2] {
+        let said = smart_app_control_refusal(Some(known)).unwrap();
+        assert!(said.contains("on or evaluating"), "{said}");
+        assert!(said.contains(&format!("state {known}")), "{said}");
+    }
+    for unknown in [3, 0xFFFF_FFFF] {
+        let said = smart_app_control_refusal(Some(unknown)).unwrap();
+        assert!(said.contains(&unknown.to_string()), "{said}");
+        assert!(
+            said.contains("which the setup program does not know"),
+            "{said}"
+        );
+        assert!(!said.contains("on or evaluating"), "{said}");
+    }
+    let absent = smart_app_control_refusal(None).unwrap();
+    assert!(absent.contains("could not be found"), "{absent}");
+}
+
+/// An entry of the code-integrity listing with a field that is missing or of another type is
+/// refused as one that the setup program does not understand, with the field and its value: no
+/// `false` or `true` stands in for a field that is not there.
+#[test]
+fn a_code_integrity_entry_with_a_missing_or_invalid_field_is_refused_as_not_understood() {
+    use serde_json::json;
+    let said = |entries: serde_json::Value| code_integrity_refusal(entries.as_array().unwrap());
+
+    let empty = said(json!([{}])).unwrap();
+    assert!(empty.contains("does not understand"), "{empty}");
+    assert!(empty.contains("its IsSystemPolicy is missing"), "{empty}");
+    assert!(!empty.contains("beyond the system's"), "{empty}");
+
+    let wrong = said(json!([{"IsSystemPolicy": "yes", "FriendlyName": "x"}])).unwrap();
+    assert!(
+        wrong.contains("its IsSystemPolicy is \"yes\", not true or false"),
+        "{wrong}"
+    );
+
+    let unnamed = said(json!([{"IsSystemPolicy": true}])).unwrap();
+    assert!(unnamed.contains("its FriendlyName is missing"), "{unnamed}");
+
+    let no_field =
+        said(json!([{"IsSystemPolicy": true, "FriendlyName": "VerifiedAndReputable"}])).unwrap();
+    assert!(no_field.contains("its IsEnforced is missing"), "{no_field}");
+    assert!(!no_field.contains("is enforcing"), "{no_field}");
+    let wrong_type = said(
+        json!([{"IsSystemPolicy": true, "FriendlyName": "VerifiedAndReputable", "IsEnforced": 1}]),
+    )
+    .unwrap();
+    assert!(
+        wrong_type.contains("its IsEnforced is 1, not true or false"),
+        "{wrong_type}"
+    );
+
+    // What it does refuse as before, and what it passes.
+    let beyond = said(json!([{"IsSystemPolicy": false, "FriendlyName": "Mine"}])).unwrap();
+    assert!(
+        beyond.ends_with("beyond the system's is present: Mine"),
+        "{beyond}"
+    );
+    let enforcing = said(
+        json!([{"IsSystemPolicy": true, "FriendlyName": "VerifiedAndReputable", "IsEnforced": true}]),
+    );
+    assert_eq!(enforcing.as_deref(), Some("Smart App Control is enforcing"));
+    assert_eq!(
+        said(json!([
+            {"IsSystemPolicy": true, "FriendlyName": "VerifiedAndReputable", "IsEnforced": false},
+            {"IsSystemPolicy": true, "FriendlyName": "DefaultWindows"}
+        ])),
+        None
+    );
+    assert_eq!(said(json!([])), None);
 }

@@ -2460,16 +2460,10 @@ fn refuse_smart_app_control() -> Result<(), Error> {
         .map(|key| key.dword("VerifiedAndReputablePolicyState"))
         .transpose()?
         .flatten();
-    match state {
-        Some(0) => Ok(()),
+    match remedy::smart_app_control_refusal(state) {
         // text: refuse_smart_app_control-1
-        Some(other) => Err(Error::Refused(format!(
-            "Smart App Control is on or evaluating on this computer (state {other})"
-        ))),
-        // text: refuse_smart_app_control-2
-        None => Err(Error::Refused(
-            "Smart App Control's state could not be found where the system keeps it: the CI policy key, or its VerifiedAndReputablePolicyState value, is not there".to_owned(),
-        )),
+        Some(text) => Err(Error::Refused(text)),
+        None => Ok(()),
     }
 }
 
@@ -2510,22 +2504,11 @@ fn refuse_code_integrity() -> Result<(), Error> {
         // text: refuse_code_integrity-5
         Error::Refused("the code-integrity policies could not be read".to_owned())
     })?;
-    for entry in policies {
-        let system = entry["IsSystemPolicy"].as_bool().unwrap_or(false);
-        let enforced = entry["IsEnforced"].as_bool().unwrap_or(true);
-        let name = entry["FriendlyName"].as_str().unwrap_or("");
-        if !system {
-            // text: refuse_code_integrity-6
-            return Err(Error::Refused(format!(
-                "a code-integrity policy beyond the system's is present: {name}"
-            )));
-        }
-        if enforced && name.starts_with("VerifiedAndReputable") {
-            // text: refuse_code_integrity-7
-            return Err(Error::Refused("Smart App Control is enforcing".to_owned()));
-        }
+    match remedy::code_integrity_refusal(policies) {
+        // text: refuse_code_integrity-6
+        Some(text) => Err(Error::Refused(text)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Finds Git where it installs for every account, refuses when anyone but the system's own class

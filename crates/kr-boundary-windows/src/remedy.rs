@@ -1187,6 +1187,95 @@ pub fn foreign_rules_refusal(ids: &[&str]) -> String {
     }
 }
 
+/// What the setup program says of Smart App Control's state value, or of its absence: nothing for
+/// the value 0 (off). The values 1 and 2 are on and evaluating, which is the state's own meaning; a
+/// value outside those three is one that the setup program does not know, and it is refused as
+/// that, with the value. `None` is a key or a value that is not there.
+#[must_use]
+// text: smart_app_control_refusal
+pub fn smart_app_control_refusal(state: Option<u32>) -> Option<String> {
+    match state {
+        Some(0) => None,
+        Some(on @ (1 | 2)) => Some(format!(
+            "Smart App Control is on or evaluating on this computer (state {on})"
+        )),
+        Some(other) => Some(format!(
+            "Smart App Control's state value is {other}, which the setup program does not know"
+        )),
+        None => Some(
+            "Smart App Control's state could not be found where the system keeps it: the CI policy key, or its VerifiedAndReputablePolicyState value, is not there".to_owned(),
+        ),
+    }
+}
+
+/// How a field of the code-integrity listing is said not to be what the setup program reads: it is
+/// not there, or it is something else, with what it is.
+fn field_not_understood(entry: &serde_json::Value, field: &str, expected: &str) -> String {
+    let found = match entry.get(field) {
+        None => "is missing".to_owned(),
+        Some(value) => {
+            let shown = value.to_string();
+            let shown = if shown.chars().count() > 60 {
+                format!("{}...", shown.chars().take(60).collect::<String>())
+            } else {
+                shown
+            };
+            format!("is {shown}, not {expected}")
+        }
+    };
+    format!(
+        "an entry of the code-integrity policy listing has a value that the setup program does not understand: its {field} {found}"
+    )
+}
+
+/// What the setup program says of the code-integrity policies that the listing holds, or nothing
+/// where each is the system's own and none is Smart App Control's enforcing policy. Each entry
+/// needs its `IsSystemPolicy` and, for a system policy, its `FriendlyName`, and for Smart App
+/// Control's (a name that starts with `VerifiedAndReputable`) its `IsEnforced`, each as the type
+/// that it has in the listing. An entry without one, or with another type, is refused as one that
+/// the setup program does not understand, with the field and its value: no value stands in for one
+/// that is not there.
+#[must_use]
+// text: code_integrity_refusal
+pub fn code_integrity_refusal(policies: &[serde_json::Value]) -> Option<String> {
+    for entry in policies {
+        let Some(system) = entry
+            .get("IsSystemPolicy")
+            .and_then(serde_json::Value::as_bool)
+        else {
+            return Some(field_not_understood(
+                entry,
+                "IsSystemPolicy",
+                "true or false",
+            ));
+        };
+        let name = entry
+            .get("FriendlyName")
+            .and_then(serde_json::Value::as_str);
+        if !system {
+            return Some(match name {
+                Some(name) => {
+                    format!("a code-integrity policy beyond the system's is present: {name}")
+                }
+                None => "a code-integrity policy beyond the system's is present".to_owned(),
+            });
+        }
+        let Some(name) = name else {
+            return Some(field_not_understood(entry, "FriendlyName", "a name"));
+        };
+        if name.starts_with("VerifiedAndReputable") {
+            let Some(enforced) = entry.get("IsEnforced").and_then(serde_json::Value::as_bool)
+            else {
+                return Some(field_not_understood(entry, "IsEnforced", "true or false"));
+            };
+            if enforced {
+                return Some("Smart App Control is enforcing".to_owned());
+            }
+        }
+    }
+    None
+}
+
 /// The refusal for an effective application control policy that is not empty: the collections that
 /// it enforces and the collections that hold rules, as the read of the policy showed them, and
 /// what this run had already changed before it read the policy.

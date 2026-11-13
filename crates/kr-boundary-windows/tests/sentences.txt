@@ -134,15 +134,19 @@ refuse_when_controlled-1 | application control already holds rule(s) of this ins
 refuse_when_controlled-2 | the words of remedy::application_control_set | read: see application_control_set
 refuse_software_restriction-1 | a software restriction policy is set on this computer | read: registry key CodeIdentifiers has the DefaultLevel value
 refuse_software_restriction-2 | a software restriction policy holds rules on this computer | read: a Paths, Hashes or UrlZones key of a level has subkeys
-refuse_smart_app_control-1 | Smart App Control is on or evaluating on this computer (state N) | read: the VerifiedAndReputablePolicyState value is not 0 (documented: 1 on, 2 evaluation)
-refuse_smart_app_control-2 | Smart App Control's state could not be found where the system keeps it: the CI policy key, or its VerifiedAndReputablePolicyState value, is not there | read: registry::open of the key answered none, or the value's read answered none
+refuse_smart_app_control-1 | the words of remedy::smart_app_control_refusal | read: see smart_app_control_refusal; the VerifiedAndReputablePolicyState value or its absence
+smart_app_control_refusal | Smart App Control is on or evaluating on this computer (state N) | read: the VerifiedAndReputablePolicyState value is 1 or 2 (documented: 1 on, 2 evaluation)
+smart_app_control_refusal | Smart App Control's state value is N, which the setup program does not know | read: the value is a DWORD that is none of 0, 1 and 2
+smart_app_control_refusal | Smart App Control's state could not be found where the system keeps it: the CI policy key, or its VerifiedAndReputablePolicyState value, is not there | read: registry::open of the key answered none, or the value's read answered none
 refuse_code_integrity-1 | the code-integrity policies could not be listed (error) | read: the Windows directory or the trusted CiTool command could not be had, error printed
 refuse_code_integrity-2 | the code-integrity policies could not be listed (error) | read: starting CiTool returned an error, printed
 refuse_code_integrity-3 | the code-integrity policies could not be listed (status) | read: CiTool's exit status was not success
 refuse_code_integrity-4 | the code-integrity policies could not be read (error) | read: the JSON of CiTool's output did not parse
 refuse_code_integrity-5 | the code-integrity policies could not be read | read: the output has no Policies array
-refuse_code_integrity-6 | a code-integrity policy beyond the system's is present: N | read: an entry with IsSystemPolicy false
-refuse_code_integrity-7 | Smart App Control is enforcing | read: an entry that is enforced and named VerifiedAndReputable
+refuse_code_integrity-6 | the words of remedy::code_integrity_refusal | read: see code_integrity_refusal; CiTool's JSON entries
+code_integrity_refusal | a code-integrity policy beyond the system's is present: N | read: an entry whose IsSystemPolicy is the boolean false; N is its FriendlyName when it is a string
+code_integrity_refusal | an entry of the code-integrity policy listing has a value that the setup program does not understand: its F is missing (or is V, not T) | read: IsSystemPolicy missing or not a boolean; FriendlyName missing or not a string on a system policy; IsEnforced missing or not a boolean on a policy named VerifiedAndReputable...
+code_integrity_refusal | Smart App Control is enforcing | read: a system entry named VerifiedAndReputable... whose IsEnforced is the boolean true
 qualify_git-1 | the words of remedy::git_program_not_reached | read: see git_program_not_reached
 qualify_git-2 | the words of remedy::git_permissions_refusal, for a file | read: see git_permissions_refusal; acl::changeable_by_others returned the finding
 qualify_git-3 | the words of remedy::git_permissions_refusal, for a folder above the files | read: see git_permissions_refusal; acl::changeable_by_others (replacement only) returned the finding
