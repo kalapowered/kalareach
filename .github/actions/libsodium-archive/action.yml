@@ -74,8 +74,12 @@ runs:
         bash scripts/place-libsodium-archive.sh "$ARCHIVE_DIR"
         echo "SODIUM_DIST_DIR=$ARCHIVE_DIR" >> "$GITHUB_ENV"
 
+    # Whatever the placing step's result: a step that refuses leaves SODIUM_DIST_DIR unset, and a
+    # job that is already red still runs its later steps that name `!cancelled()`, which would
+    # have the crate's build script download an archive that no digest here has held. So this step
+    # stands after the placing step and runs after its failure too.
     - name: Close the route to libsodium's download host
-      if: runner.os == 'Windows'
+      if: ${{ always() && runner.os == 'Windows' }}
       shell: pwsh
       run: |
         Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n0.0.0.0 download.libsodium.org"
