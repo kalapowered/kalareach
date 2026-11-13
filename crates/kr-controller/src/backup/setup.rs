@@ -1194,7 +1194,7 @@ mod tests {
         let writer = AuthorisationKeyPair::generate().expect("a key");
         let owner = AuthorisationKeyPair::generate().expect("a key");
         let producer = StoredEnvelopeKeyPair::generate().expect("a key");
-        let prepare = |archive: u8| {
+        let params_for = |archive: u8| {
             kr_client::recovery::prepare_setup(&kr_client::recovery::SetupInputs {
                 origin: origin.as_str(),
                 archive_id: ArchiveId::new(Uuid::from_bytes([archive; 16])),
@@ -1206,8 +1206,8 @@ mod tests {
             .expect("a setup is prepared")
             .params
         };
-        let repeat = prepare(1);
-        let another_archive = prepare(2);
+        let repeat = params_for(1);
+        let another_archive = params_for(2);
         let record = SetupRecord {
             archive_id: repeat.archive_id,
             origin: origin.as_str().to_owned(),
