@@ -2988,10 +2988,19 @@ async fn a_mutation_told_not_shown_on_a_connection_the_host_did_not_withdraw_lea
     )
     .await;
     assert_eq!(told.code(), kr_protocol::error::ErrorCode::OutcomeUnknown);
-    eventually("the host is asked about the connection and answers", || {
-        (tells.listed.load(std::sync::atomic::Ordering::SeqCst) >= 1).then_some(())
-    })
-    .await;
+    // The host is asked one question at a time, and a signal raised while one is out is taken up
+    // after it ends. So a second question is asked only once the first has been answered and what
+    // the answer means has been done with the connection: the mutation is told again until the
+    // host has been asked twice, and what is asserted next is asserted after the first decision.
+    let environment_id = state.connection().expect("connected").environment_id();
+    let deadline = tokio::time::Instant::now() + WATCHDOG;
+    while tells.listed.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a second question to the host about the connection did not happen"
+        );
+        a_mutation_the_host_tells_as_not_shown(&first, &tells, environment_id).await;
+    }
     assert!(
         Arc::ptr_eq(&state.session().expect("connected"), &first),
         "the connection the host did not withdraw stays"
