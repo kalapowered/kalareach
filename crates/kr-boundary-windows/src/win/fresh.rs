@@ -16,15 +16,19 @@ use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
 use std::path::{Path, PathBuf};
 
-use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_OPEN, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+    FileRenameInformationEx, NtSetInformationFile,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    RtlNtStatusToDosError,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FILE_SHARE_READ, FileRenameInfoEx,
-    SetFileInformationByHandle,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use super::ffi;
 use super::sd::{self, OwnedSd, Principals, SdKind};
@@ -278,41 +282,48 @@ pub fn replace_whole(
 }
 
 /// Renames the file behind the handle to `name` in the directory that `directory` holds, over what
-/// is there, through the file's own handle. The platform reads the name relative to the directory
-/// handle in `RootDirectory` (a bare name with no directory handle is relative to the process's
-/// current directory), so no path names the directory.
+/// is there, through the file's own handle, with the native call (`NtSetInformationFile`, the
+/// extended rename class). The structure is the page's `FILE_RENAME_INFORMATION`: `Flags` replace
+/// and POSIX semantics, `RootDirectory` the directory's handle, `FileNameLength` the bytes of the
+/// name, and the name behind it; the buffer is the structure's size plus the name's bytes, as the
+/// page asks. The platform reads a name relative to the directory handle in `RootDirectory` and no
+/// path is resolved (the Win32 call refuses every root handle, and a bare name with no root handle is
+/// read relative to the process's current directory).
 fn rename_by_handle(handle: &ffi::Handle, directory: &ffi::Handle, name: &[u16]) -> io::Result<()> {
-    // The rename replaces a file that is there, and the name goes at once whatever else has it open.
-    const REPLACE_IF_EXISTS: u32 = 0x1;
-    const POSIX_SEMANTICS: u32 = 0x2;
-    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let size = header + name.len() * 2;
+    let name_bytes = name.len() * 2;
+    let size = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
     let mut buffer = vec![0_u64; size.div_ceil(8)];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: the buffer is aligned for the structure and large enough for it and the name, which is
-    // copied behind the header; nothing else points into it.
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: the buffer is zeroed, aligned for the structure and `size` bytes long, so the fixed
+    // fields are inside it and the name's bytes, copied behind `FileName`, end inside it; nothing
+    // else points into it until the call below.
     unsafe {
-        (*info).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS;
+        (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
         (*info).RootDirectory = directory.raw();
-        (*info).FileNameLength = (name.len() * 2) as u32;
+        (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
             (&raw mut (*info).FileName).cast::<u16>(),
             name.len(),
         );
     }
-    // SAFETY: the handle is open with the right to delete, and the buffer holds the structure that the
-    // class takes, of the size given.
-    if unsafe {
-        SetFileInformationByHandle(
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: the handle is open with the right to delete, the directory's handle is open, the
+    // buffer holds the structure that the class takes, of the size given, and the status block lives
+    // through the call.
+    let status = unsafe {
+        NtSetInformationFile(
             handle.raw(),
-            FileRenameInfoEx,
+            &raw mut status_block,
             buffer.as_ptr().cast(),
             size as u32,
+            FileRenameInformationEx,
         )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
+    };
+    if status < 0 {
+        // SAFETY: converts a status the platform just returned; it reads nothing else.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
     }
     Ok(())
 }
