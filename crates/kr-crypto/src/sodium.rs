@@ -815,6 +815,9 @@ fn check(code: std::os::raw::c_int, name: &'static str) -> Result<()> {
 }
 
 #[cfg(test)]
+mod known_answers;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
