@@ -577,9 +577,15 @@ impl ControlLost {
 /// when its connection's control stream is lost, whichever comes first.
 #[derive(Clone, Debug)]
 pub struct StreamHandle {
-    revoked: Arc<std::sync::atomic::AtomicBool>,
-    woken: Arc<tokio::sync::Notify>,
+    own: Arc<OwnRevocation>,
     connection: Arc<ControlLost>,
+}
+
+/// The revocation of one stream by itself: its flag and the waiters it wakes.
+#[derive(Debug, Default)]
+struct OwnRevocation {
+    revoked: std::sync::atomic::AtomicBool,
+    woken: tokio::sync::Notify,
 }
 
 impl Default for StreamHandle {
@@ -592,29 +598,29 @@ impl StreamHandle {
     /// A handle of a stream of the connection whose control stream's loss is `connection`.
     fn under(connection: Arc<ControlLost>) -> Self {
         Self {
-            revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            woken: Arc::new(tokio::sync::Notify::new()),
+            own: Arc::default(),
             connection,
         }
     }
 
     /// Marks the stream revoked and wakes everything waiting on it.
     pub fn revoke(&self) {
-        self.revoked
+        self.own
+            .revoked
             .store(true, std::sync::atomic::Ordering::Release);
-        self.woken.notify_waiters();
+        self.own.woken.notify_waiters();
     }
 
     /// Returns true once the stream has been revoked, or its connection's control stream is lost.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
-        self.revoked.load(std::sync::atomic::Ordering::Acquire) || self.connection.is_declared()
+        self.own.revoked.load(std::sync::atomic::Ordering::Acquire) || self.connection.is_declared()
     }
 
     /// Resolves as soon as the stream is revoked.
     pub async fn revoked(&self) {
         loop {
-            let waiting = self.woken.notified();
+            let waiting = self.own.woken.notified();
             let lost = self.connection.woken.notified();
             if self.is_revoked() {
                 return;
