@@ -2766,6 +2766,10 @@ mod tests {
     ///
     /// The other shells have their reader with the shell itself, and their entry says after the
     /// user's configuration that the hooks are live.
+    ///
+    /// KR-REQ-07.86, the part about the normal profile order: the person's startup file keeps every
+    /// line it had in the order it had them, with the entry after them all, and removing the entry
+    /// gives the file back byte for byte.
     #[test]
     fn the_entries_of_the_other_shells_go_last() {
         let root = tempfile::tempdir().expect("a directory");
@@ -3095,6 +3099,9 @@ mod tests {
     /// comment inside a `param` block, attributes stacked above it or on a line of their own, a tab
     /// after `using`, a `using module` whose hashtable runs over several lines, and a here-string
     /// holding a parenthesis. A fresh install and an entry moved from the end land in the same place.
+    ///
+    /// KR-REQ-07.86, the part about a PowerShell profile running exactly once: a real PowerShell
+    /// runs each statement of the profile once, in the order it had them, after the entry.
     #[cfg(unix)]
     #[test]
     #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
