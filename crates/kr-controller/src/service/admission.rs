@@ -576,7 +576,7 @@ impl Controller {
     ) -> Given<Result<T>> {
         #[cfg(feature = "testing")]
         self.after_the_retained_lookup.wait().await;
-        recorded.checked(|| self.check_retained_under(carried))
+        recorded.checked_or_reused(|| self.check_retained_under(carried))
     }
 
     /// What a claim or a lookup that found another attempt's record refuses with, given back only

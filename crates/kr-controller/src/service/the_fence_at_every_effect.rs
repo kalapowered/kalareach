@@ -2389,6 +2389,84 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
     );
 }
 
+/// KR-REQ-09.09, the authority part, at the local door: an agent-tool installation another attempt
+/// recorded is not shown to a late attempt while this host owes a fence it could not raise, and the
+/// conflict a reused identifier meets is the fence's own refusal, which says nothing was done. The
+/// control: with nothing owed the late attempt is given what the first was told, and the reused
+/// identifier is a conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_recorded_before_a_late_attempts_lookup_is_not_shown_at_the_door_while_a_fence_is_owed()
+ {
+    use kr_protocol::skill::{AgentTarget, AgentToolsParams, InstallScope};
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let project = tempfile::TempDir::new().expect("a project directory of this test's own");
+    let installing = |directory: &std::path::Path| {
+        mutation_of(
+            &temp,
+            Method::AgentToolsInstall,
+            ParamsValue::from_typed(&AgentToolsParams {
+                agent: AgentTarget::Codex,
+                scope: InstallScope::Project,
+                project_dir: Nullable::some(directory.display().to_string()),
+            })
+            .expect("encodes"),
+        )
+    };
+    // The door's future is large: it is kept off this case's own stack.
+    let at_the_door = |mutation: MutationRequest| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        Box::pin(async move {
+            told_now(
+                &controller,
+                connection_id,
+                &mutation,
+                controller.write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::AgentToolsInstall,
+                    connection_id,
+                    None,
+                    Some(accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                ),
+            )
+            .await
+        })
+    };
+    let mutation = installing(project.path());
+    let first = at_the_door(mutation.clone()).await;
+    assert!(
+        refusal(&first).is_none(),
+        "the first attempt installs: {first:?}"
+    );
+    assert_eq!(
+        at_the_door(mutation.clone()).await,
+        first,
+        "with nothing owed the late attempt is answered from the record"
+    );
+    let reused = MutationRequest {
+        action_id: mutation.action_id,
+        ..installing(&project.path().join("another"))
+    };
+    assert_eq!(
+        refusal(&at_the_door(reused.clone()).await)
+            .expect("a reused identifier is a conflict")
+            .code,
+        ErrorCode::IdConflict
+    );
+
+    controller.hold_fence(true);
+    let duplicate = at_the_door(mutation.clone()).await;
+    told_as_not_shown(refusal(&duplicate).expect("a duplicate under a fence is refused"));
+    let conflict = at_the_door(reused).await;
+    refused_for_a_fence(
+        refusal(&conflict).unwrap_or_else(|| panic!("the fence's own refusal: {conflict:?}")),
+    );
+    controller.hold_fence(false);
+}
+
 /// KR-REQ-09.09, the authority part: an agent-tool installation another attempt recorded after the
 /// local door's own lookup found nothing is not given back to a late attempt while this host owes a
 /// fence it could not raise, or to a connection whose registration was replaced after the revision
