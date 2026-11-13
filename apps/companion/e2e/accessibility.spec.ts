@@ -572,10 +572,12 @@ test.describe('a tap on the plain text near a link of a message', () => {
           expect(away.opened, 'links opened by a tap 18 px under the words, past the reach').toEqual([])
           expect(handlers(away.clicks), 'clicks that the page added past the reach').toEqual([])
         }
-        // Farther than the reach beside the words: the browser's click on the text, and nothing more.
-        const far = await tapAndRead(page, words.right + 22 + 12, words.y)
-        expect(far.opened, 'links opened by a tap 34 px after the words').toEqual([])
-        expect(handlers(far.clicks), 'clicks that the page added 34 px after the words').toEqual([])
+        // Farther than the reach beside the words and what the pane's edge gave back (the link starts the line, so the area
+        // keeps the least size on its right): the browser's click on the text, and nothing more.
+        const past = FINGER[surface] + 12
+        const far = await tapAndRead(page, words.right + past, words.y)
+        expect(far.opened, `links opened by a tap ${String(past)} px after the words`).toEqual([])
+        expect(handlers(far.clicks), `clicks that the page added ${String(past)} px after the words`).toEqual([])
       })
 
       test(`adds no link click for the second tap of a double tap on ${surface} at ${size} text size`, async ({ page, browserName }) => {
