@@ -1509,6 +1509,51 @@ pub fn folder_words(folder: &str, record: FolderRecord, read: Option<&FolderRead
     }
 }
 
+/// Whether the check after a removal holds an account or the service to "gone": only what this tree
+/// acted on. A rollback acts on an object that its own run made (the result `made`), and on nothing
+/// else; a step that read an object and left it alone (`left_alone`) did not act on it in either
+/// tree. What no step acted on is not the tree's leftover where it stands: it is named and is no
+/// failure.
+#[must_use]
+pub fn is_this_trees_to_remove(rollback: bool, outcome: Option<Outcome>, left_alone: bool) -> bool {
+    !left_alone && (!rollback || outcome == Some(Outcome::Made))
+}
+
+/// What the check after a removal read, in words, for the ending: each account that no account has
+/// the identifier or the name of (`accounts`), the sign-in list (`sign_in_clear` names the accounts
+/// whose value was read and found not there), the broker's service (`service_clear`), each object
+/// that stands and was left alone (`stands`, a clause each), and the program directory. A part is
+/// there only where a read held it.
+#[must_use]
+// text: residue_tail
+pub fn residue_tail(
+    accounts: &str,
+    sign_in_clear: &[String],
+    service_clear: bool,
+    stands: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    if !accounts.is_empty() {
+        parts.push(accounts.to_owned());
+    }
+    match sign_in_clear {
+        [] => {}
+        [one] => parts.push(format!("the sign-in list has no value for {one}")),
+        _ => parts.push("the sign-in list has no value for either name".to_owned()),
+    }
+    if service_clear {
+        parts.push("the broker's service is not there or is marked for deletion".to_owned());
+    }
+    parts.extend(stands.iter().cloned());
+    parts.push("the program directory is not there".to_owned());
+    let last = parts.pop().unwrap_or_default();
+    if parts.is_empty() {
+        last
+    } else {
+        format!("{}, and {last}", parts.join(", "))
+    }
+}
+
 /// Whether the program path of a service, as the service manager answers it, is the installation's
 /// broker: the path that the installation gives the service when it makes it, in quotation marks,
 /// compared without regard to the case of ASCII letters.
