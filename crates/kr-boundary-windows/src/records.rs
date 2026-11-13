@@ -344,16 +344,11 @@ pub struct Seen {
     pub run: bool,
 }
 
-/// Deletes the journal's files and the empty `run` and `journal` directories, in the directories
-/// that the inspection approved and in no other. A directory that it did not see and that is there
-/// now is left whole and named in the result: nothing opened it, so nothing in it was read.
-/// Returns each thing that stayed, with the reason; nothing when all is done.
-// text: finish_journal_and_run
-pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<String> {
-    let mut stayed = Vec::new();
-    if seen.journal
-        && let Ok(entries) = fs::read_dir(journal)
-    {
+/// Deletes the journal's files in the journal's directory where the directory was approved
+/// (`approved`), and in no other. They are the broker's own files, not objects of the run that made
+/// the directory; an entry that stays is found by the removal of the directory.
+pub fn delete_journal_files(journal: &Path, approved: bool) {
+    if approved && let Ok(entries) = fs::read_dir(journal) {
         #[expect(
             clippy::disallowed_methods,
             reason = "an entry that cannot be read is not deleted here: where it is still in the directory the removal of the directory below fails for it and the result names what stayed, and where it is gone by then that removal can succeed; the removal's own result decides"
@@ -364,6 +359,16 @@ pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<Str
             }
         }
     }
+}
+
+/// Deletes the journal's files and the empty `run` and `journal` directories, in the directories
+/// that the inspection approved and in no other. A directory that it did not see and that is there
+/// now is left whole and named in the result: nothing opened it, so nothing in it was read.
+/// Returns each thing that stayed, with the reason; nothing when all is done.
+// text: finish_journal_and_run
+pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<String> {
+    let mut stayed = Vec::new();
+    delete_journal_files(journal, seen.journal);
     for (directory, approved) in [(run, seen.run), (journal, seen.journal)] {
         if !approved {
             stayed.extend(looked_at_again(directory));
