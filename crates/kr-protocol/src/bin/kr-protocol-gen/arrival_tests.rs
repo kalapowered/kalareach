@@ -774,26 +774,49 @@ fn branch_keys_cannot_collide_for_both_comparisons() {
     }
 }
 
-/// What the level comparison reports for the `Method` definition going from `old` to `new`, each
-/// a list of branches that are plain string constants named by `Method`'s own `oneOf` form.
-fn method_lines(old: &[Value], new: &[Value]) -> Vec<String> {
-    let schema = |branches: &[Value]| json!({ "$defs": { "Method": { "oneOf": branches } } });
+/// What the level comparison reports for the whole schemas `old` and `new`.
+fn level_lines(old: &Value, new: &Value) -> Vec<String> {
     crate::public_contract::compare_for_a_level(
-        &schema(old),
-        &schema(new),
+        old,
+        new,
         &|| Ok(std::collections::BTreeSet::new()),
         &mut Vec::new(),
     )
     .expect("compares")
 }
 
+/// What the level comparison reports for a schema whose only definition is `Method`, going from
+/// `old` to `new`, each given whole.
+fn method_definition_lines(old: &Value, new: &Value) -> Vec<String> {
+    level_lines(
+        &json!({ "$defs": { "Method": old } }),
+        &json!({ "$defs": { "Method": new } }),
+    )
+}
+
+/// What the level comparison reports for the `Method` definition going from `old` to `new`, each
+/// a list of branches that is the definition's `oneOf` and nothing else.
+fn method_lines(old: &[Value], new: &[Value]) -> Vec<String> {
+    method_definition_lines(&json!({ "oneOf": old }), &json!({ "oneOf": new }))
+}
+
+/// A branch of `Method` as every committed one is: a plain text constant.
+fn method(name: &str) -> Value {
+    json!({ "const": name, "type": "string" })
+}
+
+/// The line that a new method gives.
+fn added(name: &str) -> String {
+    format!("Method#const:{name} added: a variant")
+}
+
 /// The label of a branch that repeats the text of an earlier branch of its choice cannot be the
-/// label of any other branch: a method named like that branch's old label is a new method, and the
-/// repeated branch, which makes `oneOf` refuse the method it repeats, is a difference. The pair is
-/// the one that the label `text@number` joined, in both orders of its last two branches.
+/// label of any other branch: the repeated branch, which makes `oneOf` refuse the method it
+/// repeats, is a difference, and a method with a name like its label is not one that passes. The
+/// pair is the one that the label `text@number` joined, in both orders of its last two branches.
+/// A name with an `@` is no method's name, so the method of that pair is a difference too.
 #[test]
 fn a_repeated_branch_cannot_pass_as_a_new_method_by_its_label() {
-    let method = |name: &str| json!({ "const": name, "type": "string" });
     for new in [
         [method("x"), method("x"), method("x@1")],
         [method("x"), method("x@1"), method("x")],
@@ -801,28 +824,32 @@ fn a_repeated_branch_cannot_pass_as_a_new_method_by_its_label() {
         let lines = method_lines(&[method("x")], &new);
         assert_eq!(
             lines,
-            vec!["Method#1@const:x added: a variant".to_owned()],
+            vec!["Method#1@const:x added: a variant".to_owned(), added("x@1")],
             "{new:?}"
         );
     }
-    // Plain additions still pass, a method named like a label among them.
+    // Plain additions still pass.
     assert!(method_lines(&[method("x")], &[method("x"), method("y")]).is_empty());
-    assert!(method_lines(&[method("x")], &[method("x"), method("x@1")]).is_empty());
-    // A branch that repeats the text of an earlier one is not a new method even when no other
-    // branch names it as a string: the integer constant 5 and the text "5" have one text.
+    // A method named like a label is no method: its name has no shape that a method's name has.
+    assert_eq!(
+        method_lines(&[method("x")], &[method("x"), method("x@1")]),
+        vec![added("x@1")]
+    );
+    // The integer constant 5 and the text "5" are two branches of two keys. The old schema accepts
+    // the number 5 and refuses the text; the new one accepts both. The definition lists a constant
+    // that is not a text, so no line under it passes.
     let lines = method_lines(
         &[json!({ "const": 5 })],
         &[json!({ "const": 5 }), method("5")],
     );
-    assert_eq!(lines, vec!["Method#1@const:5 added: a variant".to_owned()]);
+    assert_eq!(lines, vec![added("5")]);
 }
 
 /// A branch of a list nested in a branch of `Method` can have the label of a method named like
-/// that label: a label with a `#` in the name is no method's, so neither the nested addition nor
-/// the method passes, in either direction of the change.
+/// that label: the definition has a branch that is more than a text constant, so no line under it
+/// passes, in either direction of the change.
 #[test]
 fn a_nested_branch_cannot_pass_as_a_new_method_by_its_label() {
-    let method = |name: &str| json!({ "const": name, "type": "string" });
     let nested = |name: &str, inner: Value| {
         let mut branch = method(name);
         branch["oneOf"] = inner;
@@ -830,8 +857,7 @@ fn a_nested_branch_cannot_pass_as_a_new_method_by_its_label() {
     };
     let string = || json!({ "type": "string" });
     for (old, new, line) in [
-        // The Codex section's pair: the inner list repeats its branch, and a method has the
-        // label of that second branch.
+        // The inner list repeats its branch, and a method has the label of that second branch.
         (
             vec![nested("x", json!([method("x")]))],
             vec![
@@ -840,7 +866,8 @@ fn a_nested_branch_cannot_pass_as_a_new_method_by_its_label() {
             ],
             "Method#const:x#1@const:x added: a variant",
         ),
-        // The Claude section's pair, and its opposite direction.
+        // The inner list gains a branch of a text that a method has the label of, and the
+        // opposite direction.
         (
             vec![nested("A", json!([string()]))],
             vec![
@@ -873,6 +900,338 @@ fn a_nested_branch_cannot_pass_as_a_new_method_by_its_label() {
     );
 }
 
+/// Other lists have the place `Method` as its `oneOf` has: its `anyOf` and the inner list of a
+/// nullable pair. A branch of one of them gives the line of a new method, so the line of a new
+/// method passes only where `Method` is a `oneOf` list and nothing else in both schemas; none of
+/// these does.
+#[test]
+fn a_list_of_another_keyword_at_the_place_of_method_does_not_pass_as_a_new_method() {
+    let integer = || json!({ "type": "integer" });
+    let nothing = || json!({ "type": "null" });
+    let five = "Method#value:5 added: a variant".to_owned();
+    for (old, new) in [
+        // The inner list of a nullable pair. The old schema accepts the number 5; the new one
+        // refuses it, because both branches of the inner list match it.
+        (
+            json!({ "oneOf": [integer()], "anyOf": [{ "oneOf": [integer()] }, nothing()] }),
+            json!({
+                "oneOf": [integer(), method("5")],
+                "anyOf": [{ "oneOf": [integer(), { "const": 5 }] }, nothing()],
+            }),
+        ),
+        // A direct `anyOf`. The old schema refuses the number 5; the new one accepts it, beside
+        // the text "5" that it adds.
+        (
+            json!({ "oneOf": [integer()], "anyOf": [{ "const": 0 }, { "type": "string" }] }),
+            json!({
+                "oneOf": [integer(), method("5")],
+                "anyOf": [{ "const": 0 }, { "type": "string" }, { "const": 5 }],
+            }),
+        ),
+        // The same with a text before it. The old schema accepts only "a"; the new one accepts
+        // "a" and the number 5, and refuses the text "5".
+        (
+            json!({ "oneOf": [method("a"), integer()], "anyOf": [{ "const": "a" }] }),
+            json!({
+                "oneOf": [method("a"), integer(), method("5")],
+                "anyOf": [{ "const": "a" }, { "const": 5 }],
+            }),
+        ),
+    ] {
+        assert_eq!(
+            method_definition_lines(&old, &new),
+            vec![added("5"), five.clone()],
+            "{new}"
+        );
+    }
+}
+
+/// A reference that moves from `Method` to a new definition is compared with the old `Method`
+/// under its name, so a branch of the new definition has the place `Method` too. Its constant is
+/// the number 5, `true`, `false` or `null`, and the line it gives is not the line of the text of
+/// the same name: the old schema accepted "a" at `Request.method`, the new one accepts "a" and the
+/// constant. The text of that name is a method that passes where `Method` stands alone.
+#[test]
+fn a_definition_that_a_reference_moves_to_does_not_give_the_line_of_a_new_method() {
+    for (name, constant) in [
+        ("5", json!(5)),
+        ("true", json!(true)),
+        ("false", json!(false)),
+        ("null", json!(null)),
+    ] {
+        let old = json!({ "$defs": {
+            "Method": { "oneOf": [method("a")] },
+            "Request": { "type": "object", "properties": {
+                "method": { "$ref": "#/$defs/Method" },
+            } },
+        } });
+        let new = json!({ "$defs": {
+            "Method": { "oneOf": [method("a"), method(name)] },
+            "Code": { "oneOf": [method("a"), { "const": constant }] },
+            "Request": { "type": "object", "properties": {
+                "method": { "$ref": "#/$defs/Code" },
+            } },
+        } });
+        assert_eq!(
+            level_lines(&old, &new),
+            vec![format!("Method#value:{constant} added: a variant")],
+            "{name}"
+        );
+        assert!(
+            method_lines(&[method("a")], &[method("a"), method(name)]).is_empty(),
+            "{name}"
+        );
+    }
+    // A branch of the new definition that is a text constant, and a name that `Method` does not
+    // add, is a difference: `Request.method` now accepts "b".
+    let old = json!({ "$defs": {
+        "Method": { "oneOf": [method("a")] },
+        "Request": { "type": "object", "properties": { "method": { "$ref": "#/$defs/Method" } } },
+    } });
+    let new = json!({ "$defs": {
+        "Method": { "oneOf": [method("a"), method("c")] },
+        "Code": { "oneOf": [method("a"), method("b")] },
+        "Request": { "type": "object", "properties": { "method": { "$ref": "#/$defs/Code" } } },
+    } });
+    assert_eq!(level_lines(&old, &new), vec![added("b")]);
+    // A line of another kind with a method's label is no new method: a member added to the branch
+    // "x" of the new definition has the label of the method "x.b", which `Method` adds.
+    let mut with_member = method("x");
+    with_member["properties"] = json!({ "b": { "type": "string" } });
+    let old = json!({ "$defs": {
+        "Method": { "oneOf": [method("x")] },
+        "Request": { "type": "object", "properties": { "method": { "$ref": "#/$defs/Method" } } },
+    } });
+    let new = json!({ "$defs": {
+        "Method": { "oneOf": [method("x"), method("x.b")] },
+        "Code": { "oneOf": [with_member] },
+        "Request": { "type": "object", "properties": { "method": { "$ref": "#/$defs/Code" } } },
+    } });
+    assert_eq!(
+        level_lines(&old, &new),
+        vec!["Method#const:x.b added: a member".to_owned()]
+    );
+}
+
+/// The definition is the list of plain text constants that the rule is written for in both
+/// schemas, or no line under it passes. A branch that is not a constant (a name now matches two
+/// branches, so `oneOf` refuses a name the old schema accepted), a constant that is not a text, a
+/// branch that says more than its name, and a keyword beside `oneOf` each make the definition
+/// accept something other than its names, in the old list, in the new one, or in both.
+#[test]
+fn a_definition_that_is_not_a_list_of_plain_text_constants_passes_no_line() {
+    let b = added("b");
+    let odd = [
+        // Not a constant: "b" matches this branch and its own, so the new `oneOf` refuses "b",
+        // which the old list accepted.
+        json!({ "type": "string" }),
+        // Not a text: the list accepts the number 5, which no name of it says.
+        json!({ "const": 5 }),
+        // No `type`: no value changes; it is not the plain text constant that the rule is for.
+        json!({ "const": "c" }),
+        // Another `type`: no value changes ("c" is not an integer, so the branch accepts nothing).
+        json!({ "const": "c", "type": "integer" }),
+        // More than its name: the branch refuses its own name "c", which a plain one accepts.
+        json!({ "const": "c", "type": "string", "maxLength": 0 }),
+        // A choice inside: "c" matches the inner branch once and the outer constant once, so no
+        // value changes here, but the label of an inner branch can be a method's.
+        json!({ "const": "c", "type": "string", "oneOf": [{ "type": "string" }] }),
+        // An annotation that is not a text decides nothing, and is no annotation of the rule.
+        json!({ "const": "c", "type": "string", "description": { "const": 1 } }),
+    ];
+    for branch in &odd {
+        // In both lists: the line of "b" stays, and nothing else is reported.
+        let lines = method_lines(
+            &[method("a"), branch.clone()],
+            &[method("a"), branch.clone(), method("b")],
+        );
+        assert_eq!(lines, vec![b.clone()], "in both: {branch}");
+        // In the old list only, and in the new list only: the line of "b" stays.
+        let lines = method_lines(&[method("a"), branch.clone()], &[method("a"), method("b")]);
+        assert!(lines.contains(&b), "in the old list: {branch}: {lines:?}");
+        let lines = method_lines(&[method("a")], &[method("a"), branch.clone(), method("b")]);
+        assert!(lines.contains(&b), "in the new list: {branch}: {lines:?}");
+    }
+    // A keyword beside `oneOf` in the definition: the old and the new schema, each alone or both.
+    for (keyword, value) in [
+        // No value changes: every branch is a string already.
+        ("type", json!("string")),
+        // The schema that has it refuses every text, "a" included, which the other one accepts.
+        ("maxLength", json!(0)),
+        // The schema that has it refuses "a", which the other one accepts.
+        ("not", json!({ "const": "a" })),
+        // An annotation that is not a text: no value changes.
+        ("description", json!({ "const": 1 })),
+        // A list at the place `Method`, so a branch of it can give the line of a method.
+        ("anyOf", json!([{ "const": "a" }])),
+    ] {
+        let list = |names: &[&str]| -> Value {
+            json!({ "oneOf": names.iter().map(|name| method(name)).collect::<Vec<_>>() })
+        };
+        let with = |names: &[&str]| {
+            let mut definition = list(names);
+            definition[keyword] = value.clone();
+            definition
+        };
+        let lines = method_definition_lines(&with(&["a"]), &with(&["a", "b"]));
+        assert_eq!(lines, vec![b.clone()], "in both: {keyword}");
+        let lines = method_definition_lines(&list(&["a"]), &with(&["a", "b"]));
+        assert!(lines.contains(&b), "in the new: {keyword}: {lines:?}");
+        let lines = method_definition_lines(&with(&["a"]), &list(&["a", "b"]));
+        assert!(lines.contains(&b), "in the old: {keyword}: {lines:?}");
+    }
+}
+
+/// A name that has not the shape of a method's name (lower-case letters, digits and underscores in
+/// words, with single dots between) is no new method, whether it is the line's name or any other
+/// name of the old list or the new one: the definition is then not the list the rule is for. In
+/// each case the new schema accepts a text that the old one refuses, which no method's name says;
+/// `a#b`, `a[0]`, `a{}` and `x@1` are also the labels that a nested or numbered branch has.
+#[test]
+fn a_name_that_is_not_the_shape_of_a_methods_is_no_new_method() {
+    for name in [
+        "Host.info",
+        "a#b",
+        "a..b",
+        ".a",
+        "a.",
+        "",
+        "a b",
+        "a-b",
+        "a[0]",
+        "a{}",
+        "x@1",
+        "a:b",
+        "é",
+    ] {
+        assert_eq!(
+            method_lines(&[method("a")], &[method("a"), method(name)]),
+            vec![added(name)],
+            "{name:?}"
+        );
+        // In the new list beside a name that is an addition of the right shape: both are kept.
+        let lines = method_lines(&[method("a")], &[method("a"), method(name), method("c")]);
+        assert!(lines.contains(&added("c")), "{name:?}: {lines:?}");
+        // In both lists, beside a name that is an addition of the right shape.
+        let lines = method_lines(
+            &[method("a"), method(name)],
+            &[method("a"), method(name), method("c")],
+        );
+        assert_eq!(lines, vec![added("c")], "{name:?}");
+    }
+    // Names of the shape: letters, digits and underscores in words, with single dots between.
+    for name in [
+        "b",
+        "a.b",
+        "a_b",
+        "b2",
+        "a.1",
+        "1",
+        "session.read.all",
+        "true",
+        "null",
+    ] {
+        assert!(
+            method_lines(&[method("a")], &[method("a"), method(name)]).is_empty(),
+            "{name:?}"
+        );
+    }
+}
+
+/// The names of the old list are all in the new list, and each name stands once in its list. A
+/// method that goes beside one that arrives is a difference, so a new method does not pass there:
+/// the old schema accepted "b". A name twice in the old list or in the new list leaves the new
+/// method as a difference: "a" is refused by `oneOf` in the list that holds it twice.
+#[test]
+fn a_new_method_passes_only_beside_the_old_names_each_once() {
+    // "b" goes and "c" arrives.
+    assert_eq!(
+        method_lines(&[method("a"), method("b")], &[method("a"), method("c")]),
+        vec!["Method#const:b removed: a variant".to_owned(), added("c")]
+    );
+    // A name twice in the old list, and in the new list.
+    let lines = method_lines(
+        &[method("a"), method("a")],
+        &[method("a"), method("a"), method("b")],
+    );
+    assert_eq!(lines, vec![added("b")]);
+    let lines = method_lines(&[method("a")], &[method("a"), method("b"), method("b")]);
+    assert_eq!(
+        lines,
+        vec!["Method#1@const:b added: a variant".to_owned(), added("b")]
+    );
+}
+
+/// One new method, several at once, and a new method beside changed descriptions and titles of the
+/// definition and of old branches pass, in any order of the list: the annotations decide nothing.
+#[test]
+fn a_new_method_beside_a_changed_description_passes() {
+    assert!(method_lines(&[method("a")], &[method("a"), method("b")]).is_empty());
+    assert!(
+        method_lines(
+            &[method("a.b")],
+            &[
+                method("a.b"),
+                method("c_d.e2"),
+                method("f"),
+                method("session.read.all"),
+                method("9"),
+            ]
+        )
+        .is_empty()
+    );
+    let described = |name: &str, text: &str| {
+        let mut branch = method(name);
+        branch["description"] = json!(text);
+        branch
+    };
+    let old = json!({ "description": "the methods", "oneOf": [described("a", "the first")] });
+    let mut titled = described("b", "the new one");
+    titled["title"] = json!("B");
+    let new = json!({
+        "description": "all the methods",
+        "title": "Method",
+        "oneOf": [titled, described("a", "the first, said again")],
+    });
+    assert!(method_definition_lines(&old, &new).is_empty());
+}
+
+/// The head's own `Method` is the list that the rule is written for, so the rule is in force for
+/// the real definition: with its last name left out of the earlier schema, that name is a new
+/// method that passes; a name of another shape added to the head's list does not.
+#[test]
+fn the_committed_method_is_a_list_of_plain_method_names_and_a_new_one_passes() {
+    let head = committed("packages/protocol/schema/kalareach-protocol.schema.json");
+    let branches = head["$defs"]["Method"]["oneOf"].as_array().expect("a list");
+    assert!(!branches.is_empty());
+    let mut seen = std::collections::BTreeSet::new();
+    for branch in branches {
+        let name = branch["const"].as_str().expect("a text constant");
+        let words_are_plain = |word: &str| {
+            !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        assert!(name.split('.').all(words_are_plain), "{name}");
+        assert_eq!(branch["type"], json!("string"), "{name}");
+        assert!(seen.insert(name), "{name} stands once");
+    }
+    let mut earlier = head.clone();
+    let last = earlier["$defs"]["Method"]["oneOf"]
+        .as_array_mut()
+        .expect("a list")
+        .pop()
+        .expect("a branch");
+    assert_eq!(level_lines(&earlier, &head), Vec::<String>::new(), "{last}");
+    let mut grown = head.clone();
+    grown["$defs"]["Method"]["oneOf"]
+        .as_array_mut()
+        .expect("a list")
+        .push(method("Not.a.method"));
+    assert_eq!(level_lines(&head, &grown), vec![added("Not.a.method")]);
+}
+
 /// Two equal branches are told apart by their number, and a third branch that differs is reported
 /// by its own key, for both comparisons.
 #[test]
@@ -884,7 +1243,7 @@ fn equal_branches_beside_one_that_differs_compare_by_number() {
         { "const": {}, "maxLength": 5 },
         { "type": "string", "maxLength": 100 },
     ] });
-    for (position, key) in [(0, "const:{}"), (1, "1@const:{}"), (2, "type:string")] {
+    for (position, key) in [(0, "value:{}"), (1, "1@value:{}"), (2, "type:string")] {
         let mut new = old.clone();
         new["$defs"]["Route"]["properties"]["choice"]["anyOf"][position]["maxLength"] = json!(0);
         let wanted = vec![format!("Route.choice#{key} changed: maxLength")];

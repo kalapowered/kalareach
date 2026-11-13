@@ -36,7 +36,7 @@
 //! It fails closed in both states when it cannot read what it compares: origin's tags, a release's
 //! schema, the record of the freeze.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use kr_protocol::retained::{Difference, DifferenceKind, differences};
@@ -130,54 +130,79 @@ pub fn compare(old: &Value, new: &Value) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// The method names the `Method` definition of `schema` lists as plain string constants, each with
-/// how many branches name it.
-fn method_names(schema: &Value) -> BTreeMap<String, usize> {
-    let mut names = BTreeMap::new();
-    for branch in schema["$defs"]["Method"]["oneOf"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
-        if let Some(name) = branch.get("const").and_then(Value::as_str) {
-            *names.entry(name.to_owned()).or_insert(0) += 1;
-        }
-    }
-    names
+/// Whether `name` has the shape of a method's name: words of lower-case letters, digits and
+/// underscores, with single dots between.
+fn is_a_method_name(name: &str) -> bool {
+    name.split('.').all(|word| {
+        !word.is_empty()
+            && word
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
 }
 
-/// Whether `difference` is one new method: a branch of `Method` that is only a string constant,
-/// whose name no branch of the earlier schema had and that no other branch of the new one has.
-/// Another addition under `Method`, a second branch with a name it already had, and a branch that
-/// says more than its name are not.
+/// Whether `keyword` with `value` only describes a schema to its reader and decides nothing: a
+/// `description` or a `title` that is a text, which is what the comparer leaves out.
+fn is_an_annotation(keyword: &str, value: &Value) -> bool {
+    matches!(keyword, "description" | "title") && value.is_string()
+}
+
+/// The names that the `Method` definition of `schema` accepts, when it is the definition that the
+/// rule for a new method is written for, and none otherwise. That is a `oneOf` list and nothing
+/// else (annotations aside), every branch of it a plain text constant (`const` a text, `type`
+/// "string", annotations aside), every name in the shape of a method's name and every name once.
+/// Such a definition accepts exactly its names. Any other shape accepts something that its names
+/// do not say, or has names that the rule cannot read.
+fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
+    let definition = schema["$defs"]["Method"].as_object()?;
+    if !definition
+        .iter()
+        .all(|(keyword, value)| keyword == "oneOf" || is_an_annotation(keyword, value))
+    {
+        return None;
+    }
+    let mut names = BTreeSet::new();
+    for branch in definition.get("oneOf")?.as_array()? {
+        let branch = branch.as_object()?;
+        if !branch.iter().all(|(keyword, value)| {
+            matches!(keyword.as_str(), "const" | "type") || is_an_annotation(keyword, value)
+        }) {
+            return None;
+        }
+        let name = branch.get("const")?.as_str()?;
+        if branch.get("type")?.as_str()? != "string" {
+            return None;
+        }
+        if !is_a_method_name(name) || !names.insert(name) {
+            return None;
+        }
+    }
+    Some(names)
+}
+
+/// Whether `difference` is one new method: the addition of a variant that `Method` gains, where
+/// `Method` is in both schemas the list of plain text constants that [`plain_method_names`]
+/// describes, every name of the earlier list is in the new one, and the line is about a name that
+/// the new list adds. The rule is then the difference of two sets of names, and the definition
+/// accepts exactly the names that the new list has over the earlier one.
+///
+/// The label of a line says where it is and not which list it came from: other lists have the
+/// place `Method` as its `oneOf` does (its `anyOf`, the inner list of a nullable pair, a
+/// definition that an old reference to `Method` is compared with), and two lines of them can be
+/// one. So the label only says which name the line is about, and the shape of the definition
+/// decides. Where the shape does not hold, no line under `Method` passes, and each is reported as
+/// it is.
 fn is_an_added_method(old: &Value, new: &Value, difference: &Difference) -> bool {
     if difference.kind != DifferenceKind::Added || difference.detail != "a variant" {
         return false;
     }
-    // A method comes directly from `Method`'s `oneOf`, so its label has the one `#` that follows
-    // `Method`: a rest that holds `#`, `[` or `{` is a branch nested in a branch, or a label made by
-    // a number, and is no method's name.
-    let Some(name) = difference
-        .at
-        .strip_prefix("Method#const:")
-        .filter(|name| !name.contains(['#', '[', '{']))
-    else {
+    let Some(name) = difference.at.strip_prefix("Method#const:") else {
         return false;
     };
-    let plain = new["$defs"]["Method"]["oneOf"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|branch| branch.get("const").and_then(Value::as_str) == Some(name))
-        .all(|branch| {
-            branch.get("type").and_then(Value::as_str) == Some("string")
-                && branch.as_object().is_some_and(|members| {
-                    members.keys().all(|key| {
-                        ["const", "type", "description", "title"].contains(&key.as_str())
-                    })
-                })
-        });
-    plain && method_names(new).get(name) == Some(&1) && !method_names(old).contains_key(name)
+    let (Some(before), Some(after)) = (plain_method_names(old), plain_method_names(new)) else {
+        return false;
+    };
+    before.is_subset(&after) && after.difference(&before).any(|added| *added == name)
 }
 
 /// The name of the member that `difference` adds directly to the configuration document: the only
@@ -255,7 +280,8 @@ fn is_a_new_section(
 /// level. A method a daemon serves keeps the level, because a host of the same level answers a
 /// method it does not list with `PERMISSION_DENIED` and a client that meets that refusal for a
 /// method that is new tells it from a lack of rights, so a new variant of `Method` is not a
-/// difference here. It is one for `--public-contract`, which reports it.
+/// difference here, where `Method` is a list of plain text constants in both schemas (see
+/// `is_an_added_method`). It is one for `--public-contract`, which reports it.
 ///
 /// A new section of the configuration document passes too, where `sections` (called once, and only
 /// when the schemas differ by a member added to the document) names it: the sections the build

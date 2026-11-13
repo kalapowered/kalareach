@@ -545,17 +545,16 @@ fn nullable(branches: &[Value]) -> Option<&Value> {
     }
 }
 
-/// What tells one branch of a choice from the others: a text constant, a reference, the one key of
-/// a variant carried by name, the constant member of a variant carried with a tag, or else the
-/// names of its members.
+/// What tells one branch of a choice from the others: a text constant (`const:` and the text), a
+/// constant that is not a text (`value:` and its JSON text, so that the number 5 and the text "5"
+/// are two branches), a reference, the one key of a variant carried by name, the constant member
+/// of a variant carried with a tag, or else the names of its members.
 fn head(branch: &Value) -> String {
     if let Some(constant) = branch.get("const") {
-        return format!(
-            "const:{}",
-            constant
-                .as_str()
-                .map_or_else(|| constant.to_string(), str::to_owned)
-        );
+        return match constant.as_str() {
+            Some(text) => format!("const:{text}"),
+            None => format!("value:{constant}"),
+        };
     }
     if let Some(name) = reference_of(branch) {
         return format!("ref:{name}");
@@ -593,12 +592,18 @@ type BranchKey = (String, usize);
 /// How a place names a branch it passes through, for a reader and for every rule that reads a
 /// place: `place#text` for the first branch of a text, and `place#number@text` for a later one.
 /// Every text [`head`] gives begins with a letter, so the number, which begins with a digit, comes
-/// before the text: no text can take the form of a later branch's label, a later branch's label is
-/// never the label of a branch whose text is a constant that looks like it, and two branches of one
-/// list have one label only when they have one key. Branches of lists nested in one another can
-/// share a label, since a text can hold a `#`: a rule that decides by a label reads only the
-/// labels that it can tell by their shape (`is_an_added_method` in `public_contract.rs` takes a
-/// name with no `#` in it, which only a branch of the choice itself has).
+/// before the text: no text can take the form of a later branch's label, and two branches of one
+/// list have one label only when they have one key.
+///
+/// A label says where a difference is and not which list it came from. Several lists have one
+/// place: a definition's `oneOf` and its `anyOf`; the lists of the one schema of a nullable pair,
+/// which adds no part to the place; a definition that an old reference is compared with, whose
+/// place is the old reference's name; and what stands beside a reference. Branches of lists nested
+/// in one another can share a label too, since a text can hold a `#`. Two differences of different
+/// lists can be one line, of which the comparison keeps one. So a rule that excuses a line never
+/// decides by its label alone: it decides by the shape of the definition that the label names
+/// (`is_an_added_method` in `public_contract.rs` reads the whole of `Method`), and the label only
+/// says which branch the line is about.
 fn branch_label(place: &str, (text, number): &BranchKey) -> String {
     if *number == 0 {
         format!("{place}#{text}")
@@ -1007,7 +1012,37 @@ mod tests {
             found.get(&("const:{}@2".to_owned(), 0)),
             Some(&&branches[0])
         );
-        assert_eq!(found.get(&("const:{}".to_owned(), 1)), Some(&&branches[2]));
+        assert_eq!(found.get(&("value:{}".to_owned(), 1)), Some(&&branches[2]));
+    }
+
+    /// A constant that is not a text has a text of its own, which no text constant has: the number
+    /// 5 and the text "5", `true` and the text "true", `null` and the text "null", an array and
+    /// the text of its JSON, an object and the text of its JSON are branches of two keys. A schema
+    /// that accepts the number 5 is never taken for one that accepts the text "5".
+    #[test]
+    fn a_constant_that_is_not_a_text_has_a_text_that_no_text_constant_has() {
+        for (text, constant) in [
+            ("5", json!(5)),
+            ("true", json!(true)),
+            ("null", json!(null)),
+            ("[1]", json!([1])),
+            (r#"{"a":1}"#, json!({ "a": 1 })),
+        ] {
+            let (of_text, of_constant) = (
+                head(&json!({ "const": text })),
+                head(&json!({ "const": constant })),
+            );
+            assert_eq!(of_text, format!("const:{text}"));
+            assert_ne!(of_text, of_constant, "{text}");
+        }
+        assert_eq!(head(&json!({ "const": 5 })), "value:5");
+        assert_eq!(head(&json!({ "const": "5" })), "const:5");
+        // A text constant that begins like the other form is still a text constant.
+        assert_eq!(head(&json!({ "const": "value:5" })), "const:value:5");
+        assert_ne!(
+            head(&json!({ "const": "value:5" })),
+            head(&json!({ "const": 5 }))
+        );
     }
 
     /// Every text [`head`] gives begins with a letter, whatever the branch holds (a constant or a
@@ -1020,6 +1055,8 @@ mod tests {
             json!({ "const": 5 }),
             json!({ "const": "1@x" }),
             json!({ "const": null }),
+            json!({ "const": true }),
+            json!({ "const": [1] }),
             json!({ "const": { "1": 2 } }),
             json!({ "$ref": "#/$defs/7" }),
             json!({ "properties": { "1": { "const": "2" } } }),

@@ -26,8 +26,10 @@
 //!   section of the host configuration document, a stored file read by level, which the build
 //!   lists above the level the earlier release's stored-format lock records (the run says each
 //!   section it passes, because the comparison cannot tell a section from a restriction). A new
-//!   method is a variant added to `Method` that is one plain string constant, whose name no
-//!   variant of the earlier release had and no other variant has (a host of the same level answers
+//!   method is a name that this commit's `Method` adds to the earlier release's, where both are a
+//!   list of plain string constants and nothing else, each name stands once in the shape of a
+//!   method's name (lower-case words of letters, digits and underscores, with single dots
+//!   between) and the earlier release's names are all still there (a host of the same level answers
 //!   a method it does not list with `PERMISSION_DENIED`, and a client that meets that refusal for
 //!   a method that is new asks the host a method its level has before it takes the refusal for a
 //!   lack of rights);
