@@ -90,6 +90,7 @@ impl Approved {
 
 /// What a removal says of something that is there now and that its inspection did not see.
 #[must_use]
+// text: not_there_at_the_inspection
 pub fn not_there_at_the_inspection(path: &Path) -> String {
     format!(
         "{} was not there when the removal looked for it, and something is there now, so it was not removed",
@@ -107,6 +108,7 @@ pub fn not_there_at_the_inspection(path: &Path) -> String {
 ///
 /// The data directory is tried last in any case, so that what keeps it is named. Returns each thing
 /// that could not be removed, with the reason; nothing is returned when everything is gone.
+// text: remove
 pub fn remove(records: &Records<'_>) -> Vec<String> {
     remove_with(records, &list_names)
 }
@@ -144,6 +146,7 @@ fn unseen(stayed: &mut Vec<String>, path: &Path) -> bool {
 /// shown. An error of the listing, and an error of one entry of it, both mean that a replacement of
 /// the manifest may be there and is not gone: neither `staging` nor the manifest is then deleted,
 /// and the removal says so.
+// text: remove_with
 pub fn remove_with(
     records: &Records<'_>,
     names: &dyn Fn(&Path) -> io::Result<Vec<io::Result<OsString>>>,
@@ -253,6 +256,7 @@ pub fn begin<M>(
 /// Removes the data directory that the inspection found empty, and nothing else: no record is
 /// deleted by name and no directory is emptied. A directory that holds anything by now stays, and
 /// is named. Returns what could not be removed, with the reason; nothing when it is gone.
+// text: remove_empty
 pub fn remove_empty(data: &Path) -> Vec<String> {
     match fs::remove_dir(data) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => {
@@ -285,6 +289,7 @@ pub struct Seen {
 /// that the inspection approved and in no other. A directory that it did not see and that is there
 /// now is left whole and named in the result: nothing opened it, so nothing in it was read.
 /// Returns each thing that stayed, with the reason; nothing when all is done.
+// text: finish_journal_and_run
 pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<String> {
     let mut stayed = Vec::new();
     if seen.journal
@@ -329,6 +334,7 @@ fn unlisted(error: &io::Error) -> io::Error {
 /// full stop, to follow last words that have none, and is empty where the record was read or is
 /// not there.
 #[must_use]
+// text: unread_prior
 pub fn unread_prior(approved: bool, there: bool) -> &'static str {
     if there && !approved {
         ". The earlier-state record was not read, so the Application Identity service's start value and running state were not put back: the next removal inspects the record again"
@@ -343,9 +349,10 @@ pub fn unread_prior(approved: bool, there: bool) -> &'static str {
 /// checked by no handle in this run, and a new installation refuses until it is gone: the removal
 /// is run again, reads the first entry that it finds on its own handle and says what to do about it.
 #[must_use]
+// text: next_step
 pub fn next_step(manifest_stays: bool, data_is_empty: bool) -> &'static str {
     if manifest_stays {
-        "The manifest stays with them. If a program holds one of them open, close it. Then run the removal again, which inspects the data directory again and says what remains"
+        "Something is at the manifest's name, and it stays with them. If a program holds one of them open, close it. Then run the removal again, which inspects the data directory again and says what remains"
     } else if data_is_empty {
         "The directory is empty, and a new installation accepts an empty data directory: if a program holds it (a console that has it as its current directory, for one), close that program, then run the removal again, which removes it"
     } else {

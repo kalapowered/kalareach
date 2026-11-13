@@ -176,6 +176,7 @@ pub fn choose(kind: EntryKind, origin: &Origin, manifest: &Presence) -> Remedy {
 /// of what the entry holds, which no read showed; "the next run makes it new" is said only of what
 /// the installation makes.
 #[must_use]
+// text: ending
 pub fn ending(
     entry: &std::path::Path,
     remedy: Remedy,
@@ -188,7 +189,7 @@ pub fn ending(
         Remedy::Remove => {
             if matches!(manifest, Presence::Present) {
                 format!(
-                    "Remove {entry}, and nothing else, then run the setup program again: the manifest stays where it is."
+                    "Remove {entry}, and nothing else, then run the setup program again: the entry at the manifest's name stays where it is."
                 )
             } else {
                 format!("Remove {entry}, and nothing else, then run the setup program again.")
@@ -197,7 +198,7 @@ pub fn ending(
         Remedy::MoveAside => {
             let basis = match origin {
                 Origin::Refused(error) => format!(
-                    "The permission list of {entry} refuses the Administrators group ({error}), which no list of the installation's does, so the installation did not make it."
+                    "Nothing shows who made {entry}: it could not be opened ({error}). A permission list that refuses the Administrators group gives that error, and no list of the installation's does; an entry with a delete pending gives it too."
                 ),
                 Origin::Unknown(error) => format!(
                     "Nothing shows who made {entry}, because it could not be read ({error})."
@@ -254,6 +255,7 @@ pub enum ParentCure {
 /// The words that tell the person what to do about a refused folder above the data directory, one
 /// remedy for the state its handle and a lookup showed.
 #[must_use]
+// text: parent_advice
 pub fn parent_advice(cure: &ParentCure) -> String {
     match cure {
         ParentCure::Unreadable => "Nothing shows who made this folder, because it could not be opened to be checked. Do not correct its owner or its list, and do not remove it: either would hide what it is. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned(),
@@ -277,6 +279,7 @@ pub enum Tree {
 /// The rights of a permission-list entry that let an account replace a folder or what is in it,
 /// said in words. A right that replaces nothing (read, add a file, add a subdirectory) is not said.
 #[must_use]
+// text: rights_in_words
 pub fn rights_in_words(mask: u32) -> String {
     const DELETE_CHILD: u32 = 0x0000_0040;
     const DELETE: u32 = 0x0001_0000;
@@ -309,6 +312,7 @@ pub fn rights_in_words(mask: u32) -> String {
 /// An identity as the refusal names it: by its account name where the system resolves one, with the
 /// identifier beside it, and by the identifier alone where it does not.
 #[must_use]
+// text: identity_text
 pub fn identity_text(name: Option<&str>, sid: &str) -> String {
     match name {
         Some(name) if !name.is_empty() => format!("{name} ({sid})"),
@@ -319,6 +323,7 @@ pub fn identity_text(name: Option<&str>, sid: &str) -> String {
 /// What the check of a folder above the trees says of an entry that gives an identity outside the
 /// system's class a right that lets it replace the folder or what is in it.
 #[must_use]
+// text: rights_finding
 pub fn rights_finding(identity: &str, mask: u32) -> String {
     format!(
         "{identity} is allowed {} (rights 0x{mask:x})",
@@ -328,6 +333,7 @@ pub fn rights_finding(identity: &str, mask: u32) -> String {
 
 /// The reason that a volume on another computer is not used: the words of the volume check's
 /// refusal and of the shape check's, which reads a share in a final path.
+// text: REMOTE_VOLUME
 pub const REMOTE_VOLUME: &str =
     "the volume is on another computer, and only local volumes are supported";
 
@@ -501,6 +507,7 @@ pub fn is_below(folder: &str, known: &str) -> bool {
 /// is malformed, a pipe that the broker closed at its stop) has another cause, and the words do not
 /// send the person looking for sessions.
 #[must_use]
+// text: hello_failure
 pub fn hello_failure(failure: &crate::frame::FrameError) -> String {
     use crate::frame::FrameError;
     let deadline = matches!(
@@ -520,6 +527,7 @@ pub fn hello_failure(failure: &crate::frame::FrameError) -> String {
 /// end with no full stop. Only the administrators' pipe says that other elevated sessions may hold
 /// it: the persons' pipe is held by persons, which the words do not claim.
 #[must_use]
+// text: busy_pipe
 pub fn busy_pipe(seconds: u64, administrators: bool) -> String {
     let held_by = if administrators {
         " (other elevated sessions may hold the administrators' pipe)"
@@ -587,6 +595,7 @@ impl Stage {
 /// own known folder, at the path that the system gives for it (its own final path), with that
 /// folder and every folder above it plain, on a fixed, local NTFS volume.
 #[must_use]
+// text: supported_layout
 pub fn supported_layout(tree: Tree) -> String {
     let (tree, known) = match tree {
         Tree::Data => ("data directory", "ProgramData"),
@@ -628,6 +637,7 @@ impl Ending {
 /// installation does not support and tells no one to change. `stage` says whether the run had
 /// changed anything.
 #[must_use]
+// text: ancestor_refusal
 pub fn ancestor_refusal(subject: &Subject<'_>, tree: Tree, stage: Stage) -> String {
     match subject.whose {
         Whose::Shared => shared_refusal(subject.folder, tree, &subject.fault, stage),
@@ -783,6 +793,7 @@ const DATA_UNREADABLE: &str = "Nothing shows who made this directory, because it
 const CASE_REMEDY: &str = "Turn the flag off (`fsutil.exe file setCaseSensitiveInfo <the directory> disable`), then run the setup program again. Nothing in it is removed.";
 
 /// Why a data directory is refused when it separates names that differ only by case.
+// text: CASE_SENSITIVE_WHY
 pub const CASE_SENSITIVE_WHY: &str = "it separates names that differ only by case, and the installation compares names without regard to case";
 
 /// The words that end the refusal of the data directory itself, from what its own handle showed
@@ -790,6 +801,7 @@ pub const CASE_SENSITIVE_WHY: &str = "it separates names that differ only by cas
 /// remedy. Only a directory that the system's class owns is told what to correct, and no remedy
 /// says what the directory holds, which no read of it showed.
 #[must_use]
+// text: data_ending
 pub fn data_ending(origin: &Origin, case_sensitive: bool) -> &'static str {
     match origin {
         Origin::Foreign => DATA_NOT_MADE,
@@ -802,12 +814,14 @@ pub fn data_ending(origin: &Origin, case_sensitive: bool) -> &'static str {
 
 /// Why a private root is refused when no journal names it: what the journals say, and nothing of
 /// what the broker is doing.
+// text: UNNAMED_ROOT_WHY
 pub const UNNAMED_ROOT_WHY: &str = "no journal names it as unfinished work";
 
 /// What a refusal in the program directory says is kept: the program directory or the entry in it
 /// is not removed, and the manifest is said to record the installation and stay only where one was
 /// read (`recorded`).
 #[must_use]
+// text: program_keeping
 pub fn program_keeping(recorded: bool, whole_directory: bool) -> &'static str {
     match (recorded, whole_directory) {
         (true, false) => {
@@ -825,6 +839,7 @@ pub fn program_keeping(recorded: bool, whole_directory: bool) -> &'static str {
 /// word says that a program holds it: every cause is a condition, and the one that applies is for
 /// the person to find. `keeping` is what the refusal keeps ([`program_keeping`]).
 #[must_use]
+// text: program_open_advice
 pub fn program_open_advice(entry: &str, keeping: &str) -> String {
     format!(
         "If a program holds {entry} open, close that program. If its list refuses the check, correct who may open it. If it is a link, remove the link itself and not what it points to; if it is not a folder, remove that entry and nothing else. Then run the setup program again. {keeping}"
@@ -837,6 +852,7 @@ pub fn program_open_advice(entry: &str, keeping: &str) -> String {
 /// into what it leads to, so the words name the removals that do not. `repair` says whether a
 /// repair can make the program files again, which it can only where an installation is recorded.
 #[must_use]
+// text: program_removal_advice
 pub fn program_removal_advice(entry: &str, link: bool, repair: bool) -> String {
     let after = if repair {
         "A repair makes the program files again. Then run the setup program again."
@@ -898,6 +914,7 @@ pub struct KnownFolder<'a> {
 /// After it, a folder strictly below a known folder is the installation's own and the first folder
 /// of a walk above a known folder is a volume's root.
 #[must_use]
+// text: shape_refusal
 pub fn shape_refusal(
     program_files: &KnownFolder<'_>,
     program_data: &KnownFolder<'_>,
@@ -958,6 +975,7 @@ pub fn shape_refusal(
 /// said on a condition, since nothing was read of an installation. No words tell anyone to remove
 /// what stays by hand: the policy's rules are shared with other programs.
 #[must_use]
+// text: known_folder_unreadable
 pub fn known_folder_unreadable(folder: &str, status: &str, removal: bool) -> String {
     let limit = if removal {
         format!(
@@ -1063,6 +1081,7 @@ pub fn stop_broker<E>(
 /// that it stopped before it changed the program directory, since its own failure path says what is
 /// undone.
 #[must_use]
+// text: broker_not_stopped
 pub fn broker_not_stopped(repair: bool) -> String {
     let first = "The broker's service did not reach the stopped state, so this run stopped before it changed the program directory.";
     if repair {
@@ -1078,15 +1097,104 @@ pub fn broker_not_stopped(repair: bool) -> String {
 /// what was read after it, and what the run left. A repair has no rollback; an installation's own
 /// failure path says what is undone, so only a repair uses these words.
 #[must_use]
+// text: broker_stop_refused
 pub fn broker_stop_refused(error: &str) -> String {
     format!(
         "The broker's service refused the request to stop it ({error}), and a read of its state after that showed it neither stopped nor changing state, so this run stopped before it changed the program directory. What it had already changed stays, and a repair has no rollback. Run the setup program again when the service is stopped or running."
     )
 }
 
+/// What a read of a file that the policy needs showed when it gave no answer: absence is said only
+/// for the platform's "not found", and any other failure says that the read failed, with its error.
+fn not_reached(what: &str, absent: &str, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("{what} {absent}")
+    } else {
+        format!("{what} could not be read: {error}")
+    }
+}
+
+/// The refusal for a program of Git that the policy names and the read of which gave no answer.
+#[must_use]
+// text: git_program_not_reached
+pub fn git_program_not_reached(path: &str, error: &std::io::Error) -> String {
+    not_reached(
+        &format!("Git's program {path}"),
+        "is not where the policy expects it",
+        error,
+    )
+}
+
+/// The refusal for a file of the payload directory whose lookup gave no answer.
+#[must_use]
+// text: payload_file_not_reached
+pub fn payload_file_not_reached(path: &str, error: &std::io::Error) -> String {
+    not_reached(path, "is not in the payload directory", error)
+}
+
+/// The refusal for an effective application control policy that is not empty: the collections that
+/// it enforces and the collections that hold rules, as the read of the policy showed them, and
+/// what this run had already changed before it read the policy.
+#[must_use]
+// text: application_control_set
+pub fn application_control_set(enforced: &[&str], ruled: &[&str]) -> String {
+    let mut facts = Vec::new();
+    if !enforced.is_empty() {
+        facts.push(format!("it enforces {}", enforced.join(", ")));
+    }
+    if !ruled.is_empty() {
+        facts.push(format!("it holds rules in {}", ruled.join(", ")));
+    }
+    format!(
+        "The effective application control policy is not empty: {}. The installation does not go on beside a policy that it did not write. This run had already made or protected the data directory and the directories in it before it read the policy, and the manifest records them.",
+        facts.join(" and ")
+    )
+}
+
+/// Why a configuration file that the installation makes empty is refused: it is not empty.
+// text: CONFIG_NOT_EMPTY_WHY
+pub const CONFIG_NOT_EMPTY_WHY: &str =
+    "it is not empty, and the installation's own configuration is empty";
+
+/// What to do about a configuration file that is not empty: remove it, and a repair makes it again.
+#[must_use]
+// text: empty_config_advice
+pub fn empty_config_advice(entry: &str, repair: bool) -> String {
+    let again = if repair {
+        "A repair makes it again, empty. "
+    } else {
+        ""
+    };
+    format!(
+        "Remove {entry}, and nothing else: the installation makes it empty, and a configuration that is not empty may hold settings that the Git that the boundary's accounts run would read, and a change of its owner or its list does not cure that. {again}Then run the setup program again."
+    )
+}
+
+/// The removal's line on the Application Identity service's start type where it puts nothing back,
+/// from the three values that it read: the start type now, the one the installation recorded
+/// (`start=<number>`), and the one in the earlier-state record. A value that is equal to the others
+/// was changed by nobody.
+#[must_use]
+// text: appid_start_type_left
+pub fn appid_start_type_left(current: u32, recorded: Option<&str>, prior: u32) -> String {
+    let recorded = recorded.and_then(|detail| detail.strip_prefix("start="));
+    match recorded {
+        Some(number) if number == current.to_string() && current == prior => format!(
+            "the Application Identity service's start type is {current}, the same as the installation recorded and the earlier-state record holds: there is nothing to put back"
+        ),
+        Some(number) => format!(
+            "the Application Identity service's start type is {current}, not the {number} that the installation recorded, so it is left alone"
+        ),
+        None => format!(
+            "the Application Identity service's start type is {current}, and the installation recorded no start type for it, so it is left alone"
+        ),
+    }
+}
+
 /// A folder's final path as a person can use it: without the `\\?\` prefix of the extended form, and
 /// with the form of a network path (`\\?\UNC\server\share`) as `\\server\share`.
 #[must_use]
+// text: dos_path_of
 pub fn dos_path_of(final_path: &str) -> String {
     match final_path.strip_prefix(r"\\?\") {
         Some(rest) => match rest.strip_prefix(r"UNC\") {
