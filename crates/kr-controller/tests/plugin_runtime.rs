@@ -886,7 +886,7 @@ impl World {
             link_histories: Mutex::new(Vec::new()),
             _published: published,
             _published_second: published_second,
-            first_published: second.then(|| (generation, package)),
+            first_published: second.then_some((generation, package)),
             apart: Apart { child: None },
             _hosts: HostEnding {
                 requested,
