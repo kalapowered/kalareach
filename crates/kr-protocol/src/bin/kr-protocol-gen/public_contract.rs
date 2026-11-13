@@ -81,18 +81,17 @@ const METADATA_OBJECT_KEYS: [&str; 6] = [
 ];
 
 /// Whether the definition is an open object of its own `properties` and nothing else that composes
-/// or closes it: `type` is `object`, there is no `additionalProperties`, and every key is from
-/// [`METADATA_OBJECT_KEYS`]. Its reader drops a member it does not know, so a member added to its
-/// `properties` is one that an earlier reader accepts, wherever the object is used as a property,
-/// an item or an `anyOf` or `allOf` branch; where it is used under a `oneOf`, a `not` or an `if`,
-/// the member narrows the object and so can widen the place, which [`accepted`] checks with
-/// [`is_used_only_where_it_widens`]. A `$ref`, a nullable pair or a list of branches gives a label
-/// of the same form from another list, and a closed object refuses the member. The keys that the
-/// rule reads have the form that it reads ([`has_plain_forms`]).
+/// or closes it: `type` is `object` and every key is from [`METADATA_OBJECT_KEYS`], which leaves out
+/// `additionalProperties`, so the object is not closed. Its reader drops a member it does not know,
+/// so a member added to its `properties` is one that an earlier reader accepts, wherever the object
+/// is used as a property, an item or an `anyOf` or `allOf` branch; where it is used under a
+/// `oneOf`, a `not` or an `if`, the member narrows the object and so can widen the place, which
+/// [`accepted`] checks with [`is_used_only_where_it_widens`]. A `$ref`, a nullable pair or a list
+/// of branches gives a label of the same form from another list, and a closed object refuses the
+/// member. The keys that the rule reads have the form that it reads ([`has_plain_forms`]).
 fn is_a_metadata_object(schema: &Value, definition: &str) -> bool {
     let node = &schema["$defs"][definition];
     node.get("type").and_then(Value::as_str) == Some("object")
-        && node.get("additionalProperties").is_none()
         && has_plain_forms(node)
         && node.as_object().is_some_and(|members| {
             members
