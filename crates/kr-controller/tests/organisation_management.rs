@@ -1055,13 +1055,14 @@ async fn the_host_takes_a_lease_for_its_own_key_only_once_it_is_exclusively_orga
 async fn a_lease_presented_across_another_devices_revocation_is_not_shown_and_its_repeat_is_answered()
  {
     let fixture = Fixture::start().await;
+    // Paired before the host is exclusive: afterwards no device of the owner's confirms a pairing.
+    let bea = fixture.member("bea", SERVED).await;
     let mut client = fixture.host.client().await;
     fixture
         .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
         .await
         .expect("the owner makes the host exclusive");
     drop(client);
-    let bea = fixture.member("bea", SERVED).await;
     let lease = fixture.organisation.lease(
         2,
         &organisation_support::member("owner"),
@@ -1920,7 +1921,10 @@ async fn making_the_host_exclusive_never_commits_after_the_last_device_that_coul
     let (client, answer) = enabling.await.expect("the change ends");
     drop(client);
     let refused = answer.expect_err("no device is left that could recover the host");
-    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    // The revocation owes a fence, and the door tells a refusal that says nothing was done as the
+    // fence's own once the route has answered: the refusal, not the change, is what is not shown.
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("fence"), "{refused:?}");
     assert!(!fixture.listed().await.exclusive);
     fixture.host.stop().await;
 }
