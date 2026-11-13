@@ -19,7 +19,7 @@ use kr_protocol::local::LocalBuild;
 use kr_protocol::retained::surface::Refusal;
 use kr_protocol::retained::{
     CodecError, Compatible, Declared, Difference, DifferenceKind, Level, RetainedLevel, Surface,
-    assess, current, differences,
+    SurfaceError, assess, current, differences,
 };
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::update::CompatibilityLevel;
@@ -801,9 +801,9 @@ fn the_recordings_beside_the_tests_are_of_the_release_before() {
 
 /// A surface cut from a schema holds the keywords of the schema's own root, beside its
 /// definitions, and a difference in one is a difference of the surface: a validator applies them to
-/// every document, so a root whose `type` changes accepts what it refused. Its annotations are
-/// left out, as everywhere. Its `properties` are left out too: they list one member for every
-/// definition of the bundle, which the cut reads by name, so a member that moves to another
+/// every document, so a root whose `type` changes accepts other values. Its annotations are left
+/// out, as everywhere. Its `properties` are left out too: they are the bundle's entries, which the
+/// cut does not read (it reads the definitions by name), so an entry that moves to another
 /// definition is not seen. A surface read from a recorded document holds none, and compares none.
 #[test]
 fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
@@ -880,13 +880,40 @@ fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
     quiet["properties"] = json!({ "b": { "$ref": "#/$defs/B" } });
     quiet["allOf"][0]["description"] = json!("Another part of the root");
     assert_eq!(found(&base, &cut(&quiet, definitions())), vec![]);
-    // A reference of the root does not make its target part of the cut: a recorded document
-    // lists the roots of the cut only, so the cut stays one that `parse` reads back.
+    // A reference of the root is compared where its target is in the surface, and a cut that does
+    // not hold the target is refused: the roots of the cut are all that a recorded document lists,
+    // and an absent target would make a changed reference no difference. The cut stays one that
+    // `parse` reads back.
     let mut composed = root();
     composed["allOf"] = json!([{ "$ref": "#/$defs/B" }]);
-    let referring = cut(&composed, definitions());
-    assert_eq!(referring.names().collect::<Vec<_>>(), ["A"]);
+    let with_roots = |roots: &[&str]| {
+        let mut schema = composed.clone();
+        schema["$defs"] = definitions();
+        Surface::cut(&schema, roots)
+    };
+    assert_eq!(
+        with_roots(&["A"]),
+        Err(SurfaceError::RootReference("B".to_owned()))
+    );
+    let referring = with_roots(&["A", "B"]).expect("a cut that holds the target");
+    assert_eq!(referring.names().collect::<Vec<_>>(), ["A", "B"]);
     assert!(Surface::parse(&referring.render()).is_ok());
+    // A reference of the root that is not to `$defs` by its plain name cannot be told from one that
+    // is, by a reader that decodes the fragment or reads an address: the cut refuses it.
+    for reference in [
+        "#/%24defs/B",
+        "https://example.test/x#/$defs/B",
+        "#/properties/a",
+    ] {
+        let mut schema = root();
+        schema["oneOf"] = json!([{ "$ref": reference }]);
+        schema["$defs"] = definitions();
+        assert_eq!(
+            Surface::cut(&schema, &["A", "B"]),
+            Err(SurfaceError::BadReference(reference.to_owned())),
+            "{reference}"
+        );
+    }
     // A recorded document holds no root keywords, so the surface read from one compares none.
     let recorded = Surface::parse(&base.render()).expect("the recorded surface");
     assert_eq!(
@@ -908,9 +935,7 @@ fn a_definition_named_like_the_roots_place_is_refused() {
     for roots in [&["$root"][..], &["A"][..]] {
         assert_eq!(
             Surface::cut(&schema, roots),
-            Err(kr_protocol::retained::SurfaceError::ReservedName(
-                "$root".to_owned()
-            )),
+            Err(SurfaceError::ReservedName("$root".to_owned())),
             "{roots:?}"
         );
     }

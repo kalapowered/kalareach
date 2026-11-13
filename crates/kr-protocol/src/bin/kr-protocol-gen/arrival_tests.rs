@@ -1315,9 +1315,9 @@ fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
                 "Name": { "type": "string", "not": { "$ref": "#/$defs/X" } },
                 "id": "#$defs/X",
             }),
-            // The same among the definitions of the schema: a definition that is a text (a text
-            // under another keyword's name, `$ref`, is refused by the cut, as every definition name
-            // that begins with `$` is).
+            // A definition that is a text, among the definitions of the schema: the walk refuses
+            // a text under a name. (A text under `$ref`, another keyword's name, is refused by the
+            // cut, as every definition name that begins with `$` is.)
             "a definition that is a text, named like a keyword",
         ),
         (
@@ -2084,8 +2084,8 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
     }
     // A keyword of the schema's own root that uses the document: in a `oneOf` beside a plain
     // object, the old root accepts `{"push": {}}` (only the plain object matches) and the new one
-    // refuses it (both match). The root's `properties`, which list every definition of the bundle
-    // and so refer to the document, are no use of it.
+    // refuses it (both match). A bare reference among the root's `properties` is the bundle's own
+    // entry, and a use as a property only widens with its target; any other entry is read.
     let with_root = |schema: &Value, keyword: &str, member: Value| {
         let mut schema = schema.clone();
         schema[keyword] = member;
@@ -2121,7 +2121,49 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
             json!("#/$defs/ConfigurationDocument"),
         ),
     );
-    assert_eq!((lines, passed), (wanted, vec![]), "a reference at the root");
+    assert_eq!(
+        (lines, passed),
+        (wanted.clone(), vec![]),
+        "a reference at the root"
+    );
+    // A member of the root's `properties` that is more than a bare reference is read: under a
+    // `not`, the old root accepts `{"config": {"push": {}}}` and the new one refuses it.
+    let (lines, passed) = section_lines(
+        &with_root(
+            &closed(false),
+            "properties",
+            json!({ "config": { "not": document.clone() } }),
+        ),
+        &with_root(
+            &closed(true),
+            "properties",
+            json!({ "config": { "not": document.clone() } }),
+        ),
+    );
+    assert_eq!(
+        (lines, passed),
+        (wanted.clone(), vec![]),
+        "a not under a root property"
+    );
+    // A `$dynamicRef` with a pointer reaches the document as a `$ref` does.
+    let dynamic = json!({ "$dynamicRef": "#/$defs/ConfigurationDocument" });
+    let (lines, passed) = section_lines(
+        &with_root(
+            &closed(false),
+            "oneOf",
+            json!([dynamic, { "type": "object" }]),
+        ),
+        &with_root(
+            &closed(true),
+            "oneOf",
+            json!([dynamic, { "type": "object" }]),
+        ),
+    );
+    assert_eq!(
+        (lines, passed),
+        (wanted.clone(), vec![]),
+        "a $dynamicRef at the root"
+    );
     let listed = json!({ "configuration_document": document });
     let (lines, passed) = section_lines(
         &with_root(&closed(false), "properties", listed.clone()),
@@ -2249,8 +2291,8 @@ fn a_member_of_a_read_only_metadata_object_passes_only_in_an_open_plain_object()
         }
         schema
     };
-    // Where the object is used as a property, a wider object only widens the place, so the member
-    // passes.
+    // Where the object is used as a property, a narrower object only narrows the place, so the
+    // member passes.
     let property = json!({ "type": "object", "properties": { "info": info.clone() } });
     assert_eq!(
         crate::public_contract::compare(
@@ -2263,12 +2305,24 @@ fn a_member_of_a_read_only_metadata_object_passes_only_in_an_open_plain_object()
     // `Holder` that is a `oneOf` of it and a plain object refuses it in the old schema (both
     // branches match) and accepts it in the new one (the plain object alone matches), and a `Holder`
     // that is a `not` of it accepts the value in the new schema and refuses it in the old one.
+    // `unevaluatedProperties` reads which members the object evaluated, and a new member makes it
+    // evaluate more: `{"info": {"id": "x", "note": "y"}}` is refused by the old schema (`note` is
+    // unevaluated) and accepted by the new one.
     for (holder, says) in [
         (
             json!({ "oneOf": [info.clone(), { "type": "object" }] }),
             "a oneOf beside a plain object",
         ),
-        (json!({ "not": info }), "a not"),
+        (json!({ "not": info.clone() }), "a not"),
+        (
+            json!({ "type": "object", "properties": { "info": {
+                "$ref": "#/$defs/Info", "unevaluatedProperties": false } } }),
+            "an unevaluatedProperties beside the reference",
+        ),
+        (
+            json!({ "allOf": [info], "unevaluatedProperties": false }),
+            "an unevaluatedProperties beside an allOf",
+        ),
     ] {
         // The `Holder` stands in both schemas, in the earlier one only or in the new one only.
         for (old_holder, new_holder, where_) in [

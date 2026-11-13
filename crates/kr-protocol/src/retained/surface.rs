@@ -38,6 +38,10 @@ pub enum SurfaceError {
     /// The text is not a surface document.
     #[error("not a surface document: {0}")]
     NotASurface(String),
+    /// The schema's own root refers to a definition that the cut does not hold: a root reference
+    /// is compared only where its target is in the surface, so the cut refuses one that is not.
+    #[error("the schema's own root refers to {0}, which the cut does not hold")]
+    RootReference(String),
     /// A definition has a name that begins with `$`, which the place of the schema's own root
     /// takes.
     #[error("{0} is a definition name that begins with $, which names the schema's own root")]
@@ -54,12 +58,12 @@ const ROOT_PLACE: &str = "$root";
 /// A validator applies the keywords of a schema's root (`type`, `$schema`, `not`, a `$ref`) to every
 /// document, so a surface that is cut from a schema holds them beside the definitions, and
 /// [`differences`] compares them: a change of the root's `type` alone is a difference. Two things
-/// of the root are left out: its annotations, as everywhere, and its `properties`, which hold one
-/// member for every definition of the bundle (nearly all of them a reference), so that the cut
-/// reads the definitions by name and a member that moves to another definition is not seen. A
-/// reference of the root is compared where its target is a definition of the surface, and does not
-/// add its target to it. A surface that is read from a recorded document holds no root keywords
-/// (the document records none), and compares none.
+/// of the root are left out: its annotations, as everywhere, and its `properties`, the bundle's
+/// entries (each a reference to a definition, but for a few that are inline), which the cut does
+/// not read: it reads the definitions by name, and an entry that moves to another definition is not
+/// seen. A reference of the root has to be to a definition that the surface holds, by its plain
+/// name, and the cut refuses one that is not, so that every one is compared. A surface that is read
+/// from a recorded document holds no root keywords (the document records none), and compares none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
     roots: Vec<String>,
@@ -75,8 +79,10 @@ impl Surface {
     /// # Errors
     ///
     /// Returns [`SurfaceError::UnknownRoot`] for a root the bundle lacks,
-    /// [`SurfaceError::BadReference`] for a reference that is not to one of its definitions, and
-    /// [`SurfaceError::ReservedName`] for a definition it reaches with a name that begins with `$`.
+    /// [`SurfaceError::BadReference`] for a reference that is not to one of its definitions by
+    /// its plain name, [`SurfaceError::ReservedName`] for a definition it reaches with a name that
+    /// begins with `$`, and [`SurfaceError::RootReference`] for a reference of its own root to a
+    /// definition that the roots do not reach.
     pub fn cut(schema: &Value, roots: &[&str]) -> Result<Self, SurfaceError> {
         let all = schema
             .get("$defs")
@@ -105,13 +111,20 @@ impl Surface {
             }
             definitions.insert(name, without_annotations(definition));
         }
+        let own = own_keywords(schema);
+        for reference in references(&own) {
+            let target = reference_name(&reference)?;
+            if !definitions.contains_key(&target) {
+                return Err(SurfaceError::RootReference(target));
+            }
+        }
         let mut roots: Vec<String> = roots.iter().map(|root| (*root).to_owned()).collect();
         roots.sort();
         roots.dedup();
         Ok(Self {
             roots,
             definitions,
-            root: Some(own_keywords(schema)),
+            root: Some(own),
         })
     }
 

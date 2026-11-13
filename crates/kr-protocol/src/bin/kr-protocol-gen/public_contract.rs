@@ -215,7 +215,9 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
 /// definition, through any chain of definitions that reach it. A use under any other keyword is not
 /// counted: under some of them (a `oneOf`, a `not`, an `if`, a `contains` with `maxContains`) a
 /// wider definition can make the place refuse a value that it accepted, and the walk does not tell
-/// those from the rest. The walk reads every definition and the keywords of the schema beside
+/// those from the rest. A schema that has an `unevaluatedItems` or an `unevaluatedProperties`
+/// anywhere is refused whole: they read what the keywords beside them evaluated, which a
+/// definition changes both ways. The walk reads every definition and the keywords of the schema beside
 /// `$defs` (the root must name the dialect of [`DIALECT`], and nothing below it may name another),
 /// and it refuses any form that it cannot read (see [`widens_at`]).
 fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
@@ -363,17 +365,11 @@ fn widens_at(keyword: &str, member: &Value, reaching: &BTreeSet<&str>, widening:
         "items" | "additionalProperties" | "anyOf" | "allOf" | "prefixItems" => {
             widens_with(member, reaching, widening)
         }
-        "oneOf"
-        | "not"
-        | "if"
-        | "then"
-        | "else"
-        | "contains"
-        | "propertyNames"
-        | "unevaluatedItems"
-        | "unevaluatedProperties"
-        | "additionalItems"
-        | "contentSchema" => widens_with(member, reaching, false),
+        // They read what the keywords beside them evaluated, so a definition that evaluates more or
+        // fewer members changes the place both ways: the walk reads no place that has one.
+        "unevaluatedItems" | "unevaluatedProperties" => false,
+        "oneOf" | "not" | "if" | "then" | "else" | "contains" | "propertyNames"
+        | "additionalItems" | "contentSchema" => widens_with(member, reaching, false),
         _ => is_plain_data(member, reaching),
     }
 }
@@ -440,28 +436,51 @@ fn member_added_to_the_configuration_document(difference: &Difference) -> Option
         .filter(|member| !member.contains(['.', '#', '[', '{']))
 }
 
-/// Whether a `$ref` to the definition `name` occurs anywhere in a definition of `schema` or in a
-/// keyword of its own root. The root's `properties` are not read: they list a member for every
-/// definition of the bundle, so each is referred to there, and a use as a property widens.
+/// Whether a reference (`$ref` or `$dynamicRef`) to the definition `name` occurs anywhere in a
+/// definition of `schema` or in a keyword of its own root. An entry of the root's `properties` that
+/// is a bare `$ref` is the bundle's own (the schema lists its messages there, and a use as a
+/// property widens with its target) and is not read; any other entry is.
 fn is_referred_to(schema: &Value, name: &str) -> bool {
     fn refers(node: &Value, reference: &str) -> bool {
         match node {
             Value::Object(members) => {
-                members.get("$ref").and_then(Value::as_str) == Some(reference)
+                ["$ref", "$dynamicRef"]
+                    .iter()
+                    .any(|keyword| members.get(*keyword).and_then(Value::as_str) == Some(reference))
                     || members.values().any(|member| refers(member, reference))
             }
             Value::Array(items) => items.iter().any(|item| refers(item, reference)),
             _ => false,
         }
     }
+    fn is_a_bare_reference(entry: &Value) -> bool {
+        entry.as_object().is_some_and(|members| {
+            members.len() == 1 && members.get("$ref").is_some_and(Value::is_string)
+        })
+    }
     let reference = format!("#/$defs/{name}");
-    let in_root = schema.as_object().is_some_and(|members| {
-        members.get("$ref").and_then(Value::as_str) == Some(reference.as_str())
-            || members.iter().any(|(keyword, member)| {
-                !matches!(keyword.as_str(), "$defs" | "properties") && refers(member, &reference)
-            })
-    });
-    in_root
+    let root: serde_json::Map<String, Value> = schema
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(keyword, _)| keyword.as_str() != "$defs")
+        .map(
+            |(keyword, member)| match (keyword.as_str(), member.as_object()) {
+                ("properties", Some(entries)) => (
+                    keyword.clone(),
+                    Value::Object(
+                        entries
+                            .iter()
+                            .filter(|(_, entry)| !is_a_bare_reference(entry))
+                            .map(|(entry_name, entry)| (entry_name.clone(), entry.clone()))
+                            .collect(),
+                    ),
+                ),
+                _ => (keyword.clone(), member.clone()),
+            },
+        )
+        .collect();
+    refers(&Value::Object(root), &reference)
         || schema["$defs"].as_object().is_some_and(|definitions| {
             definitions
                 .values()
@@ -484,10 +503,11 @@ fn is_referred_to(schema: &Value, name: &str) -> bool {
 ///   added member is a key that the earlier schema refused (an open document, a nullable pair or
 ///   a `$ref` with `properties` beside it gives the same label from a list where the member
 ///   restricts a value that the earlier schema accepted);
-/// * no definition of either schema, and no keyword of either root, refers to
-///   `ConfigurationDocument`, so no answer a host gives carries the document, and a reference that
-///   moved to a copy of it cannot hide the add: only the file and the registry's copy of it are
-///   read by a release that lacks the section.
+/// * no definition of either schema, and no keyword of either root (but a bare reference among the
+///   root's `properties`, the bundle's own entry), refers to `ConfigurationDocument`, so no answer a
+///   host gives carries the document, and a reference that moved to a copy of it cannot hide the
+///   add: only the file and the registry's copy of it are read by a release that lacks the
+///   section.
 ///
 /// Anything else about the document is compared as it is for every definition, so a change to an
 /// existing member, a default, `required`, a ceiling or a section the table does not list still
