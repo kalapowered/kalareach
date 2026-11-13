@@ -362,14 +362,15 @@ jobs:
       # minutes: 8 November's runner ran 14 percent slower than 7 November's, and the outage of that
       # night's downloads added 3 minutes more. The limit is what the job's limit leaves once the
       # other steps have theirs, less 3 minutes for the set-up and clean-up that no step limit
-      # counts. Those steps' limits add up to 63 minutes, each at least twice the longest its step
-      # took in the eleven nights (the disk step, at 3.8 minutes, has 8), so the limits of the
-      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The report's 289
-      # minutes are 24 over 8 November's need with its outage, 27 over it without, and 5 over it
+      # counts. Those steps' limits add up to 65 minutes, each at least twice the longest its step
+      # took in the eleven nights (the disk step, at 3.8 minutes, has 8; the closing report, which
+      # also reads the kernel's log for failed writes to the volume, has 4), so the limits of the
+      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The report's 287
+      # minutes are 22 over 8 November's need with its outage, 25 over it without, and 3 over it
       # with the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) in place
       # of the outage.
       - name: The conformance report
-        timeout-minutes: 289
+        timeout-minutes: 287
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
         run: |
@@ -426,7 +427,7 @@ jobs:
       - name: What the disk has left
         if: ${{ !cancelled() }}
         continue-on-error: true
-        timeout-minutes: 2
+        timeout-minutes: 4
         run: bash scripts/disk-report.sh end "what the disk has left"
 
       - name: Keep the result and the evidence
@@ -439,9 +440,19 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: windows
+    name: windows part ${{ matrix.part }} of 2
     if: github.event_name != 'workflow_dispatch' || inputs.windows
     runs-on: windows-2025
+    # The platform's plan is run in two parts, one in each job of the matrix: it took 252 minutes
+    # on 11 and 12 November, with the suites that start a daemon or a worker running ten times
+    # longer than on 10 November, and it ran into its limit on 13 November. Each part holds the
+    # build steps that open the plan and half of the suites, which took 128 and 123 minutes in the
+    # run of 12 November, under three quarters of the report's limit even at the slowest pace of
+    # that run. A part that fails does not stop the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
     # Every step has a limit of its own, and the limits add up to less than this one, so a step
     # that hangs is ended and the steps after it still report. The job's own limit is under
     # GitHub's six hours.
@@ -536,20 +547,20 @@ jobs:
       # has come before, so that a component that could not be built is reported by the test that
       # needs it, by name, and not by a job that stopped before the report.
       #
-      # The step builds and runs every suite in turn, with no build cache, and it grows with the
-      # suites. It took 102 to 143 minutes with 76 to 81 steps (16 to 25 October). With 87, 89 and
-      # 91 steps it ran into its limit of 150 minutes on the next three nights, each time in the
-      # build of the host-events suite, the last step but one, which started 141 to 142 minutes in.
-      # A run with 91 steps took 185 minutes (29 October) and one with 92 took 191 (3 November). The
-      # limit is what this job's limit leaves once the other steps have theirs, less 3 minutes for
-      # the set-up and clean-up that no step limit counts: the limits of the job's steps add up to
-      # 352 of its 355 minutes. That is about 1.5 times the longest full run; twice it, 382
-      # minutes, does not fit in a job.
+      # The step builds and runs the suites of its part in turn, with no build cache, and it grows
+      # with the suites. The whole plan took 102 to 143 minutes with 76 to 81 steps (16 to 25
+      # October), 185 minutes with 91 (29 October), 191 with 92 (3 November), and 252 minutes with 96
+      # on 11 and 12 November. The limit is what this job's limit leaves once the other steps have
+      # theirs, less 3 minutes for the set-up and clean-up that no step limit counts: the limits of
+      # the job's steps add up to 352 of its 355 minutes. A part takes about half of the plan and
+      # the two builds that open it: 128 and 123 minutes in the run of 12 November, so the limit
+      # is more than twice what a part needs and a part keeps more than a quarter of it.
       - name: The conformance report
         if: ${{ !cancelled() }}
         timeout-minutes: 281
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
+          REPORT_PART: ${{ matrix.part }}
         run: |
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -558,7 +569,7 @@ jobs:
             $arguments += '--group'
             $arguments += $name
           }
-          cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR @arguments
+          cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR --part "$env:REPORT_PART/2" @arguments
 
       # The drives as the report left them; the change in used space since the first reading is what
       # the job took.
@@ -576,6 +587,6 @@ jobs:
         timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: conformance-windows
+          name: conformance-windows-part-${{ matrix.part }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error

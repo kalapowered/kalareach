@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::evidence::{self, Figure, KnownDifference};
+use crate::fault::{self, Rerun};
 use crate::id::{Family, Identifier};
 use crate::identity::{self, Commit, PackageVersion, System, TerminalProfile, Toolchain};
 use crate::lane::{self, Part};
@@ -71,6 +72,9 @@ pub struct StepRecord {
     pub log: String,
     /// Why it could not be run or read.
     pub error: Option<String>,
+    /// The second run of the step, when a file the first run linked could not be started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun: Option<Rerun>,
 }
 
 /// One run of one test.
@@ -243,6 +247,9 @@ pub struct RunRecordHeader {
     pub applications: Option<Vec<ApplicationRecord>>,
     /// The groups this run selected.
     pub selection: Vec<String>,
+    /// The part of the platform's plan this run is, as `number/parts`, when it is one of several.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
     /// Whether the run was asked for the whole terminal matrix.
     pub all_terminals: bool,
     /// Where the evidence is.
@@ -268,6 +275,9 @@ pub struct Summary {
     pub tests: Counts,
     /// Steps that did not exit 0 or could not be read.
     pub failed_steps: Vec<usize>,
+    /// Steps that were run again after a file they linked could not be started.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rerun_steps: Vec<usize>,
 }
 
 /// The result.
@@ -344,6 +354,9 @@ pub struct Options {
     /// The `kr-conformance` program, which Cargo runs each test binary through while a step's
     /// tests are listed.
     pub lister: PathBuf,
+    /// Which part of the platform's plan this run is, as the number of the part from 1 and the
+    /// number of parts, when the plan is run in parts by separate runs.
+    pub part: Option<(usize, usize)>,
 }
 
 /// Why a run stopped before it ran anything.
@@ -454,6 +467,10 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             applications_plan.as_ref(),
         )
     });
+    let steps = match options.part {
+        Some(part) => plan::part_of(steps, part),
+        None => steps,
+    };
     let mut executed = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         progress(&format!(
@@ -463,7 +480,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             step.what,
             step.line()
         ));
-        let done = run::execute(
+        let done = fault::execute(
             step,
             index + 1,
             &run::Place {
@@ -473,6 +490,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                 lister: &options.lister,
             },
             &map.packages,
+            &mut *progress,
         );
         progress(&format!(
             "  exit {} in {} s{}",
@@ -622,6 +640,12 @@ pub fn assemble(
         })
         .collect();
     summary.known_differences = known_differences.len();
+    summary.rerun_steps = executed
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step.rerun.is_some())
+        .map(|(index, _)| index + 1)
+        .collect();
     summary.failed_steps = executed
         .iter()
         .enumerate()
@@ -678,6 +702,9 @@ pub fn assemble(
             packages,
             applications: options.applications.clone(),
             selection: groups.iter().map(|group| group.name().to_owned()).collect(),
+            part: options
+                .part
+                .map(|(number, parts)| format!("{number}/{parts}")),
             all_terminals: options.all_terminals,
             evidence_directory: options.evidence.to_string_lossy().replace('\\', "/"),
         },
@@ -699,6 +726,7 @@ pub fn assemble(
                 seconds: step.seconds,
                 log: step.log.clone(),
                 error: step.error.clone(),
+                rerun: step.rerun.clone(),
             })
             .collect(),
         identifiers,
@@ -1208,6 +1236,7 @@ impl<'a> Resolver<'a> {
             step.error.is_some()
                 && step.built.is_empty()
                 && matches!(step.step.reading, plan::Reading::Cargo)
+                && command_holds(&step.step.command, target)
         }) {
             return format!(
                 "no step that ran listed this target; `{}` did not build ({})",
@@ -1221,7 +1250,7 @@ impl<'a> Resolver<'a> {
             .iter()
             .filter(|group| matches!(group, Group::EndToEnd | Group::Performance))
             .find_map(|group| plan::group_absent_reason(*group, self.options.platform));
-        match (target.kind, absent) {
+        let base = match (target.kind, absent) {
             (TargetKind::Bench, _) => format!(
                 "a benchmark target: the performance group runs the measurements it holds, and {}",
                 plan::unrun_reason(self.options.platform)
@@ -1230,6 +1259,12 @@ impl<'a> Resolver<'a> {
                 format!("{}; {reason}", plan::unrun_reason(self.options.platform))
             }
             _ => plan::unrun_reason(self.options.platform).to_owned(),
+        };
+        match self.options.part {
+            Some((number, parts)) => format!(
+                "{base}; this run is part {number} of {parts} of the platform's plan, and another part may run it"
+            ),
+            None => base,
         }
     }
 
@@ -1533,6 +1568,34 @@ fn case_names(file: &str, cases: &[crate::vitest::Case]) -> Vec<String> {
         .collect()
 }
 
+/// Whether a Cargo step's command could have held a target, so that a step that failed before it
+/// listed its targets is named as the reason for the targets it would have run and no others: a
+/// run of the workspace holds every target, one that names packages holds their targets, and one
+/// that names integration tests holds those.
+fn command_holds(command: &[String], target: &TargetId) -> bool {
+    let words: Vec<&str> = command
+        .iter()
+        .map(String::as_str)
+        .take_while(|word| *word != "--")
+        .collect();
+    if words.contains(&"--workspace") {
+        return true;
+    }
+    let mut packages: Vec<&str> = Vec::new();
+    let mut tests: Vec<&str> = Vec::new();
+    for pair in words.windows(2) {
+        match pair[0] {
+            "-p" | "--package" => packages.push(pair[1]),
+            "--test" => tests.push(pair[1]),
+            _ => {}
+        }
+    }
+    (packages.is_empty() || packages.contains(&target.package.as_str()))
+        && (tests.is_empty()
+            || !matches!(target.kind, TargetKind::Test)
+            || tests.contains(&target.name.as_str()))
+}
+
 /// Combines a test's runs into one outcome and reason, or `None` when nothing ran it.
 fn combine(runs: &[RunRecord]) -> Option<(Outcome, Option<String>)> {
     let with = |wanted: Outcome| runs.iter().filter(move |run| run.outcome == wanted);
@@ -1708,6 +1771,39 @@ fn reproducing(runs: &[RunRecord]) -> Option<&RunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_that_failed_before_listing_is_named_only_for_the_targets_it_would_have_run() {
+        let target = |package: &str, kind: TargetKind, name: &str| TargetId {
+            package: package.to_owned(),
+            kind,
+            name: name.to_owned(),
+        };
+        let words = |line: &str| -> Vec<String> { line.split(' ').map(str::to_owned).collect() };
+        let transport =
+            words("cargo test --locked --release -p kr-transport --test perf -- --nocapture");
+        assert!(command_holds(
+            &transport,
+            &target("kr-transport", TargetKind::Test, "perf")
+        ));
+        assert!(!command_holds(
+            &transport,
+            &target("kr-transport", TargetKind::Test, "other")
+        ));
+        assert!(!command_holds(
+            &transport,
+            &target("kr-worker", TargetKind::Test, "perf")
+        ));
+        assert!(command_holds(
+            &transport,
+            &target("kr-transport", TargetKind::Lib, "kr_transport")
+        ));
+        let workspace = words("cargo test --locked --workspace --no-fail-fast");
+        assert!(command_holds(
+            &workspace,
+            &target("kr-worker", TargetKind::Lib, "kr_worker")
+        ));
+    }
 
     #[test]
     fn a_failure_outweighs_a_pass_and_a_pass_outweighs_an_ignore() {
