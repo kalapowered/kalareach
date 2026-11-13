@@ -424,6 +424,11 @@ impl Broker {
     /// instance that is not bound ends, with nothing of the adoption left, and the next look
     /// adopts the program again. The refusal and the end are one step under the broker's lock.
     ///
+    /// Returns `None` where the binding asked for was made, and the plugin of the binding the
+    /// instance holds where it kept one a snapshot made: that plugin may not be the one the
+    /// adoption recognised the program for, at the older frame, and it is the one the instance is
+    /// announced as.
+    ///
     /// # Errors
     ///
     /// Returns what [`Self::bind`] refused with, where the instance has ended because of it.
@@ -435,7 +440,7 @@ impl Broker {
         frame: FrameId,
         executable: MatchedExecutable,
         now: TimestampMs,
-    ) -> Result<()> {
+    ) -> Result<Option<PluginId>> {
         let mut state = self.state();
         let refused = match state.bind_admitted(
             binding_id,
@@ -445,17 +450,17 @@ impl Broker {
             executable,
             now,
         ) {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(None),
             Err(refused) => refused,
         };
         #[cfg(feature = "testing")]
         crate::plugin_link_trace::bind_refused(application_instance_id);
-        if state
+        if let Some(held) = state
             .bindings
             .values()
-            .any(|held| held.application_instance_id == application_instance_id)
+            .find(|held| held.application_instance_id == application_instance_id)
         {
-            return Ok(());
+            return Ok(Some(held.plugin_id.clone()));
         }
         let ended = state.end_instance(application_instance_id);
         drop(state);

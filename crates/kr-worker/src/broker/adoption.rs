@@ -481,7 +481,7 @@ impl Adoptions {
         };
         let application_instance_id =
             ApplicationInstanceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()));
-        let summary = AgentInstanceSummary {
+        let mut summary = AgentInstanceSummary {
             application_instance_id,
             plugin_id: match &recognition {
                 Recognition::Package(admitted) => Nullable::some(admitted.plugin_id.clone()),
@@ -528,8 +528,13 @@ impl Adoptions {
                     },
                     now,
                 );
-                if bound.is_err() {
-                    return Vec::new();
+                match bound {
+                    Err(_) => return Vec::new(),
+                    // A snapshot that bound the instance meanwhile may have found another package
+                    // for the program: the instance is announced as the binding it holds is for,
+                    // since that is the plugin its actions are taken from.
+                    Ok(Some(kept)) => summary.plugin_id = Nullable::some(kept),
+                    Ok(None) => {}
                 }
             }
             adopted.insert(

@@ -391,6 +391,8 @@ fn bindings_held(setup: &Setup) -> Vec<(BrokerBindingId, ApplicationInstanceId)>
 /// registered the binding is left with one that is gone.
 #[test]
 fn kr_req_11_13_a_snapshot_applied_during_an_adoption_leaves_the_program_the_binding_it_made() {
+    // The failure text carries the broker's account. This turns the trace on for the whole test
+    // process, and a report then carries its tail: no other case of this file reads one.
     kr_worker::plugin_link_trace::start();
     let setup = Setup::new();
     let started = setup.start();
@@ -427,6 +429,62 @@ fn kr_req_11_13_a_snapshot_applied_during_an_adoption_leaves_the_program_the_bin
         after.iter().map(|(_, bound)| *bound).collect::<Vec<_>>(),
         [instance],
         "and that binding is for the instance adopted: {after:?}"
+    );
+    started.end();
+}
+
+/// KR-REQ-11.13: where the snapshot applied during an adoption finds another package for the
+/// program than the adoption did, the instance keeps the binding the snapshot made and is
+/// announced as the plugin that binding is for, since its actions are taken from the announcement
+/// and only that binding holds them.
+#[test]
+fn kr_req_11_13_an_adoption_keeping_a_snapshots_binding_is_announced_as_that_bindings_plugin() {
+    let setup = Setup::with(fixture::COMMAND, |store, _| {
+        vec![
+            fixture::declarative_package(
+                store,
+                "claude-one",
+                fixture::COMMAND,
+                MatchConfidence::Exact,
+            )
+            .expect("the package"),
+            fixture::declarative_package(
+                store,
+                "claude-two",
+                fixture::COMMAND,
+                MatchConfidence::Exact,
+            )
+            .expect("the package"),
+        ]
+    });
+    // The first package alone is admitted when the adoption recognises the program, and the
+    // second alone when the snapshot that comes during the adoption is applied.
+    setup.admit_only(2, &[0]);
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let (arrived, release) = setup.adoptions.pause_before_binding();
+
+    let told = std::thread::scope(|scope| {
+        let adopting = scope.spawn(|| setup.adopt(&foreground));
+        arrived
+            .recv_timeout(LIVENESS)
+            .expect("the adoption reaches the moment between recording and binding its instance");
+        setup.admit_only(3, &[1]);
+        release.send(()).expect("the adoption is let go");
+        adopting.join().expect("the adoption ends")
+    });
+
+    assert_eq!(told.len(), 1, "the program is adopted once: {told:?}");
+    let instance = told[0].application_instance_id;
+    assert_eq!(
+        setup.bound_to(instance),
+        Some(setup.packages[1].package_digest),
+        "the instance holds the binding the snapshot made, for the second package"
+    );
+    assert_eq!(
+        told[0].plugin_id.as_ref(),
+        Some(&testing::admitted(&setup.packages[1]).plugin_id),
+        "and it is announced as the second package's plugin"
     );
     started.end();
 }
