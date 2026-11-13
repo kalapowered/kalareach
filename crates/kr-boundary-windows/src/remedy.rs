@@ -339,13 +339,16 @@ pub fn is_on_a_network_share(final_path: &str) -> bool {
 /// and the `\\?\` prefix of the extended form.
 #[must_use]
 pub fn is_the_volumes_own_root(supplied: &str, final_path: &str) -> bool {
-    let plain = |text: &str| {
-        text.strip_prefix(r"\\?\")
-            .unwrap_or(text)
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
-    };
-    !is_on_a_network_share(final_path) && plain(supplied) == plain(final_path)
+    !is_on_a_network_share(final_path) && plain_path(supplied) == plain_path(final_path)
+}
+
+/// A path as the comparisons read it: without the `\\?\` prefix of the extended form and without a
+/// trailing backslash, and in lower case.
+fn plain_path(text: &str) -> String {
+    text.strip_prefix(r"\\?\")
+        .unwrap_or(text)
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 /// Whether the folder that a path leads to is the one that was asked for: its final path, as the
@@ -361,15 +364,12 @@ pub fn is_the_place_asked_for(supplied: &str, final_path: &str) -> bool {
             .eq_ignore_ascii_case(supplied)
 }
 
-/// Why a folder above the installation's trees is refused.
+/// What was found at a folder of the walk that reads the folders above and around the
+/// installation's trees. Whose folder it is, and so the form of its words, is the [`Subject`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AncestorFault<'a> {
     /// A link or a mounted folder: the installation does not go through either above its trees.
     Link,
-    /// A link or a mounted folder in the boundary's own folders, from the top of its program tree
-    /// down to the program directory's parent: the setup program makes these itself as plain
-    /// folders, so the words do not send anyone to another computer's known folders.
-    OwnLink,
     /// Not a folder.
     NotAFolder,
     /// A drive letter that is no volume's root: the final path of its opened root.
@@ -379,15 +379,71 @@ pub enum AncestorFault<'a> {
     Volume(&'a str),
     /// The folder could not be opened or read: the platform's error.
     Unreadable(&'a str),
-    /// The folder's volume did not answer: the query for what the volume is failed, or the root of
-    /// the volume is not there. The platform's error.
+    /// The folder's volume did not answer: the query for what the volume is failed, or the open of
+    /// the volume's root failed with an error other than "not found". The platform's error.
     VolumeUnanswered(&'a str),
+    /// The root of the folder's volume is not there: the open of the root answered "not found". The
+    /// platform's error.
+    RootMissing(&'a str),
     /// The owner or the list is refused: the check's own sentence, which names the identity and the
     /// rights.
     List(&'a str),
     /// The owner or the list of a folder from the program directory's top down to its parent is
     /// refused: the folders on the way to the program also refuse the right to add to them.
     Writable(&'a str),
+}
+
+impl<'a> AncestorFault<'a> {
+    /// What an open that failed with an error other than "not found" found: at the root of a
+    /// volume the volume did not answer, and at any folder above it the folder could not be opened
+    /// or read, which a program that holds it open can cause.
+    #[must_use]
+    pub fn open_failed(root: bool, error: &'a str) -> Self {
+        if root {
+            AncestorFault::VolumeUnanswered(error)
+        } else {
+            AncestorFault::Unreadable(error)
+        }
+    }
+}
+
+/// Whose folder a refusal is about, which decides the form of its words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Subject<'a> {
+    /// A folder that the installation does not make: a known folder itself, every folder above it
+    /// up to the root of its volume, a drive letter. Other programs share it. Its words are built
+    /// by one function from what was found, and say what a supported layout is or, for a state that
+    /// can pass, what to try that changes no folder. They hold no instruction to change that
+    /// folder.
+    Shared(AncestorFault<'a>),
+    /// A folder that the installation makes: strictly below a known folder. Only its words can tell
+    /// the administrator what to correct.
+    Own(AncestorFault<'a>),
+}
+
+impl<'a> Subject<'a> {
+    /// The subject of a fault at `folder` where `known` is the known folder that the walk starts
+    /// from: a folder strictly below the known folder is the installation's own, and the known
+    /// folder itself and every folder above it are shared.
+    #[must_use]
+    pub fn at(folder: &str, known: &str, fault: AncestorFault<'a>) -> Self {
+        if is_below(folder, known) {
+            Subject::Own(fault)
+        } else {
+            Subject::Shared(fault)
+        }
+    }
+}
+
+/// Whether `folder` lies strictly below `known`: the known folder itself, a folder above it and a
+/// sibling whose name only begins with the known folder's name are not below it. The comparison
+/// ignores case, a trailing backslash and the `\\?\` prefix of the extended form.
+#[must_use]
+pub fn is_below(folder: &str, known: &str) -> bool {
+    let (folder, known) = (plain_path(folder), plain_path(known));
+    folder.len() > known.len()
+        && folder.starts_with(&known)
+        && folder.as_bytes()[known.len()] == b'\\'
 }
 
 /// What the installer says when the broker's hello fails. Only a failure that the read's deadline
@@ -426,20 +482,28 @@ pub fn busy_pipe(seconds: u64, administrators: bool) -> String {
     )
 }
 
-/// When in a run a folder above the trees is refused, so that the words claim only what is so.
+/// When in a run a folder of the walk is refused, so that the words claim only what is so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     /// The run has changed nothing yet: the folder is read before anything is made, written or
     /// stopped.
     Before,
-    /// The run had already made changes, which the manifest records, when the folder was read again.
+    /// An installation had already made changes, which the manifest records, when the folder was
+    /// read again.
     After,
-    /// A repair had already made changes, and stopped the broker, when the folder was read again.
-    /// A repair has no rollback, so the broker stays stopped.
-    AfterRepair,
-    /// The run had made the folder that holds the data directory, empty, and nothing else when
-    /// that folder was read again. No manifest records it, and a later rollback leaves it.
+    /// A repair had already made changes when the folder was read again. A repair has no rollback.
+    AfterRepair {
+        /// Whether the repair stopped the broker or found it stopped, which is the only case in
+        /// which the words say that the broker stays stopped.
+        broker_stopped: bool,
+    },
+    /// The run had made the folder that holds the data directory with its own call, and nothing
+    /// else, when that folder was read again. No manifest records it, and a later rollback leaves
+    /// it. The words say nothing of what is in it, which nothing has looked at yet.
     DataParentMade,
+    /// A removal that undoes an installation that failed read the folder. The removal has changed
+    /// nothing; what the installation had made before it failed is still there.
+    Rollback,
 }
 
 impl Stage {
@@ -450,89 +514,231 @@ impl Stage {
             Stage::After => {
                 "This run had already made changes before it read the folder again, and the manifest records them."
             }
-            Stage::AfterRepair => {
-                "This run had already made changes before it read the folder again, and the manifest records them. A repair has no rollback: the broker stays stopped."
+            Stage::AfterRepair {
+                broker_stopped: true,
+            } => {
+                "This run had already made changes before it read the folder again. A repair has no rollback. The broker stays stopped."
+            }
+            Stage::AfterRepair {
+                broker_stopped: false,
+            } => {
+                "This run had already made changes before it read the folder again. A repair has no rollback."
             }
             Stage::DataParentMade => {
-                "This run had already made the folder that holds the data directory before it read the folder again; it is empty and stays."
+                "This run had already made the folder that holds the data directory before it read the folder again, and the folder stays."
+            }
+            Stage::Rollback => {
+                "This removal, which undoes the installation that failed, had changed nothing when it read the folder: whatever that installation had already made is still there."
             }
         }
     }
 }
 
-/// What ends the refusal of a volume that the installation does not use: the layout is not
-/// supported, and the words direct no change to a folder that other programs share. `known` names
-/// the system's known folder that must lie on a fixed, local NTFS volume.
+/// What a run that reads the folders of a tree is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purpose {
+    /// An installation or a repair: it makes things in the tree.
+    Install,
+    /// A removal: it takes things out of the tree.
+    Remove,
+}
+
+/// What a walk does where the root of a tree's volume is not there (the open of the root answers
+/// "not found").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingRoot {
+    /// Refuse before any change.
+    Refuse,
+    /// Go on, and say at the end what could not be reached.
+    GoOn,
+}
+
+/// What a run does about a root that is not there. An installation and a repair refuse: nothing can
+/// be made on a disk that is gone. A removal of the program tree goes on, since a removal that
+/// refuses there can never finish: the policy goes back and the accounts, the service and the data
+/// go, and its last words name the program directory that it could not reach. The data tree's root
+/// still refuses a removal, since with it gone the removal reads no manifest.
 #[must_use]
-pub fn volume_layout(known: &str) -> String {
+pub fn missing_root(purpose: Purpose, tree: Tree) -> MissingRoot {
+    match (purpose, tree) {
+        (Purpose::Remove, Tree::Program) => MissingRoot::GoOn,
+        _ => MissingRoot::Refuse,
+    }
+}
+
+/// The last words of a removal that went on past a program tree's root that is not there.
+#[must_use]
+pub fn program_unreached(program: &str) -> String {
     format!(
-        "This layout is not supported: the setup program installs only where the system's {known} folder is on a fixed, local NTFS volume, and it directs no change to a folder that other programs share. Run it on a computer where that folder is on such a volume, then run the setup program again."
+        "{program} could not be reached: the root of its volume is not there, so nothing in it was checked or removed. If that volume comes back, remove the program directory then."
     )
 }
 
-/// The refusal of a folder above the data directory or the program directory, up to the volume's
-/// root: the folder, the tree below it, why it is refused and what to do. Nothing is removed or
-/// moved: a folder with other things in it is not the installation's to remove, and a link or a
-/// mounted folder above the trees is the administrator's own layout, which the installation does
-/// not support and tells no one to change. `stage` says whether the run had changed anything.
+/// What a supported layout is, in one sentence that says where the boundary installs: the tree's
+/// own known folder, with that folder and every folder above it plain, on a fixed, local NTFS
+/// volume.
 #[must_use]
-pub fn ancestor_refusal(
-    folder: &str,
-    tree: Tree,
-    fault: &AncestorFault<'_>,
-    stage: Stage,
-) -> String {
-    let below = match tree {
+pub fn supported_layout(tree: Tree) -> String {
+    let (tree, known) = match tree {
+        Tree::Data => ("data directory", "ProgramData"),
+        Tree::Program => ("program directory", "Program Files"),
+    };
+    format!(
+        "This layout is not supported: the setup program installs the boundary's {tree} only in the system's {known} folder, and only where that folder and every folder above it, up to the root of its volume, are plain folders on a fixed, local NTFS volume that only the system, the Administrators group and the installer service own or can replace."
+    )
+}
+
+/// The one sentence that ends the words of every folder that the installation does not make.
+const SHARED_CLOSING: &str =
+    "The setup program directs no change to a folder that other programs share.";
+
+/// How the words of a folder that the installation does not make end, before the run's changes.
+/// Every ending is fixed: a fault chooses one and cannot add words of its own.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// The layout is not supported.
+    Layout,
+    /// The volume did not answer, or its root is not there: it can come back.
+    VolumeAnswers,
+    /// The folder could not be opened or read: a program may hold it, or its volume may not answer.
+    HeldOrAnswers,
+}
+
+impl Ending {
+    fn words(self, tree: Tree) -> String {
+        match self {
+            Ending::Layout => supported_layout(tree),
+            Ending::VolumeAnswers => {
+                "Check that the volume is there and answers, then run the setup program again."
+                    .to_owned()
+            }
+            Ending::HeldOrAnswers => {
+                "Close the program that holds it open, or check that its volume is there and answers, then run the setup program again."
+                    .to_owned()
+            }
+        }
+    }
+}
+
+/// The refusal of a folder in the walk that reads the folders above and around the data directory
+/// and the program directory: the folder, the tree, why it is refused, what the run changed, and, by
+/// whose folder it is, what a supported layout is or what to correct. Nothing is removed or moved: a
+/// link or a mounted folder above the trees is the administrator's own layout, which the
+/// installation does not support and tells no one to change. `stage` says whether the run had
+/// changed anything.
+#[must_use]
+pub fn ancestor_refusal(folder: &str, tree: Tree, subject: &Subject<'_>, stage: Stage) -> String {
+    match subject {
+        Subject::Shared(fault) => shared_refusal(folder, tree, fault, stage),
+        Subject::Own(fault) => own_refusal(folder, tree, fault, stage),
+    }
+}
+
+/// The words of a tree in a refusal.
+fn below(tree: Tree) -> &'static str {
+    match tree {
         Tree::Data => "data directory (its manifest, its journal and the roots of its operations)",
         Tree::Program => "program directory (the program that the service runs as the system)",
+    }
+}
+
+/// The one function that builds the words of a folder that the installation does not make: what was
+/// found, then one fixed ending (what a supported layout is, or what to try that changes no
+/// folder), the program directory's keeping where the tree is the program's, what the run changed,
+/// and the closing sentence. A fault supplies what was found and chooses its ending; no fault can
+/// add an instruction to change the folder.
+fn shared_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage) -> String {
+    let below = below(tree);
+    let head = format!("{folder} is a folder above the boundary's {below}.");
+    let (found, ending) = match fault {
+        AncestorFault::Alias(found) => (
+            format!(
+                "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread."
+            ),
+            Ending::Layout,
+        ),
+        AncestorFault::Volume(reason) => (
+            format!("{head} It is on a volume that the installation does not use ({reason})."),
+            Ending::Layout,
+        ),
+        AncestorFault::Link => (
+            format!(
+                "{head} It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read."
+            ),
+            Ending::Layout,
+        ),
+        AncestorFault::NotAFolder => (
+            format!("{head} It is refused because it is not a folder."),
+            Ending::Layout,
+        ),
+        AncestorFault::List(why) => (
+            format!(
+                "{head} It is refused because {why}. An identity that may delete the folder, delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on a different folder than the one that it checked."
+            ),
+            Ending::Layout,
+        ),
+        AncestorFault::Writable(why) => (
+            format!(
+                "{head} It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program."
+            ),
+            Ending::Layout,
+        ),
+        AncestorFault::Unreadable(error) => (
+            format!(
+                "{head} It is refused because it could not be opened or read to be checked ({error})."
+            ),
+            Ending::HeldOrAnswers,
+        ),
+        AncestorFault::VolumeUnanswered(error) => (
+            format!(
+                "{head} It is refused because its volume did not answer ({error}). A drive that is being removed, a disk that has failed or a network share that has gone does not answer."
+            ),
+            Ending::VolumeAnswers,
+        ),
+        AncestorFault::RootMissing(error) => (
+            format!(
+                "{head} It is refused because the root of its volume is not there ({error}). A drive that has been removed or a disk that has failed leaves no root."
+            ),
+            Ending::VolumeAnswers,
+        ),
     };
-    let keep = "Do not remove or move it: it holds other things.";
+    let ending = ending.words(tree);
+    let kept = match tree {
+        Tree::Program => "Do not remove the program directory. ",
+        Tree::Data => "",
+    };
     let changes = stage.changes();
+    format!("{found} {ending} {kept}{changes} {SHARED_CLOSING}")
+}
+
+/// The words of a folder that the installation makes, which can tell the administrator what to
+/// correct. A fault that no such folder can have, and a volume that the installation does not use,
+/// say what they say for a folder that the installation does not make.
+fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage) -> String {
+    let below = below(tree);
+    let changes = stage.changes();
+    let kept = match tree {
+        Tree::Program => "Do not remove the program directory.",
+        Tree::Data => "",
+    };
     match fault {
-        AncestorFault::Alias(found) => format!(
-            "{folder} is a drive letter that is not the root of its volume: it leads to {found}. The installation reads every folder above the boundary's {below} up to the root of the volume, and a tree reached through {folder} would leave the folders above {found} unread. {changes} The setup program installs only in the system's own known folders, and one of them is reached through {folder}: end the substitution or redirection of that letter, or give the known folder a place on a volume's own root, then run the setup program again."
-        ),
-        AncestorFault::Volume(reason) => match tree {
-            Tree::Data => {
-                let layout = volume_layout("ProgramData");
-                format!(
-                    "{folder} is a folder above the boundary's {below}. It is on a volume that the installation does not use ({reason}): it keeps its data directory on a fixed, local NTFS volume, and nothing in {folder} can be corrected to make another volume one. {changes} {layout}"
-                )
-            }
-            Tree::Program => {
-                let layout = volume_layout("Program Files");
-                format!(
-                    "{folder} is a folder above the boundary's {below}. It is on a volume that the installation does not use ({reason}): it keeps its program directory on a fixed, local NTFS volume, and nothing in {folder} can be corrected to make another volume one. {changes} Do not remove the program directory. {layout}"
-                )
-            }
-        },
         AncestorFault::Link => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The system's default places have none. The setup program installs only in the system's own known folders and cannot be pointed at another path, and it directs no change to a folder that other programs share: run it on a computer where its known folders are plain folders."
-        ),
-        AncestorFault::OwnLink => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The setup program makes this folder itself, as a plain folder, in the system's own known folder. It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share. Do not remove the program directory."
+            "{folder} is a folder above the boundary's {below}. It is refused because it is a link or a mounted folder. The installation does not go through a link or a mounted folder at or above its trees: the folders above the place that the link leads to are not the ones that it read. This layout is not supported. {changes} The setup program makes this folder itself, as a plain folder, in the system's own known folder. It does not follow or change a link or a mounted folder in its place, and it directs no change to a folder that other programs share. {kept}"
         ),
         AncestorFault::NotAFolder => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder. The system's default places are folders. {changes} Correct the path, then run the setup program again. {keep}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} Remove or rename what is in its place if nothing else needs it, then run the setup program again. {kept}"
         ),
-        AncestorFault::VolumeUnanswered(error) => {
-            let kept = match tree {
-                Tree::Program => "Do not remove the program directory. ",
-                Tree::Data => "",
-            };
-            format!(
-                "{folder} is a folder above the boundary's {below}. It is refused because its volume did not answer ({error}). The installation asks a volume what it is before it reads anything on it, and a drive that is being removed, a disk that has failed or a network share that has gone does not answer. {changes} {kept}Check that the volume is there and answers, then run the setup program again."
-            )
-        }
         AncestorFault::Unreadable(error) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} Close the program that holds it open or correct who may open it, then run the setup program again. {keep}"
-        ),
-        AncestorFault::List(why) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because {why}. An identity that may delete the folder, delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on another place. {changes} If the reason names an owner, make the system, the Administrators group or the installer service its owner. If it names a right, remove or narrow the entry that allows it, an inherited entry too (a denying entry does not cancel an allowing one for this check), so that no other identity has the right to delete the folder, to delete or rename an entry in it, to change its list or to take its ownership, nor the generic forms that hold them (generic write, generic all and maximum allowed); the right to add an entry is what the system gives by default, and it stays allowed. If it names a missing list, give the folder a list of plain entries that the check reads. If it names an entry of a kind that the check does not read, replace that one entry with plain entries that the check reads, and keep every entry that denies something. Then run the setup program again. {keep}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} Close the program that holds it open or correct who may open it, then run the setup program again. {kept}"
         ),
         AncestorFault::Writable(why) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program. {changes} Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. Do not remove the program directory. Do not move this folder: it holds other things."
+            "{folder} is a folder above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program. {changes} Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. {kept} Do not move this folder: it holds other things."
         ),
+        AncestorFault::Alias(_)
+        | AncestorFault::Volume(_)
+        | AncestorFault::VolumeUnanswered(_)
+        | AncestorFault::RootMissing(_)
+        | AncestorFault::List(_) => shared_refusal(folder, tree, fault, stage),
     }
 }
 
