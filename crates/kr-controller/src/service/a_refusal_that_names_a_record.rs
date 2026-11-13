@@ -159,6 +159,7 @@ async fn an_authority_change_that_meets_a_refusal_it_cannot_read_is_not_told_aft
                 admission,
             )
             .await
+            .into_given()
     })
     .await;
 

@@ -265,6 +265,62 @@ impl std::fmt::Debug for OwnBarrier {
     }
 }
 
+/// Evidence that a request's own effect raised the barrier that withdrew every connection of this
+/// host, the request's own included.
+///
+/// A host-wide revision removes every connection admitted before it, so a request whose own effect
+/// raised one has its own connection withdrawn by it and nothing else has gone wrong. Only
+/// [`Controller::barrier_proving`] makes one: from a barrier that captured at least one host-wide
+/// debt of the request's own and no host-wide debt of anyone else's, and carrying the revision that
+/// barrier set. The local door asks the revision to be the one still in force when it tells the
+/// answer ([`Controller::withdrawal_stands`]), so a later withdrawal of any kind withholds it.
+pub(crate) struct HostWithdrawal {
+    debt: crate::grants::store::DebtId,
+    revision: AuthorityRevision,
+}
+
+impl std::fmt::Debug for HostWithdrawal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostWithdrawal")
+            .field("debt", &self.debt)
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+/// What a barrier's first step took: the revision it set and the debts it captured, with how far
+/// each reaches.
+struct Withdrawn {
+    revision: AuthorityRevision,
+    captured: BTreeMap<crate::grants::store::DebtId, Reach>,
+}
+
+impl Withdrawn {
+    fn debts(&self) -> Vec<crate::grants::store::DebtId> {
+        self.captured.keys().copied().collect()
+    }
+
+    /// The proof that `own` withdrew the whole host, when this first step shows it: a host-wide
+    /// debt among the request's own, and no host-wide debt that is not.
+    fn proof_for(&self, own: &[crate::grants::store::DebtId]) -> Option<HostWithdrawal> {
+        let mut own_host = None;
+        for (debt, reach) in &self.captured {
+            if *reach != Reach::Host {
+                continue;
+            }
+            if !own.contains(debt) {
+                return None;
+            }
+            own_host.get_or_insert(*debt);
+        }
+        own_host.map(|debt| HostWithdrawal {
+            debt,
+            revision: self.revision,
+        })
+    }
+}
+
 /// Which published debts a barrier's first step captures ([`Controller::withdraw`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Capture {
@@ -354,7 +410,7 @@ async fn debt_pass(
             {
                 // The daemon has gone, or goes now that this pass has let it go.
                 None => return,
-                Some(Ok(captured)) => untold.extend(captured.into_iter().flatten()),
+                Some(Ok(withdrawn)) => untold.extend(withdrawn.iter().flat_map(Withdrawn::debts)),
                 Some(Err(error)) => eprintln!(
                     "kr-controller: a barrier this host owes could not be raised yet, so nothing \
                      is admitted or forwarded until it is: {error}"
@@ -1071,12 +1127,40 @@ impl Controller {
     /// not capture stays published then, so admission and forwarding stay refused until the debt
     /// pass raises its barrier.
     pub(crate) async fn barrier(&self, own: OwnBarrier) -> Result<RevocationBarrier> {
+        self.barrier_proving(own).await.map(|(barrier, _)| barrier)
+    }
+
+    /// [`Self::barrier`], and the proof that the request's own debts withdrew the whole host when
+    /// they did ([`HostWithdrawal`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::barrier`].
+    pub(crate) async fn barrier_proving(
+        &self,
+        own: OwnBarrier,
+    ) -> Result<(RevocationBarrier, Option<HostWithdrawal>)> {
         let withdrawn = self.withdraw(Capture::Every, &own.debts).await;
+        let proof = withdrawn
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .and_then(|withdrawn| withdrawn.proof_for(&own.debts));
         drop(own);
         match withdrawn? {
-            Some(captured) => self.tell(&captured).await,
-            None => self.announce_authority_revision().await,
+            Some(withdrawn) => Ok((self.tell(&withdrawn.debts()).await?, proof)),
+            None => Ok((self.announce_authority_revision().await?, None)),
         }
+    }
+
+    /// Whether the revision in force is still the one `withdrew` set: no later barrier, of this
+    /// request or of any other, has moved it. An unreadable registry counts as moved.
+    pub(crate) async fn withdrawal_stands(&self, withdrew: &HostWithdrawal) -> bool {
+        self.registry
+            .lock()
+            .await
+            .authority_revision()
+            .is_ok_and(|revision| revision == withdrew.revision)
     }
 
     /// The published debts one barrier takes: the ones `first` names, then the rest while what they
@@ -1301,7 +1385,7 @@ impl Controller {
         &self,
         capture: Capture,
         first: &[crate::grants::store::DebtId],
-    ) -> Result<Option<Vec<crate::grants::store::DebtId>>> {
+    ) -> Result<Option<Withdrawn>> {
         let captured = {
             let mut registry = self.registry.lock().await;
             let captured = self.capturable(&capture, first);
@@ -1391,7 +1475,7 @@ impl Controller {
         // waiting for its peer is stopped by its connection closing, not by the next check. Only a
         // connection whose registration went is closed, so a narrower reach closes only its own.
         self.fence_network_connections().await;
-        Ok(Some(captured.into_keys().collect()))
+        Ok(Some(Withdrawn { revision, captured }))
     }
 
     /// A barrier's second step: every worker is told the revision in force, the policy and the
@@ -1461,7 +1545,7 @@ impl Controller {
     /// Returns the barrier's error; a debt it could not capture stays published.
     pub(crate) async fn raise_owed_barrier(&self) -> Result<Option<RevocationBarrier>> {
         match self.withdraw(Capture::Left, &[]).await? {
-            Some(captured) => self.tell(&captured).await.map(Some),
+            Some(withdrawn) => self.tell(&withdrawn.debts()).await.map(Some),
             None => Ok(None),
         }
     }
