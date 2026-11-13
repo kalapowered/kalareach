@@ -144,6 +144,7 @@ begin-3 | is not there, so no manifest says what to remove | X is not there, so 
 
 # ---- win/install.rs
 inject-1 | a failure was injected after the | a failure was injected after the step | rule: the testing feature's injected failure; no fact about the machine
+inject-2 | the manifest could not be damaged as the test asked | the manifest could not be damaged as the test asked (why) | read: the test build only: `KR_BOUNDARY_DAMAGE_MANIFEST` is set at the injected failure's step, and the open of the manifest's name relative to the run's handle of the data directory, the write, the mark for removal, or the value itself (neither `garbage` nor `absent`) failed; no product build has this seam
 entry-1 | exists, and no manifest of the installation records it | an account named N exists, and no manifest of the installation records it | read: account::find found the account and no manifest records it
 entry-2 | exists, and no manifest of the installation records it | a service named N exists, and no manifest of the installation records it | read: the service manager opened the service and no manifest records it
 entry-3 | exists, and no manifest of the installation records it | X exists, and no manifest of the installation records it | read: records::look answered There and no manifest records it
