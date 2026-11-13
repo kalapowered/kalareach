@@ -3263,7 +3263,10 @@ fn installation_record(directory: &std::path::Path) -> Option<std::path::PathBuf
 }
 
 /// An installation of the Codex tools at project scope in `project`, under a fresh identifier.
-fn installation_in(temp: &kr_ipc::testing::TempHost, project: &std::path::Path) -> MutationRequest {
+pub(super) fn installation_in(
+    temp: &kr_ipc::testing::TempHost,
+    project: &std::path::Path,
+) -> MutationRequest {
     use kr_protocol::skill::{AgentTarget, AgentToolsParams, InstallScope};
 
     mutation_of(
