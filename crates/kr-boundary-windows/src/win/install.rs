@@ -3995,25 +3995,51 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     // (6) the accounts, their rights and the files.
     for object in manifest.of_kind(ObjectKind::Account) {
         let name = object.id.clone();
+        let recorded = object.detail.clone();
         keep(
             (|| -> Result<(), Error> {
-                // A lookup that failed ends this step before anything of the account is changed:
-                // only a lookup that answered "no such account" goes on without a right to take away.
-                let found = account::find(&name)?;
-                if let Some(sid) = &found {
+                // The account is looked up by the identifier that the manifest records, so an
+                // account that has been renamed is found; only where the manifest records none is
+                // it looked up by its name. A lookup that failed ends this step before anything of
+                // the account is changed: only a lookup that answered "no such account" goes on
+                // without a right to take away.
+                let found = match &recorded {
+                    Some(id) => account::find_by_id(id)?,
+                    None => account::find(&name)?.map(|sid| (sid, name.clone())),
+                };
+                if let Some((sid, _)) = &found {
                     account::revoke_all_rights(sid)?;
                     account::delete_profile(sid)?;
                 }
                 account::unhide_from_sign_in(&name)?;
-                account::delete(&name)?;
-                if found.is_some() {
-                    // text: remove_at-20
-                    say(&format!("account {name} is removed with its rights"));
-                } else {
-                    // text: remove_at-20-not-found
-                    say(&format!(
-                        "account {name} is not found by its name, so its rights were not taken away"
-                    ));
+                match (&found, &recorded) {
+                    (Some((_, current)), _) => account::delete(current)?,
+                    (None, None) => account::delete(&name)?,
+                    (None, Some(_)) => {}
+                }
+                match (&found, &recorded) {
+                    (Some((_, current)), _) if *current == name => {
+                        // text: remove_at-20
+                        say(&format!("account {name} is removed with its rights"));
+                    }
+                    (Some((_, current)), _) => {
+                        // text: remove_at-20-renamed
+                        say(&format!(
+                            "account {name} is named {current} now, and is removed with its rights"
+                        ));
+                    }
+                    (None, None) => {
+                        // text: remove_at-20-not-found
+                        say(&format!(
+                            "account {name} is not found by its name, and the manifest records no identifier for it, so its rights were not taken away"
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        // text: remove_at-20-no-identifier
+                        say(&format!(
+                            "no account has the identifier that the manifest records for {name}, so no rights were taken away"
+                        ));
+                    }
                 }
                 Ok(())
             })(),
@@ -4046,12 +4072,16 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         ));
     }
     if let Some(prior) = &prior {
-        match residue(prior, paths) {
-            Ok((left, shared)) if left.is_empty() => {
+        match residue(prior, paths, &manifest) {
+            Ok(Residue {
+                left,
+                shared,
+                accounts,
+            }) if left.is_empty() => {
                 if let Some(shared) = shared {
                     // text: remove_at-22-present
                     say(&format!(
-                        "the policy shows no difference from the present policy without the installation's rules ({}, so the earlier-state record is not the comparison{}); the two accounts and the sign-in list's values for them are not there, the broker's service is not there or is marked for deletion, and the program directory is not there",
+                        "the policy shows no difference from the present policy without the installation's rules ({}, so the earlier-state record is not the comparison{}); {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there",
                         shared.words(),
                         if shared.allow_all_stays {
                             "; the allow-all rule stays"
@@ -4061,12 +4091,12 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                     ));
                 } else {
                     // text: remove_at-22
-                    say(
-                        "the policy shows no difference from the earlier-state record; the two accounts and the sign-in list's values for them are not there, the broker's service is not there or is marked for deletion, and the program directory is not there",
-                    );
+                    say(&format!(
+                        "the policy shows no difference from the earlier-state record; {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there"
+                    ));
                 }
             }
-            Ok((left, _)) => {
+            Ok(Residue { left, .. }) => {
                 for line in &left {
                     // text: remove_at-23
                     say(&format!("the check after the removal found: {line}"));
@@ -4251,18 +4281,31 @@ fn shared_rules(policy: &Policy) -> Option<Shared> {
     })
 }
 
+/// What a check after a removal found, and what it read.
+pub struct Residue {
+    /// What is left, or could not be read, one line each; empty where every comparison holds.
+    pub left: Vec<String>,
+    /// The rules that the installation did not make, where the policy was compared with the present
+    /// policy less the installation's rules.
+    pub shared: Option<Shared>,
+    /// What the check read of the two accounts where nothing of them was found: for each, that no
+    /// account has the identifier that the manifest records, or the name where it records none.
+    pub accounts: String,
+}
+
 /// What the machine shows of the installation after a removal, and what the policy was compared
 /// with. The policy is compared with the earlier-state record, or, where a rule that the
 /// installation did not make has joined the executable collection, with the present policy without
-/// the installation's rules (the second part is the rules that are there then). The accounts, the sign-in list, the broker's service and the
-/// program directory are compared with their not being there. An empty list means that each
-/// comparison holds. The data directory is not counted: it holds the records this check reads, and
+/// the installation's rules (the second part is the rules that are there then). Each account is
+/// looked up by the identifier that the manifest records for it, or by its name where the manifest
+/// records none; the sign-in list, the broker's service and the program directory are looked at too.
+/// All are compared with their not being there. An empty list means that each comparison holds. The data directory is not counted: it holds the records this check reads, and
 /// goes last.
 ///
 /// # Errors
 ///
 /// Returns the failure of a call that could not look.
-pub fn residue(prior: &Prior, paths: &Paths) -> Result<(Vec<String>, Option<Shared>), Error> {
+pub fn residue(prior: &Prior, paths: &Paths, manifest: &Manifest) -> Result<Residue, Error> {
     let mut left = Vec::new();
     let (_, effective) = Channel::new(&paths.staging).effective()?;
     let baseline = Policy::parse(&prior.policy_xml).map_err(|error| {
@@ -4281,13 +4324,37 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<(Vec<String>, Option<Shar
         baseline
     };
     left.extend(effective.differences(&expected));
+    let mut read = Vec::new();
     for name in [CHECKOUT, CONNECT] {
-        match account::find(name) {
-            Ok(Some(_)) => left.push(format!("the account {name} is still there")),
-            Ok(None) => {}
-            Err(error) => left.push(format!(
-                "a lookup of the account {name} failed ({error}), so whether it is gone is not known"
-            )),
+        // Each account is looked up by the identifier that the manifest records for it, so an
+        // account that has been renamed is found; where the manifest records none, by its name.
+        let recorded = manifest
+            .find(ObjectKind::Account, name)
+            .and_then(|object| object.detail.as_deref());
+        match recorded {
+            Some(id) => match account::find_by_id(id) {
+                Ok(Some((_, now))) if now == name => {
+                    left.push(format!("the account {name} is still there"));
+                }
+                Ok(Some((_, now))) => {
+                    left.push(format!("the account {name} is still there, named {now}"));
+                }
+                Ok(None) => read.push(format!(
+                    "no account has the identifier that the manifest records for {name}"
+                )),
+                Err(error) => left.push(format!(
+                    "a lookup of the account that has the identifier recorded for {name} failed ({error}), so whether it is gone is not known"
+                )),
+            },
+            None => match account::find(name) {
+                Ok(Some(_)) => left.push(format!("the account {name} is still there")),
+                Ok(None) => read.push(format!(
+                    "no account has the name {name}, and the manifest records no identifier for it"
+                )),
+                Err(error) => left.push(format!(
+                    "a lookup of the account {name} failed ({error}), so whether it is gone is not known"
+                )),
+            },
         }
         if account::hidden_from_sign_in(name)? {
             left.push(format!("the sign-in list still has a value for {name}"));
@@ -4306,5 +4373,9 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<(Vec<String>, Option<Shar
             paths.program.display()
         )),
     }
-    Ok((left, shared))
+    Ok(Residue {
+        left,
+        shared,
+        accounts: read.join("; "),
+    })
 }

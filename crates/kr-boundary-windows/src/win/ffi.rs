@@ -8,7 +8,8 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 use windows_sys::Win32::Security::{
@@ -31,6 +32,17 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// What the system names an account that has an identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Named {
+    /// The name of the account's domain: this computer's account domain for a local account.
+    pub domain: String,
+    /// The account's own name in it.
+    pub name: String,
+    /// Whether the identifier is that of a user account.
+    pub user: bool,
+}
 
 /// The result of a call into the platform.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -397,15 +409,19 @@ impl Sid {
         self.storage.as_ptr().cast_mut().cast()
     }
 
-    /// The account's name as the system resolves it, with its domain (`BUILTIN\Users`), or `None`
-    /// where it does not resolve.
-    #[must_use]
-    pub fn account_name(&self) -> Option<String> {
-        use windows_sys::Win32::Security::LookupAccountSidW;
+    /// The account that has this identifier, as the system resolves it: `Some` where an account has
+    /// it, `None` where the system answers that no account has it (its "no mapping" answer).
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the lookup failed for any other reason: nothing is then
+    /// known about the account.
+    pub fn lookup_account(&self) -> Result<Option<Named>> {
+        use windows_sys::Win32::Security::{LookupAccountSidW, SidTypeUser};
         let (mut name_length, mut domain_length) = (0_u32, 0_u32);
         let mut kind: SID_NAME_USE = 0;
         // SAFETY: the identifier is valid; with no buffers the call only reports the sizes.
-        unsafe {
+        let sized = unsafe {
             LookupAccountSidW(
                 null(),
                 self.as_ptr(),
@@ -414,12 +430,20 @@ impl Sid {
                 null_mut(),
                 &raw mut domain_length,
                 &raw mut kind,
-            );
+            )
+        };
+        if sized == 0 {
+            // SAFETY: reads the calling thread's last error.
+            let code = unsafe { GetLastError() };
+            if code == ERROR_NONE_MAPPED {
+                return Ok(None);
+            }
+            if code != ERROR_INSUFFICIENT_BUFFER {
+                // text: ffi_lookup_account-1
+                return Err(error(code, "looking up the account that has an identifier"));
+            }
         }
-        if name_length == 0 {
-            return None;
-        }
-        let mut name = vec![0_u16; name_length as usize];
+        let mut name = vec![0_u16; name_length.max(1) as usize];
         let mut domain = vec![0_u16; domain_length.max(1) as usize];
         // SAFETY: both buffers are the sizes the first call asked for.
         let found = unsafe {
@@ -434,19 +458,36 @@ impl Sid {
             )
         };
         if found == 0 {
-            return None;
+            // SAFETY: reads the calling thread's last error.
+            let code = unsafe { GetLastError() };
+            if code == ERROR_NONE_MAPPED {
+                return Ok(None);
+            }
+            // text: ffi_lookup_account-2
+            return Err(error(code, "looking up the account that has an identifier"));
         }
         name.truncate(name_length as usize);
         domain.truncate(domain_length as usize);
-        let (name, domain) = (
-            String::from_utf16_lossy(&name),
-            String::from_utf16_lossy(&domain),
-        );
-        Some(if domain.is_empty() {
-            name
-        } else {
-            format!("{domain}\\{name}")
-        })
+        Ok(Some(Named {
+            domain: String::from_utf16_lossy(&domain),
+            name: String::from_utf16_lossy(&name),
+            user: kind == SidTypeUser,
+        }))
+    }
+
+    /// The account's name as the system resolves it, with its domain (`BUILTIN\Users`), or `None`
+    /// where it does not resolve or the lookup failed: it is for showing the identifier beside a
+    /// name, and nothing decides on it.
+    #[must_use]
+    pub fn account_name(&self) -> Option<String> {
+        match self.lookup_account() {
+            Ok(Some(Named { domain, name, .. })) => Some(if domain.is_empty() {
+                name
+            } else {
+                format!("{domain}\\{name}")
+            }),
+            Ok(None) | Err(_) => None,
+        }
     }
 
     /// The identifier as text.
