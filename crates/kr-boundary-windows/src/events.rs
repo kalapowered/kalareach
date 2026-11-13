@@ -73,6 +73,16 @@ pub enum EventError {
         /// The element: the event's number or the record's.
         name: String,
     },
+    /// The element of a number holds something beside its text: a comment, a CDATA section, an
+    /// element or another item.
+    // text: events-7
+    #[error(
+        "the application-control log gave the {name} with something beside its text (a comment, a CDATA section, an element or another item), so which text is its number is not known"
+    )]
+    NotOneText {
+        /// The element: the event's number or the record's.
+        name: String,
+    },
     /// An event holds no element of one of its numbers.
     // text: events-6
     #[error("the application-control log gave an event with no {name}")]
@@ -97,10 +107,18 @@ pub fn parse(xml: &str) -> Result<Vec<LogEvent>, EventError> {
     let mut current: Option<LogEvent> = None;
     let mut numbers = Numbers::default();
     let mut field: Option<String> = None;
+    // The element of a number that is open: it holds one text, and a reference that stands for a
+    // character, and nothing else.
+    let mut number_open: Option<String> = None;
     loop {
         let event = reader
             .read_event()
             .map_err(|error| EventError::Unreadable(error.to_string()))?;
+        if let Some(name) = &number_open
+            && !matches!(event, Event::Text(_) | Event::GeneralRef(_) | Event::End(_))
+        {
+            return Err(EventError::NotOneText { name: name.clone() });
+        }
         match event {
             Event::Start(element) => {
                 let name = element.local_name().as_ref().to_owned();
@@ -110,6 +128,9 @@ pub fn parse(xml: &str) -> Result<Vec<LogEvent>, EventError> {
                 } else if current.is_some() {
                     // An element of a number that is there is read, whatever it holds.
                     numbers.begin(&name)?;
+                    if matches!(name.as_str(), "EventID" | "EventRecordID") {
+                        number_open = Some(name.clone());
+                    }
                     field = Some(name);
                 }
             }
@@ -163,6 +184,7 @@ pub fn parse(xml: &str) -> Result<Vec<LogEvent>, EventError> {
                 } else {
                     field = None;
                 }
+                number_open = None;
             }
             Event::Eof => break,
             _ => {}

@@ -248,15 +248,20 @@ fn a_policy_entry_with_a_missing_or_unknown_field_is_refused_as_not_understood()
     for sid in [
         "whatever",
         "S-1",
-        "S-1-1",
         "S-1-",
         "S-1-1-0-",
+        "S-1-5-",
         "S-2-1-0",
         "S-1-5-21-111-x-333-1001",
         "S-1-+5-32-544",
         "S-1-5-4294967296",
         "S-1-5-021",
         "S-1-281474976710656-1",
+        "S-1-0x00000000ffff-1",
+        "S-1-0x0001000000000-1",
+        "S-1-0x00010000000-1",
+        "S-1-0x00010000000g-1",
+        "S-1-0x-1",
         "S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16",
         "{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}",
     ] {
@@ -273,9 +278,32 @@ fn a_policy_entry_with_a_missing_or_unknown_field_is_refused_as_not_understood()
         r#"Action="Deny" UserOrGroupSid=" s-1-5-32-544 " Id=" {b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01} ""#,
         r#"Action="Deny" UserOrGroupSid="S-1-5-4294967295" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
         r#"Action="Deny" UserOrGroupSid="S-1-281474976710655-0" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
+        // An authority of 2^32 or more is written in hexadecimal, twelve digits, in either case.
+        r#"Action="Deny" UserOrGroupSid="S-1-0x000100000000-1" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
+        r#"Action="Deny" UserOrGroupSid="S-1-0XFFFFFFFFFFFF-5-6" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
+        // An identifier with no sub-authority is a structure that the system can write.
+        r#"Action="Deny" UserOrGroupSid="S-1-5" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
+        r#"Action="Deny" UserOrGroupSid="S-1-1" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
         r#"Action="Deny" UserOrGroupSid="S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
     ] {
         Policy::parse(&rule(attributes)).expect("an identifier of its form is read");
+    }
+    // The attributes of an entry are read in one pass, and a name that is given twice is refused
+    // whichever field is asked for first: the reviewers' example puts the repeated name after a
+    // valid one, in an order in which every lookup of a required field stops before it.
+    for attributes in [
+        r#"Action="Allow" UserOrGroupSid="S-1-1-0" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}" Id="{}""#,
+        r#"Action="Allow" Action="Deny" UserOrGroupSid="S-1-1-0" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}""#,
+        r#"Action="Allow" UserOrGroupSid="S-1-1-0" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}" x:Id="{}" xmlns:x="urn:x""#,
+    ] {
+        let error = Policy::parse(&rule(attributes)).expect_err("a repeated attribute is refused");
+        assert!(
+            matches!(
+                error,
+                kr_boundary_windows::policy::PolicyError::Unreadable(_)
+            ),
+            "{error}"
+        );
     }
     let condition = |condition: &str| {
         format!(
@@ -615,6 +643,7 @@ fn an_event_with_an_empty_or_missing_number_or_a_second_element_of_one_is_refuse
         Err(events::EventError::NotANumber { name, .. }) => format!("not a number: {name}"),
         Err(events::EventError::Repeated { name }) => format!("twice: {name}"),
         Err(events::EventError::Missing { name }) => format!("missing: {name}"),
+        Err(events::EventError::NotOneText { name }) => format!("beside its text: {name}"),
         other => format!("{other:?}"),
     };
     // An element with no content is a number that is not there, not a record number of zero.
@@ -652,6 +681,40 @@ fn an_event_with_an_empty_or_missing_number_or_a_second_element_of_one_is_refuse
         name_of("<EventID>8004</EventID><EventRecordID>77</EventRecordID><EventRecordID/>"),
         "twice: EventRecordID"
     );
+    // A number's element holds its text and nothing else: a CDATA section, a comment, a nested
+    // element or an instruction beside the text is refused, and so is one before it. The reviewers'
+    // own example had a CDATA part after the digits and the parser took the digits for the number.
+    assert_eq!(
+        name_of("<EventID>8004</EventID><EventRecordID>77<![CDATA[bad]]></EventRecordID>"),
+        "beside its text: EventRecordID"
+    );
+    assert_eq!(
+        name_of("<EventID><![CDATA[8004]]></EventID><EventRecordID>77</EventRecordID>"),
+        "beside its text: EventID"
+    );
+    assert_eq!(
+        name_of("<EventID>80<!-- one -->04</EventID><EventRecordID>77</EventRecordID>"),
+        "beside its text: EventID"
+    );
+    assert_eq!(
+        name_of("<EventID>8004</EventID><EventRecordID>7<Data>x</Data>7</EventRecordID>"),
+        "beside its text: EventRecordID"
+    );
+    assert_eq!(
+        name_of("<EventID>8004</EventID><EventRecordID>7<Data/>7</EventRecordID>"),
+        "beside its text: EventRecordID"
+    );
+    assert_eq!(
+        name_of("<EventID>8004</EventID><EventRecordID>77<?note x?></EventRecordID>"),
+        "beside its text: EventRecordID"
+    );
+    // A reference that stands for a character is part of the text: it splits the text and nothing
+    // else, and a comment or a section in another element of the event is not a number's concern.
+    let split = events::parse(&event(
+        "<EventID>80&#48;4</EventID><EventRecordID> 77 </EventRecordID><!-- n --><Data><![CDATA[x]]></Data>",
+    ))
+    .unwrap();
+    assert_eq!((split[0].id, split[0].record), (8004, 77));
     // Two events each carry their own numbers once.
     let two = events::parse(&format!(
         "{}{}",

@@ -184,8 +184,26 @@ fn is_number_up_to(part: &str, largest: u64) -> bool {
             <= largest
 }
 
-/// Whether a normalised account identifier is a security identifier: `S-1-`, an authority of up to
-/// 48 bits, and one to fifteen sub-authorities of up to 32 bits, each in decimal digits alone.
+/// Whether the identifier authority of a normalised security identifier is one that the system
+/// writes: a decimal number of up to 48 bits, or, for an authority of 2^32 or more, which the system
+/// writes in hexadecimal, `0X` and exactly twelve hexadecimal digits of which the first four are not
+/// all zero.
+fn is_authority(part: &str) -> bool {
+    match part.strip_prefix("0X") {
+        Some(hex) => {
+            hex.len() == 12
+                && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                && !hex.starts_with("0000")
+        }
+        None => is_number_up_to(part, (1 << 48) - 1),
+    }
+}
+
+/// Whether a normalised account identifier is a security identifier: `S-1-`, an authority as
+/// [`is_authority`] reads it, and up to fifteen sub-authorities of up to 32 bits, each in decimal
+/// digits alone. An identifier with no sub-authority is a structure that the system can write, so it
+/// is read as one: no check here shows that the platform never names such an identifier for an
+/// account, and a refusal of a policy that the platform wrote would stop an installation for nothing.
 fn is_account_id(sid: &str) -> bool {
     let parts: Vec<&str> = sid.split('-').collect();
     let [prefix, revision, authority, subs @ ..] = parts.as_slice() else {
@@ -193,8 +211,8 @@ fn is_account_id(sid: &str) -> bool {
     };
     *prefix == "S"
         && *revision == "1"
-        && is_number_up_to(authority, (1 << 48) - 1)
-        && (1..=15).contains(&subs.len())
+        && is_authority(authority)
+        && subs.len() <= 15
         && subs
             .iter()
             .all(|sub| is_number_up_to(sub, u64::from(u32::MAX)))
@@ -503,17 +521,29 @@ impl Policy {
     }
 }
 
+/// The value of the attribute of this name, read in one pass over every attribute of the element:
+/// an element that gives any name twice is refused, whichever name is asked for, so a repeated
+/// attribute is never passed over by a lookup that finds its first one.
 fn attribute(element: &BytesStart<'_>, name: &str) -> Result<Option<String>, PolicyError> {
+    let mut found = None;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|error| PolicyError::Unreadable(error.to_string()))?;
-        if attribute.key.local_name().as_ref() == name {
+        let key = attribute.key.local_name();
+        if !seen.insert(key.as_ref().to_owned()) {
+            return Err(PolicyError::Unreadable(format!(
+                "an element gives the attribute {} twice",
+                key.as_ref()
+            )));
+        }
+        if key.as_ref() == name {
             let value = attribute
                 .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|error| PolicyError::Unreadable(error.to_string()))?;
-            return Ok(Some(value.into_owned()));
+            found = Some(value.into_owned());
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// A field that the entry must carry and must give a value to: its value, or the refusal that names
