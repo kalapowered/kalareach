@@ -10,6 +10,8 @@ import { Buffer } from 'node:buffer'
 
 import { expect, test, type CDPSession, type Page } from '@playwright/test'
 
+import { CLICK_AWAY } from '../src/markdown/link-target'
+
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 /** Opens the phone's session on `surface`, on a screen the size of a current phone's. */
@@ -455,8 +457,32 @@ async function tapAndRead(
     )
     throw new Error(`${(error as Error).message}; ${where}`, { cause: error })
   }
-  return { clicks: (await clicksSeen(page)).slice(clicksBefore), opened: (await openedLinks(page)).slice(openedBefore), lit: (await looksSeen(page)).slice(looksBefore).map((look) => look.lit), presses: (await looksSeen(page)).slice(looksBefore) }
+  const presses = (await looksSeen(page)).slice(looksBefore)
+  const clicks = (await clicksSeen(page)).slice(clicksBefore)
+  noteAway(page, presses, clicks)
+  return { clicks, opened: (await openedLinks(page)).slice(openedBefore), lit: presses.map((look) => look.lit), presses }
 }
+
+/** The farthest that a browser click lay from its tap's press in a case, in px: logged, and held to the handler's bound. */
+const farthestAway = new WeakMap<Page, number>()
+
+/** Logs how far the browser's click of a tap lay from its press, and holds it to the bound that the handler uses. */
+function noteAway(page: Page, presses: readonly Look[], clicks: readonly Clicked[]): void {
+  const press = presses[0]
+  if (press === undefined) return
+  for (const click of browsers(clicks)) {
+    const away = Math.hypot(click.x - press.x, click.y - press.y)
+    farthestAway.set(page, Math.max(farthestAway.get(page) ?? 0, away))
+    expect(away, `the distance from the press at ${String(press.x)}, ${String(press.y)} to its click (${click.named})`).toBeLessThanOrEqual(CLICK_AWAY)
+  }
+}
+
+test.afterEach(({ page }, info) => {
+  const away = farthestAway.get(page)
+  if (away === undefined) return
+  info.annotations.push({ type: 'press-to-click', description: `${away.toFixed(2)} px (the bound is ${CLICK_AWAY.toFixed(2)})` })
+  console.log(`press-to-click ${info.project.name} ${away.toFixed(2)}`)
+})
 
 const openedLinks = (page: Page): Promise<string[]> => page.evaluate(() => window.krTestHost?.openedLinks.slice() ?? [])
 const pressedLooks = (page: Page): Promise<number> => page.evaluate(() => document.querySelectorAll('.md-link[data-pressed]').length)
