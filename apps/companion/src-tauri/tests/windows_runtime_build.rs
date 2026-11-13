@@ -15,13 +15,13 @@ fn refused(target_os: &str, target_env: &str, input: Option<&str>) -> Option<&'s
 }
 
 #[test]
-fn an_msvc_build_that_asks_for_the_static_runtime_is_refused_with_the_way_to_start_it() {
+fn an_msvc_build_that_asks_for_the_static_runtime_is_refused_with_the_command_that_starts_it() {
     // The Tauri command line sets `true`; the build step takes any value but `false` as a request.
     for value in ["true", "1", ""] {
         let words = refused("windows", "msvc", Some(value))
             .unwrap_or_else(|| panic!("a build with {value:?} was not refused"));
         assert!(
-            words.contains("STATIC_VCRUNTIME=false"),
+            words.contains("pnpm -C apps/companion desktop build"),
             "{value:?}: {words}"
         );
     }
