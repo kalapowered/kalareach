@@ -1806,6 +1806,14 @@ impl Broker {
         Ok(())
     }
 
+    /// Forgets one binding, for this host's own tests that bind a package to an instance a test's
+    /// own descriptor is bound to, since an instance has one binding. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    pub fn forget_binding(&self, binding_id: BrokerBindingId) {
+        self.state().forget(vec![binding_id], kr_ipc::now_ms());
+    }
+
     /// Returns every live binding with the release it holds, for a report on plugin admissions.
     ///
     /// Only a binding made from admissions knows its release; one made from a test's own

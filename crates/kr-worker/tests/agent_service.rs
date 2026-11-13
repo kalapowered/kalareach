@@ -4112,6 +4112,8 @@ fn bind_the_example(host: &Host) -> (BrokerBindingId, tempfile::TempDir) {
         1,
     );
     let bound = BrokerBindingId::new(Uuid::from_bytes([41; 16]));
+    // The suite's own descriptor is bound to the instance, and an instance has one binding.
+    broker.forget_binding(binding());
     broker
         .bind(
             bound,
