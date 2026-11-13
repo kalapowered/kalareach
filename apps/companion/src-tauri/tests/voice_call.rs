@@ -2396,9 +2396,10 @@ async fn a_check_of_the_host_path_that_does_not_reach_the_host_says_so_in_place_
         .close();
     let refused = scene
         .state_where("the connection that was not opened", |state| {
-            problem_words(state, "host_path")
-                .iter()
-                .any(|words| words.contains("The connection to the host was not opened"))
+            problem_words(state, "host_path").iter().any(|words| {
+                words.contains("The connection to the host was not opened")
+                    && words.contains("the host refused the connection")
+            })
         })
         .await;
     assert_eq!(refused["host"], "lost");

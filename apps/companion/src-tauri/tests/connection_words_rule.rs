@@ -51,9 +51,18 @@
 //!   `ConnectionRefused(refusal) => Unopened::NotAdmitted(refusal.into())`, because
 //!   `Unopened::NotAdmitted` holds the host's words (`connection::HostWords`) and no conversion from
 //!   a refusal into them exists, so only `Unopened::of_refused_connection` makes that cause, and the
-//!   compiler, not this rule, keeps it so.
+//!   compiler, not this rule, keeps it so;
+//! - a refusal's `.message` that comes after `]` or `?` (`errors[0].message.contains(..)`,
+//!   `reply?.message == ..`) or at the start of a line, where the text before it names no receiver,
+//!   and `.message.clone().contains(..)`, where a call stands between the field and the search;
+//! - a function of a needle that is used as a value with no call (`.and_then(Wire::kept_refusal)`,
+//!   `let read = Unopened::refusal_kept_by;`), or called with white space before its bracket, so
+//!   that the text does not hold the name and its opening bracket together;
+//! - a header-named exception takes the first line of the last `fn` before the hit: two functions
+//!   under one type whose signatures begin with the same line, a signature that spans lines whose
+//!   first line is the same in both, and a nested `fn` that holds the hit, are not told apart.
 //!
-//! A reading of these forms is found by review of the change that adds it, and by the compiler where
+//! None of these forms is used by product code. A reading of these forms is found by review of the change that adds it, and by the compiler where
 //! the cause's types forbid it.
 
 use std::collections::BTreeMap;
@@ -346,21 +355,21 @@ const EXCEPTIONS: [Exception; 64] = [
         function: "link",
         needle: COMPARED,
         lines: 1,
-        reason: "the refusal of a question request, answered on a connection that is open; it decides nothing about a connection that was not opened",
+        reason: "the error of a question's link: the link's acquisition, which is told by its cause, or the refusal of a question request answered on a connection that is open; it decides nothing about a connection that was not opened",
     },
     Exception {
         file: "questions.rs",
         function: "link",
         needle: MATCHED,
         lines: 1,
-        reason: "the refusal of a question request, answered on a connection that is open; it decides nothing about a connection that was not opened",
+        reason: "the error of a question's link: the link's acquisition, which is told by its cause, or the refusal of a question request answered on a connection that is open; it decides nothing about a connection that was not opened",
     },
     Exception {
         file: "questions.rs",
         function: "link",
         needle: USED,
         lines: 1,
-        reason: "the refusal of a question request, answered on a connection that is open; it decides nothing about a connection that was not opened",
+        reason: "the error of a question's link: the link's acquisition, which is told by its cause, or the refusal of a question request answered on a connection that is open; it decides nothing about a connection that was not opened",
     },
     Exception {
         file: "questions.rs",

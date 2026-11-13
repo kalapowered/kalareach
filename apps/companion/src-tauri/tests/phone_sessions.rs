@@ -2764,10 +2764,9 @@ async fn kr_req_19_08_a_device_revoked_before_its_admission_is_told_the_hosts_wo
     assert!(!told.is_empty(), "the watch told what its tries came to");
     for told in told {
         assert_eq!(told["state"], "reconnecting", "{told}");
-        assert_ne!(
-            told["reason"],
-            first.as_str(),
-            "the host's earlier words are not kept: {told}"
+        assert_eq!(
+            told["reason"], "the host could not be reached",
+            "each later try says that the host was not reached: {told}"
         );
     }
     adopted.stop().await;
@@ -3468,9 +3467,9 @@ async fn kr_req_19_08_a_view_opened_again_says_what_its_last_try_came_to() {
     control.end_connections(true);
     open_view(companion, session, "last-try", 95).expect("a handle comes back");
     let lost = ended_with(95).await;
-    assert!(
-        !is_the_hosts(&lost),
-        "the host's earlier words are not kept: {lost}"
+    assert_eq!(
+        lost, "The connection to this session ended: the connection ended",
+        "the view says its connection was lost"
     );
     control.end_connections(false);
 
