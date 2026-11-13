@@ -14,6 +14,13 @@
  * target, the other side grows by what was cut, so a link at the pane's edge keeps the least size
  * too; the room that gives back goes to a link only where no other link's words are nearer. At an
  * equal distance the earlier link in the message takes the point.
+ *
+ * The pane scrolls, so its box is the part of the conversation that is in view, and a link takes part
+ * only by what is in view of its words. A line of words wholly outside the pane has no area and no
+ * distance: it never takes a point and keeps no other link's area from growing. The room that a cut is
+ * given back applies only on an axis on which the words are wholly in view; words that the pane's edge
+ * cuts keep the part of their target that is in view, and nothing is given back on that axis. A point
+ * outside the pane's box (a scroll bar's strip) is no link's.
  */
 
 /** A point in the page's coordinates. */
@@ -54,17 +61,19 @@ const EQUAL = 1e-6
  * gives: no target reaches past it.
  */
 export function linkAt(point: Point, links: readonly Link[], reach: Reach, bounds: Rect): number | null {
-  const distances = links.map(({ words }) => Math.min(...words.map((rect) => distanceTo(rect, point))))
+  if (!holds(bounds, point)) return null
+  const seen = links.map(({ words }) => words.filter((rect) => inView(rect, bounds)))
+  const distances = seen.map((parts) => Math.min(...parts.map((rect) => distanceTo(rect, point))))
   const closest = Math.min(...distances)
   let chosen: number | null = null
   let nearest = Number.POSITIVE_INFINITY
   for (let index = 0; index < links.length; index += 1) {
-    const { words } = links[index] ?? { words: [] }
+    const parts = seen[index] ?? []
     const distance = distances[index] ?? Number.POSITIVE_INFINITY
-    const own = words.some((rect) => holds(within(targetOf(rect, reach), bounds), point))
+    const own = parts.some((rect) => holds(within(targetOf(rect, reach), bounds), point))
     // What the pane's edge cut from one side is given back on the other, but not where it takes a
     // point from the link whose words are nearer.
-    const given = !own && distance <= closest + EQUAL && words.some((rect) => holds(fitted(targetOf(rect, reach), bounds), point))
+    const given = !own && distance <= closest + EQUAL && parts.some((rect) => holds(fitted(rect, reach, bounds), point))
     if (!own && !given) continue
     if (distance < nearest - EQUAL) {
       chosen = index
@@ -94,13 +103,15 @@ function within(rect: Rect, bounds: Rect): Rect {
 }
 
 /**
- * `rect` held to `bounds`, with each cut given back: where an edge of `bounds` cuts one side of the
- * rectangle, the opposite side grows by what was cut, in both directions. A rectangle larger than
- * `bounds` in a direction fills `bounds` there.
+ * The target of the words `rect` held to `bounds`, with each cut given back: where an edge of `bounds`
+ * cuts one side of the target, the opposite side grows by what was cut. This is so only on an axis on
+ * which the words are wholly in view; on an axis that the edge cuts through the words, the target is
+ * what is in view of it. A target larger than `bounds` in a direction fills `bounds` there.
  */
-function fitted(rect: Rect, bounds: Rect): Rect {
-  const across = fit(rect.left, rect.right, bounds.left, bounds.right)
-  const down = fit(rect.top, rect.bottom, bounds.top, bounds.bottom)
+function fitted(rect: Rect, reach: Reach, bounds: Rect): Rect {
+  const target = targetOf(rect, reach)
+  const across = rect.left >= bounds.left && rect.right <= bounds.right ? fit(target.left, target.right, bounds.left, bounds.right) : clamp(target.left, target.right, bounds.left, bounds.right)
+  const down = rect.top >= bounds.top && rect.bottom <= bounds.bottom ? fit(target.top, target.bottom, bounds.top, bounds.bottom) : clamp(target.top, target.bottom, bounds.top, bounds.bottom)
   return { left: across[0], right: across[1], top: down[0], bottom: down[1] }
 }
 
@@ -117,6 +128,16 @@ function fit(low: number, high: number, min: number, max: number): readonly [num
     to = max
   }
   return [Math.max(from, min), to]
+}
+
+/** The span from `low` to `high` held to the span from `min` to `max`, with nothing given back. */
+function clamp(low: number, high: number, min: number, max: number): readonly [number, number] {
+  return [Math.max(low, min), Math.min(high, max)]
+}
+
+/** Whether any of `rect` is in view in `bounds`: a rectangle that only touches an edge has nothing in view. */
+function inView(rect: Rect, bounds: Rect): boolean {
+  return rect.right > bounds.left && rect.left < bounds.right && rect.bottom > bounds.top && rect.top < bounds.bottom
 }
 
 function holds(rect: Rect, point: Point): boolean {
