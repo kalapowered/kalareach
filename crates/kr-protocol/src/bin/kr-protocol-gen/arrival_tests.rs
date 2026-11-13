@@ -2444,8 +2444,8 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
 /// that the section is the only difference that can be excused. (A `$ref` of another form in a
 /// keyword of the root other than `properties`, and in a definition where no definition has its
 /// text as a literal name, is refused when the schema is cut, before this rule reads it; among the
-/// root's `properties`, which the cut does not read, and in a definition whose literal name the
-/// text is, the walk refuses it.)
+/// root's `properties`, whose references the cut does not follow, and in a definition whose literal
+/// name the text is, the walk refuses it.)
 #[test]
 fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
     let schema = |with_push: bool| {
@@ -2569,21 +2569,25 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
     assert!(excused.is_empty(), "the section passed: {excused:#?}");
 }
 
-/// The keys of a place that a rule reads have the form that it reads: a `required` that is a text
-/// or holds a non-text, and a `description` or a `title` that is not a text, leave the member as a
-/// line for each of the three rules that read a definition's keys. The comparer reads `required`
-/// only as a list of texts (it drops an entry that is no text and reads a text as no list) and skips
-/// `description` and `title` whatever their value, so the form itself is no line of its own. The
-/// form stands in both schemas, in the earlier one only and in the new one only.
+/// The keys of a place that a rule reads have the form that it reads: a `required` that is a text,
+/// holds a non-text or names a member twice, and a `description` or a `title` that is not a text,
+/// leave the member as a line for each of the three rules that read a definition's keys. The
+/// comparer reads `required` only as a set of texts (it drops an entry that is no text, reads a
+/// text as no list and a repeated name as one) and skips `description` and `title` whatever their
+/// value, so the form itself is no line of its own. The form stands in both schemas, in the earlier
+/// one only and in the new one only.
 #[test]
 fn a_place_whose_required_or_annotation_has_another_form_excuses_nothing() {
     type Edit = fn(&mut Value);
-    let forms: [(&str, Edit); 4] = [
+    let forms: [(&str, Edit); 5] = [
         ("a required that is a text", |node| {
             node["required"] = json!("member");
         }),
         ("a required that holds a number", |node| {
             node["required"] = json!(["id", 1]);
+        }),
+        ("a required that names a member twice", |node| {
+            node["required"] = json!(["id", "id"]);
         }),
         ("a description that is an object", |node| {
             node["description"] = json!({ "a": 1 });

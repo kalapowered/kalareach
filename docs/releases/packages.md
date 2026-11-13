@@ -202,10 +202,12 @@ stored file that a release reads by level ([Configuration levels](../host/update
 a release that lacks the section ignores and counts it, applies the rest and refuses to edit the
 document, so the section keeps the level. The check passes a member added to that document when the
 build lists it as a section that arrived with a level above the level the earlier release's
-`stored-formats.lock` records for the document, when it is not required, and when no definition of
-either schema refers to the document. A lock that is absent, does not read, lists no document or
-records no level fails the check, and the member added stays in the failure. A change to an
-existing member of the document, to a default, to `required` or to the ceilings, a member added to
+`stored-formats.lock` records for the document, when it is not required, and when the document is a
+plain closed object in both schemas, as defined for the SDK's arrivals below. Neither schema may use
+the document. No definition and no keyword of either root refers to it, but for one entry among the
+root's `properties`, which is the bundle's own name for the type. A lock that is absent, does not
+read, lists no document or records no level fails the check, and the member added stays in the
+failure. A change to an existing member of the document, to a default, to `required` or to the ceilings, a member added to
 the ceilings, and a section the build does not list above that level still move the level. The run
 says each section it passes. Three limits hold.
 
@@ -242,23 +244,44 @@ of plain string constants and nothing else, each name stands once in the shape o
 (lower-case words of letters, digits and underscores, with single dots between), and the earlier
 names are all still there. Every use of `Method` in the schema must also be one that a wider
 `Method` only widens: a property, an item, an `anyOf` or an `allOf`, and not a `oneOf`, a `not` or
-an `if`. Descriptions and titles are ignored. A
-release from before `worker-surface.json` has no table to compare, so its tables are left out and
-its schema, plugin host protocol and table of public majors are compared. A release of the level without the SDK schema file or the SDK's
-`package-contract.json`, or whose file does not read, fails the check. When no release is at the commit's level, the commit moves it, and the check
+an `if`. Descriptions and titles are ignored. Every exception but a new definition reads both
+schemas whole. Both roots have to name the 2020-12 dialect (`https://json-schema.org/draft/2020-12/schema`), every
+`$ref` has to be `#/$defs/NAME` with a NAME of letters, digits and underscores, and every keyword
+of every definition and of the root has to be one that the check knows: the applicators, the
+validation keywords with plain values and the annotations. A schema with another dialect, another
+form of reference, a scope keyword (`$id`, `$anchor`, `$dynamicRef` and the like),
+`unevaluatedItems`, `unevaluatedProperties` or an unknown keyword leaves the difference in the
+failure, since such a keyword can change what a place accepts in a way that the check does not
+read. A release from before `worker-surface.json` has no table to compare, so its tables are left
+out and its schema, plugin host protocol and table of public majors are compared. A release of the
+level without the SDK schema file or the SDK's `package-contract.json`, or whose file does not
+read, fails the check. When no release is at the commit's level, the commit moves it, and the check
 runs `scripts/check-retained-release.sh` in the same run.
+
+Both comparisons also read the members of each schema's root `properties`, the bundle's entries, by
+name, because a consumer reads a type through its member: the plugin SDK's TypeScript reader
+compiles each validator from `kalareach-plugin-sdk#/properties/<root>`. A member that moves to
+another definition, gains a keyword or is removed is a difference at `$root.<member>`, and so is a
+change to an inline member (`identifiers` in the protocol schema, `vocabulary` in the SDK schema).
+An entry that is a reference is compared by its text and is not followed, so a definition that is
+renamed with its member following it is a difference at the member although the definition itself
+is the same. A member that only the commit has is not a difference. A recorded surface of a
+retained level holds no root, so this comparison does not reach it.
 
 The plugin SDK schema has one more exception, for a member that the SDK's own arrival table lists.
 The table is `arrivals` in `packages/plugin-sdk/schema/package-contract.json`, generated from
 `crates/kr-plugin-sdk/src/arrivals.rs`: for each member, its definition, its name and the SDK
 version it arrived at. The check passes an optional member added to a definition, and says each one
 it passes with both versions, when all of these hold: the definition is a plain closed object in
-both SDK schemas (`type` is `object`, `additionalProperties` is `false`, and the definition's own
+both SDK schemas (`type` is `object`, `additionalProperties` is `false`, the definition's own
 keys are among `type`, `properties`, `required`, `additionalProperties`, `description` and
-`title`), one that neither release's protocol schema has, that the connector table's root (`ConnectorManifest`) reaches and that the
-package manifest's root (`PluginManifest`) does not, in the earlier release's SDK schema and in the
-commit's; the commit's table lists the member at an SDK version above the `sdk_version` that the
-earlier release's contract states; and the commit's own `sdk_version` is above that version too. A
+`title`, `required` is a list of distinct texts, and `description` and `title` are texts), one that
+neither release's protocol schema has, that the connector table's root (`ConnectorManifest`) reaches
+and that the package manifest's root (`PluginManifest`) does not, in the earlier release's SDK
+schema and in the commit's; every use of the definition, in both schemas, is one where a wider
+definition only widens the place (the uses that a new method allows); the commit's table lists the
+member at an SDK version above the `sdk_version` that the earlier release's contract states; and
+the commit's own `sdk_version` is above that version too. A
 required member, a member the table does not list, a member listed with no rise, a member of a
 definition the protocol schema shares or the package manifest reaches, a nested member, a new
 variant, a changed type, default or bound, a removal, a lower SDK version, and an entry of an
@@ -313,7 +336,12 @@ open testing track) are not client releases and freeze nothing.
 with the releases a client may have been built from, and reports what an earlier reader cannot read.
 A definition that is new is not a difference. A member that is added is not one either when it is
 optional and the earlier release's object carries `x-kalareach-read-only-metadata`, because that
-object's reader drops a member it does not know. Every other difference is reported: a member or a
+object's reader drops a member it does not know. The object has to be an open plain object in both
+schemas: `type` is `object`, there is no `additionalProperties`, and its keys are among `type`,
+`properties`, `required`, `description`, `title` and the marker. Every use of it has to be one where
+a narrower object only narrows the place (a property, an item, an additional or pattern property, an
+`anyOf` or `allOf` branch, or a whole definition), because under a `oneOf`, a `not` or an `if` the
+new member can widen it. Every other difference is reported: a member or a
 variant added to a closed object, a member, a variant or a definition removed, and any change.
 `SessionSummary.root` is one: an earlier strict reader cannot read the summary of a command session.
 No client was released, so no shim carries it. A new section of the configuration document is one

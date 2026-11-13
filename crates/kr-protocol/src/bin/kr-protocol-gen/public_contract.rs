@@ -888,15 +888,19 @@ fn is_a_listed_arrival(
 }
 
 /// Whether the keys of a definition that a rule reads have the form that it reads: `required` is a
-/// list of texts (a rule that finds it no list takes the member for one that is not required, and a
-/// reader that iterates a text reads it as a list of letters), and `description` and `title` are
-/// texts (the comparer skips them whatever their value, so a change of one that is no text would be
-/// no line).
+/// list of texts with no name twice (a rule that finds it no list takes the member for one that is
+/// not required, a reader that iterates a text reads it as a list of letters, and a reader that
+/// checks the schema refuses a repeated name, which the comparer reads as one), and `description`
+/// and `title` are texts (the comparer skips them whatever their value, so a change of one that is
+/// no text would be no line).
 fn has_plain_forms(node: &Value) -> bool {
     node.get("required").is_none_or(|required| {
-        required
-            .as_array()
-            .is_some_and(|names| names.iter().all(Value::is_string))
+        required.as_array().is_some_and(|names| {
+            let mut seen = BTreeSet::new();
+            names
+                .iter()
+                .all(|name| name.as_str().is_some_and(|name| seen.insert(name)))
+        })
     }) && ["description", "title"]
         .iter()
         .all(|keyword| node.get(keyword).is_none_or(Value::is_string))
