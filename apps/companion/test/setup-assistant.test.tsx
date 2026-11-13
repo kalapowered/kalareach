@@ -317,6 +317,9 @@ describe('what setup costs a person', () => {
     expect(said).toMatch(/nothing on this screen signed you up for anything/)
   })
 
+  // KR-REQ-26.42: setup needs no Cloudflare, Stripe, Firebase or Apple account: from first paint to
+  // the last step it performs only the setup host operations, and none of them signs in, pairs, pays
+  // or registers for anything.
   it('performs only these host operations from first paint to the last step', async () => {
     const { calls } = start()
     await screen.findByTestId('setup-identity')
