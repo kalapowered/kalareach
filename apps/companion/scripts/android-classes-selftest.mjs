@@ -1739,7 +1739,7 @@ held(
 // `--preserve-symlinks-main`, which keeps the link in the module's own name, given as the flag or by
 // `NODE_OPTIONS`. A start that did nothing and ended 0 would pass a store run that checked nothing.
 // The inputs are ones each refuses, and the wrapper refuses a command that is not the build.
-const COMMANDS = ['ios', 'sign-ios', 'store-ios-sign', 'android-classes', 'identifiers', 'privacy-manifest', 'store-bundle']
+const COMMANDS = ['ios', 'desktop', 'sign-ios', 'store-ios-sign', 'android-classes', 'identifiers', 'privacy-manifest', 'store-bundle']
 {
   const link = join(work, 'entry-link')
   symlinkSync(import.meta.dirname, link)
@@ -1747,6 +1747,7 @@ const COMMANDS = ['ios', 'sign-ios', 'store-ios-sign', 'android-classes', 'ident
   const preserved = [process.env.NODE_OPTIONS, '--preserve-symlinks-main'].filter(Boolean).join(' ')
   for (const [file, args] of [
     ['ios.mjs', ['dev']],
+    ['desktop.mjs', ['dev']],
     ['sign-ios.mjs', ['--no-such-mode']],
     ['store-ios-sign.mjs', []],
     ['android-classes.mjs', [`${missing}.apk`]],

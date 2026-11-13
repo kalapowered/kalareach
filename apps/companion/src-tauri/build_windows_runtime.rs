@@ -19,8 +19,7 @@ const STATIC_RUNTIME_INPUT: &str = "STATIC_VCRUNTIME";
 /// What a build that asks for the static runtime is told.
 const REFUSAL: &str = "this program links the dynamic Visual C++ runtime, and the environment asks for the static one \
      (STATIC_VCRUNTIME is set to something other than `false`, which the Tauri command line does for a bundle build), \
-     so start the build with STATIC_VCRUNTIME=false, as `STATIC_VCRUNTIME=false pnpm -C apps/companion tauri build` \
-     (in PowerShell, set `$env:STATIC_VCRUNTIME = 'false'` first)";
+     so build the bundle with `pnpm -C apps/companion desktop build`, which gives the build STATIC_VCRUNTIME=false";
 
 /// The words that refuse a build, or none. Only a build for an MSVC target is refused, and only when
 /// the variable is set to anything but `false`, which is the Tauri build step's own reading of it.
