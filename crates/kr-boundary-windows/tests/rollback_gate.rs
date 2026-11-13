@@ -364,7 +364,14 @@ fn the_folder_above_the_program_directory_is_made_and_removed_only_as_the_run_th
         "if matches!(tree, DataTree::ByName) {\n        remove_program_folder(paths, &manifest, &mut failures);"
     ));
     let take = code_of(body_of(&source, "fn take_away(&mut self) -> Rolled"));
-    assert!(take.contains("take(object(program_folder), folder, false);"));
+    // The folder above the program directory that stays is kept apart from the data directory's
+    // place, with a clause of its own in the ending.
+    assert!(take.contains("match object(program_folder) {"));
+    assert!(take.contains("rolled.folder.extend(remedy::rollback_entry(&taken, &path));"));
+    assert!(!take.contains("take(object(program_folder)"));
+    let steps_end = steps.find("remedy::rollback_laid_stays(").unwrap();
+    assert!(steps[..steps_end].contains("rolled.stayed.is_empty() && rolled.folder.is_empty()"));
+    assert!(steps[steps_end..].contains("&rolled.folder,"));
     let removal = code_of(body_of(&source, "fn remove_program_folder("));
     assert!(removal.contains("remedy::FolderRecord::of(object.outcome, object.detail.is_some())"));
     assert!(

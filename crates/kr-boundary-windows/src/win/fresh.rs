@@ -214,7 +214,7 @@ pub fn record_file(path: &Path, only_new: bool) -> io::Result<File> {
 pub fn hold_directory(directory: &Path) -> io::Result<ffi::Handle> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-    // Base: `directory` is the full path that the caller names, resolved from the volume's root and never against the current directory
+    // Base: `directory` is the path that the caller names: the installer's callers pass full paths that they built from `Paths`, which the call resolves from the volume's root, and a relative path would be resolved against the current directory
     // The flag lets the open of a directory succeed.
     let file = std::fs::OpenOptions::new()
         .read(true)
