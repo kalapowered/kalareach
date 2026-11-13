@@ -1057,11 +1057,11 @@ impl HostHandler for ServingHandler {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum First {
     /// The control reader declares the loss.
-    TheLoss,
+    Loss,
     /// The handler returns.
-    TheHandler,
+    Handler,
     /// The connection closes, while the reader is held before it declares the loss.
-    TheConnection,
+    Connection,
 }
 
 /// Starts a listener for `handler` whose connections end under `hold`.
@@ -1097,6 +1097,9 @@ async fn start_serving(
 /// returns or is dropped takes its streams out of the registry before the connection's cleanup
 /// runs; where the reader is held, the loss is declared by nothing but the listener's own end of
 /// the session, and the streams are revoked when the handler has gone, before the cleanup.
+///
+/// The cleanup's hold blocks the thread that runs it, so these cases run on a runtime of several
+/// threads.
 async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
     let (host, client) = paired_pair().await;
     let handler = Arc::new(ServingHandler {
@@ -1139,11 +1142,11 @@ async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
     // listener has dropped the handler, and the handler's streams with it, before the loss is
     // declared.
     let held =
-        (first != First::TheLoss).then(|| (hold.hold_the_declaration(), hold.hold_the_cleanup()));
+        (first != First::Loss).then(|| (hold.hold_the_declaration(), hold.hold_the_cleanup()));
     match first {
-        First::TheLoss => authorised.control_writer.finish().expect("the stream ends"),
-        First::TheHandler => handler.finish.notify_one(),
-        First::TheConnection => connection.close(0u32.into(), b"done"),
+        First::Loss => authorised.control_writer.finish().expect("the stream ends"),
+        First::Handler => handler.finish.notify_one(),
+        First::Connection => connection.close(0u32.into(), b"done"),
     }
     let mut reader = None;
     if let Some(((_, release_reader), (cleaning, release_cleanup))) = held {
@@ -1170,19 +1173,19 @@ async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
     listener.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_is_revoked_where_the_control_reader_declares_the_loss_first() {
-    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::TheLoss).await;
+    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::Loss).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_is_revoked_where_the_handler_returns_before_the_loss_is_declared() {
-    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::TheHandler).await;
+    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::Handler).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_is_revoked_where_the_connection_closes_before_the_loss_is_declared() {
-    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::TheConnection).await;
+    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::Connection).await;
 }
 
 /// A stream the handler let go of while the connection was live, whose registration is gone, is
