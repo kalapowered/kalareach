@@ -468,7 +468,7 @@ fn a_member_added_to_a_type_fails_and_a_new_definition_and_a_new_method_pass() {
     let head = repo.commit(&again, "a name twice");
     let error = check(&repo.directory, &repo.head(&again, &head), &releases)
         .expect_err("a name the level already had is not a new method");
-    assert!(error.contains("Method#const:host.info@"), "{error}");
+    assert!(error.contains("Method#1@const:host.info"), "{error}");
 
     let mut wider = now.clone();
     wider.schema["$defs"]["Method"] = methods(&["host.info", "session.read"]);

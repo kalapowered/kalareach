@@ -774,6 +774,49 @@ fn branch_keys_cannot_collide_for_both_comparisons() {
     }
 }
 
+/// What the level comparison reports for the `Method` definition going from `old` to `new`, each
+/// a list of branches that are plain string constants named by `Method`'s own `oneOf` form.
+fn method_lines(old: &[Value], new: &[Value]) -> Vec<String> {
+    let schema = |branches: &[Value]| json!({ "$defs": { "Method": { "oneOf": branches } } });
+    crate::public_contract::compare_for_a_level(
+        &schema(old),
+        &schema(new),
+        &|| Ok(std::collections::BTreeSet::new()),
+        &mut Vec::new(),
+    )
+    .expect("compares")
+}
+
+/// The label of a branch that repeats the text of an earlier branch of its choice cannot be the
+/// label of any other branch: a method named like that branch's old label is a new method, and the
+/// repeated branch, which makes `oneOf` refuse the method it repeats, is a difference. The pair is
+/// the one that the label `text@number` joined, in both orders of its last two branches.
+#[test]
+fn a_repeated_branch_cannot_pass_as_a_new_method_by_its_label() {
+    let method = |name: &str| json!({ "const": name, "type": "string" });
+    for new in [
+        [method("x"), method("x"), method("x@1")],
+        [method("x"), method("x@1"), method("x")],
+    ] {
+        let lines = method_lines(&[method("x")], &new);
+        assert_eq!(
+            lines,
+            vec!["Method#1@const:x added: a variant".to_owned()],
+            "{new:?}"
+        );
+    }
+    // Plain additions still pass, a method named like a label among them.
+    assert!(method_lines(&[method("x")], &[method("x"), method("y")]).is_empty());
+    assert!(method_lines(&[method("x")], &[method("x"), method("x@1")]).is_empty());
+    // A branch that repeats the text of an earlier one is not a new method even when no other
+    // branch names it as a string: the integer constant 5 and the text "5" have one text.
+    let lines = method_lines(
+        &[json!({ "const": 5 })],
+        &[json!({ "const": 5 }), method("5")],
+    );
+    assert_eq!(lines, vec!["Method#1@const:5 added: a variant".to_owned()]);
+}
+
 /// Two equal branches are told apart by their number, and a third branch that differs is reported
 /// by its own key, for both comparisons.
 #[test]
@@ -785,7 +828,7 @@ fn equal_branches_beside_one_that_differs_compare_by_number() {
         { "const": {}, "maxLength": 5 },
         { "type": "string", "maxLength": 100 },
     ] });
-    for (position, key) in [(0, "const:{}"), (1, "const:{}@1"), (2, "type:string")] {
+    for (position, key) in [(0, "const:{}"), (1, "1@const:{}"), (2, "type:string")] {
         let mut new = old.clone();
         new["$defs"]["Route"]["properties"]["choice"]["anyOf"][position]["maxLength"] = json!(0);
         let wanted = vec![format!("Route.choice#{key} changed: maxLength")];

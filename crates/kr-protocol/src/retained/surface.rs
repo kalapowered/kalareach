@@ -508,10 +508,7 @@ impl Comparer<'_> {
         names.extend(old_heads.keys());
         names.extend(new_heads.keys());
         for key in names {
-            let nested = match key {
-                (text, 0) => format!("{at}#{text}"),
-                (text, number) => format!("{at}#{text}@{number}"),
-            };
+            let nested = branch_label(at, key);
             match (old_heads.get(key), new_heads.get(key)) {
                 (Some(old), Some(new)) => self.node(old, new, &nested),
                 (Some(_), None) => self.report(&nested, DifferenceKind::Removed, "a variant"),
@@ -593,7 +590,23 @@ fn head(branch: &Value) -> String {
 /// branch's key.
 type BranchKey = (String, usize);
 
-/// The branches of a choice by key, or the key that two of them would share.
+/// How a place names a branch it passes through, for a reader and for every rule that reads a
+/// place: `place#text` for the first branch of a text, and `place#number@text` for a later one.
+/// Every text [`head`] gives begins with a letter, so the number, which begins with a digit, comes
+/// before the text: no text can take the form of a later branch's label, a later branch's label is
+/// never the label of a branch whose text is a constant that looks like it, and two branches have
+/// one label only when they have one key.
+fn branch_label(place: &str, (text, number): &BranchKey) -> String {
+    if *number == 0 {
+        format!("{place}#{text}")
+    } else {
+        format!("{place}#{number}@{text}")
+    }
+}
+
+/// The branches of a choice by key, or the key that two of them would share. The numbers are
+/// counted for each text, so a key is never shared and this never gives the error: it is kept as a
+/// guard, so that a change to how keys are made fails the comparison and never replaces a branch.
 fn heads(branches: &[Value]) -> Result<BTreeMap<BranchKey, &Value>, BranchKey> {
     let mut found = BTreeMap::new();
     let mut counted: BTreeMap<String, usize> = BTreeMap::new();
@@ -959,7 +972,7 @@ fn describe(value: &CanonicalValue) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{heads, insert_branch};
+    use super::{branch_label, head, heads, insert_branch};
 
     /// A branch whose key is taken is an error and the branch already there stays: a key is never
     /// replaced.
@@ -992,5 +1005,46 @@ mod tests {
             Some(&&branches[0])
         );
         assert_eq!(found.get(&("const:{}".to_owned(), 1)), Some(&&branches[2]));
+    }
+
+    /// Every text [`head`] gives begins with a letter, whatever the branch holds (a constant or a
+    /// name made of digits included): that is what lets the number of a later branch come first in
+    /// its label, so that no branch's text can take the form of a later branch's label.
+    #[test]
+    fn no_branch_text_begins_with_a_digit() {
+        let branches = [
+            json!({ "const": "5" }),
+            json!({ "const": 5 }),
+            json!({ "const": "1@x" }),
+            json!({ "const": null }),
+            json!({ "const": { "1": 2 } }),
+            json!({ "$ref": "#/$defs/7" }),
+            json!({ "properties": { "1": { "const": "2" } } }),
+            json!({ "properties": { "1": {} }, "required": ["1"] }),
+            json!({ "properties": { "1": {}, "2": {} } }),
+            json!({ "properties": {} }),
+            json!({ "type": "string" }),
+            json!({ "type": 5 }),
+            json!({ "enum": [1] }),
+            json!({}),
+        ];
+        for branch in &branches {
+            let text = head(branch);
+            assert!(
+                text.starts_with(|first: char| first.is_ascii_alphabetic()),
+                "{branch}: {text}"
+            );
+        }
+        // The label of a later branch is not the label of any first branch, the text that looks
+        // most like it included.
+        let later = branch_label("Method", &("const:x".to_owned(), 1));
+        assert_eq!(later, "Method#1@const:x");
+        for text in ["const:x", "const:x@1", "const:1@x"] {
+            assert_ne!(
+                branch_label("Method", &(text.to_owned(), 0)),
+                later,
+                "{text}"
+            );
+        }
     }
 }
