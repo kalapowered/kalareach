@@ -1006,6 +1006,11 @@ async fn a_catalogue_receipt_a_fence_overtakes_in_the_last_wait_is_not_shown() {
     let answered = first.await.expect("the first copy is answered");
     let routed = refusal_of(&answered);
     assert_eq!(routed.code, ErrorCode::OutcomeUnknown, "{routed:?}");
+    assert_eq!(
+        routed.message,
+        super::outcome_not_shown().message,
+        "the word the door gives for an answer it will not show, not the one for an effect it waited on"
+    );
     let told = written(&connection, &recording, answered).await;
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
     world.serving.abort();
