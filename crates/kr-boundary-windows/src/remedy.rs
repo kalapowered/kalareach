@@ -275,7 +275,14 @@ pub fn choose(
             .map_or(Remedy::NoStep, Remedy::MoveAside)
     };
     let removed = || grounds.clearance().map_or(Remedy::NoStep, Remedy::Remove);
-    if record == Some(Record::NotRecorded) {
+    // A failed read gives no step for any state of the manifest's record, so the record that the
+    // manifest does not hold is a reason to move an entry aside only where the read of the entry
+    // itself did not fail.
+    let failed_read = matches!(
+        origin,
+        Origin::Refused(_) | Origin::Unknown(_) | Origin::Changed(_)
+    );
+    if record == Some(Record::NotRecorded) && !failed_read {
         return aside();
     }
     match origin {

@@ -282,7 +282,7 @@ fn the_words_of_a_refused_entry_say_what_the_handle_showed_and_nothing_of_who_ma
 #[test]
 fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_of_its_record() {
     let data = "D:/data";
-    for origin in [Origin::System, Origin::Foreign, unknown(), held()] {
+    for origin in [Origin::System, Origin::Foreign, held()] {
         for kind in [
             EntryKind::Manifest,
             EntryKind::Staging,
@@ -301,6 +301,30 @@ fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_o
                 Remedy::MoveAside(clearance()),
                 "{kind:?} {origin:?}"
             );
+        }
+    }
+    // An origin that rests on a failed read gives no step for any state of the record, with a
+    // clearance in hand: the read does not show what the entry is.
+    for origin in [
+        unknown(),
+        Origin::Refused("Windows error 5".to_owned()),
+        Origin::Changed("the identifier names another object".to_owned()),
+    ] {
+        for kind in [
+            EntryKind::Manifest,
+            EntryKind::Staging,
+            EntryKind::Journal,
+            EntryKind::Run,
+            EntryKind::Other,
+            EntryKind::UnnamedRoot,
+        ] {
+            for record in [None, Some(Record::Recorded), Some(Record::NotRecorded)] {
+                assert_eq!(
+                    choose(&at_install(), kind, &origin, &Presence::Present, record),
+                    Remedy::NoStep,
+                    "{kind:?} {origin:?} {record:?}"
+                );
+            }
         }
     }
     // What the handle chooses is chosen again where the manifest records the entry or the record was
