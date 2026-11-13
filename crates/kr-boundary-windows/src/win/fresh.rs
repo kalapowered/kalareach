@@ -225,8 +225,14 @@ pub fn hold_directory(directory: &Path) -> io::Result<ffi::Handle> {
 /// a path takes place. The record is then proved to be where it is read: the record's name is opened
 /// relative to the same directory handle, and the identity of what that opens must be the identity
 /// of the object that was written. A name that is not there, a failed read or another object is a
-/// failure. Where a step fails the same handle marks the replacement for removal: the object that
-/// this call made is the one that goes, wherever it is by then.
+/// failure.
+///
+/// Where the write, the flush or the rename fails, nothing has changed at the record's name, and
+/// the same handle marks the replacement for removal. Where the rename has put the object at the
+/// name, the object is marked for removal only if a read established that another object, or none,
+/// stands at the name. Where a read failed, nothing is established, and the object stays at the
+/// name: after a repair it may be the only manifest there is, and a failed read is no reason to
+/// delete it. The error then says which read failed and that the object was left.
 ///
 /// # Errors
 ///
@@ -258,27 +264,66 @@ pub fn replace_whole(
         "the replacement's own handle",
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
-    let Err(failure) = written.and_then(|()| {
+    let renamed = written.and_then(|()| {
         let name: Vec<u16> = path
             .file_name()
             .ok_or_else(|| io::Error::other("the record has no file name"))?
             .encode_wide()
             .collect();
         rename_by_handle(&handle, directory, &name)?;
-        prove_in_place(directory, &handle, &name, path)
-    }) else {
-        return Ok(());
+        Ok(name)
+    });
+    // Before the rename nothing has changed at the record's name: the replacement is the only
+    // object that this call made, and it goes.
+    let name = match renamed {
+        Ok(name) => name,
+        Err(failure) => {
+            return match super::root::delete(&handle) {
+                Ok(()) => Err(failure),
+                Err(error) => Err(io::Error::new(
+                    failure.kind(),
+                    format!(
+                        "{failure}; the replacement {} could not be marked for removal either: {error}",
+                        staging.display()
+                    ),
+                )),
+            };
+        }
     };
-    match super::root::delete(&handle) {
-        Ok(()) => Err(failure),
-        Err(error) => Err(io::Error::new(
+    match prove_in_place(directory, &handle, &name, path) {
+        Ok(()) => Ok(()),
+        // A read established that another object, or none, stands at the name: the object that
+        // was written is not the record, and it goes.
+        Err(Unproved::NotTheRecord(failure)) => {
+            let marked = match super::root::delete(&handle) {
+                Ok(()) => "the object that was written was marked for removal".to_owned(),
+                Err(error) => {
+                    format!("the object that was written could not be marked for removal: {error}")
+                }
+            };
+            Err(io::Error::new(
+                failure.kind(),
+                format!("{failure}; {marked}"),
+            ))
+        }
+        // A read failed, so nothing is established about what stands at the name, and the rename
+        // has already replaced the earlier record: where this object is the only record, marking it
+        // would leave none. It stays, unmarked; the handle closes without deleting it.
+        Err(Unproved::Unread(failure)) => Err(io::Error::new(
             failure.kind(),
             format!(
-                "{failure}; the replacement {} could not be marked for removal either: {error}",
-                staging.display()
+                "{failure}; no read showed another object at the record's name, so the record that was written was not marked for removal and was left where the rename put it"
             ),
         )),
     }
+}
+
+/// What the proof after a rename could not show.
+enum Unproved {
+    /// A read established that another object, or none, stands at the record's name.
+    NotTheRecord(io::Error),
+    /// A read failed, so nothing is established about what stands at the record's name.
+    Unread(io::Error),
 }
 
 /// Renames the file behind the handle to `name` in the directory that `directory` holds, over what
@@ -331,56 +376,173 @@ fn rename_by_handle(handle: &ffi::Handle, directory: &ffi::Handle, name: &[u16])
 /// Proves that the record is where it is read after the rename: the name is opened relative to the
 /// same directory handle, for its attributes only, and the identity of what it opens is compared with
 /// the identity of the object that was written. No path is opened.
+///
+/// A name that is not there and another object at the name are the answers of reads: they are
+/// [`Unproved::NotTheRecord`]. A read that failed (the identity of the written object, the open of
+/// the name for a reason other than not found, the identity of what the name opens) shows nothing
+/// of what stands at the name, and is [`Unproved::Unread`].
 fn prove_in_place(
     directory: &ffi::Handle,
     written: &ffi::Handle,
     name: &[u16],
     path: &Path,
-) -> io::Result<()> {
-    let wrote = key_of(written).map_err(|error| {
-        io::Error::other(format!(
+) -> Result<(), Unproved> {
+    // The seam of the test build: one read of the proof fails, after a rename that really took
+    // place.
+    #[cfg(feature = "testing")]
+    let forced = crate::manifest::forced::failure_at("proof");
+    #[cfg(not(feature = "testing"))]
+    let forced: Result<(), String> = Ok(());
+    let wrote = forced
+        .and_then(|()| key_of(written).map_err(|error| error.to_string()))
+        .map_err(|error| {
+        Unproved::Unread(io::Error::other(format!(
             "the rename of {} returned success, and a read of the identity of the record that was written failed: {error}",
             path.display()
-        ))
+        )))
     })?;
     let found = match DirHandle::open_beneath(directory, name, 0, true, FILE_OPEN) {
         Ok(found) => found,
         Err(failure)
             if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
         {
-            return Err(io::Error::new(
+            return Err(Unproved::NotTheRecord(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
                     "the rename of {} returned success, and the open of its name in the directory that holds it answered not found, so the record is not where it is read",
                     path.display()
                 ),
-            ));
+            )));
         }
         Err(failure) => {
-            return Err(io::Error::other(format!(
+            return Err(Unproved::Unread(io::Error::other(format!(
                 "the rename of {} returned success, and the open of its name in the directory that holds it failed: {failure}",
                 path.display()
-            )));
+            ))));
         }
     };
     let read = key_of(&found).map_err(|error| {
-        io::Error::other(format!(
+        Unproved::Unread(io::Error::other(format!(
             "the rename of {} returned success, and a read of the identity of what its name opens failed: {error}",
             path.display()
-        ))
+        )))
     })?;
     if read != wrote {
-        return Err(io::Error::other(format!(
+        return Err(Unproved::NotTheRecord(io::Error::other(format!(
             "the rename of {} returned success, and its name in the directory that holds it opens the object {read}, not the record that was written, {wrote}",
             path.display()
-        )));
+        ))));
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
     use super::*;
+
+    /// A forced failure is the process's, not a thread's: each case that writes a record takes this
+    /// lock, so that a failure forced for one case is not met by another.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    fn one_at_a_time() -> MutexGuard<'static, ()> {
+        match ONE_AT_A_TIME.lock() {
+            Ok(held) => held,
+            Err(poisoned) => PoisonError::into_inner(poisoned),
+        }
+    }
+
+    /// The names that a directory holds.
+    #[cfg(feature = "testing")]
+    fn names_in(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A read of the proof that fails after the rename has put the record at its name keeps the
+    /// record: the earlier record is already replaced, and a repair's only manifest is not marked
+    /// for removal because a read failed. The error names the read that failed and says that the
+    /// record was left. A write after it then replaces the record as it does at any time.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_read_of_the_proof_that_fails_after_the_rename_keeps_the_record_and_the_error_says_so() {
+        let _one = one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let directory = hold_directory(dir.path()).unwrap();
+        let record = dir.path().join("manifest.json");
+        replace_whole(
+            &directory,
+            &record,
+            &dir.path().join("manifest-one.new"),
+            b"first",
+        )
+        .unwrap();
+        crate::manifest::forced::fail_the_next("proof");
+        let error = replace_whole(
+            &directory,
+            &record,
+            &dir.path().join("manifest-two.new"),
+            b"second",
+        )
+        .unwrap_err()
+        .to_string();
+        for part in [
+            "a read of the identity of the record that was written failed",
+            "a failure forced for a case at the step proof",
+            "no read showed another object at the record's name",
+            "was not marked for removal and was left where the rename put it",
+        ] {
+            assert!(error.contains(part), "{part}: {error}");
+        }
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "second");
+        assert_eq!(names_in(dir.path()), ["manifest.json"]);
+        replace_whole(
+            &directory,
+            &record,
+            &dir.path().join("manifest-three.new"),
+            b"third",
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "third");
+    }
+
+    /// A write that fails before the rename changes nothing at the record's name: the earlier
+    /// record stays as it was, and the replacement is marked for removal through its own handle.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_write_that_fails_before_the_rename_marks_the_replacement_and_leaves_the_record() {
+        let _one = one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let directory = hold_directory(dir.path()).unwrap();
+        let record = dir.path().join("manifest.json");
+        replace_whole(
+            &directory,
+            &record,
+            &dir.path().join("manifest-one.new"),
+            b"first",
+        )
+        .unwrap();
+        crate::manifest::forced::fail_the_next("replacement");
+        let error = replace_whole(
+            &directory,
+            &record,
+            &dir.path().join("manifest-two.new"),
+            b"second",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("a failure forced for a case at the step replacement"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "first");
+        assert_eq!(names_in(dir.path()), ["manifest.json"]);
+    }
 
     /// A replacement is put at the record's name in the directory that holds it, whatever the
     /// process's current directory is: a bare name that no directory handle goes with would be read
@@ -388,6 +550,7 @@ mod tests {
     /// is proved by opening it relative to the same handle, and a second write replaces the first.
     #[test]
     fn a_replacement_is_put_at_the_records_name_in_its_own_directory_and_not_in_the_current_one() {
+        let _one = one_at_a_time();
         let dir = tempfile::tempdir().unwrap();
         let directory = hold_directory(dir.path()).unwrap();
         let record = dir.path().join("manifest.json");

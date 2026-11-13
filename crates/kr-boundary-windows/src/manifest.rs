@@ -400,8 +400,10 @@ fn replacement_name(path: &Path) -> PathBuf {
 /// beside the first error. A replacement that this call did not make (the name was taken) is not
 /// touched.
 ///
-/// On Windows the replacement is written, renamed relative to the held directory handle, proved to
-/// be at the record's name and, where a step fails, marked for removal through its one handle.
+/// On Windows the replacement is written, renamed relative to the held directory handle and proved
+/// to be at the record's name. It is marked for removal through its one handle where a step before
+/// the rename fails, or where a read after it established that another object, or none, stands at
+/// the name; where a read after the rename failed, the record stays at its name.
 #[cfg(windows)]
 fn replace_through(beside: &Beside, path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::win::fresh::replace_whole(beside, path, staging, bytes)
