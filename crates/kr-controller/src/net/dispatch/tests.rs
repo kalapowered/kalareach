@@ -4705,6 +4705,86 @@ async fn a_local_prompt_whose_admission_lapses_before_its_draft_is_recorded_reco
     world.serving.abort();
 }
 
+/// KR-REQ-09.09: what a worker answers a local prompt with is a copy as far as the host can tell, so
+/// it is told under the strict check wherever the fence lands once it has arrived: the worker's
+/// acceptance, and the refusal of a worker that does not accept it, are both not shown. The controls: with no fence the acceptance, and the
+/// worker's own refusal, are given as they are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workers_answer_to_a_local_prompt_is_not_shown_once_a_fence_lands_after_it_arrives() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::ErrorCode;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for (refused, fenced) in [(false, false), (true, false), (false, true), (true, true)] {
+        let script = Scripted::new();
+        script.accepts_prompts(!refused);
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let admission = fake::admission(controller, world.accepted).await;
+        let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let mutation = a_local_prompt(
+            &world,
+            &admission,
+            ActionId::new(kr_ipc::new_uuid()),
+            Nullable::null(),
+            Nullable::some(kr_protocol::agent::PromptText::new("run the tests").expect("text")),
+        );
+        let (arrived, release) = controller.pause_after_a_route_answers();
+        let door = controller.perform(&actor, admission.connection_id, None, mutation);
+        let landing = async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+                .await
+                .expect("the worker's answer arrives")
+                .expect("the pause is armed");
+            if fenced {
+                controller.hold_fence(true);
+            }
+            release.send(()).expect("the door goes on");
+        };
+        let (answered, ()) = tokio::join!(door, landing);
+        match (&answered, refused, fenced) {
+            (
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Ok(_),
+                    ..
+                }),
+                false,
+                false,
+            ) => {}
+            (
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Error(error),
+                    ..
+                }),
+                true,
+                false,
+            ) => assert_ne!(
+                error.code,
+                ErrorCode::OutcomeUnknown,
+                "the worker's own refusal is given as it is: {error:?}"
+            ),
+            (
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Error(error),
+                    ..
+                }),
+                _,
+                true,
+            ) => {
+                assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
+                assert_eq!(
+                    error.message,
+                    crate::error::ControllerError::outcome_not_shown().to_string()
+                );
+            }
+            _ => panic!("refused {refused}, fenced {fenced}: {answered:?}"),
+        }
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-14.11, KR-REQ-09.09: the same for a paired device's prompt. The record is made under the
 /// admission the prompt arrived under, so a device whose registration is withdrawn while the
 /// prompt waits for its worker's link records nothing and sends nothing.
