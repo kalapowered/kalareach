@@ -170,13 +170,14 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
     Some(names)
 }
 
-/// Whether every use of the definition `name` in a definition of `schema` is one where a wider
-/// definition makes the place that uses it accept at least what it accepted: a use as a property, an
-/// item (`items`, `prefixItems`), an additional or pattern property, in an `anyOf` or an `allOf`, or
-/// as a whole definition, through any chain of definitions that reach it. A use under any other
-/// keyword is not counted: under some of them (a `oneOf`, a `not`, an `if`, a `contains` with
-/// `maxContains`) a wider definition can make the place refuse a value that it accepted, and the
-/// walk does not tell those from the rest.
+/// Whether every use of the definition `name` in `schema` is one where a wider definition makes the
+/// place that uses it accept at least what it accepted: a use as a property, an item (`items`,
+/// `prefixItems`), an additional or pattern property, in an `anyOf` or an `allOf`, or as a whole
+/// definition, through any chain of definitions that reach it. A use under any other keyword is not
+/// counted: under some of them (a `oneOf`, a `not`, an `if`, a `contains` with `maxContains`) a
+/// wider definition can make the place refuse a value that it accepted, and the walk does not tell
+/// those from the rest. The walk reads every definition and the keywords of the schema beside
+/// `$defs`, and it refuses any form that it cannot read (see [`widens_at`]).
 fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
     let Some(definitions) = schema["$defs"].as_object() else {
         return true;
@@ -202,50 +203,74 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
     definitions
         .values()
         .all(|node| widens_with(node, &reaching, true))
+        && schema
+            .as_object()
+            .into_iter()
+            .flatten()
+            .all(|(keyword, member)| {
+                keyword == "$defs" || widens_at(keyword, member, &reaching, true)
+            })
 }
 
 /// Whether every `$ref` under `node` to a definition of `reaching` stands where a wider definition
-/// widens the place: `widening` says that the path to `node` has only such places. A reference that
-/// is not `#/$defs/NAME` with a name of ASCII letters, digits and `_` (a validator may decode or
-/// strip any other name), and a keyword that changes how references resolve (`$dynamicRef`,
-/// `$recursiveRef`, `$dynamicAnchor`, `$anchor`, `$id`, `id`), are refused wherever they stand: the walk
-/// cannot say what they reach.
+/// widens the place: `widening` says that the path to `node` has only such places.
 fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
     match node {
         Value::Object(members) => members
             .iter()
-            .all(|(keyword, member)| match keyword.as_str() {
-                "$ref" => match member
-                    .as_str()
-                    .and_then(|target| target.strip_prefix("#/$defs/"))
-                {
-                    Some(target)
-                        if !target.is_empty()
-                            && target
-                                .bytes()
-                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') =>
-                    {
-                        widening || !reaching.contains(target)
-                    }
-                    _ => false,
-                },
-                "$dynamicRef" | "$recursiveRef" | "$dynamicAnchor" | "$anchor" | "$id" | "id" => {
-                    false
-                }
-                "properties" | "patternProperties" if member.is_object() => member
-                    .as_object()
-                    .into_iter()
-                    .flat_map(|named| named.values())
-                    .all(|schema| widens_with(schema, reaching, widening)),
-                "items" | "additionalProperties" | "anyOf" | "allOf" | "prefixItems" => {
-                    widens_with(member, reaching, widening)
-                }
-                _ => widens_with(member, reaching, false),
-            }),
+            .all(|(keyword, member)| widens_at(keyword, member, reaching, widening)),
         Value::Array(items) => items
             .iter()
             .all(|item| widens_with(item, reaching, widening)),
         _ => true,
+    }
+}
+
+/// Whether `member`, the value of `keyword` in a schema, stands where a wider definition of
+/// `reaching` widens the place (see [`widens_with`]).
+///
+/// The walk follows a `$ref` only when it is `#/$defs/` and a name of one or more ASCII letters,
+/// digits and `_`. That is a fragment of two pointer segments with no character that a validator
+/// decodes (`%`, `~`) or removes (a trailing `#`, a tab, a line feed, a carriage return, a space
+/// at the end) and no `/` that starts a third segment, so every validator reads the same two
+/// segments. Such a reference has no scheme, host or path, so it is resolved against the base
+/// address of the resource that holds it. Only `$id` (and draft-04's `id`) gives a place a base
+/// address of its own; `$anchor`, `$dynamicAnchor` and `$recursiveAnchor` name a place that a
+/// plain-name fragment or a dynamic reference can reach; `$dynamicRef` and `$recursiveRef` pick
+/// their target by the place that evaluates them. The walk refuses each of these keywords and
+/// each other form of `$ref` (`#`, `#name`, an address, `#/definitions/NAME`, an empty name),
+/// wherever it stands in a definition or beside `$defs`, so a schema that it accepts holds no
+/// place with an address or a name of its own and no reference that it cannot read. Every
+/// reference that it follows then reaches, in every validator, the member of the one `$defs` that
+/// its name says (a generated file holds a key once). A name that `$defs` lacks reaches nothing:
+/// that is an error, never another place.
+fn widens_at(keyword: &str, member: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
+    match keyword {
+        "$ref" => match member
+            .as_str()
+            .and_then(|target| target.strip_prefix("#/$defs/"))
+        {
+            Some(target)
+                if !target.is_empty()
+                    && target
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') =>
+            {
+                widening || !reaching.contains(target)
+            }
+            _ => false,
+        },
+        "$dynamicRef" | "$recursiveRef" | "$dynamicAnchor" | "$recursiveAnchor" | "$anchor"
+        | "$id" | "id" => false,
+        "properties" | "patternProperties" if member.is_object() => member
+            .as_object()
+            .into_iter()
+            .flat_map(|named| named.values())
+            .all(|schema| widens_with(schema, reaching, widening)),
+        "items" | "additionalProperties" | "anyOf" | "allOf" | "prefixItems" => {
+            widens_with(member, reaching, widening)
+        }
+        _ => widens_with(member, reaching, false),
     }
 }
 
@@ -256,7 +281,7 @@ fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool 
 ///   describes, so it accepts exactly its names;
 /// * every name of the earlier list is in the new one;
 /// * the line is about a name that the new list adds;
-/// * every use of `Method` in a definition of both schemas is one where a wider `Method` only widens the place that
+/// * every use of `Method` in both schemas is one where a wider `Method` only widens the place that
 ///   uses it ([`is_used_only_where_it_widens`]).
 ///
 /// Then every place that uses `Method` accepts what it accepted, and a value that it accepts anew

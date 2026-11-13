@@ -1164,6 +1164,175 @@ fn a_new_method_does_not_pass_where_a_use_of_method_does_not_widen() {
     }
 }
 
+/// A reference that the walk follows reaches, in every validator, the definition that its name
+/// says. A name that some validator decodes (`~`), cuts (a tab, a line feed, a carriage return, a
+/// space at the end) or reads as more than one pointer segment (`/`), and a keyword that gives a
+/// place an address, a name or a target that depends on where it is evaluated (`$id`, `id`,
+/// `$anchor`, `$dynamicAnchor`, `$recursiveRef`), can send a reference to another place than the
+/// one that the walk reads. No line under `Method` passes beside one, wherever it stands and even
+/// where nothing in the schema refers to it.
+#[test]
+fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
+    let reference = || json!({ "$ref": "#/$defs/Method" });
+    // `Name` is a string that is not the definition `name`, which holds nothing; a validator that
+    // changes `name` before it reads the reference reads another definition.
+    let not_named = |name: &str| -> Value {
+        let mut definitions = json!({
+            "Name": { "type": "string", "not": { "$ref": format!("#/$defs/{name}") } } });
+        definitions[name] = json!({});
+        definitions
+    };
+    // A place that uses `Method` as a property, with `keyword` beside the reference.
+    let holder_with = |keyword: &str, value: Value| -> Value {
+        let mut place = reference();
+        place[keyword] = value;
+        json!({ "Holder": { "type": "object", "properties": { "m": place } } })
+    };
+    for (extra, says) in [
+        (
+            not_named("Met\thod"),
+            // A validator that removes a tab reads `Method`: the old schema accepts "b" as a
+            // `Name`; the new one refuses it.
+            "a tab in the name",
+        ),
+        (
+            not_named("Met\nhod"),
+            // A validator that removes a line feed reads `Method`: the old schema accepts "b" as
+            // a `Name`; the new one refuses it.
+            "a line feed in the name",
+        ),
+        (
+            not_named("Met\rhod"),
+            // A validator that removes a carriage return reads `Method`: the old schema accepts
+            // "b" as a `Name`; the new one refuses it.
+            "a carriage return in the name",
+        ),
+        (
+            not_named("Method "),
+            // A validator that strips a space at the end reads `Method`: the old schema accepts
+            // "b" as a `Name`; the new one refuses it.
+            "a space at the end of the name",
+        ),
+        (
+            not_named(""),
+            // No definition of a protocol or a plugin SDK schema has an empty name, and a pointer
+            // that ends in an empty segment is read in more than one way: nothing is claimed.
+            "an empty name",
+        ),
+        (
+            json!({
+                "A~B": { "properties": { "m": reference() } },
+                "A~0B": {},
+                "Name": { "not": { "$ref": "#/$defs/A~0B" } },
+            }),
+            // A validator reads `~0` as `~`, so the reference is to `A~B`, which holds `Method`
+            // as a property: the old schema accepts `{"m": "b"}` as a `Name`; the new one refuses
+            // it.
+            "a ~ in the name",
+        ),
+        (
+            json!({
+                "Holder": { "properties": { "m": reference() } },
+                "Holder/properties/m": {},
+                "Name": { "type": "string", "not": { "$ref": "#/$defs/Holder/properties/m" } },
+            }),
+            // A validator reads the name as three segments, which reach the property `m` of
+            // `Holder`, that is `Method`: the old schema accepts "b" as a `Name`; the new one
+            // refuses it.
+            "a / in the name",
+        ),
+        (
+            holder_with("$id", json!("https://example.test/m")),
+            // A reference in a place that has an address of its own is resolved against that
+            // address, so it reaches the `Method` of the resource at that address, if there is
+            // one, and not the schema's.
+            "an address of its own",
+        ),
+        (
+            json!({
+                "X": {},
+                "Name": { "type": "string", "not": { "$ref": "#/$defs/X" } },
+                "Holder": { "type": "object", "properties": { "m": {
+                    "id": "#$defs/X", "$ref": "#/$defs/Method" } } },
+            }),
+            // A resolver that reads `id` takes `#/$defs/X` for the place that carries `id`, which
+            // is `Method`: the old schema accepts "b" as a `Name`; the new one refuses it.
+            "an id",
+        ),
+        (
+            holder_with("$anchor", json!("m")),
+            // An anchor names a place that a reference from another schema (`#m`, or an address
+            // with `#m`) reaches, and the walk sees none of them.
+            "an anchor that nothing in the schema refers to",
+        ),
+        (
+            holder_with("$dynamicAnchor", json!("m")),
+            // A `$dynamicRef` of another schema, evaluated through this one, reaches the place
+            // that carries the anchor, and the walk sees none of them.
+            "a dynamic anchor that nothing in the schema refers to",
+        ),
+        (
+            holder_with("$recursiveAnchor", json!(true)),
+            // A `$recursiveRef` of another schema, evaluated through this one, reaches the place
+            // that carries the anchor, and the walk sees none of them.
+            "a recursive anchor that nothing in the schema refers to",
+        ),
+        (
+            json!({
+                "Holder": { "type": "object", "properties": { "m": reference() } },
+                "Again": { "$recursiveRef": "#" },
+            }),
+            // A `$recursiveRef` reaches the outermost schema that has a `$recursiveAnchor`, which
+            // the walk cannot tell from any other place.
+            "a recursive reference",
+        ),
+    ] {
+        let lines = level_lines(
+            &with_methods(&extra, &["a"]),
+            &with_methods(&extra, &["a", "b"]),
+        );
+        assert_eq!(lines, vec![added("b")], "{says}");
+    }
+}
+
+/// The keywords of the schema beside `$defs` use definitions too: a use of `Method` at the root
+/// that does not widen blocks the line, as one in a definition does, and the root's properties,
+/// which is how the generated schemas use definitions, widen.
+#[test]
+fn a_new_method_does_not_pass_where_the_root_uses_method_without_widening() {
+    let reference = json!({ "$ref": "#/$defs/Method" });
+    let holder =
+        json!({ "Holder": { "type": "object", "properties": { "m": reference.clone() } } });
+    let with_root = |root: &Value, names: &[&str]| -> Value {
+        let mut schema = with_methods(&holder, names);
+        for (keyword, member) in root.as_object().into_iter().flatten() {
+            schema[keyword] = member.clone();
+        }
+        schema
+    };
+    for (root, says) in [
+        (
+            json!({ "not": reference.clone() }),
+            // The old schema accepts "b" as a whole; the new one refuses it.
+            "a not at the root",
+        ),
+        (
+            json!({ "not": { "$ref": "#/$defs/Holder" } }),
+            // The old schema accepts `{"m": "b"}` as a whole; the new one refuses it.
+            "a not at the root, one definition away",
+        ),
+    ] {
+        let lines = level_lines(&with_root(&root, &["a"]), &with_root(&root, &["a", "b"]));
+        assert_eq!(lines, vec![added("b")], "{says}");
+    }
+    let properties = json!({ "properties": { "m": reference, "n": { "$ref": "#/$defs/Holder" } } });
+    let lines = level_lines(
+        &with_root(&properties, &["a"]),
+        &with_root(&properties, &["a", "b"]),
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
 /// Where every use of `Method` widens with it, the new name passes: a use as a property (also one
 /// whose name is a keyword), an item, an additional property, a pattern property, in an `anyOf`,
 /// an `allOf`, a nullable pair, beside an annotation, as a whole definition, through another
@@ -1183,6 +1352,9 @@ fn a_new_method_passes_where_every_use_of_method_widens() {
         "Nullable": { "anyOf": [reference(), { "type": "null" }] },
         "Described": { "$ref": "#/$defs/Method", "description": "a method" },
         "Chain": { "type": "object", "properties": { "inner": { "$ref": "#/$defs/Property" } } },
+        // A definition whose name has an upper-case letter, a digit and an underscore.
+        "Chain_2": { "anyOf": [{ "$ref": "#/$defs/Chain" }, { "type": "null" }] },
+        "Outer": { "type": "object", "properties": { "next": { "$ref": "#/$defs/Chain_2" } } },
     });
     assert!(
         level_lines(
@@ -1212,10 +1384,11 @@ fn with_methods(extra: &Value, names: &[&str]) -> Value {
 /// A name that has not the shape of a method's name (lower-case letters, digits and underscores in
 /// words, with single dots between) is no new method, whether it is the line's name or any other
 /// name of the old list or the new one: the definition is then not the list the rule is for. In
-/// the first case the new schema accepts a text that the old one refuses, which no method's name says.
-/// `#`, `@`, `[` and `{` mark a branch, a numbered branch, an item and an additional property in a
-/// label, so a name that holds one can look like the label of another place. Where a name is in
-/// both lists, the new list adds only "c", which has the shape, and its line is reported too.
+/// the first case the new schema accepts a text that the old one refuses, which no method's name
+/// says. `#`, `@`, `[` and `{` mark a branch, a numbered branch, an item and an additional
+/// property in a label, so a name that holds one can look like the label of another place. Where
+/// a name is in both lists, the new list adds only "c", which has the shape, and its line is
+/// reported too.
 #[test]
 fn a_name_that_is_not_the_shape_of_a_methods_is_no_new_method() {
     for name in [
