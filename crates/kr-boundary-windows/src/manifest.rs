@@ -121,6 +121,10 @@ pub enum Outcome {
     Made,
     /// The object stood there when the step looked, and the step did not make it.
     Found,
+    /// The object stood there when a new installation looked, and the installation refused to go on
+    /// with it: it did not make it and did not use it. Neither a rollback nor the removal acts on
+    /// it, where a repair's `found` is an object that the removal acts on.
+    Refused,
 }
 
 /// One object the installation laid down.
@@ -144,13 +148,14 @@ impl Object {
     /// Whether a step that undoes may act on the object. The rollback of a failed new installation
     /// acts on what that run made and on nothing else. The removal acts on what a run made and on
     /// what a run found and used (a repair finds what an earlier run made); an object with no result
-    /// is not acted on, since nothing shows that the installation made it.
+    /// is not acted on, since nothing shows that the installation made it, and an object that a new
+    /// installation refused is acted on by neither.
     #[must_use]
     pub fn acted_on_by(&self, rollback: bool) -> bool {
         match self.outcome {
             Some(Outcome::Made) => true,
             Some(Outcome::Found) => !rollback,
-            None => false,
+            Some(Outcome::Refused) | None => false,
         }
     }
 }

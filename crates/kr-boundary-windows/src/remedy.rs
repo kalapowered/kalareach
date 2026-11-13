@@ -1321,8 +1321,8 @@ pub fn rollback_ending(marked: &[String], records_deleted: bool) -> String {
 
 /// The words for an object that a rollback did not act on, because its own run holds no result that
 /// it made it: what the run's record holds of the step, and that the rollback left the object as it
-/// is. A rollback leaves an object that its run did not make, one that its run found and one with no
-/// result. They say what the record holds and nothing of the object itself.
+/// is. A rollback leaves an object that its run did not make, one that its run found, one that its
+/// run refused and one with no result. They say what the record holds and nothing of the object itself.
 #[must_use]
 // text: left_alone
 pub fn left_alone(what: &str, name: &str, outcome: Option<Outcome>) -> String {
@@ -1330,8 +1330,11 @@ pub fn left_alone(what: &str, name: &str, outcome: Option<Outcome>) -> String {
         None => format!(
             "{what} {name}: this run recorded the step that was to make it and holds no result that the step made it, so the rollback left it as it is"
         ),
-        Some(_) => format!(
+        Some(Outcome::Found | Outcome::Made) => format!(
             "{what} {name}: this run found it where it looked and did not make it, so the rollback left it as it is"
+        ),
+        Some(Outcome::Refused) => format!(
+            "{what} {name}: this run found it where it looked, did not make it and went no further with it, so the rollback left it as it is"
         ),
     }
 }
@@ -1425,7 +1428,7 @@ impl FolderRecord {
     #[must_use]
     pub fn of(outcome: Option<Outcome>, has_identity: bool) -> FolderRecord {
         match (outcome, has_identity) {
-            (Some(Outcome::Found), _) => FolderRecord::Found,
+            (Some(Outcome::Found | Outcome::Refused), _) => FolderRecord::Found,
             (_, false) => FolderRecord::NoIdentity,
             (Some(Outcome::Made), true) => FolderRecord::Made,
             (None, true) => FolderRecord::Intent,

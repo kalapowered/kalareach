@@ -572,6 +572,36 @@ fn a_rollback_acts_on_what_a_run_made_and_the_removal_on_what_a_run_made_or_foun
     assert!(acts("made", false));
 }
 
+/// A service that a new installation refused is recorded with a result of its own: neither a
+/// rollback nor the removal acts on it, and it is not the `found` that the removal acts on where a
+/// repair found and used the service.
+#[test]
+fn a_service_that_a_new_installation_refused_is_acted_on_by_neither_tree() {
+    const SERVICE: &str = "KalaReachBoundary";
+    let mut manifest = Manifest::begin();
+    manifest.record(ObjectKind::Service, SERVICE, None);
+    manifest.conclude(ObjectKind::Service, SERVICE, Outcome::Refused);
+    let service = manifest.find(ObjectKind::Service, SERVICE).unwrap();
+    assert!(!service.acted_on_by(true));
+    assert!(!service.acted_on_by(false));
+    assert_ne!(service.outcome, Some(Outcome::Found));
+    let again = Manifest::parse(&manifest.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        again.find(ObjectKind::Service, SERVICE).unwrap().outcome,
+        Some(Outcome::Refused)
+    );
+    // The same service as a repair found and used it is acted on by the removal.
+    let mut repair = Manifest::begin();
+    repair.record(ObjectKind::Service, SERVICE, None);
+    repair.conclude(ObjectKind::Service, SERVICE, Outcome::Found);
+    assert!(
+        repair
+            .find(ObjectKind::Service, SERVICE)
+            .unwrap()
+            .acted_on_by(false)
+    );
+}
+
 #[test]
 fn the_manifest_is_a_store_that_refuses_what_it_does_not_know() {
     let dir = tempfile::tempdir().unwrap();

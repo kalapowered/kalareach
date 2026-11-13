@@ -497,6 +497,36 @@ fn a_replacement_that_became_the_manifest_is_taken_as_the_manifest() {
     assert!(staging < published && published < manifest);
 }
 
+/// A service that stands at the broker's name when a new installation looks is refused at the first
+/// look, before any call that changes it, with a result that neither tree acts on.
+#[test]
+fn a_service_that_a_new_installation_refused_is_refused_at_the_first_look_and_acted_on_by_no_tree()
+{
+    let source = install_source();
+    let lay = code_of(body_of(&source, "fn lay_down("));
+    let first_look = lay
+        .find("let broker_service = manager.open(SERVICE)?;")
+        .expect("the first look at the broker's service");
+    let refusal = lay
+        .find("if broker_service.is_some() && !existing {\n        return Err(refused_service());")
+        .expect("a new installation refuses the service that stands there");
+    let stop = lay
+        .find("remedy::stop_broker(")
+        .expect("a repair stops the broker");
+    assert!(first_look < refusal && refusal < stop);
+    // The service step refuses with the result that no tree acts on, and says the same words.
+    let step = lay
+        .find("Some(_) => {\n            run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;")
+        .expect("the service step's refusal");
+    let refused = lay[step..]
+        .find("run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;")
+        .expect("the result is refused");
+    let words = lay[step..].find("return Err(refused_service());").unwrap();
+    assert!(refused < words);
+    assert_eq!(source.matches("refused_service()").count(), 3);
+    assert!(!lay[step..step + words].contains("Outcome::Found"));
+}
+
 #[test]
 fn the_journal_files_go_only_where_the_service_never_ran_or_a_read_showed_that_it_ended() {
     let source = install_source();
