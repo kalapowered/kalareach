@@ -174,24 +174,6 @@ async fn a_workflow_decision_reads_the_wall_clock_once_its_lock_is_held() {
     }
 }
 
-/// Makes every write of the host's policy fail from here, as it would on a full disk. The fault
-/// is lifted by dropping its trigger on the returned connection.
-fn refuse_policy_writes(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connection {
-    let registry = rusqlite::Connection::open(temp.environment().registry_database())
-        .expect("opens the registry");
-    registry
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .expect("waits for the daemon's writes");
-    registry
-        .execute_batch(
-            "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
-                 WHEN NEW.key = 'policy'
-                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
-        )
-        .expect("the fault is in place");
-    registry
-}
-
 /// While the floor is owed its record, a workflow's grant that reads the clock is not decided,
 /// and a personal grant that never expires, under no time bound of this host's policy, is
 /// decided as before. Once the floor is written down, the expiring grant is decided again.
@@ -199,7 +181,7 @@ fn refuse_policy_writes(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connectio
 async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
     let temp = kr_ipc::testing::TempHost::create();
     let controller = daemon(&temp).await;
-    let registry = refuse_policy_writes(&temp);
+    let registry = super::net::tests::refuse_policy_writes(&temp);
     // A lapse this host found and could not write down. It is kept strictly above the floor: a
     // write of the floor already in flight when the fault was put in place, by the daemon's own
     // tick, may cover the floor's own moment. This is no tolerance.
@@ -237,9 +219,7 @@ async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
         "{refused:?}"
     );
 
-    registry
-        .execute_batch("DROP TRIGGER refuse_policy;")
-        .expect("the fault is cleared");
+    super::net::tests::allow_policy_writes(&registry);
     controller
         .decide_for_workflow(
             &expiring,
@@ -255,10 +235,12 @@ async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lapse_the_floor_on_disk_already_covers_leaves_the_floor_owed_nothing() {
     let temp = kr_ipc::testing::TempHost::create();
-    let controller = daemon(&temp).await;
+    // Started once the daemon's own first passes are over, so that none of them writes the floor
+    // again between the reading below and the fault.
+    let controller = super::net::tests::daemon_after_its_first_passes(&temp).await;
     // The floor is written down at this host's reading now, and then nothing more can be.
     controller.settled_now_ms();
-    let _registry = refuse_policy_writes(&temp);
+    let _registry = super::net::tests::refuse_policy_writes(&temp);
     controller.keep_lapse(controller.utc_floor().written());
 
     let now_ms = kr_ipc::now_ms().get();

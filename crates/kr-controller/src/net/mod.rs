@@ -3009,7 +3009,9 @@ pub(crate) mod tests {
     /// ([`until_its_first_passes_are_over`]). A test that arranges the host's floor, by a worker's
     /// reading or a failed write, starts its daemon here, so that no pass of the daemon writes the
     /// floor as it stands after that first step.
-    async fn daemon_after_its_first_passes(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+    pub(in crate::service) async fn daemon_after_its_first_passes(
+        temp: &kr_ipc::testing::TempHost,
+    ) -> Arc<Controller> {
         let controller = daemon(temp).await;
         until_its_first_passes_are_over(&controller).await;
         controller
@@ -3185,7 +3187,9 @@ pub(crate) mod tests {
     }
 
     /// Makes every write of the host's policy fail from here, as it would on a full disk.
-    fn refuse_policy_writes(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connection {
+    pub(in crate::service) fn refuse_policy_writes(
+        temp: &kr_ipc::testing::TempHost,
+    ) -> rusqlite::Connection {
         let registry = rusqlite::Connection::open(temp.environment().registry_database())
             .expect("opens the registry");
         registry
@@ -3202,7 +3206,7 @@ pub(crate) mod tests {
     }
 
     /// Lets the host's policy be written again.
-    fn allow_policy_writes(registry: &rusqlite::Connection) {
+    pub(in crate::service) fn allow_policy_writes(registry: &rusqlite::Connection) {
         registry
             .execute_batch("DROP TRIGGER refuse_policy;")
             .expect("the fault is cleared");
