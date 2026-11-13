@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { childEnvironment, refusal } from './desktop.mjs'
+import { childArguments, childEnvironment, refusal } from './desktop.mjs'
 
 let failures = 0
 
@@ -36,7 +36,7 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '-t', 'universal-apple-darwin', '--no-sign'],
     // What follows a bare `--` is passed on to cargo, whatever it looks like.
     ['build', '--', '--runner', 'x'],
-    ['build', '--ci', '--', '--no-bundle', '--target', 'x86_64-pc-windows-msvc']
+    ['build', '--ci', '--', '--no-bundle', '--locked', '--offline']
   ]) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is run as it is given on ${platform}`, 'false', refused(argv, platform))
   }
@@ -83,6 +83,21 @@ for (const argv of [
   held(`\`pnpm desktop ${argv.join(' ')}\` is refused, since it makes no bundle`, 'true', refused(argv))
 }
 
+// A build with no bundle selected makes nothing to read, whatever the form of the option.
+for (const argv of [
+  ['build', '--bundles'],
+  ['build', '-b'],
+  ['build', '--bundles', '--ci'],
+  ['build', '-b', '--no-sign'],
+  ['build', '--bundles='],
+  ['build', '--bundles', '--', 'app']
+]) {
+  held(`\`pnpm desktop ${argv.join(' ')}\` is refused, since it selects no bundle`, 'true', refused(argv))
+}
+for (const argv of [['build', '--bundles', 'app'], ['build', '-bapp'], ['build', '-b', 'app,dmg'], ['build', '--bundles=nsis', '--ci']]) {
+  held(`\`pnpm desktop ${argv.join(' ')}\` selects a bundle`, 'false', refused(argv))
+}
+
 // The setting is made for the machine this runs on, so a Windows target is built on Windows only.
 const WINDOWS_TARGETS = [
   ['build', '--target', 'x86_64-pc-windows-msvc'],
@@ -99,9 +114,69 @@ for (const platform of ['darwin', 'linux']) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}`, 'true', refused(argv, platform))
   }
 }
-for (const argv of WINDOWS_TARGETS) {
+// On Windows the MSVC targets are the two that the link options of `.cargo/config.toml` name, and any
+// other is refused: the static runtime would not be left out of its link.
+for (const argv of [
+  ['build', '--target', 'x86_64-pc-windows-msvc'],
+  ['build', '--target=aarch64-pc-windows-msvc'],
+  ['build', '-t', 'x86_64-pc-windows-gnu'],
+  ['build', '-tx86_64-pc-windows-msvc'],
+  ['build', '--bundles', 'nsis', '--target', 'aarch64-pc-windows-gnullvm']
+]) {
   held(`\`pnpm desktop ${argv.join(' ')}\` is run on Windows`, 'false', refused(argv, 'win32'))
 }
+for (const argv of [
+  ['build', '-t=i686-pc-windows-msvc'],
+  ['build', '--target', 'i686-pc-windows-msvc'],
+  ['build', '--tar', 'x86_64-uwp-windows-msvc'],
+  ['build', '-dt', 'thumbv7a-pc-windows-msvc']
+]) {
+  held(`\`pnpm desktop ${argv.join(' ')}\` is refused on Windows, since its link has no options that leave the static runtime out`, 'true', refused(argv, 'win32'))
+}
+// A target given by the environment is held to the same rule, in any spelling of the name on Windows.
+for (const [platform, name, value, expected] of [
+  ['win32', 'CARGO_BUILD_TARGET', 'i686-pc-windows-msvc', 'true'],
+  ['win32', 'cargo_build_target', 'i686-pc-windows-msvc', 'true'],
+  ['win32', 'CARGO_BUILD_TARGET', 'x86_64-pc-windows-msvc', 'false'],
+  ['win32', 'CARGO_BUILD_TARGET', 'aarch64-pc-windows-msvc', 'false'],
+  ['win32', 'CARGO_BUILD_TARGET', '', 'false'],
+  ['darwin', 'CARGO_BUILD_TARGET', 'x86_64-pc-windows-msvc', 'true'],
+  ['linux', 'CARGO_BUILD_TARGET', 'aarch64-pc-windows-msvc', 'true'],
+  ['darwin', 'CARGO_BUILD_TARGET', 'aarch64-apple-darwin', 'false'],
+  ['linux', 'CARGO_BUILD_TARGET', 'x86_64-unknown-linux-gnu', 'false']
+]) {
+  const answer = refusal(['build'], platform, { PATH: 'x', [name]: value })
+  held(`${name}=${JSON.stringify(value)} on ${platform} is refused: ${expected}`, expected, String(answer !== null))
+  if (expected === 'true') held(`the refusal for ${name} names the variable`, 'true', String(answer.includes('CARGO_BUILD_TARGET')))
+}
+
+// What follows a bare `--` goes to cargo, whose own `--config` can set the environment and the flags of the
+// build (the variable that the entry gives, `env.STATIC_VCRUNTIME` forced to `true`, among them) and whose
+// `--target` is read by none of the checks: both are refused on every platform, in every form.
+for (const platform of ['darwin', 'linux', 'win32']) {
+  for (const argv of [
+    ['build', '--', '--config', 'env.STATIC_VCRUNTIME.value="true"'],
+    ['build', '--', '--config=env.STATIC_VCRUNTIME.force=true'],
+    ['build', '--ci', '--', '--locked', '--config', 'build.rustflags=[]'],
+    ['build', '--', '--target', 'x86_64-pc-windows-msvc'],
+    ['build', '--', '--target=aarch64-apple-darwin'],
+    ['build', '--features', 'a', '--', '--target', 'x']
+  ]) {
+    held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}, since cargo would be given its own setting`, 'true', refused(argv, platform))
+  }
+  for (const argv of [['build', '--', '--locked'], ['build', '--', '--offline', '--frozen'], ['build', '--', '--target-dir', 'x'], ['build', '--', '--configuration']]) {
+    held(`\`pnpm desktop ${argv.join(' ')}\` is run as it is given on ${platform}`, 'false', refused(argv, platform))
+  }
+}
+
+// The command line tool takes the runner from the build's configuration unless it is given one, and a
+// configuration that the caller passes can name another program: the build is given cargo.
+held('the build is given cargo as its runner, right after the build', JSON.stringify(['build', '--runner', 'cargo']), JSON.stringify(childArguments(['build'])))
+held(
+  'what the caller gave follows the runner as it was given',
+  JSON.stringify(['build', '--runner', 'cargo', '--config', '{"build":{"runner":"cargo-xwin"}}', '--', '--locked']),
+  JSON.stringify(childArguments(['build', '--config', '{"build":{"runner":"cargo-xwin"}}', '--', '--locked']))
+)
 
 // On Windows an environment that gives the compiler flags replaces the link options that keep the static
 // runtime out of the link, in every spelling of the name, and with any value, an empty one included
