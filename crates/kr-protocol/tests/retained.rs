@@ -815,6 +815,7 @@ fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
             "title": "Bundle",
             "description": "What the bundle holds",
             "properties": { "a": { "$ref": "#/$defs/A" } },
+            "allOf": [{ "type": "object", "description": "A part of the root" }],
         })
     };
     let cut = |root: &Value, defined: Value| {
@@ -876,6 +877,7 @@ fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
     quiet["title"] = json!("Another title");
     quiet["description"] = json!("Another description");
     quiet["properties"] = json!({ "b": { "$ref": "#/$defs/B" } });
+    quiet["allOf"][0]["description"] = json!("Another part of the root");
     assert_eq!(found(&base, &cut(&quiet, definitions())), vec![]);
     // A reference of the root reaches a definition that no root of the cut names, so a change
     // there is a difference of the surface too.
