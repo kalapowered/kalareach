@@ -270,6 +270,8 @@ describe('the boxes the handler reads', () => {
     expect(reads.length, 'boxes read by the press').toBeLessThanOrEqual(bound)
     expect(reads.length, 'boxes read by the press, against every link').toBeLessThan(links.flat().length / 4)
     const readLinks = new Set(reads.filter((each) => each.classList.contains('md-link')))
+    // Only the 3 links of message 30 that lie within the reach beside the press have their words read.
+    expect(reads.filter((each) => each.classList.contains('md-link-label')).length, 'links whose words were read by the press').toBe(3)
     expect(readLinks.has(links[10]?.[0]), 'a link of a message far from the press').toBe(false)
     expect(readLinks.has(links[31]?.[0]), 'a link of a message beyond the reach under the press').toBe(false)
     fire('pointerup', pointer(texts[30], { clientY: y + 2700, timeStamp: 120 }))
