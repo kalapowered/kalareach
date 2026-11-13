@@ -1293,8 +1293,7 @@ impl Controller {
                         .await
                 }
                 Method::DeviceRevoke => {
-                    self.device_revoke(mutation, carried, &hold, withdrew)
-                        .await
+                    self.device_revoke(mutation, carried, &hold, withdrew).await
                 }
                 Method::OrganisationWithdraw => {
                     self.organisation_withdraw(mutation, carried, &hold, withdrew)

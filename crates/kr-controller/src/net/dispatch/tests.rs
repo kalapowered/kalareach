@@ -4691,7 +4691,9 @@ async fn a_local_prompt_whose_admission_lapses_before_its_draft_is_recorded_reco
     else {
         panic!("the prompt is refused: {answered:?}");
     };
-    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    // The route is the worker's, whose answer is a copy as far as the door can tell: with the
+    // registration gone the caller is not shown what became of the prompt, whatever the refusal.
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
     assert!(
         !is_submitted(controller, &actor, draft_id),
         "the draft was recorded after its admission had lapsed"
