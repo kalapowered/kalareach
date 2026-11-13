@@ -24,7 +24,9 @@ place may hold. A request that meets every condition starts a thread that the te
 so the host does not take the thread its reply names as the one the terminal is in. A route with no
 `hidden_when`, or an empty one, means what it meant before. A package whose table states the member
 declares `"sdk_range": ">=0.1.7, <0.2.0"`, and the package check refuses a table that carries the
-member under a range that admits an earlier SDK version. A condition's place begins with the
+member under a range that admits an earlier SDK version. It refuses the table under a range with a
+prerelease part (`>=0.1.7-alpha, <0.2.0`, `>=0.1.7, <0.2.0-rc.1`) as well, because it cannot decide
+such a range: state the range with release versions only. A condition's place begins with the
 table's `params` member, since the host reads it in the request's parameters. The package check
 declares `"sdk_range": ">=0.1.7, <0.2.0"`, and the package check refuses a table that carries the
 member under a range that admits an earlier SDK version. A condition's place begins with the

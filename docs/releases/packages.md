@@ -264,12 +264,15 @@ it did, since the comparison goes by where a definition is used and not by its n
 a reference to an equal definition and for `oneOf` branches in a new order too. A release from
 before the table has an empty one, and a release whose contract file is missing, states no SDK
 version or has a table that does not read fails the check with a message of its own. The table
-lists a member only where a package that lacks it means what it meant before. The package check
-refuses a connector table that carries a listed member under an `sdk_range` that admits an SDK
-version below the member's arrival, so a package that uses the member states a range that an
-earlier host does not admit. The comparison cannot prove that a member's absence keeps the earlier meaning, so each entry of
-the arrival table is a review item for the member's own schema: the comparison sees neither, and
-the review of the change that lists a member must.
+lists a member only where a package that lacks it means what it meant before. The comparison
+cannot prove that a member's absence keeps the earlier meaning, so each entry of the arrival table
+is a review item for the member's own schema: the comparison sees neither, and the review of the
+change that lists a member must. The package check refuses a connector table that
+carries a listed member under an `sdk_range` that admits an SDK version below the member's arrival,
+so a package that uses the member states a range that an earlier host does not admit. It refuses
+the table under a range with a prerelease part as well (`>=0.1.7-alpha, <0.2.0`,
+`>=0.1.7, <0.2.0-rc.1`), because it cannot decide such a range: the package states the range with
+release versions only, as in `>=0.1.7, <0.2.0`.
 
 The check fails when it cannot list origin's tags, when this checkout's tags are not origin's, when
 a release's tree cannot be read and when a source is in a form it does not read, and it never leaves

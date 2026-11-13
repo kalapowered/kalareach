@@ -1039,9 +1039,15 @@ fn check_arrivals(range: &VersionRange, table: &serde_json::Value, report: &mut 
                 CONNECTOR_FILE,
                 format!(
                     "the table carries {}.{}, which arrived at SDK {}, and the sdk_range {range} \
-                     has a prerelease part, which cannot be told from a range that admits an SDK \
-                     version below it",
-                    arrival.definition, arrival.member, arrival.sdk_version
+                     has a prerelease part: the check cannot decide a range with a prerelease \
+                     part, so state the range with release versions only, for example \
+                     `>={}, <{}.{}.0`",
+                    arrival.definition,
+                    arrival.member,
+                    arrival.sdk_version,
+                    arrival.sdk_version,
+                    arrived.get().major,
+                    arrived.get().minor + 1
                 ),
             ));
         } else if range.admits_a_version_below(&arrived) {
