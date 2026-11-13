@@ -23,7 +23,8 @@ const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 /**
  * What the taps need on the conversation: two table rows, text after a link, a link with another on
  * the next line, the control of an image that has not been loaded with a link on the next line, a link
- * in the middle of a line with no other link near, and room to scroll.
+ * in the middle of a line with no other link near, a link at the start and one at the end of a line,
+ * room to scroll, and a link on the conversation's last line.
  */
 const TAP_MESSAGES: readonly string[] = [
   ['| Item | Notes |', '| --- | --- |', '| one | [first notes](https://example.org/table-1) |', '| two | [second notes](https://example.org/table-2) |'].join('\n'),
@@ -34,14 +35,21 @@ const TAP_MESSAGES: readonly string[] = [
   'Plain words, a second paragraph above the link.',
   'See [it](https://example.org/middle) now',
   'Plain words under the link, a paragraph of their own, with no other link near the one above.',
+  '[1](https://example.org/at-start) then plain words after the link at the start of the line.',
+  'Plain words before the link at the end of the line, [2](https://example.org/at-end)',
   ...Array.from(
     { length: 16 },
     (_, index) => `Plain words in paragraph ${String(index + 1)}, which holds no link, so that the conversation is longer than the screen and scrolls.`
-  )
+  ),
+  'The last words of the conversation end with [a link](https://example.org/last-line)'
 ]
 
 /** Puts the messages of the taps on the first session. */
 export function fillForTaps(controls: FakeHostControls): void {
+  // The link at the end of a line has its words end at the pane's right edge, as a full line's last word does.
+  const style = document.createElement('style')
+  style.textContent = ".m-node p:has(.md-link[title$='at-end']) { text-align: justify; text-align-last: justify; }"
+  document.head.append(style)
   for (const message of TAP_MESSAGES) controls.records.appendEntry(SESSION, 'message', message)
   document.dispatchEvent(new Event('visibilitychange'))
 }

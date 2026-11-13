@@ -18,12 +18,13 @@
  *   The open at the click runs the same rule at the press's own point, so what lights at the press is
  *   what opens at the release.
  *
- * Where the listeners stand: the pointer down is on the document, in the capture phase, because a press
- * outside the pane must end the pane's record and its look; the pointer move, up and cancel are on the
- * document from a press to its end, because a release or a cancel can come outside the pane when the
- * finger slides out. The click is on the pane itself, in the capture phase: every click the decision
- * reads lies in the pane, and a tap on the pane's own area, where no message lies, has the pane as its
- * target.
+ * Where the listeners stand: all on the document, in the capture phase for the pointer down and the
+ * click. A press outside the pane must end the pane's record and its look, so the pointer down is not on
+ * the pane; the pointer move, up and cancel are on the document from a press to its end, because a
+ * release or a cancel can come outside the pane when the finger slides out; and the click acts only on
+ * a click whose target lies in the pane. A click listener on the pane itself gave no click at any point
+ * where the document's gives none: the points that get none in a desktop WebKit are its scroll bar's
+ * strip at the pane's right edge, which no listener changes and which the phones do not have.
  *
  * The pane's bounds are its client box: what holds content and can be tapped, with no border and no
  * scroll bar's strip that takes up room. A press or a click outside it lights and opens nothing.
@@ -115,6 +116,7 @@ export function startLinkPress(element: HTMLElement): () => void {
     document.addEventListener('pointercancel', cancel)
   }
   const click = (event: MouseEvent): void => {
+    if (!here(event.target)) return
     const { clientX: x, clientY: y } = event
     const decision = decide(
       press,
@@ -128,10 +130,10 @@ export function startLinkPress(element: HTMLElement): () => void {
   }
 
   document.addEventListener('pointerdown', down, true)
-  element.addEventListener('click', click, true)
+  document.addEventListener('click', click, true)
   return () => {
     document.removeEventListener('pointerdown', down, true)
-    element.removeEventListener('click', click, true)
+    document.removeEventListener('click', click, true)
     stop()
     light(null)
   }
