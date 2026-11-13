@@ -3,7 +3,7 @@
 //! that is no volume's root. They run on every platform.
 
 use kr_boundary_windows::remedy::{
-    AncestorFault, ParentCure, Presence, Stage, Subject, Tree, ancestor_refusal,
+    AncestorFault, KnownFolder, ParentCure, Presence, Stage, Subject, Tree, ancestor_refusal,
     broker_not_stopped, dos_path_of, identity_text, is_below, is_on_a_network_share,
     is_the_place_asked_for, is_the_volumes_own_root, known_folder_unreadable, parent_advice,
     program_removal_advice, rights_finding, rights_in_words, shape_refusal, supported_layout,
@@ -17,14 +17,19 @@ const GENERIC_ALL: u32 = 0x1000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 
+/// The ending of a state that can pass.
+const RETRY: &str = "Run the setup program again when it can be opened.";
+
 /// The sentence that ends the words of every folder that the installation does not make.
 const CLOSING: &str = "The setup program directs no change to a folder that other programs share.";
 
 /// The number of faults and of stages that the cases go through. A new variant needs an arm in
-/// `fault_index` or `stage_index` (a compile error until it has one), an index below the count
-/// (a failed case until the count is raised) and a place in the list (a failed case until the list
-/// holds as many as the count).
-const FAULTS: usize = 11;
+/// `fault_index` or `stage_index`: the match is exhaustive, so a variant with no arm does not
+/// compile. The match does not force a place in the list, and the count does not either: a variant
+/// that has an arm and no entry passes, so whoever adds a variant adds its entry to `every_fault`
+/// or `every_stage` and raises the count beside it. The list is checked against its count, and each
+/// entry against its index.
+const FAULTS: usize = 12;
 const STAGES: usize = 6;
 
 fn fault_index(fault: &AncestorFault<'_>) -> usize {
@@ -40,6 +45,7 @@ fn fault_index(fault: &AncestorFault<'_>) -> usize {
         AncestorFault::RootMissing(_) => 8,
         AncestorFault::List(_) => 9,
         AncestorFault::Writable(_) => 10,
+        AncestorFault::Leads(_) => 11,
     }
 }
 
@@ -72,6 +78,7 @@ fn every_fault() -> Vec<AncestorFault<'static>> {
         AncestorFault::RootMissing("Windows error 3"),
         AncestorFault::List("S-1-5-32-545 is allowed the right named by its list"),
         AncestorFault::Writable("S-1-5-32-545 is allowed to add"),
+        AncestorFault::Leads(r"C:\Shared\Target"),
     ];
     assert_eq!(faults.len(), FAULTS, "every fault is in the list");
     for (at, fault) in faults.iter().enumerate() {
@@ -206,7 +213,7 @@ fn every_fault_of_a_folder_that_the_installation_does_not_make_has_the_one_form(
         for fault in every_fault() {
             for stage in every_stage() {
                 let text =
-                    ancestor_refusal(r"C:\Shared", tree, &Subject::Shared(fault.clone()), stage);
+                    ancestor_refusal(&Subject::shared(r"C:\Shared", fault.clone()), tree, stage);
                 let what = format!("{tree:?} {fault:?} {stage:?}: {text}");
                 assert!(text.contains(r"C:\Shared"), "{what}");
                 assert!(
@@ -223,10 +230,7 @@ fn every_fault_of_a_folder_that_the_installation_does_not_make_has_the_one_form(
                     | AncestorFault::VolumeUnanswered(_)
                     | AncestorFault::RootMissing(_) => {
                         assert!(!text.contains(&layout), "{what}");
-                        assert!(
-                            text.contains("Run the setup program again when it can be opened."),
-                            "{what}"
-                        );
+                        assert!(text.contains(RETRY), "{what}");
                         assert!(!text.contains("Close the program"), "{what}");
                         assert!(!text.contains("did not answer"), "{what}");
                         assert!(!text.contains("holds it open"), "{what}");
@@ -284,9 +288,8 @@ fn the_refusal_of_a_list_names_the_real_sentence_and_says_what_a_supported_layou
         r"NT AUTHORITY\Authenticated Users (S-1-5-11) is allowed the right to delete or rename an entry in it, the right to delete it (rights 0x10040)"
     );
     let text = ancestor_refusal(
-        r"D:\ProgramData",
+        &Subject::shared(r"D:\ProgramData", AncestorFault::List(&finding)),
         Tree::Data,
-        &Subject::Shared(AncestorFault::List(&finding)),
         Stage::Before,
     );
     assert!(text.contains(r"D:\ProgramData"), "{text}");
@@ -310,9 +313,8 @@ fn the_refusal_of_a_list_names_the_real_sentence_and_says_what_a_supported_layou
 #[test]
 fn the_refusal_of_a_folder_above_the_program_directory_names_that_tree() {
     let text = ancestor_refusal(
-        r"C:\",
+        &Subject::shared(r"C:\", AncestorFault::List("a reason")),
         Tree::Program,
-        &Subject::Shared(AncestorFault::List("a reason")),
         Stage::Before,
     );
     assert!(
@@ -332,9 +334,8 @@ fn the_refusal_of_a_folder_above_the_program_directory_names_that_tree() {
 fn the_refusal_of_a_link_or_a_mounted_folder_never_tells_an_administrator_to_remove_it() {
     for tree in [Tree::Data, Tree::Program] {
         let text = ancestor_refusal(
-            r"C:\ProgramData",
+            &Subject::shared(r"C:\ProgramData", AncestorFault::Link),
             tree,
-            &Subject::Shared(AncestorFault::Link),
             Stage::Before,
         );
         assert!(text.contains(r"C:\ProgramData"), "{text}");
@@ -364,13 +365,13 @@ fn the_refusal_of_a_link_or_a_mounted_folder_never_tells_an_administrator_to_rem
 #[test]
 fn a_refusal_after_the_runs_changes_does_not_say_that_nothing_was_changed() {
     for fault in every_fault() {
-        let subject = Subject::Shared(fault.clone());
-        let before = ancestor_refusal(r"C:\x", Tree::Program, &subject, Stage::Before);
+        let subject = Subject::shared(r"C:\x", fault.clone());
+        let before = ancestor_refusal(&subject, Tree::Program, Stage::Before);
         assert!(
             before.contains("Nothing was changed"),
             "{fault:?}: {before}"
         );
-        let after = ancestor_refusal(r"C:\x", Tree::Program, &subject, Stage::After);
+        let after = ancestor_refusal(&subject, Tree::Program, Stage::After);
         assert!(!after.contains("Nothing was changed"), "{fault:?}: {after}");
         assert!(
             after.contains("had already made changes"),
@@ -381,7 +382,7 @@ fn a_refusal_after_the_runs_changes_does_not_say_that_nothing_was_changed() {
             "{fault:?}: {after}"
         );
         assert!(!after.contains("stays stopped"), "{fault:?}: {after}");
-        let made = ancestor_refusal(r"C:\x", Tree::Data, &subject, Stage::DataParentMade);
+        let made = ancestor_refusal(&subject, Tree::Data, Stage::DataParentMade);
         assert!(!made.contains("Nothing was changed"), "{fault:?}: {made}");
         assert!(
             made.contains("had already made the folder that holds the data directory"),
@@ -397,11 +398,10 @@ fn a_refusal_after_the_runs_changes_does_not_say_that_nothing_was_changed() {
 #[test]
 fn a_repair_says_that_the_broker_stays_stopped_only_where_it_was_stopped() {
     for fault in every_fault() {
-        let subject = Subject::Shared(fault.clone());
+        let subject = Subject::shared(r"C:\x", fault.clone());
         let stopped = ancestor_refusal(
-            r"C:\x",
-            Tree::Program,
             &subject,
+            Tree::Program,
             Stage::AfterRepair {
                 broker_stopped: true,
             },
@@ -424,9 +424,8 @@ fn a_repair_says_that_the_broker_stays_stopped_only_where_it_was_stopped() {
         );
         assert!(!stopped.contains("manifest"), "{fault:?}: {stopped}");
         let running = ancestor_refusal(
-            r"C:\x",
-            Tree::Program,
             &subject,
+            Tree::Program,
             Stage::AfterRepair {
                 broker_stopped: false,
             },
@@ -447,13 +446,12 @@ fn no_stage_says_that_a_folder_is_empty_and_the_data_parents_stage_says_what_the
     for fault in every_fault() {
         for stage in every_stage() {
             let text =
-                ancestor_refusal(r"C:\x", Tree::Data, &Subject::Shared(fault.clone()), stage);
+                ancestor_refusal(&Subject::shared(r"C:\x", fault.clone()), Tree::Data, stage);
             assert!(!text.contains("empty"), "{fault:?} {stage:?}: {text}");
         }
         let made = ancestor_refusal(
-            r"C:\x",
+            &Subject::shared(r"C:\x", fault.clone()),
             Tree::Data,
-            &Subject::Shared(fault.clone()),
             Stage::DataParentMade,
         );
         assert!(
@@ -470,9 +468,8 @@ fn no_stage_says_that_a_folder_is_empty_and_the_data_parents_stage_says_what_the
 fn the_removal_that_undoes_a_failed_installation_does_not_say_that_nothing_was_changed() {
     for fault in every_fault() {
         let text = ancestor_refusal(
-            r"C:\x",
+            &Subject::shared(r"C:\x", fault.clone()),
             Tree::Program,
-            &Subject::Shared(fault.clone()),
             Stage::Rollback,
         );
         assert!(!text.contains("Nothing was changed"), "{fault:?}: {text}");
@@ -492,9 +489,8 @@ fn the_removal_that_undoes_a_failed_installation_does_not_say_that_nothing_was_c
 #[test]
 fn the_refusal_of_what_is_not_a_folder_or_cannot_be_read_says_what_a_layout_is_or_what_to_try() {
     let text = ancestor_refusal(
-        r"C:\x",
+        &Subject::shared(r"C:\x", AncestorFault::NotAFolder),
         Tree::Data,
-        &Subject::Shared(AncestorFault::NotAFolder),
         Stage::Before,
     );
     assert!(text.contains("it is not a folder"), "{text}");
@@ -502,9 +498,8 @@ fn the_refusal_of_what_is_not_a_folder_or_cannot_be_read_says_what_a_layout_is_o
     assert!(text.contains("This layout is not supported"), "{text}");
     assert!(!text.contains("Correct the path"), "{text}");
     let text = ancestor_refusal(
-        r"C:\x",
+        &Subject::shared(r"C:\x", AncestorFault::Unreadable("Windows error 5")),
         Tree::Program,
-        &Subject::Shared(AncestorFault::Unreadable("Windows error 5")),
         Stage::Before,
     );
     assert!(text.contains(r"C:\x"), "{text}");
@@ -513,10 +508,7 @@ fn the_refusal_of_what_is_not_a_folder_or_cannot_be_read_says_what_a_layout_is_o
         "{text}"
     );
     assert!(text.contains("program directory"), "{text}");
-    assert!(
-        text.contains("Run the setup program again when it can be opened."),
-        "{text}"
-    );
+    assert!(text.contains(RETRY), "{text}");
     // No cause is named: the error can be any of many.
     for cause in [
         "Close the program",
@@ -538,9 +530,8 @@ fn a_volume_that_cannot_be_asked_is_refused_for_its_volume_and_names_no_cause() 
         (Tree::Data, "data directory"),
     ] {
         let text = ancestor_refusal(
-            r"Z:\",
+            &Subject::shared(r"Z:\", AncestorFault::VolumeUnanswered("Windows error 21")),
             tree,
-            &Subject::Shared(AncestorFault::VolumeUnanswered("Windows error 21")),
             Stage::Before,
         );
         assert!(
@@ -552,10 +543,7 @@ fn a_volume_that_cannot_be_asked_is_refused_for_its_volume_and_names_no_cause() 
             "{text}"
         );
         assert!(text.contains("Nothing was changed"), "{text}");
-        assert!(
-            text.contains("Run the setup program again when it can be opened."),
-            "{text}"
-        );
+        assert!(text.contains(RETRY), "{text}");
         for cause in [
             "Close the program",
             "holds it open",
@@ -566,9 +554,8 @@ fn a_volume_that_cannot_be_asked_is_refused_for_its_volume_and_names_no_cause() 
             assert!(!text.contains(cause), "{cause}: {text}");
         }
         let after = ancestor_refusal(
-            r"Z:\",
+            &Subject::shared(r"Z:\", AncestorFault::VolumeUnanswered("Windows error 21")),
             tree,
-            &Subject::Shared(AncestorFault::VolumeUnanswered("Windows error 21")),
             Stage::AfterRepair {
                 broker_stopped: true,
             },
@@ -576,9 +563,8 @@ fn a_volume_that_cannot_be_asked_is_refused_for_its_volume_and_names_no_cause() 
         assert!(!after.contains("Nothing was changed"), "{after}");
     }
     let program = ancestor_refusal(
-        r"Z:\",
+        &Subject::shared(r"Z:\", AncestorFault::VolumeUnanswered("Windows error 21")),
         Tree::Program,
-        &Subject::Shared(AncestorFault::VolumeUnanswered("Windows error 21")),
         Stage::Before,
     );
     assert!(
@@ -593,9 +579,8 @@ fn a_volume_that_cannot_be_asked_is_refused_for_its_volume_and_names_no_cause() 
 fn a_root_that_is_not_there_is_said_to_be_not_there_and_nothing_more() {
     for tree in [Tree::Program, Tree::Data] {
         let text = ancestor_refusal(
-            r"Z:\",
+            &Subject::shared(r"Z:\", AncestorFault::RootMissing("Windows error 3")),
             tree,
-            &Subject::Shared(AncestorFault::RootMissing("Windows error 3")),
             Stage::Before,
         );
         assert!(
@@ -605,10 +590,7 @@ fn a_root_that_is_not_there_is_said_to_be_not_there_and_nothing_more() {
         for word in ["asks", "asked", "did not answer", "removed", "failed"] {
             assert!(!text.contains(word), "{word}: {text}");
         }
-        assert!(
-            text.contains("Run the setup program again when it can be opened."),
-            "{text}"
-        );
+        assert!(text.contains(RETRY), "{text}");
     }
 }
 
@@ -616,9 +598,8 @@ fn a_root_that_is_not_there_is_said_to_be_not_there_and_nothing_more() {
 fn a_drive_letter_that_is_no_volumes_root_is_refused_with_the_letter_and_the_real_path() {
     for tree in [Tree::Data, Tree::Program] {
         let text = ancestor_refusal(
-            r"X:\",
+            &Subject::shared(r"X:\", AncestorFault::Alias(r"C:\Shared\Backing")),
             tree,
-            &Subject::Shared(AncestorFault::Alias(r"C:\Shared\Backing")),
             Stage::Before,
         );
         assert!(
@@ -662,9 +643,8 @@ fn a_folder_on_a_volume_that_is_not_used_is_refused_for_its_volume() {
         (Tree::Data, "data directory"),
     ] {
         let text = ancestor_refusal(
-            r"Y:\",
+            &Subject::shared(r"Y:\", AncestorFault::Volume(reason)),
             tree,
-            &Subject::Shared(AncestorFault::Volume(reason)),
             Stage::Before,
         );
         assert!(
@@ -687,9 +667,8 @@ fn a_folder_on_a_volume_that_is_not_used_is_refused_for_its_volume() {
         assert!(!text.to_lowercase().contains("re-point"), "{text}");
     }
     let program = ancestor_refusal(
-        r"Y:\",
+        &Subject::shared(r"Y:\", AncestorFault::Volume("a reason")),
         Tree::Program,
-        &Subject::Shared(AncestorFault::Volume("a reason")),
         Stage::Before,
     );
     assert!(
@@ -702,18 +681,16 @@ fn a_folder_on_a_volume_that_is_not_used_is_refused_for_its_volume() {
     assert!(program.contains(&anchor), "{program}");
     assert!(!anchor.contains("Move "), "{anchor}");
     let data = ancestor_refusal(
-        r"Y:\",
+        &Subject::shared(r"Y:\", AncestorFault::Volume("a reason")),
         Tree::Data,
-        &Subject::Shared(AncestorFault::Volume("a reason")),
         Stage::Before,
     );
     assert!(data.contains("ProgramData folder"), "{data}");
     assert!(!data.contains("program directory"), "{data}");
     // After the run's changes the words do not claim that nothing was changed.
     let after = ancestor_refusal(
-        r"Y:\",
+        &Subject::shared(r"Y:\", AncestorFault::Volume("a reason")),
         Tree::Program,
-        &Subject::Shared(AncestorFault::Volume("a reason")),
         Stage::After,
     );
     assert!(!after.contains("Nothing was changed"), "{after}");
@@ -787,15 +764,13 @@ fn the_known_folder_gets_the_words_of_a_shared_folder_and_the_products_own_folde
         AncestorFault::Unreadable("Windows error 5"),
     ] {
         let at_known = ancestor_refusal(
-            known,
-            Tree::Program,
             &Subject::at(known, known, fault.clone()),
+            Tree::Program,
             Stage::Before,
         );
         let shared = ancestor_refusal(
-            known,
+            &Subject::shared(known, fault.clone()),
             Tree::Program,
-            &Subject::Shared(fault.clone()),
             Stage::Before,
         );
         assert_eq!(at_known, shared, "{fault:?}");
@@ -805,9 +780,8 @@ fn the_known_folder_gets_the_words_of_a_shared_folder_and_the_products_own_folde
             "{fault:?}: {at_known}"
         );
         let below = ancestor_refusal(
-            own,
-            Tree::Program,
             &Subject::at(own, known, fault.clone()),
+            Tree::Program,
             Stage::Before,
         );
         let own_words = match fault {
@@ -823,13 +797,12 @@ fn the_known_folder_gets_the_words_of_a_shared_folder_and_the_products_own_folde
         }
     }
     let text = ancestor_refusal(
-        known,
-        Tree::Program,
         &Subject::at(
             known,
             known,
             AncestorFault::Writable("S-1-5-32-545 is allowed to add"),
         ),
+        Tree::Program,
         Stage::Before,
     );
     assert!(
@@ -846,13 +819,12 @@ fn the_known_folder_gets_the_words_of_a_shared_folder_and_the_products_own_folde
     assert!(text.contains("Nothing was changed"), "{text}");
     assert!(instructions_in(&text).is_empty(), "{text}");
     let made = ancestor_refusal(
-        own,
-        Tree::Program,
         &Subject::at(
             own,
             known,
             AncestorFault::Writable("S-1-5-32-545 is allowed to add"),
         ),
+        Tree::Program,
         Stage::Before,
     );
     assert!(
@@ -888,18 +860,18 @@ fn only_a_folder_strictly_below_the_known_folder_is_the_installations_own() {
     assert!(is_below(r"C:\Windows", r"C:\"));
     assert!(!is_below(r"C:\", r"C:\"));
     // The choice itself: the known folder is shared, a folder strictly below it is the product's own.
-    assert!(matches!(
-        Subject::at(known, known, AncestorFault::Link),
-        Subject::Shared(AncestorFault::Link)
-    ));
-    assert!(matches!(
-        Subject::at(r"C:\Program Files\KalaReach", known, AncestorFault::Link),
-        Subject::Own(AncestorFault::Link, _)
-    ));
-    assert!(matches!(
-        Subject::at(r"C:\", known, AncestorFault::Link),
-        Subject::Shared(AncestorFault::Link)
-    ));
+    let at = |folder| Subject::at(folder, known, AncestorFault::Link);
+    assert!(!at(known).is_the_installations_own());
+    assert!(at(r"C:\Program Files\KalaReach").is_the_installations_own());
+    assert!(!at(r"C:\").is_the_installations_own());
+    assert!(
+        !Subject::shared(r"C:\Program Files\KalaReach", AncestorFault::Link)
+            .is_the_installations_own()
+    );
+    // A forward slash is a backslash.
+    assert!(is_below(r"C:/Program Files/KalaReach", known));
+    assert!(is_below(r"C:\Program Files\KalaReach", r"C:/Program Files"));
+    assert!(!is_below(r"C:/Program Files", known));
 }
 
 /// A link at the boundary's own folder above the program directory is not a known folder of another
@@ -908,13 +880,12 @@ fn only_a_folder_strictly_below_the_known_folder_is_the_installations_own() {
 #[test]
 fn a_link_at_the_boundarys_own_folder_sends_the_administrator_nowhere_else() {
     let text = ancestor_refusal(
-        r"C:\Program Files\KalaReach",
-        Tree::Program,
         &Subject::at(
             r"C:\Program Files\KalaReach",
             r"C:\Program Files",
             AncestorFault::Link,
         ),
+        Tree::Program,
         Stage::Before,
     );
     assert!(
@@ -972,49 +943,321 @@ fn a_final_path_is_printed_as_a_person_can_use_it() {
     assert_eq!(dos_path_of(r"\\?\C:\"), r"C:\");
 }
 
-/// The shape of the paths is read before any walk: a known folder that is the root of a volume, and
-/// known folders that overlap (the same folder, or one at or below the other tree's own folder), are
-/// layouts that are not supported, in the shared form, whatever the letter case, a trailing
-/// backslash or the extended prefix.
+/// A known folder as the system gave it, whose open showed the final path `found`.
+fn known<'a>(given: &'a str, found: &'a str) -> KnownFolder<'a> {
+    KnownFolder {
+        given,
+        opened: Ok(found),
+    }
+}
+
+/// A known folder whose open or whose read of the final path failed with `error`.
+fn unopened<'a>(given: &'a str, error: &'a str) -> KnownFolder<'a> {
+    KnownFolder {
+        given,
+        opened: Err(error),
+    }
+}
+
+const PF: &str = r"C:\Program Files";
+const PF_FINAL: &str = r"\\?\C:\Program Files";
+const PD: &str = r"C:\ProgramData";
+const PD_FINAL: &str = r"\\?\C:\ProgramData";
+
+/// The words of a refusal that the shape check gives for a layout that is not supported: no
+/// instruction, one closing sentence, and what the run changed.
+fn shape_words(text: &str) {
+    assert!(text.contains("This layout is not supported"), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(text.ends_with(CLOSING), "{text}");
+    assert_eq!(text.matches(CLOSING).count(), 1, "{text}");
+    assert!(instructions_in(text).is_empty(), "{text}");
+}
+
+/// A known folder whose path is not its own final path is refused first, in the shared form with the
+/// layout ending, with what it leads to and no cause: a short name, a link or a mounted folder, a
+/// forward slash, a substituted letter, a network path, an extended prefix, a trailing backslash and
+/// another form of its letters all end here, for either tree.
 #[test]
-fn the_shape_of_the_known_folders_is_refused_before_any_walk() {
-    let pf = r"C:\Program Files";
-    let pd = r"C:\ProgramData";
-    assert_eq!(shape_refusal(pf, pd), None);
-    assert_eq!(
-        shape_refusal(r"c:\program files\", r"\\?\C:\ProgramData"),
-        None
-    );
-    assert_eq!(
-        shape_refusal(r"C:\Program Files", r"C:\Program Files (x86)"),
-        None
-    );
-    for (files, data, folder) in [
-        (r"D:\", pd, r"D:\"),
-        (r"\\?\d:\", pd, r"\\?\d:\"),
-        (pf, r"E:", r"E:"),
-        (pf, r"e:\", r"e:\"),
-        (r"D:\Data", r"D:\Data", r"D:\Data"),
-        (r"d:\data\", r"D:\DATA", r"d:\data\"),
-        (r"D:\Data\KalaReach", r"D:\Data", r"D:\Data\KalaReach"),
+fn a_known_folder_that_is_not_its_own_final_path_is_refused_with_what_it_leads_to() {
+    // (the path that the system gave, the final path of the folder that it opens, what it leads to)
+    let forms = [
+        (r"C:\SHARED~1", r"\\?\C:\Shared Data", r"C:\Shared Data"),
+        (r"C:\PROGRA~3", PD_FINAL, PD),
         (
-            r"\\?\D:\Data\KalaReach\x",
-            r"D:\Data",
-            r"\\?\D:\Data\KalaReach\x",
+            r"C:\PF",
+            r"\\?\C:\ProgramData\KalaReach",
+            r"C:\ProgramData\KalaReach",
         ),
-        (r"D:\Data", r"D:\Data\KalaReach", r"D:\Data"),
-        (r"D:\Data", r"d:\data\kalareach\sub", r"D:\Data"),
+        (
+            "C:/ProgramData/KalaReach",
+            r"\\?\C:\ProgramData\KalaReach",
+            r"C:\ProgramData\KalaReach",
+        ),
+        (
+            "C:\\\u{dc}nder\\Data",
+            "\\\\?\\C:\\\u{fc}nder\\Data",
+            "C:\\\u{fc}nder\\Data",
+        ),
+        (
+            r"X:\ProgramData",
+            r"\\?\C:\Shared\ProgramData",
+            r"C:\Shared\ProgramData",
+        ),
+        (
+            r"\\server\share\Data",
+            r"\\?\UNC\server\share\Data",
+            r"\\server\share\Data",
+        ),
+        (PF_FINAL, PF_FINAL, PF),
+        (r"C:\Program Files\", PF_FINAL, PF),
+        ("E:", r"\\?\E:\", r"E:\"),
+        ("E:/", r"\\?\E:\", r"E:\"),
+        (r"\\?\Volume{0-1}\", r"\\?\E:\", r"E:\"),
+        (
+            r"\\server\share\",
+            r"\\?\UNC\server\share\",
+            r"\\server\share\",
+        ),
+    ];
+    for (given, found, leads_to) in forms {
+        for tree in [Tree::Program, Tree::Data] {
+            // The refused folder may be either of the two, and the other is a good one.
+            let (files, data) = match tree {
+                Tree::Program => (known(given, found), known(PD, PD_FINAL)),
+                Tree::Data => (known(PF, PF_FINAL), known(given, found)),
+            };
+            let text = shape_refusal(&files, &data, Stage::Before)
+                .unwrap_or_else(|| panic!("{given} for {tree:?} is refused"));
+            let above = match tree {
+                Tree::Program => "above the boundary's program directory",
+                Tree::Data => "above the boundary's data directory",
+            };
+            assert!(
+                text.starts_with(&format!("{given} is a folder {above}")),
+                "{given}: {text}"
+            );
+            assert!(
+                text.contains(&format!("that folder's own path is {leads_to}.")),
+                "{given}: {text}"
+            );
+            assert!(text.contains(&supported_layout(tree)), "{given}: {text}");
+            assert!(!text.contains("root of a volume"), "{given}: {text}");
+            assert!(!text.contains("overlaps"), "{given}: {text}");
+            shape_words(&text);
+            for cause in ["link", "short name", "subst", "alias", "mounted"] {
+                assert!(
+                    !text.to_lowercase().contains(cause),
+                    "{given} {cause}: {text}"
+                );
+            }
+        }
+    }
+}
+
+/// The Codex pair: the system gave `C:\SHARED~1` for ProgramData, the short name of `C:\Shared Data`,
+/// and `C:\Shared Data\KalaReach` for Program Files. The data walk would read that folder as the
+/// installation's own and tell the administrator to remove or rename it: the shape check ends the run
+/// first, with no instruction.
+#[test]
+fn a_short_name_for_a_known_folder_never_makes_the_other_known_folder_the_installations_own() {
+    let text = shape_refusal(
+        &known(r"C:\Shared Data\KalaReach", r"\\?\C:\Shared Data\KalaReach"),
+        &known(r"C:\SHARED~1", r"\\?\C:\Shared Data"),
+        Stage::Before,
+    )
+    .expect("refused");
+    assert!(
+        text.starts_with(r"C:\SHARED~1 is a folder above the boundary's data directory"),
+        "{text}"
+    );
+    assert!(
+        text.contains(r"that folder's own path is C:\Shared Data."),
+        "{text}"
+    );
+    shape_words(&text);
+    assert!(!text.contains("remove or rename"), "{text}");
+}
+
+/// The Claude pair, a junction: Program Files' path is `C:\PF`, which leads to the data tree's own
+/// folder. The known folder is refused for where it leads, so the data walk never reads
+/// `C:\ProgramData\KalaReach` as the installation's own folder under a shared known folder.
+#[test]
+fn a_junction_to_the_other_trees_folder_is_refused_for_where_it_leads() {
+    let text = shape_refusal(
+        &known(r"C:\PF", r"\\?\C:\ProgramData\KalaReach"),
+        &known(PD, PD_FINAL),
+        Stage::Before,
+    )
+    .expect("refused");
+    assert!(
+        text.contains(r"that folder's own path is C:\ProgramData\KalaReach."),
+        "{text}"
+    );
+    assert!(!text.contains("overlaps"), "{text}");
+    shape_words(&text);
+}
+
+/// A known folder that could not be opened, or whose final path could not be read, gets the words of
+/// a folder that could not be opened or read, with the platform's error and the ending of a state
+/// that can pass. It never gets a root or an overlap sentence, whatever its path says.
+#[test]
+fn a_known_folder_that_cannot_be_opened_gets_the_shared_words_for_that() {
+    let error = "Windows error 3";
+    for (files, data, folder, tree) in [
+        (unopened(PF, error), known(PD, PD_FINAL), PF, "program"),
+        (known(PF, PF_FINAL), unopened(PD, error), PD, "data"),
+        (
+            unopened(r"D:\", error),
+            known(PD, PD_FINAL),
+            r"D:\",
+            "program",
+        ),
     ] {
-        let text =
-            shape_refusal(files, data).unwrap_or_else(|| panic!("{files} and {data} are refused"));
-        assert!(text.contains(folder), "{files} {data}: {text}");
-        assert!(text.contains("This layout is not supported"), "{text}");
-        assert!(text.contains("Nothing was changed"), "{text}");
+        let text = shape_refusal(&files, &data, Stage::Before).expect("refused");
+        assert!(
+            text.starts_with(&format!(
+                "{folder} is a folder above the boundary's {tree} directory"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "It is refused because it could not be opened or read to be checked (Windows error 3)."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("root of a volume"), "{text}");
+        assert!(!text.contains("overlaps"), "{text}");
+        assert!(!text.contains("This layout is not supported"), "{text}");
+        assert!(text.contains(RETRY), "{text}");
+        assert!(text.contains("Nothing was changed."), "{text}");
         assert!(text.ends_with(CLOSING), "{text}");
         assert!(instructions_in(&text).is_empty(), "{text}");
     }
-    // A sibling that shares a prefix with the other tree's own folder is no overlap.
-    assert_eq!(shape_refusal(r"D:\Data\KalaReach2", r"D:\Data"), None);
+}
+
+/// The root and the overlap are decided by the final paths alone, in the forms that the system gives
+/// them: a known folder that is a plain root (a drive letter and a backslash, whichever the letter
+/// case), known folders that are the same folder, or one at or below the other tree's own folder.
+#[test]
+fn the_root_and_the_overlap_compare_the_final_paths_alone() {
+    // (Program Files: given and final, ProgramData: given and final, the refused folder, its tree)
+    let refused = [
+        ((r"D:\", r"\\?\D:\"), (PD, PD_FINAL), r"D:\", "program"),
+        ((r"d:\", r"\\?\D:\"), (PD, PD_FINAL), r"d:\", "program"),
+        ((PF, PF_FINAL), (r"e:\", r"\\?\E:\"), r"e:\", "data"),
+        (
+            (r"Volume{0-1}\", r"\\?\Volume{0-1}\"),
+            (PD, PD_FINAL),
+            r"Volume{0-1}\",
+            "program",
+        ),
+        (
+            (r"D:\Data", r"\\?\D:\Data"),
+            (r"D:\Data", r"\\?\D:\Data"),
+            r"D:\Data",
+            "program",
+        ),
+        (
+            (r"d:\data", r"\\?\D:\Data"),
+            (r"D:\DATA", r"\\?\D:\Data"),
+            r"d:\data",
+            "program",
+        ),
+        (
+            (r"D:\Data\KalaReach", r"\\?\D:\Data\KalaReach"),
+            (r"D:\Data", r"\\?\D:\Data"),
+            r"D:\Data\KalaReach",
+            "program",
+        ),
+        (
+            (r"D:\Data\KalaReach\x", r"\\?\D:\Data\KalaReach\x"),
+            (r"D:\Data", r"\\?\D:\Data"),
+            r"D:\Data\KalaReach\x",
+            "program",
+        ),
+        (
+            (r"D:\Data", r"\\?\D:\Data"),
+            (r"D:\Data\KalaReach", r"\\?\D:\Data\KalaReach"),
+            r"D:\Data",
+            "program",
+        ),
+        (
+            (r"D:\Data", r"\\?\D:\Data"),
+            (r"D:\Data\KalaReach\sub", r"\\?\D:\Data\KalaReach\sub"),
+            r"D:\Data",
+            "program",
+        ),
+    ];
+    for ((files, files_final), (data, data_final), folder, tree) in refused {
+        let text = shape_refusal(
+            &known(files, files_final),
+            &known(data, data_final),
+            Stage::Before,
+        )
+        .unwrap_or_else(|| panic!("{files} and {data} are refused"));
+        assert!(
+            text.starts_with(&format!(
+                "{folder} is a folder above the boundary's {tree} directory"
+            )),
+            "{files} {data}: {text}"
+        );
+        assert!(
+            text.contains("root of a volume") || text.contains("overlaps"),
+            "{files} {data}: {text}"
+        );
+        shape_words(&text);
+    }
+}
+
+/// The good layout passes, whatever the on-disk letter case of the final path, and so does a sibling
+/// that only shares a prefix with the other tree's own folder.
+#[test]
+fn the_good_layout_and_a_sibling_pass() {
+    assert_eq!(
+        shape_refusal(&known(PF, PF_FINAL), &known(PD, PD_FINAL), Stage::Before),
+        None
+    );
+    assert_eq!(
+        shape_refusal(
+            &known(r"C:\PROGRAM FILES", PF_FINAL),
+            &known(r"c:\programdata", PD_FINAL),
+            Stage::Before
+        ),
+        None
+    );
+    assert_eq!(
+        shape_refusal(
+            &known(PF, PF_FINAL),
+            &known(r"C:\Program Files (x86)", r"\\?\C:\Program Files (x86)"),
+            Stage::Before
+        ),
+        None
+    );
+    assert_eq!(
+        shape_refusal(
+            &known(r"D:\Data\KalaReach2", r"\\?\D:\Data\KalaReach2"),
+            &known(r"D:\Data", r"\\?\D:\Data"),
+            Stage::Before
+        ),
+        None
+    );
+}
+
+/// A refusal of the shape says what the run changed: for the removal that undoes a failed
+/// installation, nothing of its own, with what that installation made still there.
+#[test]
+fn the_shape_refusal_says_what_the_run_changed() {
+    let (files, data) = (known(r"D:\", r"\\?\D:\"), known(PD, PD_FINAL));
+    let before = shape_refusal(&files, &data, Stage::Before).expect("refused");
+    assert!(before.contains("Nothing was changed."), "{before}");
+    let rollback = shape_refusal(&files, &data, Stage::Rollback).expect("refused");
+    assert!(!rollback.contains("Nothing was changed."), "{rollback}");
+    assert!(
+        rollback.contains("whatever that installation had already made is still there"),
+        "{rollback}"
+    );
 }
 
 /// The setup program's line for a known folder that cannot be read says the error and that nothing

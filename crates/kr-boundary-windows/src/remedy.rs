@@ -342,11 +342,12 @@ pub fn is_the_volumes_own_root(supplied: &str, final_path: &str) -> bool {
     !is_on_a_network_share(final_path) && plain_path(supplied) == plain_path(final_path)
 }
 
-/// A path as the comparisons read it: without the `\\?\` prefix of the extended form and without a
-/// trailing backslash, and in lower case.
+/// A path as the comparisons read it: with a forward slash as a backslash, without the `\\?\` prefix
+/// of the extended form and without a trailing backslash, and in lower case.
 fn plain_path(text: &str) -> String {
+    let text = text.replace('/', r"\");
     text.strip_prefix(r"\\?\")
-        .unwrap_or(text)
+        .unwrap_or(&text)
         .trim_end_matches('\\')
         .to_ascii_lowercase()
 }
@@ -378,6 +379,10 @@ pub enum AncestorFault<'a> {
     /// A known folder that overlaps the system's other known folder: the same folder, or one that
     /// lies at or below the other tree's own folder. The other known folder.
     Overlap(&'a str),
+    /// A known folder whose path, as the system gave it, is not the final path of the folder that
+    /// it opens: a link or a mounted folder at it, a short name, a forward slash, a substituted
+    /// letter and another form of its letters all end here. The final path, as a person can use it.
+    Leads(&'a str),
     /// A drive letter that is no volume's root: the final path of its opened root.
     Alias(&'a str),
     /// The folder is on a volume that the installation does not use: why, as the volume check says
@@ -399,37 +404,65 @@ pub enum AncestorFault<'a> {
     Writable(&'a str),
 }
 
-/// Whose folder a refusal is about, which decides the form of its words.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Subject<'a> {
-    /// A folder that the installation does not make: a known folder itself, every folder above it
-    /// up to the root of its volume, a drive letter. Other programs share it. Its words are built
-    /// by one function from what was found, and say what a supported layout is or, for a state that
-    /// can pass, what to try that changes no folder. They hold no instruction to change that
-    /// folder.
-    Shared(AncestorFault<'a>),
-    /// A folder that the installation makes: strictly below a known folder. Only its words can tell
-    /// the administrator what to correct. Only [`Subject::at`] makes one: the token cannot be made
-    /// outside this module.
-    Own(AncestorFault<'a>, OwnToken),
+/// A fault at one folder, and whose folder it is, which decides the form of its words. The folder,
+/// the fault and whose it is stay behind private fields: a subject is made by [`Subject::shared`]
+/// or [`Subject::at`] and is never taken apart or paired with another fault or folder.
+///
+/// A folder that the installation does not make (a known folder itself, every folder above it up
+/// to the root of its volume, a drive letter) is shared with other programs. Its words are built by
+/// one function from what was found, and say what a supported layout is or, for a state that can
+/// pass, what to try that changes no folder. They hold no instruction to change that folder. A
+/// folder that the installation makes (strictly below a known folder) is the only one whose words
+/// can tell the administrator what to correct, and only [`Subject::at`] makes such a subject.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Subject<'a> {
+    folder: &'a str,
+    fault: AncestorFault<'a>,
+    whose: Whose,
 }
 
-/// The proof that a subject was chosen by [`Subject::at`], which compares the folder with its known
-/// folder. It has no public constructor.
+/// Whose a folder is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OwnToken(());
+enum Whose {
+    /// Shared with other programs.
+    Shared,
+    /// The installation's own.
+    Own,
+}
 
 impl<'a> Subject<'a> {
-    /// The subject of a fault at `folder` where `known` is the known folder that the walk starts
-    /// from: a folder strictly below the known folder is the installation's own, and the known
-    /// folder itself and every folder above it are shared.
+    /// A fault at a folder that the installation does not make.
     #[must_use]
-    pub fn at(folder: &str, known: &str, fault: AncestorFault<'a>) -> Self {
-        if is_below(folder, known) {
-            Subject::Own(fault, OwnToken(()))
-        } else {
-            Subject::Shared(fault)
+    pub fn shared(folder: &'a str, fault: AncestorFault<'a>) -> Self {
+        Subject {
+            folder,
+            fault,
+            whose: Whose::Shared,
         }
+    }
+
+    /// A fault at `folder` where `known` is the known folder that the walk starts from: a folder
+    /// strictly below the known folder is the installation's own, and the known folder itself and
+    /// every folder above it are shared.
+    #[must_use]
+    pub fn at(folder: &'a str, known: &str, fault: AncestorFault<'a>) -> Self {
+        let whose = if is_below(folder, known) {
+            Whose::Own
+        } else {
+            Whose::Shared
+        };
+        Subject {
+            folder,
+            fault,
+            whose,
+        }
+    }
+
+    /// Whether the folder is one that the installation makes, so that its words may say what to
+    /// correct.
+    #[must_use]
+    pub fn is_the_installations_own(&self) -> bool {
+        self.whose == Whose::Own
     }
 }
 
@@ -533,8 +566,8 @@ impl Stage {
 }
 
 /// What a supported layout is, in one sentence that says where the boundary installs: the tree's
-/// own known folder, with that folder and every folder above it plain, on a fixed, local NTFS
-/// volume.
+/// own known folder, at the path that the system gives for it (its own final path), with that
+/// folder and every folder above it plain, on a fixed, local NTFS volume.
 #[must_use]
 pub fn supported_layout(tree: Tree) -> String {
     let (tree, known) = match tree {
@@ -542,7 +575,7 @@ pub fn supported_layout(tree: Tree) -> String {
         Tree::Program => ("program directory", "Program Files"),
     };
     format!(
-        "This layout is not supported: the setup program installs the boundary's {tree} only in the system's {known} folder, and only where that folder and every folder above it, up to the root of its volume, are plain folders on a fixed, local NTFS volume that only the system, the Administrators group and the installer service own or can replace."
+        "This layout is not supported: the setup program installs the boundary's {tree} only in the system's {known} folder, and only where the path that the system gives for that folder is its own final path and that folder and every folder above it, up to the root of its volume, are plain folders on a fixed, local NTFS volume that only the system, the Administrators group and the installer service own or can replace."
     )
 }
 
@@ -577,10 +610,10 @@ impl Ending {
 /// installation does not support and tells no one to change. `stage` says whether the run had
 /// changed anything.
 #[must_use]
-pub fn ancestor_refusal(folder: &str, tree: Tree, subject: &Subject<'_>, stage: Stage) -> String {
-    match subject {
-        Subject::Shared(fault) => shared_refusal(folder, tree, fault, stage),
-        Subject::Own(fault, _) => own_refusal(folder, tree, fault, stage),
+pub fn ancestor_refusal(subject: &Subject<'_>, tree: Tree, stage: Stage) -> String {
+    match subject.whose {
+        Whose::Shared => shared_refusal(subject.folder, tree, &subject.fault, stage),
+        Whose::Own => own_refusal(subject.folder, tree, &subject.fault, stage),
     }
 }
 
@@ -651,6 +684,12 @@ fn shared_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: St
             ),
             Ending::Layout,
         ),
+        AncestorFault::Leads(found) => (
+            format!(
+                "{head} It is refused because the path that the system gives for it is not the final path of the folder that it opens: that folder's own path is {found}."
+            ),
+            Ending::Layout,
+        ),
         AncestorFault::VolumeUnanswered(error) => (
             format!(
                 "{head} It is refused because its volume could not be asked what it is ({error})."
@@ -700,6 +739,7 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
         | AncestorFault::RootMissing(_)
         | AncestorFault::VolumeRoot
         | AncestorFault::Overlap(_)
+        | AncestorFault::Leads(_)
         | AncestorFault::List(_) => shared_refusal(folder, tree, fault, stage),
     }
 }
@@ -727,10 +767,10 @@ pub fn program_removal_advice(entry: &str, link: bool, repair: bool) -> String {
     }
 }
 
-/// Whether a path is the root of a volume: a drive letter and nothing after it.
+/// Whether a final path is the root of its volume: nothing is after the volume's name (a drive
+/// letter or a volume's identifier).
 fn is_a_volume_root(path: &str) -> bool {
-    let plain = plain_path(path);
-    plain.len() == 2 && plain.ends_with(':')
+    !plain_path(path).contains('\\')
 }
 
 /// Whether `folder` is `base` or lies below it.
@@ -738,32 +778,81 @@ fn is_at_or_below(folder: &str, base: &str) -> bool {
     plain_path(folder) == plain_path(base) || is_below(folder, base)
 }
 
+/// A known folder as the shape check reads it: the path that the system gave for it, and what the
+/// open of that path showed.
+#[derive(Clone, Copy, Debug)]
+pub struct KnownFolder<'a> {
+    /// The path that the system gave for the known folder.
+    pub given: &'a str,
+    /// What the open of the path showed: the final path of the folder that it opens, with every
+    /// link followed, as the system gives it (with the `\\?\` prefix of its extended form), or the
+    /// platform's error of the open or of the read of that final path.
+    pub opened: Result<&'a str, &'a str>,
+}
+
 /// The refusal of a layout whose known folders cannot hold the two trees, read before any walk by
-/// every installation, repair and removal: a known folder that is the root of a volume (so no folder
-/// is above it), and known folders that overlap (the same folder, or one at or below the other
-/// tree's own folder, `<known>\KalaReach`). Its words are the shared form with the layout ending.
+/// every installation, repair and removal. The words are the shared form. The decision is made in
+/// this order:
+///
+/// 1. a known folder that could not be opened is refused with the words of a folder that could not
+///    be opened;
+/// 2. a known folder whose path is not its own final path is refused with what it leads to: a link
+///    or a mounted folder at it, a short name, a forward slash, a substituted letter and another
+///    form of its letters all end here, and the root and overlap tests never read a spelling;
+/// 3. the final paths alone are then compared: a known folder that is the root of a volume (so no
+///    folder is above it), and known folders that overlap (the same folder, or one at or below the
+///    other tree's own folder, `<known>\KalaReach`).
+///
 /// After it, a folder strictly below a known folder is the installation's own and the first folder
 /// of a walk above a known folder is a volume's root.
 #[must_use]
-pub fn shape_refusal(program_files: &str, program_data: &str) -> Option<String> {
+pub fn shape_refusal(
+    program_files: &KnownFolder<'_>,
+    program_data: &KnownFolder<'_>,
+    stage: Stage,
+) -> Option<String> {
+    let mut finals = [""; 2];
+    for (at, (known, tree)) in [(program_files, Tree::Program), (program_data, Tree::Data)]
+        .into_iter()
+        .enumerate()
+    {
+        let leads_to;
+        let fault = match known.opened {
+            Err(error) => AncestorFault::Unreadable(error),
+            Ok(found) if !is_the_place_asked_for(known.given, found) => {
+                leads_to = dos_path_of(found);
+                AncestorFault::Leads(&leads_to)
+            }
+            Ok(found) => {
+                finals[at] = found;
+                continue;
+            }
+        };
+        return Some(shared_refusal(known.given, tree, &fault, stage));
+    }
+    let [files, data] = finals;
     let own_of = |known: &str| format!(r"{}\KalaReach", known.trim_end_matches('\\'));
-    let (folder, tree, fault) = if is_a_volume_root(program_files) {
-        (program_files, Tree::Program, AncestorFault::VolumeRoot)
-    } else if is_a_volume_root(program_data) {
-        (program_data, Tree::Data, AncestorFault::VolumeRoot)
-    } else if is_at_or_below(program_files, &own_of(program_data))
-        || is_at_or_below(program_data, &own_of(program_files))
-        || plain_path(program_files) == plain_path(program_data)
+    let (folder, tree, fault) = if is_a_volume_root(files) {
+        (
+            program_files.given,
+            Tree::Program,
+            AncestorFault::VolumeRoot,
+        )
+    } else if is_a_volume_root(data) {
+        (program_data.given, Tree::Data, AncestorFault::VolumeRoot)
+    } else if is_at_or_below(files, &own_of(data))
+        || is_at_or_below(data, &own_of(files))
+        || plain_path(files) == plain_path(data)
     {
         (
-            program_files,
+            program_files.given,
             Tree::Program,
-            AncestorFault::Overlap(program_data),
+            AncestorFault::Overlap(program_data.given),
         )
     } else {
         return None;
     };
-    Some(shared_refusal(folder, tree, &fault, Stage::Before))
+    Some(shared_refusal(folder, tree, &fault, stage))
 }
 
 /// The setup program's line for a known folder that cannot be read: which folder, the platform's
