@@ -939,6 +939,50 @@ fn give_to(path: &Path, who: &str) {
     assert!(done.status.success(), "{done:?}");
 }
 
+/// Makes a local account that carries no comment. The installation's own accounts carry a comment
+/// that its reads look for, and an account that carries it keeps the setup program from naming a
+/// move: a case in which another account owns an object, and the words of a move are asserted,
+/// makes that account here and not with the product's `account::create`.
+#[cfg(feature = "testing")]
+fn account_without_the_comment(name: &str) -> Sid {
+    use windows_sys::Win32::NetworkManagement::NetManagement::{
+        NERR_Success, NetUserAdd, UF_DONT_EXPIRE_PASSWD, UF_PASSWD_CANT_CHANGE, UF_SCRIPT,
+        USER_INFO_1, USER_PRIV_USER,
+    };
+    let mut account: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let mut secret: Vec<u16> = format!(
+        "Aa1!{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+    .encode_utf16()
+    .chain(Some(0))
+    .collect();
+    let info = USER_INFO_1 {
+        usri1_name: account.as_mut_ptr(),
+        usri1_password: secret.as_mut_ptr(),
+        usri1_password_age: 0,
+        usri1_priv: USER_PRIV_USER,
+        usri1_home_dir: std::ptr::null_mut(),
+        usri1_comment: std::ptr::null_mut(),
+        usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD | UF_PASSWD_CANT_CHANGE,
+        usri1_script_path: std::ptr::null_mut(),
+    };
+    let mut parameter = 0_u32;
+    // SAFETY: the structure and the strings it points at are this function's own for the call.
+    let status = unsafe {
+        NetUserAdd(
+            std::ptr::null(),
+            1,
+            (&raw const info).cast(),
+            &raw mut parameter,
+        )
+    };
+    secret.fill(0);
+    assert_eq!(status, NERR_Success, "making the account {name}");
+    Sid::of_account(name).expect("the account just made has an identifier")
+}
+
 fn paths_under(folder: &Path) -> Paths {
     Paths {
         data: folder.join("Boundary"),
@@ -966,13 +1010,14 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     );
     assert!(text.contains("is refused because"), "why: {text}");
     assert!(
-        text.contains("remove or rename the folder"),
+        text.contains("Correct its list: give it a protected list"),
         "what to do: {text}"
     );
     assert!(
         text.contains("Nothing is at the data directory's name in it"),
         "{text}"
     );
+    assert!(!text.contains("remove or rename the folder"), "{text}");
 
     // The same refusal for a folder that holds the data directory, with its manifest, journals and
     // roots, never says to remove it: it says what to correct.
@@ -1882,18 +1927,28 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
         assert!(text.contains(&owner.to_text().unwrap()), "{text}");
         assert!(
             text.contains(
-                "The handle of this folder shows an owner that is not the system or the Administrators group, and it can hold files that another account wrote."
+                "The handle of this folder shows an owner that is not the system or the Administrators group: "
             ),
             "{text}"
         );
-        assert!(text.contains("Move the folder aside"), "{text}");
         assert!(
-            text.contains("unless you know that your own installation wrote it"),
+            text.contains("It can hold files that another account wrote."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "The setup program does not use what is in it while that account owns it."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("give the ownership of this folder and of everything in it back to the Administrators group"),
             "{text}"
         );
         never(
             &text,
             &[
+                "Move the folder aside",
                 "remove or rename the folder",
                 "remove the folder",
                 "Correct its list instead",
@@ -1993,8 +2048,8 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
 }
 
 /// A folder above the data directory that cannot be opened to be checked, for a reason that is no
-/// program holding it open, shows nothing of who made it: it is told to be moved aside, and neither
-/// corrected into place nor removed.
+/// program holding it open, shows nothing of who made it: no step is named, and it is neither
+/// corrected into place, moved aside nor removed.
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
@@ -2017,8 +2072,12 @@ fn a_parent_folder_that_cannot_be_opened_is_told_to_be_moved_aside_and_not_to_be
     icacls(&["/remove:d", "*S-1-5-18", "*S-1-5-32-544"]);
     let text = refused.unwrap_err().to_string();
     assert!(text.contains("could not be opened to be checked"), "{text}");
-    assert!(text.contains("Move the folder aside"), "{text}");
+    assert!(
+        text.contains("The setup program names no step for it."),
+        "{text}"
+    );
     for other in [
+        "Move the folder aside",
         "remove or rename the folder",
         "remove the folder",
         "Correct its list instead",
@@ -3239,9 +3298,10 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     install::make_data_directory(&paths).expect("the remnants of an installation's own run");
 
     // A file in staging that another account owns is refused before anything is written, and it is
-    // as it was: not rewritten, not given to anybody.
+    // as it was: not rewritten, not given to anybody. The account carries no comment of the
+    // installation's, so the refusal names the move.
     let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
-    let owner = account::create(&name).unwrap();
+    let owner = account_without_the_comment(&name);
     give_to(&policy, &name);
     let before = summary_of(&policy);
     let shown = policy.file_name().unwrap().to_string_lossy().into_owned();
@@ -3593,7 +3653,11 @@ fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is
     let _ = std::fs::remove_dir_all(&parent);
     assert_ne!(code, 0, "{output}");
     assert!(output.contains("is refused because"), "{output}");
-    assert!(output.contains("remove or rename the folder"), "{output}");
+    assert!(
+        output.contains("Correct its list: give it a protected list"),
+        "{output}"
+    );
+    assert!(!output.contains("remove or rename the folder"), "{output}");
     assert_eq!(snapshot(), before, "nothing was changed");
 }
 
