@@ -109,15 +109,18 @@ fn every_stage() -> Vec<Stage> {
 }
 
 /// The words that tell an administrator to change a folder: a move, another place, the end of a
-/// substitution or a redirection, an owner, a list, the removal of a link or of what is in the way,
-/// a rename, a delete, a mount, a command that does any of these. A second line behind the type:
-/// compared without regard to case, and a word that starts with a letter only where no letter is
-/// before it.
-const INSTRUCTIONS: [&str; 25] = [
+/// substitution or a redirection, an owner, a list, a permission, a grant, the removal of a link or
+/// of the folder or of what is in the way, a rename, a delete, a mount, a command that does any of
+/// these. A second line behind the type, which is the first: compared without regard to case, and a
+/// word that starts with a letter only where no letter is before it.
+const INSTRUCTIONS: [&str; 36] = [
     "rename",
     "delete",
     "take ownership",
     "change its owner",
+    "change the owner",
+    "change the permissions",
+    "change its list",
     "set its permissions",
     "unmount",
     "dismount",
@@ -125,8 +128,12 @@ const INSTRUCTIONS: [&str; 25] = [
     "icacls",
     "takeown",
     "mountvol",
+    "mklink",
+    "fsutil",
+    "attrib",
     "move ",
     "remove or",
+    "remove the folder",
     "remove the link",
     "remove it",
     "remove that",
@@ -134,17 +141,26 @@ const INSTRUCTIONS: [&str; 25] = [
     "end the",
     "redirection of",
     "give the",
+    "give it",
     "make the",
     "narrow",
     "correct",
+    "grant",
     "re-point",
+    "repoint",
+    "relocate",
     "other place",
 ];
+
+/// The verbs that are an instruction when they begin a sentence and a description when they do not
+/// ("could replace that program" says what a folder's owner can do): checked at the start of the
+/// text and after a full stop, a semicolon or a colon.
+const IMPERATIVES: [&str; 6] = ["replace", "remove", "change", "give", "set", "make"];
 
 /// The instruction words that `text` holds.
 fn instructions_in(text: &str) -> Vec<&'static str> {
     let lower = text.to_lowercase();
-    INSTRUCTIONS
+    let mut found: Vec<&'static str> = INSTRUCTIONS
         .into_iter()
         .filter(|word| {
             lower.match_indices(word).any(|(at, _)| {
@@ -155,7 +171,45 @@ fn instructions_in(text: &str) -> Vec<&'static str> {
                         .is_some_and(char::is_alphabetic)
             })
         })
-        .collect()
+        .collect();
+    for verb in IMPERATIVES {
+        let begins = lower.starts_with(&format!("{verb} "))
+            || [". ", "; ", ": "]
+                .iter()
+                .any(|stop| lower.contains(&format!("{stop}{verb} ")));
+        if begins {
+            found.push(verb);
+        }
+    }
+    found
+}
+
+/// The net behind the type: it catches each phrase that the two reviews named, and not a sentence
+/// that only says what a folder's owner could do.
+#[test]
+fn the_net_of_forbidden_words_catches_each_instruction_to_change_a_shared_folder() {
+    for instruction in [
+        "Remove the folder.",
+        "Change the permissions.",
+        "Give it to the Administrators group.",
+        "Change its list.",
+        "Change the owner.",
+        "Grant the Administrators group the right.",
+        "Re-point the link.",
+        "Repoint it.",
+        "Relocate the folder.",
+        "Replace the folder with a plain one.",
+        "Run mklink to make another.",
+        "Run fsutil to turn the flag off.",
+        "Run attrib on it.",
+    ] {
+        assert!(
+            !instructions_in(&format!("It is refused. {instruction}")).is_empty(),
+            "{instruction}"
+        );
+    }
+    let description = "Whoever owns it, or can add to it, could replace that program.";
+    assert!(instructions_in(description).is_empty(), "{description}");
 }
 
 #[test]
