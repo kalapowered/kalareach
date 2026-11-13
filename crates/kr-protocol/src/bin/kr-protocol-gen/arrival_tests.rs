@@ -1674,6 +1674,104 @@ fn a_change_of_the_roots_type_beside_a_new_method_is_reported() {
     );
 }
 
+/// A member of the root's `properties`, the bundle's entries, is read by its name, so one that
+/// moves to another definition, one that gains a keyword, an inline one that changes (the SDK
+/// schema's `vocabulary` here) and one that is gone are a line for the protocol's comparison, the
+/// level's and the SDK's, each at `$root.<member>`. A member that arrives is no line.
+#[test]
+fn a_changed_or_removed_member_of_the_roots_properties_is_a_line_for_every_comparison() {
+    let protocol = protocol_schema();
+    let mut old = sdk_schema();
+    old["properties"] = json!({
+        "route": { "$ref": "#/$defs/Route" },
+        "wrapper": { "$ref": "#/$defs/Wrapper" },
+        "vocabulary": { "type": "object", "additionalProperties": false,
+            "properties": { "word": { "type": "string" } } },
+    });
+    let cases: [(&str, fn(&mut Value), &str); 6] = [
+        (
+            "a member moved to another definition",
+            |schema| schema["properties"]["route"] = json!({ "$ref": "#/$defs/Wrapper" }),
+            "$root.route changed: $ref",
+        ),
+        (
+            "a member that gains a keyword",
+            |schema| schema["properties"]["route"]["default"] = json!(null),
+            "$root.route changed: default",
+        ),
+        (
+            "the inline member gains a member",
+            |schema| {
+                schema["properties"]["vocabulary"]["properties"]["more"] =
+                    json!({ "type": "string" });
+            },
+            "$root.vocabulary.more added: a member",
+        ),
+        (
+            "the inline member is opened",
+            |schema| schema["properties"]["vocabulary"]["additionalProperties"] = json!(true),
+            "$root.vocabulary changed: additionalProperties",
+        ),
+        (
+            "a member is removed",
+            |schema| {
+                schema["properties"]
+                    .as_object_mut()
+                    .expect("members")
+                    .remove("wrapper");
+            },
+            "$root.wrapper removed: a member",
+        ),
+        (
+            "a member is removed and another arrives",
+            |schema| {
+                schema["properties"]
+                    .as_object_mut()
+                    .expect("members")
+                    .remove("wrapper");
+                schema["properties"]["both"] = json!({ "$ref": "#/$defs/Both" });
+            },
+            "$root.wrapper removed: a member",
+        ),
+    ];
+    for (what, edit, wanted) in cases {
+        let mut new = old.clone();
+        edit(&mut new);
+        let wanted = vec![wanted.to_owned()];
+        assert_eq!(
+            crate::public_contract::compare(&old, &new),
+            Ok(wanted.clone()),
+            "the protocol's comparison: {what}"
+        );
+        assert_eq!(level_lines(&old, &new), wanted, "the level's: {what}");
+        let outcome = compare(
+            &old,
+            &with_hidden(&new),
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", Some(LISTED)),
+        );
+        assert_eq!(outcome.passed.len(), 1, "{what}");
+        assert_eq!(outcome.lines, wanted, "the SDK's: {what}");
+    }
+    let mut arrived = old.clone();
+    arrived["properties"]["both"] = json!({ "$ref": "#/$defs/Both" });
+    assert_eq!(
+        crate::public_contract::compare(&old, &arrived),
+        Ok(Vec::new())
+    );
+    assert_eq!(level_lines(&old, &arrived), Vec::<String>::new());
+    let outcome = compare(
+        &old,
+        &with_hidden(&arrived),
+        (&protocol, &protocol),
+        &contract("0.1.6", None),
+        &contract("0.1.7", Some(LISTED)),
+    );
+    assert_eq!(outcome.passed.len(), 1);
+    assert_eq!(outcome.lines, Vec::<String>::new());
+}
+
 /// Where every use of `Method` widens with it, the new name passes: a use as a property (also one
 /// whose name is a keyword), an item, an additional property, a pattern property, in an `anyOf`,
 /// an `allOf`, a nullable pair, beside an annotation, as a whole definition, through another

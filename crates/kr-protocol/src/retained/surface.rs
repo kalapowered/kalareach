@@ -54,25 +54,36 @@ pub enum SurfaceError {
 /// with `$`: [`Surface::cut`] refuses one.
 const ROOT_PLACE: &str = "$root";
 
-/// The definitions reachable from some roots in a generated schema, and the keywords of the
-/// schema's own root.
+/// The definitions reachable from some roots in a generated schema, and the keywords and members
+/// of the schema's own root.
 ///
 /// A validator applies the keywords of a schema's root (`type`, `$schema`, `not`, a `$ref`) to every
 /// document, so a surface that is cut from a schema holds them beside the definitions, and
-/// [`differences`] compares them: a change of the root's `type` alone is a difference. Two things
-/// of the root are left out: its annotations, as everywhere, and its `properties`, the bundle's
-/// entries (each a reference to a definition, but for a few that are inline), which the cut does
-/// not read: it reads the definitions by name, and an entry that moves to another definition is not
-/// seen. A reference of the root has to be to a definition that the surface holds, by its plain
-/// name, and the cut refuses one that is not, so that every one is compared. A surface that is read
-/// from a recorded document holds no root keywords (the document records none), and compares none.
+/// [`differences`] compares them: a change of the root's `type` alone is a difference. A reference
+/// of the root has to be to a definition that the surface holds, by its plain name, and the cut
+/// refuses one that is not, so that every one is compared. The root's annotations are left out, as
+/// everywhere.
+///
+/// The members of the root's `properties`, the bundle's entries, are held too, and each is read by
+/// its name, as a consumer reads it (each is a reference to a definition, but for a few that are
+/// inline). The cut does not follow an entry's reference: the definitions it holds are the ones
+/// the roots reach, so an entry is compared by its own text. A surface that is read from a recorded
+/// document holds no root (the document records none), and compares none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
     roots: Vec<String>,
     definitions: BTreeMap<String, Value>,
-    /// The root's keywords other than its annotations and `properties`, as an object; `None` for a
-    /// recorded document.
-    root: Option<Value>,
+    /// The schema's own root; `None` for a recorded document.
+    root: Option<Root>,
+}
+
+/// What a surface holds of the schema's own root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Root {
+    /// The root's keywords other than its annotations, `$defs` and `properties`, as an object.
+    keywords: Value,
+    /// The entries of the root's `properties`, without their annotations, by member name.
+    members: BTreeMap<String, Value>,
 }
 
 impl Surface {
@@ -84,8 +95,9 @@ impl Surface {
     /// [`SurfaceError::BadReference`] for a reference that is not `#/$defs/NAME` (and, for a
     /// reference of its own root, with a NAME of ASCII letters, digits and `_`),
     /// [`SurfaceError::ReservedName`] for a definition it reaches with a name that
-    /// begins with `$`, and [`SurfaceError::RootReference`] for a reference of its own root to a
-    /// definition that the roots do not reach.
+    /// begins with `$`, [`SurfaceError::RootReference`] for a reference of its own root to a
+    /// definition that the roots do not reach, and [`SurfaceError::NotASurface`] for a `properties`
+    /// of its own root that is not an object of members.
     pub fn cut(schema: &Value, roots: &[&str]) -> Result<Self, SurfaceError> {
         let all = schema
             .get("$defs")
@@ -121,13 +133,17 @@ impl Surface {
                 return Err(SurfaceError::RootReference(target));
             }
         }
+        let members = own_members(schema)?;
         let mut roots: Vec<String> = roots.iter().map(|root| (*root).to_owned()).collect();
         roots.sort();
         roots.dedup();
         Ok(Self {
             roots,
             definitions,
-            root: Some(own),
+            root: Some(Root {
+                keywords: own,
+                members,
+            }),
         })
     }
 
@@ -293,6 +309,22 @@ fn own_keywords(schema: &Value) -> Value {
     without_annotations(&Value::Object(own))
 }
 
+/// The entries of a schema's own root `properties`, each without its annotations, by member name.
+/// A root with no `properties` holds none; one whose `properties` is not an object of members cannot
+/// be read by name.
+fn own_members(schema: &Value) -> Result<BTreeMap<String, Value>, SurfaceError> {
+    match schema.get("properties") {
+        None => Ok(BTreeMap::new()),
+        Some(Value::Object(members)) => Ok(members
+            .iter()
+            .map(|(name, entry)| (name.clone(), without_annotations(entry)))
+            .collect()),
+        Some(_) => Err(SurfaceError::NotASurface(
+            "the root's properties are not an object of members".to_owned(),
+        )),
+    }
+}
+
 fn references(node: &Value) -> Vec<String> {
     let mut found = Vec::new();
     collect_references(node, &mut found);
@@ -352,7 +384,8 @@ fn plain_reference_name(reference: &str) -> Result<String, SurfaceError> {
 pub struct Difference {
     /// Where, by the old surface's names: `Definition`, `Definition.member`, `Definition#variant`,
     /// and these nested (`Definition#variant.member[]`); `$root` for a keyword of the schema's own
-    /// root, and the same nested for a keyword of the root that has parts.
+    /// root, `$root.member` for a member of its `properties`, and the same nested for a keyword of
+    /// the root or a member that has parts.
     pub at: String,
     /// What kind of difference.
     pub kind: DifferenceKind,
@@ -398,7 +431,10 @@ impl fmt::Display for Difference {
 /// Both are walked from the roots they share through the references between definitions, so the
 /// name a definition has on either side does not matter; only where it is used. Every keyword of
 /// a schema is compared but its description and its title. So are the keywords of the schema's own
-/// root, where both surfaces hold them.
+/// root and each of its members that both surfaces have, where both surfaces hold a root: an entry
+/// that is a reference is compared by its text, not followed, and the root's members that only the
+/// old surface has are removals. A member that only the new surface has is an arrival, which an
+/// earlier reader never named, and is not listed.
 #[must_use]
 pub fn differences(old: &Surface, new: &Surface) -> Vec<Difference> {
     let mut comparer = Comparer {
@@ -428,7 +464,8 @@ pub fn differences(old: &Surface, new: &Surface) -> Vec<Difference> {
         }
     }
     if let (Some(old_root), Some(new_root)) = (&old.root, &new.root) {
-        comparer.node(old_root, new_root, ROOT_PLACE);
+        comparer.node(&old_root.keywords, &new_root.keywords, ROOT_PLACE);
+        comparer.members(&old_root.members, &new_root.members);
     }
     comparer.found.sort();
     comparer.found.dedup();
@@ -523,6 +560,38 @@ impl Comparer<'_> {
                 _ => {}
             }
         }
+    }
+
+    /// The members of the schema's own root: each that both have is compared as an entry, one that
+    /// only the old root has is a removal, and one that only the new root has is an arrival, which
+    /// is no difference.
+    fn members(&mut self, old: &BTreeMap<String, Value>, new: &BTreeMap<String, Value>) {
+        for (name, before) in old {
+            let at = format!("{ROOT_PLACE}.{name}");
+            match new.get(name) {
+                Some(after) => self.entry(before, after, &at),
+                None => self.report(&at, DifferenceKind::Removed, "a member"),
+            }
+        }
+    }
+
+    /// An entry of the root's `properties`. Where both are references, the text of the reference is
+    /// compared and the definition is not followed: the entry is what a consumer reads by the
+    /// member's name, so a member that moves to another definition is a difference even where the
+    /// two definitions are alike. What stands beside a reference, and an inline entry, are read as
+    /// everywhere else.
+    fn entry(&mut self, old: &Value, new: &Value, at: &str) {
+        if let (Some(before), Some(after)) = (old.get("$ref"), new.get("$ref")) {
+            if before != after {
+                self.report(at, DifferenceKind::Changed, "$ref");
+            }
+            let (beside_old, beside_new) = (without_the_reference(old), without_the_reference(new));
+            if beside_old != beside_new {
+                self.node(&beside_old, &beside_new, at);
+            }
+            return;
+        }
+        self.node(old, new, at);
     }
 
     fn properties(&mut self, before: Option<&Value>, after: Option<&Value>, at: &str) {

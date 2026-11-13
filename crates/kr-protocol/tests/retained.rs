@@ -802,9 +802,9 @@ fn the_recordings_beside_the_tests_are_of_the_release_before() {
 /// A surface cut from a schema holds the keywords of the schema's own root, beside its
 /// definitions, and a difference in one is a difference of the surface: a validator applies them to
 /// every document, so a root whose `type` changes accepts other values. Its annotations are left
-/// out, as everywhere. Its `properties` are left out too: they are the bundle's entries, which the
-/// cut does not read (it reads the definitions by name), so an entry that moves to another
-/// definition is not seen. A surface read from a recorded document holds none, and compares none.
+/// out, as everywhere. Its `properties`, the bundle's entries, are compared by member (see
+/// `a_change_of_a_member_of_the_schemas_own_root_is_a_difference`). A surface read from a recorded
+/// document holds none, and compares none.
 #[test]
 fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
     let dialect = "https://json-schema.org/draft/2020-12/schema";
@@ -872,12 +872,11 @@ fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
         )],
         "a root that names no dialect"
     );
-    // Annotations, in the root and inside a keyword of it, and the bundle's own `properties` (not
-    // compared: see above) are no difference.
+    // Annotations, in the root, inside a keyword of it and on a member, are no difference.
     let mut quiet = root();
     quiet["title"] = json!("Another title");
     quiet["description"] = json!("Another description");
-    quiet["properties"] = json!({ "b": { "$ref": "#/$defs/B" } });
+    quiet["properties"]["a"]["description"] = json!("Another member");
     quiet["allOf"][0]["description"] = json!("Another part of the root");
     assert_eq!(found(&base, &cut(&quiet, definitions())), vec![]);
     // A reference of the root is compared where its target is in the surface, and a cut that does
@@ -922,6 +921,160 @@ fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
             &cut(&changed("type", json!("string")), definitions())
         ),
         vec![]
+    );
+}
+
+/// A surface cut from a schema holds the members of the schema's own root, the bundle's entries,
+/// and compares them by name: a consumer reads a member by its name (the plugin SDK's reader
+/// compiles a validator from each), so an entry that moves to another definition, one that gains
+/// a keyword and an inline entry that changes are differences, and so is a member that is gone,
+/// each at `$root.<member>`. An entry that is a reference is compared by its text and not
+/// followed, so a renamed definition that its entry follows is a line at the member. A member that
+/// only the new root has is an arrival: an earlier reader never named it, so it is no difference.
+/// An entry that is not an object of members is refused by the cut, and a recorded document holds
+/// no root, so it compares none.
+#[test]
+fn a_change_of_a_member_of_the_schemas_own_root_is_a_difference() {
+    let bundle = || {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "a": { "$ref": "#/$defs/A" },
+                "b": { "$ref": "#/$defs/B" },
+                "identifiers": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "a_id": { "$ref": "#/$defs/A" } },
+                },
+            },
+            "$defs": {
+                "A": { "type": "string" },
+                "B": { "type": "string" },
+                "Holder": { "type": "object", "properties": { "a": { "$ref": "#/$defs/A" } } },
+            },
+        })
+    };
+    let cut = |schema: &Value| Surface::cut(schema, &["B", "Holder"]).expect("a surface");
+    let lines = |old: &Value, new: &Value| -> Vec<String> {
+        differences(&cut(old), &cut(new))
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    let edited = |edit: &dyn Fn(&mut Value)| {
+        let mut schema = bundle();
+        edit(&mut schema);
+        schema
+    };
+    assert_eq!(lines(&bundle(), &bundle()), Vec::<String>::new());
+    // A member that moves to another definition, though both definitions are alike.
+    assert_eq!(
+        lines(
+            &bundle(),
+            &edited(&|schema| schema["properties"]["a"] = json!({ "$ref": "#/$defs/B" }))
+        ),
+        ["$root.a changed: $ref"]
+    );
+    // A member that gains a keyword beside its reference, and one that stops being a reference.
+    assert_eq!(
+        lines(
+            &bundle(),
+            &edited(&|schema| schema["properties"]["a"]["default"] = json!("x"))
+        ),
+        ["$root.a changed: default"]
+    );
+    assert_eq!(
+        lines(
+            &bundle(),
+            &edited(&|schema| schema["properties"]["a"] = json!({ "type": "string" }))
+        ),
+        ["$root.a changed: a reference against an inline schema"]
+    );
+    // The inline member: a member it gains, one it loses, and a keyword of its own.
+    assert_eq!(
+        lines(
+            &bundle(),
+            &edited(
+                &|schema| schema["properties"]["identifiers"]["properties"]["extra"] =
+                    json!({ "type": "string" })
+            )
+        ),
+        ["$root.identifiers.extra added: a member"]
+    );
+    assert_eq!(
+        lines(
+            &bundle(),
+            &edited(&|schema| {
+                schema["properties"]["identifiers"]["properties"] = json!({});
+            })
+        ),
+        ["$root.identifiers.a_id removed: a member"]
+    );
+    assert_eq!(
+        lines(
+            &bundle(),
+            &edited(
+                &|schema| schema["properties"]["identifiers"]["additionalProperties"] = json!(true)
+            )
+        ),
+        ["$root.identifiers changed: additionalProperties"]
+    );
+    // A member that is gone; a member that arrives is no difference, beside a removal too.
+    let without_b = edited(&|schema| {
+        schema["properties"]
+            .as_object_mut()
+            .expect("members")
+            .remove("b");
+    });
+    assert_eq!(lines(&bundle(), &without_b), ["$root.b removed: a member"]);
+    let with_c = edited(&|schema| schema["properties"]["c"] = json!({ "$ref": "#/$defs/A" }));
+    assert_eq!(lines(&bundle(), &with_c), Vec::<String>::new());
+    let swapped = edited(&|schema| {
+        schema["properties"]
+            .as_object_mut()
+            .expect("members")
+            .remove("b");
+        schema["properties"]["c"] = json!({ "$ref": "#/$defs/A" });
+    });
+    assert_eq!(lines(&bundle(), &swapped), ["$root.b removed: a member"]);
+    // Annotations of a member decide nothing.
+    assert_eq!(
+        lines(
+            &bundle(),
+            &edited(&|schema| schema["properties"]["a"]["description"] = json!("About a"))
+        ),
+        Vec::<String>::new()
+    );
+    // A definition that is renamed, with its member following it: the definitions are alike, so
+    // the line is the member's, the accepted cost of comparing an entry by its name.
+    let renamed = edited(&|schema| {
+        let body = schema["$defs"]
+            .as_object_mut()
+            .expect("definitions")
+            .remove("A");
+        schema["$defs"]["Renamed"] = body.expect("A");
+        schema["$defs"]["Holder"]["properties"]["a"] = json!({ "$ref": "#/$defs/Renamed" });
+        schema["properties"]["a"] = json!({ "$ref": "#/$defs/Renamed" });
+        schema["properties"]["identifiers"]["properties"]["a_id"] =
+            json!({ "$ref": "#/$defs/Renamed" });
+    });
+    assert_eq!(lines(&bundle(), &renamed), ["$root.a changed: $ref"]);
+    // Members that are not an object of members cannot be read by name, so the cut refuses them.
+    for members in [json!(["a"]), json!("a"), json!(null)] {
+        let schema = edited(&|schema| schema["properties"] = members.clone());
+        assert!(
+            matches!(
+                Surface::cut(&schema, &["B", "Holder"]),
+                Err(SurfaceError::NotASurface(_))
+            ),
+            "{members}"
+        );
+    }
+    // A recorded document holds no root, so the surface read from one compares no member.
+    let recorded = Surface::parse(&cut(&bundle()).render()).expect("the recorded surface");
+    assert_eq!(
+        differences(&recorded, &cut(&without_b)),
+        Vec::<Difference>::new()
     );
 }
 
