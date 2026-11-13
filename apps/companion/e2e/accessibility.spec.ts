@@ -913,6 +913,29 @@ interface Sampled {
 }
 
 /** What the area measure found. Sizes are in px; the lists are points as offsets from the words' middle. */
+/** Reports the continuous area and the browser's ring apart, with the places of the ring's taps and of the gaps. */
+function reportGrid(area: Area): void {
+  const place = (list: readonly string[]): string => (list.length === 0 ? 'none' : list.length > 12 ? `${String(list.length)} taps, from ${list[0] ?? ''} to ${list[list.length - 1] ?? ''}` : list.join(' | '))
+  const text = `the page's continuous area ${String(area.width)} x ${String(area.height)} px (reported extents with the browser's ring ${String(area.right - area.left)} x ${String(area.bottom - area.top)} px), ${String(area.grid.taps)} grid taps; the browser's ring: ${place(area.grid.ring)}; gaps: ${place(area.grid.gaps)}`
+  test.info().annotations.push({ type: 'grid', description: text })
+  console.log(`grid ${test.info().project.name} ${test.info().title}: ${text}`)
+}
+
+/**
+ * What a tap's look says against what its click did, or null when they agree. Where the click names plain
+ * text the page's handler decides and the look at the press is the open at the release. Where the
+ * browser's click names an element the browser decides, and the look lit nothing or that same link. The
+ * rule of the handler's look: a point at which the look lit one link and the click names another link or a
+ * control is a conflict.
+ */
+function lookDisagrees(made: { clicks: Clicked[]; opened: string[]; lit: (string | null)[] }): string | null {
+  const lit = made.lit[0] ?? null
+  const opened = made.opened[made.opened.length - 1] ?? null
+  const named = browsers(made.clicks).find((click) => !click.named.startsWith('text'))?.named ?? null
+  if (named === null) return lit === opened ? null : `lit ${String(lit)}, opened ${String(opened)}`
+  return lit === null || named === `link ${lit}` ? null : `lit ${lit}, the click named ${named}`
+}
+
 interface Area {
   readonly left: number
   readonly right: number
@@ -935,6 +958,18 @@ interface Area {
   readonly ring: { readonly left: number; readonly right: number; readonly top: number; readonly bottom: number }
   /** The taps near the two ends of the area that opens, with what each lit and opened (L lit, O opened), to read a short side by. */
   readonly edges: string[]
+  /** The page's own continuous area: the extent from the words' middle outward in which the look lights (px; `width` and `height` are its). The browser's ring lies past it. */
+  readonly solid: { readonly left: number; readonly right: number; readonly top: number; readonly bottom: number }
+  /** The taps of a grid over the reported area and one step beyond it on every side. */
+  readonly grid: {
+    readonly taps: number
+    /** Taps that broke the rule: not exactly one open inside the continuous area, an open outside it that the browser's own click to the link did not make, any open one step beyond the reported area, or a look that disagrees with the click. */
+    readonly wrong: string[]
+    /** Taps outside the continuous area at which the browser's own adjustment opened the link: the ring, by place. */
+    readonly ring: string[]
+    /** Taps between the continuous area and the reported edge at which nothing opened, by place. */
+    readonly gaps: string[]
+  }
 }
 
 /**
@@ -1001,6 +1036,7 @@ async function areaOf(page: Page, href: string, words: Words, size: number): Pro
     while (high + 1 <= max && (await probe(high + 1)).opened === href) high += 1
     // The look's extent from the words' middle outward, then to the pixel.
     const middleAt = Math.round(middle)
+
     let litLow = middleAt
     let litHigh = middleAt
     while (litLow - 4 >= min && (await probe(litLow - 4)).lit === href) litLow -= 4
@@ -1029,13 +1065,58 @@ async function areaOf(page: Page, href: string, words: Words, size: number): Pro
   const down = await scan('y', Math.floor(words.top - reach), Math.ceil(words.bottom + reach), Math.ceil(pane.top), Math.ceil(pane.bottom) - 1, words.y)
   const [left, right] = across.open
   const [top, bottom] = down.open
+  // The page's own area is where the look lights: a rectangle, which the page keeps at the least size. The
+  // browser's own adjustment opens the link past it, in a shape of its own (the ring).
+  const [solidLeft, solidRight] = across.lit
+  const [solidTop, solidBottom] = down.lit
+  // A grid over the whole reported area and one step beyond it on every side, within the pane. Inside the
+  // page's area every tap lights the link and opens it exactly once; outside it a tap opens nothing, or opens
+  // the link by the browser's own click on the link (the ring); one step beyond the reported area none opens.
+  const step = 8
+  const along = (from: number, to: number, min: number, max: number): number[] => {
+    const points = new Set<number>()
+    for (let n = from - step; n <= to + step; n += step) points.add(n)
+    points.add(from - step).add(from).add(to).add(to + step)
+    return [...points].filter((n) => n >= min && n <= max).sort((a, b) => a - b)
+  }
+  const grid = { taps: 0, wrong: [] as string[], ring: [] as string[], gaps: [] as string[] }
+  for (const y of along(top, bottom - 1, Math.ceil(pane.top), Math.ceil(pane.bottom) - 1)) {
+    for (const x of along(left, right - 1, Math.ceil(pane.left), Math.ceil(pane.right) - 1)) {
+      const made = await tapAndRead(page, x, y)
+      grid.taps += 1
+      const place = `${String(Math.round(x - words.x))}, ${String(Math.round(y - words.y))}`
+      const inLit = x >= solidLeft - 1 && x < solidRight + 1 && y >= solidTop - 1 && y < solidBottom + 1
+      // Certainly the page's area: the look's extent along the words' line, and the least size's band about the
+      // words' middle across it (a link's own box can reach further than the page's area, so the look's extent
+      // down the column is not the page's area across). A margin at each side: the extents come from taps at whole pixels.
+      const inside = x >= solidLeft + 1 && x < solidRight - 1 && Math.abs(y - words.y) <= size / 2 - 2
+      const beyond = x < left || x > right - 1 || y < top || y > bottom - 1
+      const named = browsers(made.clicks).find((click) => !click.named.startsWith('text'))?.named ?? null
+      const disagreement = lookDisagrees(made)
+      if (disagreement !== null) grid.wrong.push(`${place}: ${disagreement}`)
+      if (made.opened.length > 1 || (made.opened.length === 1 && made.opened[0] !== href)) {
+        grid.wrong.push(`${place}: opened ${made.opened.join(',')} (the click named ${named ?? 'plain text'})`)
+      } else if (inside && made.opened.length !== 1) {
+        const press = made.presses[0]
+        grid.wrong.push(`${place}: inside the page's area, opened nothing; the press at ${String(press?.x)}, ${String(press?.y)} on ${press?.target ?? '-'} lit ${String(made.lit[0] ?? null)}`)
+      } else if (made.opened.length === 1 && !inLit) {
+        // Outside the page's own area the open is the browser's own adjustment, by its click on the link; the page adds none.
+        if (named === `link ${href}`) grid.ring.push(place)
+        else grid.wrong.push(`${place}: the page opened the link outside the area that lit it (the click named ${named ?? 'plain text'})`)
+      } else if (made.opened.length === 0 && !inLit && !beyond) {
+        grid.gaps.push(place)
+      }
+    }
+  }
   return {
     left,
     right,
     top,
     bottom,
-    width: right - left,
-    height: bottom - top,
+    width: solidRight - solidLeft,
+    height: solidBottom - solidTop,
+    solid: { left: solidLeft, right: solidRight, top: solidTop, bottom: solidBottom },
+    grid,
     taps,
     different,
     unlike,
@@ -1059,17 +1140,12 @@ async function missedInRing(page: Page, words: Words, size: number, href: string
     const opened = made.opened[made.opened.length - 1] ?? null
     const label = `${String(Math.round(point.x - words.x))}, ${String(Math.round(point.y - words.y))}`
     if (opened !== href) missed.push(`${label}: opened ${String(opened)}`)
-    // Where the browser itself sends the click to the link's button the browser decides; elsewhere the handler does, and the look is the open.
-    const browser = made.clicks.some((click) => click.phase === 'capture' && click.trusted && click.named.startsWith('link'))
-    if (!browser && (made.lit[0] ?? null) !== opened) missed.push(`${label}: lit ${String(made.lit[0] ?? null)}, opened ${String(opened)}`)
+    // The look at every point: where the click names plain text the look is the open; where the browser's
+    // click names an element, the look lit nothing or that same link.
+    const disagreement = lookDisagrees(made)
+    if (disagreement !== null) missed.push(`${label}: ${disagreement}`)
   }
   return missed
-}
-
-/** Taps one point, and says which link it opened, if any: the link that the page's own opened-links list gained. */
-async function tapAt(page: Page, x: number, y: number): Promise<string | null> {
-  const made = await tapAndRead(page, x, y)
-  return made.opened[made.opened.length - 1] ?? null
 }
 
 // KR-REQ-13.19: the area in which a tap opens a link is at least the size the platform asks for around
@@ -1080,6 +1156,8 @@ async function tapAt(page: Page, x: number, y: number): Promise<string | null> {
 // on a desktop; everywhere else the nearer words win.
 test.describe('the area in which a tap opens a link', () => {
   test.use({ hasTouch: true })
+  // A grid of taps over the whole area and one step beyond it: some hundreds of taps for the larger areas.
+  test.describe.configure({ timeout: 300_000 })
   for (const surface of SURFACES) {
     for (const [size, ratio] of SIZES) {
       test(`is at least the least size around a link's words on ${surface} at ${size} text size`, async ({ page }) => {
@@ -1090,8 +1168,9 @@ test.describe('the area in which a tap opens a link', () => {
         const area = await areaOf(page, MIDDLE_LINK, words, FINGER[surface])
         test.info().annotations.push({ type: 'area', description: `middle ${surface} ${size}: ${String(area.width)} x ${String(area.height)} px (least ${String(FINGER[surface])}), ${String(area.taps)} taps` })
         expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(FINGER[surface])
-        expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, or left a hole').toEqual({ different: [], unlike: [], conflicts: [], holes: [] })
+        expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes, grid: area.grid.wrong }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, left a hole, or broke the grid rule').toEqual({ different: [], unlike: [], conflicts: [], holes: [], grid: [] })
         test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
+        reportGrid(area)
       })
 
       for (const [where, href, markdown] of EDGES) {
@@ -1117,8 +1196,9 @@ test.describe('the area in which a tap opens a link', () => {
           const area = await areaOf(page, href, words, size)
           test.info().annotations.push({ type: 'area', description: `${where} ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)}), ${String(area.taps)} taps` })
           expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(size)
-          expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, or left a hole').toEqual({ different: [], unlike: [], conflicts: [], holes: [] })
+          expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes, grid: area.grid.wrong }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, left a hole, or broke the grid rule').toEqual({ different: [], unlike: [], conflicts: [], holes: [], grid: [] })
           test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
+          reportGrid(area)
           // What lights at a press is what opens: the pressed look at the far point of the area, none past it.
           const inside = ringPoints(words, pane, size)
           const far = where === 'at the end of a line' ? inside[0] : inside[inside.length - 1]
@@ -1156,8 +1236,9 @@ test.describe('the area in which a tap opens a link', () => {
           description: `last line ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)}), ${String(area.taps)} taps; room under the words ${String(Math.round((pane.bottom - settled.bottom) * 10) / 10)}`
         })
         expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(size)
-        expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, or left a hole').toEqual({ different: [], unlike: [], conflicts: [], holes: [] })
+        expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes, grid: area.grid.wrong }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, left a hole, or broke the grid rule').toEqual({ different: [], unlike: [], conflicts: [], holes: [], grid: [] })
         test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
+        reportGrid(area)
         const inside = ringPoints(settled, pane, size)
         const top = inside[0]
         const atTop = await tapAndRead(page, top?.x ?? 0, top?.y ?? 0)
@@ -1193,8 +1274,11 @@ test.describe('the area in which a tap opens a link', () => {
             },
             { px: x, py: y }
           )
-          const opened = await tapAt(page, x, y)
+          const made = await tapAndRead(page, x, y)
+          const opened = made.opened[made.opened.length - 1] ?? null
           if (opened !== expected) wrong.push(`y ${String(Math.round(y - first.y))}: ${String(opened)}, expected ${String(expected)}`)
+          const disagreement = lookDisagrees(made)
+          if (disagreement !== null) wrong.push(`y ${String(Math.round(y - first.y))}: the look ${disagreement}`)
         }
         expect(wrong, 'taps on the axis between the two links that opened the other link or none').toEqual([])
       })
