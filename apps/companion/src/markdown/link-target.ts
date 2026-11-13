@@ -231,16 +231,34 @@ export type Decision<L> = { readonly kind: 'stand' } | { readonly kind: 'open'; 
 /** How long after a press's pointer up its click may still come, in milliseconds. */
 export const CLICK_WITHIN = 3000
 
-/** How far a press may move, and how far its click may lie from it, and still be one tap, in CSS pixels: the platforms' touch slop is 8 to 10. */
+/** How far a press may move and still be one tap, in CSS pixels: the platforms' touch slop is 8 to 10. */
 export const SLOP = 10
 
 /**
- * How far the engine may report a tap's click from the press, in CSS pixels. Chromium moves the click of a
- * tap on plain text toward a nearby link by up to 10 px before it sends it (measured: a press 22 px under a
- * short link's words, at the edge of its area, came as a click 10.007 px from the press), and rounds the
- * point; the slop is the platforms' limit for a finger that moves, and this is twice it.
+ * The most that an engine moves the click of a tap away from its press when it adjusts the touch toward
+ * a nearby control, in CSS pixels at a page scale of 1 (the page's viewport sets it; on a zoomed page the
+ * same distance is fewer CSS pixels).
+ *
+ * - Blink: `third_party/blink/renderer/core/page/touch_adjustment.cc`, `GetHitTestRectForAdjustment`,
+ *   holds the touch's area between `kMinAdjustmentSizeDip` (20) and `kMaxAdjustmentSizeDip` (32) wide,
+ *   and `SnapTo` puts the adjusted point inside that square: at most 16 px on an axis, `16 * sqrt(2)`
+ *   at its corner. A finger-sized contact has the largest area; a synthetic touch has the smallest (10 px
+ *   on an axis, which is what the browser cases log).
+ * - WebKit: `Source/WebCore/page/LocalFrame.cpp`, `LocalFrame::qualifyingNodeAtViewportLocation`, tests
+ *   points up to `unscaledSearchRadius` (15) times the screen's pixel density over 163 (about 1 on a
+ *   phone) from the touch, on each axis: at most 15 px, less on a diagonal.
+ *
+ * The larger of the two is Blink's corner. The cases log the press-to-click distance of every tap on both
+ * engines and on the emulated phones, and hold it to `CLICK_AWAY`.
  */
-export const CLICK_AWAY = 2 * SLOP
+export const TOUCH_ADJUSTMENT = 16 * Math.SQRT2
+
+/**
+ * How far a click may lie from its press and still be that press's tap: the finger's slop and the
+ * engine's largest adjustment of a touch. A click opens only the link that its press lit, whatever the
+ * bound is; the bound keeps a click that another input made elsewhere from using an old press.
+ */
+export const CLICK_AWAY = SLOP + TOUCH_ADJUSTMENT
 
 const STAND = { kind: 'stand' } as const
 
