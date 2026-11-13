@@ -1688,7 +1688,8 @@ fn a_changed_or_removed_member_of_the_roots_properties_is_a_line_for_every_compa
         "vocabulary": { "type": "object", "additionalProperties": false,
             "properties": { "word": { "type": "string" } } },
     });
-    let cases: [(&str, fn(&mut Value), &str); 6] = [
+    type Edit = fn(&mut Value);
+    let cases: [(&str, Edit, &str); 6] = [
         (
             "a member moved to another definition",
             |schema| schema["properties"]["route"] = json!({ "$ref": "#/$defs/Wrapper" }),
