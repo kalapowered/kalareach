@@ -102,11 +102,14 @@ jobs:
 
       # The Windows daemon the script starts keeps its directories below this one, and the product
       # refuses a directory that grants access to anybody but its owner and the machine's own
-      # accounts. A directory in the profile of the account that runs the job inherits exactly that;
-      # one at the root of a drive grants access to every authenticated user.
+      # accounts. A directory in the profile of the account that runs the job inherits exactly that,
+      # and the account's own temporary folder is in its profile, which is where section 27 puts a
+      # test run's artefacts on Windows; one at the root of a drive grants access to every
+      # authenticated user.
       - name: Choose where the acceptance writes
         run: |
-          $directory = Join-Path $env:USERPROFILE 'kr-test-artifacts'
+          $temporary = (Get-Item $env:TEMP).FullName
+          $directory = Join-Path $temporary 'kr-test-artifacts'
           New-Item -ItemType Directory -Force $directory | Out-Null
           "KR_TEST_ARTIFACTS_DIR=$directory" >> $env:GITHUB_ENV
 
