@@ -1168,11 +1168,11 @@ fn a_new_method_does_not_pass_where_a_use_of_method_does_not_widen() {
 /// says. A name that some validator decodes (`~`), cuts (a tab, a line feed, a carriage return, a
 /// space at the end) or reads as more than one pointer segment (`/`), and a keyword that gives a
 /// place an address, a name or a target that depends on where it is evaluated (`$id`, `id`,
-/// `$anchor`, `$dynamicAnchor`, `$recursiveAnchor`, `$recursiveRef`), can send a reference to
-/// another place than the one that the walk reads. No line under `Method` passes beside one,
-/// wherever it stands (also among the keys of a map of names, under a name that is a keyword, and
-/// in a constant, a default or a keyword that the walk does not know) and even where nothing in
-/// the schema refers to it.
+/// `$anchor`, `$dynamicAnchor`, `$recursiveAnchor`, `$recursiveRef`, `$schema`), can send a
+/// reference to another place than the one that the walk reads. No line under `Method` passes
+/// beside one, wherever it stands (also in a schema that stands under a name that is a keyword,
+/// as a text under such a name, and in a constant, a default or a keyword that the walk does not
+/// know) and even where nothing in the schema refers to it.
 #[test]
 fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
     let reference = || json!({ "$ref": "#/$defs/Method" });
@@ -1275,9 +1275,47 @@ fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
         ),
         (
             holder_with("$recursiveAnchor", json!(true)),
-            // The place that carries `"$recursiveAnchor": true` is the one that a `$recursiveRef`
-            // of another schema, evaluated through this one, selects, and the walk sees none.
+            // `"$recursiveAnchor": true` lets a `$recursiveRef` select the place that carries it,
+            // and the walk sees no such reference: it refuses the keyword.
             "a recursive anchor that nothing in the schema refers to",
+        ),
+        (
+            holder_with("$schema", json!("http://json-schema.org/draft-04/schema#")),
+            // A validator that reads the dialect of each place reads draft-04 here, which has no
+            // `const`: each branch of `Method` accepts every text, so the old schema accepts
+            // `{"m": "a"}` as a `Holder` (one branch matches) and the new one refuses it (two do).
+            "another dialect for a place",
+        ),
+        (
+            json!({
+                "X": {},
+                "Name": { "type": "string", "not": { "$ref": "#/$defs/X" } },
+                "D": { "$defs": { "id": "#$defs/X", "$ref": "#/$defs/Method" } },
+            }),
+            // A resolver that reads every object for `id` takes a text under the name `id` for
+            // the address of the map, which holds `Method`: the old schema accepts "b" as a
+            // `Name`; the new one refuses it.
+            "a text under a name that is a keyword, in a nested map of definitions",
+        ),
+        (
+            json!({
+                "X": {},
+                "Name": { "type": "string", "not": { "$ref": "#/$defs/X" } },
+                "D": { "type": "object", "properties": {
+                    "$anchor": "$defs/X", "$ref": "#/$defs/Method" } },
+            }),
+            // The same through `$anchor` in a map of properties.
+            "a text under a name that is a keyword, in a map of properties",
+        ),
+        (
+            json!({
+                "X": {},
+                "Name": { "type": "string", "not": { "$ref": "#/$defs/X" } },
+                "id": "#$defs/X",
+                "$ref": "#/$defs/Method",
+            }),
+            // The same among the definitions of the schema: a definition that is a text.
+            "a definition that is a text, named like a keyword",
         ),
         (
             json!({
@@ -1323,7 +1361,8 @@ fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
 
 /// The keywords of the schema beside `$defs` use definitions too: a use of `Method` at the root
 /// that does not widen blocks the line, as one in a definition does, and the root's properties,
-/// which is how the generated schemas use definitions, widen.
+/// which is how the generated schemas use definitions, widen. The root may name the one dialect
+/// that the walk is written for, and no other.
 #[test]
 fn a_new_method_does_not_pass_where_the_root_uses_method_without_widening() {
     let reference = json!({ "$ref": "#/$defs/Method" });
@@ -1347,11 +1386,20 @@ fn a_new_method_does_not_pass_where_the_root_uses_method_without_widening() {
             // The old schema accepts `{"m": "b"}` as a whole; the new one refuses it.
             "a not at the root, one definition away",
         ),
+        (
+            json!({ "$schema": "http://json-schema.org/draft-04/schema#" }),
+            // Draft-04 has no `const`: `Method` accepts every text with one name and none with
+            // two, so the old schema accepts `{"m": "a"}` as a whole and the new one refuses it.
+            "another dialect at the root",
+        ),
     ] {
         let lines = level_lines(&with_root(&root, &["a"]), &with_root(&root, &["a", "b"]));
         assert_eq!(lines, vec![added("b")], "{says}");
     }
-    let properties = json!({ "properties": { "m": reference, "n": { "$ref": "#/$defs/Holder" } } });
+    let properties = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": { "m": reference, "n": { "$ref": "#/$defs/Holder" } },
+    });
     let lines = level_lines(
         &with_root(&properties, &["a"]),
         &with_root(&properties, &["a", "b"]),
@@ -1381,13 +1429,17 @@ fn a_new_method_passes_where_every_use_of_method_widens() {
         // A definition whose name has an upper-case letter, a digit and an underscore.
         "Chain_2": { "anyOf": [{ "$ref": "#/$defs/Chain" }, { "type": "null" }] },
         "Outer": { "type": "object", "properties": { "next": { "$ref": "#/$defs/Chain_2" } } },
-        // Names that are keywords, in each map of names, are names: no place has an address.
+        // Names that are keywords, in each of the six maps of names, are names (a schema, a
+        // boolean or a list stands under each): no place has an address.
         "Named": { "oneOf": [
             { "type": "object", "properties": { "id": { "type": "string" },
-                "$id": { "type": "string" }, "$anchor": { "type": "string" } } },
+                "$id": { "type": "string" }, "$anchor": { "type": "string" } },
+                "patternProperties": { "id": { "type": "string" } } },
             { "type": "null" }] },
         "Mapped": { "type": "object", "$defs": { "id": { "type": "string" } },
-            "dependentSchemas": { "id": { "required": ["x"] } } },
+            "definitions": { "$id": true },
+            "dependentSchemas": { "id": { "required": ["x"] } },
+            "dependencies": { "$anchor": ["x"] } },
         // Data that holds no keyword that the walk refuses.
         "Data": { "default": { "kind": 1 }, "examples": [{ "m": "a" }], "const": null,
             "x-vendor": { "properties": { "kind": 1 } } },

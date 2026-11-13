@@ -177,7 +177,8 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
 /// counted: under some of them (a `oneOf`, a `not`, an `if`, a `contains` with `maxContains`) a
 /// wider definition can make the place refuse a value that it accepted, and the walk does not tell
 /// those from the rest. The walk reads every definition and the keywords of the schema beside
-/// `$defs`, and it refuses any form that it cannot read (see [`widens_at`]).
+/// `$defs` (the root may name the dialect of [`DIALECT`] and no other), and it refuses any form
+/// that it cannot read (see [`widens_at`]).
 fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
     let Some(definitions) = schema["$defs"].as_object() else {
         return true;
@@ -200,16 +201,35 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
             break;
         }
     }
-    definitions
-        .values()
-        .all(|node| widens_with(node, &reaching, true))
+    schemas_widen(definitions, &reaching, true)
         && schema
             .as_object()
             .into_iter()
             .flatten()
-            .all(|(keyword, member)| {
-                keyword == "$defs" || widens_at(keyword, member, &reaching, true)
+            .all(|(keyword, member)| match keyword.as_str() {
+                "$defs" => true,
+                "$schema" => member.as_str() == Some(DIALECT),
+                _ => widens_at(keyword, member, &reaching, true),
             })
+}
+
+/// The dialect that the walk is written for, and the only one that a schema may name (at its root).
+const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+
+/// Whether every member of `named`, a map from names to schemas, is a schema that stands where it
+/// may (see [`widens_at`]). A member must be an object, a boolean or a list: a name is a keyword
+/// to a resolver that reads every object for the keywords `$id`, `id`, `$anchor` and
+/// `$dynamicAnchor`, and it takes any text under one of them for an address or a name, so a text
+/// under a name is refused.
+fn schemas_widen(
+    named: &serde_json::Map<String, Value>,
+    reaching: &BTreeSet<&str>,
+    widening: bool,
+) -> bool {
+    named.values().all(|schema| {
+        (schema.is_object() || schema.is_boolean() || schema.is_array())
+            && widens_with(schema, reaching, widening)
+    })
 }
 
 /// Whether every `$ref` under `node` to a definition of `reaching` stands where a wider definition
@@ -228,9 +248,10 @@ fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool 
 
 /// The keywords that give a place an address of its own (`$id`, and draft-04's `id`), a name that
 /// a reference can find (`$anchor`, `$dynamicAnchor`), a mark that lets a `$recursiveRef` select
-/// the place (`$recursiveAnchor`), or a target that depends on the place that evaluates it
-/// (`$dynamicRef`, `$recursiveRef`).
-const SCOPE_KEYWORDS: [&str; 7] = [
+/// the place (`$recursiveAnchor`), a target that depends on the place that evaluates it
+/// (`$dynamicRef`, `$recursiveRef`), or another dialect for the place (`$schema`, which only the
+/// root of a schema may have, and only with [`DIALECT`]).
+const SCOPE_KEYWORDS: [&str; 8] = [
     "$id",
     "id",
     "$anchor",
@@ -238,6 +259,7 @@ const SCOPE_KEYWORDS: [&str; 7] = [
     "$recursiveAnchor",
     "$dynamicRef",
     "$recursiveRef",
+    "$schema",
 ];
 
 /// Whether a `$ref` to `member` stands where a wider definition of `reaching` widens the place
@@ -271,28 +293,25 @@ fn reference_widens(member: &Value, reaching: &BTreeSet<&str>, widening: bool) -
 /// against the base address of the resource that holds it, and it reaches the member of the one
 /// `$defs` that its name says (a generated file holds a key once; a name that `$defs` lacks
 /// reaches nothing, which is an error and never another place). Only a [`SCOPE_KEYWORDS`] keyword
-/// can change that, and the walk refuses each of them wherever it stands. It reads a key as a
-/// name only in a map from names to schemas (`properties`, `patternProperties`, `$defs`,
-/// `definitions`, `dependentSchemas`, `dependencies`), where a name is not a keyword; every key of
-/// a value that it does not read as a schema (a constant, a default, an example, a keyword that it
-/// does not know) is read as a keyword, so no keyword hides among names. A schema that the walk
-/// accepts then holds no place with an address or a name of its own and no reference that it
-/// cannot read.
+/// can change that, and the walk refuses each of them wherever it stands (`$schema` only at the
+/// root, and only with the one dialect that the walk is written for). It reads a key as a name
+/// only in a map from names to schemas (`properties`, `patternProperties`, `$defs`,
+/// `definitions`, `dependentSchemas`, `dependencies`), and only where the member under the name
+/// is an object, a boolean or a list ([`schemas_widen`]); every key of a value that it does not
+/// read as a schema (a constant, a default, an example, a keyword that it does not know) is read
+/// as a keyword, so no keyword hides among names. A schema that the walk accepts then holds no
+/// place with an address, a name or a dialect of its own and no reference that it cannot read.
 fn widens_at(keyword: &str, member: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
     match keyword {
         "$ref" => reference_widens(member, reaching, widening),
         _ if SCOPE_KEYWORDS.contains(&keyword) => false,
         "properties" | "patternProperties" if member.is_object() => member
             .as_object()
-            .into_iter()
-            .flat_map(|named| named.values())
-            .all(|schema| widens_with(schema, reaching, widening)),
+            .is_some_and(|named| schemas_widen(named, reaching, widening)),
         "$defs" | "definitions" | "dependentSchemas" | "dependencies" if member.is_object() => {
             member
                 .as_object()
-                .into_iter()
-                .flat_map(|named| named.values())
-                .all(|schema| widens_with(schema, reaching, false))
+                .is_some_and(|named| schemas_widen(named, reaching, false))
         }
         "items" | "additionalProperties" | "anyOf" | "allOf" | "prefixItems" => {
             widens_with(member, reaching, widening)
