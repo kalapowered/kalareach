@@ -2325,7 +2325,7 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         (vec![], vec!["push".to_owned()]),
         "modelled keywords"
     );
-    let rows: [(&str, fn(&mut Value)); 8] = [
+    let rows: [(&str, fn(&mut Value)); 10] = [
         ("an unmodelled keyword at the root", |schema| {
             schema["x-unmodelled"] = json!(true);
         }),
@@ -2353,6 +2353,20 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         ("a recursive reference at the root", |schema| {
             schema["$recursiveRef"] = json!("#");
         }),
+        (
+            "a bundle entry that is a reference of another form",
+            |schema| {
+                schema["properties"] =
+                    json!({ "c": { "$ref": "#/%24defs/ConfigurationDocument" } });
+            },
+        ),
+        (
+            "a bundle entry with a keyword beside its reference",
+            |schema| {
+                schema["properties"] = json!({ "c": { "$ref": "#/$defs/ConfigurationDocument",
+                "description": "The document." } });
+            },
+        ),
         ("a dynamic reference with an address", |schema| {
             schema["$defs"]["Holder"] = json!({ "type": "object", "properties": {
                 "c": { "$dynamicRef": "https://example.com/bundle#/$defs/ConfigurationDocument" } } });
