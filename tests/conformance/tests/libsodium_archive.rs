@@ -254,3 +254,30 @@ fn a_job_places_the_libsodium_archive_before_it_restores_a_cargo_cache() {
         "no job places the archive and restores a cache: the check read nothing"
     );
 }
+
+/// The route to the download host is closed whether or not the archive was placed: a job that is
+/// already red still runs its later steps that name `!cancelled()`, and none of them may have the
+/// crate's build script download an archive that no digest holds. The step stands after the
+/// placing step and its condition survives that step's failure.
+#[test]
+fn the_route_to_the_download_host_is_closed_after_a_refusal_too() {
+    let action = read(".github/actions/libsodium-archive/action.yml");
+    let placing = action
+        .find("- name: Place what the cache lacks")
+        .expect("the action has the placing step");
+    let closing = action
+        .find("- name: Close the route")
+        .expect("the action has the closing step");
+    assert!(
+        placing < closing,
+        "the route is closed before the archive is placed"
+    );
+    let condition = action[closing..]
+        .lines()
+        .find(|line| line.trim_start().starts_with("if:"))
+        .expect("the step has a condition");
+    assert!(
+        condition.contains("always()"),
+        "the step is skipped after a failure: {condition}"
+    );
+}
