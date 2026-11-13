@@ -274,7 +274,11 @@ impl Controller {
     /// A write's answer is withheld after its effect ran, so the caller is told its outcome is
     /// unknown: a refusal of any other kind says nothing was done, which is false here. A read has
     /// no effect to be unsure of and is refused.
-    fn lease_ended_reply(&self, request_id: RequestId, method: Option<Method>) -> ControlFrame {
+    pub(super) fn lease_ended_reply(
+        &self,
+        request_id: RequestId,
+        method: Option<Method>,
+    ) -> ControlFrame {
         let code = match method.map(|method| method.entry().effect) {
             Some(EffectClass::Write) => ErrorCode::OutcomeUnknown,
             Some(EffectClass::Read) | None => ErrorCode::PermissionDenied,
@@ -375,6 +379,59 @@ impl Controller {
         tokio::sync::oneshot::Sender<()>,
     ) {
         self.before_a_door_effect.arm()
+    }
+
+    /// Arms the pause the next local write stops at once the route that performs it has answered,
+    /// before the answer is told, so that a connection can be withdrawn or a fence set where the
+    /// answer is asked what it stands on. Returns the end that says the route has answered, and the
+    /// end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_a_route_answers(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.after_a_route_answers.arm()
+    }
+
+    /// Arms the pause the next answer the local door tells stops at as it begins to tell it, so
+    /// that authority can change after the route's own work and before the check that decides what
+    /// is shown. Returns the end that says the door has arrived, and the end that lets it go. The
+    /// pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_a_reply_is_told(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.before_a_reply_is_told.arm()
+    }
+
+    /// Every reply the local door's sink has consumed so far, with the request it answers.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn replies_written(&self) -> Vec<(RequestId, ControlFrame)> {
+        self.replies_written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Notes a reply the sink consumed.
+    #[cfg(feature = "testing")]
+    pub(crate) fn note_a_reply_written(&self, request_id: RequestId, frame: &ControlFrame) {
+        self.replies_written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((request_id, frame.clone()));
+    }
+
+    /// Stops here while the pause before a reply is told is armed ([`Self::pause_before_a_reply_is_told`]).
+    #[cfg(feature = "testing")]
+    pub(crate) async fn stop_before_a_reply_is_told(&self) {
+        self.before_a_reply_is_told.wait().await;
     }
 
     /// Arms the pause the next copy of an action stops at once its window has refused it and it has

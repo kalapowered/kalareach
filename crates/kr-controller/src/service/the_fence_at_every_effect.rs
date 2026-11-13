@@ -125,15 +125,16 @@ async fn performed_once(
 }
 
 /// What the local door tells of what a write came to, once the write has been performed: the
-/// reply for `mutation` on `connection_id` under the authority the connection stands on now.
+/// reply for `mutation` on `connection_id`, under the revision the connection was admitted under
+/// when the write began, as the door reads it beside the registration check.
 pub(super) async fn told_now(
     controller: &Controller,
     connection_id: ConnectionId,
     mutation: &MutationRequest,
     settled: impl std::future::Future<Output = crate::given::Settled<ControlFrame>>,
 ) -> ControlFrame {
-    let settled = settled.await;
     let admitted = controller.admitted_revision(connection_id).ok();
+    let settled = settled.await;
     crate::given::local_door::told(
         settled,
         &crate::given::local_door::Standing::new(
@@ -178,11 +179,9 @@ async fn a_fence_this_host_owes_stops_a_local_retrys_retained_answer() {
     let refused = controller
         .perform(&actor_id, connection_id, None, mutation.clone())
         .await;
-    let error = refusal(&refused).unwrap_or_else(|| {
+    told_as_not_shown(refusal(&refused).unwrap_or_else(|| {
         panic!("a retained answer is not given back while a fence is owed: {refused:?}")
-    });
-    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
-    assert!(error.message.contains("fence"), "{error:?}");
+    }));
 
     controller.hold_fence(false);
     let answered = controller
@@ -233,14 +232,9 @@ async fn a_registration_replaced_while_a_retry_waits_stops_its_retained_answer()
     release.send(()).expect("the retry goes on");
 
     let refused = retrying.await.expect("the retry finishes");
-    let error = refusal(&refused).unwrap_or_else(|| {
+    told_as_not_shown(refusal(&refused).unwrap_or_else(|| {
         panic!("a retry admitted before the replacement is not answered after it: {refused:?}")
-    });
-    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
-    assert_eq!(
-        error.message,
-        crate::authority::AdmissionLapse::Revoked.to_string()
-    );
+    }));
 }
 
 /// KR-REQ-09.12: a retained answer stays readable after the window that admitted its action has
@@ -1224,7 +1218,7 @@ async fn a_privacy_change_recorded_before_a_late_attempts_claim_is_not_given_bac
 
     controller.hold_fence(true);
     let refused = late().await;
-    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+    told_as_not_shown(refusal(&refused).unwrap_or_else(|| {
         panic!("a fence this host owes stops the retained answer: {refused:?}")
     }));
     controller.hold_fence(false);
@@ -1395,115 +1389,6 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
         refused_for_a_fence(
             refusal(&answered)
                 .unwrap_or_else(|| panic!("{method:?} while a fence is owed: {answered:?}")),
-        );
-    }
-}
-
-/// The local write methods this daemon performs itself that pass their admission on to the service
-/// that acts: every one of them asks the fence and the registration again inside that service.
-const TAKES_AN_ADMISSION: [Method; 26] = [
-    Method::SessionCreate,
-    Method::SessionClose,
-    Method::AgentPromptSubmit,
-    Method::AgentPromptQueue,
-    Method::AgentToolsInstall,
-    Method::AgentToolsRemove,
-    Method::GrantCreate,
-    Method::GrantRevoke,
-    Method::GrantTransfer,
-    Method::DeviceRevoke,
-    Method::DeliveryDestinationConfigure,
-    Method::DeliveryDestinationRemove,
-    Method::DeliveryDestinationSecretSet,
-    Method::OrganisationEnrol,
-    Method::OrganisationPolicyApply,
-    Method::OrganisationExclusiveSet,
-    Method::OrganisationWithdraw,
-    Method::MembershipPresent,
-    Method::PrivacySet,
-    Method::SessionRename,
-    Method::DescriptionConfigure,
-    Method::DescriptionDownload,
-    Method::EnvironmentCapabilitiesCheck,
-    Method::MachineJoin,
-    Method::MachineMerge,
-    Method::MachineSplit,
-];
-
-/// Whether one of the services that take the admission of a local write performs `method`.
-fn performed_by_a_service(method: Method) -> bool {
-    super::net::methods::serves(method)
-        || crate::transfer::TransferModule::serves(method)
-        || crate::voice::VoiceModule::serves(method)
-        || crate::catalogue::CatalogueModule::serves(method)
-        || crate::project::ProjectModule::serves(method)
-        || crate::automation::AutomationModule::serves(method)
-        || crate::attention::AttentionModule::serves(method)
-        || crate::changeset::ChangeSetModule::serves(method)
-}
-
-/// Whether the registry holds `method` as a write a local caller makes.
-fn is_a_local_write(method: Method) -> bool {
-    let entry = method.entry();
-    entry.effect == kr_protocol::authority::EffectClass::Write
-        && entry
-            .ingress
-            .contains(&kr_protocol::actor::ActorIngress::LocalIpc)
-}
-
-/// KR-REQ-09.09, 09.12 and 26.16: every local write method the daemon performs itself is placed,
-/// as one that takes no admission into a service and is held to the fence by name, or as one that
-/// passes its admission on. A method that is neither is not one the daemon performs; the control
-/// is that the daemon says so when it is asked. So a method added to the daemon without being
-/// placed fails here, instead of running while the host owes a fence.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_local_write_method_the_daemon_performs_is_placed() {
-    use super::routes::NO_ADMISSION;
-
-    let (temp, controller, _clock) = daemon().await;
-    let (connection_id, actor_id) = admitted(&controller).await;
-    let captured = controller
-        .admitted_revision(connection_id)
-        .expect("the connection is registered");
-    for listed in NO_ADMISSION.iter().chain(&TAKES_AN_ADMISSION) {
-        assert!(
-            is_a_local_write(*listed) && !performed_by_a_service(*listed),
-            "{listed:?} is listed and is not a local write the daemon performs itself"
-        );
-    }
-    for listed in &TAKES_AN_ADMISSION {
-        assert!(
-            !NO_ADMISSION.contains(listed),
-            "{listed:?} is on both lists"
-        );
-    }
-    for method in Method::ALL.iter().copied() {
-        if !is_a_local_write(method)
-            || performed_by_a_service(method)
-            || NO_ADMISSION.contains(&method)
-            || TAKES_AN_ADMISSION.contains(&method)
-        {
-            continue;
-        }
-        let answered = controller
-            .write_method(
-                &actor_id,
-                &mutation_of(&temp, method, ParamsValue::empty()),
-                method,
-                connection_id,
-                None,
-                Some(accepted(&controller)),
-                Some(captured),
-            )
-            .await
-            .into_answer_for_test();
-        let error = refusal(&answered)
-            .unwrap_or_else(|| panic!("{method:?} is performed and is placed on no list"));
-        assert!(
-            error
-                .message
-                .contains("is not a mutation this daemon serves"),
-            "{method:?} is performed and is placed on no list: {error:?}"
         );
     }
 }
@@ -2420,8 +2305,11 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
         let actor_id = actor_id.clone();
         let mutation = mutation.clone();
         async move {
-            controller
-                .write_method(
+            told_now(
+                &controller,
+                connection_id,
+                &mutation,
+                controller.write_method(
                     &actor_id,
                     &mutation,
                     Method::MachineSplit,
@@ -2429,9 +2317,9 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
                     None,
                     Some(accepted(&controller)),
                     controller.admitted_revision(connection_id).ok(),
-                )
-                .await
-                .into_answer_for_test()
+                ),
+            )
+            .await
         }
     };
     let first = attempt(Arc::clone(&controller)).await;

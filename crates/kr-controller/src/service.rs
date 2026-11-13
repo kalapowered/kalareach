@@ -673,6 +673,21 @@ pub struct Controller {
     /// its claim. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_a_door_effect: ReadPause,
+    /// Where this host's own tests stop a local write once the route that performs it has
+    /// answered, before the answer is told, so that a connection can be withdrawn or a fence set
+    /// where the answer is asked what it stands on. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_a_route_answers: ReadPause,
+    /// Where this host's own tests stop the local door as it begins to tell an answer, so that
+    /// authority can change after the route's own work and before the check that decides what is
+    /// shown. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_a_reply_is_told: ReadPause,
+    /// Each reply the local door's sink consumed, with the request it answers, in the order they
+    /// were written: what a test reads to hold that a caller is given the reply that was made and
+    /// no other. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    replies_written: std::sync::Mutex<Vec<(kr_protocol::ids::RequestId, ControlFrame)>>,
     /// Where this host's own tests stop a copy of an action at the local door that its window
     /// refuses, once it has looked for the claim of the action and found none while another arrival
     /// may carry the action out, so that the other arrival can end in between. Compiled away in
@@ -1531,6 +1546,14 @@ mod a_change_that_waits_for_its_store;
 /// What the local door asks again where a retained answer goes back and where a mutation lands.
 #[cfg(test)]
 mod the_fence_at_every_effect;
+
+/// The walks over the method table that hold the local door's routes.
+#[cfg(test)]
+mod every_local_write_has_one_route;
+
+/// The reply a local caller reads for a mutation is the reply the door made.
+#[cfg(test)]
+mod every_mutation_reply_is_the_reply_that_was_checked;
 
 /// A local connection whose peer stops reading.
 #[cfg(test)]
