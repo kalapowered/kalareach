@@ -4107,6 +4107,7 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
 struct Serving {
     controller: Arc<Controller>,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    _ending: kr_ipc::testing::Serving,
     // Declared last: the directory is removed after every field above has let go of its files.
     temp: kr_ipc::testing::TempHost,
 }
@@ -4124,10 +4125,12 @@ impl Serving {
             .expect("an endpoint");
         let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+        let ending = kr_ipc::testing::Serving::guarding(&clients);
         Self {
             temp,
             controller,
             clients,
+            _ending: ending,
         }
     }
 
@@ -4138,6 +4141,7 @@ impl Serving {
             temp,
             controller,
             clients,
+            ..
         } = self;
         clients.abort();
         let _ = clients.await;
@@ -4924,7 +4928,7 @@ async fn standing_admission(
         .controller_endpoint()
         .expect("an endpoint");
     let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
-    tokio::spawn(Arc::clone(controller).serve_clients(listener));
+    let serving = kr_ipc::testing::Serving::spawn(Arc::clone(controller).serve_clients(listener));
     let client = kr_ipc::client::LocalClient::connect(
         &endpoint,
         kr_protocol::local::LocalClientKind::Cli,
@@ -4939,7 +4943,7 @@ async fn standing_admission(
             .continuous_now()
             .checked_add(Duration::from_secs(120)),
     };
-    (client, admission)
+    (client, admission, serving)
 }
 
 /// KR-REQ-09.08: a key registration whose attempt ended unrecorded is not answered with what
@@ -4951,7 +4955,7 @@ async fn standing_admission(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unfinished_key_registration_is_not_answered_with_another_actions_registration() {
     let (temp, controller) = daemon().await;
-    let (_client, admission) = standing_admission(&temp, &controller).await;
+    let (_client, admission, _serving) = standing_admission(&temp, &controller).await;
     let environment_id = temp.environment_id();
     let device = device_id(0xd1);
     let actor = kr_transport::listener::device_principal(&device);

@@ -223,6 +223,7 @@ pub struct Host {
     pub environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    _ending: kr_ipc::testing::Serving,
     /// The owner device the host was bootstrapped with.
     pub owner: Option<DeviceRecord>,
     /// That device's own endpoint and keys, for a suite that connects it.
@@ -1111,6 +1112,7 @@ impl Host {
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the client endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+        let ending = kr_ipc::testing::Serving::guarding(&clients);
         // The endpoint configuration is this suite's own, so the network is registered here rather
         // than from the environment. The device keys live in memory and go with it.
         let joined = net::register(
@@ -1172,6 +1174,7 @@ impl Host {
             environment_id,
             endpoint,
             clients,
+            _ending: ending,
             work: kr_ipc::testing::PrivateTempDir::create(),
             owner: None,
             owner_device: None,

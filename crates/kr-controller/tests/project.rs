@@ -66,6 +66,7 @@ struct Host {
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    _ending: kr_ipc::testing::Serving,
     // Declared last: the directory is removed after every field above has let go of its files.
     temp: kr_ipc::testing::TempHost,
     /// Where the repositories live. Shared, so it outlives a daemon a test replaces.
@@ -148,12 +149,14 @@ async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<PrivateTempDir>) -> 
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+    let ending = kr_ipc::testing::Serving::guarding(&clients);
     Host {
         temp,
         controller,
         environment_id,
         endpoint,
         clients,
+        _ending: ending,
         work,
     }
 }

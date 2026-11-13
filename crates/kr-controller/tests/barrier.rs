@@ -123,6 +123,7 @@ fn submission(byte: u8, actor_id: &ActorId) -> Submission {
 struct Worker {
     /// First, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
+    _serving: Option<kr_ipc::testing::Serving>,
     runtime: Arc<SessionRuntime>,
     service: Arc<WorkerService>,
     session_id: SessionId,
@@ -210,6 +211,7 @@ async fn worker_serving(apart: bool) -> Worker {
         journal_path: Some(environment.journal_database(session_id)),
         build_id: build(),
     };
+    let mut serving = None;
     let (runtime, service, apart_worker) = if apart {
         let (runtime, service, worker) =
             ApartWorker::start(session, identity, endpoint.clone(), binding).await;
@@ -227,11 +229,14 @@ async fn worker_serving(apart: bool) -> Worker {
             WorkerService::new(Arc::clone(&runtime), identity, endpoint.clone(), binding)
                 .expect("a worker service"),
         );
-        tokio::spawn(Arc::clone(&service).serve(listener));
+        serving = Some(kr_ipc::testing::Serving::spawn(
+            Arc::clone(&service).serve(listener),
+        ));
         (runtime, service, None)
     };
     Worker {
         _apart: apart_worker,
+        _serving: serving,
         _temp: temp,
         runtime,
         service,
@@ -1864,6 +1869,7 @@ impl WorkerSupervisor for RendezvousSupervisor {
 struct Hosted {
     /// First, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
+    _serving: Option<kr_ipc::testing::Serving>,
     controller: Arc<Controller>,
     client_endpoint: kr_ipc::paths::Endpoint,
     endpoint: kr_ipc::paths::Endpoint,
@@ -2122,6 +2128,7 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
         journal_path: Some(journal_path.clone()),
         build_id: build(),
     };
+    let mut serving = None;
     let (runtime, service, apart_worker) = if apart {
         // The session's own tasks run on a runtime of their own, apart from the connections: its
         // monitor locks the session each time it wakes, and on this test's runtime, or on the
@@ -2147,7 +2154,9 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
             .expect("a worker service"),
         );
         let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
-        tokio::spawn(Arc::clone(&service).serve(listener));
+        serving = Some(kr_ipc::testing::Serving::spawn(
+            Arc::clone(&service).serve(listener),
+        ));
         (runtime, service, None)
     };
     let ready = {
@@ -2175,6 +2184,7 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
     );
     Hosted {
         _apart: apart_worker,
+        _serving: serving,
         _temp: Arc::clone(&daemon.temp),
         controller: Arc::clone(&daemon.controller),
         client_endpoint,

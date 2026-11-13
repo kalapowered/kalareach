@@ -65,6 +65,7 @@ struct Worker {
     /// The task that serves the worker's endpoint, which a restart ends.
     #[cfg_attr(not(unix), allow(dead_code))]
     serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
+    _ending: kr_ipc::testing::Serving,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -175,6 +176,7 @@ async fn worker_on(
         .expect("a worker service"),
     );
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));
+    let ending = kr_ipc::testing::Serving::guarding(&serving);
     let known = KnownWorker {
         level: kr_protocol::retained::Level::this(),
         descriptor: kr_protocol::worker::WorkerDescriptor {
@@ -201,6 +203,7 @@ async fn worker_on(
         controller,
         boot,
         serving,
+        _ending: ending,
     }
 }
 

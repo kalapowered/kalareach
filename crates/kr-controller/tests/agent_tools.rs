@@ -58,6 +58,7 @@ fn build() -> BuildId {
 
 struct Host {
     _controller: Arc<Controller>,
+    _serving: kr_ipc::testing::Serving,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     state_dir: std::path::PathBuf,
@@ -94,10 +95,11 @@ async fn host() -> Host {
     .expect("the daemon starts");
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+    let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&controller).serve_clients(listener));
     Host {
         _temp: temp,
         _controller: controller,
+        _serving: serving,
         environment_id,
         endpoint,
         state_dir,

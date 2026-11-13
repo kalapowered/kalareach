@@ -41,6 +41,7 @@ impl WorkerSupervisor for RefusingSupervisor {
 struct Host {
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
+    _serving: kr_ipc::testing::Serving,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -77,11 +78,12 @@ async fn host() -> Host {
     .expect("the daemon starts");
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+    let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&controller).serve_clients(listener));
     Host {
         _temp: temp,
         environment_id,
         endpoint,
+        _serving: serving,
     }
 }
 
