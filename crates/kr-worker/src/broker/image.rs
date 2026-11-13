@@ -1460,11 +1460,13 @@ mod tests {
 
     /// A thin Mach-O of one 4096-byte page and an embedded signature after it, whose code directory
     /// has one code slot per `slots` entry (the page's own hash, or another), each slot entry
-    /// placed at the directory offsets `at`.
+    /// placed at the directory offsets `at`. `mark` is a byte of the page that nothing reads, so
+    /// that two files can differ in the code their directories hash.
     #[cfg(target_os = "macos")]
-    fn signed(page_hash: Option<[u8; 32]>, at: &[u32]) -> (Vec<u8>, [u8; 20]) {
+    fn signed(page_hash: Option<[u8; 32]>, at: &[u32], mark: u8) -> (Vec<u8>, [u8; 20]) {
         use sha2::Digest as _;
         let mut file = vec![0_u8; 4096];
+        file[64] = mark;
         file[0..4].copy_from_slice(&0xfeed_facf_u32.to_le_bytes());
         file[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
         file[12..16].copy_from_slice(&2_u32.to_le_bytes());
@@ -1510,6 +1512,34 @@ mod tests {
         (file, own[..20].try_into().expect("20 bytes"))
     }
 
+    /// A universal file that holds `slices` one after the other, each at a 4096-byte boundary as
+    /// the file of several architectures does. Returns the file and where each slice starts.
+    #[cfg(target_os = "macos")]
+    fn universal(slices: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
+        let mut starts = Vec::new();
+        let mut next = 8 + 20 * slices.len();
+        for slice in slices {
+            next = next.next_multiple_of(4096);
+            starts.push(next);
+            next += slice.len();
+        }
+        let mut file = Vec::new();
+        file.extend_from_slice(&0xcafe_babe_u32.to_be_bytes());
+        file.extend_from_slice(&u32::try_from(slices.len()).expect("few").to_be_bytes());
+        for (index, (slice, start)) in slices.iter().zip(&starts).enumerate() {
+            file.extend_from_slice(&0x0100_000c_u32.to_be_bytes());
+            file.extend_from_slice(&u32::try_from(index).expect("few").to_be_bytes());
+            file.extend_from_slice(&u32::try_from(*start).expect("small").to_be_bytes());
+            file.extend_from_slice(&u32::try_from(slice.len()).expect("small").to_be_bytes());
+            file.extend_from_slice(&12_u32.to_be_bytes());
+        }
+        for (slice, start) in slices.iter().zip(&starts) {
+            file.resize(*start, 0);
+            file.extend_from_slice(slice);
+        }
+        (file, starts)
+    }
+
     #[cfg(target_os = "macos")]
     fn written(bytes: &[u8]) -> (PathBuf, PathBuf) {
         let directory = std::env::temp_dir().join(format!("kr-signed-{}", kr_ipc::new_uuid()));
@@ -1523,7 +1553,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_code_directory_that_matches_its_pages_is_kept() {
-        let (file, hash) = signed(None, &[0]);
+        let (file, hash) = signed(None, &[0], 0);
         let (directory, path) = written(&file);
         let read =
             read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false)).expect("read");
@@ -1536,7 +1566,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_code_directory_that_does_not_match_its_pages_is_not_kept() {
-        let (file, _) = signed(Some([7; 32]), &[0]);
+        let (file, _) = signed(Some([7; 32]), &[0], 0);
         let (directory, path) = written(&file);
         let read =
             read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false)).expect("read");
@@ -1553,7 +1583,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_signature_that_repeats_a_slot_yields_nothing() {
-        let (file, _) = signed(None, &[0; 40]);
+        let (file, _) = signed(None, &[0; 40], 0);
         let (directory, path) = written(&file);
         let read =
             read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false)).expect("read");
@@ -1565,39 +1595,37 @@ mod tests {
         );
     }
 
-    /// One changed byte in the code of bash's arm64e slice, the rest of the file as it is: that
-    /// slice's directory is no longer kept, and the other slice's still is.
+    /// A universal file of three signed slices, one byte of the middle slice's page changed, the
+    /// rest of the file as it is: that slice's directory is no longer kept, and the directories of
+    /// the other two still are.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_changed_page_drops_only_its_slice_s_directory() {
-        let original = identity_of(Path::new("/bin/bash")).hashed.code_directories;
-        let mut bytes = std::fs::read("/bin/bash").expect("bash");
-        let count =
-            usize::try_from(u32::from_be_bytes(bytes[4..8].try_into().expect("4"))).expect("count");
-        let arm = (0..count)
-            .map(|slice| 8 + slice * 20)
-            .find(|at| {
-                u32::from_be_bytes(bytes[*at..*at + 4].try_into().expect("4")) == 0x0100_000c
-            })
-            .expect("an arm64 slice");
-        let offset = usize::try_from(u32::from_be_bytes(
-            bytes[arm + 8..arm + 12].try_into().expect("4"),
-        ))
-        .expect("offset");
-        // A byte inside the slice's first page, in its load commands.
-        bytes[offset + 40] ^= 0xff;
-        let (directory, path) = written(&bytes);
-        let read =
-            read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false)).expect("read");
-        let _ = std::fs::remove_dir_all(&directory);
-        assert_eq!(original.len(), 2, "bash is universal: {original:?}");
+        let slices: Vec<(Vec<u8>, [u8; 20])> =
+            (1..=3).map(|mark| signed(None, &[0], mark)).collect();
+        let bytes: Vec<&[u8]> = slices.iter().map(|(file, _)| file.as_slice()).collect();
+        let (mut file, starts) = universal(&bytes);
+        let kept_of = |file: &[u8]| {
+            let (directory, path) = written(file);
+            let read = read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false))
+                .expect("read");
+            let _ = std::fs::remove_dir_all(&directory);
+            let mut kept = read.code_directories;
+            kept.sort_unstable();
+            kept
+        };
+        let mut every: Vec<[u8; 20]> = slices.iter().map(|(_, hash)| *hash).collect();
+        every.sort_unstable();
         assert_eq!(
-            read.code_directories.len(),
-            1,
-            "{:?}",
-            read.code_directories
+            kept_of(&file),
+            every,
+            "the file as it is keeps every slice's"
         );
-        assert!(original.contains(&read.code_directories[0]));
+        // A byte inside the middle slice's page that no header names.
+        file[starts[1] + 2048] ^= 0xff;
+        let mut others = vec![slices[0].1, slices[2].1];
+        others.sort_unstable();
+        assert_eq!(kept_of(&file), others, "the changed slice's is gone");
     }
 
     /// The hashes read from a universal file's own signature include the one `codesign` names for
