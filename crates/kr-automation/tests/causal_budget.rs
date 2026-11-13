@@ -1540,6 +1540,81 @@ async fn a_rearm_whose_admission_has_lapsed_writes_nothing() {
     );
 }
 
+/// KR-REQ-09.09: a rearm refused for what the chain's budget holds (a root nothing is known for,
+/// a chain on another generation, a budget that has not run out) says nothing of that budget to a
+/// request whose admission has lapsed: the admission is asked first, and its refusal is the answer.
+/// Under an admission that stands the same requests meet the same refusals as before. The repeat of
+/// a rearm that was performed is answered from the chain without the admission, which it has
+/// nothing left to use, and a device is still told of no chain but its own grant's.
+#[tokio::test]
+async fn a_rearm_refused_for_its_chains_state_waits_for_its_admission() {
+    let table = common::every_right(&[test_grant_id(1), test_grant_id(3)]);
+    let service = AutomationService::in_memory(common::host(
+        Arc::new(MockActionRunner::new()),
+        table,
+        Arc::new(ManualClock::new(1_000)),
+    ))
+    .expect("a service");
+    let root = an_exhausted_chain(&service, 65).await;
+    let lapsed = || {
+        Err(AutomationError::Lapsed {
+            code: ErrorCode::PermissionDenied,
+            detail: "the authority this request was admitted under was withdrawn".to_owned(),
+        })
+    };
+    let rearm = |chain: CausalRootId,
+                 leaves: u64,
+                 admission: &(dyn Fn() -> kr_automation::Result<()> + Send + Sync),
+                 caller_grant: Option<GrantId>| {
+        service.rearm(
+            &kr_protocol::automation::WorkflowRearmParams {
+                causal_root_id: chain,
+                grant_reference: caller_grant.unwrap_or_else(|| test_grant_id(1)),
+                generation: kr_protocol::scalars::U64::new(leaves),
+            },
+            &Submitted {
+                answered: None,
+                key: &common::fresh_action(Method::WorkflowRearm),
+                admission,
+                caller_grant,
+            },
+            2_000,
+        )
+    };
+    let refusal = |result: kr_automation::Result<kr_automation::Rearmed>| {
+        let error = result.expect_err("the rearm is refused");
+        (code(&error), error.to_string())
+    };
+
+    // A chain on another generation, and a root nothing is known for.
+    let (word, _) = refusal(rearm(root, 5, &lapsed, None));
+    assert_eq!(word, ErrorCode::PermissionDenied, "another generation");
+    let (word, _) = refusal(rearm(test_root_id(9), 0, &lapsed, None));
+    assert_eq!(word, ErrorCode::PermissionDenied, "an unknown root");
+    // The control: the admission stands, and the state is what refuses.
+    let (word, _) = refusal(rearm(root, 5, &common::admitted, None));
+    assert_eq!(word, ErrorCode::DraftConflict, "another generation");
+    let (word, detail) = refusal(rearm(test_root_id(9), 0, &common::admitted, None));
+    assert_eq!(word, ErrorCode::InvalidArgument, "{detail}");
+    assert!(detail.contains("causal root not found"), "{detail}");
+
+    // A budget that has not run out: the chain is rearmed once and is in good standing.
+    rearm(root, 0, &common::admitted, None).expect("the first rearm");
+    let (word, _) = refusal(rearm(root, 1, &lapsed, None));
+    assert_eq!(word, ErrorCode::PermissionDenied, "a budget that stands");
+    let (word, detail) = refusal(rearm(root, 1, &common::admitted, None));
+    assert_eq!(word, ErrorCode::InvalidArgument, "{detail}");
+    assert!(detail.contains("has not run out"), "{detail}");
+
+    // The repeat of the rearm that was performed is answered under a lapsed admission, as it
+    // would be after the window, and a device is told no more of the chain than before.
+    let repeated = rearm(root, 0, &lapsed, None).expect("the repeat is answered from the chain");
+    assert_eq!(repeated.result.generation.get(), 1);
+    let (word, detail) = refusal(rearm(root, 0, &lapsed, Some(test_grant_id(3))));
+    assert_eq!(word, ErrorCode::InvalidArgument, "{detail}");
+    assert!(detail.contains("causal root not found"), "{detail}");
+}
+
 /// KR-REQ-25.17: a rearm that fails part way leaves the chain as it was, the refused descendant
 /// still waiting for the rearm that will continue it.
 #[test]

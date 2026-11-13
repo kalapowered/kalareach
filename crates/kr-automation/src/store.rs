@@ -1389,7 +1389,10 @@ impl<'c> Journal<'c> {
     /// compare-and-swap on it, which is what makes a repeat a repeat and not a second budget: a
     /// chain already on the generation after `leaves` is answered as having been rearmed and is
     /// not touched, and a chain on any other generation is refused. A chain whose budget has not
-    /// run out is refused too, because nothing about it is stopped.
+    /// run out is refused too, because nothing about it is stopped. The repeat is answered before
+    /// the journal's admission is asked, since it has nothing left to admit; every refusal waits
+    /// for the admission, so a request whose admission has lapsed is told of nothing the chain
+    /// holds.
     ///
     /// The budget moves to the next generation with fresh counters. Every descendant the budget of
     /// the generation it leaves refused is handed to `continue_with` once, with the new
@@ -1400,9 +1403,11 @@ impl<'c> Journal<'c> {
     ///
     /// # Errors
     ///
-    /// Returns [`AutomationError::InvalidArgument`] for a root this journal holds no budget for
-    /// and for a chain whose budget has not run out, [`AutomationError::GenerationMismatch`] for a
-    /// chain on another generation, a storage error, and whatever `continue_with` returns.
+    /// Returns whatever the admission refused with, which comes before any refusal that
+    /// describes the chain; [`AutomationError::InvalidArgument`] for a root this journal holds no
+    /// budget for and for a chain whose budget has not run out,
+    /// [`AutomationError::GenerationMismatch`] for a chain on another generation, a storage
+    /// error, and whatever `continue_with` returns.
     pub fn rearm_budget<T>(
         &self,
         root_id: CausalRootId,
@@ -1410,14 +1415,19 @@ impl<'c> Journal<'c> {
         now_ms: u64,
         mut continue_with: impl FnMut(&Journal<'_>, &Continuation, u64) -> Result<Option<T>>,
     ) -> Result<Rearm<T>> {
-        let mut budget = self
-            .load_budget(root_id)?
-            .ok_or_else(|| AutomationError::InvalidArgument("causal root not found".to_owned()))?;
-        if follows(budget.generation, leaves) {
+        let held = self.load_budget(root_id)?;
+        if let Some(budget) = &held
+            && follows(budget.generation, leaves)
+        {
             return Ok(Rearm::Already {
                 generation: budget.generation,
             });
         }
+        // What the journal holds of a chain is said only to a request whose admission still
+        // stands, so a refusal that describes the chain waits for it.
+        self.admit()?;
+        let mut budget = held
+            .ok_or_else(|| AutomationError::InvalidArgument("causal root not found".to_owned()))?;
         if budget.generation != leaves {
             return Err(AutomationError::GenerationMismatch {
                 root: root_id,
@@ -1430,7 +1440,6 @@ impl<'c> Journal<'c> {
                 "the budget of chain {root_id} has not run out, so there is nothing to rearm"
             )));
         }
-        self.admit()?;
         budget.rearm(now_ms);
         self.save_budget(&budget)?;
         let continuations = self.continuations(root_id, leaves)?;
