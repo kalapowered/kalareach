@@ -1476,7 +1476,8 @@ async function wordsInBox(page: Page, href: string, outside: number): Promise<{ 
       const paragraph = link?.closest('p')
       if (!link || !paragraph?.parentElement) throw new Error('the page shows no such link')
       const box = document.createElement('div')
-      box.style.cssText = 'overflow-x: auto; overflow-y: hidden; width: 200px;'
+      // The box lies 60 px inside the pane, so that its edge clips the words where the pane's own edge does not.
+      box.style.cssText = 'overflow-x: auto; overflow-y: hidden; width: 200px; margin-left: 60px;'
       paragraph.parentElement.insertBefore(box, paragraph)
       box.append(paragraph)
       // The room after the words lets the box scroll them past its left edge.
@@ -1506,12 +1507,13 @@ test.describe('a link in a box inside a message that clips it', () => {
           await pressPage(page, surface, { scale: ratio, only: [PLAIN, BOXED, PLAIN] })
           const { edge, words } = await wordsInBox(page, BOXED_HREF, outside)
           const wrong: string[] = []
-          for (const inward of [1, 3, 6, 12, 24, 36, 44, 52]) {
+          // Inside the box, and outside it between its edge and the words that it hides.
+          for (const inward of [-12, -6, -3, 1, 3, 6, 12, 24, 36, 44, 52]) {
             const made = await tapAndRead(page, edge + inward, words.y)
             const lit = made.lit.find((look) => look !== null) ?? null
             if (lit !== null || made.opened.length > 0) wrong.push(`${String(inward)} px inside the box: lit ${String(lit)}, opened ${made.opened.join(',') || 'nothing'}`)
           }
-          expect(wrong, 'taps on the plain text inside the box that lit or opened the link whose words the box hides').toEqual([])
+          expect(wrong, 'taps near the box’s edge that lit or opened the link whose words the box hides').toEqual([])
         })
       }
 
