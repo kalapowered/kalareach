@@ -7,10 +7,10 @@ use std::path::Path;
 use kr_boundary_windows::manifest::Outcome;
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CASE_SENSITIVE_WHY, EntryKind, Grounds, IntentAct, IntentRead, Origin, ParentCure, Presence,
-    Purpose, Standing, Taken, choose, data_ending, data_made_ending, ending, intent_words,
-    left_alone, parent_advice, program_keeping, program_open_advice, rollback_ending,
-    rollback_entry, rollback_laid_stays, rollback_not_changed, service_program_is,
+    CASE_SENSITIVE_WHY, EntryKind, Grounds, IntentAct, IntentRead, NotProved, Origin, ParentCure,
+    Presence, Purpose, RecordLeft, Standing, Taken, choose, data_ending, data_made_ending, ending,
+    intent_words, left_alone, parent_advice, program_keeping, program_open_advice, rollback_ending,
+    rollback_entry, rollback_failed, rollback_laid_stays, rollback_not_changed, service_program_is,
     unnamed_root_why,
 };
 
@@ -742,4 +742,96 @@ fn the_service_is_the_installations_where_its_program_is_the_broker_in_the_progr
     ));
     assert!(!service_program_is(&format!("\"{broker}\" -x"), broker));
     assert!(!service_program_is("", broker));
+}
+
+#[test]
+fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_record() {
+    let failures = vec!["removing an account: Windows error 5".to_owned()];
+    let proved = rollback_failed(
+        &failures,
+        &RecordLeft::Proved {
+            manifest: "M".to_owned(),
+        },
+        "",
+    );
+    assert!(
+        proved.contains("found the manifest that this run holds"),
+        "{proved}"
+    );
+    assert!(
+        proved.contains("the administrator's removal takes the rest"),
+        "{proved}"
+    );
+    for found in [
+        NotProved::Absent,
+        NotProved::Differs,
+        NotProved::Unread("Windows error 5".to_owned()),
+    ] {
+        let saved = rollback_failed(
+            &failures,
+            &RecordLeft::Saved {
+                manifest: "M".to_owned(),
+                found: found.clone(),
+            },
+            "",
+        );
+        assert!(saved.contains(&found.words()), "{saved}");
+        assert!(saved.contains("wrote its record again at M"), "{saved}");
+        assert!(
+            saved.contains("the administrator's removal takes the rest"),
+            "{saved}"
+        );
+        let unsaved = rollback_failed(
+            &failures,
+            &RecordLeft::NotSaved {
+                found: found.clone(),
+                why: "Windows error 112".to_owned(),
+                stays: vec!["D".to_owned(), "F".to_owned()],
+            },
+            ". The earlier-state record was not read",
+        );
+        assert!(
+            unsaved.contains("writing this run's record again failed (Windows error 112)"),
+            "{unsaved}"
+        );
+        assert!(
+            unsaved.contains("no record of this run is on disk"),
+            "{unsaved}"
+        );
+        assert!(unsaved.contains("did not take away: D; F"), "{unsaved}");
+        assert!(
+            unsaved.ends_with(". The earlier-state record was not read"),
+            "{unsaved}"
+        );
+        // No ending says that a record is kept or that the manifest stays where it is, since none
+        // of them reads a record that it did not find, and no ending gives a step.
+        for text in [&saved, &unsaved] {
+            for forbidden in [
+                "records are kept",
+                "stays where it is",
+                "Remove ",
+                "remove it",
+                "move it",
+            ] {
+                assert!(!text.contains(forbidden), "{forbidden} in {text}");
+            }
+        }
+        assert!(
+            !unsaved.contains("administrator's removal takes the rest"),
+            "{unsaved}"
+        );
+    }
+    let none = rollback_failed(
+        &failures,
+        &RecordLeft::NotSaved {
+            found: NotProved::Absent,
+            why: "w".to_owned(),
+            stays: Vec::new(),
+        },
+        "",
+    );
+    assert!(
+        none.contains("this run held no object that it had made"),
+        "{none}"
+    );
 }

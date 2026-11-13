@@ -273,3 +273,26 @@ fn a_failed_early_read_ends_the_removal_and_is_kept_by_a_rollback() {
     assert_eq!(count(&steps, "manager.open(SERVICE)?"), 2);
     assert_eq!(count(&steps, "manager.open(APPID)?"), 2);
 }
+
+#[test]
+fn a_rollback_that_ends_with_a_failed_step_leaves_a_record_before_it_ends() {
+    let source = install_source();
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    // The failure ending of a rollback reads the manifest's name and writes the record again where
+    // the read does not find it, before it builds its words; the removal's ending is its own.
+    let ending = steps
+        .find("DataTree::Laid(run) => {\n                let record = run.keep_record();")
+        .expect("the rollback's failure ending keeps the record first");
+    let words = steps[ending..]
+        .find("remedy::rollback_failed(")
+        .expect("and then says what became of it");
+    assert!(words > 0);
+    let keep = code_of(body_of(&source, "fn keep_record("));
+    assert!(keep.contains("self.manifest_on_disk()"));
+    assert!(keep.contains("self.save()"));
+    // The program directory's check in a rollback is told whether the manifest is on disk by a
+    // read, and not that it is.
+    let roll = code_of(body_of(&source, "fn roll_back("));
+    assert!(roll.contains("matches!(run.manifest_on_disk(), Ok(()))"));
+    assert!(!roll.contains("check_program_directory(&paths, true,"));
+}
