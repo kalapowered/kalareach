@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { CLICK_AWAY, decide, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
+import { CLICK_AWAY, decide, keepsPress, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
 
 /** Links are named by strings here: the decision only compares them. */
 type Id = string
@@ -165,7 +165,18 @@ describe('the nearest-words rule at the press’s point, run again at the click'
   })
 })
 
+describe('what keeps a press', () => {
+  it('is nothing for a press that lit no link', () => {
+    expect(keepsPress(press({ start: null }), layoutOf(UPPER))).toBe(false)
+  })
+})
+
 describe('where the click lies against the press', () => {
+  it('allows the finger’s 10 px and an engine’s adjustment of up to 22.6 px more, and no farther: 32 px opens, 33 px stands', () => {
+    expect(decide(press(), click({ point: { x: 60 + 32, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
+    expect(decide(press(), click({ point: { x: 60 + 33, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
+  })
+
   it('opens the link at the edge of its area, where the engine reports the click a pixel off the point that lit it', () => {
     // The upper link's area ends 22 px under its words' middle (y 108.5): 130.5. The press was at 130.5, the click is reported at 131.
     expect(decide(press({ at: { x: 60, y: 130.5 } }), click({ point: { x: 60, y: 131 } }), layoutOf(UPPER))).toEqual(OPEN_UPPER)
