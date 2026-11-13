@@ -187,6 +187,14 @@ fn no_ending_of_any_object_tells_a_removal_a_repair_or_a_status_report_to_move_i
                         if matches!(remedy, Remedy::MoveAside(_) | Remedy::Remove(_)) {
                             assert!(moves, "a move without a clearance: {what}");
                         }
+                        // An origin that rests on a failed read gives no step for any state of the
+                        // record, any lookup and any purpose.
+                        if matches!(
+                            origin,
+                            Origin::Refused(_) | Origin::Unknown(_) | Origin::Changed(_)
+                        ) {
+                            assert_eq!(remedy, Remedy::NoStep, "{what}");
+                        }
                         if says_a_move(&text) {
                             assert!(moves, "{what}");
                             assert!(
