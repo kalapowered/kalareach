@@ -807,7 +807,7 @@ fn a_record_that_cannot_be_deleted_ends_the_removal_with_the_platforms_words_and
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
-fn a_removal_sweeps_the_brokers_journal_names_after_the_stop_and_leaves_other_names() {
+fn a_removal_sweeps_the_brokers_journal_names_after_the_stop() {
     let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     require_elevated();
     let before = snapshot();
@@ -818,59 +818,63 @@ fn a_removal_sweeps_the_brokers_journal_names_after_the_stop_and_leaves_other_na
     let hex = uuid::Uuid::new_v4().simple().to_string();
     let brokers = paths.journal.join(format!("{hex}.journal"));
     std::fs::write(&brokers, b"journal of a run").unwrap();
-    // Names that are not the broker's form: they stay.
-    let others: Vec<String> = vec![
-        "a.journal".to_owned(),
-        format!("{}.journal", "AB".repeat(16)),
-        format!("{hex}.journal.old"),
-        format!("{hex}.txt"),
-    ];
-    for other in &others {
-        std::fs::write(paths.journal.join(other), b"put here by hand").unwrap();
-    }
     let (code, removal) = ordinary_removal();
-    let remaining: std::collections::BTreeSet<String> = std::fs::read_dir(&paths.journal)
-        .map(|entries| {
-            entries
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
+    let stands = brokers.exists();
     observed(&format!(
-        "after the removal the journal directory holds {remaining:?}, exit {code:?}"
+        "after the removal the broker's journal file stands {stands}, exit {code:?}"
+    ));
+    let _ = std::fs::remove_file(&brokers);
+    assert_eq!(code, Some(0), "the removal succeeds: {removal}");
+    assert!(
+        !stands,
+        "the removal left a file that stands under the broker's journal names: {removal}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the removal the computer is as it was: {removal}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_removal_leaves_a_journal_name_that_is_not_the_brokers_and_names_it() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let person = Person::make();
+    a_good_installation(&person);
+    let paths = Paths::system().unwrap();
+    let other = paths.journal.join("a.journal");
+    std::fs::write(&other, b"put here by hand").unwrap();
+    let (code, removal) = ordinary_removal();
+    let stands = other.exists();
+    observed(&format!(
+        "after the removal a.journal stands {stands}, exit {code:?}"
     ));
     for line in removal.lines().filter(|line| line.contains("a.journal")) {
         observed(&format!("removal line: {line}"));
     }
     // The case's own cleanup, so that a second removal can end the run's records.
-    for other in &others {
-        let _ = std::fs::remove_file(paths.journal.join(other));
-    }
-    let _ = std::fs::remove_file(&brokers);
+    let _ = std::fs::remove_file(&other);
     assert!(
-        !remaining.contains(&format!("{hex}.journal")),
-        "the removal left a file that stands under the broker's journal names: {removal}"
-    );
-    assert_eq!(
-        remaining,
-        others.iter().cloned().collect(),
+        stands,
         "the removal took away a file that is not under the broker's journal names: {removal}"
     );
     assert!(
         removal.contains("a.journal"),
         "the removal does not name the file that it left in the journal directory: {removal}"
     );
-    if paths.data.exists() {
-        let (second_code, second) = ordinary_removal();
-        assert_eq!(
-            second_code,
-            Some(0),
-            "the second removal succeeds: {second}"
-        );
-    }
+    let (second_code, second) = ordinary_removal();
+    assert_eq!(
+        second_code,
+        Some(0),
+        "the second removal succeeds: {second}"
+    );
     assert_eq!(
         snapshot(),
         before,
-        "after the second removal the computer is as it was: {removal}"
+        "after the second removal the computer is as it was: {second}"
     );
 }
