@@ -178,11 +178,13 @@ async fn a_duplicate_close_answered_from_the_closure_record_is_not_shown_when_a_
 }
 
 /// KR-REQ-09.09: the accepted price of telling a worker's answer as a copy. Another device's
-/// withdrawal that completes between a first close's effect and its reply stamps the connection's
-/// registration with a new revision, and the answer is not shown although the connection stands and
-/// no fence is owed. The close was sent to the worker once and stands; the same close asked again on
-/// the same connection is admitted under the new revision, reaches the worker, which answers it from
-/// its receipt, and is told.
+/// withdrawal that completes between a first close's route answer and its reply stamps the
+/// connection's registration with a new revision, and the answer is not shown although the
+/// connection stands and no fence is owed. The worker was sent the close once; the same close asked
+/// again on the same connection is admitted under the new revision, is forwarded to the worker and
+/// is told as the worker answers it. The worker here refuses every frame and keeps no receipt, so
+/// the case shows the word at the door and that the repeat is forwarded and told, and not that a
+/// close took effect or that a receipt answers the repeat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn another_devices_withdrawal_between_a_first_closes_effect_and_its_reply_is_not_shown_and_the_close_stands()
  {
