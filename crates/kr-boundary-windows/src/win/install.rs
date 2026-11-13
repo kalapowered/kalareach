@@ -1126,7 +1126,9 @@ struct Laid {
     /// directory. A folder that stood there before the run is never in it.
     program_folder: Option<MadeObject>,
     /// The replacement of the manifest that a write is making, from the call that made it until it
-    /// is proved to be the manifest or is marked for removal.
+    /// is proved to be the manifest or is marked for removal. Once the rename has put it at the
+    /// manifest's name it is the manifest: the earlier manifest's identity is dropped then, and the
+    /// rollback takes it where it takes the manifest, after the other records.
     replacement: Option<MadeFile>,
     /// The creating handle of the earlier-state record, from the call that made it until the write,
     /// the flush and the taking of its identity are done (or marked for removal): it holds a right
@@ -3886,7 +3888,15 @@ impl Run {
         // the only steps are the move of the handle into a shared pointer and the call itself), and
         // the run's rollback marks the file through it wherever the file is.
         let hold = |made: Option<(&Arc<ffi::Handle>, &Path)>| {
-            ffi::locked(&self.laid).replacement = made.map(|(handle, path)| MadeFile {
+            let mut laid = ffi::locked(&self.laid);
+            // A replacement that the rename put at the manifest's name is the manifest from then
+            // on, and the object that an earlier save proved no longer has that name: its identity
+            // is dropped, so that the one object at the name is held once, as the replacement,
+            // until the write proves it (then it is the held manifest) or marks it.
+            if made.is_some_and(|(_, path)| path == self.paths.manifest) {
+                laid.manifest = None;
+            }
+            laid.replacement = made.map(|(handle, path)| MadeFile {
                 handle: Arc::clone(handle),
                 path: path.to_path_buf(),
             });
@@ -4084,8 +4094,10 @@ impl Run {
     /// own handle of the data directory is closed before the data directory is taken. The directories of the journal and of the
     /// private roots go first (the broker's own files in them were deleted before this), then the
     /// earlier-state record, then the staging directory (the files that this run staged in it were
-    /// deleted before this), and the manifest, each only once what it follows is gone, so that a
-    /// run that is made again from the records that stay finds them. The data directory goes last,
+    /// deleted before this), and the manifest (a replacement that a rename has put at the
+    /// manifest's name is the manifest, and goes in its place), each only once what it follows is
+    /// gone, so that a run that is made again from the records that stay finds them. The data
+    /// directory goes last,
     /// and the folder above it where this run made that too, whatever happened before, so that what
     /// keeps them is named. Returns what the rollback came to for each object, by its path: those
     /// that it marked for removal, in the order that it took them, and those that it did not take
@@ -4141,7 +4153,13 @@ impl Run {
         let mut gone = take(object(run), &self.paths.run, false);
         gone &= take(object(journal), &self.paths.journal, false);
         // A replacement of the manifest that the run still holds is marked through the handle that
-        // made it, wherever the object is by now: at the replacement's name, or at the manifest's.
+        // made it, wherever the object is by now. Where the rename has put it at the manifest's
+        // name it is the manifest and goes where the manifest goes, after the other records;
+        // before the rename it stands at its own name and goes first.
+        let (replacement, published) = match replacement {
+            Some(file) if file.path == self.paths.manifest => (None, Some(file)),
+            other => (other, None),
+        };
         if gone && let Some(file) = replacement {
             let path = file.path.clone();
             gone = take(Some(file.take_away(directory.as_ref())), &path, true);
@@ -4159,7 +4177,18 @@ impl Run {
             gone = take(object(staging), &self.paths.staging, false);
         }
         if gone {
-            take(object(manifest), &self.paths.manifest, true);
+            match published {
+                Some(file) => {
+                    take(
+                        Some(file.take_away(directory.as_ref())),
+                        &self.paths.manifest,
+                        true,
+                    );
+                }
+                None => {
+                    take(object(manifest), &self.paths.manifest, true);
+                }
+            }
         }
         // The folder above the program directory, only where this run's own call made it: it goes
         // once the program directory is gone, and stays where it holds anything else.
@@ -6984,6 +7013,80 @@ mod tests {
 
     /// A replacement of the manifest that the run still holds, from the call that made it, is
     /// marked through the handle that made it, at whatever name it has, and counts as a record.
+    /// A later save whose rename succeeded and whose proof then failed has published the manifest:
+    /// the earlier manifest's identity is dropped, the rollback takes the published object after the
+    /// other records, the manifest is neither named as not found nor counted twice, and nothing stays.
+    #[test]
+    fn a_published_replacement_is_taken_as_the_manifest_after_the_other_records() {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        crate::manifest::forced::fail_the_next("proof");
+        run.save().unwrap_err();
+        {
+            let laid = ffi::locked(&run.laid);
+            assert!(laid.manifest.is_none());
+            assert_eq!(
+                laid.replacement.as_ref().map(|file| file.path.clone()),
+                Some(run.paths.manifest.clone())
+            );
+        }
+        let rolled = run.take_away();
+        assert!(rolled.stayed.is_empty(), "{rolled:?}");
+        let prior = rolled
+            .marked
+            .iter()
+            .position(|path| *path == run.paths.prior.display().to_string())
+            .unwrap();
+        let manifest = rolled
+            .marked
+            .iter()
+            .position(|path| *path == run.paths.manifest.display().to_string())
+            .unwrap();
+        assert!(prior < manifest, "{rolled:?}");
+        assert_eq!(
+            rolled
+                .marked
+                .iter()
+                .filter(|path| **path == run.paths.manifest.display().to_string())
+                .count(),
+            1,
+            "{rolled:?}"
+        );
+        assert!(rolled.records_deleted, "{rolled:?}");
+        assert!(!run.paths.manifest.try_exists().unwrap());
+    }
+
+    /// Where another record cannot go, the published manifest stays with it, so that the
+    /// administrator's removal has its record.
+    #[test]
+    fn a_published_manifest_stays_where_another_record_cannot_go() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        crate::manifest::forced::fail_the_next("proof");
+        run.save().unwrap_err();
+        // Another process holds the earlier-state record and shares neither deleting nor renaming.
+        let scanner = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&run.paths.prior)
+            .unwrap();
+        let rolled = run.take_away();
+        drop(scanner);
+        assert!(run.paths.prior.try_exists().unwrap());
+        assert!(run.paths.manifest.try_exists().unwrap());
+        assert!(!rolled.records_deleted, "{rolled:?}");
+        let manifest = run.paths.manifest.display().to_string();
+        assert!(!rolled.marked.contains(&manifest), "{rolled:?}");
+        assert!(
+            rolled
+                .stayed
+                .iter()
+                .all(|entry| !entry.starts_with(&manifest)),
+            "{rolled:?}"
+        );
+    }
+
     #[test]
     fn a_replacement_that_the_run_holds_is_marked_through_the_handle_that_made_it() {
         let top = tempfile::tempdir().unwrap();

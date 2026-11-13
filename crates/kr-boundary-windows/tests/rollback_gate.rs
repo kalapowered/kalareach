@@ -439,6 +439,49 @@ fn a_failed_tree_removal_names_removing_the_entries_and_not_a_listing() {
     assert!(source.contains("a read of what it holds failed ({error})"));
 }
 
+/// A replacement that the rename has put at the manifest's name is the manifest: the write drops the
+/// earlier manifest's identity where it reports the replacement at that path, and the rollback takes
+/// the replacement where it takes the manifest, after the other records.
+#[test]
+fn a_replacement_that_became_the_manifest_is_taken_as_the_manifest() {
+    let source = install_source();
+    let save = code_of(body_of(
+        &source,
+        "    fn save(&self) -> Result<(), Error> {",
+    ));
+    let dropped = save
+        .find("if made.is_some_and(|(_, path)| path == self.paths.manifest) {")
+        .expect("the write tells the run of a replacement at the manifest's path");
+    let drop_it = save
+        .find("laid.manifest = None;")
+        .expect("the earlier identity goes");
+    let hold_it = save.find("laid.replacement = made.map(").unwrap();
+    assert!(dropped < drop_it && drop_it < hold_it);
+    let rollback = code_of(body_of(&source, "    fn take_away(&mut self) -> Rolled {"));
+    let split = rollback
+        .find("Some(file) if file.path == self.paths.manifest => (None, Some(file)),")
+        .expect("a replacement at the manifest's path is set apart");
+    let staging = rollback
+        .find("take(object(staging), &self.paths.staging, false)")
+        .unwrap();
+    let published = rollback
+        .find("Some(file) => {")
+        .expect("the published replacement's slot");
+    let manifest = rollback
+        .find("take(object(manifest), &self.paths.manifest, true);")
+        .unwrap();
+    // The replacement that stands at its own name goes first, before the earlier-state record; the
+    // one that stands at the manifest's goes after the staging directory, in the manifest's place.
+    let first = rollback
+        .find("if gone && let Some(file) = replacement {")
+        .unwrap();
+    let prior = rollback
+        .find("if gone && let Some(file) = prior_creating {")
+        .unwrap();
+    assert!(split < first && first < prior && prior < staging);
+    assert!(staging < published && published < manifest);
+}
+
 #[test]
 fn the_journal_files_go_only_where_the_service_never_ran_or_a_read_showed_that_it_ended() {
     let source = install_source();
