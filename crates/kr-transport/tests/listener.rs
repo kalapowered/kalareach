@@ -28,7 +28,7 @@ use kr_transport::codec::{FrameReader, FrameWriter};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{self, PairedDirectory};
 use kr_transport::listener::{
-    AuthorisedSession, BoxFuture, HostHandler, ListenerConfig, NetworkListener, register,
+    AuthorisedSession, BoxFuture, EndHold, HostHandler, ListenerConfig, NetworkListener, register,
 };
 use kr_transport::preauth::PairingSurface;
 use kr_transport::random::fresh_nonce;
@@ -1003,6 +1003,10 @@ struct ServingHandler {
     streams: Mutex<Vec<kr_transport::streams::StreamHandle>>,
     /// Ends the handler by itself.
     finish: tokio::sync::Notify,
+    /// Makes the handler let go of the data streams it holds, and go on serving.
+    let_go: tokio::sync::Notify,
+    /// How many times the handler has let go of its streams.
+    let_go_done: AtomicUsize,
 }
 
 impl PairedDirectory for ServingHandler {
@@ -1033,6 +1037,10 @@ impl HostHandler for ServingHandler {
                         self.streams.lock().await.push(stream.handle());
                         held.push(stream);
                     }
+                    () = self.let_go.notified() => {
+                        held.clear();
+                        self.let_go_done.fetch_add(1, Ordering::AcqRel);
+                    }
                     () = self.finish.notified() => break,
                     frame = session.control.recv() => if frame.is_none() { break },
                 }
@@ -1056,22 +1064,15 @@ enum First {
     TheConnection,
 }
 
-/// A data stream is revoked with the control stream's loss whichever part of the
-/// connection's end the listener sees first, and whether or not the stream is still registered when
-/// the loss is declared. The handler holds each stream while it serves, so a handler that returns
-/// or is dropped takes its streams out of the registry before the connection's cleanup runs.
-async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
-    let (host, client) = paired_pair().await;
-    let handler = Arc::new(ServingHandler {
-        client: client.record,
-        lost: AtomicUsize::new(0),
-        streams: Mutex::new(Vec::new()),
-        finish: tokio::sync::Notify::new(),
-    });
-    let hold = kr_transport::listener::EndHold::default();
+/// Starts a listener for `handler` whose connections end under `hold`.
+async fn start_serving(
+    host: &Side,
+    handler: Arc<ServingHandler>,
+    hold: EndHold,
+) -> NetworkListener {
     let config = ListenerConfig {
         accepted_kinds: vec![StreamKind::TerminalOutput],
-        end_hold: hold.clone(),
+        end_hold: hold,
         ..ListenerConfig::new(
             EndpointConfig {
                 bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
@@ -1081,14 +1082,33 @@ async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
             ControllerGeneration::new(1),
         )
     };
-    let listener = register(
+    register(
         config,
         Arc::clone(&host.identity),
         &host.keys.transport,
-        Arc::clone(&handler),
+        handler,
     )
     .await
-    .expect("a listener");
+    .expect("a listener")
+}
+
+/// A data stream is revoked with the control stream's loss whichever part of the connection's end
+/// the listener sees first. The handler holds each stream while it serves, so a handler that
+/// returns or is dropped takes its streams out of the registry before the connection's cleanup
+/// runs; where the reader is held, the loss is declared by nothing but the listener's own end of
+/// the session, and the streams are revoked when the handler has gone, before the cleanup.
+async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(ServingHandler {
+        client: client.record,
+        lost: AtomicUsize::new(0),
+        streams: Mutex::new(Vec::new()),
+        finish: tokio::sync::Notify::new(),
+        let_go: tokio::sync::Notify::new(),
+        let_go_done: AtomicUsize::new(0),
+    });
+    let hold = EndHold::default();
+    let listener = start_serving(&host, Arc::clone(&handler), hold.clone()).await;
     let connection = client
         .endpoint
         .connect(listener_addr(&listener), ALPN)
@@ -1118,20 +1138,35 @@ async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
     // The reader is held where the connection or the handler ends the session first, so that the
     // listener has dropped the handler, and the handler's streams with it, before the loss is
     // declared.
-    let reader = (first != First::TheLoss).then(|| hold.hold_the_declaration());
+    let held =
+        (first != First::TheLoss).then(|| (hold.hold_the_declaration(), hold.hold_the_cleanup()));
     match first {
         First::TheLoss => authorised.control_writer.finish().expect("the stream ends"),
         First::TheHandler => handler.finish.notify_one(),
         First::TheConnection => connection.close(0u32.into(), b"done"),
+    }
+    let mut reader = None;
+    if let Some(((_, release_reader), (cleaning, release_cleanup))) = held {
+        // The cleanup is where the handler has gone and the host's hook has not run: the streams
+        // are revoked by now, though nothing but the listener's end of the session declared it.
+        tokio::task::spawn_blocking(move || cleaning.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("the wait ends")
+            .expect("the cleanup is reached");
+        assert_eq!(handler.lost.load(Ordering::Acquire), 0);
+        assert!(
+            handle.is_revoked(),
+            "the stream is revoked when the handler has gone"
+        );
+        release_cleanup.send(()).expect("the cleanup goes on");
+        reader = Some(release_reader);
     }
     wait_until(|| handler.lost.load(Ordering::Acquire) == 1).await;
     assert!(
         handle.is_revoked(),
         "the stream is revoked when the loss is declared"
     );
-    if let Some((_, release)) = reader {
-        drop(release);
-    }
+    drop(reader);
     listener.shutdown().await;
 }
 
@@ -1148,4 +1183,65 @@ async fn a_stream_is_revoked_where_the_handler_returns_before_the_loss_is_declar
 #[tokio::test]
 async fn a_stream_is_revoked_where_the_connection_closes_before_the_loss_is_declared() {
     a_stream_is_revoked_with_the_loss_of_the_control_stream(First::TheConnection).await;
+}
+
+/// A stream the handler let go of while the connection was live, whose registration is gone, is
+/// revoked with the loss of the control stream as every other stream of the connection is.
+#[tokio::test]
+async fn a_stream_the_handler_let_go_of_is_revoked_with_the_loss_of_the_control_stream() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(ServingHandler {
+        client: client.record,
+        lost: AtomicUsize::new(0),
+        streams: Mutex::new(Vec::new()),
+        finish: tokio::sync::Notify::new(),
+        let_go: tokio::sync::Notify::new(),
+        let_go_done: AtomicUsize::new(0),
+    });
+    let listener = start_serving(&host, Arc::clone(&handler), EndHold::default()).await;
+    let connection = client
+        .endpoint
+        .connect(listener_addr(&listener), ALPN)
+        .await
+        .expect("a connection");
+    let mut authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let registry = Arc::new(StreamRegistry::new(
+        authorised.connection_id,
+        Arc::new(kr_transport::scheduler::StreamBudget::new(
+            SendLimits::default(),
+        )),
+        None,
+    ));
+    let _stream = registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a data stream");
+    let handle = loop {
+        if let Some(handle) = handler.streams.lock().await.first().cloned() {
+            break handle;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    handler.let_go.notify_one();
+    wait_until(|| handler.let_go_done.load(Ordering::Acquire) == 1).await;
+    // A task waiting on the stream that is gone is let go by the loss, as it is by its own
+    // revocation.
+    let waiting = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.revoked().await })
+    };
+    authorised.control_writer.finish().expect("the stream ends");
+    wait_until(|| handler.lost.load(Ordering::Acquire) == 1).await;
+    assert!(
+        handle.is_revoked(),
+        "the stream is revoked when the loss is declared"
+    );
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("a task waiting on the stream is let go by the loss")
+        .expect("the waiting task ends");
+    listener.shutdown().await;
 }
