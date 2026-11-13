@@ -65,7 +65,12 @@ pub(crate) enum Declined {
 
 /// The reply to a request that is declined: nothing is withheld, and the refusal is written as it
 /// is.
-pub(crate) fn declined(declined: Declined, request_id: RequestId) -> DoorReply {
+#[cfg_attr(not(feature = "testing"), allow(unused_variables))]
+pub(crate) fn declined(
+    controller: &Controller,
+    declined: Declined,
+    request_id: RequestId,
+) -> DoorReply {
     let frame = match declined {
         Declined::Unauthorised(refusal) => {
             error_reply(request_id, ErrorCode::PermissionDenied, refusal.to_string())
@@ -87,6 +92,8 @@ pub(crate) fn declined(declined: Declined, request_id: RequestId) -> DoorReply {
             crate::transfer::WRONG_ENDPOINT,
         ),
     };
+    #[cfg(feature = "testing")]
+    controller.note_a_reply_made(request_id, false, &frame);
     DoorReply {
         frame,
         request_id,
@@ -177,6 +184,8 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
             }
         }
     };
+    #[cfg(feature = "testing")]
+    controller.note_a_reply_made(request_id, true, &frame);
     DoorReply {
         frame,
         request_id,

@@ -1044,6 +1044,95 @@ async fn the_host_takes_a_lease_for_its_own_key_only_once_it_is_exclusively_orga
     fixture.host.stop().await;
 }
 
+/// KR-REQ-09.09, KR-REQ-17.54: the answer to a presentation of the lease for the host's own local
+/// owner is a copy of what an earlier presentation made, so the door tells it only under the
+/// exact revision the request was admitted under. Another device's revocation that completes
+/// after the route has answered withdraws that device and stamps the local connection with its
+/// revision: the connection stands, no fence is owed, and the answer is not shown. The lease stays
+/// installed, and the same lease presented again on the same connection is admitted under the new
+/// revision and answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_presented_across_another_devices_revocation_is_not_shown_and_its_repeat_is_answered()
+ {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+    let bea = fixture.member("bea", SERVED).await;
+    let lease = fixture.organisation.lease(
+        2,
+        &organisation_support::member("owner"),
+        fixture.listed().await.host_device.authorisation_key,
+        fixture.now(),
+        &[ActionRight::SessionView],
+    );
+    let params = MembershipPresentParams {
+        lease,
+        authority: Nullable::null(),
+    };
+    let environment = fixture.host.environment_id;
+    let mut client = fixture.host.client().await;
+    let first: kr_protocol::organisation::MembershipPresentResult = calls::mutate_as(
+        environment,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        Method::MembershipPresent,
+        &params,
+    )
+    .await
+    .expect("the host takes the lease for its local owner");
+
+    let controller = fixture.host.controller();
+    let before = fixture.authority_revision();
+    let (arrived, release) = controller.pause_after_a_route_answers();
+    let telling = tokio::spawn({
+        let params = params.clone();
+        async move {
+            let told: Result<kr_protocol::organisation::MembershipPresentResult, _> =
+                calls::mutate_as(
+                    environment,
+                    &mut client,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    Method::MembershipPresent,
+                    &params,
+                )
+                .await;
+            (client, told)
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the route answers")
+        .expect("the pause is armed");
+    controller
+        .revoke_device_authority(bea.record.device_id, None, None)
+        .await
+        .expect("another device's authority is revoked");
+    release.send(()).expect("the door goes on");
+    let (mut client, told) = telling.await.expect("the door tells it");
+    assert!(
+        fixture.authority_revision().get() > before.get(),
+        "the revocation moved the revision"
+    );
+    let refused = told.expect_err("a copy across a restamp is not shown");
+    assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
+
+    let again: kr_protocol::organisation::MembershipPresentResult = calls::mutate_as(
+        environment,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        Method::MembershipPresent,
+        &params,
+    )
+    .await
+    .expect("the same lease on the same connection is answered");
+    assert_eq!(again, first, "it is answered as the first presentation was");
+    fixture.host.stop().await;
+}
+
 /// KR-REQ-17.54: what recovers the host is for the device that can recover it. An owner's device
 /// whose grant ends is refused on a lapsed exclusive host, a leased owner device keeps every
 /// confirmation, and the confirmation of ending exclusive management is not carried by a device
