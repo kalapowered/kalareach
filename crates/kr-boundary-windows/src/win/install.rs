@@ -889,17 +889,18 @@ fn names_held_by(identity: &ffi::Handle) -> String {
 
 /// What a read of a name answers after the object that stood there was marked for removal, in the
 /// directory that `holder` holds: [`Taken::Marked`] where the name is not found (the object is
-/// gone), and the words that say what was read otherwise: an object at the name, or a read that
-/// failed. The mark alone does not show that an object is gone, so no text says so before this read.
-fn read_back(holder: &ffi::Handle, units: &[u16]) -> Result<Taken, String> {
+/// gone), [`Taken::Stays`] where an object is at the name, and [`Taken::Unconfirmed`] where the
+/// read failed, so that nothing says that the object is gone or that it stays. The mark alone does
+/// not show that an object is gone, so no text says so before this read.
+fn read_back(holder: &ffi::Handle, units: &[u16]) -> Taken {
     match DirHandle::open_beneath(holder, units, 0, true, FILE_OPEN) {
         Err(failure)
             if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
         {
-            Ok(Taken::Marked)
+            Taken::Marked
         }
-        Ok(_) => Err("it was marked for removal and is still at its name".to_owned()),
-        Err(failure) => Err(format!(
+        Ok(_) => Taken::Stays("it was marked for removal and is still at its name".to_owned()),
+        Err(failure) => Taken::Unconfirmed(format!(
             "it was marked for removal, but {}, so whether it is gone is not known",
             remedy::platform_error("a read of its name afterwards failed", failure.code)
         )),
@@ -917,8 +918,9 @@ impl MadeObject {
     /// with none of this object's handles open. Returns [`Taken::Marked`] where the mark was set
     /// and a read of the name afterwards answered not found,
     /// [`Taken::NotFound`] where the open answered that the name is not found (nothing was read of
-    /// the object and nothing was done with it), and [`Taken::Stays`] with the platform's refusal,
-    /// or what was found at the name.
+    /// the object and nothing was done with it), [`Taken::Unconfirmed`] where the mark was set and
+    /// the read of the name afterwards failed, and [`Taken::Stays`] with the platform's refusal, or
+    /// what was found at the name.
     fn take_away(self) -> Taken {
         self.take_away_with(false)
     }
@@ -1010,7 +1012,7 @@ impl MadeObject {
                 // is said to be gone only where that read answers not found.
                 drop(at_name);
             }
-            read_back(&holder, &units)
+            Ok(read_back(&holder, &units))
         })();
         // The handle of the open is closed, then the object's own, then the directory's.
         drop((identity, holder));
@@ -1047,9 +1049,11 @@ impl Made {
     /// above it is marked, where this run made that too, and only once the directory is gone. The
     /// caller has closed its own handles of both. Returns what came of the directory and of the
     /// folder: each is [`Taken::NotMade`] where this run did not make it, [`Taken::Marked`] where
-    /// the platform marked it, [`Taken::NotFound`] where its name was not found, and
+    /// the platform marked it, [`Taken::NotFound`] where its name was not found,
+    /// [`Taken::Unconfirmed`] where it was marked and a read of its name afterwards failed, and
     /// [`Taken::Stays`] with the platform's refusal, or what stands at its name (a folder that is
-    /// not tried because the directory in it stays, or was not found, says so).
+    /// not tried because the directory in it stays, was not confirmed gone, or was not found, says
+    /// so).
     fn take_away(self) -> (Taken, Taken) {
         let Made { parent, directory } = self;
         let directory = directory.map_or(Taken::NotMade, MadeObject::take_away);
@@ -1058,9 +1062,9 @@ impl Made {
             // The folder is not tried while the data directory's own removal did not finish. The
             // words give what that removal answered and no more: a directory that holds an entry
             // and another object at the directory's name are different answers.
-            Some(_) if matches!(directory, Taken::Stays(_)) => {
-                let Taken::Stays(why) = &directory else {
-                    unreachable!("the arm matched a directory that stays")
+            Some(_) if matches!(directory, Taken::Stays(_) | Taken::Unconfirmed(_)) => {
+                let (Taken::Stays(why) | Taken::Unconfirmed(why)) = &directory else {
+                    unreachable!("the arm matched a directory that stays or is not confirmed gone")
                 };
                 Taken::Stays(format!(
                     "not tried: the removal of the data directory did not finish ({why})"
@@ -1145,8 +1149,9 @@ struct MadeFile {
 impl MadeFile {
     /// Marks the file for removal through the handle of the call that made it, closes the handle,
     /// and reads the file's name in the directory that `holder` holds. Returns [`Taken::Marked`]
-    /// where the mark was set and the read answered not found, and [`Taken::Stays`] with the
-    /// platform's refusal of the mark, or with what the read answered.
+    /// where the mark was set and the read answered not found, [`Taken::Unconfirmed`] where the
+    /// mark was set and the read failed or none was made, and [`Taken::Stays`] with the platform's
+    /// refusal of the mark, or with what the read answered.
     fn take_away(self, holder: Option<&ffi::Handle>) -> Taken {
         let MadeFile { handle, path } = self;
         if let Err(failure) = super::root::delete(&handle) {
@@ -1161,14 +1166,12 @@ impl MadeFile {
             .map(|name| name.encode_wide().collect())
             .unwrap_or_default();
         let Some(holder) = holder else {
-            return Taken::Stays(
-                "it was marked for removal, and no read of its name was made".to_owned(),
+            return Taken::Unconfirmed(
+                "it was marked for removal, and no read of its name was made, so whether it is gone is not known"
+                    .to_owned(),
             );
         };
-        match read_back(holder, &units) {
-            Ok(taken) => taken,
-            Err(words) => Taken::Stays(words),
-        }
+        read_back(holder, &units)
     }
 }
 
@@ -5420,6 +5423,13 @@ fn remove_program_folder(paths: &Paths, manifest: &Manifest, failures: &mut Vec<
             say(&format!("{shown} stays: {why}"));
             failures.push(format!("removing the folder {shown}: {why}"));
         }
+        Taken::Unconfirmed(why) => {
+            // The mark was set and a read of the name afterwards failed: nothing says that the
+            // folder stays, so the line does not say it.
+            // text: remove_at-39-unconfirmed
+            say(&format!("{shown}: {why}"));
+            failures.push(format!("removing the folder {shown}: {why}"));
+        }
         Taken::NotMade => {}
     }
 }
@@ -5972,6 +5982,13 @@ fn undo_recorded(
             Taken::Stays(why) => {
                 // text: install_remove_at-2
                 say(&format!("removing the program directory failed: {why}"));
+                failures.push(format!("removing the program directory: {why}"));
+            }
+            Taken::Unconfirmed(why) => {
+                // text: install_remove_at-2-unconfirmed
+                say(&format!(
+                    "removing the program directory did not end in a read that found it gone: {why}"
+                ));
                 failures.push(format!("removing the program directory: {why}"));
             }
         }
