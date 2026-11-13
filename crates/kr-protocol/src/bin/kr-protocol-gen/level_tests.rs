@@ -1155,7 +1155,7 @@ fn public(root: bool, privacy: bool, required_privacy: bool) -> Value {
         definitions["HostPrivacyState"] = json!({ "type": "string", "enum": ["on", "off"] });
     }
     definitions["HostInfoResult"] = host;
-    json!({ "$defs": definitions })
+    json!({ "$schema": DIALECT, "$defs": definitions })
 }
 
 /// `SessionSummary.root` is the member of the early 0.76 builds' closed reader: it is reported, and

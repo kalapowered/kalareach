@@ -82,11 +82,12 @@ const METADATA_OBJECT_KEYS: [&str; 6] = [
 
 /// Whether the definition is an open object of its own `properties` and nothing else that composes
 /// or closes it: `type` is `object`, there is no `additionalProperties`, and every key is from
-/// [`METADATA_OBJECT_KEYS`]. Its reader drops a member it does not know, and an open object says
-/// nothing of a value's member that it does not list, so a member added to its `properties`
-/// changes no verdict of the earlier schema on a value that a newer host sends, wherever the
-/// definition is used. A `$ref`, a nullable pair or a list of branches gives a label of the same
-/// form from another list, and a closed object refuses the member.
+/// [`METADATA_OBJECT_KEYS`]. Its reader drops a member it does not know, so a member added to its
+/// `properties` is one that an earlier reader accepts, wherever the object is used as a property,
+/// an item or an `anyOf` or `allOf` branch; where it is used under a `oneOf`, a `not` or an `if`,
+/// the member narrows the object and so can widen the place, which [`accepted`] checks with
+/// [`is_used_only_where_it_widens`]. A `$ref`, a nullable pair or a list of branches gives a label
+/// of the same form from another list, and a closed object refuses the member.
 fn is_a_metadata_object(schema: &Value, definition: &str) -> bool {
     let node = &schema["$defs"][definition];
     node.get("type").and_then(Value::as_str) == Some("object")
@@ -99,7 +100,8 @@ fn is_a_metadata_object(schema: &Value, definition: &str) -> bool {
 }
 
 /// Whether `difference` is one an earlier reader accepts: a definition that is new, or an optional
-/// member that a read-only metadata object of the earlier release did not have.
+/// member that a read-only metadata object of the earlier release did not have, where every use of
+/// the object is one that a narrower object only narrows.
 fn accepted(old: &Value, new: &Value, difference: &Difference) -> bool {
     if difference.kind != DifferenceKind::Added {
         return false;
@@ -128,6 +130,8 @@ fn accepted(old: &Value, new: &Value, difference: &Difference) -> bool {
         && !required
         && is_a_metadata_object(old, definition)
         && is_a_metadata_object(new, definition)
+        && is_used_only_where_it_widens(old, definition)
+        && is_used_only_where_it_widens(new, definition)
 }
 
 /// Every difference between one release's schema and the head's, with every definition a root.
@@ -217,7 +221,7 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
 fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
     // A root that names no dialect is read in whatever dialect the reader defaults to, and an older
     // one has no `const` and ignores what stands beside a `$ref`: the walk reads neither.
-    if schema.get("$schema").is_none() {
+    if schema.get("$schema").and_then(Value::as_str) != Some(DIALECT) {
         return false;
     }
     let Some(definitions) = schema["$defs"].as_object() else {
@@ -248,7 +252,8 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
             .flatten()
             .all(|(keyword, member)| match keyword.as_str() {
                 "$defs" => true,
-                "$schema" => member.as_str() == Some(DIALECT),
+                // The dialect is the walk's own, as checked above.
+                "$schema" => true,
                 _ => widens_at(keyword, member, &reaching, true),
             })
 }
@@ -435,7 +440,9 @@ fn member_added_to_the_configuration_document(difference: &Difference) -> Option
         .filter(|member| !member.contains(['.', '#', '[', '{']))
 }
 
-/// Whether a `$ref` to the definition `name` occurs anywhere in a definition of `schema`.
+/// Whether a `$ref` to the definition `name` occurs anywhere in a definition of `schema` or in a
+/// keyword of its own root. The root's `properties` are not read: they list a member for every
+/// definition of the bundle, so each is referred to there, and a use as a property widens.
 fn is_referred_to(schema: &Value, name: &str) -> bool {
     fn refers(node: &Value, reference: &str) -> bool {
         match node {
@@ -448,11 +455,18 @@ fn is_referred_to(schema: &Value, name: &str) -> bool {
         }
     }
     let reference = format!("#/$defs/{name}");
-    schema["$defs"].as_object().is_some_and(|definitions| {
-        definitions
-            .values()
-            .any(|definition| refers(definition, &reference))
-    })
+    let in_root = schema.as_object().is_some_and(|members| {
+        members.get("$ref").and_then(Value::as_str) == Some(reference.as_str())
+            || members.iter().any(|(keyword, member)| {
+                !matches!(keyword.as_str(), "$defs" | "properties") && refers(member, &reference)
+            })
+    });
+    in_root
+        || schema["$defs"].as_object().is_some_and(|definitions| {
+            definitions
+                .values()
+                .any(|definition| refers(definition, &reference))
+        })
 }
 
 /// Whether `difference` is a new section of the configuration document that an earlier release
@@ -470,9 +484,10 @@ fn is_referred_to(schema: &Value, name: &str) -> bool {
 ///   added member is a key that the earlier schema refused (an open document, a nullable pair or
 ///   a `$ref` with `properties` beside it gives the same label from a list where the member
 ///   restricts a value that the earlier schema accepted);
-/// * no definition of either schema refers to `ConfigurationDocument`, so no answer a host gives
-///   carries the document, and a reference that moved to a copy of it cannot hide the add: only
-///   the file and the registry's copy of it are read by a release that lacks the section.
+/// * no definition of either schema, and no keyword of either root, refers to
+///   `ConfigurationDocument`, so no answer a host gives carries the document, and a reference that
+///   moved to a copy of it cannot hide the add: only the file and the registry's copy of it are
+///   read by a release that lacks the section.
 ///
 /// Anything else about the document is compared as it is for every definition, so a change to an
 /// existing member, a default, `required`, a ceiling or a section the table does not list still

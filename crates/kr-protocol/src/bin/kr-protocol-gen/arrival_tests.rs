@@ -1314,9 +1314,10 @@ fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
                 "X": {},
                 "Name": { "type": "string", "not": { "$ref": "#/$defs/X" } },
                 "id": "#$defs/X",
-                "$ref": "#/$defs/Method",
             }),
-            // The same among the definitions of the schema: a definition that is a text.
+            // The same among the definitions of the schema: a definition that is a text (a text
+            // under another keyword's name, `$ref`, is refused by the cut, as every definition name
+            // that begins with `$` is).
             "a definition that is a text, named like a keyword",
         ),
         (
@@ -1487,10 +1488,32 @@ fn a_listed_member_does_not_arrive_where_a_schema_names_no_dialect() {
     }
 }
 
+/// The place of the schema's own root is `$root`, so a definition with a name that begins with `$`
+/// cannot be told from it and is refused. The schema is a definition `$root` marked as read-only
+/// metadata and a nullable pair at the root: the old pair's closed object refuses `{"note": "x"}`,
+/// the new one accepts it, and the line of the root's member `$root.note added: a member` is the
+/// label of a member of the marked definition.
+#[test]
+fn a_definition_named_like_the_roots_place_is_refused() {
+    let schema = |with_note: bool| {
+        let mut object = json!({ "type": "object", "properties": {},
+            "additionalProperties": false });
+        if with_note {
+            object["properties"]["note"] = json!({ "type": "string" });
+        }
+        json!({ "$schema": DIALECT,
+            "$defs": { "$root": { "type": "object", "properties": {},
+                "x-kalareach-read-only-metadata": true } },
+            "anyOf": [object, { "type": "null" }] })
+    };
+    let outcome = crate::public_contract::compare(&schema(false), &schema(true));
+    assert!(outcome.is_err(), "{outcome:?}");
+}
+
 /// A change of a keyword of the root beside a new method is a difference of its own: the old
-/// schema accepts the texts of `Method` as a whole (its root is a string) and refuses a number; the
-/// new one, whose root is a number, does the reverse. Nothing under `$defs` differs but the method,
-/// so the new method passes and the root's line is the only one.
+/// schema accepts the texts of `Method` as a whole (its root is a string that is also a `Method`);
+/// the new one, whose root is a number that is also a `Method`, accepts no value. Nothing under
+/// `$defs` differs but the method, so the new method passes and the root's line is the only one.
 #[test]
 fn a_change_of_the_roots_type_beside_a_new_method_is_reported() {
     let with_root = |root_type: &str, names: &[&str]| {
@@ -2059,6 +2082,56 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
             "{says}: {lines:?}"
         );
     }
+    // A keyword of the schema's own root that uses the document: in a `oneOf` beside a plain
+    // object, the old root accepts `{"push": {}}` (only the plain object matches) and the new one
+    // refuses it (both match). The root's `properties`, which list every definition of the bundle
+    // and so refer to the document, are no use of it.
+    let with_root = |schema: &Value, keyword: &str, member: Value| {
+        let mut schema = schema.clone();
+        schema[keyword] = member;
+        schema
+    };
+    let document = json!({ "$ref": "#/$defs/ConfigurationDocument" });
+    let (lines, passed) = section_lines(
+        &with_root(
+            &closed(false),
+            "oneOf",
+            json!([document, { "type": "object" }]),
+        ),
+        &with_root(
+            &closed(true),
+            "oneOf",
+            json!([document, { "type": "object" }]),
+        ),
+    );
+    assert_eq!(
+        (lines, passed),
+        (wanted.clone(), vec![]),
+        "a oneOf at the root"
+    );
+    let (lines, passed) = section_lines(
+        &with_root(
+            &closed(false),
+            "$ref",
+            json!("#/$defs/ConfigurationDocument"),
+        ),
+        &with_root(
+            &closed(true),
+            "$ref",
+            json!("#/$defs/ConfigurationDocument"),
+        ),
+    );
+    assert_eq!((lines, passed), (wanted, vec![]), "a reference at the root");
+    let listed = json!({ "configuration_document": document });
+    let (lines, passed) = section_lines(
+        &with_root(&closed(false), "properties", listed.clone()),
+        &with_root(&closed(true), "properties", listed),
+    );
+    assert_eq!(
+        (lines, passed),
+        (vec![], vec!["push".to_owned()]),
+        "the root's properties"
+    );
 }
 
 /// A listed member of the SDK's schema arrives only where every use of its definition widens with
@@ -2104,8 +2177,7 @@ fn a_listed_member_does_not_arrive_where_a_use_of_its_definition_does_not_widen(
 
 /// The uses of a listed member's definition are read in both schemas, each by itself: a use that
 /// does not widen in the earlier schema alone, or in the new schema alone, still keeps the member
-/// from arriving. The definition `Holder` stands in one schema only, so the line about it is
-/// reported too.
+/// from arriving. The definition `Holder` stands in one schema only.
 #[test]
 fn a_listed_member_does_not_arrive_where_one_schema_alone_has_a_use_that_does_not_widen() {
     let (protocol, not_a_route) = (
@@ -2148,10 +2220,12 @@ fn a_listed_member_does_not_arrive_where_one_schema_alone_has_a_use_that_does_no
 }
 
 /// The public contract passes an optional member of a read-only metadata object only where the
-/// line is a member line of an open object of its own properties. A variant whose text holds a dot
-/// and a member of a variant have labels of the same form, so a definition named like their
-/// place must not stand for it; a nullable pair of a closed object and a `$ref` give the label from
-/// another list.
+/// line is a member line of an open object of its own properties and every use of the object is
+/// one that a narrower object only narrows (a property, an item, an `anyOf`): in a `oneOf` beside a
+/// plain object or in a `not`, the member makes the new schema accept a value that the old one
+/// refuses. A variant whose text holds a dot and a member of a variant have labels of the same
+/// form, so a definition named like their place must not stand for it; a nullable pair of a closed
+/// object and a `$ref` give the label from another list.
 #[test]
 fn a_member_of_a_read_only_metadata_object_passes_only_in_an_open_plain_object() {
     let marker = "x-kalareach-read-only-metadata";
@@ -2163,44 +2237,81 @@ fn a_member_of_a_read_only_metadata_object_passes_only_in_an_open_plain_object()
         }
         definition
     };
-    let schema = |definition: &Value| json!({ "$defs": { "Info": definition.clone() } });
+    let schema =
+        |definition: &Value| json!({ "$schema": DIALECT, "$defs": { "Info": definition.clone() } });
     let passes = crate::public_contract::compare(&schema(&object(false)), &schema(&object(true)));
     assert_eq!(passes, Ok(vec![]));
-    // Used beside a plain object in a `oneOf`, the open object's verdict on a value that a newer
-    // host sends is the earlier schema's, so the member still passes.
-    let used = |definition: &Value| {
-        json!({ "$defs": { "Info": definition.clone(),
-            "Holder": { "oneOf": [{ "$ref": "#/$defs/Info" }, { "type": "object" }] } } })
+    let info = json!({ "$ref": "#/$defs/Info" });
+    let used = |definition: &Value, holder: Option<&Value>| {
+        let mut schema = json!({ "$schema": DIALECT, "$defs": { "Info": definition.clone() } });
+        if let Some(holder) = holder {
+            schema["$defs"]["Holder"] = holder.clone();
+        }
+        schema
     };
+    // Where the object is used as a property, a wider object only widens the place, so the member
+    // passes.
+    let property = json!({ "type": "object", "properties": { "info": info.clone() } });
     assert_eq!(
-        crate::public_contract::compare(&used(&object(false)), &used(&object(true))),
+        crate::public_contract::compare(
+            &used(&object(false), Some(&property)),
+            &used(&object(true), Some(&property))
+        ),
         Ok(vec![])
     );
+    // A member narrows the object: the value `{"id": "x", "note": 5}` matches the open object, so a
+    // `Holder` that is a `oneOf` of it and a plain object refuses it in the old schema (both
+    // branches match) and accepts it in the new one (the plain object alone matches), and a `Holder`
+    // that is a `not` of it accepts the value in the new schema and refuses it in the old one.
+    for (holder, says) in [
+        (
+            json!({ "oneOf": [info.clone(), { "type": "object" }] }),
+            "a oneOf beside a plain object",
+        ),
+        (json!({ "not": info }), "a not"),
+    ] {
+        // The `Holder` stands in both schemas, in the earlier one only or in the new one only.
+        for (old_holder, new_holder, where_) in [
+            (Some(&holder), Some(&holder), "both"),
+            (Some(&holder), None, "the earlier only"),
+            (None, Some(&holder), "the new only"),
+        ] {
+            let lines = crate::public_contract::compare(
+                &used(&object(false), old_holder),
+                &used(&object(true), new_holder),
+            )
+            .expect("compares");
+            assert!(
+                lines.contains(&"Info.note added: a member".to_owned()),
+                "{says}, in {where_}: {lines:?}"
+            );
+        }
+    }
     let rows = [
         (
             // A new method whose name has a dot is the line `Method#const:a.b added: a variant`.
-            json!({ "$defs": { "Method": { "oneOf": [{ "const": "a", "type": "string" }] },
+            json!({ "$schema": DIALECT, "$defs": { "Method": { "oneOf": [{ "const": "a", "type": "string" }] },
                 "Method#const:a": object(false) } }),
-            json!({ "$defs": { "Method": { "oneOf": [{ "const": "a", "type": "string" },
+            json!({ "$schema": DIALECT, "$defs": { "Method": { "oneOf": [{ "const": "a", "type": "string" },
                 { "const": "a.b", "type": "string" }] }, "Method#const:a": object(false) } }),
             "Method#const:a.b added: a variant",
         ),
         (
             // A member of a variant is the line `Choice#tag:kind=x.note added: a member`.
-            json!({ "$defs": { "Choice": { "oneOf": [{ "type": "object",
+            json!({ "$schema": DIALECT, "$defs": { "Choice": { "oneOf": [{ "type": "object",
                 "properties": { "kind": { "const": "x" } } }] },
                 "Choice#tag:kind=x": object(false) } }),
-            json!({ "$defs": { "Choice": { "oneOf": [{ "type": "object",
+            json!({ "$schema": DIALECT, "$defs": { "Choice": { "oneOf": [{ "type": "object",
                 "properties": { "kind": { "const": "x" }, "note": { "type": "string" } } }] },
                 "Choice#tag:kind=x": object(false) } }),
             "Choice#tag:kind=x.note added: a member",
         ),
         (
             // A closed object in a nullable pair, marked at the top: the old schema refuses `note`.
-            json!({ "$defs": { "Info": { marker: true, "anyOf": [{ "type": "object",
+            json!({ "$schema": DIALECT, "$defs": { "Info": { marker: true, "anyOf": [{ "type": "object",
                 "properties": { "id": { "type": "string" } }, "additionalProperties": false },
                 { "type": "null" }] } } }),
-            json!({ "$defs": { "Info": { marker: true, "anyOf": [{ "type": "object",
+            json!({ "$schema": DIALECT, "$defs": { "Info": { marker: true, "anyOf": [{ "type": "object",
                 "properties": { "id": { "type": "string" }, "note": { "type": "string" } },
                 "additionalProperties": false }, { "type": "null" }] } } }),
             "Info.note added: a member",

@@ -38,10 +38,14 @@ pub enum SurfaceError {
     /// The text is not a surface document.
     #[error("not a surface document: {0}")]
     NotASurface(String),
+    /// A definition has a name that begins with `$`, which the place of the schema's own root
+    /// takes.
+    #[error("{0} is a definition name that begins with $, which names the schema's own root")]
+    ReservedName(String),
 }
 
-/// The place of the schema's own root in a [`Difference`]: no definition has a name that begins
-/// with `$`.
+/// The place of the schema's own root in a [`Difference`]. No definition has a name that begins
+/// with `$`: [`Surface::cut`] refuses one.
 const ROOT_PLACE: &str = "$root";
 
 /// The definitions reachable from some roots in a generated schema, and the keywords of the
@@ -50,14 +54,18 @@ const ROOT_PLACE: &str = "$root";
 /// A validator applies the keywords of a schema's root (`type`, `$schema`, `not`, a `$ref`) to every
 /// document, so a surface that is cut from a schema holds them beside the definitions, and
 /// [`differences`] compares them: a change of the root's `type` alone is a difference. Two things
-/// of the root are left out: its annotations, as everywhere, and its `properties`, which name the
-/// bundle's definitions that the cut reads by name. A surface that is read from a recorded document
-/// holds no root keywords (the document records none), and compares none.
+/// of the root are left out: its annotations, as everywhere, and its `properties`, which hold one
+/// member for every definition of the bundle (nearly all of them a reference), so that the cut
+/// reads the definitions by name and a member that moves to another definition is not seen. A
+/// reference of the root is compared where its target is a definition of the surface, and does not
+/// add its target to it. A surface that is read from a recorded document holds no root keywords
+/// (the document records none), and compares none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
     roots: Vec<String>,
     definitions: BTreeMap<String, Value>,
-    /// The root's keywords that decide something, as an object; `None` for a recorded document.
+    /// The root's keywords other than its annotations and `properties`, as an object; `None` for a
+    /// recorded document.
     root: Option<Value>,
 }
 
@@ -66,8 +74,9 @@ impl Surface {
     ///
     /// # Errors
     ///
-    /// Returns [`SurfaceError::UnknownRoot`] for a root the bundle lacks, and
-    /// [`SurfaceError::BadReference`] for a reference that is not to one of its definitions.
+    /// Returns [`SurfaceError::UnknownRoot`] for a root the bundle lacks,
+    /// [`SurfaceError::BadReference`] for a reference that is not to one of its definitions, and
+    /// [`SurfaceError::ReservedName`] for a definition it reaches with a name that begins with `$`.
     pub fn cut(schema: &Value, roots: &[&str]) -> Result<Self, SurfaceError> {
         let all = schema
             .get("$defs")
@@ -81,13 +90,12 @@ impl Surface {
             }
             todo.push((*root).to_owned());
         }
-        let own = own_keywords(schema);
-        for reference in references(&own) {
-            todo.push(reference_name(&reference)?);
-        }
         while let Some(name) = todo.pop() {
             if definitions.contains_key(&name) {
                 continue;
+            }
+            if name.starts_with('$') {
+                return Err(SurfaceError::ReservedName(name));
             }
             let definition = all
                 .get(&name)
@@ -103,7 +111,7 @@ impl Surface {
         Ok(Self {
             roots,
             definitions,
-            root: Some(own),
+            root: Some(own_keywords(schema)),
         })
     }
 
@@ -257,8 +265,8 @@ fn strip(node: &Value, names: bool) -> Value {
     }
 }
 
-/// The keywords of a schema's own root that decide something: all of them but `$defs`, `properties`
-/// and the annotations.
+/// The keywords of a schema's own root that [`Surface`] holds: all of them but `$defs`,
+/// `properties` and the annotations.
 fn own_keywords(schema: &Value) -> Value {
     let mut own = serde_json::Map::new();
     for (keyword, member) in schema.as_object().into_iter().flatten() {
