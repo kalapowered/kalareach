@@ -220,10 +220,17 @@ impl Manifest {
     ///
     /// Returns [`StoreError::Io`] when the file cannot be written.
     pub fn save_beside(&self, path: &Path, beside: &Beside) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|error| StoreError::Unreadable(error.to_string()))?;
-        replace(beside, path, &bytes)?;
+        replace(beside, path, &self.to_bytes()?)?;
         Ok(())
+    }
+
+    /// The bytes that [`Manifest::save_beside`] writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Unreadable`] when the manifest cannot be serialized.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        serde_json::to_vec_pretty(self).map_err(|error| StoreError::Unreadable(error.to_string()))
     }
 
     /// Writes the manifest, replacing the file whole, for a caller that holds no handle of the
@@ -386,7 +393,7 @@ fn replace(beside: &Beside, path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// The name a file's replacement is written under: the file's stem, 32 random hexadecimal digits
 /// and `.new`, beside the file.
-fn replacement_name(path: &Path) -> PathBuf {
+pub(crate) fn replacement_name(path: &Path) -> PathBuf {
     let stem = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -406,7 +413,9 @@ fn replacement_name(path: &Path) -> PathBuf {
 /// the name; where a read after the rename failed, the record stays at its name.
 #[cfg(windows)]
 fn replace_through(beside: &Beside, path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
-    crate::win::fresh::replace_whole(beside, path, staging, bytes)
+    // No run holds the replacement here: the call that does not hold it is for callers that write a
+    // record with nothing to roll back from it.
+    crate::win::fresh::replace_whole(beside, path, staging, bytes, &|_| {}).map(drop)
 }
 
 /// [`replace_through`] for the other systems: they have no handle that renames or marks a file by
