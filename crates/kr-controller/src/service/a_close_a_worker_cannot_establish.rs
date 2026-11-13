@@ -37,6 +37,7 @@ async fn a_worker_that_cannot_say_what_became_of_a_close_is_reported_as_unknown(
             carried,
         )
         .await
+        .into_answer_for_test()
         .expect_err("a worker that cannot say what became of the close gives no closure");
     assert_eq!(
         error.code(),

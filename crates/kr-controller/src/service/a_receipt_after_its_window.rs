@@ -268,6 +268,7 @@ async fn at_the_local_door(
             controller.admitted_revision(connection_id).ok(),
         )
         .await
+        .into_answer_for_test()
 }
 
 /// KR-REQ-09.09, the local door's attention route: a copy whose window passed after the door's own

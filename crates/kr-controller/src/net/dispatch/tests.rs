@@ -334,7 +334,8 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
             Some(world.accepted),
             carried,
         )
-        .await;
+        .await
+        .into_answer_for_test();
 
     // Every voice effect. What reaches the worker from here on is the voice module's.
     let before_voice = recorded

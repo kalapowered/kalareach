@@ -24,8 +24,10 @@ use kr_protocol::scalars::{CanonicalSet, U64};
 use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 use super::admission::remaining_deadline;
+use super::close::Ended;
 use super::routes::local_actor;
 use super::{Controller, parse};
 
@@ -62,6 +64,9 @@ impl Controller {
     /// Returns the refusal the worker gave, under its own code, the refusal the record met, that
     /// the session closed where its closure is recorded, an unknown session, or `OUTCOME_UNKNOWN`
     /// when the worker did not answer in time.
+    ///
+    /// The whole answer is a copy: the worker keeps its own receipts and the daemon cannot tell its
+    /// first answer from one it gave before. The door tells it under the check a copy is owed.
     pub(super) async fn local_prompt(
         self: &Arc<Self>,
         actor_id: &kr_protocol::ids::ActorId,
@@ -69,8 +74,11 @@ impl Controller {
         connection_id: ConnectionId,
         accepted: Option<AcceptedDeadline>,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
-        let params: kr_protocol::agent::AgentPromptParams = parse(&mutation.params)?;
+    ) -> Given<Result<ParamsValue>> {
+        let params: kr_protocol::agent::AgentPromptParams = match parse(&mutation.params) {
+            Ok(params) => params,
+            Err(error) => return Given::copied(Err(error)),
+        };
         let session_id = params.target.subject.session_id;
         match self
             .prompt_the_worker(
@@ -86,12 +94,11 @@ impl Controller {
             // Wherever the daemon finds no worker for the session, at the look before the prompt
             // is sent or at the check taking the link makes, a session whose closure is recorded
             // is closed, and the record is what says so.
-            Err(error @ ControllerError::UnknownSession { .. }) => Err(self
-                .closed_or(session_id, error)
-                .await
-                .copied()
-                .into_answer()),
-            answered => answered,
+            Err(Ended::Plain(error @ ControllerError::UnknownSession { .. })) => {
+                self.closed_or(session_id, error).await.copied().map(Err)
+            }
+            Ok(answer) => Given::copied(Ok(answer)),
+            Err(ended) => ended.given(),
         }
     }
 
@@ -105,7 +112,7 @@ impl Controller {
         connection_id: ConnectionId,
         accepted: Option<AcceptedDeadline>,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
+    ) -> std::result::Result<ParamsValue, Ended> {
         // A worker that did not answer when this daemon started is not gone; it was busy, or it
         // started slowly. A session the registry lists whose worker the directory does not hold is
         // looked for again before the prompt is refused as for a session nobody holds, as a read
@@ -130,18 +137,14 @@ impl Controller {
         // Nothing has been sent until the prompt is forwarded, so a prompt that finds no link to
         // take, whether it waited too long, the worker is gone or its session is, has not reached
         // the worker. If the session's closure was recorded meanwhile, the record is the answer.
-        let mut link = match tokio::time::timeout_at(budget, self.worker_client(&worker)).await {
+        let link = match tokio::time::timeout_at(budget, self.worker_client(&worker)).await {
             Ok(Ok(link)) => link,
             Ok(Err(error)) => {
-                return Err(self
-                    .closed_or(session_id, error)
-                    .await
-                    .copied()
-                    .into_answer());
+                return Err(Ended::Refusal(self.closed_or(session_id, error).await));
             }
             Err(_) => {
-                return Err(self
-                    .closed_or(
+                return Err(Ended::Refusal(
+                    self.closed_or(
                         session_id,
                         ControllerError::Uncertain {
                             detail: "the connection to the worker that owns this session did \
@@ -150,11 +153,42 @@ impl Controller {
                                 .to_owned(),
                         },
                     )
-                    .await
-                    .copied()
-                    .into_answer());
+                    .await,
+                ));
             }
         };
+        self.prompt_over_the_link(
+            link,
+            budget,
+            session_id,
+            actor_id,
+            mutation,
+            connection_id,
+            accepted,
+            carried,
+        )
+        .await
+        .map_err(Ended::Plain)
+    }
+
+    /// The exchange with the worker once the link to it is held: the admission, the draft the
+    /// prompt names, and the prompt itself. Whatever goes wrong here is this route's own error.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exchange is the link and its budget, the session and the caller, the request \
+                  and the connection it arrived on, and the admission it carries"
+    )]
+    async fn prompt_over_the_link(
+        self: &Arc<Self>,
+        mut link: super::workers::WorkerLink,
+        budget: tokio::time::Instant,
+        session_id: kr_protocol::ids::SessionId,
+        actor_id: &kr_protocol::ids::ActorId,
+        mutation: &MutationRequest,
+        connection_id: ConnectionId,
+        accepted: Option<AcceptedDeadline>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
         let actor = local_actor(actor_id.clone(), connection_id, self.generation);
         // The admission is asked once the link is held, because holding it is where the wait was.
         // A deadline that ran out while this prompt queued is refused, and nothing is recorded or

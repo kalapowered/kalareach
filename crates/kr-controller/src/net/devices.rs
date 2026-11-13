@@ -2112,7 +2112,7 @@ mod tests {
                 || Ok(()),
                 TimestampMs::new(1_764_003_800_000),
             )
-            .map(Given::into_answer)
+            .map(Given::into_answer_for_test)
     }
 
     fn an_earlier_device(directory: &DeviceDirectory, byte: u8) -> DeviceRecord {

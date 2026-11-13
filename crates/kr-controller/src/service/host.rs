@@ -83,7 +83,7 @@ impl Controller {
         // the agent's files is read. The authority itself is asked where an answer the host
         // holds goes back and where the dispatch marker is written, below.
         if let Err(refusal) = self.authorised(carried.connection_id) {
-            return Given::fresh(Err(refusal));
+            return Given::fresh(Err(refusal.into()));
         }
         // What the host holds of the action goes back only under the authority this attempt
         // arrived under, asked with it in hand. That is a result, the conflict a reused identifier
