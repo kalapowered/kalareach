@@ -1570,6 +1570,8 @@ mod the_end_of_a_write_is_told_under_its_authority;
 /// What the local door tells of a copy when a barrier restamps the registration after the
 /// route's own check.
 #[cfg(test)]
+mod a_close_that_meets_a_fence_after_the_route_answers;
+#[cfg(test)]
 mod a_copy_meets_a_restamp;
 
 /// A local connection whose peer stops reading.
