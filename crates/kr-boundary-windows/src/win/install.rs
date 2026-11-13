@@ -219,6 +219,20 @@ fn make_after(run: &Run, step: &str) -> Result<(), Error> {
     })
 }
 
+/// Ends the process at once, as a program that was killed, where `KR_BOUNDARY_DIE_AT` names the
+/// point: `account` right after the call that made the first account returned and before its
+/// result is recorded, `service` likewise for the service. What a killed run leaves is an intent
+/// with no result. The test build only.
+#[cfg(feature = "testing")]
+fn die_at(point: &str) {
+    if std::env::var("KR_BOUNDARY_DIE_AT").as_deref() == Ok(point) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(feature = "testing"))]
+fn die_at(_point: &str) {}
+
 /// Damages the manifest through the run's handle of the data directory, as `how` says: `garbage`
 /// or `absent`.
 #[cfg(feature = "testing")]
@@ -4336,6 +4350,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             _ => {
                 run.record(ObjectKind::Account, name, None)?;
                 account::add(name)?;
+                die_at("account");
                 run.conclude(ObjectKind::Account, name, Outcome::Made)?;
                 account::sid_of(name)?
             }
@@ -4383,6 +4398,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
                 DISPLAY,
                 &paths.program.join(BROKER).display().to_string(),
             )?;
+            die_at("service");
             run.conclude(ObjectKind::Service, SERVICE, Outcome::Made)?;
             made
         }
@@ -4403,8 +4419,13 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         APPID,
         Some(&format!("start={AUTOMATIC}")),
     )?;
+    // The result follows the step: `made` where this run's call set the start type, `found` where it
+    // was automatic already and this run set nothing.
     if appid_start != AUTOMATIC {
         Identity(&appid).set_automatic()?;
+        run.conclude(ObjectKind::AppIdentity, APPID, Outcome::Made)?;
+    } else {
+        run.conclude(ObjectKind::AppIdentity, APPID, Outcome::Found)?;
     }
     let git = run
         .manifest
@@ -4451,16 +4472,23 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
 
     // The policy, and the platform's next event that says it applied it.
     let wanted = Policy::installed(&sids[0].to_text()?, &sids[1].to_text()?);
-    for id in [
+    let rules = [
         policy::RULE_ALLOW_ALL,
         policy::RULE_CHECKOUT,
         policy::RULE_CONNECT,
-    ] {
+    ];
+    for id in rules {
         run.record(ObjectKind::PolicyRule, id, None)?;
     }
     // The log's newest record is read by the process that writes the policy, right before it writes,
     // and comes back with the write's answer: an event after that number came after the write began.
     let before_write = channel.set(&wanted.render())?;
+    // The write answered: the rules are this run's, and the rollback may take them out.
+    for id in rules {
+        run.manifest
+            .conclude(ObjectKind::PolicyRule, id, Outcome::Made);
+    }
+    run.save()?;
     note_call(&format!("policy written after record {before_write}"));
     // text: lay_down-16
     say("the policy is written");
@@ -4905,6 +4933,64 @@ fn roll_back(run: &mut Run) -> Result<(), Error> {
     )
 }
 
+/// What the installation's mark is on an account, for the words of the removal: the comment that
+/// the installation gives its accounts when it makes them.
+const ACCOUNT_MARK: &str = "the comment that the installation gives its accounts";
+
+/// What the installation's mark is on the service, for the words of the removal: the program that
+/// the installation gives the service when it makes it.
+const SERVICE_MARK: &str = "its program is the broker's file in the program directory";
+
+/// Reads an account that the manifest records as an intent with no result: whether an account of
+/// that name is there (a lookup of the name), and whether it carries the comment that the
+/// installation gives its accounts when it makes them (the enumeration that the entry reads, one
+/// call of `NetUserEnum` at level 1, which gives each account's name and comment).
+fn read_account_intent(name: &str) -> remedy::IntentRead {
+    match account::find(name) {
+        Err(error) => {
+            remedy::IntentRead::Failed(format!("the lookup of the account failed: {error}"))
+        }
+        Ok(None) => remedy::IntentRead::NotThere,
+        Ok(Some(_)) => match account::carrying_the_installation_comment() {
+            Err(error) => remedy::IntentRead::Failed(format!(
+                "the enumeration of the accounts that carry the installation's comment failed: {error}"
+            )),
+            Ok(names) if names.iter().any(|named| named.eq_ignore_ascii_case(name)) => {
+                remedy::IntentRead::Marked
+            }
+            Ok(_) => remedy::IntentRead::Unmarked,
+        },
+    }
+}
+
+/// Reads the service that the manifest records as an intent with no result: whether a service of
+/// that name is there (the service manager's open of the name), and whether its program is the
+/// broker's file in the program directory (`QueryServiceConfig`, which gives the program path that
+/// the installation wrote when it made the service, in quotation marks).
+fn read_service_intent(manager: &service::Manager, paths: &Paths) -> remedy::IntentRead {
+    let service = match manager.open(SERVICE) {
+        Err(error) => {
+            return remedy::IntentRead::Failed(format!("the open of the service failed: {error}"));
+        }
+        Ok(None) => return remedy::IntentRead::NotThere,
+        Ok(Some(service)) => service,
+    };
+    match service.configuration() {
+        Err(error) => remedy::IntentRead::Failed(format!(
+            "the read of the service's configuration failed: {error}"
+        )),
+        Ok((_, program))
+            if remedy::service_program_is(
+                &program,
+                &paths.program.join(BROKER).display().to_string(),
+            ) =>
+        {
+            remedy::IntentRead::Marked
+        }
+        Ok(_) => remedy::IntentRead::Unmarked,
+    }
+}
+
 /// The removal's steps for the objects that `manifest` records, after an inspection approved what is
 /// in the data directory: the broker held in maintenance, the policy put back, the Application
 /// Identity service's start type, the release proved through the broker, the service, the accounts,
@@ -4956,9 +5042,29 @@ fn undo_recorded(
     // the removal on what a run made or found. An object that is on record as an intent with no
     // result is not acted on, and a line says so.
     let rollback = tree.is_rollback();
-    let service_is_ours = manifest
-        .find(ObjectKind::Service, SERVICE)
-        .is_some_and(|object| object.acted_on_by(rollback));
+    // The removal decides about an intent with no result (a run that died) by a read of the object,
+    // and not by the absence of the result; a rollback has the results of its own run and acts on
+    // them alone.
+    let service_is_ours = match manifest.find(ObjectKind::Service, SERVICE) {
+        Some(object) if object.acted_on_by(rollback) => true,
+        Some(object) if !rollback && object.outcome.is_none() => {
+            let read = read_service_intent(&manager, paths);
+            // text: remove_at-33-service
+            say(&remedy::intent_words(
+                "the service",
+                SERVICE,
+                SERVICE_MARK,
+                &read,
+            ));
+            if let remedy::IntentRead::Failed(why) = &read {
+                failures.push(format!(
+                    "reading the service, which the manifest records as an intent with no result: {why}"
+                ));
+            }
+            read.act() == remedy::IntentAct::Remove
+        }
+        _ => false,
+    };
     // (1) the broker stays up and refuses new invocations.
     let mut session = None;
     if service_is_ours && let Some(service) = manager.open(SERVICE)? {
@@ -5001,7 +5107,15 @@ fn undo_recorded(
     }
 
     // (2) the policy: our rules go; a rule that the installation did not make keeps the allow-all rule beside it.
-    let has_rules = manifest.of_kind(ObjectKind::PolicyRule).next().is_some();
+    // A rollback takes out the rules that its own write is on record for; the removal takes out the
+    // rules that the manifest lists.
+    let has_rules = manifest
+        .of_kind(ObjectKind::PolicyRule)
+        .any(|object| !rollback || object.acted_on_by(true));
+    if rollback && !has_rules && manifest.of_kind(ObjectKind::PolicyRule).next().is_some() {
+        // text: remove_at-34-policy
+        say(&remedy::rollback_not_changed("the policy"));
+    }
     if has_rules {
         keep(
             (|| -> Result<(), Error> {
@@ -5114,7 +5228,18 @@ fn undo_recorded(
     }
 
     // (3) the Application Identity service's start type goes back only where it is still ours.
-    if let (Some(object), Some(prior)) = (manifest.find(ObjectKind::AppIdentity, APPID), &prior) {
+    if rollback
+        && let Some(object) = manifest.find(ObjectKind::AppIdentity, APPID)
+        && !object.acted_on_by(true)
+    {
+        // text: remove_at-34-start
+        say(&remedy::rollback_not_changed(
+            "the Application Identity service's start type",
+        ));
+    }
+    if let (Some(object), Some(prior)) = (manifest.find(ObjectKind::AppIdentity, APPID), &prior)
+        && (!rollback || object.acted_on_by(true))
+    {
         keep(
             (|| -> Result<(), Error> {
                 let appid = manager.open(APPID)?.ok_or_else(|| {
@@ -5220,16 +5345,12 @@ fn undo_recorded(
     }
     // The service goes only where a result shows that a run made it, or, for the removal, found and
     // used it: a service that this run did not make is not deleted.
-    if let Some(object) = manifest.find(ObjectKind::Service, SERVICE)
+    if rollback
         && !service_is_ours
+        && let Some(object) = manifest.find(ObjectKind::Service, SERVICE)
     {
         // text: remove_at-29-service
-        say(&remedy::left_alone(
-            "the service",
-            SERVICE,
-            object.outcome,
-            rollback,
-        ));
+        say(&remedy::left_alone("the service", SERVICE, object.outcome));
     }
     keep(
         (|| -> Result<(), Error> {
@@ -5265,14 +5386,24 @@ fn undo_recorded(
         let recorded = object.detail.clone();
         // An account whose create failed, or whose create no result shows, is not touched: not its
         // rights, not its profile, not its sign-in entry, not the account.
-        if !object.acted_on_by(rollback) {
+        let acts = if object.acted_on_by(rollback) {
+            true
+        } else if rollback {
             // text: remove_at-29-account
-            say(&remedy::left_alone(
-                "account",
-                &name,
-                object.outcome,
-                rollback,
-            ));
+            say(&remedy::left_alone("account", &name, object.outcome));
+            false
+        } else {
+            let read = read_account_intent(&name);
+            // text: remove_at-33-account
+            say(&remedy::intent_words("account", &name, ACCOUNT_MARK, &read));
+            if let remedy::IntentRead::Failed(why) = &read {
+                failures.push(format!(
+                    "reading account {name}, which the manifest records as an intent with no result: {why}"
+                ));
+            }
+            read.act() == remedy::IntentAct::Remove
+        };
+        if !acts {
             continue;
         }
         keep(
