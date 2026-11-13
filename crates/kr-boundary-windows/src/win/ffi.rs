@@ -106,6 +106,61 @@ pub enum KnownFolder {
     ProgramData,
 }
 
+impl KnownFolder {
+    /// The folder's name as a person reads it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            KnownFolder::ProgramFiles => "Program Files",
+            KnownFolder::ProgramData => "ProgramData",
+        }
+    }
+}
+
+/// A known folder that the shell could not give: which one, and the platform's answer.
+#[derive(Debug, thiserror::Error)]
+#[error("reading the system's {} folder: {}", .folder.name(), system_form(*.status))]
+pub struct KnownFolderError {
+    /// The folder.
+    pub folder: KnownFolder,
+    /// The platform's answer, an `HRESULT`.
+    pub status: u32,
+}
+
+/// A platform error in the system's own form: its code in hexadecimal and, where the system has a
+/// message for it, the message. An `HRESULT` that wraps a Windows error is looked up by that error.
+#[must_use]
+pub fn system_form(code: u32) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
+    };
+    let number = if code >> 16 == 0x8007 {
+        code & 0xFFFF
+    } else {
+        code
+    };
+    let mut buffer = [0_u16; 512];
+    // SAFETY: the buffer's length is passed; the call takes no source and no inserts.
+    let length = unsafe {
+        FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            null(),
+            number,
+            0,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            null(),
+        )
+    } as usize;
+    let message = String::from_utf16_lossy(&buffer[..length.min(buffer.len())]);
+    let message = message.trim();
+    if message.is_empty() {
+        format!("0x{code:08X}")
+    } else {
+        format!("0x{code:08X} ({message})")
+    }
+}
+
 /// A system folder as the shell's own call gives it. It is never read from the environment: an
 /// unelevated session of the same account can set its own variables, and the installation runs
 /// elevated and lays programs down that the system runs.
@@ -113,7 +168,9 @@ pub enum KnownFolder {
 /// # Errors
 ///
 /// Returns the platform's error when the folder cannot be read.
-pub fn known_folder(which: KnownFolder) -> Result<std::path::PathBuf> {
+pub fn known_folder(
+    which: KnownFolder,
+) -> std::result::Result<std::path::PathBuf, KnownFolderError> {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{
         FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
@@ -129,13 +186,10 @@ pub fn known_folder(which: KnownFolder) -> Result<std::path::PathBuf> {
     if status < 0 || text.is_null() {
         // SAFETY: frees what the call allocated, if it did.
         unsafe { CoTaskMemFree(text.cast()) };
-        return Err(error(
-            status as u32,
-            match which {
-                KnownFolder::ProgramFiles => "reading the system's Program Files folder",
-                KnownFolder::ProgramData => "reading the system's ProgramData folder",
-            },
-        ));
+        return Err(KnownFolderError {
+            folder: which,
+            status: status as u32,
+        });
     }
     // SAFETY: the answer is a NUL-terminated string that the call allocated.
     let length = unsafe { (0..).take_while(|&at| *text.add(at) != 0).count() };

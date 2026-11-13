@@ -184,7 +184,7 @@ fn instructions_in(text: &str) -> Vec<&'static str> {
     found
 }
 
-/// The net behind the type: it catches each phrase that the two reviews named, and not a sentence
+/// The net behind the type: it catches each of these instruction phrases, and not a sentence
 /// that only says what a folder's owner could do.
 #[test]
 fn the_net_of_forbidden_words_catches_each_instruction_to_change_a_shared_folder() {
@@ -1142,7 +1142,7 @@ fn a_known_folder_that_is_not_its_own_final_path_is_refused_with_what_it_leads_t
     }
 }
 
-/// The Codex pair: the system gave `C:\SHARED~1` for ProgramData, the short name of `C:\Shared Data`,
+/// A short name for ProgramData: the system gave `C:\SHARED~1` for ProgramData, the short name of `C:\Shared Data`,
 /// and `C:\Shared Data\KalaReach` for Program Files. The data walk would read that folder as the
 /// installation's own and tell the administrator to remove or rename it: the shape check ends the run
 /// first, with no instruction.
@@ -1166,7 +1166,7 @@ fn a_short_name_for_a_known_folder_never_makes_the_other_known_folder_the_instal
     assert!(!text.contains("remove or rename"), "{text}");
 }
 
-/// The Claude pair, a junction: Program Files' path is `C:\PF`, which leads to the data tree's own
+/// A junction: Program Files' path is `C:\PF`, which leads to the data tree's own
 /// folder. The known folder is refused for where it leads, so the data walk never reads
 /// `C:\ProgramData\KalaReach` as the installation's own folder under a shared known folder.
 #[test]
@@ -1359,28 +1359,37 @@ fn the_shape_refusal_says_what_the_run_changed() {
     }
 }
 
-/// The setup program's line for a known folder that cannot be read says the error and that nothing
-/// was changed, and at a removal the limit that it has. It names no removal by hand.
+/// The setup program's line for a known folder that cannot be read names the folder, prints the
+/// platform's error in the system's own form (its code in hexadecimal and its message), says that
+/// nothing was changed, and at a removal says the limit that it has: if the boundary is installed
+/// its service, its accounts and its rules stay, and if that folder's volume is gone for good the
+/// setup program cannot remove them. It names no removal by hand.
 #[test]
-fn the_line_for_a_known_folder_that_cannot_be_read_says_the_limit_of_a_removal() {
-    let error = "reading the system's Program Files folder: Windows error 3";
-    let setup = known_folder_unreadable(error, false);
-    assert!(setup.contains(error), "{setup}");
-    assert!(setup.contains("Nothing was changed."), "{setup}");
-    assert!(!setup.contains("manifest"), "{setup}");
-    assert!(setup.ends_with(CLOSING), "{setup}");
-    let removal = known_folder_unreadable(error, true);
+fn the_line_for_a_known_folder_that_cannot_be_read_names_the_folder_and_the_error() {
+    let status = "0x80070003 (The system cannot find the path specified.)";
+    let setup = known_folder_unreadable("ProgramData", status, false);
+    assert_eq!(
+        setup,
+        format!(
+            "The system's ProgramData folder could not be read: {status}. Nothing was changed. {CLOSING}"
+        )
+    );
+    let removal = known_folder_unreadable("Program Files", status, true);
     for part in [
-        error,
-        "Nothing was changed.",
+        "The system's Program Files folder could not be read: 0x80070003 (The system cannot find the path specified.). Nothing was changed.",
         "reads what to remove from the manifest in the data directory",
         "checks the program directory before it deletes anything",
         "cannot go on while that folder cannot be read",
-        "The broker's service, its two accounts and its rules in the policy stay.",
-        "If the volume is gone for good, the setup program cannot remove them.",
+        "If the boundary is installed, the broker's service, its two accounts and its rules in the policy stay.",
+        "If the volume of the Program Files folder is gone for good, the setup program cannot remove them.",
     ] {
         assert!(removal.contains(part), "{part}: {removal}");
     }
+    // What stays is said only on a condition, and that comes before it.
+    let installed = removal.find("If the boundary is installed").expect("said");
+    let stays = removal.find("rules in the policy stay").expect("said");
+    assert!(installed < stays, "{removal}");
+    assert!(!removal.contains("the volume is gone"), "{removal}");
     assert!(removal.ends_with(CLOSING), "{removal}");
     // No removal by hand: the policy's rules are shared with other programs.
     for by_hand in [

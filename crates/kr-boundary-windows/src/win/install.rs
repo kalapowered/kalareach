@@ -115,6 +115,9 @@ pub enum Error {
     /// A call into the platform failed.
     #[error(transparent)]
     Win(#[from] ffi::Error),
+    /// A known folder of the system could not be read.
+    #[error(transparent)]
+    KnownFolder(#[from] ffi::KnownFolderError),
     /// A record could not be read or written.
     #[error(transparent)]
     Store(#[from] StoreError),
