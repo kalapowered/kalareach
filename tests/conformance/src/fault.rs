@@ -19,7 +19,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -44,11 +44,13 @@ const CODE_SIGNATURE: u32 = 0x1d;
 /// load commands of any program the build makes.
 const HEAD_BYTES: usize = 65_536;
 
-/// How much time, in all, the report spends on the second runs of steps. A step whose first run
-/// took longer than what is left is not run again: the report's own limit would end the run
-/// before it wrote its result, and a run that ends red with its result is better than one that
-/// ends with none.
-pub const RERUN_BUDGET: Duration = Duration::from_secs(30 * 60);
+/// How much time, in all, the report spends on the second runs of steps, counted by what each
+/// second run took. A step is not run again when nothing is left, or when its first run took
+/// longer than what is left, which is the least its second run takes: the report's own limit would
+/// end the run before it wrote its result, and a run that ends red with its result is better than
+/// one that ends with none. Five minutes is under the 10.5 that the slowest night, which ran the
+/// report to 276 of its 287 minutes, left.
+pub const RERUN_BUDGET: Duration = Duration::from_secs(5 * 60);
 
 /// How long a program that was asked to end is given before it is killed.
 #[cfg(target_os = "macos")]
@@ -74,6 +76,10 @@ const LOG_LIMIT: Duration = Duration::from_secs(90);
 
 /// The longest stretch of the kernel's log that is read, in minutes.
 const LOG_MINUTES: u64 = 90;
+
+/// How long before the earliest of the files was written, and after the latest, the kernel's log
+/// is read, in seconds: a write that the disk loses is the storage's error of that minute.
+const LOG_PADDING: u64 = 180;
 
 /// What the evidence says about the cause of a file that could not be started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -101,8 +107,9 @@ pub struct Rerun {
     pub cause: Cause,
     /// The evidence, in a sentence.
     pub reason: String,
-    /// The file that holds each file's facts and the kernel's lines, relative to the evidence
-    /// directory.
+    /// The file that holds each file's facts and the count of the kernel's storage lines, relative
+    /// to the evidence directory; the lines themselves are in the file beside it that ends in
+    /// `.kernel.txt`.
     pub facts: String,
     /// How many files and directories were removed before the second run.
     pub removed: usize,
@@ -347,27 +354,49 @@ pub fn count_storage_errors(text: &str) -> usize {
         .count()
 }
 
-/// How many minutes of the kernel's log are read: from a little before the earliest of the files
-/// that could not be started was written, up to now, and no more than `LOG_MINUTES`. The length of
-/// the step is not part of it: a storage error from before the file was written says nothing of it.
-fn window_minutes(files: &[FileFacts]) -> u64 {
-    let earliest = files
-        .iter()
-        .filter_map(|file| file.age)
-        .max()
-        .unwrap_or_default();
-    (earliest.as_secs() / 60 + 3).min(LOG_MINUTES)
+/// The stretch of the kernel's log that is read, in seconds since the epoch: from `LOG_PADDING`
+/// before the earliest of the files that could not be started was written to `LOG_PADDING` after
+/// the latest, and not past now, in no more than `LOG_MINUTES`. Neither the length of the step nor
+/// the time the build then waited for other jobs is part of it: a storage error from before the
+/// file was written, or long after, says nothing of it.
+fn window_of(files: &[FileFacts], now: SystemTime) -> (u64, u64) {
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let written = |file: &FileFacts| now.saturating_sub(file.age.map_or(0, |age| age.as_secs()));
+    let first = files.iter().map(written).min().unwrap_or(now);
+    let last = files.iter().map(written).max().unwrap_or(now);
+    let end = (last + LOG_PADDING).min(now);
+    let start = first
+        .saturating_sub(LOG_PADDING)
+        .max(end.saturating_sub(LOG_MINUTES * 60));
+    (start, end)
 }
 
-/// Asks a process to end, and kills it when it has not ended after `GRACE`. `sudo` passes the
-/// request on to the program it runs; it cannot pass on a kill, which would leave that program
-/// running.
+/// Asks a process to end, and kills it when it has not ended after `GRACE`. A process that runs
+/// as root, which `sudo` is, takes a signal from root only, so the request is made through `sudo`
+/// then; `sudo` passes a request to end on to the program it runs, and cannot pass on a kill.
 #[cfg(target_os = "macos")]
-fn end_process(child: &mut std::process::Child) {
-    let asked = Command::new("/bin/kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .is_ok_and(|status| status.success());
+fn end_process(child: &mut std::process::Child, as_root: bool) {
+    let pid = child.id().to_string();
+    let signal = |name: &str| {
+        let mut command = if as_root {
+            let mut command = Command::new("sudo");
+            command.args(["-n", "/bin/kill"]);
+            command
+        } else {
+            Command::new("/bin/kill")
+        };
+        command
+            .arg(name)
+            .arg(&pid)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    let asked = signal("-TERM");
     let asked_at = std::time::Instant::now();
     while asked && asked_at.elapsed() < GRACE {
         if child.try_wait().is_ok_and(|status| status.is_some()) {
@@ -375,14 +404,31 @@ fn end_process(child: &mut std::process::Child) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    if as_root {
+        signal("-KILL");
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
 
-/// Writes the kernel's storage lines of the last `minutes` to `out`.
+/// The local time at `epoch` seconds, in the form the kernel's log reads a date in.
 #[cfg(target_os = "macos")]
-fn storage_log(minutes: u64, out: &Path) -> Result<(), String> {
-    let window = format!("{minutes}m");
+fn local_time(epoch: u64) -> Result<String, String> {
+    let output = Command::new("/bin/date")
+        .args(["-r", &epoch.to_string(), "+%Y-%m-%d %H:%M:%S"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("the date could not be formatted".to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Writes the kernel's storage lines from `start` to `end`, in seconds since the epoch, to `out`.
+#[cfg(target_os = "macos")]
+fn storage_log(start: u64, end: u64, out: &Path) -> Result<(), String> {
+    let (start, end) = (local_time(start)?, local_time(end)?);
     for with_sudo in [true, false] {
         let mut command = if with_sudo {
             let mut command = Command::new("sudo");
@@ -393,8 +439,10 @@ fn storage_log(minutes: u64, out: &Path) -> Result<(), String> {
         };
         command.args([
             "show",
-            "--last",
-            &window,
+            "--start",
+            &start,
+            "--end",
+            &end,
             "--style",
             "compact",
             "--predicate",
@@ -412,7 +460,7 @@ fn storage_log(minutes: u64, out: &Path) -> Result<(), String> {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if started.elapsed() > LOG_LIMIT => {
-                    end_process(&mut child);
+                    end_process(&mut child, with_sudo);
                     return Err("the kernel's log was not read in time".to_owned());
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(200)),
@@ -427,7 +475,7 @@ fn storage_log(minutes: u64, out: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn storage_log(_minutes: u64, _out: &Path) -> Result<(), String> {
+fn storage_log(_start: u64, _end: u64, _out: &Path) -> Result<(), String> {
     Err("the kernel's log is read on macOS only".to_owned())
 }
 
@@ -542,9 +590,11 @@ fn profiles_of(target: &Path) -> Vec<PathBuf> {
 /// directory under its `build` (a build script). A file anywhere else under the target directory
 /// is not one that a build wrote.
 fn profile_of_output(target: &Path, file: &Path) -> Option<PathBuf> {
+    // A profile directory is one level below the target directory, or two with a target triple.
     let is_profile = |directory: &Path| {
-        directory.starts_with(target)
-            && directory != target
+        directory
+            .strip_prefix(target)
+            .is_ok_and(|rest| (1..=2).contains(&rest.components().count()))
             && directory.join(".fingerprint").is_dir()
     };
     let parent = file.parent()?;
@@ -558,6 +608,52 @@ fn profile_of_output(target: &Path, file: &Path) -> Option<PathBuf> {
     let profile = above.parent()?;
     (above.file_name().is_some_and(|name| name == "build") && is_profile(profile))
         .then(|| profile.to_path_buf())
+}
+
+/// Whether Cargo has a record of having built `file`, a program in `profile`: a build script has
+/// the records of the unit its directory is named for; a unit's file in `deps` has the records of
+/// the unit its hash names; a program in the profile directory is a link to a file in `deps` that
+/// has them. A program that something other than Cargo wrote there has none.
+fn has_cargo_record(profile: &Path, file: &Path) -> bool {
+    let records = profile.join(".fingerprint");
+    let recorded = |hash: &str| {
+        std::fs::read_dir(&records).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(&format!("-{hash}"))
+            })
+        })
+    };
+    let Some(parent) = file.parent() else {
+        return false;
+    };
+    if parent
+        .parent()
+        .is_some_and(|above| above == profile.join("build"))
+    {
+        return parent
+            .file_name()
+            .is_some_and(|unit| records.join(unit).is_dir());
+    }
+    if parent == profile.join("deps") {
+        return file
+            .file_name()
+            .and_then(|name| hash_of(&name.to_string_lossy()).map(recorded))
+            .unwrap_or(false);
+    }
+    let Ok(own) = std::fs::metadata(file) else {
+        return false;
+    };
+    std::fs::read_dir(profile.join("deps")).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|metadata| same_file(&own, &metadata))
+                && hash_of(&entry.file_name().to_string_lossy()).is_some_and(recorded)
+        })
+    })
 }
 
 /// Adds the programs of `directory`, written at or after `began`, whose Mach-O header shows them
@@ -807,14 +903,16 @@ fn facts_text(account: &Account<'_>) -> String {
     text
 }
 
-/// Whether a test of the step's run failed: a step in which one did has a failure of its own, which
-/// a second run could hide.
+/// Whether a test of the step's run failed, or its outcomes cannot be read: a step in which one
+/// did has a failure of its own, which a second run could hide.
 fn has_failed_test(done: &Executed) -> bool {
     done.binaries.iter().any(|(_, binary)| {
-        binary
-            .tests
-            .values()
-            .any(|outcome| matches!(outcome, Outcome::Failed))
+        binary.problem.is_some()
+            || binary.summary.is_some_and(|summary| summary[1] > 0)
+            || binary
+                .tests
+                .values()
+                .any(|outcome| matches!(outcome, Outcome::Failed))
     })
 }
 
@@ -845,19 +943,33 @@ pub fn execute(
     let Ok(bytes) = std::fs::read(place.evidence.join(&first.log)) else {
         return first;
     };
+    let built_by_cargo = |path: &PathBuf| {
+        written_since(path, began)
+            && profile_of_output(&target, path)
+                .is_some_and(|profile| has_cargo_record(&profile, path))
+    };
     let named: Vec<PathBuf> = named_files(&String::from_utf8_lossy(&bytes), &target)
         .into_iter()
-        .filter(|path| written_since(path, began) && profile_of_output(&target, path).is_some())
+        .filter(built_by_cargo)
         .collect();
-    if named.is_empty() || has_failed_test(&first) {
+    if named.is_empty() {
         return first;
     }
     let took = Duration::from_secs(first.seconds);
-    if took > *budget {
-        let said = format!(
-            "a file the step linked could not be started, and the step is not run again: its first run took {} s and {} s are left for second runs",
+    let refusal = if has_failed_test(&first) {
+        Some("a test of the step failed".to_owned())
+    } else if budget.is_zero() || took > *budget {
+        Some(format!(
+            "its first run took {} s and {} s are left for second runs",
             took.as_secs(),
             budget.as_secs()
+        ))
+    } else {
+        None
+    };
+    if let Some(why) = refusal {
+        let said = format!(
+            "a file the step linked could not be started, and the step is not run again: {why}"
         );
         progress(&format!("  {said}"));
         first.error = Some(match first.error.take() {
@@ -866,12 +978,11 @@ pub fn execute(
         });
         return first;
     }
-    *budget -= took;
     let now = SystemTime::now();
     let files: Vec<FileFacts> = named.iter().map(|path| facts_of(path, now)).collect();
     let swept: Vec<PathBuf> = damaged_since(&target, began)
         .into_iter()
-        .filter(|path| !named.contains(path))
+        .filter(|path| !named.contains(path) && built_by_cargo(path))
         .collect();
     let stem = Path::new(&first.log)
         .file_stem()
@@ -883,7 +994,8 @@ pub fn execute(
         unkept.push(format!("{} was not made: {error}", faults.display()));
     }
     let kernel = faults.join(format!("{stem}.kernel.txt"));
-    let storage = storage_log(window_minutes(&files), &kernel).and_then(|()| {
+    let (from, until) = window_of(&files, now);
+    let storage = storage_log(from, until, &kernel).and_then(|()| {
         std::fs::read_to_string(&kernel)
             .map(|text| count_storage_errors(&text))
             .map_err(|error| error.to_string())
@@ -945,6 +1057,7 @@ pub fn execute(
         relative.join(", ")
     ));
     let mut second = run::execute(step, number, place, packages);
+    *budget = budget.saturating_sub(Duration::from_secs(second.seconds));
     if cause == Cause::Unexplained {
         let said = format!(
             "a file the step linked could not be started, and it was {reason}: the cause may be this repository's"
@@ -1046,15 +1159,85 @@ mod tests {
     }
 
     #[test]
-    fn the_kernels_log_is_read_from_a_little_before_the_earliest_file_was_written() {
+    fn the_kernels_log_is_read_around_the_time_the_files_were_written() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let at = |seconds: u64| 1_000_000 - seconds;
         let aged = |seconds: u64| FileFacts {
             age: Some(Duration::from_secs(seconds)),
             ..facts(None, None)
         };
-        assert_eq!(window_minutes(&[aged(30)]), 3);
-        assert_eq!(window_minutes(&[aged(30), aged(600)]), 13);
-        assert_eq!(window_minutes(&[aged(3 * 3600)]), LOG_MINUTES);
-        assert_eq!(window_minutes(&[]), 3);
+        // One file written 30 seconds ago: from three minutes before to now.
+        assert_eq!(
+            window_of(&[aged(30)], now),
+            (at(30) - LOG_PADDING, 1_000_000)
+        );
+        // Files written ten minutes and half a minute ago.
+        assert_eq!(
+            window_of(&[aged(30), aged(600)], now),
+            (at(600) - LOG_PADDING, 1_000_000)
+        );
+        // A file written an hour ago, and the build then waited: the window ends three minutes
+        // after the write, and the storage errors of the last hour are not part of it.
+        assert_eq!(
+            window_of(&[aged(3600)], now),
+            (at(3600) - LOG_PADDING, at(3600) + LOG_PADDING)
+        );
+        // Files hours apart are read no further back than the longest stretch.
+        let (from, until) = window_of(&[aged(5 * 3600), aged(60)], now);
+        assert_eq!(until, 1_000_000);
+        assert_eq!(until - from, LOG_MINUTES * 60);
+    }
+
+    #[test]
+    fn a_program_is_one_cargo_built_only_where_cargo_has_a_record_of_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("target/debug");
+        let script = profile.join("build/serde_json-1ad93a6e71728a74/build-script-build");
+        write(&script, b"");
+        assert!(!has_cargo_record(&profile, &script), "no record yet");
+        write(
+            &profile.join(".fingerprint/serde_json-1ad93a6e71728a74/invoked.timestamp"),
+            b"",
+        );
+        assert!(has_cargo_record(&profile, &script));
+        let other = profile.join("build/serde_json-0000000000000000/build-script-build");
+        write(&other, b"");
+        assert!(!has_cargo_record(&profile, &other));
+
+        let unit = profile.join("deps/report-f1d5e145b44f9f2d");
+        write(&unit, b"");
+        assert!(!has_cargo_record(&profile, &unit));
+        write(
+            &profile.join(".fingerprint/kr-conformance-f1d5e145b44f9f2d/test"),
+            b"",
+        );
+        assert!(has_cargo_record(&profile, &unit));
+        assert!(!has_cargo_record(
+            &profile,
+            &profile.join("deps/report-aaaaaaaaaaaaaaaa")
+        ));
+
+        // A program in the profile directory is one Cargo linked where it is a link to a unit's
+        // file that has records, and not where something else wrote it.
+        let stray = profile.join("helper");
+        write(&stray, b"");
+        assert!(!has_cargo_record(&profile, &stray));
+        #[cfg(unix)]
+        {
+            let linked = profile.join("kr-conformance");
+            std::fs::hard_link(&unit, &linked).unwrap();
+            assert!(has_cargo_record(&profile, &linked));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_is_said_to_be_unread_and_is_not_damaged() {
+        let directory = tempfile::tempdir().unwrap();
+        let facts = facts_of(directory.path(), SystemTime::now());
+        assert!(facts.unread.is_some(), "{facts:?}");
+        assert_eq!(facts.shape, None);
+        assert!(!facts.damaged());
     }
 
     #[test]
@@ -1236,8 +1419,8 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
         std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
-        // A program that a test of the repository leaves under the target directory is not a
-        // program a build wrote, whether or not it looks cut short.
+        // A program under the target directory outside the places a build puts programs is not
+        // one a build wrote, whether or not it looks cut short.
         program(&target.join("fixtures/helper"), b"");
         program(&profile.join("examples/helper"), b"");
         program(
