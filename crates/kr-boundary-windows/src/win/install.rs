@@ -4417,6 +4417,16 @@ fn sweep_staging(staging: &DirHandle) -> Vec<String> {
     sweep_layout(staging, Layout::Staging)
 }
 
+/// The refusal of a new installation at a service that stands at the broker's name when the run was
+/// to make it: said by the first look, which no call that changes the service precedes, and by the
+/// service step, so that both say what is true of the run, which did nothing to the service.
+fn refused_service() -> Error {
+    // text: lay_down-21
+    Error::Failed(format!(
+        "a service named {SERVICE} stood on this computer when this run was to make it; this run did not make it and has not changed it"
+    ))
+}
+
 /// Makes the folder directly above the program directory where it is not there, and records what
 /// became of it: the intent before the call, then the folder's identity and the result `made` where
 /// the run's own call made it, or the result `found` where something stood there (an earlier run's
@@ -4575,6 +4585,11 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // The program directory and its files.
     let manager = service::manager()?;
     let broker_service = manager.open(SERVICE)?;
+    // A new installation does not take over a service that stands at the broker's name: it ends at
+    // this first look, before any call that changes the service (the stop below is a repair's).
+    if broker_service.is_some() && !existing {
+        return Err(refused_service());
+    }
     // A repair has no rollback: the broker is said to stay stopped only where a read of its service
     // said stopped. A service that is running is asked to stop and waited for; one that is on its way
     // to either state is waited for (a stop request is refused there); where it does not reach the
@@ -4742,11 +4757,10 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             service
         }
         Some(_) => {
-            run.conclude(ObjectKind::Service, SERVICE, Outcome::Found)?;
-            // text: lay_down-21
-            return Err(Error::Failed(format!(
-                "a service named {SERVICE} stood on this computer when this run was to make it; this run did not make it and has not changed it"
-            )));
+            // A result that neither a rollback nor the removal acts on: not `found`, which the
+            // removal acts on where a repair found and used the service.
+            run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;
+            return Err(refused_service());
         }
         None => {
             let made = manager.create(
