@@ -1137,10 +1137,7 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
     .expect_err("a pipe that did not end");
     let took = begun.elapsed();
     testing::release_held_pipe_writers();
-    assert!(
-        uncertain(&held, "still open after the end of its job"),
-        "{held:?}"
-    );
+    assert!(uncertain(&held, "still open at its last look"), "{held:?}");
     assert!(
         took < Duration::from_secs(6),
         "the readers stop at the deadline: {took:?}"
@@ -1176,10 +1173,7 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
     let took = begun.elapsed();
     testing::release_held_pipe_writers();
     assert!(uncertain(&held, "had also failed"), "{held:?}");
-    assert!(
-        uncertain(&held, "still open after the end of its job"),
-        "{held:?}"
-    );
+    assert!(uncertain(&held, "still open at its last look"), "{held:?}");
     assert!(
         matches!(&held, LaunchError::EndUncertain(text) if text.contains("asked for by a case")),
         "the failure of the case's own is the one that is said: {held:?}"
@@ -1203,7 +1197,7 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
     assert!(
         uncertain(
             &held,
-            "standard output ended true, standard error ended false"
+            "standard output: ended; standard error: still open at its last look"
         ),
         "{held:?}"
     );
@@ -1219,7 +1213,7 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
     assert!(
         uncertain(
             &held,
-            "standard output ended true, standard error ended false"
+            "standard output: ended; standard error: still open at its last look"
         ) && uncertain(&held, "asked for by a case"),
         "{held:?}"
     );
@@ -1725,7 +1719,7 @@ fn a_stop_ends_the_readers_and_the_jobs_end_within_a_short_bound_though_a_writer
     testing::release_held_pipe_writers();
     setter.join().unwrap();
     assert!(
-        matches!(&ran, Err(LaunchError::EndUncertain(text)) if text.contains("still open after the end of its job")),
+        matches!(&ran, Err(LaunchError::EndUncertain(text)) if text.contains("still open at its last look")),
         "the pipe that a writer outside the job held is an end that is not proved"
     );
     assert!(
