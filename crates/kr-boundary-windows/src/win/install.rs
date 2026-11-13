@@ -7076,7 +7076,10 @@ mod tests {
             users_may_read: true,
             ..Principals::default()
         };
-        let folder = run.paths.program.parent().unwrap().to_path_buf();
+        // The folder above the program directory does not stand yet: the call that makes it is the
+        // run's own, and the case's own `laid_run` has the program directory in a folder that does.
+        let folder = top.path().join("folder");
+        run.paths.program = folder.join("program");
         let object = create_folder_above(&folder, SdKind::AdminDir, &readable)
             .unwrap()
             .unwrap();
@@ -7090,7 +7093,15 @@ mod tests {
         assert!(!folder.try_exists().unwrap());
         // Where the folder stood before the run, the run holds nothing of it and it stays.
         let mut run = laid_run(top.path());
+        run.paths.program = folder.join("program");
         std::fs::create_dir(&folder).unwrap();
+        // The call finds the folder standing and makes nothing, so it answers none; the step then
+        // records the result `found`, and the run holds nothing of the folder.
+        assert!(
+            create_folder_above(&folder, SdKind::AdminDir, &readable)
+                .unwrap()
+                .is_none()
+        );
         let rolled = run.take_away();
         assert!(rolled.stayed.is_empty(), "{rolled:?}");
         assert!(
@@ -7251,7 +7262,7 @@ mod tests {
         std::fs::write(&mine, b"x").unwrap();
         for other in [
             "a.journal".to_owned(),
-            format!("{}.journal", "AB".repeat(16)),
+            format!("{}.journal", "CD".repeat(16)),
             format!("{hex}.journal.old"),
             format!("{hex}.txt"),
         ] {
@@ -7261,6 +7272,21 @@ mod tests {
         assert!(sweep_layout(&directory, Layout::Journal).is_empty());
         assert!(!mine.try_exists().unwrap());
         assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 4);
+        // A name is told apart by its letters as the listing gives it: upper-case digits are not the
+        // broker's form, so a file that is stored under them stays. (The platform does not tell the
+        // two cases apart when a name is opened, so such a file cannot stand beside a lower-case one
+        // of the same digits: it is the only file of the directory here.)
+        let upper_journal = top.path().join("journal-upper");
+        std::fs::create_dir(&upper_journal).unwrap();
+        let upper = format!("{}.journal", "AB".repeat(16));
+        std::fs::write(upper_journal.join(&upper), b"x").unwrap();
+        let directory = DirHandle::open_anchor(&upper_journal).unwrap().unwrap();
+        assert!(sweep_layout(&directory, Layout::Journal).is_empty());
+        let left: Vec<String> = std::fs::read_dir(&upper_journal)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, [upper]);
     }
 
     #[cfg(feature = "testing")]
