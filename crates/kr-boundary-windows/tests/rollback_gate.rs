@@ -296,3 +296,53 @@ fn a_rollback_that_ends_with_a_failed_step_leaves_a_record_before_it_ends() {
     assert!(roll.contains("matches!(run.manifest_on_disk(), Ok(()))"));
     assert!(!roll.contains("check_program_directory(&paths, true,"));
 }
+
+#[test]
+fn the_folder_above_the_program_directory_is_made_and_removed_only_as_the_run_that_made_it_records()
+{
+    let source = install_source();
+    // The installation: the intent (with the identity that an earlier run recorded), the folder's
+    // own creating call, the folder held in the run's value before any record is written, then the
+    // identity and the result `made`; a folder that stood there gets the result `found`.
+    let folder = code_of(body_of(&source, "fn make_program_folder("));
+    let at = |needle: &str| {
+        folder
+            .find(needle)
+            .unwrap_or_else(|| panic!("make_program_folder has no {needle}"))
+    };
+    let intent = at("run.record(ObjectKind::ProgramFolder, &id, earlier.as_deref())?;");
+    let made = at("create_folder_above(folder, SdKind::AdminDir, readable)?");
+    let held = at("ffi::locked(&run.laid).program_folder = Some(made);");
+    let identity = at("run.record(ObjectKind::ProgramFolder, &id, Some(identity?.as_str()))?;");
+    let result = at("run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Made)");
+    assert!(intent < made && made < held && held < identity && identity < result);
+    assert!(folder.contains("run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Found)"));
+    // lay_down makes the folder after the check of the program directory's parents and before the
+    // program directory.
+    let lay = code_of(body_of(&source, "fn lay_down("));
+    let check = lay.find("check_program_parents(&paths, after)?;").unwrap();
+    let folder_at = lay
+        .find("make_program_folder(run, &paths, &readable)?;")
+        .unwrap();
+    let program = lay
+        .find("fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)")
+        .unwrap();
+    assert!(check < folder_at && folder_at < program);
+    // No step removes the folder above the program directory by its path: the rollback takes the
+    // one that its run holds, and the ordinary removal the one that its manifest records.
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    assert!(
+        !steps.contains("fs::remove_dir(parent)"),
+        "a step removes a folder by its path"
+    );
+    assert!(steps.contains(
+        "if matches!(tree, DataTree::ByName) {\n        remove_program_folder(paths, &manifest, &mut failures);"
+    ));
+    let take = code_of(body_of(&source, "fn take_away(&mut self) -> Rolled"));
+    assert!(take.contains("take(object(program_folder), folder, false);"));
+    let removal = code_of(body_of(&source, "fn remove_program_folder("));
+    assert!(removal.contains("remedy::FolderRecord::of(object.outcome, object.detail.is_some())"));
+    assert!(
+        removal.contains("remedy::folder_act(record, read.as_ref()) != remedy::FolderAct::Remove")
+    );
+}

@@ -1062,6 +1062,10 @@ struct Laid {
     staging: Option<MadeObject>,
     journal: Option<MadeObject>,
     run: Option<MadeObject>,
+    /// The folder directly above the program directory, where this run's own call made it: held from
+    /// that call, with the handle of the folder that holds it, and taken away after the program
+    /// directory. A folder that stood there before the run is never in it.
+    program_folder: Option<MadeObject>,
     /// The replacement of the manifest that a write is making, from the call that made it until it
     /// is proved to be the manifest or is marked for removal.
     replacement: Option<MadeFile>,
@@ -3236,7 +3240,11 @@ fn open_data_directory(
 ) -> Result<(ffi::Handle, DirHandle, Inspected), Error> {
     let held = match check_data_parent(paths)? {
         Some(held) => held,
-        None => match create_data_parent(paths.data_parent())? {
+        None => match create_folder_above(
+            paths.data_parent(),
+            SdKind::DataParent,
+            &Principals::default(),
+        )? {
             Some(created) => {
                 // The folder is checked on the handle of the call that made it, not opened again
                 // by its path. The copy that this run holds beneath it cannot delete it.
@@ -3387,14 +3395,18 @@ fn native_path(path: &Path) -> OsString {
     OsString::from_wide(&[r"\??\".encode_utf16().collect::<Vec<u16>>(), rest.to_vec()].concat())
 }
 
-/// Makes the folder above the data directory with the protected list, in one call that is relative to
-/// the handle of the folder that holds it, which the run opens and keeps for the cleanup, and that
-/// returns the handle of the folder that it made. The made folder's handle shares everything and
-/// holds no right to delete it. Returns none where something was there already: a folder that
-/// appeared between the look and the call is opened and checked next, and was not made here.
-fn create_data_parent(parent: &Path) -> Result<Option<MadeObject>, Error> {
-    let descriptor = sd::descriptor(SdKind::DataParent, &Principals::default())?;
-    let holder = match parent.parent().zip(parent.file_name()) {
+/// Makes a folder with the protected list of `kind`, in one call that is relative to the handle of
+/// the folder that holds it, which the run opens and keeps for the cleanup, and that returns the
+/// handle of the folder that it made. The made folder's handle shares everything and holds no right
+/// to delete it. Returns none where something was there already: a folder that appeared between the
+/// look and the call is opened and checked next, and was not made here.
+fn create_folder_above(
+    folder: &Path,
+    kind: SdKind,
+    principals: &Principals,
+) -> Result<Option<MadeObject>, Error> {
+    let descriptor = sd::descriptor(kind, principals)?;
+    let holder = match folder.parent().zip(folder.file_name()) {
         Some((above, name)) => open_directory_at(
             None,
             &native_path(above),
@@ -3409,7 +3421,7 @@ fn create_data_parent(parent: &Path) -> Result<Option<MadeObject>, Error> {
         // text: create_data_parent-1
         return Err(Error::Failed(format!(
             "{} was not made, because the folder that holds it was not found",
-            parent.display()
+            folder.display()
         )));
     };
     Ok(open_directory_relative(
@@ -3951,6 +3963,7 @@ impl Run {
             staging,
             journal,
             run,
+            program_folder,
             replacement,
             prior_creating,
             prior,
@@ -4020,6 +4033,11 @@ impl Run {
         }
         if gone {
             take(object(manifest), &self.paths.manifest, true);
+        }
+        // The folder above the program directory, only where this run's own call made it: it goes
+        // once the program directory is gone, and stays where it holds anything else.
+        if let Some(folder) = self.paths.program.parent() {
+            take(object(program_folder), folder, false);
         }
         drop(directory);
         let (directory, folder) = made.take_away();
@@ -4232,6 +4250,43 @@ fn sweep_staging(staging: &Path) {
     }
 }
 
+/// Makes the folder directly above the program directory where it is not there, and records what
+/// became of it: the intent before the call, then the folder's identity and the result `made` where
+/// the run's own call made it, or the result `found` where something stood there (an earlier run's
+/// result `made` stays). The folders above that one are the system's and are made by path where
+/// they are missing, as before; the installation never removes them. The folder that this run made
+/// is held in the run's value from the call that made it, before any record is written.
+fn make_program_folder(run: &mut Run, paths: &Paths, readable: &Principals) -> Result<(), Error> {
+    let Some(folder) = paths.program.parent() else {
+        return Ok(());
+    };
+    let id = folder.display().to_string();
+    // A repair keeps the identity that an earlier run recorded: the intent is written with it.
+    let earlier = run
+        .manifest
+        .find(ObjectKind::ProgramFolder, &id)
+        .and_then(|object| object.detail.clone());
+    run.record(ObjectKind::ProgramFolder, &id, earlier.as_deref())?;
+    if let Some(above) = folder.parent()
+        && !above.as_os_str().is_empty()
+    {
+        fresh::directory_all(above, SdKind::AdminDir, readable)
+            // text: make_program_folder-1
+            .map_err(io_error(
+                "making the folders above the program directory's folder",
+            ))?;
+    }
+    match create_folder_above(folder, SdKind::AdminDir, readable)? {
+        Some(made) => {
+            let identity = file_key(&made.identity).map(|key| key.to_string());
+            ffi::locked(&run.laid).program_folder = Some(made);
+            run.record(ObjectKind::ProgramFolder, &id, Some(identity?.as_str()))?;
+            run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Made)
+        }
+        None => run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Found),
+    }
+}
+
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
     let paths = run.paths.clone();
     // The folder, the directory and the directories in it are held, and each list goes on its own
@@ -4404,6 +4459,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         remedy::Stage::After
     };
     check_program_parents(&paths, after)?;
+    make_program_folder(run, &paths, &readable)?;
     fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)
         // text: install_lay_down-1
         .map_err(io_error("making the program directory"))?;
@@ -5126,6 +5182,108 @@ fn read_service_intent(manager: &service::Manager, paths: &Paths) -> remedy::Int
     }
 }
 
+/// Opens the folder directly above the program directory for the removal: its holder (the folder
+/// above it) by path, and the folder itself relative to that handle, never through a path again. The
+/// handle of the folder shares everything and holds no right to delete, as the handle of a folder
+/// that a run made does. What was read: nothing at the name, an object with another identity than
+/// the one recorded, or the recorded folder with the number of entries in it.
+fn open_program_folder(
+    folder: &Path,
+    identity: &str,
+) -> Result<(Option<MadeObject>, remedy::FolderRead), Error> {
+    let Some((above, name)) = folder.parent().zip(folder.file_name()) else {
+        return Ok((None, remedy::FolderRead::NotThere));
+    };
+    let Some((holder, _)) = open_directory_at(None, &native_path(above), FILE_OPEN, None, LIST)?
+    else {
+        return Ok((None, remedy::FolderRead::NotThere));
+    };
+    let units: Vec<u16> = name.encode_wide().collect();
+    let held = match DirHandle::open_beneath(&holder, &units, LIST, true, FILE_OPEN) {
+        Ok(held) => held,
+        Err(failure)
+            if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+        {
+            return Ok((None, remedy::FolderRead::NotThere));
+        }
+        Err(failure) => return Err(failure.into()),
+    };
+    let found = file_key(&held)?;
+    if found.to_string() != identity {
+        return Ok((None, remedy::FolderRead::Other));
+    }
+    let entries = held_directory(held.duplicate(LIST)?)?.children()?.len();
+    let read = if entries == 0 {
+        remedy::FolderRead::Empty
+    } else {
+        remedy::FolderRead::Holds(entries)
+    };
+    Ok((
+        Some(MadeObject {
+            identity: held,
+            holder,
+            name: name.to_owned(),
+            directory: true,
+        }),
+        read,
+    ))
+}
+
+/// The removal's step for the folder directly above the program directory: it goes where the
+/// manifest records that the installation made it and a read found that folder at its name with
+/// nothing in it, and in no other case (one that stood before the installation stays, also where it
+/// is empty; one that holds an entry stays). Where the folder stays only for the reason the words
+/// give, the removal does not fail; where a read or the removal itself failed, it does, so that its
+/// records stay.
+fn remove_program_folder(paths: &Paths, manifest: &Manifest, failures: &mut Vec<String>) {
+    let Some(folder) = paths.program.parent() else {
+        return;
+    };
+    let shown = folder.display().to_string();
+    let Some(object) = manifest.find(ObjectKind::ProgramFolder, &shown) else {
+        return;
+    };
+    let record = remedy::FolderRecord::of(object.outcome, object.detail.is_some());
+    let (made, read) = match (record.is_read(), object.detail.as_deref()) {
+        (true, Some(identity)) => match open_program_folder(folder, identity) {
+            Ok((made, read)) => (made, Some(read)),
+            Err(error) => (None, Some(remedy::FolderRead::Failed(error.to_string()))),
+        },
+        _ => (None, None),
+    };
+    // text: remove_at-36
+    say(&remedy::folder_words(&shown, record, read.as_ref()));
+    if let Some(remedy::FolderRead::Failed(why)) = &read {
+        failures.push(format!("reading the folder {shown}: {why}"));
+    }
+    if remedy::folder_act(record, read.as_ref()) != remedy::FolderAct::Remove {
+        return;
+    }
+    let Some(made) = made else {
+        return;
+    };
+    match made.take_away() {
+        Taken::Marked => {
+            // text: remove_at-37
+            say(&format!(
+                "{shown}: marked for removal, and a read of its name afterwards found it gone"
+            ));
+        }
+        Taken::NotFound => {
+            // text: remove_at-38
+            say(&format!(
+                "{shown}: its name was not found when the removal opened it to remove it, so the removal did nothing with it"
+            ));
+        }
+        Taken::Stays(why) => {
+            // text: remove_at-39
+            say(&format!("{shown} stays: {why}"));
+            failures.push(format!("removing the folder {shown}: {why}"));
+        }
+        Taken::NotMade => {}
+    }
+}
+
 /// The removal's steps for the objects that `manifest` records, after an inspection approved what is
 /// in the data directory: the broker held in maintenance, the policy put back, the Application
 /// Identity service's start type, the release proved through the broker, the service, the accounts,
@@ -5655,9 +5813,6 @@ fn undo_recorded(
             "removing the program directory",
             &mut failures,
         );
-        if let Some(parent) = paths.program.parent() {
-            let _ = fs::remove_dir(parent);
-        }
     } else if (matches!(tree, DataTree::ByName)
         || manifest
             .find(ObjectKind::Directory, &paths.program.display().to_string())
@@ -5667,6 +5822,11 @@ fn undo_recorded(
         // It was not there when the removal checked, so no check opened it: nothing is deleted. A
         // rollback looks only where this run recorded the program directory.
         failures.push(text);
+    }
+    // The folder above the program directory goes only where the manifest records that the
+    // installation made it. A rollback takes it away through the handle of the call that made it.
+    if matches!(tree, DataTree::ByName) {
+        remove_program_folder(paths, &manifest, &mut failures);
     }
     // The journal's files and the empty `run` and `journal` directories go where the inspection
     // opened and approved them, and nowhere else. Unfinished work was refused before the removal
@@ -6293,6 +6453,7 @@ mod tests {
                 staging: Some(staging),
                 journal: Some(journal),
                 run: Some(private),
+                program_folder: None,
                 replacement: None,
                 prior_creating: None,
                 prior: Some(prior),
@@ -6550,5 +6711,163 @@ mod tests {
         );
         assert!(rolled.records_deleted, "{rolled:?}");
         assert!(!path.try_exists().unwrap());
+    }
+
+    /// Whether a directory stands at the path, with a failed look failing the case.
+    fn is_folder(path: &Path) -> bool {
+        std::fs::metadata(path).unwrap().is_dir()
+    }
+
+    /// The places of a case about the folder above the program directory: the program directory is in
+    /// a folder of its own in a temporary directory, and everything else is beside it.
+    fn folder_paths(top: &Path) -> Paths {
+        let data = top.join("data");
+        Paths {
+            program: top.join("folder").join("program"),
+            program_top: top.to_path_buf(),
+            journal: data.join("journal"),
+            run: data.join("run"),
+            git: top.join("git"),
+            staging: data.join("staging"),
+            manifest: data.join("manifest.json"),
+            prior: data.join("prior.json"),
+            data,
+        }
+    }
+
+    /// A manifest that records the folder as the installation does: the identity of what stands at
+    /// its path now, and the result given.
+    fn recording(paths: &Paths, outcome: Option<Outcome>, identity: bool) -> Manifest {
+        let folder = paths.program.parent().unwrap();
+        let id = folder.display().to_string();
+        let held = DirHandle::open_anchor(folder).unwrap().unwrap();
+        let mut manifest = Manifest::begin();
+        let key = held.key().to_string();
+        manifest.record(
+            ObjectKind::ProgramFolder,
+            &id,
+            identity.then_some(key.as_str()),
+        );
+        if let Some(outcome) = outcome {
+            manifest.conclude(ObjectKind::ProgramFolder, &id, outcome);
+        }
+        manifest
+    }
+
+    #[test]
+    fn the_folder_above_the_program_directory_is_the_runs_only_where_its_own_call_made_it() {
+        let top = tempfile::tempdir().unwrap();
+        let readable = Principals {
+            users_may_read: true,
+            ..Principals::default()
+        };
+        // A folder that the call makes is held, and goes through its identity.
+        let made = top.path().join("made");
+        let object = create_folder_above(&made, SdKind::AdminDir, &readable)
+            .unwrap()
+            .expect("the call made the folder");
+        assert!(is_folder(&made));
+        // A second call finds the folder and makes nothing: it is not the run's.
+        assert!(
+            create_folder_above(&made, SdKind::AdminDir, &readable)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(object.take_away(), Taken::Marked);
+        assert!(!made.try_exists().unwrap());
+        // A folder made by hand before the run stays, empty or not.
+        let by_hand = top.path().join("by-hand");
+        std::fs::create_dir(&by_hand).unwrap();
+        assert!(
+            create_folder_above(&by_hand, SdKind::AdminDir, &readable)
+                .unwrap()
+                .is_none()
+        );
+        assert!(is_folder(&by_hand));
+    }
+
+    #[test]
+    fn a_rollback_takes_the_folder_above_the_program_directory_after_it_and_only_where_the_run_made_it()
+     {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        let readable = Principals {
+            users_may_read: true,
+            ..Principals::default()
+        };
+        let folder = run.paths.program.parent().unwrap().to_path_buf();
+        let object = create_folder_above(&folder, SdKind::AdminDir, &readable)
+            .unwrap()
+            .unwrap();
+        ffi::locked(&run.laid).program_folder = Some(object);
+        let rolled = run.take_away();
+        assert!(rolled.stayed.is_empty(), "{rolled:?}");
+        assert!(
+            rolled.marked.contains(&folder.display().to_string()),
+            "{rolled:?}"
+        );
+        assert!(!folder.try_exists().unwrap());
+        // Where the folder stood before the run, the run holds nothing of it and it stays.
+        let mut run = laid_run(top.path());
+        std::fs::create_dir(&folder).unwrap();
+        let rolled = run.take_away();
+        assert!(rolled.stayed.is_empty(), "{rolled:?}");
+        assert!(
+            is_folder(&folder),
+            "a folder that stood before the run stays"
+        );
+    }
+
+    #[test]
+    fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_manifest_records_that_it_made_it()
+     {
+        let top = tempfile::tempdir().unwrap();
+        let paths = folder_paths(top.path());
+        let folder = paths.program.parent().unwrap().to_path_buf();
+        let shown = folder.display().to_string();
+        let run_with = |manifest: &Manifest| {
+            let mut failures = Vec::new();
+            remove_program_folder(&paths, manifest, &mut failures);
+            failures
+        };
+        // Made, empty, identity equal: removed, and the read of its name found it gone.
+        std::fs::create_dir(&folder).unwrap();
+        let manifest = recording(&paths, Some(Outcome::Made), true);
+        assert!(run_with(&manifest).is_empty());
+        assert!(!folder.try_exists().unwrap());
+        // A result of found: stays, also where empty.
+        std::fs::create_dir(&folder).unwrap();
+        let manifest = recording(&paths, Some(Outcome::Found), true);
+        assert!(run_with(&manifest).is_empty());
+        assert!(is_folder(&folder));
+        // Made but holding an entry: stays, and the removal does not fail for it.
+        std::fs::create_dir(folder.join("other")).unwrap();
+        let manifest = recording(&paths, Some(Outcome::Made), true);
+        assert!(run_with(&manifest).is_empty());
+        assert!(is_folder(&folder.join("other")));
+        std::fs::remove_dir(folder.join("other")).unwrap();
+        // Made, with the identity of another object: stays.
+        let mut manifest = recording(&paths, Some(Outcome::Made), true);
+        manifest.record(
+            ObjectKind::ProgramFolder,
+            &shown,
+            Some("0000000000000000:00"),
+        );
+        assert!(run_with(&manifest).is_empty());
+        assert!(is_folder(&folder));
+        // An intent with the identity and no result: read, and removed as a made one.
+        // An intent with no identity: nothing shows what the call made, so it stays.
+        let manifest = recording(&paths, None, false);
+        assert!(run_with(&manifest).is_empty());
+        assert!(is_folder(&folder));
+        let manifest = recording(&paths, None, true);
+        assert!(run_with(&manifest).is_empty());
+        assert!(!folder.try_exists().unwrap());
+        // Recorded and not there: nothing to remove, and no failure.
+        assert!(run_with(&manifest).is_empty());
+        // Not recorded: untouched.
+        std::fs::create_dir(&folder).unwrap();
+        assert!(run_with(&Manifest::begin()).is_empty());
+        assert!(is_folder(&folder));
     }
 }
