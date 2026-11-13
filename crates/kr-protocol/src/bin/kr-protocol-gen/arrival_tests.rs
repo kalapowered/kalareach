@@ -1933,6 +1933,28 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
         let (lines, passed) = section_lines(&old, &new);
         assert_eq!((lines, passed), (wanted.clone(), vec![]), "{says}");
     }
+    // The document is open in one schema only: the change of `additionalProperties` is a line of
+    // its own, and the section does not pass beside it, whichever schema is the open one.
+    let closed_with = |with_push: bool| closed(with_push)["$defs"].clone();
+    for (old, new, says) in [
+        (
+            open(false),
+            closed_with(true)["ConfigurationDocument"].clone(),
+            "open, then closed",
+        ),
+        (
+            closed_with(false)["ConfigurationDocument"].clone(),
+            open(true),
+            "closed, then open",
+        ),
+    ] {
+        let wrap = |definition: Value| json!({ "$defs": { "ConfigurationDocument": definition } });
+        let (lines, passed) = section_lines(&wrap(old), &wrap(new));
+        assert!(
+            lines.contains(&wanted[0]) && passed.is_empty(),
+            "{says}: {lines:?}"
+        );
+    }
 }
 
 /// A listed member of the SDK's schema arrives only where every use of its definition widens with
