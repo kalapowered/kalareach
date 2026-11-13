@@ -51,6 +51,17 @@ beforeEach(() => {
   vi.spyOn(document, 'removeEventListener').mockImplementation(((type: string) => {
     listening.delete(type)
   }))
+  // The window's own listeners (the blur) are kept where `fire` finds them; any other goes where it goes.
+  const windowAdd = window.addEventListener.bind(window)
+  const windowRemove = window.removeEventListener.bind(window)
+  vi.spyOn(window, 'addEventListener').mockImplementation(((type: string, listener: EventListener, options?: boolean | AddEventListenerOptions) => {
+    if (type === 'blur') listening.set('window blur', listener)
+    else windowAdd(type, listener, options)
+  }) as typeof window.addEventListener)
+  vi.spyOn(window, 'removeEventListener').mockImplementation(((type: string, listener: EventListener, options?: boolean | EventListenerOptions) => {
+    if (type === 'blur') listening.delete('window blur')
+    else windowRemove(type, listener, options)
+  }) as typeof window.removeEventListener)
   vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
     reads.push(this)
     return rectOf(boxes.get(this))
@@ -341,7 +352,7 @@ describe('a tap between two links, through the handler', () => {
 })
 
 describe('where the handler’s listeners stand', () => {
-  it('puts every listener on the document: the click, the pointer down, and from a press to its end the move, up, cancel and scroll, and the visual viewport’s scroll and resize', () => {
+  it('puts every listener on the document: the click, the pointer down, and from a press to its end the move, up, cancel, lost capture, visibility change and scroll, the window’s blur and the visual viewport’s scroll and resize', () => {
     viewportOf({ left: 0, top: 0, right: 390, bottom: 844 })
     const { pane } = between({ left: 0, top: 0, right: 8, bottom: 17 })
     const stop = start(pane)
@@ -349,13 +360,16 @@ describe('where the handler’s listeners stand', () => {
     fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
     expect([...listening.keys()].sort()).toEqual([
       'click',
+      'lostpointercapture',
       'pointercancel',
       'pointerdown',
       'pointermove',
       'pointerup',
       'scroll',
       'viewport resize',
-      'viewport scroll'
+      'viewport scroll',
+      'visibilitychange',
+      'window blur'
     ])
     // Scroll events do not bubble, so only the capture phase on the document hears the scroll of every box.
     expect(capturing.get('scroll'), 'the scroll listener is in the capture phase').toBe(true)
@@ -363,22 +377,39 @@ describe('where the handler’s listeners stand', () => {
     expect([...listening.keys()]).toEqual([])
   })
 
-  it('takes the scroll and the viewport listeners off when the press ends: at the release, at a cancel and at a move past the slop', () => {
+  it('takes the scroll, viewport, capture, visibility and blur listeners off when the press ends: at the release, at a cancel, at a move past the slop, at a lost capture, at a blur and at a hidden page', () => {
     viewportOf({ left: 0, top: 0, right: 390, bottom: 844 })
     const { pane } = between({ left: 0, top: 0, right: 8, bottom: 17 })
     start(pane)
     clock(100)
-    const standing = (): string[] => [...listening.keys()].filter((type) => type === 'scroll' || type.startsWith('viewport')).sort()
+    const standing = (): string[] =>
+      [...listening.keys()].filter((type) => type === 'scroll' || type.startsWith('viewport') || type === 'lostpointercapture' || type === 'window blur').sort()
+    const during = ['lostpointercapture', 'scroll', 'viewport resize', 'viewport scroll', 'window blur']
     fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
-    expect(standing(), 'listeners during the press').toEqual(['scroll', 'viewport resize', 'viewport scroll'])
+    expect(standing(), 'listeners during the press').toEqual(during)
+    expect([...listening.keys()], 'the page’s visibility change is heard during the press').toContain('visibilitychange')
     fire('pointerup', pointer(pane, { clientX: 4, clientY: 25, timeStamp: 120 }))
     expect(standing(), 'listeners after the release').toEqual([])
+    expect([...listening.keys()], 'visibility listener after the release').not.toContain('visibilitychange')
     fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
     fire('pointercancel', pointer(pane, { clientX: 4, clientY: 25 }))
     expect(standing(), 'listeners after a cancel').toEqual([])
     fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
     fire('pointermove', pointer(pane, { clientX: 4, clientY: 45 }))
     expect(standing(), 'listeners after a move past the slop').toEqual([])
+    fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
+    fire('lostpointercapture', pointer(pane))
+    expect(standing(), 'listeners after a lost capture').toEqual([])
+    expect([...listening.keys()], 'visibility listener after a lost capture').not.toContain('visibilitychange')
+    fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
+    fire('window blur', {} as Event)
+    expect(standing(), 'listeners after a blur').toEqual([])
+    expect([...listening.keys()], 'visibility listener after a blur').not.toContain('visibilitychange')
+    fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+    fire('visibilitychange', {} as Event)
+    expect(standing(), 'listeners after the page was hidden').toEqual([])
+    expect([...listening.keys()], 'visibility listener after the page was hidden').not.toContain('visibilitychange')
     // A press that lights nothing has no look to keep and stands on no scroll.
     fire('pointerdown', pointer(pane, { clientX: 300, clientY: 700 }))
     expect(standing(), 'listeners for a press that lit nothing').toEqual([])
@@ -826,6 +857,56 @@ describe('a scroll under a held press', () => {
     fire('pointerup', pointer(text, { clientX: 138, clientY: 108, timeStamp: 120 }))
     fire('click', click(text, { clientX: 138, clientY: 108 }))
     expect(opened).toEqual([links[0]])
+  })
+})
+
+describe('a press whose release can no longer come', () => {
+  const y = 328
+
+  /** A touch press on plain text beside the first link of message 3, lit. */
+  function held(): { links: HTMLElement[][]; texts: HTMLElement[] } {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look of the press').toBe(true)
+    return { links, texts }
+  }
+
+  /** The release that follows, and the click that the engine sends for it. */
+  function released(texts: HTMLElement[]): void {
+    fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
+    fire('click', click(texts[3], { clientY: y }))
+  }
+
+  it('ends the look when the pointer’s capture is lost, and opens nothing', () => {
+    const { links, texts } = held()
+    fire('lostpointercapture', pointer(texts[3], { pointerId: 2 }))
+    expect(isLit(links[3]?.[0]), 'the look after another pointer lost its capture').toBe(true)
+    fire('lostpointercapture', pointer(texts[3]))
+    expect(isLit(links[3]?.[0]), 'the look after the press’s own pointer lost its capture').toBe(false)
+    released(texts)
+    expect(opened).toEqual([])
+  })
+
+  it('ends the look when the window loses focus, and opens nothing', () => {
+    const { links, texts } = held()
+    fire('window blur', {} as Event)
+    expect(isLit(links[3]?.[0]), 'the look after the window’s blur').toBe(false)
+    released(texts)
+    expect(opened).toEqual([])
+  })
+
+  it('ends the look when the page is hidden, and leaves it for a change that leaves the page shown', () => {
+    const { links, texts } = held()
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    fire('visibilitychange', {} as Event)
+    expect(isLit(links[3]?.[0]), 'the look after a visibility change that leaves the page shown').toBe(true)
+    hidden.mockReturnValue(true)
+    fire('visibilitychange', {} as Event)
+    expect(isLit(links[3]?.[0]), 'the look after the page was hidden').toBe(false)
+    released(texts)
+    expect(opened).toEqual([])
   })
 })
 
