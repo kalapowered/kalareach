@@ -742,8 +742,9 @@ key. The digests move only together with the crate's pin, to the archive of the 
 crate version bundles, so that every target keeps one tag. They never move alone, and a refusal in a
 job is not cured by a new digest in the change that met it.
 
-The manifest records the crate version, not a system library version. Compile and verify it on
-every Tauri target.
+The manifest records the crate version, not a system library version. A Windows MSVC release's
+manifest also names the archive above and its digest, and `kr-release` refuses to write it when this
+document names another. Compile and verify it on every Tauri target.
 
 `hmac` 0.13.0 and `sha2` 0.11.0, the versions pinned above, are built with their `zeroize`
 features, so their internal buffers are cleared. `hkdf` 0.13.0 has no such feature; its pseudorandom

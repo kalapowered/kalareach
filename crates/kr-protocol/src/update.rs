@@ -697,6 +697,20 @@ pub struct ReleaseDependencies {
     pub pinned: Vec<PinnedCrate>,
     /// The pairing vectors the pinned PAKE is held to.
     pub vectors: Vec<ReleaseSource>,
+    /// The prebuilt archive the release's target links, where it links one: libsodium's own
+    /// archive of its release tag on Windows. Absent for a target that compiles every library
+    /// from source, and from the manifest of a release built before it was stated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prebuilt_archive: Option<PrebuiltArchive>,
+}
+
+/// A prebuilt archive that a release links, as its publisher serves it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrebuiltArchive {
+    /// The archive's name as its publisher publishes it.
+    pub name: String,
+    /// Its SHA-256 digest.
+    pub sha256: Digest256,
 }
 
 /// One pinned library and the crates it resolved.
@@ -1560,6 +1574,7 @@ mod tests {
                 lock_sha256: Digest256::from_bytes([9; 32]),
                 pinned: Vec::new(),
                 vectors: Vec::new(),
+                prebuilt_archive: None,
             }),
             stores: vec![store("registry", 7, 1)],
             files,
@@ -1984,6 +1999,32 @@ mod tests {
         assert_eq!(read.shells[0].patch_revisions, ["1", "1"]);
         assert!(read.shells[0].upstream.is_none() && read.shells[0].patches.is_empty());
         assert!(read.agents.is_empty() && read.dependencies.is_none());
+    }
+
+    /// A release names the prebuilt archive its target links only where it links one: the member
+    /// is left out of every other manifest, which an earlier reader takes as it stands, and is read
+    /// back whole where it is present.
+    #[test]
+    fn a_manifest_names_the_prebuilt_archive_only_where_one_is_linked() {
+        let mut written = manifest(vec![file("bin/kr")]);
+        let value = serde_json::to_value(&written).expect("encodes");
+        assert!(value["dependencies"].get("prebuilt_archive").is_none());
+
+        written
+            .dependencies
+            .as_mut()
+            .expect("the manifest lists its dependencies")
+            .prebuilt_archive = Some(PrebuiltArchive {
+            name: "libsodium-1.0.22-msvc.zip".to_owned(),
+            sha256: Digest256::from_bytes([7; 32]),
+        });
+        let value = serde_json::to_value(&written).expect("encodes");
+        assert_eq!(
+            value["dependencies"]["prebuilt_archive"]["name"],
+            "libsodium-1.0.22-msvc.zip"
+        );
+        let members: SignedMembers = serde_json::from_value(value).expect("reads");
+        assert_eq!(members.manifest().expect("reads"), written);
     }
 
     /// A package that states its patches and lists other revisions of them for the release before

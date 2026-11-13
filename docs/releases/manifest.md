@@ -31,7 +31,7 @@ asked.
 | `retained_levels` | The compatibility levels the control daemon speaks to a worker at | The levels the same build retains, its own first |
 | `shells` | What each shell package is made of | The package in the tree and the repository's pins for the shell (below) |
 | `agents` | The executable builds of supported agents the release is qualified against, with the capabilities each opens | The bundled signed plugin index (below) |
-| `dependencies` | The cryptographic libraries the release is built with, as resolved | `Cargo.toml` and `Cargo.lock` (below) |
+| `dependencies` | The cryptographic libraries the release is built with, as resolved, and for a Windows MSVC release the prebuilt libsodium archive it links | `Cargo.toml`, `Cargo.lock` and `scripts/place-libsodium-archive.sh` (below) |
 | `stores` | Every store the programs read, with the version each writes, the lowest it brings forward and, for a store that has one, the newest version above its own that it reads without writing | `stored-formats.lock` |
 | `files` | Every file but the manifest, with its length, SHA-256 digest and whether it is a program | The tree |
 
@@ -128,7 +128,10 @@ crate bundles, `libsodium-1.0.22-msvc.zip`, and not the archive that upstream re
 `scripts/place-libsodium-archive.sh` fixes it and its signature by size and SHA-256, for a test job
 and a release job alike, and [the cryptography reference](../crypto/README.md#release-manifest)
 names both digests and the rule for moving them. A Windows release job that is handed other bytes
-stops before it builds.
+stops before it builds. The manifest of a Windows MSVC release names that archive as upstream
+publishes it, and its SHA-256, in `dependencies.prebuilt_archive`, read from the script and held to
+the cryptography reference, which must name the same. The manifest of every other target leaves the
+member out, and a reader takes a manifest that lacks it.
 
 ## The release record
 
