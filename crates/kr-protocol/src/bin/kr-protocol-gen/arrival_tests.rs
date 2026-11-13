@@ -1998,6 +1998,51 @@ fn a_listed_member_does_not_arrive_where_a_use_of_its_definition_does_not_widen(
     }
 }
 
+/// The uses of a listed member's definition are read in both schemas, each by itself: a use that
+/// does not widen in the earlier schema alone, or in the new schema alone, still keeps the member
+/// from arriving. The definition `Holder` stands in one schema only, so the line about it is
+/// reported too.
+#[test]
+fn a_listed_member_does_not_arrive_where_one_schema_alone_has_a_use_that_does_not_widen() {
+    let (protocol, not_a_route) = (
+        protocol_schema(),
+        json!({ "not": { "$ref": "#/$defs/Route" } }),
+    );
+    for (in_the_old, says) in [
+        // The old schema accepts `{"method": "a", "hidden": []}` as a `Holder` (it is no `Route`);
+        // the new schema has no `Holder`, so nothing there decides it.
+        (
+            true,
+            "a use that does not widen in the earlier schema alone",
+        ),
+        // The earlier schema has no `Holder`; the new one refuses the value above as a `Holder`.
+        (false, "a use that does not widen in the new schema alone"),
+    ] {
+        let mut old = sdk_schema();
+        let mut new = with_hidden(&old);
+        if in_the_old {
+            old["$defs"]["Holder"] = not_a_route.clone();
+        } else {
+            new["$defs"]["Holder"] = not_a_route.clone();
+        }
+        let outcome = compare(
+            &old,
+            &new,
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", Some(LISTED)),
+        );
+        assert!(
+            outcome
+                .lines
+                .contains(&"Route.hidden added: a member".to_owned()),
+            "{says}: {:?}",
+            outcome.lines
+        );
+        assert!(outcome.passed.is_empty(), "{says}");
+    }
+}
+
 /// The public contract passes an optional member of a read-only metadata object only where the
 /// line is a member line of an open object of its own properties. A variant whose text holds a dot
 /// and a member of a variant have labels of the same form, so a definition named like their
@@ -2057,6 +2102,34 @@ fn a_member_of_a_read_only_metadata_object_passes_only_in_an_open_plain_object()
             "Info.note added: a member",
         ),
     ];
+    // A marked object that is closed or composed in one schema only is no open plain object there:
+    // the old schema refuses `note` when it is closed, and a composed one may restrict it.
+    let with_key = |with_member: bool, key: &str, value: Value| {
+        let mut definition = object(with_member);
+        definition[key] = value;
+        definition
+    };
+    let one_schema_only = [
+        (
+            with_key(false, "additionalProperties", json!(false)),
+            object(true),
+        ),
+        (
+            with_key(false, "allOf", json!([{ "type": "object" }])),
+            object(true),
+        ),
+        (
+            object(false),
+            with_key(true, "additionalProperties", json!(false)),
+        ),
+        (
+            object(false),
+            with_key(true, "allOf", json!([{ "type": "object" }])),
+        ),
+    ];
+    let rows = rows.into_iter().chain(
+        one_schema_only.map(|(old, new)| (schema(&old), schema(&new), "Info.note added: a member")),
+    );
     for (old, new, line) in rows {
         let lines = crate::public_contract::compare(&old, &new).expect("compares");
         assert!(
