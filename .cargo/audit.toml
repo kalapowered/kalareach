@@ -52,7 +52,7 @@ ignore = [
     # which the script holds, so only an archive that upstream's key signed reaches extraction. The
     # fix is in zip 9.0.0. The pinned crate, libsodium-sys-stable 1.24.0, asks for zip 8. Its
     # release 1.24.5 allows zip 9 but bundles a snapshot of libsodium's unreleased stable branch
-    # instead of the 1.0.22 release, and this workspace takes libsodium only at a release tag. The
+    # instead of the 1.0.22 release, and this workspace builds libsodium's source only at a release tag. The
     # host's own reader of a Windows release archive, in kr-cli, uses zip 9. Remove these once the
     # lock carries no zip older than 9.0.0.
     "RUSTSEC-2026-0367", # set-user-ID and set-group-ID bits kept
