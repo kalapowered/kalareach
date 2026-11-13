@@ -5,11 +5,20 @@
 #![cfg(all(windows, feature = "testing"))]
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 
 use kr_boundary_windows::manifest::{Manifest, forced};
-use kr_boundary_windows::win::install::{self, Options, Paths};
+use kr_boundary_windows::policy::Policy;
+use kr_boundary_windows::win::applocker::Channel;
+use kr_boundary_windows::win::install::{self, CHECKOUT, CONNECT, Options, Paths, SERVICE};
+use kr_boundary_windows::win::pipe::Kind as Pipe;
+use kr_boundary_windows::win::{account, registry, service, token};
+
+const SPECIAL_ACCOUNTS: &str =
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList";
 
 /// The cases change the process's current directory and the point where a failure is forced, which
 /// are the process's own: one runs at a time.
@@ -135,4 +144,159 @@ fn a_failure_after_the_folder_and_the_data_directory_were_made_leaves_nothing_of
             "{point}: something of the program tree was made: {text}"
         );
     }
+}
+
+/// What a case compares before and after: everything the installation may change.
+#[derive(Debug, PartialEq, Eq)]
+struct Snapshot {
+    policy: Policy,
+    appid_start: u32,
+    appid_running: bool,
+    accounts: [bool; 2],
+    service: bool,
+    program_dir: bool,
+    data_dir: bool,
+    data_parent: bool,
+    pipes_gone: bool,
+    hidden: Vec<String>,
+}
+
+fn snapshot() -> Snapshot {
+    let paths = Paths::system().expect("the system's folders are read");
+    let manager = service::manager().unwrap();
+    let appid = manager
+        .open("AppIDSvc")
+        .unwrap()
+        .expect("the Application Identity service exists");
+    let (_, policy) = Channel::new(&std::env::temp_dir()).effective().unwrap();
+    let mut hidden = registry::open(SPECIAL_ACCOUNTS)
+        .unwrap()
+        .map(|key| key.value_names().unwrap())
+        .unwrap_or_default();
+    hidden.sort();
+    Snapshot {
+        policy,
+        appid_start: appid.configuration().unwrap().0,
+        appid_running: appid.status().unwrap().running(),
+        accounts: [
+            account::find(CHECKOUT).unwrap().is_some(),
+            account::find(CONNECT).unwrap().is_some(),
+        ],
+        // A service that is deleted but still listed because a handle to it is open is gone.
+        service: manager
+            .open(SERVICE)
+            .unwrap()
+            .is_some_and(|service| !service.marked_for_deletion().unwrap()),
+        program_dir: paths.program.exists(),
+        data_dir: paths.data.exists(),
+        data_parent: paths.data_parent().exists(),
+        pipes_gone: [Pipe::Persons, Pipe::Administrators]
+            .iter()
+            .all(|kind| std::fs::metadata(kind.name()).is_err()),
+        hidden,
+    }
+}
+
+/// A new installation of the setup program that fails after the named step with the manifest
+/// damaged as `how` says, from a working directory of its own. Returns the exit code and the
+/// output, and checks that the rollback restored the earlier state and that no manifest stands in
+/// any other place than the data directory's.
+fn a_late_failure_with_a_damaged_manifest(how: &str) -> String {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        token::current_is_administrator().unwrap(),
+        "the case must run elevated"
+    );
+    let before = snapshot();
+    assert!(
+        !before.service
+            && before.accounts == [false, false]
+            && !before.data_dir
+            && !before.data_parent
+            && !before.program_dir
+            && before.pipes_gone,
+        "the machine is not clean: {before:?}"
+    );
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..6];
+    let person_name = format!("krperson{id}");
+    let person = account::create(&person_name).expect("the person's account is made");
+    let elsewhere: PathBuf = std::env::temp_dir().join(format!("krcurrent-{id}"));
+    std::fs::create_dir(&elsewhere).unwrap();
+    let bin = PathBuf::from(
+        std::env::var_os("KR_BOUNDARY_BIN")
+            .expect("KR_BOUNDARY_BIN names the directory with the setup program and its payloads"),
+    );
+    let mut command = Command::new(bin.join("kr-boundary-setup.exe"));
+    command
+        .args([
+            "install",
+            "--payload",
+            bin.join("payload").to_str().unwrap(),
+            "--person",
+            &person.to_text().unwrap(),
+        ])
+        .current_dir(&elsewhere)
+        .env("KR_BOUNDARY_FAIL_AFTER", "broker")
+        .env("KR_BOUNDARY_DAMAGE_MANIFEST", how)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("the setup program starts");
+    child.stdin.take().unwrap().write_all(b"yes\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!(
+        "--- kr-boundary-setup install, failure after the broker step, manifest {how} -> {:?}\n{text}",
+        output.status.code()
+    );
+    let _ = account::delete(&person_name);
+    assert_ne!(output.status.code(), Some(0), "{how}: {text}");
+    assert!(
+        text.contains("a failure was injected after the broker step"),
+        "{how}: {text}"
+    );
+    assert!(
+        !text.contains("could not be damaged"),
+        "{how}: the seam did not damage the manifest: {text}"
+    );
+    assert!(
+        text.contains("undoing what was done"),
+        "{how}: the rollback did not start: {text}"
+    );
+    assert!(
+        text.contains("the removal after the failure finished") && !text.contains("also failed"),
+        "{how}: the rollback did not end without a failure: {text}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "{how}: after the rollback the computer is as it was: {text}"
+    );
+    // No manifest stands anywhere that it should not: not in the working directory of the setup
+    // program, and not in the folder above the data directory, which is gone.
+    assert_eq!(
+        names_in(&elsewhere),
+        BTreeSet::new(),
+        "{how}: the setup program's working directory holds a file: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&elsewhere);
+    text
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_new_installation_that_fails_late_with_an_unreadable_manifest_is_rolled_back_to_the_earlier_state()
+ {
+    a_late_failure_with_a_damaged_manifest("garbage");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_new_installation_that_fails_late_with_an_absent_manifest_is_rolled_back_to_the_earlier_state()
+{
+    a_late_failure_with_a_damaged_manifest("absent");
 }
