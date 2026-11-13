@@ -18,11 +18,11 @@ use windows_sys::Win32::System::Services::{
     QueryServiceConfigW, QueryServiceStatusEx, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE,
     SC_MANAGER_ALL_ACCESS, SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
     SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS,
-    SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW,
-    SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_NO_CHANGE,
-    SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS,
-    StartServiceW,
+    SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_STOP,
+    SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_NO_CHANGE,
+    SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING,
+    SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
 };
 
 use super::ffi::{Result, error, from_wide, last, wide};
@@ -74,7 +74,8 @@ impl Status {
     }
 
     /// The state as a run that stops the service reads it: stopped, on its way to running or to
-    /// stopped, running, or another.
+    /// stopped, running, paused, on its way to either of those two, or a number that is none of
+    /// the seven that the service manager defines.
     #[must_use]
     pub fn broker_state(&self) -> crate::remedy::ServiceState {
         use crate::remedy::ServiceState;
@@ -82,7 +83,10 @@ impl Status {
             SERVICE_STOPPED => ServiceState::Stopped,
             SERVICE_START_PENDING | SERVICE_STOP_PENDING => ServiceState::Pending,
             SERVICE_RUNNING => ServiceState::Running,
-            _ => ServiceState::Other,
+            SERVICE_PAUSED => ServiceState::Paused,
+            SERVICE_PAUSE_PENDING => ServiceState::PausePending,
+            SERVICE_CONTINUE_PENDING => ServiceState::ContinuePending,
+            other => ServiceState::Unknown(other),
         }
     }
 }
