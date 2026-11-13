@@ -1256,14 +1256,47 @@ pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &s
 
 /// The words that end a rollback whose steps ended without a failure but that could not take away
 /// all that the run laid in the data directory's place: each object that stays, with the platform's
-/// words and, for a directory, the entries that it holds. They say what was read and no more, and
-/// give no step: nothing in them tells a person to move, remove or correct anything.
+/// words and, for a directory, the entries that it holds, and then each object that was marked for
+/// removal through the identity that the run kept of it, where there is one. They say what was read
+/// and no more, and give no step: nothing in them tells a person to move, remove or correct
+/// anything.
 #[must_use]
 // text: rollback_laid_stays
-pub fn rollback_laid_stays(stayed: &[String]) -> String {
+pub fn rollback_laid_stays(stayed: &[String], marked: &[String]) -> String {
+    let marked_words = if marked.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " It marked for removal, each through the identity that this run kept of it: {}.",
+            marked.join("; ")
+        )
+    };
     format!(
-        "The steps of the rollback ended without a failure, but this run could not take away all that it made: {}.",
+        "The steps of the rollback ended without a failure, but this run could not take away all that it made: {}.{marked_words}",
         stayed.join("; ")
+    )
+}
+
+/// The words that end a rollback whose steps ended without a failure and that took away all that
+/// the run laid in the data directory's place: each object that was marked for removal through
+/// the identity that the run kept of it, by its path, in the order that the rollback took them.
+/// They say that the records are deleted only where the run wrote records and marked each of them
+/// (`records_deleted`), and say nothing of records otherwise. Where the run held no object that it
+/// made, they say that nothing was marked. They give no step.
+#[must_use]
+// text: rollback_ending
+pub fn rollback_ending(marked: &[String], records_deleted: bool) -> String {
+    if marked.is_empty() {
+        return "the removal ended without a failure; this run held no object that it had made, so the rollback marked nothing for removal".to_owned();
+    }
+    let opening = if records_deleted {
+        "the removal ended without a failure and its records are deleted"
+    } else {
+        "the removal ended without a failure"
+    };
+    format!(
+        "{opening}. The rollback marked for removal, each through the identity that this run kept of it: {}",
+        marked.join("; ")
     )
 }
 
