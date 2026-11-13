@@ -125,10 +125,9 @@ impl LocalWrite {
             _ if crate::attention::AttentionModule::serves(method) => Self::Attention,
             _ if crate::changeset::ChangeSetModule::serves(method) => Self::ChangeSet,
             // Neither the daemon nor a worker's request table serves these: the palette is no
-            // action of a request, raw input is an ordered stream with no action identity, and the
-            // root editor's frames travel to the worker on its own stream.
+            // action of a request, and the root editor's frames travel to the worker on its own
+            // stream.
             Method::TerminalPaletteSet
-            | Method::InputWrite
             | Method::RootEditorEnter
             | Method::RootEditorLeave
             | Method::RootEditorFence

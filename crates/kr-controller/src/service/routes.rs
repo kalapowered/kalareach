@@ -165,17 +165,10 @@ impl Controller {
         // door made and without asking the admission, so what it gives back as a copy goes back
         // only under the authority this attempt arrived under, asked with the answer in hand.
         // The conflict of a reused identifier is no copy, and is held to the same check.
-        let reused = given.origin() == crate::given::Origin::Fresh
-            && matches!(given.answer_ref(), Err(refusal) if refusal.code == ErrorCode::IdConflict);
-        if (given.is_copied() || reused)
+        if given.is_held_to_the_strict_check()
             && let Err(refusal) = self.check_retained_in_hand(&carried).await
         {
-            let refusal = Err(refusal.to_protocol_error());
-            return if given.is_copied() {
-                Given::withheld(refusal)
-            } else {
-                Given::fresh(refusal)
-            };
+            return given.refused_by(refusal.to_protocol_error());
         }
         given
     }
