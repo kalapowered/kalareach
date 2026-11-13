@@ -7130,13 +7130,14 @@ async fn a_deadline_that_passes_while_the_call_waits_on_the_service_refuses_it_a
     assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
 }
 
-/// KR-REQ-09.09: a call that ends with an answer that tells no delay is given that answer as it
-/// ended, though a fence landed while the read that settles its bundle write was out. Only an answer
-/// that tells a delay is held to the admission again, so a fence that meets no delay does not turn an
-/// unknown or a decline into a refusal; the command repeats the unknown at a door that meets the
-/// fence. In the first phase the read finds no bundle, because the write the service held open acted
-/// on nothing; in the second it finds other bytes at the locator. The control: with the fence let go,
-/// the same call records the setup.
+/// KR-REQ-09.09: a call that ends with an answer that tells no delay, though a fence landed while
+/// the read that settles its bundle write was out, is not shown that answer: it is told that what
+/// became of the action is not shown, because the answer is a result of this request's own attempt
+/// and the authority it stood on has gone. Only an answer that tells a delay is held to the
+/// admission again inside the service, so the service ends the call as it found it and the door
+/// withholds the result. In the first phase the read finds no bundle, because the write the service
+/// held open acted on nothing; in the second it finds other bytes at the locator. The control: with
+/// the fence let go, the same call records the setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves_an_answer_that_tells_no_delay_as_it_is()
  {
@@ -7151,16 +7152,15 @@ async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves
     within("the read that settles it", web.requests_reach(SYNC, 2)).await;
     rig.controller.hold_fence(true);
     web.release_held();
-    let answer = call
+    let told = call
         .await
         .expect("the call ends")
-        .expect("an unknown that tells no delay is answered while a fence is owed");
+        .expect_err("a result is not shown while a fence is owed");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
     assert!(
-        matches!(
-            &answer,
-            BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_none()
-        ),
-        "{answer:?}"
+        told.message.contains("may have been carried out"),
+        "{}",
+        told.message
     );
     assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
     assert!(rig.controller.backup().setup().expect("a read").is_none());
@@ -7171,8 +7171,8 @@ async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves
         BackupEnableResult::Enabled { .. }
     ));
 
-    // A decline is given as it ended too: the locator holds other bytes, so the write is refused and
-    // the read that settles it finds them.
+    // A decline is a result too, and is not shown: the locator holds other bytes, so the write is
+    // refused and the read that settles it finds them.
     let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
@@ -7186,14 +7186,11 @@ async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves
     within("the read that settles it", web.requests_reach(SYNC, 2)).await;
     rig.controller.hold_fence(true);
     web.release_held();
-    assert_eq!(
-        call.await
-            .expect("the call ends")
-            .expect("a decline is answered while a fence is owed"),
-        BackupEnableResult::Declined {
-            cause: BackupEnableCause::BundleConflict {}
-        }
-    );
+    let told = call
+        .await
+        .expect("the call ends")
+        .expect_err("a decline is not shown while a fence is owed");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 }
 
 /// The seconds a call that ended as unknown was told to wait, when it was told some.
@@ -7654,14 +7651,33 @@ async fn a_repeat_answered_from_the_recorded_setup_is_refused_when_a_fence_lands
     .await;
     rig.controller.hold_fence(true);
     web.release_held();
-    for call in [holding, repeat] {
-        let refusal = call
-            .await
-            .expect("the call ends")
-            .expect_err("a call is refused while a fence is owed");
-        assert_eq!(refusal.code, ErrorCode::PermissionDenied);
-        assert!(refusal.message.contains("fence"), "{}", refusal.message);
-    }
+    let held = holding
+        .await
+        .expect("the call ends")
+        .expect_err("a call that has something to do is refused while a fence is owed");
+    let repeated = repeat
+        .await
+        .expect("the call ends")
+        .expect_err("a repeat is not answered while a fence is owed");
+    assert_eq!(
+        held.code,
+        ErrorCode::PermissionDenied,
+        "{held:?} {repeated:?}"
+    );
+    assert!(held.message.contains("fence"), "{}", held.message);
+    // The repeat would be answered from the setup the first call recorded, which is a copy: the
+    // door does not show it once the fence is owed, and says that what became of the action is not
+    // shown, not that the host refused.
+    assert_eq!(
+        repeated.code,
+        ErrorCode::OutcomeUnknown,
+        "{held:?} {repeated:?}"
+    );
+    assert!(
+        repeated.message.contains("may have been carried out"),
+        "{}",
+        repeated.message
+    );
 
     rig.controller.hold_fence(false);
     assert!(matches!(
@@ -7714,14 +7730,32 @@ async fn a_repeat_answered_from_the_recorded_setup_is_refused_when_its_registrat
         .await
         .expect("the authority is withdrawn");
     web.release_held();
-    for call in [holding, repeat] {
-        let refusal = call
-            .await
-            .expect("the call ends")
-            .expect_err("a call whose registration is gone is refused");
-        assert_eq!(refusal.code, ErrorCode::PermissionDenied);
-        assert!(refusal.message.contains("withdrawn"), "{}", refusal.message);
-    }
+    let held = holding
+        .await
+        .expect("the call ends")
+        .expect_err("a call whose registration is gone is refused");
+    let repeated = repeat
+        .await
+        .expect("the call ends")
+        .expect_err("a repeat whose registration is gone is not answered");
+    assert_eq!(
+        held.code,
+        ErrorCode::PermissionDenied,
+        "{held:?} {repeated:?}"
+    );
+    assert!(held.message.contains("withdrawn"), "{}", held.message);
+    // The repeat would be answered from the recorded setup, which is a copy: it is not shown to a
+    // connection whose registration is gone.
+    assert_eq!(
+        repeated.code,
+        ErrorCode::OutcomeUnknown,
+        "{held:?} {repeated:?}"
+    );
+    assert!(
+        repeated.message.contains("may have been carried out"),
+        "{}",
+        repeated.message
+    );
 
     assert!(matches!(
         rig.enable(&made.params).await,

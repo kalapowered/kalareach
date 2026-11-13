@@ -8532,8 +8532,10 @@ impl kr_controller::push::transport::DeliveryTransports for HeldWhereToSend {
 
 /// KR-REQ-24.29: the authority a deletion was admitted under is asked again immediately before
 /// the request is put, after the credential is found and the transport is resolved. A person whose
-/// registration is withdrawn while the host works out where to send has the call refused, and
-/// nothing leaves the host.
+/// registration is withdrawn while the host works out where to send has nothing sent, and is not
+/// shown the call's answer: the deletion's whole answer is a copy of older export records, so the
+/// door tells it as an outcome that is not shown once the registration it was admitted under is
+/// gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_registration_withdrawn_while_a_deletion_finds_its_transport_sends_nothing() {
     let gateway = Arc::new(DeliveringGateway::default());
@@ -8560,7 +8562,16 @@ async fn a_registration_withdrawn_while_a_deletion_finds_its_transport_sends_not
     });
 
     let error = answer.expect_err("the registration the call was admitted under is gone");
-    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{error:?}"
+    );
+    assert!(
+        error.message.contains("may have been carried out"),
+        "{}",
+        error.message
+    );
     assert!(gateway.forgets().is_empty(), "nothing left the host");
     host.stop().await;
 }
