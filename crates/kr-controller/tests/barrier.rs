@@ -124,6 +124,7 @@ struct Worker {
     /// First, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
     _serving: Option<kr_ipc::testing::Serving>,
+    _closing: kr_worker::testing::ClosedOnDrop,
     runtime: Arc<SessionRuntime>,
     service: Arc<WorkerService>,
     session_id: SessionId,
@@ -237,6 +238,7 @@ async fn worker_serving(apart: bool) -> Worker {
     Worker {
         _apart: apart_worker,
         _serving: serving,
+        _closing: kr_worker::testing::ClosedOnDrop::of(&runtime),
         _temp: temp,
         runtime,
         service,
@@ -1870,6 +1872,7 @@ struct Hosted {
     /// First, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
     _serving: Option<kr_ipc::testing::Serving>,
+    _closing: kr_worker::testing::ClosedOnDrop,
     controller: Arc<Controller>,
     client_endpoint: kr_ipc::paths::Endpoint,
     endpoint: kr_ipc::paths::Endpoint,
@@ -2185,6 +2188,7 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
     Hosted {
         _apart: apart_worker,
         _serving: serving,
+        _closing: kr_worker::testing::ClosedOnDrop::of(&runtime),
         _temp: Arc::clone(&daemon.temp),
         controller: Arc::clone(&daemon.controller),
         client_endpoint,

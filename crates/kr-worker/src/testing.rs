@@ -598,3 +598,34 @@ impl TerminalWrites {
             .clone()
     }
 }
+
+/// A session that is closed when this is dropped.
+///
+/// A session that is only dropped is not ended: the worker service and the tasks it started hold
+/// its runtime, and with it the session's journal, until the test's runtime ends. A fixture keeps
+/// this as a field declared before its directory, so that the close is asked for before the
+/// directory is removed. The close is asked for and not waited for: the journal is let go of a
+/// moment later, which is what the removal of the directory is tried again for.
+pub struct ClosedOnDrop(std::sync::Arc<crate::runtime::SessionRuntime>);
+
+impl ClosedOnDrop {
+    /// Closes `runtime`'s session when this is dropped.
+    #[must_use]
+    pub fn of(runtime: &std::sync::Arc<crate::runtime::SessionRuntime>) -> Self {
+        Self(std::sync::Arc::clone(runtime))
+    }
+}
+
+impl Drop for ClosedOnDrop {
+    fn drop(&mut self) {
+        // A case that failed may have left the session's lock poisoned, and a panic in a drop
+        // while another is unwinding ends the process.
+        if std::thread::panicking() {
+            return;
+        }
+        self.0
+            .close(kr_protocol::session::ClosureReason::CloseRequested)
+            .1
+            .release();
+    }
+}

@@ -45,6 +45,7 @@ struct Hosted {
     service: Arc<WorkerService>,
     _pipes: Pipes,
     _serving: kr_ipc::testing::Serving,
+    _closing: kr_worker::testing::ClosedOnDrop,
     // Declared last: the directory is removed after every field above has let go of its files.
     temp: Arc<kr_ipc::testing::TempHost>,
 }
@@ -282,6 +283,7 @@ async fn session_in(
         service,
         _pipes: Pipes { directory },
         _serving: serving,
+        _closing: kr_worker::testing::ClosedOnDrop::of(&runtime),
     }
 }
 

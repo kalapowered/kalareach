@@ -100,6 +100,7 @@ struct Worker {
     _view: kr_worker::output::OutputStream,
     _service: Arc<WorkerService>,
     _serving: kr_ipc::testing::Serving,
+    _closing: kr_worker::testing::ClosedOnDrop,
 }
 
 impl Worker {
@@ -242,6 +243,7 @@ impl Worker {
         )
         .expect("the worker's descriptor is published");
         Self {
+            _closing: kr_worker::testing::ClosedOnDrop::of(&runtime),
             runtime,
             session_id,
             epoch,
