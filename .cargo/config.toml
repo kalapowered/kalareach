@@ -20,14 +20,14 @@
 # fixing it would mean building libsodium from source on every Windows machine.
 [target.x86_64-pc-windows-msvc]
 rustflags = [
-  "-Clink-arg=/NODEFAULTLIB:LIBCMT",
+  "-Ctarget-feature=+crt-static",
   "-Clink-arg=/NODEFAULTLIB:LIBCMTD",
   "-Clink-arg=/IGNORE:4099",
 ]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = [
-  "-Clink-arg=/NODEFAULTLIB:LIBCMT",
+  "-Ctarget-feature=+crt-static",
   "-Clink-arg=/NODEFAULTLIB:LIBCMTD",
   "-Clink-arg=/IGNORE:4099",
 ]
@@ -59,3 +59,5 @@ GGML_AVX512_BF16 = { value = "OFF", force = true }
 GGML_AMX_TILE = { value = "OFF", force = true }
 GGML_AMX_INT8 = { value = "OFF", force = true }
 GGML_AMX_BF16 = { value = "OFF", force = true }
+LLAMA_STATIC_CRT = { value = "1", force = true }
+CMAKE_MSVC_RUNTIME_LIBRARY = { value = "MultiThreaded", force = true }
