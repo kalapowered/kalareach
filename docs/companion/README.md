@@ -1269,12 +1269,15 @@ Screenshots from the end-to-end run go to `/tmp`, named for what they show.
 pnpm -C apps/companion desktop build
 ```
 
-This wraps `tauri build` to build for the current machine and bundle for the bundles listed in
-`tauri.conf.json`. The macOS bundles are the app bundle and the `.dmg` disk image. On Linux it
-bundles the `.deb`, `.rpm` and AppImage bundles. On Windows it bundles the MSI and NSIS installers.
-All options are forwarded to `tauri build` as given, except that the command refuses `--runner`,
-`--no-bundle` and a first word other than `build`. It also errors if `--target` is set to a Windows
-target triple on a non-Windows machine.
+This wraps `tauri build` to build for the current machine and make the bundles that `bundle.targets`
+in `tauri.conf.json` names, which is every format the platform supports. The macOS bundles are the
+app bundle and the `.dmg` disk image. On Linux it bundles the `.deb`, `.rpm` and AppImage bundles.
+On Windows it bundles the MSI and NSIS installers. All options are forwarded to `tauri build` as
+given. The command gives it cargo as its runner, and it refuses `--runner`, `--no-bundle`,
+`--bundles` with no value, a first word other than `build`, and cargo's own `--config` and
+`--target` after a bare `--`. It also errors if `--target` or `CARGO_BUILD_TARGET` names a Windows
+target triple on a non-Windows machine, or an MSVC target other than `x86_64-pc-windows-msvc` and
+`aarch64-pc-windows-msvc` on Windows.
 
 What each platform needs:
 
@@ -1292,21 +1295,24 @@ The `companion-bundle` workflow builds and reads the Windows bundle. No job buil
 Linux bundle.
 
 The application itself links against the dynamic Visual C++ runtime. The workspace's
-`.cargo/config.toml` excludes the static runtime from the linker options for all MSVC builds because
-the C library the workspace vendors asks for the static runtime. This causes problems with the
-static and dynamic runtime both being linked because then there are two heaps and two copies of the
-runtime state. The Tauri command line sets `STATIC_VCRUNTIME=true` in the environment for the
-desktop build unless it's already `false`. The build script refuses a build that asks for the static
-runtime. To avoid this error this command sets it to `false` on Windows, whatever the environment
-holds. If it was already set to something else it prints the previous value and that it's replacing
-it.
+`.cargo/config.toml` excludes the static runtime from the linker options for the
+`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` targets because the C library the workspace
+vendors asks for the static runtime. This causes problems with the static and dynamic runtime both
+being linked because then there are two heaps and two copies of the runtime state. The Tauri command
+line sets `STATIC_VCRUNTIME=true` in the environment for the desktop build unless it's already
+`false`. The build script refuses a build that asks for the static runtime. To avoid this error this
+command sets it to `false` on Windows, whatever the environment holds. If it was already set to
+something else it prints the previous value and that it's replacing it. Each Windows build prints
+tauri-build's warning that `STATIC_VCRUNTIME` is deprecated, which is expected while the
+variable is set.
 
-On Windows the build takes its rustflags from the repository's `.cargo/config.toml` file alone. If
-any of `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` or `CARGO_TARGET_*_RUSTFLAGS`
-are set in the environment then it errors and explains why. The first two replace the link options
-in the file, and the other two are a second source of flags that the command does not take. Running
-`tauri build` without using this command on Windows causes the build to error in a build script with
-a message naming this command.
+On Windows the build takes its rustflags from the repository's `.cargo/config.toml` file alone, as
+far as the environment and the command's arguments reach. If any of `RUSTFLAGS`,
+`CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` or `CARGO_TARGET_*_RUSTFLAGS` are set in the
+environment then it errors and explains why. The first two replace the link options in the file, and
+the other two are a second source of flags that the command does not take. Running `tauri build` on
+Windows without this command, with `STATIC_VCRUNTIME` not already `false`, causes the build to error
+in a build script with a message naming this command.
 
 The `companion-bundle` workflow runs when manually dispatched and when pushed to main and a file in
 the package's native code, this command or this workflow file is modified. It builds the application
@@ -1318,9 +1324,10 @@ runtime's are. Then it installs the NSIS installer in a temporary directory with
 make it silent. After installing it lists all the files and uses `dumpbin` on the installed
 executable again. Then it uninstalls it. Then it extracts the MSI installer using the administrative
 install option which doesn't actually install or register anything. Then it lists the files and
-again runs `dumpbin` on the executable. In the last two `dumpbin` runs it also lists where each
-import resolves. The Visual C++ runtime comes from the runner, because neither installer carries it.
-It never runs the application. It doesn't upload anything.
+again runs `dumpbin` on the executable. In the last two `dumpbin` runs it also classifies each
+import by name as beside the executable, a Windows API set, a Windows system library or the Visual
+C++ runtime, and that does not fail the job. The Visual C++ runtime comes from the runner, because
+neither installer carries it. It never runs the application. It doesn't upload anything.
 
 The installers bring the program alone, so the Visual C++ runtime must already be on the machine. No
 Windows bundle is released until that is settled.
