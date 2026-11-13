@@ -1024,6 +1024,10 @@ pub struct Piped {
     /// process that is not shown to have ended still holds the child's output, unless a read
     /// failed (`failed`), which shows nothing of the pipe.
     pub ended: bool,
+    /// Whether the last look at the pipe showed it open: it answered that nothing was waiting while
+    /// a writer still held it. A pipe that was not read at all (the deadline came first), one whose
+    /// last read returned data, and one whose read failed are none of them shown open.
+    pub open: bool,
     /// The error of a look at the pipe or a read of it that failed, where one did: the pipe's end
     /// is then neither shown nor refuted.
     pub failed: Option<ffi::Error>,
@@ -1042,6 +1046,7 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant, stop: Option<&Stop>) -> Piped
     // job that keeps the pipe open must not hold a service that is stopping until the run's deadline.
     let mut limit = deadline;
     let mut stop_seen = false;
+    let mut open = false;
     loop {
         if !stop_seen && stop.is_some_and(Stop::is_set) {
             stop_seen = true;
@@ -1051,6 +1056,7 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant, stop: Option<&Stop>) -> Piped
             return Piped {
                 bytes: kept,
                 ended: false,
+                open,
                 failed: None,
             };
         }
@@ -1058,9 +1064,11 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant, stop: Option<&Stop>) -> Piped
         // failure of the look or the read is the error, which neither shows nor refutes the end.
         match ffi::pipe_read(pipe, &mut chunk) {
             Ok(ffi::PipeRead::Empty) => {
+                open = true;
                 std::thread::sleep(PIPE_POLL.min(limit.saturating_duration_since(Instant::now())));
             }
             Ok(ffi::PipeRead::Data(read)) => {
+                open = false;
                 let room = CAPTURE_LIMIT.saturating_sub(kept.len());
                 kept.extend_from_slice(&chunk[..(read as usize).min(room)]);
             }
@@ -1068,6 +1076,7 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant, stop: Option<&Stop>) -> Piped
                 return Piped {
                     bytes: kept,
                     ended: true,
+                    open: false,
                     failed: None,
                 };
             }
@@ -1075,6 +1084,7 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant, stop: Option<&Stop>) -> Piped
                 return Piped {
                     bytes: kept,
                     ended: false,
+                    open: false,
                     failed: Some(failure),
                 };
             }

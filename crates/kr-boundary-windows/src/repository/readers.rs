@@ -176,13 +176,12 @@ pub fn reader_line(reader: Reader, argument: Option<&str>) -> Result<OperationLi
     };
     #[expect(
         clippy::disallowed_methods,
-        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+        reason = "a revision that does not qualify fails this test and falls to the last arm of the match below, which refuses the line: the argument is text from the request, and a failed parse ends in a refusal"
     )]
+    let qualifies = |spec: &str| qualified_revision(spec).is_ok();
     let last = match (form.argument, argument) {
         (Argument::Nothing, None) => None,
-        (Argument::Revision, Some(spec)) if qualified_revision(spec).is_ok() => {
-            Some(format!("{spec}^{{commit}}"))
-        }
+        (Argument::Revision, Some(spec)) if qualifies(spec) => Some(format!("{spec}^{{commit}}")),
         (Argument::RefName, Some(name))
             if name.len() <= MAX_REF_NAME_BYTES
                 && name.strip_prefix(BRANCH_PREFIX).is_some_and(is_branch_name) =>
@@ -242,7 +241,7 @@ pub fn parse_r1(output: &Output<'_>, name: &str) -> Result<String, Refusal> {
     }
     #[expect(
         clippy::disallowed_methods,
-        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+        reason = "output of the Git program that is not one object name and a newline is refused by the failure that follows ('ok_or_else'), so a failed parse ends in a refusal"
     )]
     let line = output
         .stdout
@@ -338,12 +337,12 @@ fn listing<'a>(form: &ReaderForm, stdout: &'a [u8]) -> Result<Vec<&'a [u8]>, Ref
 fn mode_of(text: &[u8]) -> Option<u32> {
     #[expect(
         clippy::disallowed_methods,
-        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+        reason = "a mode that is not valid text gives none, and every caller refuses a listing line whose mode is none (malformed)"
     )]
     let text = std::str::from_utf8(text).ok()?;
     #[expect(
         clippy::disallowed_methods,
-        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+        reason = "a mode that is not one of the listed modes in octal gives none, and every caller refuses a listing line whose mode is none (malformed)"
     )]
     let mode = MODES
         .contains(&text)
@@ -355,7 +354,7 @@ fn mode_of(text: &[u8]) -> Option<u32> {
 fn oid_of(text: &[u8]) -> Option<String> {
     #[expect(
         clippy::disallowed_methods,
-        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+        reason = "an object name that is not valid text or not an object name gives none, and every caller refuses a listing line whose object name is none (malformed)"
     )]
     let oid = std::str::from_utf8(text)
         .ok()
@@ -548,7 +547,7 @@ pub fn parse_r5<'a>(requested: &[String], output: &Output<'a>) -> Result<Vec<&'a
         }
         #[expect(
             clippy::disallowed_methods,
-            reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+            reason = "a size that is not digits is refused by the framing failure that follows ('an answer's size is malformed'), so a failed parse ends in a refusal"
         )]
         let size = match (kind, size) {
             (b"blob", Some(size)) => std::str::from_utf8(size)
@@ -559,7 +558,7 @@ pub fn parse_r5<'a>(requested: &[String], output: &Output<'a>) -> Result<Vec<&'a
         };
         #[expect(
             clippy::disallowed_methods,
-            reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+            reason = "a size that does not parse, or that is over the bound, is refused by the failure that follows ('a blob is too large'), so a failed parse ends in a refusal"
         )]
         let size = size
             .parse::<usize>()

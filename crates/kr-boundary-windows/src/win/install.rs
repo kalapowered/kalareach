@@ -4251,7 +4251,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 if let Some(shared) = shared {
                     // text: remove_at-22-present
                     say(&format!(
-                        "the policy shows no difference from the present policy without the installation's rules ({}, so the earlier-state record is not the comparison{}); {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there",
+                        "the policy shows no difference from the present policy without the installation's two deny rules ({}, so the earlier-state record is not the comparison{}); {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there",
                         shared.words(),
                         if shared.allow_all_stays {
                             "; the allow-all rule stays"

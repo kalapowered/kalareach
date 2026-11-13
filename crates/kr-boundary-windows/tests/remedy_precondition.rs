@@ -247,7 +247,7 @@ fn a_permission_list_that_the_check_cannot_evaluate_is_not_said_to_let_others_ch
         assert_eq!(
             bare,
             format!(
-                "A look at {path} found that it has no permission list, so anyone may change it."
+                "A look at {path} found that it has no permission list, which by itself refuses nobody."
             )
         );
         for text in [&allows, &inherited, &owner, &no_list]

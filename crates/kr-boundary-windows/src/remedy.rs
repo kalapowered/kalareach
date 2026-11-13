@@ -416,7 +416,7 @@ impl std::fmt::Display for Finding {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Finding::Granted(Grant::NoList) => {
-                out.write_str("it has no permission list, so anyone may change it")
+                out.write_str("it has no permission list, which by itself refuses nobody")
             }
             Finding::Granted(
                 Grant::Owner(words) | Grant::OnWhatIsMade(words) | Grant::Allows(words),
