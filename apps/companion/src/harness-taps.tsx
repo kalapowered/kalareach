@@ -19,7 +19,7 @@ import { useEffect, type ReactNode } from 'react'
 import type { FakeHostControls } from './host/fake'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
-/** The build session, whose conversation holds one line before anything is added: the short conversation's. */
+/** The build session, whose conversation the short conversation's one message replaces. */
 const SHORT_SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
 /**
@@ -46,16 +46,17 @@ const TAP_MESSAGES: readonly string[] = [
   'The last words of the conversation end with [a link](https://example.org/last-line)'
 ]
 
-/** A conversation shorter than the pane: one message, which is the link alone, in a session that holds one other line. */
-const SHORT_MESSAGES: readonly string[] = ['[a short link](https://example.org/short-last)']
+/** A conversation shorter than the pane at either text size: one message, the link alone. */
+const SHORT_MESSAGE = '[a short link](https://example.org/short-last)'
 
-/** Puts the messages of the taps on the first session, or the short conversation's one message on the second. */
+/** Puts the messages of the taps on the first session, or the short conversation's one message alone on the second. */
 export function fillForTaps(controls: FakeHostControls, short = false): void {
   // The link at the end of a line has its words end at the pane's right edge, as a full line's last word does.
   const style = document.createElement('style')
   style.textContent = ".m-node p:has(.md-link[title$='at-end']) { text-align: justify; text-align-last: justify; }"
   document.head.append(style)
-  for (const message of short ? SHORT_MESSAGES : TAP_MESSAGES) controls.records.appendEntry(short ? SHORT_SESSION : SESSION, 'message', message)
+  if (short) controls.records.beginWith(SHORT_SESSION, 'message', SHORT_MESSAGE)
+  else for (const message of TAP_MESSAGES) controls.records.appendEntry(SESSION, 'message', message)
   document.dispatchEvent(new Event('visibilitychange'))
 }
 

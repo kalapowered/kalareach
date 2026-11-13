@@ -162,7 +162,11 @@ final class LinkTapTests: HarnessTestCase {
 
     /// Taps a point of the page, or holds a finger on it for `hold` seconds, and reports what happened after the last
     /// event the record had before.
-    private func tap(_ label: String, at point: CGPoint, shift: CGVector, hold: TimeInterval = 0) -> Result {
+    ///
+    /// `within` holds the page's own pointer point to the requested point: the tap fails where the page saw the pointer farther
+    /// from the point than that on either axis, so a calibration that is wrong fails the tap and does not move the samples.
+    /// `clickExpected` is false for a press that the platform may leave without a click (a long press).
+    private func tap(_ label: String, at point: CGPoint, shift: CGVector, hold: TimeInterval = 0, clickExpected: Bool = true, within tolerance: CGFloat? = nil) -> Result {
         let before = events().last?.order ?? 0
         let openedBefore = opened().count
         if hold > 0 {
@@ -175,9 +179,22 @@ final class LinkTapTests: HarnessTestCase {
         let now = opened()
         let result = Result(label: label, events: seen, opened: Array(now.dropFirst(openedBefore)), focus: recordText("TAPFOCUS"))
         report(result, at: point)
-        if let disagreement = lookDisagreement(result) { XCTFail("\(label): the pressed look and the click disagree: \(disagreement)") }
+        if let tolerance {
+            if let down = seen.first(where: { $0.type == "pointerdown" }) {
+                XCTAssertLessThanOrEqual(abs(down.point.x - point.x), tolerance, "\(label): the page saw the pointer at x \(down.point.x), the requested point is x \(point.x)")
+                XCTAssertLessThanOrEqual(abs(down.point.y - point.y), tolerance, "\(label): the page saw the pointer at y \(down.point.y), the requested point is y \(point.y)")
+            } else {
+                XCTFail("\(label): the page saw no pointer down")
+            }
+        }
+        if let disagreement = lookDisagreement(result, clickExpected: clickExpected) { XCTFail("\(label): the pressed look and the click disagree: \(disagreement)") }
         return result
     }
+
+    /// How far the page's own pointer point may lie from the requested point on either axis, in points, for the taps of a
+    /// link's boundary. The inside taps lie 1 point inside an edge and the outside taps 3 points outside it, and a first
+    /// tap sets the screen offset, so a tap that lands farther than this from its point is not a sample of that boundary.
+    private static let pointerTolerance: CGFloat = 1.5
 
     /// Drags from a point of the page to another, slowly enough for the page to scroll with the finger.
     private func drag(_ label: String, from point: CGPoint, by distance: CGVector, shift: CGVector) -> Result {
@@ -199,7 +216,20 @@ final class LinkTapTests: HarnessTestCase {
         let list = result.events.map {
             "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail),\($0.kind) pointer \($0.pointer) \($0.pointerType),at \(String(format: "%.1f %.1f", $0.point.x, $0.point.y)))"
         }.joined(separator: " ")
-        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit at the press: \(result.events.first(where: { $0.type == "pointerdown" })?.lit ?? "nothing") | press-to-click: \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit at the press: \(result.events.first(where: { $0.type == "pointerdown" })?.lit ?? "nothing") | press-to-click(\(clickKind(result))): \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | pointer point off by \(pointerOff(result, at: point)) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+    }
+
+    /// What the system's click landed on, for the two distances that are logged apart: `element` (a link's button or another
+    /// control, where the platform's adjustment or the tap itself chose it) and `plain text` (where only the page decides).
+    private func clickKind(_ result: Result) -> String {
+        guard let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else { return "none" }
+        return click.target.contains("md-link") || click.target.hasPrefix("button") ? "element" : "plain text"
+    }
+
+    /// How far the page's own pointer point lay from the point that was requested, as two signed numbers.
+    private func pointerOff(_ result: Result, at point: CGPoint) -> String {
+        guard let down = result.events.first(where: { $0.type == "pointerdown" }) else { return "-" }
+        return String(format: "%.1f %.1f", down.point.x - point.x, down.point.y - point.y)
     }
 
     /// How far the system's click lay from the press that made it, in points, or nil where no click came.
@@ -214,11 +244,14 @@ final class LinkTapTests: HarnessTestCase {
         return String(target[target.index(after: open)..<target.index(before: target.endIndex)])
     }
 
-    /// The look at the press against what the tap did, or nil where they agree. Where the system's click names plain
+    /// The look at the press against what the tap did, or nil where they agree. A tap with no trusted click of the system's
+    /// does not agree (unless `clickExpected` is false). Where the system's click names plain
     /// text the page decided, and the look at the press is the open at the release; where it names a link's button or
     /// another control, the system decided, and the look lit nothing or that same link.
-    private func lookDisagreement(_ result: Result) -> String? {
-        guard let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else { return nil }
+    private func lookDisagreement(_ result: Result, clickExpected: Bool = true) -> String? {
+        // Without the system's click there is nothing to hold the look to: a tap that gets none fails, since the look
+        // would then pass whatever it lit.
+        guard let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else { return clickExpected ? "no trusted click arrived" : nil }
         let lit = result.events.first(where: { $0.type == "pointerdown" })?.lit
         if click.target.contains("md-link") {
             let name = linkName(of: click.target)
@@ -322,13 +355,15 @@ final class LinkTapTests: HarnessTestCase {
         let step: CGFloat = 3
         let xs = [left, (left + right) / 2, right]
         let ys = [top, (top + bottom) / 2, bottom]
-        let centre = tap("\(named): \(edge.name), the words' middle", at: CGPoint(x: words.midX, y: words.midY), shift: edgeShift)
+        // The first tap sets the screen offset, and fails where the page saw the pointer 4 points or more from the point:
+        // that is a wrong frame, not an offset to calibrate by.
+        let centre = tap("\(named): \(edge.name), the words' middle", at: CGPoint(x: words.midX, y: words.midY), shift: edgeShift, within: 4)
         // The system's frame of a link's button is not its page box to the point, and a tap at the area's edge is
         // within a point of the page's own area: the first tap's own position says where the page's coordinates lie.
         if let down = centre.events.first(where: { $0.type == "pointerdown" }) {
             let miss = CGVector(dx: words.midX - down.point.x, dy: words.midY - down.point.y)
             say("LINKTAP \(named): \(edge.name), the first tap landed \(miss.dx) \(miss.dy) points from the words' middle")
-            if abs(miss.dx) < 4 && abs(miss.dy) < 4 { edgeShift = CGVector(dx: edgeShift.dx + miss.dx, dy: edgeShift.dy + miss.dy) }
+            edgeShift = CGVector(dx: edgeShift.dx + miss.dx, dy: edgeShift.dy + miss.dy)
         }
         expectOpened(centre, edge.name)
         for (row, y) in ys.enumerated() {
@@ -336,12 +371,12 @@ final class LinkTapTests: HarnessTestCase {
                 // Inward is the direction from the side toward the area's middle: plus at the left and top.
                 let toward = CGVector(dx: column == 0 ? 1 : column == 2 ? -1 : 0, dy: row == 0 ? 1 : row == 2 ? -1 : 0)
                 let label = "\(named): \(edge.name), the area's \(["top", "middle", "bottom"][row]) \(["left", "centre", "right"][column])"
-                let onEdge = tap("\(label), at its edge", at: CGPoint(x: x + toward.dx * inset, y: y + toward.dy * inset), shift: edgeShift)
+                let onEdge = tap("\(label), at its edge", at: CGPoint(x: x + toward.dx * inset, y: y + toward.dy * inset), shift: edgeShift, within: Self.pointerTolerance)
                 expectOpened(onEdge, edge.name)
                 let outside = CGPoint(x: x - toward.dx * step, y: y - toward.dy * step)
                 // A step outside a side that is the pane's own edge lies outside the pane: no tap there.
                 if !room.contains(outside) { continue }
-                let beyond = tap("\(label), one step outside", at: outside, shift: edgeShift)
+                let beyond = tap("\(label), one step outside", at: outside, shift: edgeShift, within: Self.pointerTolerance)
                 if edge.box.intersection(edge.view).contains(outside) {
                     expectOnTheLinksButton(beyond, edge.name)
                 } else {
@@ -350,7 +385,7 @@ final class LinkTapTests: HarnessTestCase {
             }
         }
         if edge.name == "at-end" {
-            let outermost = tap("\(named): \(edge.name), the pane's right-most column", at: CGPoint(x: room.maxX - 1, y: words.midY), shift: edgeShift)
+            let outermost = tap("\(named): \(edge.name), the pane's right-most column", at: CGPoint(x: room.maxX - 1, y: words.midY), shift: edgeShift, within: Self.pointerTolerance)
             expectOpened(outermost, edge.name)
         }
     }
@@ -383,6 +418,7 @@ final class LinkTapTests: HarnessTestCase {
     private func expectOnTheLinksButton(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertFalse(result.events.contains { $0.type == "click" && !$0.trusted }, "\(result.label): the page added a click on the link's own button", file: file, line: line)
         if let disagreement = lookDisagreement(result) { XCTFail("\(result.label): \(disagreement)", file: file, line: line) }
+        XCTAssertEqual(result.opened.count, 1, "\(result.label): the links that opened: \(result.opened), expected \(name) once", file: file, line: line)
         XCTAssertTrue(result.opened.allSatisfy { $0.hasSuffix(name) }, "\(result.label): opened \(result.opened), expected only \(name)", file: file, line: line)
     }
 
@@ -394,6 +430,7 @@ final class LinkTapTests: HarnessTestCase {
         if !result.opened.isEmpty {
             let click = result.events.first { $0.type == "click" && $0.trusted }
             XCTAssertTrue(click?.target.contains("md-link") ?? false, "\(result.label): opened \(result.opened) with a click that named \(click?.target ?? "none")", file: file, line: line)
+            XCTAssertEqual(result.opened.count, 1, "\(result.label): the links that opened: \(result.opened), expected \(name) once", file: file, line: line)
             XCTAssertTrue(result.opened.allSatisfy { $0.hasSuffix(name) }, "\(result.label): opened \(result.opened), expected only \(name)", file: file, line: line)
         }
     }
@@ -410,10 +447,9 @@ final class LinkTapTests: HarnessTestCase {
         }
     }
 
-    /// A conversation shorter than the pane: the link's area is whole, and the pane's bare area lies under it. A tap
-    /// there gets the system's click on the pane itself, which opens nothing and lights nothing. This runs at the
-    /// default size only: at the largest size the shortest conversation the page can show (one line before the link)
-    /// is 424 points tall in a pane of 217, so there is no bare area, and the last-line case holds the pane's bottom.
+    /// A conversation shorter than the pane: the link alone, so the link's area is whole and the pane's bare area lies
+    /// under it. A tap there gets the system's click on the pane itself, which opens nothing and lights nothing. This
+    /// runs at both sizes.
     private func runShort(size: String?, named: String) {
         continueAfterFailure = true
         start(size: size, short: true)
@@ -598,7 +634,8 @@ final class LinkTapTests: HarnessTestCase {
             "\(named): a press of one second on a link's words",
             at: CGPoint(x: pressed.words[0].midX, y: pressed.words[0].midY),
             shift: offset(of: pressed),
-            hold: 1.0
+            hold: 1.0,
+            clickExpected: false
         )
         let heldClicks = held.events.filter { $0.type == "click" && $0.trusted }.count
         XCTAssertEqual(held.opened.count, heldClicks, "\(held.label): \(heldClicks) clicks of the system's, \(held.opened.count) links opened")
@@ -651,6 +688,10 @@ final class LinkTapTests: HarnessTestCase {
 
     func testAShortConversationAtTheDefaultTextSize() {
         runShort(size: nil, named: "short, default size")
+    }
+
+    func testAShortConversationAtTheLargestTextSize() {
+        runShort(size: Self.largest, named: "short, largest size")
     }
 
     func testTheLastLineAtTheDefaultTextSize() {
