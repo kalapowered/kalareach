@@ -343,6 +343,12 @@ fn an_intent_for_an_account_that_stands_without_the_installations_mark_leaves_it
         "the removal does not say that the account stood without the mark: {text}"
     );
     assert!(
+        text.contains(
+            "stands there and the manifest holds no result that the installation made it"
+        ) && text.contains("its records are deleted"),
+        "the removal's check does not say that the account stands there and was not made by the installation: {text}"
+    );
+    assert!(
         stands,
         "the removal took away an account that does not carry the installation's mark: {text}"
     );
@@ -791,26 +797,43 @@ fn a_removal_sweeps_the_brokers_journal_names_after_the_stop_and_leaves_other_na
     let paths = Paths::system().unwrap();
     let hex = uuid::Uuid::new_v4().simple().to_string();
     let brokers = paths.journal.join(format!("{hex}.journal"));
-    let other = paths.journal.join("a.journal");
     std::fs::write(&brokers, b"journal of a run").unwrap();
-    std::fs::write(&other, b"put here by hand").unwrap();
+    // Names that are not the broker's form: they stay.
+    let others: Vec<String> = vec![
+        "a.journal".to_owned(),
+        format!("{}.journal", "AB".repeat(16)),
+        format!("{hex}.journal.old"),
+        format!("{hex}.txt"),
+    ];
+    for other in &others {
+        std::fs::write(paths.journal.join(other), b"put here by hand").unwrap();
+    }
     let (code, removal) = ordinary_removal();
-    let (brokers_stands, other_stands) = (brokers.exists(), other.exists());
+    let remaining: std::collections::BTreeSet<String> = std::fs::read_dir(&paths.journal)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     observed(&format!(
-        "after the removal: the broker's journal file stands {brokers_stands}, a.journal stands {other_stands}, exit {code:?}"
+        "after the removal the journal directory holds {remaining:?}, exit {code:?}"
     ));
     for line in removal.lines().filter(|line| line.contains("a.journal")) {
         observed(&format!("removal line: {line}"));
     }
     // The case's own cleanup, so that a second removal can end the run's records.
-    let _ = std::fs::remove_file(&other);
+    for other in &others {
+        let _ = std::fs::remove_file(paths.journal.join(other));
+    }
     let _ = std::fs::remove_file(&brokers);
     assert!(
-        !brokers_stands,
+        !remaining.contains(&format!("{hex}.journal")),
         "the removal left a file that stands under the broker's journal names: {removal}"
     );
-    assert!(
-        other_stands,
+    assert_eq!(
+        remaining,
+        others.iter().cloned().collect(),
         "the removal took away a file that is not under the broker's journal names: {removal}"
     );
     assert!(
