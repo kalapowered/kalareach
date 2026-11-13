@@ -42,13 +42,14 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentThread, INFINITE, OpenProcess, OpenThreadToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, SetEvent,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::pipe_access;
 
 use super::ffi::{self, Handle, Result, Sid, error, last, wide};
 use super::sd::{Summary, summary_of_handle};
+pub use super::stop::Stop;
 
 /// One of the broker's two pipes. Each has a name, a permission list, a most number of instances
 /// and its own listener and worker slots, so that nothing a connection of one does reaches the other.
@@ -89,99 +90,6 @@ impl Kind {
     #[must_use]
     pub const fn slots(self) -> usize {
         self.instances() as usize - 2
-    }
-}
-
-/// An event that, once set, ends every wait of every connection that holds it.
-///
-/// A wait on the event has three answers: set, not set, and failed. A failed wait says nothing about
-/// the event, so it does not count as "not set": it sets the stop for good, which ends the work,
-/// and the failure is kept for [`Stop::unread`], which the service reports. Every reader after it
-/// sees the stop set, and [`Stop::reason`] says which of the two it is.
-pub struct Stop {
-    event: Handle,
-    unread: std::sync::OnceLock<String>,
-}
-
-impl Stop {
-    /// A new stop event, not set.
-    ///
-    /// # Errors
-    ///
-    /// Returns the platform's error when the event cannot be made.
-    pub fn new() -> Result<Arc<Stop>> {
-        // SAFETY: a manual-reset event with no name and no security attributes.
-        let event = unsafe { CreateEventW(null(), 1, 0, null()) };
-        Ok(Arc::new(Stop {
-            // text: pipe_new-1
-            event: Handle::new(event, "making the stop event")?,
-            unread: std::sync::OnceLock::new(),
-        }))
-    }
-
-    /// Ends every wait.
-    pub fn set(&self) {
-        // SAFETY: the event handle is open.
-        unsafe {
-            SetEvent(self.event.raw());
-        }
-    }
-
-    /// Whether the event is set, or could not be waited on (see [`Stop::unread`]).
-    #[must_use]
-    pub fn is_set(&self) -> bool {
-        self.waited(0)
-    }
-
-    /// The error of a wait on the event that failed, if one did.
-    #[must_use]
-    // text: unread
-    pub fn unread(&self) -> Option<&str> {
-        self.unread.get().map(String::as_str)
-    }
-
-    /// What ended the work, in words, for a reader that finds the stop set: that the service is
-    /// stopping, or, where a wait on the event failed, that the stop could not be read, with the
-    /// error. A failed wait is never told as a stop that someone asked for.
-    #[must_use]
-    // text: stop_reason
-    pub fn reason(&self) -> String {
-        match self.unread() {
-            Some(unread) => format!("the stop could not be read ({unread})"),
-            None => "the service is stopping".to_owned(),
-        }
-    }
-
-    /// Waits on the event for up to the milliseconds. Returns whether it is set, or whether the wait
-    /// failed, which is kept in `unread` and sets the event, so that every later wait and every later
-    /// reader sees the stop set.
-    fn waited(&self, milliseconds: u32) -> bool {
-        if self.unread.get().is_some() {
-            return true;
-        }
-        // text: pipe_stop_waited-1
-        match ffi::wait(self.event.raw(), milliseconds, "waiting on the stop event") {
-            Ok(ffi::Waited::Signalled(_)) => true,
-            Ok(ffi::Waited::TimedOut) => false,
-            Err(failure) => {
-                let _ = self.unread.set(failure.to_string());
-                self.set();
-                true
-            }
-        }
-    }
-
-    /// Waits for as long as `duration` or until the event is set, and says whether it is set (or
-    /// could not be waited on, as [`Stop::is_set`]). A pause of a request's own work that the stop
-    /// must be able to end takes this and not a sleep.
-    #[must_use]
-    pub fn wait(&self, duration: std::time::Duration) -> bool {
-        self.waited(super::ffi::milliseconds(duration, INFINITE - 1))
-    }
-
-    /// The event's handle, for a wait of another module that the stop must be able to end.
-    pub(super) fn event(&self) -> HANDLE {
-        self.event.raw()
     }
 }
 
@@ -382,16 +290,18 @@ fn wait(
     deadline: Option<Instant>,
     stuck: &mut bool,
 ) -> io::Result<(u32, Transfer)> {
-    // The stop's event is the first handle: when both are signalled the call reports the lower index,
-    // so a transfer that finished at once never wins over the stop.
-    let handles = [stop.event.raw(), transfer.event.raw()];
     let milliseconds = deadline.map_or(INFINITE, |deadline| {
         let left = deadline.saturating_duration_since(Instant::now());
         // One less than the longest wait, which means "forever".
         super::ffi::milliseconds(left, INFINITE - 1)
     });
-    // text: pipe_wait-1
-    let waited = ffi::wait_any(&handles, milliseconds, "waiting for the other end");
+    // The stop is waited on first: when both are signalled the call reports the stop, so a transfer
+    // that finished at once never wins over it, and a wait that fails is kept as the unread stop.
+    let waited = stop.wait_for(
+        &[transfer.event.raw()],
+        milliseconds,
+        "waiting for the other end",
+    );
     if !matches!(waited, Ok(ffi::Waited::Signalled(1))) {
         // A transfer that is not seen to end after the cancel stays with the process, and the
         // cancel's own failed wait is told beside the reason.
