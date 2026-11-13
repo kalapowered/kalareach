@@ -817,6 +817,62 @@ fn a_repeated_branch_cannot_pass_as_a_new_method_by_its_label() {
     assert_eq!(lines, vec!["Method#1@const:5 added: a variant".to_owned()]);
 }
 
+/// A branch of a list nested in a branch of `Method` can have the label of a method named like
+/// that label: a label with a `#` in the name is no method's, so neither the nested addition nor
+/// the method passes, in either direction of the change.
+#[test]
+fn a_nested_branch_cannot_pass_as_a_new_method_by_its_label() {
+    let method = |name: &str| json!({ "const": name, "type": "string" });
+    let nested = |name: &str, inner: Value| {
+        let mut branch = method(name);
+        branch["oneOf"] = inner;
+        branch
+    };
+    let string = || json!({ "type": "string" });
+    for (old, new, line) in [
+        // The Codex section's pair: the inner list repeats its branch, and a method has the
+        // label of that second branch.
+        (
+            vec![nested("x", json!([method("x")]))],
+            vec![
+                nested("x", json!([method("x"), method("x")])),
+                method("x#1@const:x"),
+            ],
+            "Method#const:x#1@const:x added: a variant",
+        ),
+        // The Claude section's pair, and its opposite direction.
+        (
+            vec![nested("A", json!([string()]))],
+            vec![
+                nested(
+                    "A",
+                    json!([string(), { "type": "string", "maxLength": 100 }]),
+                ),
+                method("A#1@type:string"),
+            ],
+            "Method#const:A#1@type:string added: a variant",
+        ),
+        (
+            vec![nested("A", json!([{ "type": "integer" }]))],
+            vec![
+                nested("A", json!([{ "type": "integer" }, string()])),
+                method("A#type:string"),
+            ],
+            "Method#const:A#type:string added: a variant",
+        ),
+    ] {
+        assert_eq!(method_lines(&old, &new), vec![line.to_owned()], "{new:?}");
+    }
+    // A plain new method with dots in its name still passes.
+    assert!(
+        method_lines(
+            &[method("host.info")],
+            &[method("host.info"), method("session.read.all")]
+        )
+        .is_empty()
+    );
+}
+
 /// Two equal branches are told apart by their number, and a third branch that differs is reported
 /// by its own key, for both comparisons.
 #[test]
