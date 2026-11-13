@@ -15,13 +15,16 @@
 // it holds is refused:
 //
 // - a runner of the caller's own: the setting above is read by cargo's build step;
-// - `--no-bundle`, and `--bundles` with no value: they leave no bundle to read;
+// - `--no-bundle`, and `--bundles` with no value: they leave no bundle to read (a list of formats that
+//   the platform cannot make leaves none either, and is not read here);
 // - a Windows target on a machine that is not Windows, and on Windows an MSVC target that the
 //   link options of `.cargo/config.toml` do not name (x86-64 and ARM64): the setting is made for the
 //   machine this runs on, and those options are what keep the static runtime out of the link;
 // - after a bare `--`, cargo's own `--config` and `--target`: either can set the environment, the
 //   flags or the target that this command holds;
-// - a target given by `CARGO_BUILD_TARGET`, held to the same rule as `--target`;
+// - `CARGO_BUILD_TARGET`: the command line tool does not read it, so cargo would build for it into the
+//   directory of that target and the bundle would be made from the program of another build; a target
+//   is given as `--target`;
 // - on Windows, an environment that gives the compiler flags (`RUSTFLAGS` and the like):
 //   `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` replace the link options of `.cargo/config.toml`, after
 //   which the link only warns, and the others are a second source of flags that this build does not take.
@@ -162,7 +165,7 @@ export function refusal(argv, platform = process.platform, env = process.env) {
   const options = optionsOf(rest)
   if (options.some((option) => option.name === 'runner')) {
     return (
-      `pnpm desktop does not run a build with a runner other than cargo (it was given \`${given}\`): ` +
+      `pnpm desktop gives the build cargo as its runner and does not take another (it was given \`${given}\`): ` +
       "the setting it gives the build is read by cargo's build step."
     )
   }
@@ -191,10 +194,12 @@ export function refusal(argv, platform = process.platform, env = process.env) {
       return `pnpm desktop does not build for \`${option.value}\` here (it was given \`${given}\`): ${why}.`
     }
   }
-  const fromEnvironment = environmentValue(env, 'CARGO_BUILD_TARGET', platform)
-  const environmentWhy = fromEnvironment ? targetProblem(fromEnvironment, platform) : null
-  if (environmentWhy !== null) {
-    return `pnpm desktop does not build with CARGO_BUILD_TARGET=${fromEnvironment} in the environment: ${environmentWhy}.`
+  if (environmentValue(env, 'CARGO_BUILD_TARGET', platform) !== undefined) {
+    return (
+      'pnpm desktop does not run a build with CARGO_BUILD_TARGET in the environment: the command line tool does not ' +
+      'read it, so cargo would build into the directory of that target and the bundle would be made from the ' +
+      'program of another build. Give the target as `--target`.'
+    )
   }
   if (platform !== WINDOWS) return null
   const flags = Object.keys(env).find(givesCompilerFlags)
@@ -202,8 +207,8 @@ export function refusal(argv, platform = process.platform, env = process.env) {
     return (
       `pnpm desktop does not run a build with ${flags.toUpperCase()} in the environment: the link options of ` +
       '.cargo/config.toml keep the static Visual C++ runtime out of the link, and this build takes its ' +
-      'compiler flags from that file alone (RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS replace those options, ' +
-      'and the link then only warns of two runtimes).'
+      'compiler flags from that file alone, as far as the environment reaches (RUSTFLAGS and ' +
+      'CARGO_ENCODED_RUSTFLAGS replace those options, and the link then only warns of two runtimes).'
     )
   }
   return null
@@ -239,20 +244,29 @@ export function childEnvironment(platform, env) {
   }
 }
 
+/**
+ * What a run does with the arguments and the environment it is given: the reason to refuse them, or the
+ * arguments and the environment of the command line tool and the line to say about the environment.
+ * The command below runs exactly what this answers.
+ */
+export function buildPlan(argv, platform = process.platform, env = process.env) {
+  const problem = refusal(argv, platform, env)
+  if (problem !== null) return { problem }
+  return { problem: null, args: childArguments(argv), ...childEnvironment(platform, env) }
+}
+
 // Run only as the command: the entry point is compared by its real path, which is the one Node
 // gives the module, so that a start through a symbolic link still runs.
 if (startedAs(import.meta.url)) {
-  const argv = process.argv.slice(2)
-  const problem = refusal(argv)
-  if (problem !== null) {
-    console.error(problem)
+  const plan = buildPlan(process.argv.slice(2))
+  if (plan.problem !== null) {
+    console.error(plan.problem)
     process.exit(2)
   }
-  const { env, said } = childEnvironment(process.platform, process.env)
-  if (said !== null) console.error(said)
-  const result = spawnSync(process.execPath, [toolPath('@tauri-apps/cli'), ...childArguments(argv)], {
+  if (plan.said !== null) console.error(plan.said)
+  const result = spawnSync(process.execPath, [toolPath('@tauri-apps/cli'), ...plan.args], {
     stdio: 'inherit',
-    env
+    env: plan.env
   })
   if (result.error) {
     console.error(result.error.message)
