@@ -1,0 +1,200 @@
+#!/usr/bin/env node
+// Runs the desktop bundle build (`pnpm desktop build ...`): `tauri build` for the machine it runs on,
+// with the one setting that build needs on Windows.
+//
+// The application links the dynamic Visual C++ runtime. `.cargo/config.toml` leaves the static one out
+// of every MSVC link, because the C library this workspace vendors asks for the static runtime and the
+// two must not both be linked. The command line tool sets `STATIC_VCRUNTIME=true` for a desktop build
+// unless the variable is already `false`, the Tauri build step reads it before the attribute this
+// package gives it, and the package's build script then refuses the build. So on Windows this gives
+// the build `STATIC_VCRUNTIME=false`, whatever the caller's environment holds, and says so when it
+// replaces another value. On the other platforms the build gets the caller's environment as it is.
+//
+// Only the bundle build is run, and what would change what it holds is refused:
+//
+// - a runner other than cargo: the setting above is read by cargo's build step;
+// - `--no-bundle`: it leaves no bundle to read;
+// - a Windows target on a machine that is not Windows: the setting is made for the machine this runs on;
+// - on Windows, an environment that gives the compiler flags (`RUSTFLAGS` and the like): the link
+//   options of `.cargo/config.toml` are what keep the static runtime out of the link, and an
+//   environment that supplies flags of its own replaces them, after which the link only warns.
+import { spawnSync } from 'node:child_process'
+import { startedAs } from './entry-point.mjs'
+
+import { toolPath } from './tools.mjs'
+
+const WINDOWS = 'win32'
+const RUNTIME_VARIABLE = 'STATIC_VCRUNTIME'
+
+/** The long options of `tauri build`, each with whether it takes a value that must follow it. */
+const LONG = new Map([
+  ['runner', true],
+  ['target', true],
+  ['config', true],
+  // These two take any number of values, so the next word is not necessarily theirs.
+  ['features', false],
+  ['bundles', false],
+  ['debug', false],
+  ['no-bundle', false],
+  ['ci', false],
+  ['skip-stapling', false],
+  ['ignore-version-mismatches', false],
+  ['no-sign', false],
+  ['verbose', false],
+  ['help', false],
+  ['version', false]
+])
+
+/** The short options that take a value (the rest of their bundle, or the next word), with their long names. */
+const SHORT = new Map([
+  ['r', 'runner'],
+  ['t', 'target'],
+  ['f', 'features'],
+  ['b', 'bundles'],
+  ['c', 'config']
+])
+
+/**
+ * The long option a word names: its exact name, or the one option it is the start of. The command
+ * line tool reads exact names today; reading a start as well keeps a later tool that accepts one from
+ * being a way round a refusal. A start of two options names neither.
+ */
+function longName(word) {
+  if (LONG.has(word)) return word
+  const starts = [...LONG.keys()].filter((name) => name.startsWith(word))
+  return starts.length === 1 ? starts[0] : null
+}
+
+/**
+ * The options of a build in the order given, as `{ name, value }` (a value is null when none was
+ * given with the option). What follows a bare `--` is passed on to the build's runner, and is none of
+ * this command's. A short option is one of a bundle (`-dt`), read from left to right: the first of
+ * `r`, `t`, `f`, `b` and `c` takes the rest of the bundle as its value.
+ */
+function optionsOf(words) {
+  const found = []
+  // The next word is the value of an option that takes one, unless it is another option.
+  const following = (i) => (i + 1 < words.length && !words[i + 1].startsWith('-') ? i + 1 : null)
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]
+    if (word === '--') break
+    if (word.startsWith('--')) {
+      const [given, ...attached] = word.slice(2).split('=')
+      const name = longName(given)
+      let value = attached.length > 0 ? attached.join('=') : null
+      if (value === null && name !== null && LONG.get(name) && following(i) !== null) {
+        value = words[(i = following(i))]
+      }
+      found.push({ name: name ?? given, value })
+    } else if (word.length > 1 && word.startsWith('-')) {
+      for (let k = 1; k < word.length; k++) {
+        const name = SHORT.get(word[k])
+        if (name === undefined) continue
+        let value = word.slice(k + 1)
+        if (value.startsWith('=')) value = value.slice(1)
+        if (value === '' && LONG.get(name) && following(i) !== null) value = words[(i = following(i))]
+        found.push({ name, value: value === '' ? null : value })
+        break
+      }
+    }
+  }
+  return found
+}
+
+/** Whether a Windows environment variable name gives the compiler flags of a build. */
+function givesCompilerFlags(name) {
+  return /^(RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_.+_RUSTFLAGS)$/.test(
+    name.toUpperCase()
+  )
+}
+
+/**
+ * What is wrong with the arguments, or with the environment on Windows, that this was given, or null
+ * when it can run them. The platform and the environment are passed in, so that each platform's
+ * answer can be held on any machine.
+ */
+export function refusal(argv, platform = process.platform, env = process.env) {
+  const [command, ...rest] = argv
+  const given = argv.join(' ')
+  if (command !== 'build') {
+    return `pnpm desktop runs \`tauri build\` and nothing else (it was given \`${given}\`).`
+  }
+  const options = optionsOf(rest)
+  if (options.some((option) => option.name === 'runner')) {
+    return (
+      `pnpm desktop does not run a build with a runner other than cargo (it was given \`${given}\`): ` +
+      "the setting it gives the build is read by cargo's build step."
+    )
+  }
+  if (options.some((option) => option.name === 'no-bundle')) {
+    return (
+      `pnpm desktop makes the bundles, and \`--no-bundle\` leaves none to read (it was given \`${given}\`): ` +
+      'build the program alone with `cargo build -p companion-tauri --release --features custom-protocol`.'
+    )
+  }
+  if (platform !== WINDOWS) {
+    const windows = options.find(
+      (option) => option.name === 'target' && /-windows(-|$)/.test(option.value ?? '')
+    )
+    if (windows) {
+      return (
+        `pnpm desktop builds a Windows bundle on Windows only (it was given \`${given}\`): ` +
+        'it sets the C runtime for the machine it runs on.'
+      )
+    }
+    return null
+  }
+  const flags = Object.keys(env).find(givesCompilerFlags)
+  if (flags !== undefined) {
+    return (
+      `pnpm desktop does not run a build with ${flags.toUpperCase()} in the environment: the link options of ` +
+      '.cargo/config.toml keep the static Visual C++ runtime out of the link, and this build takes its ' +
+      'compiler flags from that file alone (RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS replace those options, ' +
+      'and the link then only warns of two runtimes).'
+    )
+  }
+  return null
+}
+
+/**
+ * The environment the build gets on a platform, and the line to say when it replaced a value: on
+ * Windows `STATIC_VCRUNTIME=false` whatever the caller's environment held (Windows names variables
+ * without regard to case, so every spelling of the name is replaced by the one), and on the other
+ * platforms the caller's environment as it is.
+ */
+export function childEnvironment(platform, env) {
+  if (platform !== WINDOWS) return { env: { ...env }, said: null }
+  const named = Object.keys(env).filter((key) => key.toUpperCase() === RUNTIME_VARIABLE)
+  const replaced = named.map((key) => env[key]).find((value) => value !== 'false')
+  const kept = Object.fromEntries(Object.entries(env).filter(([key]) => !named.includes(key)))
+  return {
+    env: { ...kept, [RUNTIME_VARIABLE]: 'false' },
+    said:
+      replaced === undefined
+        ? null
+        : `pnpm desktop: ${RUNTIME_VARIABLE} was \`${replaced}\` in the environment, and this build gets \`false\`, ` +
+          'since the application links the dynamic Visual C++ runtime.'
+  }
+}
+
+// Run only as the command: the entry point is compared by its real path, which is the one Node
+// gives the module, so that a start through a symbolic link still runs.
+if (startedAs(import.meta.url)) {
+  const argv = process.argv.slice(2)
+  const problem = refusal(argv)
+  if (problem !== null) {
+    console.error(problem)
+    process.exit(2)
+  }
+  const { env, said } = childEnvironment(process.platform, process.env)
+  if (said !== null) console.error(said)
+  const result = spawnSync(process.execPath, [toolPath('@tauri-apps/cli'), ...argv], {
+    stdio: 'inherit',
+    env
+  })
+  if (result.error) {
+    console.error(result.error.message)
+    process.exit(1)
+  }
+  process.exit(result.status ?? 1)
+}
