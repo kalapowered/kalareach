@@ -362,7 +362,7 @@ fn say(line: &str) {
 ///
 /// Returns [`Error::Refused`] naming the foreign object, or the failure of the call that looked.
 pub fn entry(paths: &Paths) -> Result<Entry, Error> {
-    check_shape(paths)?;
+    check_shape(paths, remedy::Stage::Before)?;
     // What the data directory holds is read on handles before any of it is used: the manifest
     // decides what a repair or a removal touches, so it is read only after the directory it is in
     // and everything beside it passed their checks.
@@ -1693,15 +1693,58 @@ fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, recorded: bool) -> Err
     )
 }
 
-/// Refuses a layout whose known folders cannot hold the two trees (a known folder that is the root
-/// of a volume, known folders that overlap): read first by every installation, repair and removal,
-/// before any walk. After it, a folder strictly below a known folder is the installation's own.
-fn check_shape(paths: &Paths) -> Result<(), Error> {
+/// What opening a known folder shows: the final path of the folder that its path leads to, with
+/// every link followed (a link or a mounted folder at the path leads to its target), or the
+/// platform's error of the open or of the read of the final path.
+fn opened_final_path(folder: &Path) -> Result<String, String> {
+    let wide = ffi::wide_path(folder);
+    // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    let handle =
+        ffi::Handle::new(raw, "opening a known folder").map_err(|error| error.to_string())?;
+    final_path_of(&handle).map_err(|error| error.to_string())
+}
+
+/// A known folder as the shape check reads it: the path that the system gave and what opening it
+/// showed.
+fn known_folder<'a>(given: &'a str, opened: &'a Result<String, String>) -> remedy::KnownFolder<'a> {
+    remedy::KnownFolder {
+        given,
+        opened: opened.as_ref().map(String::as_str).map_err(String::as_str),
+    }
+}
+
+/// Refuses a layout whose known folders cannot hold the two trees: read first by every
+/// installation, repair and removal, before any walk. Each known folder is opened with its links
+/// followed and its final path is read; [`remedy::shape_refusal`] decides on the path that the
+/// system gave and the final path of the folder that it opens, so that a known folder reached by
+/// another name is never taken for what its spelling says. After it, a folder strictly below a known
+/// folder is the installation's own.
+fn check_shape(paths: &Paths, stage: remedy::Stage) -> Result<(), Error> {
     let data_parent = paths.data_parent();
     let program_data = data_parent.parent().unwrap_or(data_parent);
+    let (files_path, data_path) = (
+        paths.program_top.display().to_string(),
+        program_data.display().to_string(),
+    );
+    let (files_opened, data_opened) = (
+        opened_final_path(&paths.program_top),
+        opened_final_path(program_data),
+    );
     match remedy::shape_refusal(
-        &paths.program_top.display().to_string(),
-        &program_data.display().to_string(),
+        &known_folder(&files_path, &files_opened),
+        &known_folder(&data_path, &data_opened),
+        stage,
     ) {
         Some(text) => Err(Error::Refused(text)),
         None => Ok(()),
@@ -1715,8 +1758,8 @@ fn check_shape(paths: &Paths) -> Result<(), Error> {
 /// tree is read on its own handle with the rules of its kind; what is above it is read here, since
 /// an account that could rename a folder above could put a link in the place of the folder below it
 /// after the installation has read that one, and the system's default lists do not give that right
-/// but nothing here rests on a default. A folder that is not there ends the walk: nothing below it
-/// is there either. A root that is not there is a volume that is gone, and every run refuses it.
+/// but nothing here rests on a default. None of these folders is the installation's to make: a
+/// folder that is not there refuses the run, and a root that is not there is a volume that is gone.
 ///
 /// Every folder read here lies strictly above `top`, the first folder that the installation makes
 /// (the data directory's parent) or the known folder itself (`Program Files`, which the program walk
@@ -1731,9 +1774,8 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
         let shown = folder.display().to_string();
         let refuse = |fault: Fault<'_>| {
             Error::Refused(remedy::ancestor_refusal(
-                &shown,
+                &remedy::Subject::shared(&shown, fault),
                 tree,
-                &remedy::Subject::Shared(fault),
                 stage,
             ))
         };
@@ -1756,18 +1798,19 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
         };
         let handle = match ffi::Handle::new(raw, "opening a folder above the installation") {
             Ok(handle) => handle,
+            // Every folder of this walk is a known folder or above one, so none is the
+            // installation's to make: a folder that is not there refuses the run. The root of the
+            // volume is the first folder of the walk, and one that is not there is a volume that is
+            // gone.
             Err(failure)
-                if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+                if index == 0
+                    && (failure.code == ERROR_FILE_NOT_FOUND
+                        || failure.code == ERROR_PATH_NOT_FOUND) =>
             {
-                // A folder that is not there ends the walk, but the root of the volume is the
-                // first folder of it: a root that is not there is a volume that is gone.
-                if index == 0 {
-                    return Err(refuse(Fault::RootMissing(&failure.to_string())));
-                }
-                return Ok(());
+                return Err(refuse(Fault::RootMissing(&failure.to_string())));
             }
-            // An open that failed is said to have failed with the platform's error, at the root of
-            // a volume and above it alike.
+            // Any other open that failed is said to have failed with the platform's error, at the
+            // root of a volume and above it alike.
             Err(failure) => return Err(unreadable(&failure)),
         };
         // The volume first, as the program directory's own open does: a file system that is not
@@ -1805,7 +1848,8 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
 /// that was asked for (its final path is the expected one), owned by the system, the Administrators
 /// group or the installer service, with no entry that lets another account add to it, rename or
 /// delete in it, write its list or take it. The paths that the service control manager runs the
-/// broker by rest on these lists. A folder that is not there is the installation's to make.
+/// broker by rest on these lists. The known folder itself that is not there refuses the run; a
+/// folder strictly below it that is not there is the installation's to make, and ends the walk.
 ///
 /// The first folder of the walk is `program_top`, the system's known folder `Program Files`, which
 /// other programs share; every folder strictly below it is the installation's own. The words of a
@@ -1826,9 +1870,8 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
         let shown = folder.display().to_string();
         let refuse = |fault: Fault<'_>| {
             Error::Refused(remedy::ancestor_refusal(
-                &shown,
-                remedy::Tree::Program,
                 &remedy::Subject::at(&shown, &known, fault),
+                remedy::Tree::Program,
                 stage,
             ))
         };
@@ -1851,8 +1894,13 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
         };
         let handle = match ffi::Handle::new(raw, "opening a folder above the program directory") {
             Ok(handle) => handle,
+            // Only a folder strictly below the known folder is the installation's to make, and
+            // nothing below a folder that is not there is there either. The known folder itself
+            // that is not there refuses the run.
             Err(failure)
-                if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+                if (failure.code == ERROR_FILE_NOT_FOUND
+                    || failure.code == ERROR_PATH_NOT_FOUND)
+                    && remedy::is_below(&shown, &known) =>
             {
                 return Ok(());
             }
@@ -3288,7 +3336,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     // acts on it and on what it holds only through what this inspection approved: a path that no
     // check opened is never read for a manifest and never deleted from. The handles are closed
     // before anything is deleted.
-    check_shape(paths)?;
+    check_shape(paths, stage)?;
     let mut seen = records::Seen::default();
     let mut approved = records::Approved::default();
     let found = match check_data_parent_at(paths, stage)? {

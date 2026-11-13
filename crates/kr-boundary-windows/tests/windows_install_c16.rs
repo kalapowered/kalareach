@@ -303,11 +303,12 @@ fn a_folder_above_the_program_top_that_an_ordinary_account_may_delete_in_is_refu
     names_the_folder_and_the_right(&text, &above, "program directory");
 }
 
-/// A link at the known folder itself (a moved `Program Files`) is another program's: the walk from
-/// the top down refuses it with the words of any link above the trees, which say what a supported
-/// layout is and never that the setup program makes the folder or that the link is to be removed. A
-/// link strictly below the known folder is the product's own: its words say that the setup program
-/// makes that folder itself. Both links are made and each text is required.
+/// A link at the known folder itself (a moved `Program Files`) is another program's: the shape check
+/// opens the known folder with the link followed and refuses it for where it leads, with the words
+/// of a folder that the installation does not make, which say what a supported layout is and never
+/// that the setup program makes the folder or that the link is to be removed. A link strictly below
+/// the known folder is the product's own: its words say that the setup program makes that folder
+/// itself. Both links are made and each text is required.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
@@ -336,9 +337,10 @@ fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
         )),
         "{text}"
     );
-    assert!(text.contains("it is a link or a mounted folder"), "{text}");
     assert!(
-        text.contains("does not go through a link or a mounted folder"),
+        text.contains(
+            "is not the final path of the folder that it opens: that folder's own path is "
+        ),
         "{text}"
     );
     assert!(text.contains("Nothing was changed"), "{text}");
@@ -500,6 +502,61 @@ fn a_link_above_the_data_parent_is_refused() {
         ),
         "{text}"
     );
+}
+
+/// A known folder that is not there refuses the run: only a folder strictly below a known folder is
+/// the installation's to make. The shape check opens both known folders first, and the data walk,
+/// read on its own, refuses a ProgramData that is not there as well. Nothing is made.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_known_folder_that_is_not_there_refuses_the_run() {
+    if needs_the_system() {
+        return;
+    }
+    let mut clean = Cleanup::default();
+    let container = inherited_folder(&mut clean);
+    let opened = "It is refused because it could not be opened or read to be checked";
+
+    // The data tree's known folder is not there.
+    let missing = container.join("Missing");
+    let parent = missing.join("KalaReach");
+    let paths = paths_with(&parent, &parent.join("Program"), &container);
+    let above = format!(
+        "{} is a folder above the boundary's data directory",
+        missing.display()
+    );
+    let text = install::check_data_parent(&paths)
+        .expect_err("a data tree's known folder that is not there")
+        .to_string();
+    assert!(text.contains(&above), "{text}");
+    assert!(text.contains(opened), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+    let text = install::entry(&paths)
+        .err()
+        .expect("the shape check opens the known folder")
+        .to_string();
+    assert!(text.contains(&above), "{text}");
+    assert!(text.contains(opened), "{text}");
+    assert!(!parent.exists(), "nothing was made");
+
+    // The program tree's known folder is not there.
+    let top = container.join("NoTop");
+    let data_parent = inherited_folder(&mut clean);
+    parent_of(&data_parent);
+    let paths = paths_with(&data_parent, &top.join("Boundary"), &top);
+    let text = install::entry(&paths)
+        .err()
+        .expect("a program tree's known folder that is not there")
+        .to_string();
+    assert!(
+        text.contains(&format!(
+            "{} is a folder above the boundary's program directory",
+            top.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains(opened), "{text}");
+    assert!(!top.exists(), "nothing was made");
 }
 
 /// A substituted drive letter is no volume's root: the folders above its target are not read, so a
