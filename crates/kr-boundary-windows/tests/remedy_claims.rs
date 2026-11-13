@@ -6,8 +6,9 @@ use std::path::Path;
 
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CASE_SENSITIVE_WHY, EntryKind, Origin, ParentCure, Presence, choose, data_ending, ending,
-    parent_advice, program_keeping, program_open_advice, unnamed_root_why,
+    CASE_SENSITIVE_WHY, EntryKind, Origin, ParentCure, Presence, choose, data_ending,
+    data_made_ending, ending, parent_advice, program_keeping, program_open_advice,
+    unnamed_root_why,
 };
 
 /// Every state that an entry's refusal can be told in.
@@ -141,6 +142,31 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
         "{owner}"
     );
     assert!(CASE_SENSITIVE_WHY.starts_with("it separates names that differ only by case"));
+}
+
+/// The ending of a data directory that this run made says what the run did with what it made and
+/// names what stayed; it gives no step and no forecast, since a run that removed what it made
+/// leaves nothing to move, to correct or to run against.
+#[test]
+fn the_ending_of_a_directory_this_run_made_says_what_was_removed_and_gives_no_step() {
+    let gone = data_made_ending(&[]);
+    assert!(gone.contains("removed what it made"), "{gone}");
+    let stayed = data_made_ending(&["C:\\Kala (e)".to_owned(), "C:\\Kala\\Data (f)".to_owned()]);
+    assert!(stayed.contains("could not remove what it made"), "{stayed}");
+    assert!(
+        stayed.contains("C:\\Kala (e); C:\\Kala\\Data (f)"),
+        "{stayed}"
+    );
+    for text in [&gone, &stayed] {
+        for step in [
+            "Move it aside",
+            "Turn the flag",
+            "Leave the system",
+            "again",
+        ] {
+            assert!(!text.contains(step), "{text}");
+        }
+    }
 }
 
 /// A refusal in the program directory says that the manifest records the installation, which a read
