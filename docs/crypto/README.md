@@ -706,9 +706,29 @@ Pin these in the release manifest, with their exact versions and the resolved de
 | `keyring` | 4.2.0 |
 | `spake2` | 0.4.0 |
 
-`libsodium-sys-stable` builds libsodium from its source archive on Linux and macOS and links
-libsodium's signed prebuilt libraries on Windows, so the manifest records the crate version, not a
-system library version. Compile and verify it on every Tauri target.
+`libsodium-sys-stable` 1.24.0 bundles libsodium's release tag 1.0.22, and every target links that
+tag. Linux and macOS compile the source archive that the crate ships. Windows MSVC links libsodium's
+prebuilt libraries of the same tag: upstream's `libsodium-1.0.22-msvc.zip` (17,690,194 bytes,
+SHA-256 `3e03a726fac4bc09cb61d8f29d658ef7a5eca0811de59082130414f7ca2e4279`) and its signature
+`libsodium-1.0.22-msvc.zip.minisig` (320 bytes, SHA-256
+`3210cf4d985f7b192bb8d5eb2ec7f481e0f47420f144cf1069921f714bfad1d1`), signed on 2026-04-09 at
+22:11:03 UTC with libsodium's key, whose identifier is `1fe8b442180f62e7`. Upstream also serves a
+`libsodium-1.0.22-stable-msvc.zip` and replaces that file in place under the same name. No build
+links it.
+
+`scripts/place-libsodium-archive.sh` places the two files and holds their sizes and digests. It
+compares a file that it fetched, and a file that was already in the directory (a restored cache
+holds one), before the build can read either, and it refuses any other bytes with one line that
+names both digests. A test job and a release job get the same bytes or the same refusal: neither a
+cache nor the cache's key stands in for the comparison. The crate's build script reads the fixed
+base name `libsodium-1.0.22-stable-msvc`, so the files lie under that name, and the build's own
+signature check then verifies upstream's signature of the tag's bytes against libsodium's public
+key. The digests move only together with the crate's pin, to the archive of the tag that the new
+crate version bundles, so that every target keeps one tag. They never move alone, and a refusal in a
+job is not cured by a new digest in the change that met it.
+
+The manifest records the crate version, not a system library version. Compile and verify it on
+every Tauri target.
 
 `hmac` 0.13.0 and `sha2` 0.11.0, the versions pinned above, are built with their `zeroize`
 features, so their internal buffers are cleared. `hkdf` 0.13.0 has no such feature; its pseudorandom
