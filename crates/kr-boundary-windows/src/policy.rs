@@ -143,7 +143,8 @@ impl Eq for Policy {}
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
     /// The text is not a policy.
-    #[error("the application-control policy could not be read: {0}")]
+    // text: policy-1
+    #[error("the text of the policy is not one that this program reads: {0}")]
     Unreadable(String),
 }
 
