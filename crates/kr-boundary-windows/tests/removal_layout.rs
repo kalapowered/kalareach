@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kr_boundary_windows::records::{Seen, entry_exists, finish_journal_and_run};
+use kr_boundary_windows::records::{Look, Seen, finish_journal_and_run, look};
 
 struct Data {
     _root: tempfile::TempDir,
@@ -151,9 +151,48 @@ fn a_look_for_an_entry_finds_a_file_a_directory_and_not_an_absent_name() {
     let folder = tempfile::tempdir().unwrap();
     let file = folder.path().join("file");
     fs::write(&file, b"x").unwrap();
-    assert!(entry_exists(&file));
-    assert!(entry_exists(folder.path()));
-    assert!(!entry_exists(&folder.path().join("absent")));
+    assert!(matches!(look(&file), Look::There));
+    assert!(matches!(look(folder.path()), Look::There));
+    assert!(matches!(
+        look(&folder.path().join("absent")),
+        Look::NotThere
+    ));
+}
+
+/// A look that fails for any reason but the name's absence is neither "there" nor "not there": it
+/// answers "not read", with its error.
+#[cfg(unix)]
+#[test]
+fn a_look_that_fails_is_not_read_and_carries_its_error() {
+    let folder = tempfile::tempdir().unwrap();
+    let file = folder.path().join("file");
+    fs::write(&file, b"x").unwrap();
+    // A name below a file: the look answers "not a directory", which is not an answer of absence.
+    match look(&file.join("below")) {
+        Look::Unread(error) => assert_ne!(error.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A journal or run directory that the inspection did not see and whose look fails now is named
+/// with the error of the look, and no text says that something is there.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_the_inspection_did_not_see_and_cannot_be_looked_at_is_named_with_its_error() {
+    let folder = tempfile::tempdir().unwrap();
+    let file = folder.path().join("file");
+    fs::write(&file, b"x").unwrap();
+    let failures =
+        finish_journal_and_run(&file.join("journal"), &file.join("run"), Seen::default());
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    for text in &failures {
+        assert!(
+            text.contains("was not there when the removal looked for it")
+                && text.contains("a look at it now failed (")
+                && !text.contains("something is there"),
+            "{text}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -164,5 +203,5 @@ fn a_link_that_points_nowhere_is_something_that_is_there() {
     std::os::unix::fs::symlink(folder.path().join("gone"), &link).unwrap();
     // The look that follows a link finds nothing, and the removal then treated the name as free.
     assert!(!link.exists());
-    assert!(entry_exists(&link));
+    assert!(matches!(look(&link), Look::There));
 }

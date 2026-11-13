@@ -211,7 +211,7 @@ fn something_in_the_data_directory_that_is_not_a_record_keeps_only_the_data_dire
     );
 }
 
-use kr_boundary_windows::records::{next_step, remove_with, unread_prior};
+use kr_boundary_windows::records::{Look, next_step, remove_with, unread_prior};
 use std::ffi::OsString;
 use std::io;
 
@@ -286,10 +286,11 @@ fn an_empty_data_directory_that_a_stopped_removal_left_is_removed_by_the_next_on
 /// it: its last words say that the Application Identity service's start value and running state
 /// were not put back and that the next removal inspects the record again (a promise of another
 /// inspection, not of a restoration: the inspection may refuse the record again), and say nothing
-/// where the record was read or is not there.
+/// where the record was read or is not there. Where the look at the record's name could not be
+/// read, the words say that and its error, and speak of a record only as one that may be there.
 #[test]
 fn the_last_words_of_a_removal_say_what_an_unread_earlier_state_record_left() {
-    let said = unread_prior(false, true);
+    let said = unread_prior(false, &Look::There);
     assert!(
         said.contains("start value and running state were not put back"),
         "{said}"
@@ -301,9 +302,62 @@ fn the_last_words_of_a_removal_say_what_an_unread_earlier_state_record_left() {
     assert!(!said.contains("does it"), "{said}");
     assert!(!said.contains("puts them back"), "{said}");
     assert!(said.starts_with(". "), "{said}");
-    assert_eq!(unread_prior(true, true), "", "the record was read");
-    assert_eq!(unread_prior(false, false), "", "there is no record");
-    assert_eq!(unread_prior(true, false), "");
+    assert_eq!(unread_prior(true, &Look::There), "", "the record was read");
+    assert_eq!(
+        unread_prior(false, &Look::NotThere),
+        "",
+        "there is no record"
+    );
+    assert_eq!(unread_prior(true, &Look::NotThere), "");
+
+    let error = io::Error::from(io::ErrorKind::PermissionDenied);
+    let unread = unread_prior(false, &Look::Unread(error));
+    assert!(
+        unread.contains("look at the earlier-state record's name failed (permission denied)"),
+        "{unread}"
+    );
+    assert!(unread.contains("if one is there"), "{unread}");
+    assert!(unread.starts_with(". "), "{unread}");
+    assert!(
+        !unread.contains("The earlier-state record was not read"),
+        "{unread}"
+    );
+    assert_eq!(
+        unread_prior(
+            true,
+            &Look::Unread(io::Error::from(io::ErrorKind::PermissionDenied))
+        ),
+        ""
+    );
+}
+
+/// A record that the inspection did not see, whose name cannot be looked at now, is left and named
+/// with the error of the look: no text says that something is there.
+#[cfg(unix)]
+#[test]
+fn a_record_whose_look_failed_is_left_and_named_with_the_error() {
+    let case = Data::installed();
+    // A file where a folder is expected: the look at a name below it answers "not a directory".
+    let blocker = case.data.join("blocker");
+    fs::write(&blocker, b"x").unwrap();
+    let prior = blocker.join("prior.json");
+    let stayed = remove(&Records {
+        data: &case.data,
+        manifest: &case.manifest(),
+        prior: &prior,
+        staging: &case.staging(),
+        approved: &Approved {
+            prior: false,
+            ..everything_there(&case.data)
+        },
+    });
+    assert!(
+        stayed.iter().any(|text| text.contains("prior.json")
+            && text.contains("a look at it now failed")
+            && !text.contains("something is there")),
+        "{stayed:?}"
+    );
+    assert!(case.manifest().exists(), "the manifest stays with it");
 }
 
 /// A directory that cannot be deleted is named, and the words that follow say what is true of the

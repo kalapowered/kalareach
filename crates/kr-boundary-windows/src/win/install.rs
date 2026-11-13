@@ -388,7 +388,9 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     // stopped, as the folders above the data tree were by the check above; a link at the program
     // directory's name, one that points nowhere included, gets the link's own remedy.
     check_program_parents(paths, remedy::Stage::Before)?;
-    if records::entry_exists(&paths.program)
+    // Only a name that is not there is passed over: for any other answer the open below reads it
+    // and speaks with its own error.
+    if !matches!(records::look(&paths.program), records::Look::NotThere)
         && let Err(refusal) = DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)?
     {
         return Err(anchor_refusal(paths, &refusal, false));
@@ -408,12 +410,25 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
         )));
     }
     for (directory, accepted) in [(&paths.program, false), (&paths.data, data_accepted)] {
-        if records::entry_exists(directory) && !accepted {
-            // text: entry-3
-            return Err(Error::Refused(format!(
-                "{} exists and this installation did not make it",
-                directory.display()
-            )));
+        if accepted {
+            continue;
+        }
+        match records::look(directory) {
+            records::Look::NotThere => {}
+            records::Look::There => {
+                // text: entry-3
+                return Err(Error::Refused(format!(
+                    "{} exists and this installation did not make it",
+                    directory.display()
+                )));
+            }
+            records::Look::Unread(error) => {
+                // text: entry-4
+                return Err(Error::Refused(format!(
+                    "a look at {} failed ({error}), so the setup program cannot tell whether something that this installation did not make is there",
+                    directory.display()
+                )));
+            }
         }
     }
     Ok(Entry::Fresh)
@@ -1973,8 +1988,8 @@ fn check_program_directory(
 ) -> Result<bool, Error> {
     check_program_parents(paths, stage)?;
     // The look follows no link: a link that points nowhere is there, and gets the link's own remedy
-    // from the open below.
-    if !records::entry_exists(&paths.program) {
+    // from the open below, as does a name that the look could not read.
+    if matches!(records::look(&paths.program), records::Look::NotThere) {
         return Ok(false);
     }
     let program = paths.program.file_name().unwrap_or_default().to_owned();
@@ -3453,7 +3468,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     }
     let manifest = match records::begin(
         found,
-        &|| records::entry_exists(&paths.data),
+        &|| records::look(&paths.data),
         quiet_when_empty,
         &paths.data,
     ) {
@@ -3709,12 +3724,9 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         if let Some(parent) = paths.program.parent() {
             let _ = fs::remove_dir(parent);
         }
-    } else if records::entry_exists(&paths.program) {
+    } else if let Some(text) = records::looked_at_again(&paths.program) {
         // It was not there when the removal checked, so no check opened it: nothing is deleted.
-        failures.push(format!(
-            "{} was not there when the removal looked for it, and something is there now, so it was not removed",
-            paths.program.display()
-        ));
+        failures.push(text);
     }
     // The journal's files and the empty `run` and `journal` directories go where the inspection
     // opened and approved them, and nowhere else. Unfinished work was refused before the removal
@@ -3747,7 +3759,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     }
     // A record that the inspection did not approve was not used: the Application Identity service
     // keeps what the installation gave it, and the last words say so.
-    let unread_prior = records::unread_prior(approved.prior, records::entry_exists(&paths.prior));
+    let unread_prior = records::unread_prior(approved.prior, &records::look(&paths.prior));
     if failures.is_empty() {
         // The records go last: a failed removal can be run again from them.
         let stayed = remove_approved_records(paths, &approved);

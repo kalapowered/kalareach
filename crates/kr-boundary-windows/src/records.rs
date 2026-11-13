@@ -88,6 +88,29 @@ impl Approved {
     }
 }
 
+/// What a look at a name answered. The look follows no link, so a link that points nowhere is
+/// there; only an answer of "not found" says that nothing is there, and an answer of any other
+/// error says nothing about the name.
+#[derive(Debug)]
+pub enum Look {
+    /// An entry is at the name.
+    There,
+    /// The look answered "not found".
+    NotThere,
+    /// The look failed for another reason: nothing is known about the name.
+    Unread(io::Error),
+}
+
+/// Looks at a name, without following a link and without opening anything.
+#[must_use]
+pub fn look(path: &Path) -> Look {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Look::There,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Look::NotThere,
+        Err(error) => Look::Unread(error),
+    }
+}
+
 /// What a removal says of something that is there now and that its inspection did not see.
 #[must_use]
 // text: not_there_at_the_inspection
@@ -96,6 +119,22 @@ pub fn not_there_at_the_inspection(path: &Path) -> String {
         "{} was not there when the removal looked for it, and something is there now, so it was not removed",
         path.display()
     )
+}
+
+/// What a removal says of a name that its inspection did not see and that it looks at once more,
+/// only to leave it alone and say why: something is there now, or the look failed with this error.
+/// Nothing for a name that is still not there.
+#[must_use]
+// text: looked_at_again
+pub fn looked_at_again(path: &Path) -> Option<String> {
+    match look(path) {
+        Look::There => Some(not_there_at_the_inspection(path)),
+        Look::Unread(error) => Some(format!(
+            "{} was not there when the removal looked for it, and a look at it now failed ({error}), so it was not removed",
+            path.display()
+        )),
+        Look::NotThere => None,
+    }
 }
 
 /// Deletes the records, last of all in a removal, and then the data directory.
@@ -132,14 +171,16 @@ fn leave(stayed: &mut Vec<String>, path: &Path, result: io::Result<()>) -> bool 
     true
 }
 
-/// Whether nothing is at the path of a record that the inspection did not see; something that is
-/// there is left where it is, and named.
+/// Whether the path of a record that the inspection did not see is still not there; something that
+/// is there, or a name that cannot be looked at, is left where it is, and named.
 fn unseen(stayed: &mut Vec<String>, path: &Path) -> bool {
-    if entry_exists(path) {
-        stayed.push(not_there_at_the_inspection(path));
-        return false;
+    match looked_at_again(path) {
+        Some(text) => {
+            stayed.push(text);
+            false
+        }
+        None => true,
     }
-    true
 }
 
 /// [`remove`] with the way the data directory is listed given, so that a listing that fails can be
@@ -229,27 +270,40 @@ pub enum Begin<M> {
 }
 
 /// Decides how a removal begins. Only a directory that the inspection opened and approved is acted
-/// on: when it found none, the path is looked at once more, only to refuse with the reason if
-/// something is there now (the folder above it is one that an ordinary account may write in until
-/// the installation has made it), and no deletion follows that look.
+/// on: when it found none, the path is looked at once more, only to refuse with what that look
+/// answered (something is there now, or the look failed with its error; the folder above it is one
+/// that an ordinary account may write in until the installation has made it), and no deletion
+/// follows that look.
 ///
-/// `something_there_now` says whether anything is at the directory's name now; it is asked only
-/// when the inspection found none.
+/// `look_now` answers what is at the directory's name now; it is asked only when the inspection
+/// found none.
 pub fn begin<M>(
     found: Inspection<M>,
-    something_there_now: &dyn Fn() -> bool,
+    look_now: &dyn Fn() -> Look,
     quiet_when_empty: bool,
     data: &Path,
 ) -> Begin<M> {
     match found {
         Inspection::Recorded(manifest) => Begin::Remove(manifest),
         Inspection::Empty => Begin::FinishEmpty,
-        Inspection::Absent if something_there_now() => Begin::Refuse(format!(
-            "{} was not there when the removal looked for it, and something is there now, so nothing was removed. Run the removal again: it checks the directory first, and says what to do about it if it is not the installation's own.",
-            data.display()
-        )),
-        Inspection::Absent if quiet_when_empty => Begin::Nothing,
-        Inspection::Absent => Begin::Refuse("nothing is installed".to_owned()),
+        Inspection::Absent => match look_now() {
+            // text: begin-1
+            Look::There => Begin::Refuse(format!(
+                "{} was not there when the removal looked for it, and something is there now, so nothing was removed. Run the removal again: it checks the directory first, and says what to do about it if it is not the installation's own.",
+                data.display()
+            )),
+            // text: begin-2
+            Look::Unread(error) => Begin::Refuse(format!(
+                "{} was not there when the removal looked for it, and a look at it now failed ({error}), so nothing was removed. Run the removal again: it looks at the directory first.",
+                data.display()
+            )),
+            Look::NotThere if quiet_when_empty => Begin::Nothing,
+            // text: begin-3
+            Look::NotThere => Begin::Refuse(format!(
+                "{} is not there, so no manifest says what to remove",
+                data.display()
+            )),
+        },
     }
 }
 
@@ -264,15 +318,6 @@ pub fn remove_empty(data: &Path) -> Vec<String> {
         }
         _ => Vec::new(),
     }
-}
-
-/// Whether anything is at the path: a link that points nowhere and an entry that cannot be read
-/// count, because the look follows no link and only an answer of not found says that nothing is
-/// there. It is a look for a refusal's reason or for a decision to leave something alone, and no
-/// deletion follows it.
-#[must_use]
-pub fn entry_exists(path: &Path) -> bool {
-    !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
 /// Which of the data directory's `journal` and `run` directories the removal's inspection opened
@@ -303,9 +348,7 @@ pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<Str
     }
     for (directory, approved) in [(run, seen.run), (journal, seen.journal)] {
         if !approved {
-            if entry_exists(directory) {
-                stayed.push(not_there_at_the_inspection(directory));
-            }
+            stayed.extend(looked_at_again(directory));
             continue;
         }
         match fs::remove_dir(directory) {
@@ -330,16 +373,17 @@ fn unlisted(error: &io::Error) -> io::Error {
 /// What a removal adds to its last words where the earlier-state record is there and its inspection
 /// did not approve it: the record was not read, so the Application Identity service keeps the start
 /// value and the running state that the installation gave it. The next removal inspects the record
-/// again, and puts them back only if that inspection approves the record. The text starts with a
-/// full stop, to follow last words that have none, and is empty where the record was read or is
-/// not there.
+/// again, and puts them back only if that inspection approves the record. Where the look at the
+/// record's name failed, no record is known to be there: the words give the error and say what is
+/// so if one is. The text starts with a full stop, to follow last words that have none, and is
+/// empty where the record was read or is not there.
 #[must_use]
 // text: unread_prior
-pub fn unread_prior(approved: bool, there: bool) -> &'static str {
-    if there && !approved {
-        ". The earlier-state record was not read, so the Application Identity service's start value and running state were not put back: the next removal inspects the record again"
-    } else {
-        ""
+pub fn unread_prior(approved: bool, look: &Look) -> String {
+    match look {
+        Look::There if !approved => ". The earlier-state record was not read, so the Application Identity service's start value and running state were not put back: the next removal inspects the record again".to_owned(),
+        Look::Unread(error) if !approved => format!(". The look at the earlier-state record's name failed ({error}), so no record was read: if one is there, the Application Identity service's start value and running state were not put back, and the next removal inspects the record again"),
+        _ => String::new(),
     }
 }
 
