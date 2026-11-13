@@ -1168,9 +1168,11 @@ fn a_new_method_does_not_pass_where_a_use_of_method_does_not_widen() {
 /// says. A name that some validator decodes (`~`), cuts (a tab, a line feed, a carriage return, a
 /// space at the end) or reads as more than one pointer segment (`/`), and a keyword that gives a
 /// place an address, a name or a target that depends on where it is evaluated (`$id`, `id`,
-/// `$anchor`, `$dynamicAnchor`, `$recursiveRef`), can send a reference to another place than the
-/// one that the walk reads. No line under `Method` passes beside one, wherever it stands and even
-/// where nothing in the schema refers to it.
+/// `$anchor`, `$dynamicAnchor`, `$recursiveAnchor`, `$recursiveRef`), can send a reference to
+/// another place than the one that the walk reads. No line under `Method` passes beside one,
+/// wherever it stands (also among the keys of a map of names, under a name that is a keyword, and
+/// in a constant, a default or a keyword that the walk does not know) and even where nothing in
+/// the schema refers to it.
 #[test]
 fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
     let reference = || json!({ "$ref": "#/$defs/Method" });
@@ -1261,8 +1263,8 @@ fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
         ),
         (
             holder_with("$anchor", json!("m")),
-            // An anchor names a place that a reference from another schema (`#m`, or an address
-            // with `#m`) reaches, and the walk sees none of them.
+            // An anchor names a place that a reference from another schema document (an address
+            // that ends in `#m`) reaches, and the walk sees none of them.
             "an anchor that nothing in the schema refers to",
         ),
         (
@@ -1273,8 +1275,8 @@ fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
         ),
         (
             holder_with("$recursiveAnchor", json!(true)),
-            // A `$recursiveRef` of another schema, evaluated through this one, reaches the place
-            // that carries the anchor, and the walk sees none of them.
+            // The place that carries `"$recursiveAnchor": true` is the one that a `$recursiveRef`
+            // of another schema, evaluated through this one, selects, and the walk sees none.
             "a recursive anchor that nothing in the schema refers to",
         ),
         (
@@ -1282,9 +1284,33 @@ fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
                 "Holder": { "type": "object", "properties": { "m": reference() } },
                 "Again": { "$recursiveRef": "#" },
             }),
-            // A `$recursiveRef` reaches the outermost schema that has a `$recursiveAnchor`, which
-            // the walk cannot tell from any other place.
+            // A `$recursiveRef` resolves `#` where it stands and, where that place has
+            // `"$recursiveAnchor": true`, selects the outermost such place of the evaluation: the
+            // walk cannot tell which places have one.
             "a recursive reference",
+        ),
+        (
+            json!({ "D": { "dependentSchemas": { "properties": {
+                "$id": "https://example.test/x" } } } }),
+            // `properties` is a name here: the schema under it applies to an object that has a
+            // member `properties`, and its `$id` gives that schema an address of its own.
+            "a keyword in a schema that stands under a name that is a keyword",
+        ),
+        (
+            json!({ "D": { "$defs": { "properties": { "$anchor": "m" } } } }),
+            // The same in a nested `$defs`: an anchor in a definition named `properties`.
+            "an anchor in a nested definition named like a keyword",
+        ),
+        (
+            json!({ "D": { "default": { "properties": { "$id": "https://example.test/x" } } } }),
+            // A resolver that searches the whole document for an `$id` (the legacy resolver of a
+            // Python validator) finds it in a default as it finds one in a schema.
+            "an address in a default",
+        ),
+        (
+            json!({ "D": { "x-vendor": { "properties": { "$id": "https://example.test/x" } } } }),
+            // The same in a keyword that the walk does not know.
+            "an address in an unknown keyword",
         ),
     ] {
         let lines = level_lines(
@@ -1355,6 +1381,16 @@ fn a_new_method_passes_where_every_use_of_method_widens() {
         // A definition whose name has an upper-case letter, a digit and an underscore.
         "Chain_2": { "anyOf": [{ "$ref": "#/$defs/Chain" }, { "type": "null" }] },
         "Outer": { "type": "object", "properties": { "next": { "$ref": "#/$defs/Chain_2" } } },
+        // Names that are keywords, in each map of names, are names: no place has an address.
+        "Named": { "oneOf": [
+            { "type": "object", "properties": { "id": { "type": "string" },
+                "$id": { "type": "string" }, "$anchor": { "type": "string" } } },
+            { "type": "null" }] },
+        "Mapped": { "type": "object", "$defs": { "id": { "type": "string" } },
+            "dependentSchemas": { "id": { "required": ["x"] } } },
+        // Data that holds no keyword that the walk refuses.
+        "Data": { "default": { "kind": 1 }, "examples": [{ "m": "a" }], "const": null,
+            "x-vendor": { "properties": { "kind": 1 } } },
     });
     assert!(
         level_lines(

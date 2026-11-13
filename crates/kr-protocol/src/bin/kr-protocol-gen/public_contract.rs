@@ -226,51 +226,103 @@ fn widens_with(node: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool 
     }
 }
 
+/// The keywords that give a place an address of its own (`$id`, and draft-04's `id`), a name that
+/// a reference can find (`$anchor`, `$dynamicAnchor`), a mark that lets a `$recursiveRef` select
+/// the place (`$recursiveAnchor`), or a target that depends on the place that evaluates it
+/// (`$dynamicRef`, `$recursiveRef`).
+const SCOPE_KEYWORDS: [&str; 7] = [
+    "$id",
+    "id",
+    "$anchor",
+    "$dynamicAnchor",
+    "$recursiveAnchor",
+    "$dynamicRef",
+    "$recursiveRef",
+];
+
+/// Whether a `$ref` to `member` stands where a wider definition of `reaching` widens the place
+/// (`widening`), or does not reach one. The walk follows a `$ref` only when it is `#/$defs/` and a
+/// name of one or more ASCII letters, digits and `_`. That is a fragment of two pointer segments
+/// with no character that a validator decodes (`%`, `~`) or removes (a trailing `#`, a tab, a line
+/// feed, a carriage return, a space at the end) and no `/` that starts a third segment, so every
+/// validator reads the same two segments. Any other `$ref` (`#`, `#name`, an address,
+/// `#/definitions/NAME`, an empty name) is refused.
+fn reference_widens(member: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
+    match member
+        .as_str()
+        .and_then(|target| target.strip_prefix("#/$defs/"))
+    {
+        Some(target)
+            if !target.is_empty()
+                && target
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') =>
+        {
+            widening || !reaching.contains(target)
+        }
+        _ => false,
+    }
+}
+
 /// Whether `member`, the value of `keyword` in a schema, stands where a wider definition of
 /// `reaching` widens the place (see [`widens_with`]).
 ///
-/// The walk follows a `$ref` only when it is `#/$defs/` and a name of one or more ASCII letters,
-/// digits and `_`. That is a fragment of two pointer segments with no character that a validator
-/// decodes (`%`, `~`) or removes (a trailing `#`, a tab, a line feed, a carriage return, a space
-/// at the end) and no `/` that starts a third segment, so every validator reads the same two
-/// segments. Such a reference has no scheme, host or path, so it is resolved against the base
-/// address of the resource that holds it. Only `$id` (and draft-04's `id`) gives a place a base
-/// address of its own; `$anchor`, `$dynamicAnchor` and `$recursiveAnchor` name a place that a
-/// plain-name fragment or a dynamic reference can reach; `$dynamicRef` and `$recursiveRef` pick
-/// their target by the place that evaluates them. The walk refuses each of these keywords and
-/// each other form of `$ref` (`#`, `#name`, an address, `#/definitions/NAME`, an empty name),
-/// wherever it stands in a definition or beside `$defs`, so a schema that it accepts holds no
-/// place with an address or a name of its own and no reference that it cannot read. Every
-/// reference that it follows then reaches, in every validator, the member of the one `$defs` that
-/// its name says (a generated file holds a key once). A name that `$defs` lacks reaches nothing:
-/// that is an error, never another place.
+/// A reference that [`reference_widens`] follows has no scheme, host or path, so it is resolved
+/// against the base address of the resource that holds it, and it reaches the member of the one
+/// `$defs` that its name says (a generated file holds a key once; a name that `$defs` lacks
+/// reaches nothing, which is an error and never another place). Only a [`SCOPE_KEYWORDS`] keyword
+/// can change that, and the walk refuses each of them wherever it stands. It reads a key as a
+/// name only in a map from names to schemas (`properties`, `patternProperties`, `$defs`,
+/// `definitions`, `dependentSchemas`, `dependencies`), where a name is not a keyword; every key of
+/// a value that it does not read as a schema (a constant, a default, an example, a keyword that it
+/// does not know) is read as a keyword, so no keyword hides among names. A schema that the walk
+/// accepts then holds no place with an address or a name of its own and no reference that it
+/// cannot read.
 fn widens_at(keyword: &str, member: &Value, reaching: &BTreeSet<&str>, widening: bool) -> bool {
     match keyword {
-        "$ref" => match member
-            .as_str()
-            .and_then(|target| target.strip_prefix("#/$defs/"))
-        {
-            Some(target)
-                if !target.is_empty()
-                    && target
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') =>
-            {
-                widening || !reaching.contains(target)
-            }
-            _ => false,
-        },
-        "$dynamicRef" | "$recursiveRef" | "$dynamicAnchor" | "$recursiveAnchor" | "$anchor"
-        | "$id" | "id" => false,
+        "$ref" => reference_widens(member, reaching, widening),
+        _ if SCOPE_KEYWORDS.contains(&keyword) => false,
         "properties" | "patternProperties" if member.is_object() => member
             .as_object()
             .into_iter()
             .flat_map(|named| named.values())
             .all(|schema| widens_with(schema, reaching, widening)),
+        "$defs" | "definitions" | "dependentSchemas" | "dependencies" if member.is_object() => {
+            member
+                .as_object()
+                .into_iter()
+                .flat_map(|named| named.values())
+                .all(|schema| widens_with(schema, reaching, false))
+        }
         "items" | "additionalProperties" | "anyOf" | "allOf" | "prefixItems" => {
             widens_with(member, reaching, widening)
         }
-        _ => widens_with(member, reaching, false),
+        "oneOf"
+        | "not"
+        | "if"
+        | "then"
+        | "else"
+        | "contains"
+        | "propertyNames"
+        | "unevaluatedItems"
+        | "unevaluatedProperties"
+        | "additionalItems"
+        | "contentSchema" => widens_with(member, reaching, false),
+        _ => is_plain_data(member, reaching),
+    }
+}
+
+/// Whether `node`, a value that the walk does not read as a schema, holds no keyword that the walk
+/// refuses: every key is read as a keyword, none as a name, and no place widens.
+fn is_plain_data(node: &Value, reaching: &BTreeSet<&str>) -> bool {
+    match node {
+        Value::Object(members) => members.iter().all(|(key, member)| match key.as_str() {
+            "$ref" => reference_widens(member, reaching, false),
+            key if SCOPE_KEYWORDS.contains(&key) => false,
+            _ => is_plain_data(member, reaching),
+        }),
+        Value::Array(items) => items.iter().all(|item| is_plain_data(item, reaching)),
+        _ => true,
     }
 }
 
