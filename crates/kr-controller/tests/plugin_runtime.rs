@@ -2048,9 +2048,30 @@ async fn a_registration_held_for_a_binding_that_goes_is_given_up_for_the_binding
     .await;
 
     // The runtime goes on: it answers what it was sent, and what it registered for the binding that
-    // went is removed, so that it holds the two bindings the broker holds.
+    // went is removed, so that it holds the two bindings the broker holds. The case waits for the
+    // removal and not for the count, which is two as soon as the third binding's registration is
+    // made, before the second's is.
     resume(&host);
     world.components_are(2, ComponentState::Registered).await;
+    let identifier = second_binding.to_string();
+    let removal = format!(
+        "ended unbind {} ",
+        &identifier[identifier.len().saturating_sub(6)..]
+    );
+    until_found(
+        PATIENCE,
+        "the link to remove what the runtime holds for the second binding",
+        || async {
+            let account = world.link_traces_after_a_look().await;
+            if account.contains(&removal) {
+                Ok(())
+            } else {
+                Err(String::new())
+            }
+        },
+        || world.link_traces_after_a_look(),
+    )
+    .await;
     world.holding(2).await;
 }
 
