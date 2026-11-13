@@ -280,18 +280,12 @@ fn cancel(pipe: HANDLE, transfer: &mut Transfer) -> ffi::Result<bool> {
     Ok(matches!(ended, ffi::Waited::Signalled(_)))
 }
 
-/// How long a wait, with a deadline or without, waits before it looks at the stop again. It exists
-/// because a stop event that could not be set wakes nobody: the failure is kept in the stop, and
-/// only a wait that comes back to read it sees it, so a failed set ends every listener within one
-/// slice. The cost is one idle wake-up a second for each listener.
-const STOP_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Waits for a transfer, up to the deadline and until the stop event is set. Every wait, with a
-/// deadline or without, waits in slices of [`STOP_SLICE`] at most, and each slice reads the stop
-/// again. When it does not
-/// finish in time it is cancelled and waited for for at most [`CANCEL_GRACE_MS`]; a transfer that
-/// still has not ended is left to end by itself, its record and buffer kept for the life of the
-/// process, and `stuck` is set so that the caller takes no more transfers on that pipe.
+/// Waits for a transfer, up to the deadline and until the stop event is set. The stop's own wait
+/// slices every wait, with a deadline or without, so a stop that could not be set ends this wait
+/// within one slice. When it does not finish in time it is cancelled and waited for for at most
+/// [`CANCEL_GRACE_MS`]; a transfer that still has not ended is left to end by itself, its record
+/// and buffer kept for the life of the process, and `stuck` is set so that the caller takes no
+/// more transfers on that pipe.
 fn wait(
     pipe: HANDLE,
     mut transfer: Transfer,
@@ -301,29 +295,17 @@ fn wait(
 ) -> io::Result<(u32, Transfer)> {
     // The stop is waited on first: when both are signalled the call reports the stop, so a transfer
     // that finished at once never wins over it, and a wait that fails is kept as the unread stop.
-    let waited = loop {
-        // Every wait is a slice at most, whatever its deadline: the longest a stop that could not be
-        // set can keep a wait is one slice.
-        let slice = deadline.map_or(STOP_SLICE, |deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(STOP_SLICE)
-        });
-        // One less than the longest wait, which means "forever".
-        let waited = stop.wait_for(
-            &[transfer.event.raw()],
-            super::ffi::milliseconds(slice, INFINITE - 1),
-            "waiting for the other end",
-        );
-        // A slice that ended with nothing signalled is waited on again while the deadline, if there
-        // is one, has not come: the next call reads the stop's kept failure first.
-        if matches!(waited, Ok(ffi::Waited::TimedOut))
-            && deadline.is_none_or(|deadline| Instant::now() < deadline)
-        {
-            continue;
-        }
-        break waited;
-    };
+    // The bound is what is left of the deadline, rounded up to a whole millisecond so that the wait
+    // never ends before the deadline, or none, which `INFINITE` says; one less than the longest wait
+    // is the longest that a deadline can ask for.
+    let bound = deadline.map_or(INFINITE, |deadline| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        super::ffi::milliseconds(
+            left + std::time::Duration::from_nanos(999_999),
+            INFINITE - 1,
+        )
+    });
+    let waited = stop.wait_for(&[transfer.event.raw()], bound, "waiting for the other end");
     if !matches!(waited, Ok(ffi::Waited::Signalled(1))) {
         // A transfer that is not seen to end after the cancel stays with the process, and the
         // cancel's own failed wait is told beside the reason.
@@ -1072,8 +1054,10 @@ pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
     })
 }
 
-#[cfg(all(test, feature = "testing"))]
+#[cfg(test)]
+#[cfg(feature = "testing")]
 mod tests {
+    use super::super::stop::STOP_SLICE;
     use super::*;
 
     /// A wait on a pipe that no client comes to ends within two slices of a stop that could not be
