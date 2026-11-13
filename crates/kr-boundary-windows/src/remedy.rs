@@ -1088,9 +1088,9 @@ const DATA_KIND: &str = "The handle of this directory shows a reparse point or a
 
 /// The words that end the refusal of a data directory at a removal or a repair, or where a part of
 /// the installation may be on the computer, when the handle shows a link or another kind of object:
-/// the records in it are not used, and no step is named.
-const DATA_KIND_STANDS: &str =
-    "The setup program does not use the records in it. It names no step for it.";
+/// it is not used as the data directory, no record behind it is used (an object that is not a
+/// directory holds none, and a link leads elsewhere), and no step is named.
+const DATA_KIND_STANDS: &str = "The setup program does not use it as the data directory, and does not use any record behind it. It names no step for it.";
 
 /// The words the refusal of a data directory that separates names by case ends with, when the
 /// system's class owns it.

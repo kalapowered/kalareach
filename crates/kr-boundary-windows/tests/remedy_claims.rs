@@ -211,7 +211,16 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
                     for claim in ["move it aside", "Move", "rename", "makes the directory new"] {
                         assert!(!text.contains(claim), "{claim}: {what}");
                     }
-                    assert!(text.contains("does not use the records in it"), "{what}");
+                    // An object that is not a directory holds no records: its words say that it is
+                    // not used as the data directory, and the owner's say that its records are not used.
+                    assert!(
+                        text.contains(if origin == Origin::Foreign {
+                            "does not use it as the data directory, and does not use any record behind it"
+                        } else {
+                            "does not use the records in it"
+                        }),
+                        "{what}"
+                    );
                     assert_eq!(
                         text.contains(
                             "give the ownership of the data directory and of everything in it back to the Administrators group"

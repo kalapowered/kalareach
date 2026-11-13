@@ -23,7 +23,24 @@ use super::ffi::{self, Handle, Result, last};
 /// takes it as the stop.
 pub struct Stop {
     event: Handle,
-    unread: std::sync::OnceLock<String>,
+    unread: std::sync::OnceLock<Failure>,
+}
+
+/// What failed first on the stop event: a wait on it, or the call that sets it. The two are told in
+/// their own words, since a failed set shows nothing of any wait.
+enum Failure {
+    /// A wait on the event failed.
+    Wait(String),
+    /// The event could not be set.
+    Set(String),
+}
+
+impl Failure {
+    fn words(&self) -> &str {
+        match self {
+            Failure::Wait(words) | Failure::Set(words) => words,
+        }
+    }
 }
 
 impl Stop {
@@ -48,7 +65,8 @@ impl Stop {
         // SAFETY: the event handle is open.
         if unsafe { SetEvent(self.event.raw()) } == 0 {
             // text: stop_set-1
-            let _ = self.unread.set(last("setting the stop event").to_string());
+            let failure = Failure::Set(last("setting the stop event").to_string());
+            let _ = self.unread.set(failure);
         }
     }
 
@@ -62,17 +80,19 @@ impl Stop {
     #[must_use]
     // text: unread
     pub fn unread(&self) -> Option<&str> {
-        self.unread.get().map(String::as_str)
+        self.unread.get().map(Failure::words)
     }
 
     /// What ended the work, in words, for a reader that finds the stop set: that the service is
-    /// stopping, or, where a wait on the event failed, that the stop could not be read, with the
-    /// error. A failed wait is never told as a stop that someone asked for.
+    /// stopping, or, where a wait on the event failed, that the stop could not be read, or, where
+    /// the event could not be set, that it could not be set, each with the error. A failed wait or
+    /// a failed set is never told as a stop that someone asked for.
     #[must_use]
     // text: stop_reason
     pub fn reason(&self) -> String {
-        match self.unread() {
-            Some(unread) => format!("the stop could not be read ({unread})"),
+        match self.unread.get() {
+            Some(Failure::Wait(unread)) => format!("the stop could not be read ({unread})"),
+            Some(Failure::Set(unread)) => format!("the stop could not be set ({unread})"),
             None => "the service is stopping".to_owned(),
         }
     }
@@ -124,7 +144,7 @@ impl Stop {
         match ffi::wait_any(&handles, milliseconds, what) {
             Ok(waited) => Ok(waited),
             Err(failure) => {
-                let _ = self.unread.set(failure.to_string());
+                let _ = self.unread.set(Failure::Wait(failure.to_string()));
                 self.set();
                 Err(failure)
             }
