@@ -175,17 +175,34 @@ const NO_LINKS: Layout<HTMLElement> = { links: [], reach: { least: 0, beside: 0 
  * The links of `pane` that a target could reach (`x`, `y`) from, laid out as they are now. The least
  * size is the stylesheet's `--target`: 44 points on iOS and 48 dp on Android, and half of it lies
  * beside the words.
+ *
+ * What this reads does not grow with the number of links. Where the pane holds no link in a message
+ * (the terminal and the output views, a conversation with no link) it reads no box at all. Otherwise
+ * it reads the pane's box, the box of each message that holds a link, and the box of each link of the
+ * messages that lie within the least size of the point; of those links only the ones within the least
+ * size of the point have their words read.
  */
 function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement> {
+  const all = pane.querySelectorAll<HTMLElement>('.m-node .md-link')
+  if (all.length === 0) return NO_LINKS
   const least = parseFloat(getComputedStyle(pane).getPropertyValue('--target'))
   const bounds = pane.getBoundingClientRect()
   if (!Number.isFinite(least) || least <= 0) return { links: [], reach: { least: 0, beside: 0 }, bounds }
-  // A link whose box lies farther from the point than a target reaches cannot hold it.
-  const links = Array.from(pane.querySelectorAll<HTMLElement>('.m-node .md-link'))
-    .filter((link) => {
-      const box = link.getBoundingClientRect()
-      return x >= box.left - least && x <= box.right + least && y >= box.top - least && y <= box.bottom + least
-    })
+  // A box that lies farther from the point than a target reaches holds no link that could hold it.
+  const near = (box: DOMRect): boolean => x >= box.left - least && x <= box.right + least && y >= box.top - least && y <= box.bottom + least
+  const messages = new Map<Element, boolean>()
+  const nearMessage = (link: HTMLElement): boolean => {
+    const message = link.closest('.m-node')
+    if (message === null) return false
+    let answer = messages.get(message)
+    if (answer === undefined) {
+      answer = near(message.getBoundingClientRect())
+      messages.set(message, answer)
+    }
+    return answer
+  }
+  const links = Array.from(all)
+    .filter((link) => nearMessage(link) && near(link.getBoundingClientRect()))
     .map((link) => ({ id: link, destination: link.title, words: wordsOf(link) }))
   return { links, reach: { least, beside: least / 2 }, bounds }
 }
