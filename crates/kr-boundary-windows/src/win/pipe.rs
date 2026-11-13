@@ -106,6 +106,7 @@ impl Stop {
     pub fn new() -> Result<Arc<Stop>> {
         // SAFETY: a manual-reset event with no name and no security attributes.
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
+        // text: pipe_new-1
         Ok(Arc::new(Stop(Handle::new(event, "making the stop event")?)))
     }
 
@@ -284,6 +285,7 @@ struct Transfer {
 impl Transfer {
     fn new(buffer: Vec<u8>) -> io::Result<Transfer> {
         // SAFETY: an event with no name; a fresh one for each transfer keeps transfers apart.
+        // text: pipe_new-2
         let event = Handle::new(
             unsafe { CreateEventW(null(), 1, 0, null()) },
             "making an event",
@@ -493,11 +495,13 @@ impl Connection {
         let mut pid = 0_u32;
         // SAFETY: the pipe is a connected server end.
         if unsafe { GetNamedPipeClientProcessId(self.pipe.raw(), &raw mut pid) } == 0 {
+            // text: pipe_identity-1
             return Err(last("identifying the caller's process"));
         }
         // SAFETY: impersonation lasts only until the reversal below, on this thread.
         unsafe {
             if ImpersonateNamedPipeClient(self.pipe.raw()) == 0 {
+                // text: pipe_identity-2
                 return Err(last("impersonating the caller"));
             }
         }
@@ -505,6 +509,7 @@ impl Connection {
         // SAFETY: the thread's own impersonation token is opened as the service itself.
         let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &raw mut token) };
         let failure = if opened == 0 {
+            // text: pipe_identity-3
             Some(last("reading the caller's token"))
         } else {
             None
@@ -516,12 +521,14 @@ impl Connection {
         if let Some(failure) = failure {
             return Err(failure);
         }
+        // text: pipe_identity-4
         let token = Handle::new(token, "the caller's token")?;
         let administrators = Sid::parse("S-1-5-32-544")?;
         let mut member = 0;
         // SAFETY: the token is an impersonation token and the identifier is valid.
         unsafe {
             if CheckTokenMembership(token.raw(), administrators.as_ptr(), &raw mut member) == 0 {
+                // text: pipe_identity-5
                 return Err(last("checking the caller's standing"));
             }
         }
@@ -541,6 +548,7 @@ impl Connection {
                 &raw mut needed,
             ) == 0
             {
+                // text: pipe_identity-6
                 return Err(last("reading the caller's account"));
             }
             Sid::from_ptr((*buffer.as_ptr().cast::<SID_AND_ATTRIBUTES>()).Sid)
@@ -912,6 +920,7 @@ impl ServerProcess {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         Ok(ServerProcess {
             pid,
+            // text: pipe_open-1
             _handle: Handle::new(handle, "opening the service's process")?,
         })
     }
@@ -953,9 +962,11 @@ pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
     let mut server = 0_u32;
     // SAFETY: the pipe is a connected client end.
     if unsafe { GetNamedPipeServerProcessId(pipe.raw(), &raw mut server) } == 0 {
+        // text: pipe_connect_held-1
         return Err(last("identifying the process that serves the pipe"));
     }
     if server != expected_server {
+        // text: pipe_connect_held-2
         return Err(error(
             0,
             format!(

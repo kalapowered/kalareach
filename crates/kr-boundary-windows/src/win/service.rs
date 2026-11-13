@@ -100,6 +100,7 @@ pub fn manager() -> Result<Manager> {
     // SAFETY: the two names are null, which means this computer's active database.
     let handle = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_ALL_ACCESS) };
     if handle.is_null() {
+        // text: service_manager-1
         Err(last("opening the service manager"))
     } else {
         Ok(Manager(handle))
@@ -117,6 +118,7 @@ impl Manager {
         // SAFETY: the manager is open and the name is NUL-terminated.
         let handle = unsafe { OpenServiceW(self.0, wide_name.as_ptr(), SERVICE_ALL_ACCESS) };
         if handle.is_null() {
+            // text: service_open-1
             let failure = last(format!("opening the service {name}"));
             if failure.code == ERROR_SERVICE_DOES_NOT_EXIST {
                 Ok(None)
@@ -156,6 +158,7 @@ impl Manager {
             )
         };
         if handle.is_null() {
+            // text: service_create-1
             Err(last(format!("making the service {name}")))
         } else {
             Ok(Service(handle, name.to_owned()))
@@ -180,6 +183,7 @@ impl Service {
             if ChangeServiceConfig2W(self.0, SERVICE_CONFIG_DESCRIPTION, (&raw const info).cast())
                 == 0
             {
+                // text: service_configure-1
                 return Err(last("describing the service"));
             }
         }
@@ -212,6 +216,7 @@ impl Service {
                 (&raw const failure).cast(),
             ) == 0
             {
+                // text: service_configure-2
                 return Err(last("setting what happens when the service fails"));
             }
         }
@@ -232,6 +237,7 @@ impl Service {
                 (&raw const required).cast(),
             ) == 0
             {
+                // text: service_configure-3
                 return Err(last("limiting the service's privileges"));
             }
         }
@@ -256,11 +262,13 @@ impl Service {
                 null_mut(),
             ) == 0
             {
+                // text: service_set_security-1
                 return Err(last(format!("reading the permission list {sddl}")));
             }
             let set = SetServiceObjectSecurity(self.0, DACL_SECURITY_INFORMATION, descriptor);
             LocalFree(descriptor);
             if set == 0 {
+                // text: service_set_security-2
                 return Err(last("setting the service's permissions"));
             }
         }
@@ -275,6 +283,7 @@ impl Service {
     pub fn start(&self) -> Result<()> {
         // SAFETY: the service is open; no arguments are passed.
         if unsafe { StartServiceW(self.0, 0, null()) } == 0 {
+            // text: service_start-1
             Err(last("starting the service"))
         } else {
             Ok(())
@@ -298,6 +307,7 @@ impl Service {
         };
         // SAFETY: the service is open and the status is an out-parameter.
         if unsafe { ControlService(self.0, SERVICE_CONTROL_STOP, &raw mut status) } == 0 {
+            // text: service_stop-1
             Err(last("stopping the service"))
         } else {
             Ok(())
@@ -312,6 +322,7 @@ impl Service {
     pub fn delete(&self) -> Result<()> {
         // SAFETY: the service is open.
         if unsafe { DeleteService(self.0) } == 0 {
+            // text: service_delete-1
             Err(last("deleting the service"))
         } else {
             Ok(())
@@ -348,6 +359,7 @@ impl Service {
         if changed != 0 {
             return Ok(false);
         }
+        // text: service_marked_for_deletion-1
         let failure = last("asking whether the service is deleted");
         if failure.code == ERROR_SERVICE_MARKED_FOR_DELETE {
             Ok(true)
@@ -385,6 +397,7 @@ impl Service {
             )
         };
         if queried == 0 {
+            // text: service_status-1
             Err(last("reading the service's status"))
         } else {
             Ok(Status {
@@ -456,6 +469,7 @@ impl Service {
             )
         };
         if changed == 0 {
+            // text: service_set_automatic-1
             Err(last("setting the service to start with Windows"))
         } else {
             Ok(())
@@ -474,6 +488,7 @@ impl Service {
             QueryServiceConfigW(self.0, null_mut(), 0, &raw mut needed);
         }
         if needed == 0 {
+            // text: service_configuration-1
             return Err(last("reading the service's configuration"));
         }
         let mut buffer = vec![0_u64; (needed as usize).div_ceil(8)];
@@ -486,6 +501,7 @@ impl Service {
                 &raw mut needed,
             ) == 0
             {
+                // text: service_configuration-2
                 return Err(last("reading the service's configuration"));
             }
             let config = &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>();

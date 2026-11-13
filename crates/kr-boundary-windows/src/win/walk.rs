@@ -116,6 +116,7 @@ pub fn check_volume(handle: &Handle) -> Result<std::result::Result<u64, VolumeRe
         )
     };
     if read == 0 {
+        // text: walk_check_volume-1
         return Err(last("reading the volume's file system"));
     }
     let length = name
@@ -149,6 +150,7 @@ pub fn check_volume(handle: &Handle) -> Result<std::result::Result<u64, VolumeRe
     if status < 0 {
         // SAFETY: converts a status code to a Windows error number; it reads nothing else.
         let code = unsafe { RtlNtStatusToDosError(status) };
+        // text: walk_check_volume-2
         return Err(error(code, "reading the volume's device"));
     }
     if device.characteristics & FILE_REMOTE_DEVICE != 0 {
@@ -334,6 +336,7 @@ fn final_path(handle: &Handle) -> Result<Vec<u16>> {
             )
         };
         if length == 0 {
+            // text: walk_final_path-1
             return Err(last("reading an object's final path"));
         }
         if (length as usize) < buffer.len() {
@@ -366,6 +369,7 @@ fn open_by_key(hint: &Handle, key: &FileKey, access: u32, share: u32) -> Result<
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         )
     };
+    // text: walk_open_by_key-1
     Handle::new(raw as HANDLE, "opening an object by its identifier")
 }
 
@@ -406,6 +410,7 @@ impl DirHandle {
                 std::ptr::null_mut(),
             )
         };
+        // text: walk_open_anchor_with-1
         let handle = Handle::new(raw, "opening the directory a walk starts from")?;
         DirHandle::checked(handle)
     }
@@ -490,6 +495,7 @@ impl DirHandle {
                 if code == ERROR_NO_MORE_FILES {
                     return Ok(children);
                 }
+                // text: walk_children-1
                 return Err(error(code, "listing a directory"));
             }
             let base = buffer.as_ptr().cast::<u8>();
@@ -795,6 +801,7 @@ impl DirHandle {
         if status < 0 {
             return Err(nt_error(status, "opening a name beneath a held directory"));
         }
+        // text: walk_nt_open_name-1
         Handle::new(raw, "opening a name beneath a held directory")
     }
 }

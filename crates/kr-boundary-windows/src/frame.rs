@@ -34,18 +34,22 @@ pub const MAX_FRAME: usize = 16 * 1024;
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
     /// The peer ended the connection between frames.
+    // text: frame-1
     #[error("the connection ended")]
     Closed,
     /// The frame is longer than the limit allows.
+    // text: frame-2
     #[error("a frame of {0} bytes is longer than the limit")]
     TooLong(usize),
     /// The frame's body is not a message of this protocol.
+    // text: frame-3
     #[error("the message is not one this protocol carries: {0}")]
     Malformed(String),
     /// A field of the message is outside its bounds.
     #[error("{0}")]
     Field(#[from] FieldError),
     /// The connection failed.
+    // text: frame-4
     #[error("the connection failed: {0}")]
     Io(#[from] io::Error),
 }

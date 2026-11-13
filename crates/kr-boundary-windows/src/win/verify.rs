@@ -99,14 +99,17 @@ unsafe fn subject_of(state: HANDLE) -> Result<String> {
     unsafe {
         let provider = WTHelperProvDataFromStateData(state);
         if provider.is_null() {
+            // text: verify_subject_of-1
             return Err(error(0, "the verification left no provider data"));
         }
         let signer = WTHelperGetProvSignerFromChain(provider, 0, 0, 0);
         if signer.is_null() || (*signer).pasCertChain.is_null() {
+            // text: verify_subject_of-2
             return Err(error(0, "the signature names no signer"));
         }
         let certificate = (*(*signer).pasCertChain).pCert;
         if certificate.is_null() {
+            // text: verify_subject_of-3
             return Err(error(0, "the signature names no signer"));
         }
         let subject = &raw const (*(*certificate).pCertInfo).Subject;

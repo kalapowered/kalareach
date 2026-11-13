@@ -323,6 +323,174 @@ verify-1 | Windows did not verify its signature | P: Windows did not verify its 
 walk-10 | a name too long for the platform | a name too long for the platform | read: the name's length in bytes is over the limit of the platform's name type; no call was made
 open_directory_relative-1 | beneath a held directory | opening (or opening or making) N beneath a held directory: Windows error N | read: NtCreateFile returned the error; with the open-if disposition the same call makes a directory that is not there
 
+# ---- the contexts of the platform calls (win/*.rs): the words name the step that failed, and its error is printed
+account_create-1 | making the account {name} | making the account {name}: Windows error N | read: the step that the words name, in `create`, returned an error
+account_delete-1 | deleting the account {name} | deleting the account {name}: Windows error N | read: the step that the words name, in `delete`, returned an error
+account_policy-1 | opening the security policy | opening the security policy: Windows error N | read: the step that the words name, in `policy`, returned an error
+account_grant_rights-1 | granting user rights | granting user rights: Windows error N | read: the step that the words name, in `grant_rights`, returned an error
+account_revoke_all_rights-1 | taking away user rights | taking away user rights: Windows error N | read: the step that the words name, in `revoke_all_rights`, returned an error
+account_delete_profile-1 | deleting a profile | deleting a profile: Windows error N | read: the step that the words name, in `delete_profile`, returned an error
+acl_changeable_by_others-1 | opening {} to read its permissions | opening {} to read its permissions: Windows error N | read: the step that the words name, in `changeable_by_others`, returned an error
+acl_judged-1 | reading the permissions of an open object | reading the permissions of an open object: Windows error N | read: the step that the words name, in `judged`, returned an error
+acl_finding_in-1 | reading the size of a permission list | reading the size of a permission list: Windows error N | read: the step that the words name, in `finding_in`, returned an error
+acl_finding_in-2 | reading an entry of a permission list | reading an entry of a permission list: Windows error N | read: the step that the words name, in `finding_in`, returned an error
+ffi_system_windows_directory-1 | reading the system's Windows directory | reading the system's Windows directory: Windows error N | read: the step that the words name, in `system_windows_directory`, returned an error
+ffi_parse-1 | reading the identifier {text} | reading the identifier {text}: Windows error N | read: the step that the words name, in `parse`, returned an error
+ffi_of_account-1 | looking up the account {name} | looking up the account {name}: Windows error N | read: the step that the words name, in `of_account`, returned an error
+ffi_of_account-2 | looking up the account {name} | looking up the account {name}: Windows error N | read: the step that the words name, in `of_account`, returned an error
+install_check_data_parent_at-1 | opening the data directory's parent folder | opening the data directory's parent folder: Windows error N | read: the step that the words name, in `check_data_parent_at`, returned an error
+install_check_data_parent_at-2 | reading the data directory's parent folder | reading the data directory's parent folder: Windows error N | read: the step that the words name, in `check_data_parent_at`, returned an error
+install_case_sensitive_reason-1 | reading whether the data directory separates names by case | reading whether the data directory separates names by case: Windows error N | read: the step that the words name, in `case_sensitive_reason`, returned an error
+install_protect_handle-1 | setting the permissions of {what} | setting the permissions of {what}: Windows error N | read: the step that the words name, in `protect_handle`, returned an error
+install_attributes_of-1 | reading {what} | reading {what}: Windows error N | read: the step that the words name, in `attributes_of`, returned an error
+install_file_key-1 | reading an object's identity | reading an object's identity: Windows error N | read: the step that the words name, in `file_key`, returned an error
+install_open_directory_relative-1 | opening a directory beneath a held directory | opening a directory beneath a held directory: Windows error N | read: the step that the words name, in `open_directory_relative`, returned an error
+install_opened_final_path-1 | opening a known folder | opening a known folder: Windows error N | read: the step that the words name, in `opened_final_path`, returned an error
+install_check_ancestors-1 | opening a folder above the installation | opening a folder above the installation: Windows error N | read: the step that the words name, in `check_ancestors`, returned an error
+install_check_program_parents-1 | opening a folder above the program directory | opening a folder above the program directory: Windows error N | read: the step that the words name, in `check_program_parents`, returned an error
+install_final_path_of-1 | reading a folder's final path | reading a folder's final path: Windows error N | read: the step that the words name, in `final_path_of`, returned an error
+install_stage_payload-1 | opening {} | opening {}: the io error | read: the step that the words name, in `stage_payload`, returned an error
+install_stage_payload-2 | reading {} | reading {}: the io error | read: the step that the words name, in `stage_payload`, returned an error
+install_stage_payload-3 | staging {name} | staging {name}: the io error | read: the step that the words name, in `stage_payload`, returned an error
+install_stage_payload-4 | staging {} | staging {}: the io error | read: the step that the words name, in `stage_payload`, returned an error
+install_stage_payload-5 | opening {} | opening {}: the io error | read: the step that the words name, in `stage_payload`, returned an error
+install_sha256_of-1 | reading {} | reading {}: the io error | read: the step that the words name, in `sha256_of`, returned an error
+install_confirm-1 | reading the answer | reading the answer: the io error | read: the step that the words name, in `confirm`, returned an error
+install_lay_down-1 | making the program directory | making the program directory: the io error | read: the step that the words name, in `lay_down`, returned an error
+install_lay_down-2 | making the empty global configuration | making the empty global configuration: the io error | read: the step that the words name, in `lay_down`, returned an error
+install_lay_down-3 | installing {} | installing {}: the io error | read: the step that the words name, in `lay_down`, returned an error
+install_remove_at-1 | making the staging directory | making the staging directory: the io error | read: the step that the words name, in `remove_at`, returned an error
+install_remove_at-2 | removing the program directory | removing the program directory: the io error | read: the step that the words name, in `remove_at`, returned an error
+install_refuse_while_unfinished-1 | reading the directory of the private roots | reading the directory of the private roots: the io error | read: the step that the words name, in `refuse_while_unfinished`, returned an error
+install_refuse_while_unfinished-2 | reading the directory of the private roots | reading the directory of the private roots: the io error | read: the step that the words name, in `refuse_while_unfinished`, returned an error
+job_new-1 | making the job | making the job: Windows error N | read: the step that the words name, in `new`, returned an error
+job_new-2 | setting the job's limits | setting the job's limits: Windows error N | read: the step that the words name, in `new`, returned an error
+job_new-3 | making the job's completion port | making the job's completion port: Windows error N | read: the step that the words name, in `new`, returned an error
+job_new-4 | attaching the completion port to the job | attaching the completion port to the job: Windows error N | read: the step that the words name, in `new`, returned an error
+job_new-5 | the job's limits read back as {read:?}, not as set ({limits:?}) | the job's limits read back as {read:?}, not as set ({limits:?}) | read: the setup program's own check found this, and no call returned an error, so no number is printed
+job_read_back-1 | reading the job's limits | reading the job's limits: Windows error N | read: the step that the words name, in `read_back`, returned an error
+job_contains-1 | asking whether a process is in the job | asking whether a process is in the job: Windows error N | read: the step that the words name, in `contains`, returned an error
+job_end-1 | ending the job | ending the job: Windows error N | read: the step that the words name, in `end`, returned an error
+launch_end_unresumed-1 | ending a suspended child | ending a suspended child: Windows error N | read: the step that the words name, in `end_unresumed`, returned an error
+launch_resume-1 | resuming the child | resuming the child: Windows error N | read: the step that the words name, in `resume`, returned an error
+launch_exit_code-1 | reading the exit code | reading the exit code: Windows error N | read: the step that the words name, in `exit_code`, returned an error
+launch_inheritable_null_device-1 | opening the null device | opening the null device: Windows error N | read: the step that the words name, in `inheritable_null_device`, returned an error
+launch_pipe-1 | making a pipe | making a pipe: Windows error N | read: the step that the words name, in `pipe`, returned an error
+launch_pipe-2 | the pipe's read end | the pipe's read end: Windows error N | read: the step that the words name, in `pipe`, returned an error
+launch_pipe-3 | the pipe's write end | the pipe's write end: Windows error N | read: the step that the words name, in `pipe`, returned an error
+launch_pipe-4 | a held copy of the pipe's write end | a held copy of the pipe's write end: Windows error N | read: the step that the words name, in `pipe`, returned an error
+launch_pipe-5 | keeping the pipe's read end from children | keeping the pipe's read end from children: Windows error N | read: the step that the words name, in `pipe`, returned an error
+launch_attributes-1 | sizing the attribute list | sizing the attribute list: Windows error N | read: the step that the words name, in `attributes`, returned an error
+launch_attributes-2 | making the attribute list | making the attribute list: Windows error N | read: the step that the words name, in `attributes`, returned an error
+launch_attributes-3 | listing the inherited handles | listing the inherited handles: Windows error N | read: the step that the words name, in `attributes`, returned an error
+launch_attributes-4 | naming the job at creation | naming the job at creation: Windows error N | read: the step that the words name, in `attributes`, returned an error
+launch_time_of-1 | reading the process's creation time | reading the process's creation time: Windows error N | read: the step that the words name, in `time_of`, returned an error
+launch_launch-1 | the job has ended and takes no new process | the job has ended and takes no new process | read: the setup program's own check found this, and no call returned an error, so no number is printed
+launch_launch-2 | the started process | the started process: Windows error N | read: the step that the words name, in `launch`, returned an error
+launch_launch-3 | the started process's thread | the started process's thread: Windows error N | read: the step that the words name, in `launch`, returned an error
+pipe_new-1 | making the stop event | making the stop event: Windows error N | read: the step that the words name, in `new`, returned an error
+pipe_new-2 | making an event | making an event: Windows error N | read: the step that the words name, in `new`, returned an error
+pipe_identity-1 | identifying the caller's process | identifying the caller's process: Windows error N | read: the step that the words name, in `identity`, returned an error
+pipe_identity-2 | impersonating the caller | impersonating the caller: Windows error N | read: the step that the words name, in `identity`, returned an error
+pipe_identity-3 | reading the caller's token | reading the caller's token: Windows error N | read: the step that the words name, in `identity`, returned an error
+pipe_identity-4 | the caller's token | the caller's token: Windows error N | read: the step that the words name, in `identity`, returned an error
+pipe_identity-5 | checking the caller's standing | checking the caller's standing: Windows error N | read: the step that the words name, in `identity`, returned an error
+pipe_identity-6 | reading the caller's account | reading the caller's account: Windows error N | read: the step that the words name, in `identity`, returned an error
+pipe_open-1 | opening the service's process | opening the service's process: Windows error N | read: the step that the words name, in `open`, returned an error
+pipe_connect_held-1 | identifying the process that serves the pipe | identifying the process that serves the pipe: Windows error N | read: the step that the words name, in `connect_held`, returned an error
+pipe_connect_held-2 | the pipe is served by process {server}, not by the service (process {expected_server}) | the pipe is served by process {server}, not by the service (process {expected_server}) | read: the setup program's own check found this, and no call returned an error, so no number is printed
+registry_open-1 | opening the key {subkey} | opening the key {subkey}: Windows error N | read: the step that the words name, in `open`, returned an error
+registry_delete_key-1 | deleting the key {subkey} | deleting the key {subkey}: Windows error N | read: the step that the words name, in `delete_key`, returned an error
+registry_set_dword-1 | setting the value {name} | setting the value {name}: Windows error N | read: the step that the words name, in `set_dword`, returned an error
+registry_dword-1 | reading the value {name} | reading the value {name}: Windows error N | read: the step that the words name, in `dword`, returned an error
+registry_delete_value-1 | deleting the value {name} | deleting the value {name}: Windows error N | read: the step that the words name, in `delete_value`, returned an error
+registry_subkey_names-1 | listing the subkeys | listing the subkeys: Windows error N | read: the step that the words name, in `subkey_names`, returned an error
+sd_from_text-1 | reading the descriptor {text} | reading the descriptor {text}: Windows error N | read: the step that the words name, in `from_text`, returned an error
+sd_needed-1 | a descriptor needs {what} and none was given | a descriptor needs {what} and none was given | read: the setup program's own check found this, and no call returned an error, so no number is printed
+sd_summarise-1 | reading a descriptor's owner | reading a descriptor's owner: Windows error N | read: the step that the words name, in `summarise`, returned an error
+sd_summarise-2 | the descriptor has no owner | the descriptor has no owner | read: the setup program's own check found this, and no call returned an error, so no number is printed
+sd_summarise-3 | reading a descriptor's flags | reading a descriptor's flags: Windows error N | read: the step that the words name, in `summarise`, returned an error
+sd_summarise-4 | reading a descriptor's list | reading a descriptor's list: Windows error N | read: the step that the words name, in `summarise`, returned an error
+sd_summarise-5 | reading a list entry | reading a list entry: Windows error N | read: the step that the words name, in `summarise`, returned an error
+sd_summary_of_object-1 | reading an object's descriptor | reading an object's descriptor: Windows error N | read: the step that the words name, in `summary_of_object`, returned an error
+service_manager-1 | opening the service manager | opening the service manager: Windows error N | read: the step that the words name, in `manager`, returned an error
+service_open-1 | opening the service {name} | opening the service {name}: Windows error N | read: the step that the words name, in `open`, returned an error
+service_create-1 | making the service {name} | making the service {name}: Windows error N | read: the step that the words name, in `create`, returned an error
+service_configure-1 | describing the service | describing the service: Windows error N | read: the step that the words name, in `configure`, returned an error
+service_configure-2 | setting what happens when the service fails | setting what happens when the service fails: Windows error N | read: the step that the words name, in `configure`, returned an error
+service_configure-3 | limiting the service's privileges | limiting the service's privileges: Windows error N | read: the step that the words name, in `configure`, returned an error
+service_set_security-1 | reading the permission list {sddl} | reading the permission list {sddl}: Windows error N | read: the step that the words name, in `set_security`, returned an error
+service_set_security-2 | setting the service's permissions | setting the service's permissions: Windows error N | read: the step that the words name, in `set_security`, returned an error
+service_start-1 | starting the service | starting the service: Windows error N | read: the step that the words name, in `start`, returned an error
+service_stop-1 | stopping the service | stopping the service: Windows error N | read: the step that the words name, in `stop`, returned an error
+service_delete-1 | deleting the service | deleting the service: Windows error N | read: the step that the words name, in `delete`, returned an error
+service_marked_for_deletion-1 | asking whether the service is deleted | asking whether the service is deleted: Windows error N | read: the step that the words name, in `marked_for_deletion`, returned an error
+service_status-1 | reading the service's status | reading the service's status: Windows error N | read: the step that the words name, in `status`, returned an error
+service_set_automatic-1 | setting the service to start with Windows | setting the service to start with Windows: Windows error N | read: the step that the words name, in `set_automatic`, returned an error
+service_configuration-1 | reading the service's configuration | reading the service's configuration: Windows error N | read: the step that the words name, in `configuration`, returned an error
+service_configuration-2 | reading the service's configuration | reading the service's configuration: Windows error N | read: the step that the words name, in `configuration`, returned an error
+token_s4u-1 | registering with the logon service | registering with the logon service: Windows error N | read: the step that the words name, in `s4u`, returned an error
+token_s4u_with-1 | finding the logon package | finding the logon package: Windows error N | read: the step that the words name, in `s4u_with`, returned an error
+token_s4u_with-2 | logging {account} on without its password (sub-status {substatus}) | logging {account} on without its password (sub-status {substatus}): Windows error N | read: the step that the words name, in `s4u_with`, returned an error
+token_s4u_with-3 | the logon's token | the logon's token: Windows error N | read: the step that the words name, in `s4u_with`, returned an error
+token_s4u_with-4 | making the logon's token a primary token | making the logon's token a primary token: Windows error N | read: the step that the words name, in `s4u_with`, returned an error
+token_s4u_with-5 | the primary token | the primary token: Windows error N | read: the step that the words name, in `s4u_with`, returned an error
+token_user_of-1 | reading the token's account | reading the token's account: Windows error N | read: the step that the words name, in `user_of`, returned an error
+token_boundary_token-1 | marking the account's own identifier deny-only | marking the account's own identifier deny-only: Windows error N | read: the step that the words name, in `boundary_token`, returned an error
+token_boundary_token-2 | the restricted token | the restricted token: Windows error N | read: the step that the words name, in `boundary_token`, returned an error
+token_boundary_token-3 | making the invocation's group the token's owner | making the invocation's group the token's owner: Windows error N | read: the step that the words name, in `boundary_token`, returned an error
+token_boundary_token-4 | reading the default permission list | reading the default permission list: Windows error N | read: the step that the words name, in `boundary_token`, returned an error
+token_boundary_token-5 | setting the token's default permission list | setting the token's default permission list: Windows error N | read: the step that the words name, in `boundary_token`, returned an error
+token_current_user-1 | opening this process's token | opening this process's token: Windows error N | read: the step that the words name, in `current_user`, returned an error
+token_current_user-2 | opening this process's token | opening this process's token: Windows error N | read: the step that the words name, in `current_user`, returned an error
+token_current_is_administrator-1 | checking whether this process is an administrator | checking whether this process is an administrator: Windows error N | read: the step that the words name, in `current_is_administrator`, returned an error
+verify_subject_of-1 | the verification left no provider data | the verification left no provider data | read: the setup program's own check found this, and no call returned an error, so no number is printed
+verify_subject_of-2 | the signature names no signer | the signature names no signer | read: the setup program's own check found this, and no call returned an error, so no number is printed
+verify_subject_of-3 | the signature names no signer | the signature names no signer | read: the setup program's own check found this, and no call returned an error, so no number is printed
+walk_check_volume-1 | reading the volume's file system | reading the volume's file system: Windows error N | read: the step that the words name, in `check_volume`, returned an error
+walk_check_volume-2 | reading the volume's device | reading the volume's device: Windows error N | read: the step that the words name, in `check_volume`, returned an error
+walk_final_path-1 | reading an object's final path | reading an object's final path: Windows error N | read: the step that the words name, in `final_path`, returned an error
+walk_open_by_key-1 | opening an object by its identifier | opening an object by its identifier: Windows error N | read: the step that the words name, in `open_by_key`, returned an error
+walk_open_anchor_with-1 | opening the directory a walk starts from | opening the directory a walk starts from: Windows error N | read: the step that the words name, in `open_anchor_with`, returned an error
+walk_children-1 | listing a directory | listing a directory: Windows error N | read: the step that the words name, in `children`, returned an error
+walk_nt_open_name-1 | opening a name beneath a held directory | opening a name beneath a held directory: Windows error N | read: the step that the words name, in `nt_open_name`, returned an error
+# ---- the `#[error]` messages that a person reads (env.rs, events.rs, frame.rs, win/install.rs)
+env-1 | the {0} path is not usable | the K path is not usable | read: a path given for the block is empty or holds a NUL (the setup's person text and the proof's detail print it)
+events-1 | the application-control log could not be read: | the application-control log could not be read: why | read: wevtutil's answer did not parse as the log's XML (applocker::query)
+frame-1 | the connection ended | the connection ended | read: the peer closed the connection between two frames
+frame-2 | a frame of {0} bytes is longer than the limit | a frame of N bytes is longer than the limit | read: the frame's length is over the limit
+frame-3 | the message is not one this protocol carries: | the message is not one this protocol carries: why | read: the frame's body did not decode as a message of the protocol
+frame-4 | the connection failed: | the connection failed: error | read: a read or a write on the pipe returned an error, which is printed
+install_error-1 | {0} | the refusal's own words | read: a pass-through; each place that makes a refusal has its own row
+install_error-2 | transparent | the platform's error as ffi::Error prints it | read: a pass-through; the context rows of the platform calls give the words
+install_error-3 | transparent | reading the system's X folder: the answer | read: a pass-through of ffi-1
+install_error-4 | transparent | the record's error | read: a pass-through of manifest-1 to manifest-3
+install_error-5 | transparent | the application-control channel's error | read: a pass-through of applocker-1 to applocker-7
+install_error-6 | {what}: {source} | the step's words: the file error | read: a pass-through; the step's words are the io_error contexts' rows
+install_error-7 | {0} | the failure's own words | read: a pass-through; each place that makes a failure has its own row
+
+# ---- the reasons handed to the refusal helpers and the prints of win/install.rs
+print_say-1 | println!("{line}") | the line that a caller of say gave | read: a step of the installation or the removal said what it did; the words and their read are the row of that call
+refusal_entry-1 | anchor_refusal(paths, &refusal, false) | the words of the anchor's refusal (a reparse point, an object that is not a directory, or the volume's words) | read: DirHandle::open_anchor_with refused the program directory's own name before anything was made
+refusal_check_data_parent_at-5 | another program holds it open | another program holds it open: with a right to delete or rename it, or without sharing it for reading and writing, and the check needs both | read: the open of the data parent's folder returned ERROR_SHARING_VIOLATION
+refusal_check_data_parent_at-4 | it could not be opened to be checked ( | it could not be opened to be checked (error) | read: the open of the data parent's folder returned an error other than the sharing violation, which is printed
+refusal_check_data_parent_at-3 | it is a reparse point, such as a link or a mounted folder | it is a reparse point, such as a link or a mounted folder | read: the attribute tag of the opened folder holds FILE_ATTRIBUTE_REPARSE_POINT
+refusal_check_data_parent_at-2 | it is not a folder | it is not a folder | read: the attribute tag of the opened folder lacks FILE_ATTRIBUTE_DIRECTORY
+refusal_check_data_parent_at-1 | &finding.to_string() | the acl finding's words | read: changeable_by_others_on returned a finding: a right that an entry grants to an account outside the allowed set, or an entry that the check could not evaluate
+refusal_directory-2 | child_refusal(&self.paths, &name, why, &Origin::Foreign) | the words that not_a_plain_directory returned | read: not_a_plain_directory found that the opened object is not a plain directory
+refusal_directory-1 | &why, &origin_of(&handle) | the words that check_held_object returned for the held handle (its own texts and the acl finding's) | read: check_held_object found a fault on the handle of an object that appeared between the listing and the call
+refusal_inspect_data_directory-6 | &lost_reason(&lost) | the words of lost_reason | read: open_child returned a loss of the child (the open was refused, or the object changed or moved)
+refusal_inspect_data_directory-5 | it is a reparse point | it is a reparse point | read: the opened child's kind is a reparse point
+refusal_inspect_data_directory-4 | it is a directory, not a file | it is a directory, not a file | read: the opened child is a directory where the layout gives a file
+refusal_inspect_data_directory-3 | it is a file, not a directory | it is a file, not a directory | read: the opened child is a file where the layout gives a directory
+refusal_inspect_data_directory-2 | it has more than one name | it has more than one name | read: the opened file's link count is above one
+refusal_inspect_data_directory-1 | &why | the words that check_held_object returned for the held handle (its own texts and the acl finding's) | read: check_held_object found a fault on the opened child's handle
+refusal_anchor_refusal-1 | program_refusal( | the anchor refusal's reason: it is a reparse point, it is not a directory, or the volume's words | read: the program directory's own name is refused as an anchor (AnchorRefusal)
+refusal_check_program_directory-2 | anchor_refusal(paths, &refusal, recorded) | the words of the anchor's refusal (a reparse point, an object that is not a directory, or the volume's words) | read: DirHandle::open_anchor_with refused the program directory's own name
+refusal_check_program_directory-1 | Cure::OwnerAndList | the words that check_readable_object returned for the program directory | read: check_readable_object found a fault on the program directory's handle (the acl finding's words, or its own)
+refusal_inspect_within-2 | why, cure, recorded | the reason that the walk of the program directory gave | read: a check of a child in the program directory returned a reason (the rows of the checks that name it)
+refusal_inspect_within-1 | why, cure, recorded | the reason that the walk of the program directory gave | read: a check of a child in the program directory returned a reason (the rows of the checks that name it)
+print_confirm-1 | Type yes to {action}:  | Type yes to the action:  | read: the setup program asks for the typed yes before it changes anything; no fact about the machine is stated
 # ---- public words outside remedy.rs and records.rs
 APPLICATION_CONTROL_STARTING | Windows starts application control after the service starts | Windows starts application control after the service starts, and the installation waits for it | rule: said after the Application Identity service starts; the wait's own bound is 300 seconds and no time of the platform is said
 STILL_STARTING | Windows is still starting application control after the restart | Windows is still starting application control after the restart; try again in a few minutes | flow: the broker's answer to every request while its proof of the boundary has not passed
@@ -331,66 +499,46 @@ USAGE | usage: kr-boundary-setup install|repair --payload DIRECTORY | usage: kr-
 system_form | FormatMessageW( | the code in hexadecimal and the system's message for it | read: FormatMessageW's text for the code (an HRESULT that wraps a Windows error is looked up by that error)
 
 # ---- the places of a form that carry no identifier, counted by file (tests/sentences.rs)
-listed | #[error] | env.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | events.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | filekey.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | frame.rs | 9 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | journal/framing.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | journal/replay.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | journal/rows.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | win/install.rs | 7 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | #[error] | env.rs | 1 | reaches no person: production builds only the proof block, which never lacks a tree
+listed | #[error] | filekey.rs | 1 | reaches no person: the error is read only in a journal row's serde; the manifest holds no file key
+listed | #[error] | frame.rs | 5 | reaches no person: the field errors come only from invocation frames, which no production route reads
+listed | #[error] | journal/framing.rs | 2 | reaches no person: the framing errors reach only the journal's append (tests) and the replay's damage text, which is not printed
+listed | #[error] | journal/replay.rs | 3 | reaches no person: the replay's errors reach only the journal's append (tests) and the damage text, which is not printed
+listed | #[error] | journal/rows.rs | 1 | reaches no person: the error is read only in the serde of a journal row, and the replay's damage text is never printed
 listed | #[error] | win/journal.rs | 7 | reaches no person: the other errors of the journal come from making, resuming and appending to a file, which no program that a person runs reads
-listed | #[error] | win/root.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | #[error] | win/root.rs | 3 | reaches no person: create_root and remove_root have no production caller
 listed | #[error] | win/walk.rs | 5 | reaches no person: a child that is gone is passed over, the walk of a tree has one caller that no person reaches, and the anchor's reparse point has its own words in the refusal
-listed | Handle::new( | win/acl.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/install.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/job.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/launch.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/pipe.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/privilege.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/token.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/walk.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | anchor_refusal( | win/install.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | child_refusal( | win/install.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | Handle::new( | win/job.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | Handle::new( | win/pipe.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | Handle::new( | win/privilege.rs | 3 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | Handle::new( | win/token.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
 listed | eprint!( | bin/kr-launch-stand-in.rs | 1 | the stand-in program of the tests, which a test runs and no person does
 listed | eprintln!( | bin/kr-launch-stand-in.rs | 3 | the stand-in program of the tests, which a test runs and no person does
 listed | eprintln!( | win/broker.rs | 1 | reaches no person: the service has no console
 listed | eprintln!( | win/setup.rs | 1 | reaches no person: Paths::system gives only a known folder error, which has its own line
-listed | error( | win/account.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/acl.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/boot.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/ffi.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/job.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/pipe.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/privilege.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/registry.rs | 7 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/root.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/sd.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/token.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/verify.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/walk.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | ffi::error( | win/install.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | ffi::error( | win/launch.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | ffi::last( | win/install.rs | 4 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | io_error( | win/install.rs | 15 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/account.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/acl.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/ffi.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/job.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/launch.rs | 12 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/pipe.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/privilege.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/root.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/sd.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/service.rs | 16 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/token.rs | 11 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/walk.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | parent_refusal( | win/install.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | error( | win/account.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/acl.rs | 5 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/boot.rs | 5 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/ffi.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/job.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/pipe.rs | 5 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/privilege.rs | 3 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/registry.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/root.rs | 2 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | error( | win/walk.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | ffi::error( | win/launch.rs | 2 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | io_error( | win/install.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/acl.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/ffi.rs | 2 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/job.rs | 3 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/launch.rs | 2 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/pipe.rs | 2 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/privilege.rs | 5 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/root.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/token.rs | 3 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | last( | win/walk.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
 listed | print!( | bin/kr-launch-stand-in.rs | 4 | the stand-in program of the tests, which a test runs and no person does
-listed | print!( | win/install.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | println!( | bin/kr-launch-stand-in.rs | 12 | the stand-in program of the tests, which a test runs and no person does
-listed | println!( | win/install.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | program_refusal( | win/install.rs | 4 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | pub const | names.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | notice.rs | 1 | the notice: its words are fixed and do not change
 listed | pub const | operation.rs | 23 | names, keys, limits, encodings and paths; no sentence for a person
