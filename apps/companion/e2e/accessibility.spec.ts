@@ -463,8 +463,13 @@ async function tapAndRead(
   return { clicks, opened: (await openedLinks(page)).slice(openedBefore), lit: presses.map((look) => look.lit), presses }
 }
 
-/** The farthest that a browser click lay from its tap's press in a case, in px: logged, and held to the handler's bound. */
-const farthestAway = new WeakMap<Page, number>()
+/**
+ * The farthest that a browser click lay from its tap's press in a case, in px, by what the click named: plain
+ * text (where only the page decides, and the bound is for) or an element (a link's own element or another
+ * control, which the browser's own adjustment chose and which stands as the browser made it). Logged, and
+ * each is held to the handler's bound.
+ */
+const farthestAway = new WeakMap<Page, { plain: number; element: number }>()
 
 /** Logs how far the browser's click of a tap lay from its press, and holds it to the bound that the handler uses. */
 function noteAway(page: Page, presses: readonly Look[], clicks: readonly Clicked[]): void {
@@ -472,7 +477,9 @@ function noteAway(page: Page, presses: readonly Look[], clicks: readonly Clicked
   if (press === undefined) return
   for (const click of browsers(clicks)) {
     const away = Math.hypot(click.x - press.x, click.y - press.y)
-    farthestAway.set(page, Math.max(farthestAway.get(page) ?? 0, away))
+    const farthest = farthestAway.get(page) ?? { plain: -1, element: -1 }
+    const kind = click.named.startsWith('text') ? 'plain' : 'element'
+    farthestAway.set(page, { ...farthest, [kind]: Math.max(farthest[kind], away) })
     expect(away, `the distance from the press at ${String(press.x)}, ${String(press.y)} to its click (${click.named})`).toBeLessThanOrEqual(CLICK_AWAY)
   }
 }
@@ -480,8 +487,9 @@ function noteAway(page: Page, presses: readonly Look[], clicks: readonly Clicked
 test.afterEach(({ page }, info) => {
   const away = farthestAway.get(page)
   if (away === undefined) return
-  info.annotations.push({ type: 'press-to-click', description: `${away.toFixed(2)} px (the bound is ${CLICK_AWAY.toFixed(2)})` })
-  console.log(`press-to-click ${info.project.name} ${away.toFixed(2)}`)
+  const said = (px: number): string => (px < 0 ? '-' : px.toFixed(2))
+  info.annotations.push({ type: 'press-to-click', description: `plain text ${said(away.plain)} px, element ${said(away.element)} px (the bound is ${CLICK_AWAY.toFixed(2)})` })
+  console.log(`press-to-click ${info.project.name} plain ${said(away.plain)} element ${said(away.element)}`)
 })
 
 const openedLinks = (page: Page): Promise<string[]> => page.evaluate(() => window.krTestHost?.openedLinks.slice() ?? [])
@@ -778,12 +786,130 @@ test.describe('a tap on the plain text near a link of a message', () => {
       expect(await pressedLooks(page), 'the pressed look at the touch’s start').toBe(1)
       await touch('touchMove', after.y - 14)
       await touch('touchMove', after.y - 30)
-      // The engine takes the moving touch for a scroll and cancels the pointer: the handler's own cancel takes the look off, before any release.
+      // The engine takes the moving touch for a scroll and cancels the pointer. The handler's move past the slop (the
+      // first move, 14 px) ends the press and takes the look off before the cancel arrives, so this case holds the move
+      // and the cancel together, not each; the next case holds the cancel alone.
       await expect.poll(() => pressedLooks(page), 'the pressed look once the engine cancelled the touch').toBe(0)
       await touch('touchEnd', after.y - 30)
       expect(await page.evaluate(() => (window as unknown as { pointerEnds: string[] }).pointerEnds), 'how the pointer ended').toEqual(['pointercancel'])
       await page.waitForTimeout(400)
       expect(await openedLinks(page), 'links opened by a touch that moved').toEqual([])
+    })
+
+    test(`adds no click for a mouse press on a link's own element that is released on plain text just past it, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      await wordsOf(page, DOCS)
+      const box = await boxOf(page, DOCS)
+      const y = (box.top + box.bottom) / 2
+      await page.mouse.move(box.right - 2, y)
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look of a mouse press on the link’s own element').toBe(1)
+      await page.mouse.move(box.right + 3, y)
+      await page.mouse.up()
+      await page.waitForTimeout(400)
+      expect(handlers(await clicksSeen(page)), 'clicks that the page added for a mouse released on plain text').toEqual([])
+      expect(await openedLinks(page), 'links opened by a mouse press on a link released on plain text past it').toEqual([])
+    })
+
+    // The held presses below stay down while the page changes under them. Chromium's protocol holds a touch, and a
+    // pen through its mouse events; WebKit has no tool for either.
+    test(`takes the pressed look off at a pointer cancel that comes with no move, and for a held press at a pen's move, a scroll, a next press and a pen's tap, on ${surface}`, async ({
+      page,
+      browserName
+    }) => {
+      test.skip(browserName !== 'chromium', 'the touch and the pen are held through the Chromium protocol: WebKit has no tool for them')
+      await pressPage(page, surface, { only: [...Array.from({ length: 12 }, () => PLAIN), ...TEXT_AFTER_LINK, ...Array.from({ length: 12 }, () => PLAIN)] })
+      let after = await pointOnTextAfter(page, DOCS)
+      const { session } = await touchSession(page)
+      const touch = (type: 'touchStart' | 'touchCancel' | 'touchEnd'): Promise<unknown> =>
+        session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchStart' ? [{ x: after.x, y: after.y }] : [] })
+      const pen = (type: 'mousePressed' | 'mouseMoved' | 'mouseReleased', y: number): Promise<unknown> =>
+        session.send('Input.dispatchMouseEvent', { type, x: after.x, y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: type === 'mouseMoved' ? 0 : 1, pointerType: 'pen' })
+      await page.evaluate(() => {
+        const seen = { moves: 0, ends: [] as string[] }
+        ;(window as unknown as { held: typeof seen }).held = seen
+        document.addEventListener('pointermove', () => (seen.moves += 1), true)
+        for (const type of ['pointerup', 'pointercancel']) document.addEventListener(type, () => seen.ends.push(type), true)
+      })
+      const held = (): Promise<{ moves: number; ends: string[] }> => page.evaluate(() => (window as unknown as { held: { moves: number; ends: string[] } }).held)
+      const scrollBy = (by: number): Promise<unknown> => page.evaluate((px) => document.querySelector('.m-pane')?.scrollBy(0, px), by)
+
+      // A touch cancelled with no move: the cancel alone ends the press.
+      await touch('touchStart')
+      expect(await pressedLooks(page), 'the pressed look of a held touch').toBe(1)
+      await touch('touchCancel')
+      await expect.poll(() => pressedLooks(page), 'the pressed look after a pointer cancel with no move').toBe(0)
+      expect(await held(), 'the pointer ended by a cancel after no move').toEqual({ moves: 0, ends: ['pointercancel'] })
+
+      // A held touch and a scroll: 3 px keep the look (the link still wins the press's point), 300 px take it off.
+      await touch('touchStart')
+      expect(await pressedLooks(page), 'the pressed look of a second held touch').toBe(1)
+      await scrollBy(3)
+      await page.waitForTimeout(300)
+      expect(await pressedLooks(page), 'the pressed look after a scroll of 3 px').toBe(1)
+      await scrollBy(300)
+      await expect.poll(() => pressedLooks(page), 'the pressed look after a scroll of 300 px').toBe(0)
+      await touch('touchEnd')
+      await page.waitForTimeout(400)
+      expect(await openedLinks(page), 'links opened by a touch whose press a scroll ended').toEqual([])
+      await scrollBy(-303)
+      await page.waitForTimeout(300)
+
+      // A pen that moves past the slop while it is down: the move ends the press, with no engine cancel to do it.
+      after = await pointOnTextAfter(page, DOCS)
+      await pen('mousePressed', after.y)
+      expect(await pressedLooks(page), 'the pressed look of a pen press').toBe(1)
+      await pen('mouseMoved', after.y + 14)
+      expect(await pressedLooks(page), 'the pressed look after a pen move of 14 px').toBe(0)
+      await pen('mouseReleased', after.y + 14)
+
+      // A next press outside the pane ends a held press, and the pane's record with it.
+      await pen('mousePressed', after.y)
+      expect(await pressedLooks(page), 'the pressed look of a second pen press').toBe(1)
+      const pane = await paneBox(page)
+      await page.mouse.move(pane.left + 10, pane.top / 2)
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look after a next press outside the pane').toBe(0)
+      await page.mouse.up()
+      await pen('mouseReleased', after.y)
+
+      // A pen's tap on plain text beside the link opens it, as a touch's does.
+      const opened = (await openedLinks(page)).length
+      await pen('mousePressed', after.y)
+      expect(await pressedLooks(page), 'the pressed look of a pen press on plain text').toBe(1)
+      await pen('mouseReleased', after.y)
+      await expect.poll(async () => (await openedLinks(page)).length - opened, 'links opened by a pen’s tap on plain text beside the link').toBe(1)
+    })
+
+    // A box between a link and the root that the view cannot be measured through: the link takes no part, as on a page
+    // with no handler, and a box that only moves its content is measured as any other.
+    test(`gives a link no area under a box that scales, rotates, contains its paint or skips its rendering, and measures a box that only moves, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+      const around = async (style: string): Promise<void> => {
+        await page.evaluate((css) => {
+          const message = document.querySelector('.m-node .md-link[title="https://example.org/docs"]')?.closest<HTMLElement>('.m-node')
+          if (message) message.style.cssText = css
+        }, style)
+      }
+      for (const [kind, style] of [
+        ['a scale', 'transform: scale(0.99)'],
+        ['the scale property', 'scale: 0.99'],
+        ['the rotate property', 'rotate: 0.2deg'],
+        ['contained paint', 'contain: paint'],
+        ['skipped rendering', 'content-visibility: auto']
+      ] as const) {
+        await around(style)
+        const after = await pointOnTextAfter(page, DOCS)
+        const made = await tapAndRead(page, after.x, after.y)
+        expect(made.lit, `the pressed look under ${kind}`).toEqual([null])
+        expect(handlers(made.clicks), `clicks that the page added under ${kind}`).toEqual([])
+        expect(made.opened, `links opened under ${kind}`).toEqual([])
+      }
+      await around('transform: translate(6px, 3px)')
+      const moved = await pointOnTextAfter(page, DOCS)
+      const made = await tapAndRead(page, moved.x, moved.y)
+      expect(made.lit, 'the pressed look under a box that only moves').toEqual([DOCS])
+      expect(made.opened, 'links opened under a box that only moves').toEqual([DOCS])
     })
 
     test(`gives the pressed look to the link a touch starts near and takes it off at the release, and lights nothing where no link's target holds the point, on ${surface}`, async ({ page }) => {
@@ -912,13 +1038,28 @@ interface Sampled {
   readonly note: string
 }
 
-/** What the area measure found. Sizes are in px; the lists are points as offsets from the words' middle. */
-/** Reports the continuous area and the browser's ring apart, with the places of the ring's taps and of the gaps. */
+/** Reports the page's area and the browser's ring apart, with the places of the ring's taps. */
 function reportGrid(area: Area): void {
   const place = (list: readonly string[]): string => (list.length === 0 ? 'none' : list.length > 12 ? `${String(list.length)} taps, from ${list[0] ?? ''} to ${list[list.length - 1] ?? ''}` : list.join(' | '))
-  const text = `the page's continuous area ${String(area.width)} x ${String(area.height)} px (reported extents with the browser's ring ${String(area.right - area.left)} x ${String(area.bottom - area.top)} px), ${String(area.grid.taps)} grid taps; the browser's ring: ${place(area.grid.ring)}; gaps: ${place(area.grid.gaps)}`
+  const text = `the page's area ${String(area.width)} x ${String(area.height)} px, ${String(area.grid.taps)} grid taps; the browser's own opens outside it (the ring): ${place(area.grid.ring)}`
   test.info().annotations.push({ type: 'grid', description: text })
   console.log(`grid ${test.info().project.name} ${test.info().title}: ${text}`)
+}
+
+/** Holds an area to the rule: the crosses found nothing wrong, the grid found no hole, no look that disagrees and no open of the handler outside it. */
+function expectArea(area: Area): void {
+  expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes, grid: area.grid.wrong }, 'taps that opened another link or a link twice, did not light what the handler opened, lit one link and met another element, left a hole, or broke the grid rule').toEqual({ different: [], unlike: [], conflicts: [], holes: [], grid: [] })
+  reportGrid(area)
+}
+
+/**
+ * Holds the area's reach beside the words: half the least size on each side, or the room that the pane
+ * leaves on that side where it is less. The measure's own size test (`Math.min(width, height)`) is met by
+ * words that are wide enough alone, so it cannot show a reach that is missing.
+ */
+function expectReach(area: Area, words: Words, pane: { left: number; right: number }, size: number): void {
+  expect.soft(words.left - area.left, 'the area’s reach to the left of the words').toBeGreaterThanOrEqual(Math.min(size / 2, words.left - pane.left) - 1)
+  expect.soft(area.right - words.right, 'the area’s reach to the right of the words').toBeGreaterThanOrEqual(Math.min(size / 2, pane.right - words.right) - 1)
 }
 
 /**
@@ -936,6 +1077,10 @@ function lookDisagrees(made: { clicks: Clicked[]; opened: string[]; lit: (string
   return lit === null || named === `link ${lit}` ? null : `lit ${lit}, the click named ${named}`
 }
 
+/**
+ * The area in which a tap opens a link, as the grid reports it: the box of the points at which the look lit the
+ * link, in px (`left` and `top` are the first such point, `right` and `bottom` one past the last).
+ */
 interface Area {
   readonly left: number
   readonly right: number
@@ -943,44 +1088,44 @@ interface Area {
   readonly bottom: number
   readonly width: number
   readonly height: number
+  /** The taps of the crosses that find the grid's whole pixels. */
   readonly taps: number
-  /** Taps that opened another link. */
+  /** Cross taps that opened another link, or the link more than once. */
   readonly different: string[]
-  /** Taps whose click named plain text, so the page's handler decided, at which the look at the press and the open at the release differed. */
+  /** Cross taps whose click named plain text, so the page's handler decided, at which the look at the press and the open at the release differed. */
   readonly unlike: string[]
-  /** Taps whose click the browser sent to an element, at which the look lit another link than that one. */
+  /** Cross taps whose click the browser sent to an element, at which the look lit another link than that one. */
   readonly conflicts: string[]
-  /** Points inside the area that lights at which the tap opened nothing. */
+  /** Cross points inside the area that lights at which the tap opened nothing. */
   readonly holes: string[]
-  /** Points between the area that lights and the browser's own adjustment further out at which the tap opened nothing. */
-  readonly gaps: string[]
-  /** How far the area that opens reaches past the area that lights on each side (px): the browser's own touch adjustment opens a link that the look did not light. */
-  readonly ring: { readonly left: number; readonly right: number; readonly top: number; readonly bottom: number }
-  /** The taps near the two ends of the area that opens, with what each lit and opened (L lit, O opened), to read a short side by. */
+  /** The cross taps near the two ends of the area that opens, with what each lit and opened (L lit, O opened), to read a short side by. */
   readonly edges: string[]
-  /** The page's own continuous area: the extent from the words' middle outward in which the look lights (px; `width` and `height` are its). The browser's ring lies past it. */
-  readonly solid: { readonly left: number; readonly right: number; readonly top: number; readonly bottom: number }
-  /** The taps of a grid over the reported area and one step beyond it on every side. */
+  /** The grid over the area and the room around it. */
   readonly grid: {
     readonly taps: number
-    /** Taps that broke the rule: not exactly one open inside the continuous area, an open outside it that the browser's own click to the link did not make, any open one step beyond the reported area, or a look that disagrees with the click. */
+    /** Taps that broke the rule: a hole or not exactly one open inside the area, a look that disagrees with the click, another link opened, or a click that the handler made outside the area. */
     readonly wrong: string[]
-    /** Taps outside the continuous area at which the browser's own adjustment opened the link: the ring, by place. */
+    /** Taps outside the area at which the browser's own click opened the link, by place and kind. */
     readonly ring: string[]
-    /** Taps between the continuous area and the reported edge at which nothing opened, by place. */
-    readonly gaps: string[]
   }
 }
 
+/** The distance between the grid's lines, in px: one step. */
+const GRID_STEP = 8
+
 /**
- * The area in which a tap opens a link, measured by taps that open: the extent, along the line through
- * the words' middle and along the column through it, of the points at which a touch's tap opens `href`,
- * and the extent in which the look lights it. Every tap is a real tap in the pane at a whole pixel
- * (WebKit reports whole pixels) and every one gets the browser's click. Each extent is found from taps
- * 4 px apart and refined to the pixel at each end, inside the pane. At a point where the click names plain
- * text the page's handler decides, and the look at the press is the open at the release (`unlike`). Where
- * the browser's click names an element, the browser decides: the look must have lit nothing or that same
- * link (`conflicts`), and the ring that the open reaches past the look is measured (`ring`).
+ * The area in which a tap opens a link. Two crosses of taps (along the line through the words' middle and
+ * along the column through it, 4 px apart and refined to the pixel at each end of what lights) find the
+ * grid's whole pixels; each tap must open exactly the link under test or nothing. Then a grid of taps, a
+ * step apart and held to the pane, covers the words and the room around them, and the area is what the
+ * grid reports: the box of the points at which the look lit the link, each edge refined to the pixel. Every
+ * such point opened the link exactly once, and a press on plain text that did not light it between points
+ * that the page's rule lit is a hole, which fails with its place. Outside the area no click that the
+ * page's handler made may open anything (the handler's click is the one that the harness sees untrusted),
+ * and an open that the browser's own click made there is the browser's ring, recorded with its place and
+ * what it was. At a point where the click names plain text the page's handler decides, and the look at
+ * the press is the open at the release; where the click names an element the browser decides, and the
+ * look lit nothing or that same link.
  */
 async function areaOf(page: Page, href: string, words: Words, size: number): Promise<Area> {
   const pane = await paneBox(page)
@@ -994,9 +1139,11 @@ async function areaOf(page: Page, href: string, words: Words, size: number): Pro
   const sample = async (x: number, y: number): Promise<Sampled> => {
     taps += 1
     const made = await tapAndRead(page, x, y)
-    const opened = made.opened[made.opened.length - 1] ?? null
+    // Exactly one open counts as the link's: a tap that opened it twice, or two links, is wrong and opens none here.
+    const opened = made.opened.length === 1 ? (made.opened[0] ?? null) : null
     const lit = made.lit[0] ?? null
     const where = `${String(Math.round(x - words.x))}, ${String(Math.round(y - words.y))}`
+    if (made.opened.length > 1) different.push(`${where}: opened ${String(made.opened.length)} times: ${made.opened.join(',')}`)
     const press = made.presses[0]
     const capture = made.clicks.filter((click) => click.phase === 'capture')
     const detail = `the press landed on ${press?.target ?? '-'} at ${String(press?.x)}, ${String(press?.y)}; clicks ${capture.map((click) => `${click.trusted ? 'trusted' : 'made'} detail ${String(click.detail)} ${click.named} at ${String(click.x)}, ${String(click.y)}`).join('; ')}`
@@ -1061,71 +1208,115 @@ async function areaOf(page: Page, href: string, words: Words, size: number): Pro
   }
   // Taps are at whole pixels, inside the pane; an area of `size` px holds at least `size` of them.
   const reach = size + 20
-  const across = await scan('x', Math.floor(words.left - reach), Math.ceil(words.right + reach), Math.ceil(pane.left), Math.ceil(pane.right) - 1, words.x)
-  const down = await scan('y', Math.floor(words.top - reach), Math.ceil(words.bottom + reach), Math.ceil(pane.top), Math.ceil(pane.bottom) - 1, words.y)
-  const [left, right] = across.open
-  const [top, bottom] = down.open
-  // The page's own area is where the look lights: a rectangle, which the page keeps at the least size. The
-  // browser's own adjustment opens the link past it, in a shape of its own (the ring).
-  const [solidLeft, solidRight] = across.lit
-  const [solidTop, solidBottom] = down.lit
-  // A grid over the whole reported area and one step beyond it on every side, within the pane. Inside the
-  // page's area every tap lights the link and opens it exactly once; outside it a tap opens nothing, or opens
-  // the link by the browser's own click on the link (the ring); one step beyond the reported area none opens.
-  const step = 8
-  const along = (from: number, to: number, min: number, max: number): number[] => {
-    const points = new Set<number>()
-    for (let n = from - step; n <= to + step; n += step) points.add(n)
-    points.add(from - step).add(from).add(to).add(to + step)
-    return [...points].filter((n) => n >= min && n <= max).sort((a, b) => a - b)
+  await scan('x', Math.floor(words.left - reach), Math.ceil(words.right + reach), Math.ceil(pane.left), Math.ceil(pane.right) - 1, words.x)
+  await scan('y', Math.floor(words.top - reach), Math.ceil(words.bottom + reach), Math.ceil(pane.top), Math.ceil(pane.bottom) - 1, words.y)
+  // The grid: lines a step apart through the words' middle, over the words and the room around them, held to the pane.
+  const lines = (middle: number, from: number, to: number, min: number, max: number): number[] => {
+    const at = Math.round(middle)
+    const points: number[] = []
+    for (let n = at - GRID_STEP * Math.ceil((at - from) / GRID_STEP); n <= to; n += GRID_STEP) if (n >= min && n <= max) points.push(n)
+    return points
   }
-  const grid = { taps: 0, wrong: [] as string[], ring: [] as string[], gaps: [] as string[] }
-  for (const y of along(top, bottom - 1, Math.ceil(pane.top), Math.ceil(pane.bottom) - 1)) {
-    for (const x of along(left, right - 1, Math.ceil(pane.left), Math.ceil(pane.right) - 1)) {
-      const made = await tapAndRead(page, x, y)
-      grid.taps += 1
-      const place = `${String(Math.round(x - words.x))}, ${String(Math.round(y - words.y))}`
-      const inLit = x >= solidLeft - 1 && x < solidRight + 1 && y >= solidTop - 1 && y < solidBottom + 1
-      // Certainly the page's area: the look's extent along the words' line, and the least size's band about the
-      // words' middle across it (a link's own box can reach further than the page's area, so the look's extent
-      // down the column is not the page's area across). A margin at each side: the extents come from taps at whole pixels.
-      const inside = x >= solidLeft + 1 && x < solidRight - 1 && Math.abs(y - words.y) <= size / 2 - 2
-      const beyond = x < left || x > right - 1 || y < top || y > bottom - 1
-      const named = browsers(made.clicks).find((click) => !click.named.startsWith('text'))?.named ?? null
-      const disagreement = lookDisagrees(made)
-      if (disagreement !== null) grid.wrong.push(`${place}: ${disagreement}`)
-      if (made.opened.length > 1 || (made.opened.length === 1 && made.opened[0] !== href)) {
-        grid.wrong.push(`${place}: opened ${made.opened.join(',')} (the click named ${named ?? 'plain text'})`)
-      } else if (inside && made.opened.length !== 1) {
-        const press = made.presses[0]
-        grid.wrong.push(`${place}: inside the page's area, opened nothing; the press at ${String(press?.x)}, ${String(press?.y)} on ${press?.target ?? '-'} lit ${String(made.lit[0] ?? null)}`)
-      } else if (made.opened.length === 1 && !inLit) {
-        // Outside the page's own area the open is the browser's own adjustment, by its click on the link; the page adds none.
-        if (named === `link ${href}`) grid.ring.push(place)
-        else grid.wrong.push(`${place}: the page opened the link outside the area that lit it (the click named ${named ?? 'plain text'})`)
-      } else if (made.opened.length === 0 && !inLit && !beyond) {
-        grid.gaps.push(place)
-      }
+  const room = size + 16
+  const xs = lines(words.x, words.left - room, words.right + room, Math.ceil(pane.left), Math.ceil(pane.right) - 1)
+  const ys = lines(words.y, words.top - room, words.bottom + room, Math.ceil(pane.top), Math.ceil(pane.bottom) - 1)
+  interface Cell {
+    readonly x: number
+    readonly y: number
+    readonly place: string
+    /** The look lit the link. */
+    readonly lit: boolean
+    /** The press landed on the link's own element, which the browser's hit test chose. */
+    readonly own: boolean
+    readonly opened: string[]
+    /** The page's handler made a click (the one that the harness sees untrusted). */
+    readonly handled: boolean
+    readonly named: string | null
+    readonly disagreement: string | null
+    readonly press: Look | undefined
+  }
+  const cells: Cell[] = []
+  const tapCell = async (x: number, y: number): Promise<Cell> => {
+    const made = await tapAndRead(page, x, y)
+    const press = made.presses[0]
+    const cell: Cell = {
+      x,
+      y,
+      place: `${String(Math.round(x - words.x))}, ${String(Math.round(y - words.y))}`,
+      lit: made.lit[0] === href,
+      own: press?.target.includes('md-link') ?? false,
+      opened: made.opened,
+      handled: handlers(made.clicks).length > 0,
+      named: browsers(made.clicks).find((click) => !click.named.startsWith('text'))?.named ?? null,
+      disagreement: lookDisagrees(made),
+      press
+    }
+    cells.push(cell)
+    return cell
+  }
+  for (const y of ys) for (const x of xs) await tapCell(x, y)
+  // The area is where the look lit the link: by the page's rule for a press on plain text, or because the browser's own
+  // hit test put the press on the link's element (the link's box, and the adjustment that the engine adds around it, which
+  // lights by design and which the browser's click opens). Its outline is not always a rectangle: the button can be taller
+  // than the rule's rectangle, and the engine's adjustment is its own.
+  const member = (cell: Cell): boolean => cell.lit
+  const first = cells.filter(member)
+  let left = Math.min(...first.map((cell) => cell.x))
+  let right = Math.max(...first.map((cell) => cell.x))
+  let top = Math.min(...first.map((cell) => cell.y))
+  let bottom = Math.max(...first.map((cell) => cell.y))
+  // Each edge to the pixel: taps one pixel at a time past the grid's last lit line, along the row or the column
+  // through the words' middle, while they stay lit (at most a step less one).
+  const reachOut = async (along: 'x' | 'y', sign: 1 | -1, edge: number, across: number): Promise<number> => {
+    let found = edge
+    for (let n = 1; n < GRID_STEP; n += 1) {
+      const at = edge + sign * n
+      const inPane = along === 'x' ? at >= Math.ceil(pane.left) && at <= Math.ceil(pane.right) - 1 : at >= Math.ceil(pane.top) && at <= Math.ceil(pane.bottom) - 1
+      if (!inPane) break
+      const cell = along === 'x' ? await tapCell(at, across) : await tapCell(across, at)
+      if (!member(cell)) break
+      found = at
+    }
+    return found
+  }
+  if (first.length > 0) {
+    left = await reachOut('x', -1, left, Math.round(words.y))
+    right = await reachOut('x', 1, right, Math.round(words.y))
+    top = await reachOut('y', -1, top, Math.round(words.x))
+    bottom = await reachOut('y', 1, bottom, Math.round(words.x))
+  }
+  right += 1
+  bottom += 1
+  const grid = { taps: cells.length, wrong: [] as string[], ring: [] as string[] }
+  if (first.length === 0) grid.wrong.push('no tap of the grid was lit by the page’s rule')
+  // A press on plain text that did not light the link, though the page's rule lit it on both sides of that point along its
+  // row or its column, is a hole in the page's area. The engine's own adjustment (a press put on the link's element) does
+  // not bracket a hole: where it reaches is its own.
+  const ruleLit = first.filter((cell) => !cell.own)
+  const between = (cell: Cell): boolean =>
+    (ruleLit.some((other) => other.y === cell.y && other.x < cell.x) && ruleLit.some((other) => other.y === cell.y && other.x > cell.x)) ||
+    (ruleLit.some((other) => other.x === cell.x && other.y < cell.y) && ruleLit.some((other) => other.x === cell.x && other.y > cell.y))
+  for (const cell of cells) {
+    const inside = member(cell) || between(cell)
+    const found = `the press on ${cell.press?.target ?? '-'} lit ${String(cell.lit)}, ${String(cell.opened.length)} opens (${cell.opened.join(',') || 'none'}), the click named ${cell.named ?? 'plain text'}`
+    if (cell.disagreement !== null) grid.wrong.push(`${cell.place}: ${cell.disagreement}`)
+    if (cell.opened.some((opened) => opened !== href)) grid.wrong.push(`${cell.place}: opened another link; ${found}`)
+    if (cell.own) {
+      // A press on the link's own element lights it, and the browser's click opens it exactly once.
+      if (!cell.lit || cell.opened.length !== 1) grid.wrong.push(`${cell.place}: a press on the link's own element did not light it and open it once; ${found}`)
+    } else if (inside) {
+      if (!cell.lit) grid.wrong.push(`${cell.place}: a hole in the area, the look did not light the link; ${found}`)
+      else if (cell.opened.length !== 1) grid.wrong.push(`${cell.place}: inside the area, not exactly one open; ${found}`)
+    } else if (cell.handled) {
+      grid.wrong.push(`${cell.place}: outside the area the handler made a click; ${found}`)
+    } else if (cell.opened.length > 1) {
+      grid.wrong.push(`${cell.place}: outside the area, more than one open; ${found}`)
+    } else if (cell.opened.length === 1) {
+      // The browser's own click on the link, past the page's area: the ring.
+      grid.ring.push(`${cell.place} (${found})`)
     }
   }
-  return {
-    left,
-    right,
-    top,
-    bottom,
-    width: solidRight - solidLeft,
-    height: solidBottom - solidTop,
-    solid: { left: solidLeft, right: solidRight, top: solidTop, bottom: solidBottom },
-    grid,
-    taps,
-    different,
-    unlike,
-    conflicts,
-    holes,
-    gaps,
-    ring: { left: across.lit[0] - left, right: right - across.lit[1], top: down.lit[0] - top, bottom: bottom - down.lit[1] },
-    edges
-  }
+  return { left, right, top, bottom, width: right - left, height: bottom - top, grid, taps, different, unlike, conflicts, holes, edges }
 }
 
 /**
@@ -1137,9 +1328,8 @@ async function missedInRing(page: Page, words: Words, size: number, href: string
   const missed: string[] = []
   for (const point of ringPoints(words, pane, size)) {
     const made = await tapAndRead(page, point.x, point.y)
-    const opened = made.opened[made.opened.length - 1] ?? null
     const label = `${String(Math.round(point.x - words.x))}, ${String(Math.round(point.y - words.y))}`
-    if (opened !== href) missed.push(`${label}: opened ${String(opened)}`)
+    if (made.opened.length !== 1 || made.opened[0] !== href) missed.push(`${label}: opened ${made.opened.join(',') || 'nothing'}, where ${href} once was required`)
     // The look at every point: where the click names plain text the look is the open; where the browser's
     // click names an element, the look lit nothing or that same link.
     const disagreement = lookDisagrees(made)
@@ -1168,9 +1358,8 @@ test.describe('the area in which a tap opens a link', () => {
         const area = await areaOf(page, MIDDLE_LINK, words, FINGER[surface])
         test.info().annotations.push({ type: 'area', description: `middle ${surface} ${size}: ${String(area.width)} x ${String(area.height)} px (least ${String(FINGER[surface])}), ${String(area.taps)} taps` })
         expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(FINGER[surface])
-        expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes, grid: area.grid.wrong }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, left a hole, or broke the grid rule').toEqual({ different: [], unlike: [], conflicts: [], holes: [], grid: [] })
-        test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
-        reportGrid(area)
+        expectReach(area, words, await paneBox(page), FINGER[surface])
+        expectArea(area)
       })
 
       for (const [where, href, markdown] of EDGES) {
@@ -1196,9 +1385,8 @@ test.describe('the area in which a tap opens a link', () => {
           const area = await areaOf(page, href, words, size)
           test.info().annotations.push({ type: 'area', description: `${where} ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)}), ${String(area.taps)} taps` })
           expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(size)
-          expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes, grid: area.grid.wrong }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, left a hole, or broke the grid rule').toEqual({ different: [], unlike: [], conflicts: [], holes: [], grid: [] })
-          test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
-          reportGrid(area)
+          expectReach(area, words, pane, size)
+          expectArea(area)
           // What lights at a press is what opens: the pressed look at the far point of the area, none past it.
           const inside = ringPoints(words, pane, size)
           const far = where === 'at the end of a line' ? inside[0] : inside[inside.length - 1]
@@ -1236,9 +1424,8 @@ test.describe('the area in which a tap opens a link', () => {
           description: `last line ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)}), ${String(area.taps)} taps; room under the words ${String(Math.round((pane.bottom - settled.bottom) * 10) / 10)}`
         })
         expect.soft(Math.min(area.width, area.height), `the area’s least side, measured by taps that open (taps near the ends: ${area.edges.join(' ')})`).toBeGreaterThanOrEqual(size)
-        expect({ different: area.different, unlike: area.unlike, conflicts: area.conflicts, holes: area.holes, grid: area.grid.wrong }, 'taps across the area that opened another link, did not light what the handler opened, lit one link and met another element, left a hole, or broke the grid rule').toEqual({ different: [], unlike: [], conflicts: [], holes: [], grid: [] })
-        test.info().annotations.push({ type: 'ring', description: `the browser’s own adjustment opens past the look (px): left ${String(area.ring.left)}, right ${String(area.ring.right)}, top ${String(area.ring.top)}, bottom ${String(area.ring.bottom)}${area.gaps.length > 0 ? `; no open between the look and the adjustment at ${area.gaps.join(' | ')}` : ''}` })
-        reportGrid(area)
+        expectReach(area, settled, pane, size)
+        expectArea(area)
         const inside = ringPoints(settled, pane, size)
         const top = inside[0]
         const atTop = await tapAndRead(page, top?.x ?? 0, top?.y ?? 0)
@@ -1275,8 +1462,7 @@ test.describe('the area in which a tap opens a link', () => {
             { px: x, py: y }
           )
           const made = await tapAndRead(page, x, y)
-          const opened = made.opened[made.opened.length - 1] ?? null
-          if (opened !== expected) wrong.push(`y ${String(Math.round(y - first.y))}: ${String(opened)}, expected ${String(expected)}`)
+          if (made.opened.length !== 1 || made.opened[0] !== expected) wrong.push(`y ${String(Math.round(y - first.y))}: ${made.opened.join(',') || 'none'}, expected ${String(expected)} once`)
           const disagreement = lookDisagrees(made)
           if (disagreement !== null) wrong.push(`y ${String(Math.round(y - first.y))}: the look ${disagreement}`)
         }
@@ -1524,6 +1710,13 @@ test.describe('a link in a box inside a message that clips it', () => {
         const reach = (width + FINGER[surface]) / 2
         for (const inward of [1, Math.min(width / 2 - 1, reach - 1)]) {
           expect((await tapAndRead(page, edge + inward, words.y)).opened, `links opened by a tap ${String(inward)} px inside the box`).toEqual([BOXED_HREF])
+        }
+        // Outside the box, left of its edge: the words that the box hides take no part, and the target of the part in
+        // view is held to the box, so no tap there is the link's, though the full words' target would hold it.
+        for (const outward of [3, 6, 12, 20]) {
+          const outside = await tapAndRead(page, edge - outward, words.y)
+          expect(outside.lit, `the pressed look ${String(outward)} px outside the box’s edge`).toEqual([null])
+          expect(outside.opened, `links opened by a tap ${String(outward)} px outside the box’s edge`).toEqual([])
         }
         const inside = Math.max(reach, (await boxOf(page, BOXED_HREF)).right - edge)
         const made = await tapAndRead(page, edge + inside + 14, words.y)
