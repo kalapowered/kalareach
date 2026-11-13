@@ -881,6 +881,19 @@ fn a_failure_after_the_application_identity_step_leaves_that_service_as_it_was_b
     );
 }
 
+/// After a rollback that left an object it did not make, and after the case's own cleanup of that
+/// object: the administrator's removal ends without a failure and the computer is as it was.
+fn removal_after_the_cleanup_leaves_the_computer_as_it_was(before: &Snapshot, rollback: &str) {
+    let (code, removal) = run_setup(&["remove"], &[], None);
+    println!("--- kr-boundary-setup remove -> {code:?}\n{removal}");
+    assert_eq!(code, Some(0), "the removal succeeds: {removal}");
+    assert_eq!(
+        &snapshot(),
+        before,
+        "after the removal the computer is as it was: {rollback}"
+    );
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn an_account_that_stood_at_its_name_when_the_run_made_it_is_not_undone_by_the_rollback() {
@@ -911,11 +924,9 @@ fn an_account_that_stood_at_its_name_when_the_run_made_it_is_not_undone_by_the_r
         account_stands,
         "the rollback took away an account that the run did not make: {text}"
     );
-    assert_eq!(
-        snapshot(),
-        before,
-        "after the case's own cleanup the computer is as it was: {text}"
-    );
+    // The rollback found the account still there at its own check, so it kept the run's records for
+    // the administrator's removal: that removal, run after the case's cleanup, takes the rest.
+    removal_after_the_cleanup_leaves_the_computer_as_it_was(&before, &text);
 }
 
 #[test]
@@ -957,9 +968,5 @@ fn a_service_that_stood_at_the_brokers_name_when_the_run_made_it_is_not_undone_b
         service_stands,
         "the rollback took away a service that the run did not make: {text}"
     );
-    assert_eq!(
-        snapshot(),
-        before,
-        "after the case's own cleanup the computer is as it was: {text}"
-    );
+    removal_after_the_cleanup_leaves_the_computer_as_it_was(&before, &text);
 }
