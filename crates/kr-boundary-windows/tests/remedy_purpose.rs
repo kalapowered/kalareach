@@ -20,7 +20,12 @@ const PURPOSES: [Purpose; 4] = [
     Purpose::Status,
 ];
 
-const STANDINGS: [Standing; 2] = [Standing::NothingFound, Standing::MayBeInstalled];
+fn standings() -> [Standing; 2] {
+    [
+        Standing::NothingFound,
+        Standing::MayBeInstalled("a read of the policy failed (Windows error 5)".to_owned()),
+    ]
+}
 
 const KINDS: [EntryKind; 10] = [
     EntryKind::Manifest,
@@ -72,15 +77,15 @@ fn says_a_move(text: &str) -> bool {
 /// were made.
 fn each_run(mut check: impl FnMut(Purpose, Standing, &Grounds<'_>, bool)) {
     for purpose in PURPOSES {
-        for standing in STANDINGS {
+        for standing in standings() {
             let asked = Cell::new(0_u32);
             let reads = || {
                 asked.set(asked.get() + 1);
-                standing
+                standing.clone()
             };
             let grounds = Grounds::new(purpose, &reads);
             let moves = purpose == Purpose::Install && standing == Standing::NothingFound;
-            check(purpose, standing, &grounds, moves);
+            check(purpose, standing.clone(), &grounds, moves);
             if purpose != Purpose::Install {
                 assert_eq!(
                     asked.get(),
@@ -88,6 +93,10 @@ fn each_run(mut check: impl FnMut(Purpose, Standing, &Grounds<'_>, bool)) {
                     "a {purpose:?} never asks what the reads found of the installation"
                 );
             }
+            assert!(
+                asked.get() <= 1,
+                "the reads are made once, not for each ending"
+            );
         }
     }
 }

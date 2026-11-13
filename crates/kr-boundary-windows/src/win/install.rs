@@ -826,32 +826,43 @@ fn with_grounds<T>(
 
 /// What the reads of this run show of the rest of the installation: nothing found only where the
 /// service, both accounts and the policy were each read and showed nothing of the installation. A
-/// read that fails or finds something leaves the answer at "may be installed".
+/// read that finds something or fails leaves the answer at "may be installed", with the words that
+/// say which read found what, or failed with which error.
 fn standing_of(paths: &Paths) -> remedy::Standing {
-    if nothing_of_the_installation_found(paths) {
-        remedy::Standing::NothingFound
-    } else {
-        remedy::Standing::MayBeInstalled
+    match something_of_the_installation(paths) {
+        None => remedy::Standing::NothingFound,
+        Some(why) => remedy::Standing::MayBeInstalled(why),
     }
 }
 
-/// Whether the service, both accounts and the policy were each read, and none shows a part of the
-/// installation. A read that fails is not "nothing found".
-fn nothing_of_the_installation_found(paths: &Paths) -> bool {
-    let service = service::manager().and_then(|manager| manager.open(SERVICE));
-    if !matches!(service, Ok(None)) {
-        return false;
+/// The first read of the service, of the two accounts and of the policy that shows a part of the
+/// installation or fails, in words; none where each read succeeded and showed nothing. A read that
+/// fails is not "nothing found".
+fn something_of_the_installation(paths: &Paths) -> Option<String> {
+    match service::manager().and_then(|manager| manager.open(SERVICE)) {
+        Ok(None) => {}
+        Ok(Some(_)) => return Some("the broker's service is there".to_owned()),
+        Err(error) => {
+            return Some(format!("a read of the broker's service failed ({error})"));
+        }
     }
     for name in [CHECKOUT, CONNECT] {
-        if !matches!(account::find(name), Ok(None)) {
-            return false;
+        match account::find(name) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Some(format!("the account {name} is there")),
+            Err(error) => {
+                return Some(format!("a lookup of the account {name} failed ({error})"));
+            }
         }
     }
     // The folder above the data directory was checked and held by the caller, and is where the
     // channel makes its own temporary directory.
     match Channel::new(paths.data_parent()).effective() {
-        Ok((_, policy)) => !policy.holds_our_rules(),
-        Err(_) => false,
+        Ok((_, policy)) if policy.holds_our_rules() => {
+            Some("the policy holds a rule of the installation".to_owned())
+        }
+        Ok(_) => None,
+        Err(error) => Some(format!("a read of the policy failed ({error})")),
     }
 }
 

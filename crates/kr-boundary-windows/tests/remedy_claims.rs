@@ -17,16 +17,19 @@ fn at_install() -> Grounds<'static> {
 }
 
 /// Every purpose with each answer that its reads could give.
-const PURPOSES_AND_STANDINGS: [(Purpose, Standing); 8] = [
-    (Purpose::Install, Standing::NothingFound),
-    (Purpose::Install, Standing::MayBeInstalled),
-    (Purpose::Repair, Standing::NothingFound),
-    (Purpose::Repair, Standing::MayBeInstalled),
-    (Purpose::Remove, Standing::NothingFound),
-    (Purpose::Remove, Standing::MayBeInstalled),
-    (Purpose::Status, Standing::NothingFound),
-    (Purpose::Status, Standing::MayBeInstalled),
-];
+fn purposes_and_standings() -> Vec<(Purpose, Standing)> {
+    let found =
+        Standing::MayBeInstalled("a read of the accounts failed (Windows error 5)".to_owned());
+    [
+        Purpose::Install,
+        Purpose::Repair,
+        Purpose::Remove,
+        Purpose::Status,
+    ]
+    .into_iter()
+    .flat_map(|purpose| [(purpose, Standing::NothingFound), (purpose, found.clone())])
+    .collect()
+}
 
 /// Every state that an entry's refusal can be told in.
 fn every_state() -> Vec<(EntryKind, Origin, Presence)> {
@@ -153,15 +156,11 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
             // Every purpose with every answer of the reads: only an installation whose reads found
             // nothing has a clearance, and the answer of the reads is not even asked for any other
             // purpose.
-            for (purpose, standing) in PURPOSES_AND_STANDINGS {
-                let reads = || standing;
+            for (purpose, standing) in purposes_and_standings() {
+                let reads = || standing.clone();
                 let grounds = Grounds::new(purpose, &reads);
                 let text = data_ending(&grounds, &origin, case_sensitive);
-                let standing = if purpose == Purpose::Install {
-                    standing
-                } else {
-                    Standing::MayBeInstalled
-                };
+                let withheld = purpose == Purpose::Install && standing != Standing::NothingFound;
                 let what = format!("{origin:?} {case_sensitive} {purpose:?} {standing:?}: {text}");
                 assert!(!text.contains("stay where they are"), "{what}");
                 assert!(!text.contains("The manifest and the journal"), "{what}");
@@ -170,7 +169,8 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
                     origin == Origin::System,
                     "{what}"
                 );
-                let moved = not_set && standing == Standing::NothingFound;
+                let moved =
+                    not_set && purpose == Purpose::Install && standing == Standing::NothingFound;
                 assert_eq!(text.contains("Move it aside"), moved, "{what}");
                 assert_eq!(
                     text.contains("the installation makes the directory new"),
@@ -178,8 +178,24 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
                     "{what}"
                 );
                 assert_eq!(
-                    text.contains("found no service, no account and no rule of the installation"),
+                    text.contains(
+                        "found no service of the installation's name, no account of the installation's two names and none of its rules. They do not see an account that was renamed."
+                    ),
                     moved,
+                    "{what}"
+                );
+                assert_eq!(
+                    text.contains(
+                        "Move it aside only if you know that nothing of an installation is left"
+                    ),
+                    moved,
+                    "{what}"
+                );
+                // An installation where a read found a part of the installation or failed says which
+                // read, with its error, where a move would otherwise be named; no other purpose reads.
+                assert_eq!(
+                    text.contains("did not show that nothing of an installation is left: a read of the accounts failed (Windows error 5)."),
+                    not_set && withheld,
                     "{what}"
                 );
                 if let Origin::Owned(read) = &origin {
@@ -191,7 +207,7 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
                     assert!(!text.contains("Whoever"), "{what}");
                     assert!(!text.contains("owner"), "{what}");
                 }
-                if not_set && standing == Standing::MayBeInstalled {
+                if not_set && !moved {
                     for claim in ["move it aside", "Move", "rename", "makes the directory new"] {
                         assert!(!text.contains(claim), "{claim}: {what}");
                     }
