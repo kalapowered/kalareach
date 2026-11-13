@@ -62,11 +62,12 @@ impl WorkerSupervisor for RefusingSupervisor {
 }
 
 struct Host {
-    temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
     /// Where the repositories live. Shared, so it outlives a daemon a test replaces.
     work: Arc<PrivateTempDir>,
 }
