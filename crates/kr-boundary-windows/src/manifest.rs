@@ -102,6 +102,11 @@ pub enum ObjectKind {
     /// is the installation's to remove where it is empty; one that stood before the run is `found`
     /// and is never removed, also where it is empty.
     ProgramFolder,
+    /// The installation asked the service manager to start the broker's service: the identifier is
+    /// the service's name. Recorded as an intent before the request and with the result `made` after
+    /// the manager accepted it, so the record in any state says that the broker may have run, and
+    /// the journal's files are not removed until the service's end is proved.
+    ServiceStarted,
     /// The Application Identity service was stopped and the installation started it: the identifier
     /// is its name. It is recorded after the service manager accepted the start, and never before,
     /// so its presence is a result and no intent.
