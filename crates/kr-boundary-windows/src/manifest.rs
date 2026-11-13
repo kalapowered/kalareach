@@ -379,7 +379,9 @@ impl Prior {
 /// `"replacement"` (inside the write of a record, after its replacement file was made), `"proof"`
 /// (the first read of the proof, after the replacement was renamed over the record), `"prior"`,
 /// `"prior-flush"` and `"prior-identity"` (the write, the flush and the taking of the identity of
-/// the earlier-state record, after it was made).
+/// the earlier-state record, after it was made). And `"manager"` and `"broker"`
+/// (the service manager's open and the broker's first open and status read, in the steps that the
+/// rollback and the removal share).
 #[cfg(feature = "testing")]
 pub mod forced {
     use std::sync::{Mutex, PoisonError};
