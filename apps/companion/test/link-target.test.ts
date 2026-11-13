@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { linkAt, type Rect, type Reach } from '../src/markdown/link-target'
+import { contestRadius, linkAt, type Rect, type Reach } from '../src/markdown/link-target'
 
 /** The pane of a 390 px wide phone. */
 const PANE: Rect = { left: 0, top: 0, right: 390, bottom: 844 }
@@ -339,6 +339,39 @@ describe('a link whose line the pane’s edge cuts', () => {
     expect(press(56, 24, [cut], ANDROID)).toBe(0)
     expect(press(56.1, 10, [cut], ANDROID)).toBeNull()
     expect(press(30, 24.1, [cut], ANDROID)).toBeNull()
+  })
+})
+
+describe('the radius within which the links of a message are weighed', () => {
+  const distance = (rect: Rect, x: number, y: number): number =>
+    Math.hypot(Math.max(rect.left - x, 0, x - rect.right), Math.max(rect.top - y, 0, y - rect.bottom))
+
+  it('is the farthest a point of an area lies from its words: the least size in both directions', () => {
+    expect(contestRadius(IOS)).toBeCloseTo(44 * Math.SQRT2, 6)
+    expect(contestRadius(ANDROID)).toBeCloseTo(48 * Math.SQRT2, 6)
+  })
+
+  it('holds every point that any area has, at the pane’s corners, edges and middle, for short and long words and for tall and short lines', () => {
+    for (const reach of [IOS, ANDROID]) {
+      let farthest = 0
+      for (const width of [8, 120]) {
+        for (const height of [17, 56]) {
+          for (const left of [0, 40, 390 - width]) {
+            for (const top of [0, 100, 844 - height]) {
+              const rect = words(left, top, width, height)
+              for (let x = Math.max(0, left - 90); x <= Math.min(390, left + width + 90); x += 2) {
+                for (let y = Math.max(0, top - 90); y <= Math.min(844, top + height + 90); y += 2) {
+                  if (press(x, y, [[rect]], reach) === 0) farthest = Math.max(farthest, distance(rect, x, y))
+                }
+              }
+            }
+          }
+        }
+      }
+      expect(farthest, `the farthest point of an area from its words at a least size of ${String(reach.least)}`).toBeLessThanOrEqual(contestRadius(reach))
+      // The corner of a pane gives its short link the area of the least size on both axes: past the least size itself.
+      expect(farthest, 'the farthest point found').toBeGreaterThan(reach.least * 1.1)
+    }
   })
 })
 

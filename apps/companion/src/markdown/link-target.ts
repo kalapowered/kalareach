@@ -82,6 +82,25 @@ export function linkAt(point: Point, links: readonly Link[], reach: Reach, bound
   return chosen
 }
 
+/**
+ * How far from a point the words of a link can be and still be nearer to it than the words of a link
+ * whose area holds it: the farthest a point of an area lies from the words that it belongs to.
+ *
+ * A target reaches `beside` past the words on each side (or `(least - width) / 2`, where that is more),
+ * and `(least - height) / 2` above and below them. Where the pane cuts a side of a target, the opposite
+ * side grows by what was cut; the words are wholly in view on an axis where that happens, so what is cut
+ * is at most the reach on the cut side, and the area ends at most twice that reach past the words on the
+ * other side: across, `2 * max(beside, least / 2)`, which is `least` for a reach of half the least size;
+ * down, less than `least`. Both axes can be cut at once, at a corner of the pane, so the farthest point
+ * of an area is at the corner of that rectangle: `hypot(least, least)` for the reach of the least size
+ * and half of it beside. Words nearer to a point than the words of such a link are within the same radius
+ * of it, so a layout that holds every link whose words are within this radius of a point holds every
+ * link that the rule weighs there.
+ */
+export function contestRadius(reach: Reach): number {
+  return Math.hypot(2 * Math.max(reach.beside, reach.least / 2), reach.least)
+}
+
 /** The region one rectangle of a link's words is pressable over: the words grown to the least size and to the reach beside them. */
 export function targetOf(words: Rect, reach: Reach): Rect {
   const wide = Math.max(reach.least, words.right - words.left + 2 * reach.beside)
