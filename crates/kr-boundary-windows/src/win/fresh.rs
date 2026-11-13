@@ -407,6 +407,73 @@ pub fn replace_whole(
     }
 }
 
+/// Writes a record new beneath the directory that `directory` holds, the earlier-state record that
+/// an installation writes once: the file is made relative to that handle (no path of the data tree
+/// is resolved for the create), in the one call that carries its whole descriptor, with the right to
+/// delete it as well as to read and write it, and shares read only. The file is the run's from the
+/// call that made it: `hold` is called with its handle the moment the create returns, with nothing
+/// that can fail between the two (the only steps are the move of the handle into a shared pointer
+/// and the call), and the run keeps the handle to the end of its work, so that its rollback marks the
+/// file through it. Where the write or the flush fails, the same handle marks the file for removal
+/// and `hold` is called with `None`; where that mark fails, the run still holds the handle. Returns
+/// `false`, having made nothing, where anything is at the name.
+///
+/// # Errors
+///
+/// Returns the first failure, with the failure of the mark where that failed too.
+pub fn write_new_beneath(
+    directory: &ffi::Handle,
+    path: &Path,
+    bytes: &[u8],
+    hold: &Hold<'_>,
+) -> io::Result<bool> {
+    let name: Vec<u16> = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("the record has no file name"))?
+        .encode_wide()
+        .collect();
+    let created = match create_beneath(
+        directory,
+        &name,
+        SdKind::AdminFile,
+        GENERIC_READ | GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ,
+    ) {
+        Ok(created) => created,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let handle = Arc::new(created);
+    hold(Some((&handle, path)));
+    let written = (|| -> io::Result<()> {
+        #[cfg(feature = "testing")]
+        crate::manifest::forced::failure_at("prior").map_err(io::Error::other)?;
+        // The file borrows the handle for the write and is never dropped, which would close it.
+        // SAFETY: the handle is open and owned by `handle`, which outlives this value.
+        let mut file = ManuallyDrop::new(unsafe { File::from_raw_handle(handle.raw().cast()) });
+        file.write_all(bytes)?;
+        #[cfg(feature = "testing")]
+        crate::manifest::forced::failure_at("prior-flush").map_err(io::Error::other)?;
+        file.sync_all()
+    })();
+    match written {
+        Ok(()) => Ok(true),
+        Err(failure) => Err(match super::root::delete(&handle) {
+            Ok(()) => {
+                hold(None);
+                failure
+            }
+            Err(error) => io::Error::new(
+                failure.kind(),
+                format!(
+                    "{failure}; the record {} could not be marked for removal either: {error}",
+                    path.display()
+                ),
+            ),
+        }),
+    }
+}
+
 /// What the proof after a rename could not show.
 enum Unproved {
     /// A read established that another object, or none, stands at the record's name.
@@ -725,6 +792,45 @@ mod tests {
                     Some(record.display().to_string())
                 ]
             );
+        }
+    }
+
+    /// The earlier-state record is made new beneath the held directory and the run holds it from the
+    /// call that made it, to the end; a second write finds the name taken and makes nothing; a write
+    /// or a flush that fails marks it through its own handle and the run is told that it is gone.
+    #[test]
+    fn the_earlier_state_record_is_the_runs_from_its_create_and_is_never_written_over() {
+        let _one = one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let directory = hold_directory(dir.path()).unwrap();
+        let path = dir.path().join("prior.json");
+        let told = Mutex::new(Vec::<Option<String>>::new());
+        let hold = |made: Option<(&Arc<ffi::Handle>, &Path)>| {
+            told.lock()
+                .unwrap()
+                .push(made.map(|(_, path)| path.display().to_string()));
+        };
+        assert!(write_new_beneath(&directory, &path, b"first", &hold).unwrap());
+        assert_eq!(*told.lock().unwrap(), [Some(path.display().to_string())]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        // A record that is there is not written over, and the run is told of nothing.
+        assert!(!write_new_beneath(&directory, &path, b"second", &hold).unwrap());
+        assert_eq!(told.lock().unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        #[cfg(feature = "testing")]
+        for point in ["prior", "prior-flush"] {
+            let other = dir.path().join(format!("{point}.json"));
+            told.lock().unwrap().clear();
+            crate::manifest::forced::fail_the_next(point);
+            let error = write_new_beneath(&directory, &other, b"x", &hold)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(point), "{error}");
+            assert_eq!(
+                *told.lock().unwrap(),
+                [Some(other.display().to_string()), None]
+            );
+            assert!(!other.try_exists().unwrap(), "{point}");
         }
     }
 
