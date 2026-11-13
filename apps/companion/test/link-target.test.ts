@@ -283,6 +283,15 @@ describe('a link the pane has scrolled out of view', () => {
     expect(press(40, 30, [hidden, atStart])).toBe(1)
   })
 
+  it('has nothing in view of words that only touch an edge of the pane', () => {
+    expect(press(150, 4, [[words(100, -17, 120)]])).toBeNull()
+    expect(press(150, 840, [[words(100, 844, 120)]])).toBeNull()
+    expect(press(4, 108, [[words(-120, 100, 120)]])).toBeNull()
+    expect(press(386, 108, [[words(390, 100, 120)]])).toBeNull()
+    // A hair in view is in view.
+    expect(press(150, 4, [[words(100, -16.9, 120)]])).toBe(0)
+  })
+
   it('takes part by the line of its words that is in view', () => {
     const wrapped = [words(16, -30, 300), words(16, -6, 200), words(16, 18, 120)]
     expect(press(60, 50, [wrapped])).toBe(0)

@@ -61,7 +61,6 @@ const EQUAL = 1e-6
  * gives: no target reaches past it.
  */
 export function linkAt(point: Point, links: readonly Link[], reach: Reach, bounds: Rect): number | null {
-  if (!holds(bounds, point)) return null
   const seen = links.map(({ words }) => words.filter((rect) => inView(rect, bounds)))
   const distances = seen.map((parts) => Math.min(...parts.map((rect) => distanceTo(rect, point))))
   const closest = Math.min(...distances)
