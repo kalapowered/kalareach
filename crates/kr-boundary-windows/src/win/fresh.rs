@@ -12,21 +12,26 @@
 use std::fs::File;
 use std::io;
 use std::io::Write as _;
+use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_OPEN, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
-    FileRenameInformationEx, NtSetInformationFile,
+    FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+    FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+    FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
-    RtlNtStatusToDosError,
+    RtlNtStatusToDosError, UNICODE_STRING,
 };
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -216,15 +221,92 @@ pub fn hold_directory(directory: &Path) -> io::Result<ffi::Handle> {
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// Writes a record whole through one handle: a replacement is made new beside the record, with the
-/// right to delete it as well as to read and write it, and shares read only. The bytes are written
-/// and flushed through that handle, the replacement is renamed over the record's name through the
-/// same handle, with the new name given relative to `directory`, the handle that the caller holds
-/// of the directory that holds the record (the platform reads a bare name with no directory handle
-/// relative to the process's current directory, not to the file's own). No open of the directory by
-/// a path takes place. The record is then proved to be where it is read: the record's name is opened
-/// relative to the same directory handle, and the identity of what that opens must be the identity
-/// of the object that was written. A name that is not there, a failed read or another object is a
+/// Makes a file new beneath the directory that `directory` holds: the name is made relative to that
+/// handle and no path is resolved, in the one call that carries the whole descriptor of the kind
+/// (owner and protected list), and the call fails when anything is at the name. Returns the handle
+/// of the call that made it, opened with `access` and `share`, synchronous so that a file made of it
+/// can be written, and without following a reparse point.
+///
+/// # Errors
+///
+/// Returns the platform's error when the call fails.
+pub fn create_beneath(
+    directory: &ffi::Handle,
+    name: &[u16],
+    kind: SdKind,
+    access: u32,
+    share: u32,
+) -> io::Result<ffi::Handle> {
+    let bytes = name.len() * 2;
+    let length =
+        u16::try_from(bytes).map_err(|_| io::Error::other("a name too long for the platform"))?;
+    let descriptor = descriptor_of(kind, &Principals::default())?;
+    let security = descriptor.attributes();
+    let mut units = name.to_vec();
+    let text = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: units.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: directory.raw(),
+        ObjectName: &raw const text,
+        Attributes: 0,
+        SecurityDescriptor: security.lpSecurityDescriptor.cast_const().cast(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut raw: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: the name, the attributes (the descriptor behind them is owned by `descriptor`, which
+    // lives to the end of this function) and the status block live through the call, the
+    // directory's handle is open, and the call keeps none of them.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status_block,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            share,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: converts a status the platform just returned; it reads nothing else.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    // text: create_beneath-1
+    ffi::Handle::new(raw, "creating a file beneath a held directory")
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// What a write of a record tells the run that holds it, as it goes: `Some` of the handle of the
+/// call that made a file and the path that the file has now, which the run keeps from then on, and
+/// `None` where the file was marked for removal or has become the record that was proved.
+pub type Hold<'a> = dyn Fn(Option<(&Arc<ffi::Handle>, &Path)>) + 'a;
+
+/// Writes a record whole through one handle: a replacement is made new beside the record, relative
+/// to `directory`, the handle that the caller holds of the directory that holds the record (no path
+/// of the data tree is resolved for the create), with the right to delete it as well as to read
+/// and write it, and shares read only. The replacement is the run's from the call that made it:
+/// `hold` is called with its handle the moment the create returns, with nothing that can fail
+/// between the two (the only steps are the move of the handle into a shared pointer and the call),
+/// and again with the record's path once the rename has put it there; it is called with `None`
+/// where the replacement was marked for removal or has become the proved record. The bytes are
+/// written and flushed through that handle, the replacement is renamed over the record's name
+/// through the same handle, with the new name given relative to `directory` (the platform reads a
+/// bare name with no directory handle relative to the process's current directory, not to the
+/// file's own). The record is then proved to be where it is read: the record's name is opened
+/// relative to the same directory handle, for its attributes only and with full sharing, and the
+/// identity of what that opens must be the identity of the object that was written. That open is
+/// returned: it is the proof's own handle, a separate file object that holds the record's identity
+/// and no right to anything. A name that is not there, a failed read or another object is a
 /// failure.
 ///
 /// Where the write, the flush or the rename fails, nothing has changed at the record's name, and
@@ -232,7 +314,8 @@ pub fn hold_directory(directory: &Path) -> io::Result<ffi::Handle> {
 /// name, the object is marked for removal only if a read established that another object, or none,
 /// stands at the name. Where a read failed, nothing is established, and the object stays at the
 /// name: after a repair it may be the only manifest there is, and a failed read is no reason to
-/// delete it. The error then says which read failed and that the object was left.
+/// delete it. The error then says which read failed and that the object was left. Where a mark
+/// failed, the run still holds the handle, so that its rollback marks the object again.
 ///
 /// # Errors
 ///
@@ -242,61 +325,67 @@ pub fn replace_whole(
     path: &Path,
     staging: &Path,
     bytes: &[u8],
-) -> io::Result<()> {
-    let mut file = file_with_access(
-        staging,
+    hold: &Hold<'_>,
+) -> io::Result<ffi::Handle> {
+    let name_of = |path: &Path, what: &str| -> io::Result<Vec<u16>> {
+        Ok(path
+            .file_name()
+            .ok_or_else(|| io::Error::other(format!("the {what} has no file name")))?
+            .encode_wide()
+            .collect())
+    };
+    // Nothing is made before both names are known.
+    let staging_name = name_of(staging, "replacement")?;
+    let name = name_of(path, "record")?;
+    let created = create_beneath(
+        directory,
+        &staging_name,
         SdKind::AdminFile,
-        &Principals::default(),
-        true,
         GENERIC_READ | GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ,
     )?;
+    let handle = Arc::new(created);
+    hold(Some((&handle, staging)));
     let written = (|| -> io::Result<()> {
         #[cfg(feature = "testing")]
         crate::manifest::forced::failure_at("replacement").map_err(io::Error::other)?;
+        // The file borrows the handle for the write and is never dropped, which would close it.
+        // SAFETY: the handle is open and owned by `handle`, which outlives this value.
+        let mut file = ManuallyDrop::new(unsafe { File::from_raw_handle(handle.raw().cast()) });
         file.write_all(bytes)?;
         file.sync_all()
     })();
-    // The handle is taken out of the file, which would close it, so that it is the one that renames
-    // the replacement and, where a step failed, marks it.
-    // text: replace_whole-1
-    let handle = ffi::Handle::new(
-        file.into_raw_handle().cast(),
-        "the replacement's own handle",
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    let renamed = written.and_then(|()| {
-        let name: Vec<u16> = path
-            .file_name()
-            .ok_or_else(|| io::Error::other("the record has no file name"))?
-            .encode_wide()
-            .collect();
-        rename_by_handle(&handle, directory, &name)?;
-        Ok(name)
-    });
     // Before the rename nothing has changed at the record's name: the replacement is the only
     // object that this call made, and it goes.
-    let name = match renamed {
-        Ok(name) => name,
-        Err(failure) => {
-            return match super::root::delete(&handle) {
-                Ok(()) => Err(failure),
-                Err(error) => Err(io::Error::new(
-                    failure.kind(),
-                    format!(
-                        "{failure}; the replacement {} could not be marked for removal either: {error}",
-                        staging.display()
-                    ),
-                )),
-            };
-        }
-    };
+    if let Err(failure) = written.and_then(|()| rename_by_handle(&handle, directory, &name)) {
+        return Err(match super::root::delete(&handle) {
+            Ok(()) => {
+                hold(None);
+                failure
+            }
+            Err(error) => io::Error::new(
+                failure.kind(),
+                format!(
+                    "{failure}; the replacement {} could not be marked for removal either: {error}",
+                    staging.display()
+                ),
+            ),
+        });
+    }
+    hold(Some((&handle, path)));
     match prove_in_place(directory, &handle, &name, path) {
-        Ok(()) => Ok(()),
+        Ok(found) => {
+            hold(None);
+            Ok(found)
+        }
         // A read established that another object, or none, stands at the name: the object that
         // was written is not the record, and it goes.
         Err(Unproved::NotTheRecord(failure)) => {
             let marked = match super::root::delete(&handle) {
-                Ok(()) => "the object that was written was marked for removal".to_owned(),
+                Ok(()) => {
+                    hold(None);
+                    "the object that was written was marked for removal".to_owned()
+                }
                 Err(error) => {
                     format!("the object that was written could not be marked for removal: {error}")
                 }
@@ -308,7 +397,7 @@ pub fn replace_whole(
         }
         // A read failed, so nothing is established about what stands at the name, and the rename
         // has already replaced the earlier record: where this object is the only record, marking it
-        // would leave none. It stays, unmarked; the handle closes without deleting it.
+        // would leave none. It stays, unmarked, and the run holds its handle.
         Err(Unproved::Unread(failure)) => Err(io::Error::new(
             failure.kind(),
             format!(
@@ -375,7 +464,9 @@ fn rename_by_handle(handle: &ffi::Handle, directory: &ffi::Handle, name: &[u16])
 
 /// Proves that the record is where it is read after the rename: the name is opened relative to the
 /// same directory handle, for its attributes only, and the identity of what it opens is compared with
-/// the identity of the object that was written. No path is opened.
+/// the identity of the object that was written. No path is opened. The open of the name, which is
+/// that identity's own file object (opened for its attributes only, with full sharing), is returned
+/// as the proof's handle of the record.
 ///
 /// A name that is not there and another object at the name are the answers of reads: they are
 /// [`Unproved::NotTheRecord`]. A read that failed (the identity of the written object, the open of
@@ -386,7 +477,7 @@ fn prove_in_place(
     written: &ffi::Handle,
     name: &[u16],
     path: &Path,
-) -> Result<(), Unproved> {
+) -> Result<ffi::Handle, Unproved> {
     // The seam of the test build: one read of the proof fails, after a rename that really took
     // place.
     #[cfg(feature = "testing")]
@@ -433,7 +524,7 @@ fn prove_in_place(
             path.display()
         ))));
     }
-    Ok(())
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -480,6 +571,7 @@ mod tests {
             &record,
             &dir.path().join("manifest-one.new"),
             b"first",
+            &|_| {},
         )
         .unwrap();
         crate::manifest::forced::fail_the_next("proof");
@@ -488,6 +580,7 @@ mod tests {
             &record,
             &dir.path().join("manifest-two.new"),
             b"second",
+            &|_| {},
         )
         .unwrap_err()
         .to_string();
@@ -506,6 +599,7 @@ mod tests {
             &record,
             &dir.path().join("manifest-three.new"),
             b"third",
+            &|_| {},
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&record).unwrap(), "third");
@@ -525,6 +619,7 @@ mod tests {
             &record,
             &dir.path().join("manifest-one.new"),
             b"first",
+            &|_| {},
         )
         .unwrap();
         crate::manifest::forced::fail_the_next("replacement");
@@ -533,6 +628,7 @@ mod tests {
             &record,
             &dir.path().join("manifest-two.new"),
             b"second",
+            &|_| {},
         )
         .unwrap_err()
         .to_string();
@@ -542,6 +638,94 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&record).unwrap(), "first");
         assert_eq!(names_in(dir.path()), ["manifest.json"]);
+    }
+
+    /// A file is made new beneath a held directory, by its bare name relative to that handle, and a
+    /// second call at the same name fails and leaves the first file as it was.
+    #[test]
+    fn a_file_is_made_beneath_a_held_directory_and_never_over_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = hold_directory(dir.path()).unwrap();
+        let name: Vec<u16> = "made.bin".encode_utf16().collect();
+        let first = create_beneath(
+            &directory,
+            &name,
+            SdKind::AdminFile,
+            GENERIC_READ | GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ,
+        )
+        .unwrap();
+        // SAFETY: the handle is open; the file borrows it for one write and is never dropped.
+        let mut file = ManuallyDrop::new(unsafe { File::from_raw_handle(first.raw().cast()) });
+        file.write_all(b"first").unwrap();
+        let again = create_beneath(
+            &directory,
+            &name,
+            SdKind::AdminFile,
+            GENERIC_READ | GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ,
+        )
+        .unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::AlreadyExists, "{again}");
+        drop(first);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("made.bin")).unwrap(),
+            "first"
+        );
+    }
+
+    /// The run is told of a replacement at the call that made it, again where the rename has put
+    /// it at the record's name, and last that it has become the proved record; a write that failed
+    /// before the rename tells it that the replacement was marked, and a read of the proof that
+    /// failed leaves the record in the run's hand.
+    #[test]
+    fn the_run_is_told_of_a_replacement_from_its_create_to_the_proved_record() {
+        let _one = one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let directory = hold_directory(dir.path()).unwrap();
+        let record = dir.path().join("manifest.json");
+        let told = Mutex::new(Vec::<Option<String>>::new());
+        let hold = |made: Option<(&Arc<ffi::Handle>, &Path)>| {
+            told.lock()
+                .unwrap()
+                .push(made.map(|(_, path)| path.display().to_string()));
+        };
+        let staging = dir.path().join("manifest-one.new");
+        let found = replace_whole(&directory, &record, &staging, b"first", &hold).unwrap();
+        // The proof's handle is the record's own object.
+        let units: Vec<u16> = "manifest.json".encode_utf16().collect();
+        let at_name = DirHandle::open_beneath(&directory, &units, 0, true, FILE_OPEN).unwrap();
+        assert_eq!(key_of(&found).unwrap(), key_of(&at_name).unwrap());
+        assert_eq!(
+            *told.lock().unwrap(),
+            [
+                Some(staging.display().to_string()),
+                Some(record.display().to_string()),
+                None
+            ]
+        );
+        #[cfg(feature = "testing")]
+        {
+            told.lock().unwrap().clear();
+            crate::manifest::forced::fail_the_next("replacement");
+            let two = dir.path().join("manifest-two.new");
+            replace_whole(&directory, &record, &two, b"second", &hold).unwrap_err();
+            assert_eq!(
+                *told.lock().unwrap(),
+                [Some(two.display().to_string()), None]
+            );
+            told.lock().unwrap().clear();
+            crate::manifest::forced::fail_the_next("proof");
+            let three = dir.path().join("manifest-three.new");
+            replace_whole(&directory, &record, &three, b"third", &hold).unwrap_err();
+            assert_eq!(
+                *told.lock().unwrap(),
+                [
+                    Some(three.display().to_string()),
+                    Some(record.display().to_string())
+                ]
+            );
+        }
     }
 
     /// A replacement is put at the record's name in the directory that holds it, whatever the
@@ -565,6 +749,7 @@ mod tests {
                 &record,
                 &dir.path().join(staging),
                 bytes.as_bytes(),
+                &|_| {},
             )
             .unwrap();
             assert_eq!(std::fs::read_to_string(&record).unwrap(), bytes);
