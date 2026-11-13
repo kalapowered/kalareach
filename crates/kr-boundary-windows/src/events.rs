@@ -66,6 +66,20 @@ pub enum EventError {
         /// What the element held.
         text: String,
     },
+    /// An event holds the element of a number twice, so which text is its number is not known.
+    // text: events-5
+    #[error("the application-control log gave an event with the {name} twice")]
+    Repeated {
+        /// The element: the event's number or the record's.
+        name: String,
+    },
+    /// An event holds no element of one of its numbers.
+    // text: events-6
+    #[error("the application-control log gave an event with no {name}")]
+    Missing {
+        /// The element: the event's number or the record's.
+        name: String,
+    },
 }
 
 /// Reads the XML `wevtutil qe` writes: a sequence of `Event` elements with no root, or the same
@@ -73,7 +87,9 @@ pub enum EventError {
 ///
 /// # Errors
 ///
-/// Returns [`EventError::Unreadable`] for text that is not well-formed.
+/// Returns [`EventError::Unreadable`] for text that is not well-formed, and an error for an event
+/// whose number or record number is missing, empty, not a number or given twice: a number that the
+/// log did not give is never taken for zero.
 pub fn parse(xml: &str) -> Result<Vec<LogEvent>, EventError> {
     let wrapped = format!("<Events>{xml}</Events>");
     let mut reader = Reader::from_str(&wrapped);
@@ -93,12 +109,18 @@ pub fn parse(xml: &str) -> Result<Vec<LogEvent>, EventError> {
                     numbers = Numbers::default();
                 } else if current.is_some() {
                     // An element of a number that is there is read, whatever it holds.
-                    match name.as_str() {
-                        "EventID" => numbers.id = Some(String::new()),
-                        "EventRecordID" => numbers.record = Some(String::new()),
-                        _ => {}
-                    }
+                    numbers.begin(&name)?;
                     field = Some(name);
+                }
+            }
+            Event::Empty(element) => {
+                let name = element.local_name().as_ref().to_owned();
+                if name == "Event" {
+                    // An event with nothing in it holds no number.
+                    events.push(finished(LogEvent::default(), Numbers::default())?);
+                } else if current.is_some() {
+                    // An element of a number with no content is a number that is not there.
+                    numbers.begin(&name)?;
                 }
             }
             Event::Text(text) => {
@@ -134,15 +156,8 @@ pub fn parse(xml: &str) -> Result<Vec<LogEvent>, EventError> {
             }
             Event::End(element) => {
                 if element.local_name().as_ref() == "Event" {
-                    if let Some(mut done) = current.take() {
-                        if let Some(text) = numbers.id.take() {
-                            done.id = number(&text, "EventID")?;
-                        }
-                        if let Some(text) = numbers.record.take() {
-                            done.record = number(&text, "EventRecordID")?;
-                        }
-                        done.rule_id = done.rule_id.trim().trim_matches(['{', '}']).to_lowercase();
-                        events.push(done);
+                    if let Some(done) = current.take() {
+                        events.push(finished(done, std::mem::take(&mut numbers))?);
                     }
                     field = None;
                 } else {
@@ -163,6 +178,39 @@ pub fn parse(xml: &str) -> Result<Vec<LogEvent>, EventError> {
 struct Numbers {
     id: Option<String>,
     record: Option<String>,
+}
+
+impl Numbers {
+    /// Starts the text of a number at the element of that name, and refuses a second element of the
+    /// same name in the event: it would replace the first one's text before either is read.
+    fn begin(&mut self, name: &str) -> Result<(), EventError> {
+        let slot = match name {
+            "EventID" => &mut self.id,
+            "EventRecordID" => &mut self.record,
+            _ => return Ok(()),
+        };
+        if slot.is_some() {
+            return Err(EventError::Repeated {
+                name: name.to_owned(),
+            });
+        }
+        *slot = Some(String::new());
+        Ok(())
+    }
+}
+
+/// An event at its end: its two numbers are read from their text, and an event that holds no
+/// element of one of them is refused, since the number would stand as zero.
+fn finished(mut event: LogEvent, numbers: Numbers) -> Result<LogEvent, EventError> {
+    let missing = |name: &str| EventError::Missing {
+        name: name.to_owned(),
+    };
+    let id = numbers.id.ok_or_else(|| missing("EventID"))?;
+    event.id = number(&id, "EventID")?;
+    let record = numbers.record.ok_or_else(|| missing("EventRecordID"))?;
+    event.record = number(&record, "EventRecordID")?;
+    event.rule_id = event.rule_id.trim().trim_matches(['{', '}']).to_lowercase();
+    Ok(event)
 }
 
 /// Reads one of the event's numbers.

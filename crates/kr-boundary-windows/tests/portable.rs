@@ -208,6 +208,50 @@ fn a_policy_entry_with_a_missing_or_unknown_field_is_refused_as_not_understood()
         r#"<AppLockerPolicy Version="1"><RuleCollection Type="" EnforcementMode="Enabled" /></AppLockerPolicy>"#.to_owned(),
         &["RuleCollection", "empty Type"],
     );
+    // An identifier is checked after it is normalised (braces off, lower case): a rule's is a GUID
+    // and an account's is a security identifier, and what is neither is not a value that stands for
+    // a rule or an account, so the entry is refused and not taken for one that is not ours.
+    for id in [
+        "{}",
+        "{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a0}",
+        "{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a0g}",
+        "b7d3c1e05a414e7b9c1d4b0a6c2f7a01",
+        "S-1-5-32-544",
+        "theirs",
+    ] {
+        refused(
+            rule(&format!(
+                r#"Action="Allow" UserOrGroupSid="S-1-1-0" Id="{id}""#
+            )),
+            &["FilePathRule", "Id", id, "does not know"],
+        );
+    }
+    for sid in [
+        "whatever",
+        "S-1",
+        "S-1-1",
+        "S-1-",
+        "S-1-1-0-",
+        "S-2-1-0",
+        "S-1-5-21-111-x-333-1001",
+        "S-1-+5-32-544",
+        "S-1-5-4294967296",
+        "{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}",
+    ] {
+        refused(
+            rule(&format!(
+                r#"Action="Allow" UserOrGroupSid="{sid}" Id="{{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}}""#
+            )),
+            &["FilePathRule", "UserOrGroupSid", sid, "does not know"],
+        );
+    }
+    // What is of the form is read, in either case and with braces or none.
+    for attributes in [
+        r#"Action="Allow" UserOrGroupSid="S-1-5-21-111-222-333-1001" Id="B7D3C1E0-5A41-4E7B-9C1D-4B0A6C2F7A01""#,
+        r#"Action="Deny" UserOrGroupSid=" s-1-5-32-544 " Id=" {b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01} ""#,
+    ] {
+        Policy::parse(&rule(attributes)).expect("an identifier of its form is read");
+    }
     let condition = |condition: &str| {
         format!(
             r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="Enabled"><FilePathRule {whole} Name="n" Description="d"><Conditions>{condition}</Conditions></FilePathRule></RuleCollection></AppLockerPolicy>"#
@@ -534,6 +578,66 @@ fn an_event_number_or_reference_that_is_not_read_is_an_error_and_not_a_default()
     ))
     .unwrap();
     assert_eq!((read[0].id, read[0].record), (BLOCKED, 77));
+}
+
+/// An event is read only with both of its numbers, each given once and holding a number: an empty
+/// element, a missing one and a second one of the same name are refused, since a number that the log
+/// did not give would stand as zero and a second element would hide the first one's text.
+#[test]
+fn an_event_with_an_empty_or_missing_number_or_a_second_element_of_one_is_refused() {
+    let event = |inner: &str| format!("<Event><System>{inner}</System></Event>");
+    let name_of = |inner: &str| match events::parse(&event(inner)) {
+        Err(events::EventError::NotANumber { name, .. }) => format!("not a number: {name}"),
+        Err(events::EventError::Repeated { name }) => format!("twice: {name}"),
+        Err(events::EventError::Missing { name }) => format!("missing: {name}"),
+        other => format!("{other:?}"),
+    };
+    // An element with no content is a number that is not there, not a record number of zero.
+    assert_eq!(
+        name_of("<EventID>8004</EventID><EventRecordID/>"),
+        "not a number: EventRecordID"
+    );
+    assert_eq!(
+        name_of("<EventID/><EventRecordID>77</EventRecordID>"),
+        "not a number: EventID"
+    );
+    // A number that the event does not carry is not a number of zero either.
+    assert_eq!(name_of("<EventID>8004</EventID>"), "missing: EventRecordID");
+    assert_eq!(
+        name_of("<EventRecordID>77</EventRecordID>"),
+        "missing: EventID"
+    );
+    assert_eq!(name_of(""), "missing: EventID");
+    assert!(matches!(
+        events::parse("<Event/>"),
+        Err(events::EventError::Missing { .. })
+    ));
+    // A second element of the same name would replace the first one's text before either is read.
+    assert_eq!(
+        name_of(
+            "<EventID>8004</EventID><EventRecordID>bad</EventRecordID><EventRecordID>77</EventRecordID>"
+        ),
+        "twice: EventRecordID"
+    );
+    assert_eq!(
+        name_of("<EventID>8004</EventID><EventID>8004</EventID><EventRecordID>77</EventRecordID>"),
+        "twice: EventID"
+    );
+    assert_eq!(
+        name_of("<EventID>8004</EventID><EventRecordID>77</EventRecordID><EventRecordID/>"),
+        "twice: EventRecordID"
+    );
+    // Two events each carry their own numbers once.
+    let two = events::parse(&format!(
+        "{}{}",
+        event("<EventID>8004</EventID><EventRecordID>1</EventRecordID>"),
+        event("<EventID>8001</EventID><EventRecordID>2</EventRecordID>")
+    ))
+    .unwrap();
+    assert_eq!(
+        two.iter().map(|e| (e.id, e.record)).collect::<Vec<_>>(),
+        [(8004, 1), (8001, 2)]
+    );
 }
 
 #[test]

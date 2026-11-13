@@ -160,6 +160,46 @@ fn normal_id(id: &str) -> String {
     id.trim().trim_matches(['{', '}']).to_lowercase()
 }
 
+/// Whether a normalised rule identifier is a GUID, as the platform writes one: five groups of
+/// hexadecimal digits of 8, 4, 4, 4 and 12, joined by hyphens.
+fn is_rule_id(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, length)| {
+            group.len() == length && group.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+}
+
+/// Whether a part of a security identifier is a number in decimal digits alone, with no leading
+/// zero, that is no more than `largest`.
+fn is_number_up_to(part: &str, largest: u64) -> bool {
+    // At most 15 digits, so the value cannot overflow.
+    part.len() <= 15
+        && part.bytes().all(|b| b.is_ascii_digit())
+        && (part == "0" || !part.starts_with('0'))
+        && !part.is_empty()
+        && part
+            .bytes()
+            .fold(0_u64, |value, digit| value * 10 + u64::from(digit - b'0'))
+            <= largest
+}
+
+/// Whether a normalised account identifier is a security identifier: `S-1-`, an authority of up to
+/// 48 bits, and one to fifteen sub-authorities of up to 32 bits, each in decimal digits alone.
+fn is_account_id(sid: &str) -> bool {
+    let parts: Vec<&str> = sid.split('-').collect();
+    let [prefix, revision, authority, subs @ ..] = parts.as_slice() else {
+        return false;
+    };
+    *prefix == "S"
+        && *revision == "1"
+        && is_number_up_to(authority, (1 << 48) - 1)
+        && (1..=15).contains(&subs.len())
+        && subs
+            .iter()
+            .all(|sub| is_number_up_to(sub, u64::from(u32::MAX)))
+}
+
 impl Policy {
     /// The policy the installation puts in force for the two accounts.
     #[must_use]
@@ -528,12 +568,20 @@ fn open(
                 "Deny" => Action::Deny,
                 other => return Err(not_known(&entry, "Action", other)),
             };
+            let given = required(element, "Id", &entry)?;
+            let id = normal_id(&given);
+            if !is_rule_id(&id) {
+                return Err(not_known(&entry, "Id", &given));
+            }
+            let given = required(element, "UserOrGroupSid", &entry)?;
+            let sid = given.trim().to_uppercase();
+            if !is_account_id(&sid) {
+                return Err(not_known(&entry, "UserOrGroupSid", &given));
+            }
             *rule = Some(Rule {
-                id: normal_id(&required(element, "Id", &entry)?),
+                id,
                 kind,
-                sid: required(element, "UserOrGroupSid", &entry)?
-                    .trim()
-                    .to_uppercase(),
+                sid,
                 action,
                 conditions: BTreeSet::new(),
                 exceptions: BTreeSet::new(),
