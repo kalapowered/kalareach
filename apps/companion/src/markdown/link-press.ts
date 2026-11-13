@@ -7,27 +7,31 @@
  * touch's or a pen's click lands on plain text near a link's words (the line under them, the words
  * after them), the link gets a click of its own. `decide` says when (see `link-target.ts`).
  *
- * - At a primary pointer down the pane writes a record of the press: its pointer type, the link that
- *   `linkAt` names at that point (the element and what it opens) and where it started. The record ends
+ * - At a primary pointer down the pane writes a record of the press: its pointer type, where it went
+ *   down, and the link it lights, with what that link opens. A press on a link's own element lights that
+ *   link, whatever the words' rectangles say, since the browser sends its click to that element; a press
+ *   on another control lights nothing; elsewhere `linkAt` names the link at that point. The record ends
  *   at the pointer's cancel and at the next primary pointer down, in the pane or outside it. No match
  *   of pointer numbers is asked of the click: the engines differ, and a click that no pointer made
  *   (a keyboard's, a screen reader's) has a detail of 0 and adds nothing.
- * - The pressed look shows on the link that `linkAt` names at the press's start, until the pointer
- *   comes up or is cancelled. It decides nothing.
+ * - The pressed look shows on that link until the pointer comes up or is cancelled. It decides nothing.
+ *   The open at the click runs the same rule at the press's own point, so what lights at the press is
+ *   what opens at the release.
  *
- * The listeners are on the document, not on the pane: a click listener on the pane would make the
- * pane a target of its own for the platforms' accessibility services. On iOS the click for a tap on
- * plain text comes because the page's other listeners (React's, on the root element below the body)
- * count for WebKit as click listeners on the text's ancestors; a listener on the document alone would
- * not count.
+ * Where the listeners stand: the pointer down is on the document, in the capture phase, because a press
+ * outside the pane must end the pane's record and its look; the pointer move, up and cancel are on the
+ * document from a press to its end, because a release or a cancel can come outside the pane when the
+ * finger slides out. The click is on the pane itself, in the capture phase: every click the decision
+ * reads lies in the pane, and a tap on the pane's own area, where no message lies, has the pane as its
+ * target.
+ *
+ * The pane's bounds are its client box: what holds content and can be tapped, with no border and no
+ * scroll bar's strip that takes up room. A press or a click outside it lights and opens nothing.
  */
 
 import { useEffect, type RefObject } from 'react'
 
-import { contestRadius, decide, linkAt, type Layout, type Named, type PaneLink, type Press, type Rect } from './link-target'
-
-/** How far a press may move and still be a tap, in CSS pixels: the platforms' touch slop is 8 to 10. */
-const SLOP = 10
+import { SLOP, contestRadius, decide, linkAt, type Layout, type Named, type PaneLink, type Press, type Rect } from './link-target'
 
 /** The message controls that are not links. */
 const OTHER_CONTROLS = 'button:not(.md-link), a[href], input, select, textarea, summary'
@@ -35,8 +39,6 @@ const OTHER_CONTROLS = 'button:not(.md-link), a[href], input, select, textarea, 
 /** What the pane keeps of the press that is going on or that ended last. */
 interface Recorded extends Press<HTMLElement> {
   readonly pointer: number
-  readonly x: number
-  readonly y: number
   moved: boolean
   upAt: number | null
 }
@@ -64,7 +66,7 @@ export function startLinkPress(element: HTMLElement): () => void {
   }
   const here = (target: EventTarget | null): boolean => target instanceof Node && element.contains(target)
   const away = (event: PointerEvent): boolean =>
-    press !== null && Math.hypot(event.clientX - press.x, event.clientY - press.y) > SLOP
+    press !== null && Math.hypot(event.clientX - press.at.x, event.clientY - press.at.y) > SLOP
 
   const move = (event: PointerEvent): void => {
     if (press !== null && event.pointerId === press.pointer && away(event)) press.moved = true
@@ -102,8 +104,7 @@ export function startLinkPress(element: HTMLElement): () => void {
     press = {
       pointer: event.pointerId,
       pointerType: event.pointerType,
-      x: event.clientX,
-      y: event.clientY,
+      at: { x: event.clientX, y: event.clientY },
       start: found === null ? null : { link: found.id, destination: found.destination },
       moved: false,
       upAt: null
@@ -118,7 +119,7 @@ export function startLinkPress(element: HTMLElement): () => void {
     const decision = decide(
       press,
       { trusted: event.isTrusted, detail: event.detail, at: performance.now(), names: namedBy(event.target), point: { x, y } },
-      () => layoutNear(element, x, y)
+      (at) => layoutNear(element, at.x, at.y)
     )
     if (decision.kind !== 'open') return
     // One press gives one open: the click that follows needs a press of its own.

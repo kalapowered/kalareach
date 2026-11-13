@@ -190,6 +190,8 @@ export interface Layout<L> {
 export interface Press<L> {
   /** `touch`, `pen` or `mouse`. */
   readonly pointerType: string
+  /** Where the pointer went down. */
+  readonly at: Point
   /** The link the nearest-words rule named at the press's start, and what it opened then, or null. */
   readonly start: { readonly link: L; readonly destination: string } | null
   /** Whether the press moved beyond the slop between its pointer down and its pointer up. */
@@ -213,6 +215,9 @@ export type Decision<L> = { readonly kind: 'stand' } | { readonly kind: 'open'; 
 /** How long after a press's pointer up its click may still come, in milliseconds. */
 export const CLICK_WITHIN = 3000
 
+/** How far a press may move, and how far its click may lie from it, and still be one tap, in CSS pixels: the platforms' touch slop is 8 to 10. */
+export const SLOP = 10
+
 const STAND = { kind: 'stand' } as const
 
 /**
@@ -221,21 +226,25 @@ const STAND = { kind: 'stand' } as const
  *
  * A click that names a link or a control stands alone. A trusted click that names neither, a click on
  * plain text, also opens a link when a touch or a pen pressed that link's words or the room beside
- * them and the click's own point still belongs to it: the press did not move beyond the slop; the
- * click has a detail of 1 and comes after the pointer's up and within `CLICK_WITHIN` of it; and the
- * nearest-words rule names the same element, opening the same destination, at the press's start and at
- * the click's point. A mouse's click on plain text opens nothing, as on a desktop. The press is the
- * record of the latest primary pointer down: a later press, or a pointer cancel, leaves none.
+ * them: the press did not move beyond the slop; the click has a detail of 1, comes after the pointer's
+ * up and within `CLICK_WITHIN` of it, and lies within the slop of the press, since the engine reports
+ * the point of the same tap, rounded or adjusted by a pixel or two; and the nearest-words rule, run again
+ * at the press's own point in the layout as it is now, names the same element, opening the same
+ * destination, as it did at the press's start. The look at the press and the open at the click are
+ * therefore one function of one point. A mouse's click on plain text opens nothing, as on a desktop.
+ * The press is the record of the latest primary pointer down: a later press, or a pointer cancel,
+ * leaves none.
  *
- * `layout` is read only when the other conditions hold.
+ * `layout` is read only when the other conditions hold, at the press's point.
  */
-export function decide<L>(press: Press<L> | null, click: Click, layout: () => Layout<L>): Decision<L> {
+export function decide<L>(press: Press<L> | null, click: Click, layout: (at: Point) => Layout<L>): Decision<L> {
   if (click.names !== 'neither' || !click.trusted || click.detail !== 1) return STAND
   if (press === null || (press.pointerType !== 'touch' && press.pointerType !== 'pen')) return STAND
   if (press.moved || press.start === null || press.upAt === null) return STAND
   if (click.at < press.upAt || click.at - press.upAt > CLICK_WITHIN) return STAND
-  const { links, reach, bounds } = layout()
-  const index = linkAt(click.point, links, reach, bounds)
+  if (Math.hypot(click.point.x - press.at.x, click.point.y - press.at.y) > SLOP) return STAND
+  const { links, reach, bounds } = layout(press.at)
+  const index = linkAt(press.at, links, reach, bounds)
   const chosen = index === null ? undefined : links[index]
   if (chosen === undefined || chosen.id !== press.start.link || chosen.destination !== press.start.destination) return STAND
   return { kind: 'open', link: chosen.id }
