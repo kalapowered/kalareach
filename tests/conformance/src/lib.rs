@@ -12,6 +12,7 @@
 
 pub mod clike;
 pub mod evidence;
+pub mod fault;
 pub mod id;
 pub mod identity;
 pub mod ignored;

@@ -51,6 +51,7 @@ fn options(platform: Platform) -> Options {
         applications: None,
         steps: None,
         lister: PathBuf::from("/tmp/l"),
+        part: None,
         environment: Vec::new(),
     }
 }
@@ -78,6 +79,7 @@ fn executed(step: Step, exit: i32, cases: Result<Vec<Case>, String>) -> Executed
         lane,
         tools: vec![("gradle".to_owned(), "8.14.3".to_owned())],
         error,
+        rerun: None,
     }
 }
 

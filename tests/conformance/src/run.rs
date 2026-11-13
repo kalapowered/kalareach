@@ -67,6 +67,9 @@ pub struct Executed {
     pub tools: Vec<(String, String)>,
     /// Why it could not be run or read, when it could not.
     pub error: Option<String>,
+    /// What a second run of the step followed, when a file the first run linked could not be
+    /// started.
+    pub rerun: Option<crate::fault::Rerun>,
 }
 
 /// Where a step runs: the repository it runs from, the evidence directory, and the variables it
@@ -130,6 +133,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         lane: None,
         tools: Vec::new(),
         error: None,
+        rerun: None,
     };
     if let Err(error) = std::fs::create_dir_all(&logs) {
         executed.error = Some(format!("the log directory could not be made: {error}"));

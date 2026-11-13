@@ -24,7 +24,7 @@ fn usage(problem: &str) -> ExitCode {
     eprintln!("kr-conformance: {problem}");
     eprintln!(
         "usage: kr-conformance run --root <repository> --evidence <directory> [--group <name>]... \
-         [--applications <cache>] [--all-terminals]\n       kr-conformance map --root <repository> \
+         [--applications <cache>] [--all-terminals] [--part <number>/<parts>]\n       kr-conformance map --root <repository> \
          [--typescript]"
     );
     ExitCode::from(2)
@@ -48,6 +48,7 @@ fn main() -> ExitCode {
     let mut applications = None;
     let mut all_terminals = false;
     let mut typescript = false;
+    let mut part = None;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
@@ -62,6 +63,10 @@ fn main() -> ExitCode {
                 }
             },
             "--all-terminals" => all_terminals = true,
+            "--part" => match rest.next().and_then(|text| parse_part(text)) {
+                Some(chosen) => part = Some(chosen),
+                None => return usage("--part takes <number>/<parts>, with 1 <= number <= parts"),
+            },
             "--typescript" => typescript = true,
             other => return usage(&format!("{other} is not an option")),
         }
@@ -81,10 +86,18 @@ fn main() -> ExitCode {
                 groups,
                 applications,
                 all_terminals,
+                part,
             )
         }
         other => usage(&format!("{other} is not a command")),
     }
+}
+
+/// A part of a plan as `<number>/<parts>`: the number of the part from 1, and the number of parts.
+fn parse_part(text: &str) -> Option<(usize, usize)> {
+    let (number, parts) = text.split_once('/')?;
+    let (number, parts): (usize, usize) = (number.parse().ok()?, parts.parse().ok()?);
+    (1..=parts).contains(&number).then_some((number, parts))
 }
 
 fn map(root: PathBuf, typescript: bool) -> ExitCode {
@@ -105,6 +118,7 @@ fn map(root: PathBuf, typescript: bool) -> ExitCode {
         steps: None,
         environment: Vec::new(),
         lister: PathBuf::new(),
+        part: None,
     };
     let map = report::map_for(&options);
     let tests: usize = map.keys.values().map(std::collections::BTreeMap::len).sum();
@@ -140,6 +154,7 @@ fn run(
     groups: Vec<Group>,
     applications: Option<PathBuf>,
     all_terminals: bool,
+    part: Option<(usize, usize)>,
 ) -> ExitCode {
     let evidence = match evidence::check_directory(evidence_directory) {
         Ok(evidence) => evidence,
@@ -195,6 +210,7 @@ fn run(
         steps: None,
         environment: Vec::new(),
         lister,
+        part,
     };
     let document = match report::run(&options, &mut |line| eprintln!("{line}")) {
         Ok(document) => document,
@@ -271,6 +287,19 @@ fn run(
             record.command, record.log
         );
     }
+    for step in &summary.rerun_steps {
+        let record = &document.steps[step - 1];
+        if let Some(rerun) = &record.rerun {
+            println!(
+                "step {step} was run again after a file that could not be started: {}; {} (first run: log {}, second run: log {}; facts {})",
+                rerun.files.join(", "),
+                rerun.reason,
+                rerun.first_log,
+                record.log,
+                rerun.facts
+            );
+        }
+    }
     for failure in &document.failures_outside_identifiers {
         println!("failed outside any identifier: {failure}");
     }
@@ -283,6 +312,12 @@ fn run(
         }
     }
     println!("result: {}", path.display());
+    if !summary.rerun_steps.is_empty() {
+        println!(
+            "{} steps were run again after a file that could not be started",
+            summary.rerun_steps.len()
+        );
+    }
     if document.passed() {
         ExitCode::SUCCESS
     } else {

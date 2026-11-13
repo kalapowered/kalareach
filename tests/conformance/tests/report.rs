@@ -121,6 +121,7 @@ fn run_step_through(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     report::run(&options, &mut |_| {}).map(|document| (document, evidence))
 }
@@ -641,6 +642,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         lane: None,
         tools: Vec::new(),
         error: None,
+        rerun: None,
     };
     let options = Options {
         root: PathBuf::from("/tmp/r"),
@@ -655,6 +657,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         steps: None,
         lister: PathBuf::from("/tmp/l"),
         environment: Vec::new(),
+        part: None,
     };
     let document = report::assemble(
         &options,
@@ -1513,6 +1516,7 @@ fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_
             "CARGO_TARGET_DIR".to_owned(),
             target.path().to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let step = &document.steps[0];
@@ -1565,6 +1569,7 @@ fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
             "CARGO_TARGET_DIR".to_owned(),
             target.path().to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let step = &document.steps[0];
@@ -1604,6 +1609,7 @@ fn a_file_a_library_wrote_and_two_test_programs_read_leaves_the_listing_nothing_
             "CARGO_TARGET_DIR".to_owned(),
             target.path().to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let step = &document.steps[0];
@@ -1745,6 +1751,7 @@ fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     match report::run(&again, &mut |_| {}) {
         Err(Stopped::Evidence(problem)) => assert!(problem.contains("earlier run"), "{problem}"),
@@ -1778,6 +1785,7 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let unrun = &document.identifiers["KR-REQ-03.02"];
@@ -1829,6 +1837,7 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     assert!(document.steps[0].error.is_some(), "{:?}", document.steps[0]);
@@ -1870,6 +1879,7 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let error = document.steps[0].error.as_deref().unwrap_or_default();
@@ -1916,6 +1926,7 @@ fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let terminals = document.terminals.as_ref().expect("the matrix");
@@ -1973,6 +1984,7 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
         )],
+        part: None,
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let passes = &document.identifiers["KR-REQ-04.01"].tests[0];

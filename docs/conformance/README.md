@@ -92,6 +92,38 @@ terminal. Those terminals are qualified on the terminal matrix hosts and virtual
 this report, so the result records each one as not run, with that reason, the report names each on
 its output, and the run exits 1. `--all-terminals` takes no `--group`.
 
+### A plan run in parts
+
+`--part <number>/<parts>` runs one part of the platform's plan, for a plan that one job cannot hold.
+Every part runs the build steps that open the plan, which the suites that start a program need, and
+then its share of the other steps, cut in order into parts of nearly equal count. Each part writes
+its own result: a test that another part runs is recorded as not run, with the reason saying that
+this run is one part of the plan, and the result's `run.part` names the part. The Windows job runs
+its plan as two parts, one in each job of its matrix, and a part that fails does not stop the
+other.
+
+### A step run again after a file that could not be started
+
+A hosted macOS runner's data volume has returned I/O errors in bursts while a build ran. The
+linker writes its output through a memory map, so a program written in a burst can end empty or
+cut short with no error from the linker, and Cargo then takes it for built. Starting it ends with
+exit status 126 and the shell's words `cannot execute binary file`, and so does every later step
+that needs it.
+
+A step that ends so, naming a file under the target directory that the step itself wrote, is run
+once more, after the file, its build directory and Cargo's record of building it are removed, along
+with every other program the step wrote that is empty or cut short. The result's step then holds a
+`rerun` object with the first run's log and exit status, the files, the cause and the file under
+`conformance/faults/` that keeps each file's size, first bytes, Mach-O header and the system's
+check of its signature, and the kernel's lines about failed writes to storage for the minutes
+before. `summary.rerun_steps` lists the steps, and the run's last line says how many were run again.
+A step run again is never a plain pass.
+
+The `cause` is `runner_disk` where the evidence shows it: a file is empty, cut short or its
+signature does not check, or the kernel logged a storage error. It is `unexplained` where the file
+is whole and validly signed and the kernel logged no storage error, and then the step has an error
+and the run fails, because the cause may be this repository's.
+
 ### The classes of test in the landing workflow
 
 Section 21 names a tool for each class of test and asks for the tests' screenshots to be kept in
@@ -500,6 +532,8 @@ identifier's `references` and `figures`.
 | `figures` | The figures the identifier's measurements recorded in this run |
 | `failures_outside_identifiers` | Tests that failed in a step and name no identifier; any one fails the run |
 | `known_differences` | Every known difference, with the identifiers of the test that recorded it |
+| `steps[].rerun` | Present on a step run again after a file that could not be started: both runs' logs, the files, the cause (`runner_disk` or `unexplained`) and what shows it |
+| `run.part` | Present on a run that is one part of the platform's plan: `number/parts` |
 | `terminals` | Present when `--all-terminals` asked for section 27's terminal matrix: each terminal, its outcome and why. A terminal that did not pass fails the run |
 | `problems` | What makes the result incomplete, such as a record a test wrote that could not be read; any one fails the run |
 | `warnings` | What the report noted and carried on past, such as a declared module whose file is not there |
