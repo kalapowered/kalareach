@@ -691,3 +691,143 @@ fn the_folder_that_a_run_made_stays_when_another_programs_entry_stands_in_it_at_
         "after the case's own cleanup the computer is as it was: {removal}"
     );
 }
+
+/// A good installation for `person`. Returns the output of the setup program.
+fn a_good_installation(person: &Person) -> String {
+    let (code, text) = install_with(person, &[]);
+    assert_eq!(code, Some(0), "the installation succeeds: {text}");
+    text
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn an_ordinary_removal_says_that_its_records_are_deleted_only_after_a_read_of_their_names() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let person = Person::make();
+    a_good_installation(&person);
+    let (code, removal) = ordinary_removal();
+    for line in removal.lines().filter(|line| line.contains("deleted")) {
+        observed(&format!("removal line: {line}"));
+    }
+    assert_eq!(code, Some(0), "the removal succeeds: {removal}");
+    assert!(
+        removal.contains(
+            "its records are deleted (a read of the name of each afterwards found it gone)"
+        ),
+        "the removal does not say that a read of the name of each record found it gone: {removal}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the removal the computer is as it was: {removal}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_record_that_cannot_be_deleted_ends_the_removal_with_the_platforms_words_and_keeps_the_record()
+{
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let paths = Paths::system().unwrap();
+    let person = Person::make();
+    a_good_installation(&person);
+    // The case holds the manifest open and shares read and write, so nobody can delete it.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(&paths.manifest)
+        .expect("the case opens the manifest without sharing delete");
+    let (code, removal) = ordinary_removal();
+    for line in removal.lines().filter(|line| {
+        line.contains("manifest") || line.contains("did not finish") || line.contains("deleted")
+    }) {
+        observed(&format!("removal line: {line}"));
+    }
+    let manifest_stands = paths.manifest.exists();
+    drop(held);
+    assert_ne!(
+        code,
+        Some(0),
+        "the removal ended without a failure: {removal}"
+    );
+    assert!(
+        manifest_stands,
+        "the manifest is gone although the case held it: {removal}"
+    );
+    assert!(
+        !removal.contains("its records are deleted"),
+        "the removal says that records are deleted although one could not be: {removal}"
+    );
+    // The case has let go: the second removal runs to its end.
+    let (second_code, second) = ordinary_removal();
+    assert_eq!(
+        second_code,
+        Some(0),
+        "the second removal succeeds: {second}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the second removal the computer is as it was: {second}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_removal_sweeps_the_brokers_journal_names_after_the_stop_and_leaves_other_names() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let person = Person::make();
+    a_good_installation(&person);
+    let paths = Paths::system().unwrap();
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    let brokers = paths.journal.join(format!("{hex}.journal"));
+    let other = paths.journal.join("a.journal");
+    std::fs::write(&brokers, b"journal of a run").unwrap();
+    std::fs::write(&other, b"put here by hand").unwrap();
+    let (code, removal) = ordinary_removal();
+    let (brokers_stands, other_stands) = (brokers.exists(), other.exists());
+    observed(&format!(
+        "after the removal: the broker's journal file stands {brokers_stands}, a.journal stands {other_stands}, exit {code:?}"
+    ));
+    for line in removal.lines().filter(|line| line.contains("a.journal")) {
+        observed(&format!("removal line: {line}"));
+    }
+    // The case's own cleanup, so that a second removal can end the run's records.
+    let _ = std::fs::remove_file(&other);
+    let _ = std::fs::remove_file(&brokers);
+    assert!(
+        !brokers_stands,
+        "the removal left a file that stands under the broker's journal names: {removal}"
+    );
+    assert!(
+        other_stands,
+        "the removal took away a file that is not under the broker's journal names: {removal}"
+    );
+    assert!(
+        removal.contains("a.journal"),
+        "the removal does not name the file that it left in the journal directory: {removal}"
+    );
+    if paths.data.exists() {
+        let (second_code, second) = ordinary_removal();
+        assert_eq!(
+            second_code,
+            Some(0),
+            "the second removal succeeds: {second}"
+        );
+    }
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the second removal the computer is as it was: {removal}"
+    );
+}
