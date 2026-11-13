@@ -1591,6 +1591,8 @@ pub enum NotProved {
     Differs,
     /// A read failed, with its words.
     Unread(String),
+    /// No read was made: the run holds no handle of the data directory to read the name by.
+    NotRead,
 }
 
 impl NotProved {
@@ -1606,6 +1608,7 @@ impl NotProved {
             NotProved::Unread(why) => format!(
                 "A read of the manifest's name afterwards failed ({why}), so what stands there is not known"
             ),
+            NotProved::NotRead => "No read of the manifest's name was made, since the run holds no handle of the data directory, so what stands there is not known".to_owned(),
         }
     }
 }
@@ -1619,15 +1622,16 @@ pub enum RecordLeft {
         /// The manifest's path.
         manifest: String,
     },
-    /// The read did not find it, and the run wrote its record again through the write that proves
-    /// it.
+    /// The read did not find it, and the run wrote its record through the write that proves it.
     Saved {
         /// The manifest's path.
         manifest: String,
         /// What the read found.
         found: NotProved,
     },
-    /// The read did not find it, and the write failed too: the run's record is not on disk.
+    /// The read did not find it, and the write failed too: that a record of this run is on disk is
+    /// not confirmed (the write may have published it before its proof failed, and a record that an
+    /// earlier write left may stand).
     NotSaved {
         /// What the read found.
         found: NotProved,
@@ -1639,9 +1643,10 @@ pub enum RecordLeft {
 }
 
 /// The words that end a rollback with a failed step: what failed, what became of the run's record,
-/// and that the administrator's removal takes the rest where the record is on disk. Where the record
-/// could not be written again, they say so and name what stays. They never say that records are kept
-/// where none is on disk, and they give no step. `unread_prior` is the words that a removal adds
+/// and that the administrator's removal takes the rest where the record is on disk. Where the
+/// record could not be written, they say that a record of this run could not be confirmed on disk
+/// and name what stays. They never say that records are kept where none is on disk, and never that
+/// none is on disk where a failed write cannot show it, and they give no step. `unread_prior` is the words that a removal adds
 /// where the earlier-state record was not read (empty, or starting with a full stop).
 #[must_use]
 // text: rollback_failed
@@ -1652,7 +1657,7 @@ pub fn rollback_failed(failures: &[String], record: &RecordLeft, unread_prior: &
             "the removal did not finish: {failed}. A read of {manifest} afterwards found the manifest that this run holds, and the administrator's removal takes the rest{unread_prior}"
         ),
         RecordLeft::Saved { manifest, found } => format!(
-            "the removal did not finish: {failed}. {}, so this run wrote its record again at {manifest}, through the write that proves it, and the administrator's removal takes the rest{unread_prior}",
+            "the removal did not finish: {failed}. {}, so this run wrote its record at {manifest}, through the write that proves it, and the administrator's removal takes the rest{unread_prior}",
             found.words()
         ),
         RecordLeft::NotSaved { found, why, stays } => {
@@ -1662,7 +1667,7 @@ pub fn rollback_failed(failures: &[String], record: &RecordLeft, unread_prior: &
                 stays.join("; ")
             };
             format!(
-                "the removal did not finish: {failed}. {}, and writing this run's record again failed ({why}), so no record of this run is on disk for the administrator's removal to use. What this run made and the rollback did not take away: {left}{unread_prior}",
+                "the removal did not finish: {failed}. {}, and writing this run's record failed ({why}), so a record of this run could not be confirmed on disk: the write may have published it before its proof failed, and a record that an earlier write left may stand. What this run made and the rollback did not take away: {left}{unread_prior}",
                 found.words()
             )
         }

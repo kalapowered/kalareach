@@ -271,6 +271,24 @@ impl Manifest {
             .find(|object| object.kind == kind && object.id.eq_ignore_ascii_case(id))
     }
 
+    /// Whether the manifest records the directory `id`. The removal's inspection refuses a data
+    /// directory that its manifest does not record, so a record that is left for the removal holds
+    /// this entry.
+    #[must_use]
+    pub fn records_directory(&self, id: &str) -> bool {
+        self.find(ObjectKind::Directory, id).is_some()
+    }
+
+    /// Records the directory `id` as the installation records its directories (an entry with no
+    /// result) where the manifest has no entry for it. Returns whether an entry was added.
+    pub fn record_directory_where_missing(&mut self, id: &str) -> bool {
+        if self.records_directory(id) {
+            return false;
+        }
+        self.record(ObjectKind::Directory, id, None);
+        true
+    }
+
     /// Every recorded object of a kind.
     pub fn of_kind(&self, kind: ObjectKind) -> impl Iterator<Item = &Object> {
         self.objects
