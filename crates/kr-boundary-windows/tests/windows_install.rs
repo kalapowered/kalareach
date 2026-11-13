@@ -2730,13 +2730,16 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
             "{text}"
         );
         assert!(!text.contains("Do not remove"), "{text}");
-        assert!(text.contains("stay where they are"), "{text}");
+        assert!(text.contains("the manifest stays where it is"), "{text}");
     };
     let correction_text = |text: &str| {
         assert!(text.contains("Correct what the reason names"), "{text}");
         assert!(text.contains("Do not remove"), "{text}");
         assert!(!text.contains("Remove "), "{text}");
-        assert!(text.contains("stay where they are"), "{text}");
+        assert!(
+            text.contains("may hold records of what is installed"),
+            "{text}"
+        );
     };
     let moved_aside_text = |text: &str| {
         assert!(text.contains("did not make"), "{text}");
@@ -3096,7 +3099,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         let text = refused.to_string();
         assert!(text.contains(words), "{text}");
         assert!(text.contains("Remove "), "{text}");
-        assert!(text.contains("stay where they are"), "{text}");
+        assert!(text.contains("the manifest stays where it is"), "{text}");
     };
     // An entry whose own handle shows that the installation did not make it is moved aside and
     // never named for removal.

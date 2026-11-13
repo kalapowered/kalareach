@@ -175,15 +175,27 @@ fn said(kind: EntryKind, origin: &Origin, manifest: &Presence) -> (Remedy, Strin
     (remedy, text)
 }
 
-/// "The manifest and the journal stay where they are" is said only where a manifest is there and the
-/// entry is not the journal; "the next run makes it new" only of what the installation makes.
+/// "The manifest stays where it is" is said only where the lookup found a manifest; the journal and
+/// what an entry holds are never claimed, and "the next run makes it new" only of what the
+/// installation makes.
 #[test]
 fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
-    // A removal with the manifest there, of an entry that is not the journal.
-    let (remedy, text) = said(EntryKind::Other, &Origin::System, &Presence::Present);
-    assert_eq!(remedy, Remedy::Remove);
-    assert!(text.contains("stay where they are"), "{text}");
-    // With no manifest, nothing stays beside it; and the journal that is removed does not stay.
+    const STAYS: &str = "the manifest stays where it is";
+    // A removal with the manifest there says that it stays, whichever entry is removed.
+    for kind in [EntryKind::Other, EntryKind::UnnamedRoot] {
+        let (remedy, text) = said(kind, &Origin::System, &Presence::Present);
+        assert_eq!(remedy, Remedy::Remove, "{kind:?}");
+        assert!(text.contains(STAYS), "{kind:?}: {text}");
+    }
+    let text = ending(
+        Path::new("D:\\data\\journal"),
+        Remedy::Remove,
+        &Origin::System,
+        EntryKind::Journal,
+        &Presence::Present,
+    );
+    assert!(text.contains(STAYS), "{text}");
+    // With no manifest, or none read, nothing is said to stay beside the entry.
     for (kind, manifest) in [
         (EntryKind::Prior, Presence::Absent),
         (EntryKind::JournalFile, Presence::Absent),
@@ -192,19 +204,8 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
     ] {
         let (remedy, text) = said(kind, &Origin::System, &manifest);
         assert_eq!(remedy, Remedy::Remove, "{kind:?}");
-        assert!(!text.contains("stay where they are"), "{kind:?}: {text}");
+        assert!(!text.contains(STAYS), "{kind:?}: {text}");
     }
-    // The journal is never said to stay where it is when it is the entry that is removed.
-    let text = ending(
-        Path::new("D:\\data\\journal"),
-        Remedy::Remove,
-        &Origin::System,
-        EntryKind::Journal,
-        &Presence::Present,
-    );
-    assert!(!text.contains("stay where they are"), "{text}");
-    let (_, text) = said(EntryKind::UnnamedRoot, &Origin::System, &Presence::Present);
-    assert!(text.contains("stay where they are"), "{text}");
     // Moved out: the next run makes new only what the installation makes.
     for (kind, makes_it) in [
         (EntryKind::Journal, true),

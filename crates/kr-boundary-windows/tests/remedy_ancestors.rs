@@ -914,6 +914,35 @@ fn a_link_at_the_boundarys_own_folder_sends_the_administrator_nowhere_else() {
     assert!(!text.to_lowercase().contains("remove the link"), "{text}");
 }
 
+/// A folder strictly below the known folder whose final path is not the one asked for is said as what
+/// it is, a path that leads elsewhere, and is never called a link: a short name or another spelling
+/// leads elsewhere as well. Its words are the layout's, and no word tells to change anything.
+#[test]
+fn a_final_path_below_the_known_folder_that_is_not_the_one_asked_for_names_no_cause() {
+    let known = r"C:\Program Files";
+    let own = r"C:\Program Files\KalaReach";
+    let text = ancestor_refusal(
+        &Subject::at(own, known, AncestorFault::Leads(r"C:\Elsewhere\KalaReach")),
+        Tree::Program,
+        Stage::Before,
+    );
+    assert!(
+        text.starts_with(&format!(
+            "{own} is a folder above the boundary's program directory"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(r"that folder's own path is C:\Elsewhere\KalaReach."),
+        "{text}"
+    );
+    assert!(text.contains(&supported_layout(Tree::Program)), "{text}");
+    assert!(text.ends_with(CLOSING), "{text}");
+    assert!(!text.to_lowercase().contains("link"), "{text}");
+    assert!(!text.contains("makes this folder itself"), "{text}");
+    assert!(instructions_in(&text).is_empty(), "{text}");
+}
+
 /// What the setup program can do after a link at the program directory's name: a repair makes the
 /// program files again only where an installation is recorded.
 #[test]

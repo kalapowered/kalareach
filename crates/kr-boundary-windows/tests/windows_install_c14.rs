@@ -290,7 +290,7 @@ fn a_name_that_the_layout_does_not_give_takes_its_remedy_from_its_own_handle() {
     give_to(&stray, "*S-1-5-32-544");
     let text = refusal(&paths);
     assert!(text.contains("Remove "), "{text}");
-    assert!(text.contains("stay where they are"), "{text}");
+    assert!(text.contains("the manifest stays where it is"), "{text}");
     std::fs::remove_file(&stray).unwrap();
 
     // A junction inside `staging`.

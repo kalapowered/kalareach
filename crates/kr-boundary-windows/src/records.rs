@@ -347,7 +347,7 @@ pub fn next_step(manifest_stays: bool, data_is_empty: bool) -> &'static str {
     if manifest_stays {
         "The manifest stays with them. If a program holds one of them open, close it. Then run the removal again, which inspects the data directory again and says what remains"
     } else if data_is_empty {
-        "The directory is empty, and a new installation accepts an empty data directory: close what holds it (a console that has it as its current directory, for one), then run the removal again, which removes it"
+        "The directory is empty, and a new installation accepts an empty data directory: if a program holds it (a console that has it as its current directory, for one), close that program, then run the removal again, which removes it"
     } else {
         "A new installation refuses until they are gone, and nothing has checked them: run the removal again, which reads the first entry that it finds on its own handle and says what to do about it, then run the setup program again"
     }
