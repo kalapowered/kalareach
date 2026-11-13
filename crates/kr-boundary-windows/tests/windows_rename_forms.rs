@@ -1,15 +1,18 @@
-//! A probe of the platform's forms of a rename through the handle of the file that is renamed. For
-//! each form it makes a file through a handle with the rights that a record's replacement is made
-//! with, renames it over a record that is there, and prints the call's answer, the structure's size
-//! and the name's length that the call passed, and where the new content then stands: in the
-//! record's folder, in the process's current directory, or nowhere. It runs only in a disposable
-//! Windows guest, as SYSTEM, in a temporary folder that is not the current directory.
+//! The platform's answers that the record's rename rests on. For each form it makes a file through
+//! a handle with the rights that a record's replacement is made with, renames it over a record that
+//! is there, and reads the call's answer and where the new content then stands: in the record's
+//! folder, in the process's current directory, or nowhere. The native call with the held folder's
+//! handle as the root and a bare name replaces the record in that folder and leaves nothing in the
+//! current directory; the Win32 call refuses every form with a root handle. A later change of
+//! either answer meets a red case. The cases run only in a disposable Windows guest, as SYSTEM, in a
+//! temporary folder that is not the current directory.
 
 #![cfg(windows)]
 #![allow(unsafe_code)]
 
 use std::os::windows::ffi::OsStrExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 use windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile;
 use windows_sys::Win32::Foundation::{
@@ -19,7 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ADD_FILE, FILE_ATTRIBUTE_NORMAL,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_RENAME_INFO, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileRenameInfo, FileRenameInfoEx,
-    GetFinalPathNameByHandleW, OPEN_EXISTING, SetFileInformationByHandle, WriteFile,
+    OPEN_EXISTING, SetFileInformationByHandle, WriteFile,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -29,6 +32,14 @@ const POSIX: u32 = 0x2;
 /// `FileRenameInformation` and `FileRenameInformationEx` of the native call.
 const NT_RENAME: i32 = 10;
 const NT_RENAME_EX: i32 = 65;
+/// The rights of a folder handle that may add a file to its folder.
+const ADD: u32 = FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_TRAVERSE | SYNCHRONIZE;
+/// The Win32 error of "the parameter is incorrect".
+const INVALID_PARAMETER: u32 = 87;
+
+/// Every case of this program changes the process's current directory, which is the process's own:
+/// one case runs at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
@@ -95,19 +106,6 @@ fn folder(path: &Path, access: u32) -> HANDLE {
     handle
 }
 
-fn final_path(handle: HANDLE) -> PathBuf {
-    let mut buffer = vec![0_u16; 1024];
-    // SAFETY: the buffer lives through the call and its length is given.
-    let length =
-        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), 1024, 0) } as usize;
-    assert!(
-        length > 0 && length < 1024,
-        "{}",
-        std::io::Error::last_os_error()
-    );
-    PathBuf::from(String::from_utf16_lossy(&buffer[..length]))
-}
-
 /// The structure that both calls take: flags (or the replace byte), the root directory, the name.
 fn buffer_of(flags: u32, root: HANDLE, name: &[u16]) -> (Vec<u64>, u32) {
     let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
@@ -128,7 +126,7 @@ fn buffer_of(flags: u32, root: HANDLE, name: &[u16]) -> (Vec<u64>, u32) {
     (buffer, size as u32)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Call {
     /// `SetFileInformationByHandle`, class `FileRenameInfo`.
     Plain,
@@ -140,38 +138,41 @@ enum Call {
     NtEx,
 }
 
-struct Form {
-    label: &'static str,
-    call: Call,
-    flags: u32,
-    /// The rights of the folder handle that goes as the root; none: no root handle.
-    root: Option<u32>,
-    /// The name is the folder's own final path with the record's name, not the bare name.
-    absolute: bool,
+/// What one rename did.
+#[derive(Debug)]
+struct Outcome {
+    /// The platform's error code when the call was refused.
+    refused: Option<u32>,
+    /// What the record's name holds in its folder afterwards.
+    in_folder: String,
+    /// Whether a file named like the record stands in the process's current directory.
+    in_current: bool,
+    /// Whether the file that was renamed still stands under its own name.
+    staging_left: bool,
 }
 
-/// Runs one form in a folder of its own and returns the line that says what happened.
-fn run(form: &Form, base: &Path) -> String {
-    let dir = base.join(form.label);
-    std::fs::create_dir(&dir).unwrap();
+/// Renames a new file over a record in a folder of its own, by the given call and flags, with a
+/// handle of that folder opened with `root_rights` as the root and the bare name, while the
+/// process's current directory is another folder.
+fn attempt(call: Call, flags: u32, root_rights: u32) -> Outcome {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let base = std::env::temp_dir().join(format!("krrename-{id}"));
+    let elsewhere = std::env::temp_dir().join(format!("krcurrent-{id}"));
+    let dir = base.join("folder");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::env::set_current_dir(&elsewhere).unwrap();
     let record = dir.join("record.json");
     std::fs::write(&record, b"old").unwrap();
     let staging = dir.join("stage.new");
     let file = staging_file(&staging, b"new");
-    let root = form.root.map(|rights| folder(&dir, rights));
-    let name_text: Vec<u16> = if form.absolute {
-        let held = root.unwrap_or_else(|| folder(&dir, GENERIC_READ));
-        wide(&final_path(held).join("record.json"))
-            .into_iter()
-            .take_while(|unit| *unit != 0)
-            .collect()
-    } else {
-        "record.json".encode_utf16().collect()
-    };
-    let (buffer, size) = buffer_of(form.flags, root.unwrap_or(std::ptr::null_mut()), &name_text);
-    let answer = match form.call {
+    let root = folder(&dir, root_rights);
+    let name: Vec<u16> = "record.json".encode_utf16().collect();
+    let (buffer, size) = buffer_of(flags, root, &name);
+    let refused = match call {
         Call::Plain | Call::Ex => {
-            let class = if matches!(form.call, Call::Ex) {
+            let class = if matches!(call, Call::Ex) {
                 FileRenameInfoEx
             } else {
                 FileRenameInfo
@@ -179,17 +180,14 @@ fn run(form: &Form, base: &Path) -> String {
             // SAFETY: the handle is open and the buffer holds the structure of the class, of the size given.
             let done =
                 unsafe { SetFileInformationByHandle(file, class, buffer.as_ptr().cast(), size) };
-            if done == 0 {
-                format!(
-                    "error {}",
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
-                )
-            } else {
-                "ok".to_owned()
-            }
+            (done == 0).then(|| {
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .map_or(u32::MAX, |code| code as u32)
+            })
         }
         Call::NtPlain | Call::NtEx => {
-            let class = if matches!(form.call, Call::NtEx) {
+            let class = if matches!(call, Call::NtEx) {
                 NT_RENAME_EX
             } else {
                 NT_RENAME
@@ -199,160 +197,89 @@ fn run(form: &Form, base: &Path) -> String {
             let status = unsafe {
                 NtSetInformationFile(file, &raw mut block, buffer.as_ptr().cast(), size, class)
             };
-            if status >= 0 {
-                "ok".to_owned()
-            } else {
-                // SAFETY: converts a status the platform just returned.
-                format!("status {status:#010x} = error {}", unsafe {
-                    RtlNtStatusToDosError(status)
-                })
-            }
+            // SAFETY: converts a status the platform just returned.
+            (status < 0).then(|| unsafe { RtlNtStatusToDosError(status) })
         }
     };
-    let in_folder = match std::fs::read(&record) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => "missing".to_owned(),
-    };
-    let current = std::env::current_dir().unwrap().join("record.json");
-    let in_current = current.exists();
-    if in_current {
-        let _ = std::fs::remove_file(&current);
-    }
-    let left = staging.exists();
+    let in_folder = std::fs::read(&record).map_or_else(
+        |_| "missing".to_owned(),
+        |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+    );
+    let in_current = elsewhere.join("record.json").exists();
+    let staging_left = staging.exists();
     // SAFETY: the handles were opened above and are closed once.
     unsafe {
         CloseHandle(file);
-        if let Some(root) = root {
-            CloseHandle(root);
-        }
+        CloseHandle(root);
     }
-    let _ = std::fs::remove_dir_all(&dir);
-    format!(
-        "FORM {:<14} {:<7} flags {} root {:<9} name {:<8} size {} namelen {}: {answer}; record in its folder: {in_folder}; record in the current directory: {in_current}; staging file left: {left}",
-        form.label,
-        match form.call {
-            Call::Plain => "plain",
-            Call::Ex => "ex",
-            Call::NtPlain => "nt",
-            Call::NtEx => "nt-ex",
-        },
-        form.flags,
-        match form.root {
-            None => "none",
-            Some(rights) if rights == GENERIC_READ => "read",
-            Some(_) => "add",
-        },
-        if form.absolute { "absolute" } else { "bare" },
-        size,
-        name_text.len() * 2,
-    )
+    std::env::set_current_dir(std::env::temp_dir()).unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+    Outcome {
+        refused,
+        in_folder,
+        in_current,
+        staging_left,
+    }
 }
 
 #[test]
 #[ignore = "needs a disposable Windows guest, as SYSTEM (see windows_install.rs)"]
-fn the_forms_of_a_rename_through_the_handle_of_the_renamed_file_are_tried() {
-    const ADD: u32 = FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_TRAVERSE | SYNCHRONIZE;
-    let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
-    let base = std::env::temp_dir().join(format!("krforms-{id}"));
-    let current = std::env::temp_dir().join(format!("krcurrent-{id}"));
-    std::fs::create_dir(&base).unwrap();
-    std::fs::create_dir(&current).unwrap();
-    std::env::set_current_dir(&current).unwrap();
-    println!(
-        "FORMS base {} current directory {}",
-        base.display(),
-        current.display()
-    );
-    let forms = [
-        Form {
-            label: "a-ex-read",
-            call: Call::Ex,
-            flags: REPLACE | POSIX,
-            root: Some(GENERIC_READ),
-            absolute: false,
-        },
-        Form {
-            label: "a2-ex-replace",
-            call: Call::Ex,
-            flags: REPLACE,
-            root: Some(GENERIC_READ),
-            absolute: false,
-        },
-        Form {
-            label: "b-plain-read",
-            call: Call::Plain,
-            flags: REPLACE,
-            root: Some(GENERIC_READ),
-            absolute: false,
-        },
-        Form {
-            label: "c1-ex-add",
-            call: Call::Ex,
-            flags: REPLACE | POSIX,
-            root: Some(ADD),
-            absolute: false,
-        },
-        Form {
-            label: "c2-ex-add-r",
-            call: Call::Ex,
-            flags: REPLACE,
-            root: Some(ADD),
-            absolute: false,
-        },
-        Form {
-            label: "c3-plain-add",
-            call: Call::Plain,
-            flags: REPLACE,
-            root: Some(ADD),
-            absolute: false,
-        },
-        Form {
-            label: "d1-ex-abs",
-            call: Call::Ex,
-            flags: REPLACE | POSIX,
-            root: None,
-            absolute: true,
-        },
-        Form {
-            label: "d2-plain-abs",
-            call: Call::Plain,
-            flags: REPLACE,
-            root: None,
-            absolute: true,
-        },
-        Form {
-            label: "e1-nt-read",
-            call: Call::NtPlain,
-            flags: REPLACE,
-            root: Some(GENERIC_READ),
-            absolute: false,
-        },
-        Form {
-            label: "e2-ntex-read",
-            call: Call::NtEx,
-            flags: REPLACE | POSIX,
-            root: Some(GENERIC_READ),
-            absolute: false,
-        },
-        Form {
-            label: "e3-nt-add",
-            call: Call::NtPlain,
-            flags: REPLACE,
-            root: Some(ADD),
-            absolute: false,
-        },
-        Form {
-            label: "e4-ntex-add",
-            call: Call::NtEx,
-            flags: REPLACE | POSIX,
-            root: Some(ADD),
-            absolute: false,
-        },
-    ];
-    for form in &forms {
-        println!("{}", run(form, &base));
+fn the_native_rename_with_a_held_directorys_handle_and_a_bare_name_replaces_the_record_in_that_directory()
+ {
+    for (call, flags, rights) in [
+        (Call::NtPlain, REPLACE, GENERIC_READ),
+        (Call::NtPlain, REPLACE, ADD),
+        (Call::NtEx, REPLACE | POSIX, GENERIC_READ),
+        (Call::NtEx, REPLACE | POSIX, ADD),
+    ] {
+        let outcome = attempt(call, flags, rights);
+        let form = format!("{call:?}, flags {flags}, root rights {rights:#x}: {outcome:?}");
+        assert_eq!(outcome.refused, None, "the call was refused: {form}");
+        assert_eq!(
+            outcome.in_folder, "new",
+            "the record in the handle's folder is not the new content: {form}"
+        );
+        assert!(
+            !outcome.in_current,
+            "a file stands in the current directory: {form}"
+        );
+        assert!(
+            !outcome.staging_left,
+            "the renamed file still stands under its own name: {form}"
+        );
     }
-    std::env::set_current_dir(std::env::temp_dir()).unwrap();
-    let _ = std::fs::remove_dir_all(&base);
-    let _ = std::fs::remove_dir_all(&current);
+}
+
+#[test]
+#[ignore = "needs a disposable Windows guest, as SYSTEM (see windows_install.rs)"]
+fn the_win32_rename_with_any_root_handle_is_refused_and_changes_nothing() {
+    for (call, flags, rights) in [
+        (Call::Plain, REPLACE, GENERIC_READ),
+        (Call::Plain, REPLACE, ADD),
+        (Call::Ex, REPLACE, GENERIC_READ),
+        (Call::Ex, REPLACE, ADD),
+        (Call::Ex, REPLACE | POSIX, GENERIC_READ),
+        (Call::Ex, REPLACE | POSIX, ADD),
+    ] {
+        let outcome = attempt(call, flags, rights);
+        let form = format!("{call:?}, flags {flags}, root rights {rights:#x}: {outcome:?}");
+        assert_eq!(
+            outcome.refused,
+            Some(INVALID_PARAMETER),
+            "the call was not refused with error 87: {form}"
+        );
+        assert_eq!(
+            outcome.in_folder, "old",
+            "the record in the handle's folder changed: {form}"
+        );
+        assert!(
+            !outcome.in_current,
+            "a file stands in the current directory: {form}"
+        );
+        assert!(
+            outcome.staging_left,
+            "the renamed file does not stand under its own name: {form}"
+        );
+    }
 }
