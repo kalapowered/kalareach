@@ -4458,3 +4458,180 @@ async fn kr_req_19_08_a_data_stream_ends_with_the_connection_that_holds_the_plac
     drop(stream);
     adopted.stop().await;
 }
+
+/// What an upload's content waits for before it gives any chunk after the first, so that the
+/// close of the connection can reach it between two chunks. The wait is for the case's release,
+/// and its bound only turns a case that never releases into a failure.
+#[derive(Debug, Default)]
+struct ChunkGate {
+    reached: std::sync::atomic::AtomicBool,
+    released: std::sync::Mutex<bool>,
+    letting_go: std::sync::Condvar,
+}
+
+/// Content that reads like [`kr_client::uploads::Held`] and holds at the second chunk.
+#[derive(Debug)]
+struct HeldAtTheSecondChunk {
+    held: kr_client::uploads::Held,
+    gate: Arc<ChunkGate>,
+}
+
+impl kr_client::uploads::Content for HeldAtTheSecondChunk {
+    fn byte_len(&self) -> u64 {
+        self.held.byte_len()
+    }
+
+    fn digest(&self) -> kr_protocol::scalars::Digest256 {
+        self.held.digest()
+    }
+
+    fn read_at(&self, offset: u64, len: u64) -> kr_client::Result<Vec<u8>> {
+        if offset > 0 {
+            self.gate
+                .reached
+                .store(true, std::sync::atomic::Ordering::Release);
+            let released = self
+                .gate
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (_released, wait) = self
+                .gate
+                .letting_go
+                .wait_timeout_while(released, WATCHDOG, |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!wait.timed_out(), "the case never let the content go");
+        }
+        self.held.read_at(offset, len)
+    }
+}
+
+/// An upload that the close of its connection interrupts between two chunks, with an opener still
+/// held, ends in an error and publishes nothing. The place is free when the close returns, and
+/// the opener that was taken before the close refuses every open after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_no_stream_to_open() {
+    use kr_client::chunks::ChunkRoute;
+    use kr_client::uploads::{self, Held, Progress, Stage, Subject, Upload};
+    use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
+    use kr_protocol::ids::TransferId;
+    use kr_protocol::limits::UPLOAD_CHUNK_LEN;
+    use kr_protocol::scalars::DurationMs;
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let rights = [ActionRight::SessionView, ActionRight::FilesUpload];
+    let (phone, _control) = phone_governed(&adopted, pairing(&rights)).await;
+    let companion = &phone.companion;
+    let host = host_of(companion);
+    let places = companion_tauri::places::budget();
+    let held_before = places.held_on(host);
+    let session = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .session()
+        .expect("the main connection");
+    let transport = Arc::clone(session.transport());
+    let opener = transport
+        .stream_opener()
+        .expect("a connection to a paired host has data streams");
+    let route = ChunkRoute::network(&session, adopted.host.environment_id)
+        .await
+        .expect("the host takes an attachment stream from a connection that holds a place");
+
+    let gate = Arc::new(ChunkGate::default());
+    let bytes: Vec<u8> = (0..2 * UPLOAD_CHUNK_LEN + 1_000)
+        .map(|index| u8::try_from(index % 251).unwrap_or(0))
+        .collect();
+    let upload = Upload::new(
+        Subject {
+            environment_id: adopted.host.environment_id,
+            session_id: None,
+            device_id: None,
+            declared_media_type: "application/octet-stream".to_owned(),
+            original_file_name: "three.bin".to_owned(),
+        },
+        Box::new(HeldAtTheSecondChunk {
+            held: Held::new(bytes),
+            gate: Arc::clone(&gate),
+        }),
+    );
+    let target = net_support::on_the_host(&adopted.host);
+    let (progress, watching) = tokio::sync::watch::channel(Progress::default());
+    // The content waits on a thread of the runtime, so the upload is a task of its own.
+    let sending = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            let mut upload = upload;
+            let sent = uploads::send(
+                &session,
+                &route,
+                &target,
+                &mut upload,
+                DurationMs::new(60_000),
+                &progress,
+            )
+            .await;
+            (sent, route)
+        }
+    });
+
+    // The first chunk is acknowledged and the second is being read, with the route's lane and the
+    // opener above both held.
+    tokio::time::timeout(WATCHDOG, async {
+        while !gate.reached.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the upload reaches its second chunk");
+    assert_eq!(
+        watching.borrow().acknowledged_chunks,
+        1,
+        "the first chunk is acknowledged before the connection is closed"
+    );
+
+    transport.close();
+
+    assert_eq!(
+        places.held_on(host) + 1,
+        held_before,
+        "the place is free when the close returns"
+    );
+    *gate
+        .released
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    gate.letting_go.notify_all();
+    let (sent, route) = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("an upload on a closed connection ends")
+        .expect("the upload's task ends");
+    assert!(
+        sent.is_err(),
+        "an upload on a closed connection was published: {sent:?}"
+    );
+    assert_ne!(watching.borrow().stage, Stage::Published);
+    tokio::time::timeout(WATCHDOG, opener.revoked())
+        .await
+        .expect("the streams of a closed connection are revoked");
+    let header = StreamHeader {
+        kind: StreamKind::AttachmentChunks,
+        connection_id: transport.connection_id(),
+        stream_id: Nullable::null(),
+        resource: StreamResource {
+            environment_id: adopted.host.environment_id,
+            session_id: Nullable::null(),
+            attachment_id: Nullable::null(),
+            transfer_id: Nullable::some(TransferId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [9; 16],
+            ))),
+        },
+    };
+    assert!(
+        opener.open(header).await.is_err(),
+        "no stream opens through an opener taken before the close"
+    );
+    drop(route);
+    adopted.stop().await;
+}
