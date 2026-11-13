@@ -564,7 +564,10 @@ impl Link {
             );
             // A call the runtime holds for as long as it likes is given up when its binding goes,
             // and the pass goes on from what the broker wants now: a binding that came meanwhile is
-            // registered at once, and not when the call's limit has passed.
+            // registered at once, and not when the call's limit has passed. A call given up while
+            // its request is still being written ends the connection, which the link then makes
+            // again: a runtime that would have read the request within the limit is not reached
+            // by it.
             let facts = facts_of(want, kr_ipc::now_ms().get());
             let source = ComponentSource {
                 path: want.component.path.clone(),
@@ -672,6 +675,15 @@ impl Link {
     /// runtime was lost on the way.
     async fn unbind_abandoned(&mut self, broker: &Weak<Broker>) -> bool {
         while let Some(binding_id) = self.abandoned.pop_first() {
+            // A binding the broker wants again is registered again by the pass, which replaces
+            // what the runtime holds of the call that was given up. Removing it here would remove
+            // that registration, after the link has taken it as made.
+            if broker
+                .upgrade()
+                .is_some_and(|broker| broker.component_wanted(binding_id))
+            {
+                continue;
+            }
             let Some(client) = self.client.as_ref() else {
                 self.abandoned.clear();
                 break;
