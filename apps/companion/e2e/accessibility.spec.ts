@@ -262,16 +262,27 @@ const browsers = (clicks: readonly Clicked[]): Clicked[] => clicks.filter((click
 /** The clicks that a handler of the page made. */
 const handlers = (clicks: readonly Clicked[]): Clicked[] => clicks.filter((click) => click.phase === 'capture' && !click.trusted)
 
-/** A pause long enough for a click's record to be old, made by the page being busy as the pointer comes up. */
-async function busyAtPointerUp(page: Page, milliseconds: number): Promise<void> {
-  await page.evaluate((busy) => {
-    window.addEventListener('pointerup', () => {
-      const end = performance.now() + busy
-      while (performance.now() < end) {
-        // Busy.
-      }
-    })
-  }, milliseconds)
+/**
+ * A pause long enough for a click's record to be old, made by the page being busy as the pointer comes
+ * up: in a listener of the window's capture phase, which runs before the pane's handler sees the
+ * release (`before`), or in one of its bubble phase, which runs after it (`after`).
+ */
+async function busyAtPointerUp(page: Page, milliseconds: number, where: 'before' | 'after'): Promise<void> {
+  await page.evaluate(
+    ({ busy, capture }) => {
+      window.addEventListener(
+        'pointerup',
+        () => {
+          const end = performance.now() + busy
+          while (performance.now() < end) {
+            // Busy.
+          }
+        },
+        capture
+      )
+    },
+    { busy: milliseconds, capture: where === 'before' }
+  )
 }
 
 /**
@@ -338,32 +349,55 @@ async function wordsOf(page: Page, href: string, line = 0): Promise<Words> {
 /** The protocol session of a page in Chromium, and the time of its last touch. */
 const touches = new WeakMap<Page, { session: CDPSession; at: number }>()
 
+/** The protocol session of a page in Chromium, made once. */
+async function touchSession(page: Page): Promise<{ session: CDPSession; at: number }> {
+  let state = touches.get(page)
+  if (!state) {
+    state = { session: await page.context().newCDPSession(page), at: 0 }
+    touches.set(page, state)
+  }
+  return state
+}
+
 /**
  * A touch's tap at a point. Chromium counts a tap that follows another soon and near it as the second
- * of a double tap (the click's `detail` is 2): each tap here carries a time of its own, a minute after
- * the one before, so a case that taps many points sees the `detail` a first tap has. WebKit counts no
- * double tap for these.
+ * of a double tap (the click's `detail` is 2): each tap here carries a time of its own, a second after
+ * the one before and never before the real time, so a case that taps many points sees the `detail` a
+ * first tap has, and the release's time is a time the page's clock has reached or is about to. WebKit
+ * counts no double tap for these.
  */
 async function tap(page: Page, x: number, y: number): Promise<void> {
   if (page.context().browser()?.browserType().name() !== 'chromium') {
     await page.touchscreen.tap(x, y)
     return
   }
-  let state = touches.get(page)
-  if (!state) {
-    state = { session: await page.context().newCDPSession(page), at: Date.now() / 1000 - 3 * 3600 }
-    touches.set(page, state)
-  }
-  state.at += 60
+  const state = await touchSession(page)
+  state.at = Math.max(state.at + 1, Date.now() / 1000)
   await state.session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }], timestamp: state.at })
   await state.session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [], timestamp: state.at + 0.05 })
 }
 
+/** A touch's tap at a point with the real time of the engine's own clock: the release is stamped when it happens. */
+async function tapNow(page: Page, x: number, y: number): Promise<void> {
+  if (page.context().browser()?.browserType().name() !== 'chromium') {
+    await page.touchscreen.tap(x, y)
+    return
+  }
+  const { session } = await touchSession(page)
+  await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] })
+  await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+}
+
 /** What one tap did: the clicks the page saw, and the links the page opened, since the tap began. */
-async function tapAndRead(page: Page, x: number, y: number): Promise<{ clicks: Clicked[]; opened: string[] }> {
+async function tapAndRead(
+  page: Page,
+  x: number,
+  y: number,
+  tapper: (page: Page, x: number, y: number) => Promise<void> = tap
+): Promise<{ clicks: Clicked[]; opened: string[] }> {
   const clicksBefore = (await clicksSeen(page)).length
   const openedBefore = (await openedLinks(page)).length
-  await tap(page, x, y)
+  await tapper(page, x, y)
   await expect.poll(async () => browsers((await clicksSeen(page)).slice(clicksBefore)).length, `a click for a tap at ${String(Math.round(x))}, ${String(Math.round(y))}`).toBeGreaterThan(0)
   return { clicks: (await clicksSeen(page)).slice(clicksBefore), opened: (await openedLinks(page)).slice(openedBefore) }
 }
@@ -574,20 +608,24 @@ test.describe('a tap on the plain text near a link of a message', () => {
       })
     }
 
-    test(`opens the link though the page is busy for 1.7 s after the pointer up, and adds nothing when it is busy for 3.2 s, on ${surface}`, async ({
-      page
-    }) => {
-      await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
-      const after = await pointOnTextAfter(page, DOCS)
-      await busyAtPointerUp(page, 1700)
-      const soon = await tapAndRead(page, after.x, after.y)
-      expect(soon.opened, 'links opened by a click 1.7 s after the pointer up').toEqual([DOCS])
-      await busyAtPointerUp(page, 3200)
-      const late = await tapAndRead(page, after.x, after.y)
-      expect(late.opened, 'links opened by a click 4.9 s after the pointer up, by a record that old').toEqual([])
-      expect(handlers(late.clicks), 'clicks that the page added to a click with an old record').toEqual([])
-      expect(late.clicks.filter((click) => click.phase === 'bubble' && click.trusted).length, 'the late click reached the page: nothing stopped it').toBe(1)
-    })
+    for (const where of ['before', 'after'] as const) {
+      test(`opens the link though the page is busy for 1.7 s ${where === 'before' ? 'before the handler sees' : 'after the handler saw'} the release, and adds nothing when it is busy for 3.2 s, on ${surface}`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
+        const after = await pointOnTextAfter(page, DOCS)
+        await busyAtPointerUp(page, 1700, where)
+        // The release is stamped when it happens: a page that is busy runs the handler's listener late, and the three seconds run from the stamp.
+        const soon = await tapAndRead(page, after.x, after.y, tapNow)
+        expect(soon.opened, 'links opened by a click 1.7 s after the release').toEqual([DOCS])
+        expect(handlers(soon.clicks).length, 'clicks that the page added 1.7 s after the release').toBe(browsers(soon.clicks)[0]?.named.startsWith('text') ? 1 : 0)
+        await busyAtPointerUp(page, 3200, where)
+        const late = await tapAndRead(page, after.x, after.y, tapNow)
+        expect(late.opened, 'links opened by a click 4.9 s after the release, by a record that old').toEqual([])
+        expect(handlers(late.clicks), 'clicks that the page added to a click that came 3.2 s after the release').toEqual([])
+        expect(late.clicks.filter((click) => click.phase === 'bubble' && click.trusted).length, 'the late click reached the page: nothing stopped it').toBe(1)
+      })
+    }
 
     test(`does not open a link whose destination changed during the press on ${surface}`, async ({ page }) => {
       await pressPage(page, surface, { extra: TEXT_AFTER_LINK })

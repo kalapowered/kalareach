@@ -48,84 +48,92 @@ interface Recorded extends Press<HTMLElement> {
 export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
   useEffect(() => {
     const element = pane.current
-    if (element === null) return undefined
-    let press: Recorded | null = null
-    let lit: HTMLElement | null = null
-
-    const light = (link: HTMLElement | null): void => {
-      if (lit !== null && lit !== link) lit.removeAttribute('data-pressed')
-      lit = link
-      link?.setAttribute('data-pressed', '')
-    }
-    const here = (target: EventTarget | null): boolean => target instanceof Node && element.contains(target)
-    const away = (event: PointerEvent): boolean =>
-      press !== null && Math.hypot(event.clientX - press.x, event.clientY - press.y) > SLOP
-
-    const move = (event: PointerEvent): void => {
-      if (press !== null && event.pointerId === press.pointer && away(event)) press.moved = true
-    }
-    const stop = (): void => {
-      document.removeEventListener('pointermove', move)
-      document.removeEventListener('pointerup', up)
-      document.removeEventListener('pointercancel', cancel)
-    }
-    const up = (event: PointerEvent): void => {
-      if (press === null || event.pointerId !== press.pointer) return
-      if (away(event)) press.moved = true
-      press.upAt = performance.now()
-      light(null)
-      stop()
-    }
-    const cancel = (event: PointerEvent): void => {
-      if (press === null || event.pointerId !== press.pointer) return
-      press = null
-      light(null)
-      stop()
-    }
-    const down = (event: PointerEvent): void => {
-      // A second finger, a pen's barrel and a mouse's other buttons are not the press that is going on.
-      if (!event.isPrimary || event.button !== 0) return
-      // Every primary press ends the one before it, in the pane or outside it.
-      press = null
-      stop()
-      light(null)
-      if (!here(event.target)) return
-      // A press that starts on a control is the control's.
-      const found = namedBy(event.target) === 'control' ? null : linkNear(element, event.clientX, event.clientY)
-      press = {
-        pointer: event.pointerId,
-        pointerType: event.pointerType,
-        x: event.clientX,
-        y: event.clientY,
-        start: found === null ? null : { link: found.id, destination: found.destination },
-        moved: false,
-        upAt: null
-      }
-      light(found?.id ?? null)
-      document.addEventListener('pointermove', move)
-      document.addEventListener('pointerup', up)
-      document.addEventListener('pointercancel', cancel)
-    }
-    const click = (event: MouseEvent): void => {
-      if (!here(event.target)) return
-      const { clientX: x, clientY: y } = event
-      const decision = decide(
-        press,
-        { trusted: event.isTrusted, detail: event.detail, at: performance.now(), names: namedBy(event.target), point: { x, y } },
-        () => layoutNear(element, x, y)
-      )
-      if (decision.kind === 'open') activate(decision.link, event)
-    }
-
-    document.addEventListener('pointerdown', down, true)
-    document.addEventListener('click', click, true)
-    return () => {
-      document.removeEventListener('pointerdown', down, true)
-      document.removeEventListener('click', click, true)
-      stop()
-      light(null)
-    }
+    return element === null ? undefined : startLinkPress(element)
   }, [pane])
+}
+
+/** Starts the handling of presses and clicks in `element`; the function it returns ends it. */
+export function startLinkPress(element: HTMLElement): () => void {
+  let press: Recorded | null = null
+  let lit: HTMLElement | null = null
+
+  const light = (link: HTMLElement | null): void => {
+    if (lit !== null && lit !== link) lit.removeAttribute('data-pressed')
+    lit = link
+    link?.setAttribute('data-pressed', '')
+  }
+  const here = (target: EventTarget | null): boolean => target instanceof Node && element.contains(target)
+  const away = (event: PointerEvent): boolean =>
+    press !== null && Math.hypot(event.clientX - press.x, event.clientY - press.y) > SLOP
+
+  const move = (event: PointerEvent): void => {
+    if (press !== null && event.pointerId === press.pointer && away(event)) press.moved = true
+  }
+  const stop = (): void => {
+    document.removeEventListener('pointermove', move)
+    document.removeEventListener('pointerup', up)
+    document.removeEventListener('pointercancel', cancel)
+  }
+  const up = (event: PointerEvent): void => {
+    if (press === null || event.pointerId !== press.pointer) return
+    if (away(event)) press.moved = true
+    // The release's own time: a page that was busy when the finger came up runs this late, and the
+    // click then runs just after it, but the three seconds started at the release. A time after the
+    // clock's own reading is no time at all.
+    press.upAt = Math.min(event.timeStamp, performance.now())
+    light(null)
+    stop()
+  }
+  const cancel = (event: PointerEvent): void => {
+    if (press === null || event.pointerId !== press.pointer) return
+    press = null
+    light(null)
+    stop()
+  }
+  const down = (event: PointerEvent): void => {
+    // A second finger, a pen's barrel and a mouse's other buttons are not the press that is going on.
+    if (!event.isPrimary || event.button !== 0) return
+    // Every primary press ends the one before it, in the pane or outside it.
+    press = null
+    stop()
+    light(null)
+    if (!here(event.target)) return
+    // A press that starts on a control is the control's.
+    const found = namedBy(event.target) === 'control' ? null : linkNear(element, event.clientX, event.clientY)
+    press = {
+      pointer: event.pointerId,
+      pointerType: event.pointerType,
+      x: event.clientX,
+      y: event.clientY,
+      start: found === null ? null : { link: found.id, destination: found.destination },
+      moved: false,
+      upAt: null
+    }
+    light(found?.id ?? null)
+    document.addEventListener('pointermove', move)
+    document.addEventListener('pointerup', up)
+    document.addEventListener('pointercancel', cancel)
+  }
+  const click = (event: MouseEvent): void => {
+    if (!here(event.target)) return
+    const { clientX: x, clientY: y } = event
+    const decision = decide(
+      press,
+      { trusted: event.isTrusted, detail: event.detail, at: performance.now(), names: namedBy(event.target), point: { x, y } },
+      () => layoutNear(element, x, y)
+    )
+    if (decision.kind !== 'open') return
+    activate(decision.link, event)
+  }
+
+  document.addEventListener('pointerdown', down, true)
+  document.addEventListener('click', click, true)
+  return () => {
+    document.removeEventListener('pointerdown', down, true)
+    document.removeEventListener('click', click, true)
+    stop()
+    light(null)
+  }
 }
 
 /** What a click's target is: a link, another control of the message, or neither (plain text). */
@@ -159,6 +167,9 @@ function linkNear(pane: HTMLElement, x: number, y: number): PaneLink<HTMLElement
   const index = linkAt({ x, y }, links, reach, bounds)
   return index === null ? null : (links[index] ?? null)
 }
+
+/** What a layout is where the pane holds no link in a message: nothing to press. */
+const NO_LINKS: Layout<HTMLElement> = { links: [], reach: { least: 0, beside: 0 }, bounds: { left: 0, top: 0, right: 0, bottom: 0 } }
 
 /**
  * The links of `pane` that a target could reach (`x`, `y`) from, laid out as they are now. The least
