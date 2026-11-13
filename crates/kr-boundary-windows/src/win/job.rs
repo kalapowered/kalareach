@@ -505,10 +505,11 @@ impl Job {
             )
         };
         // A call that failed at once (it came back with no message long before its time) would turn
-        // the caller's loop with no pause until its bound: it waits out a short pause instead. The
-        // answer decides nothing but this pace.
-        if woken == 0 && began.elapsed() < up_to.min(WAKE_PAUSE) {
-            std::thread::sleep(WAKE_PAUSE);
+        // the caller's loop with no pause until its bound: it waits out a short pause instead, no
+        // longer than the time that the caller gave it. The answer decides nothing but this pace.
+        let pause = up_to.min(WAKE_PAUSE);
+        if woken == 0 && began.elapsed() < pause {
+            std::thread::sleep(pause.saturating_sub(began.elapsed()));
         }
     }
 }
