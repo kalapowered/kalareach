@@ -32,6 +32,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use super::ffi::{Result, Sid, error, from_wide, last, wide_path};
 use super::sd::OwnedSd;
 use super::walk::{AnchorRefusal, DirHandle, LIST};
+use crate::remedy::Finding;
 
 const SDDL_REVISION_1: u32 = 1;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -247,7 +248,7 @@ fn system_class(sid: &Sid) -> bool {
 /// # Errors
 ///
 /// Returns the platform's error when the path cannot be opened or its permissions cannot be read.
-pub fn changeable_by_others(path: &Path, replacement_only: bool) -> Result<Option<String>> {
+pub fn changeable_by_others(path: &Path, replacement_only: bool) -> Result<Option<Finding>> {
     let wide = wide_path(path);
     // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
     let raw = unsafe {
@@ -288,11 +289,14 @@ pub fn changeable_by_others(path: &Path, replacement_only: bool) -> Result<Optio
 /// The answer is `None` only when the owner is in the system's own class (the system, the
 /// administrators, the installer service and the creator-owner placeholder), the object has a
 /// permission list, every entry of it was read, and no entry that allows names an account outside
-/// that class for a right that counts. Anything else is a finding: another account's right, an owner
-/// outside the class, no list, and an entry of any type but a plain allow or a plain deny. A
-/// callback entry or an object entry grants by a condition or a property that this check does not
-/// evaluate, so it is refused and never skipped. An entry that allows is counted even where another
-/// entry denies, so the answer errs towards refusing.
+/// that class for a right that counts. Anything else is a finding, of one of two kinds: a state that
+/// is read and gives another account a right ([`Finding::Granted`]: an entry's right, an owner
+/// outside the class, no list), and an object that the check cannot evaluate ([`Finding::Unevaluated`]:
+/// an entry of any type but a plain allow or a plain deny, an entry too small for its identifier, no
+/// owner). A callback entry or an object entry grants by a condition or a property that this check
+/// does not evaluate, so it is refused and never skipped, and it is not said to grant a right. An
+/// entry that allows is counted even where another entry denies, so the answer errs towards
+/// refusing.
 ///
 /// # Errors
 ///
@@ -301,7 +305,7 @@ pub fn changeable_by_others(path: &Path, replacement_only: bool) -> Result<Optio
 pub fn changeable_by_others_on(
     handle: &super::ffi::Handle,
     replacement_only: bool,
-) -> Result<Option<String>> {
+) -> Result<Option<Finding>> {
     judged(
         handle,
         if replacement_only {
@@ -327,7 +331,7 @@ pub fn changeable_by_others_on(
 ///
 /// Returns the platform's error when the permissions cannot be read or an entry cannot be read; the
 /// caller treats that as a refusal.
-pub fn replaceable_by_others_on(handle: &super::ffi::Handle) -> Result<Option<String>> {
+pub fn replaceable_by_others_on(handle: &super::ffi::Handle) -> Result<Option<Finding>> {
     judged(handle, Counts::Above)
 }
 
@@ -343,7 +347,7 @@ enum Counts {
     Above,
 }
 
-fn judged(handle: &super::ffi::Handle, counts: Counts) -> Result<Option<String>> {
+fn judged(handle: &super::ffi::Handle, counts: Counts) -> Result<Option<Finding>> {
     use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
     let mut descriptor: *mut c_void = null_mut();
     let mut owner: *mut c_void = null_mut();
@@ -382,23 +386,27 @@ fn judged(handle: &super::ffi::Handle, counts: Counts) -> Result<Option<String>>
 /// # Safety
 ///
 /// `owner` and `dacl` are each null or point into a descriptor that lives through the call.
-unsafe fn finding_in(owner: *mut c_void, dacl: *mut ACL, counts: Counts) -> Result<Option<String>> {
+unsafe fn finding_in(
+    owner: *mut c_void,
+    dacl: *mut ACL,
+    counts: Counts,
+) -> Result<Option<Finding>> {
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
     if owner.is_null() {
-        return Ok(Some("it has no owner".to_owned()));
+        return Ok(Some(Finding::Unevaluated("it has no owner".to_owned())));
     }
     // SAFETY: the owner points at an identifier inside the descriptor.
     let owner_sid = unsafe { Sid::from_ptr(owner) };
     if !system_class(&owner_sid) {
-        return Ok(Some(format!(
+        return Ok(Some(Finding::Granted(format!(
             "it is owned by {}",
             crate::remedy::identity_text(owner_sid.account_name().as_deref(), &owner_sid.to_text())
-        )));
+        ))));
     }
     if dacl.is_null() {
-        return Ok(Some(
+        return Ok(Some(Finding::Granted(
             "it has no permission list, so anyone may change it".to_owned(),
-        ));
+        )));
     }
     let mut information = ACL_SIZE_INFORMATION {
         AceCount: 0,
@@ -432,18 +440,18 @@ unsafe fn finding_in(owner: *mut c_void, dacl: *mut ACL, counts: Counts) -> Resu
         // SAFETY: every entry begins with a header; the platform returned a pointer to a whole one.
         let header = unsafe { (*allowed).Header };
         if header.AceType != ACCESS_ALLOWED_ACE_TYPE && header.AceType != ACCESS_DENIED_ACE_TYPE {
-            return Ok(Some(format!(
+            return Ok(Some(Finding::Unevaluated(format!(
                 "its permission list has an entry of type {}, which this check does not read",
                 header.AceType
-            )));
+            ))));
         }
         // SAFETY: the entry is a header, a mask and an identifier; the size the header gives bounds
         // every read of the identifier.
         if !unsafe { entry_holds_its_identifier(allowed) } {
-            return Ok(Some(
+            return Ok(Some(Finding::Unevaluated(
                 "its permission list has an entry whose size does not hold its identifier"
                     .to_owned(),
-            ));
+            )));
         }
         if header.AceType == ACCESS_DENIED_ACE_TYPE {
             continue;
@@ -466,16 +474,16 @@ unsafe fn finding_in(owner: *mut c_void, dacl: *mut ACL, counts: Counts) -> Resu
         };
         if mask & mask_of_interest != 0 && !system_class(&sid) {
             if counts == Counts::Above {
-                return Ok(Some(crate::remedy::rights_finding(
+                return Ok(Some(Finding::Granted(crate::remedy::rights_finding(
                     &crate::remedy::identity_text(sid.account_name().as_deref(), &sid.to_text()),
                     mask & mask_of_interest,
-                )));
+                ))));
             }
-            return Ok(Some(format!(
+            return Ok(Some(Finding::Granted(format!(
                 "{} is allowed rights 0x{:x} on it",
                 sid.to_text(),
                 mask & mask_of_interest
-            )));
+            ))));
         }
     }
     Ok(None)
@@ -606,10 +614,14 @@ mod tests {
             self.judge(Counts::Above)
         }
 
-        fn judge(&mut self, counts: Counts) -> Option<String> {
+        fn kind(&mut self, counts: Counts) -> Option<Finding> {
             // SAFETY: the owner lives in the descriptor the fixture keeps, and the list is a copy
             // of a valid one, damaged only in an entry's size or identifier.
             unsafe { finding_in(self.owner, self.list.as_mut_ptr().cast(), counts).unwrap() }
+        }
+
+        fn judge(&mut self, counts: Counts) -> Option<String> {
+            self.kind(counts).map(|found| found.to_string())
         }
     }
 
@@ -626,6 +638,10 @@ mod tests {
         let mut fixture = Fixture::from(&format!("{BASE}(A;OICIIO;FA;;;BU)"));
         let finding = fixture.finding(false).expect("a child would inherit it");
         assert!(finding.contains("S-1-5-32-545"), "{finding}");
+        assert!(
+            matches!(fixture.kind(Counts::Content), Some(Finding::Granted(_))),
+            "an entry's right is a grant"
+        );
         // An entry that inherits to no child and applies to nothing is not a right.
         let at = fixture.offset(2);
         fixture.list[at + 1] = INHERIT_ONLY_ACE;
@@ -666,6 +682,10 @@ mod tests {
                 assert!(
                     finding.contains("does not hold its identifier"),
                     "{text} cut to {size}: {finding:?}"
+                );
+                assert!(
+                    matches!(fixture.kind(Counts::Content), Some(Finding::Unevaluated(_))),
+                    "an entry that cannot be read is not a grant: {text} cut to {size}"
                 );
             }
         }

@@ -320,6 +320,42 @@ pub fn identity_text(name: Option<&str>, sid: &str) -> String {
     }
 }
 
+/// What the permission check found in an object's owner and list, as one of two kinds. The words
+/// of each say which state was read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Finding {
+    /// The object gives an account outside the system's own class a right that counts: an entry
+    /// that allows it, an owner outside the class, or no permission list.
+    Granted(String),
+    /// The check cannot evaluate what the object's list grants: an entry of a type that it does not
+    /// interpret, or one too small to hold its identifier. No right is known to be given.
+    Unevaluated(String),
+}
+
+impl std::fmt::Display for Finding {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Finding::Granted(words) | Finding::Unevaluated(words) => out.write_str(words),
+        }
+    }
+}
+
+/// What the setup program says of one of Git's files, or of a folder above them, whose permissions
+/// the check found a state in: `replacement` is true for a folder above the files, where the check
+/// asks only whether the folder or what it holds can be replaced. A confirmed grant is said to be
+/// one; a list that the check cannot evaluate is said to be one that the setup program cannot read.
+#[must_use]
+// text: git_permissions_refusal
+pub fn git_permissions_refusal(path: &str, finding: &Finding, replacement: bool) -> String {
+    let what = if replacement { "replaced" } else { "changed" };
+    match finding {
+        Finding::Granted(words) => format!("{path} can be {what} by others: {words}"),
+        Finding::Unevaluated(words) => {
+            format!("The setup program cannot tell whether {path} can be {what} by others: {words}")
+        }
+    }
+}
+
 /// What the check of a folder above the trees says of an entry that gives an identity outside the
 /// system's class a right that lets it replace the folder or what is in it.
 #[must_use]

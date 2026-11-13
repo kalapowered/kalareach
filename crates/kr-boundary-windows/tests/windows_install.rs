@@ -27,6 +27,8 @@ use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior};
 use kr_boundary_windows::messages;
 use kr_boundary_windows::policy::{self, Policy, RULE_ALLOW_ALL};
 use kr_boundary_windows::quote::quote_command_line;
+#[cfg(feature = "testing")]
+use kr_boundary_windows::remedy::Finding;
 use kr_boundary_windows::win::applocker::Channel;
 use kr_boundary_windows::win::ffi::{self, Sid};
 use kr_boundary_windows::win::install::{self, CHECKOUT, CONNECT, Paths, SERVICE, STEPS};
@@ -1109,10 +1111,11 @@ fn the_parent_folder_is_checked_on_one_handle_that_is_held_and_an_entry_of_an_un
     );
     let handle = open_folder(&folder, FILE_LIST_DIRECTORY | READ_CONTROL);
     assert!(
-        acl::changeable_by_others_on(&handle, false)
-            .unwrap()
-            .is_some_and(|finding| finding.contains("type")),
-        "the handle form refuses it too"
+        matches!(
+            acl::changeable_by_others_on(&handle, false).unwrap(),
+            Some(Finding::Unevaluated(finding)) if finding.contains("type")
+        ),
+        "the handle form refuses it too, as an entry that it cannot evaluate"
     );
     drop(handle);
 
@@ -1124,7 +1127,10 @@ fn the_parent_folder_is_checked_on_one_handle_that_is_held_and_an_entry_of_an_un
     let finding = acl::changeable_by_others_on(&handle, false)
         .unwrap()
         .unwrap();
-    assert!(finding.contains("S-1-5-32-545"), "{finding}");
+    assert!(
+        matches!(&finding, Finding::Granted(words) if words.contains("S-1-5-32-545")),
+        "{finding}"
+    );
     // With replacement_only a right that only adds beside the folder does not count.
     let adds = sd::descriptor_from_text("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x6;;;BU)")
         .unwrap();

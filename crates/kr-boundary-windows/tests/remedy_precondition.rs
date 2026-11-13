@@ -7,8 +7,9 @@ use std::io::{Error, ErrorKind};
 
 use kr_boundary_windows::records::next_step;
 use kr_boundary_windows::remedy::{
-    CONFIG_NOT_EMPTY_WHY, appid_start_type_left, application_control_set, empty_config_advice,
-    git_program_not_reached, payload_file_not_reached,
+    CONFIG_NOT_EMPTY_WHY, Finding, appid_start_type_left, application_control_set,
+    empty_config_advice, git_permissions_refusal, git_program_not_reached,
+    payload_file_not_reached,
 };
 
 /// A read that failed for any reason but "not found" says that the read failed, with its error, and
@@ -170,5 +171,36 @@ fn the_removals_next_step_says_what_the_lookup_found_at_the_manifests_name() {
     assert!(!stays.contains("The manifest stays"), "{stays}");
     for text in [next_step(false, true), next_step(false, false)] {
         assert!(!text.contains("manifest stays"), "{text}");
+    }
+}
+
+/// The refusal for Git's permissions says that others can change or replace a file or a folder only
+/// for a state that the check read and found to grant a right. A list that the check cannot evaluate
+/// (an entry of a type that it does not interpret) is refused in words of its own, which say that
+/// the setup program cannot tell, and never say that others can change or replace it.
+#[test]
+fn a_permission_list_that_the_check_cannot_evaluate_is_not_said_to_let_others_change_git() {
+    let path = r"C:\Program Files\Git\cmd\git.exe";
+    let granted = Finding::Granted("S-1-5-32-545 is allowed rights 0x2".to_owned());
+    let unread = Finding::Unevaluated(
+        "its permission list has an entry of type 9, which this check does not read".to_owned(),
+    );
+    for (replacement, said) in [(false, "changed"), (true, "replaced")] {
+        let confirmed = git_permissions_refusal(path, &granted, replacement);
+        assert_eq!(
+            confirmed,
+            format!("{path} can be {said} by others: S-1-5-32-545 is allowed rights 0x2")
+        );
+        let cannot = git_permissions_refusal(path, &unread, replacement);
+        assert!(
+            cannot.starts_with("The setup program cannot tell whether "),
+            "{cannot}"
+        );
+        assert!(
+            cannot.contains(&format!("can be {said} by others:")),
+            "the question is named: {cannot}"
+        );
+        assert!(!cannot.starts_with(path), "{cannot}");
+        assert!(cannot.contains("an entry of type 9"), "{cannot}");
     }
 }

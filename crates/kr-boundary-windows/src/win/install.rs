@@ -571,7 +571,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
         } else {
             ParentCure::Correct(presence_of(&paths.data))
         };
-        return Err(parent_refusal(paths, &finding, cure));
+        return Err(parent_refusal(paths, &finding.to_string(), cure));
     }
     Ok(Some(handle))
 }
@@ -943,7 +943,7 @@ fn check_data_object(handle: &ffi::Handle) -> Result<Option<String>, Error> {
 /// not.
 fn check_held_object(handle: &ffi::Handle) -> Result<Option<String>, Error> {
     if let Some(finding) = acl::changeable_by_others_on(handle, false)? {
-        return Ok(Some(finding));
+        return Ok(Some(finding.to_string()));
     }
     let summary = sd::summary_of_handle(handle)?;
     if ![SYSTEM, ADMINISTRATORS].contains(&summary.owner.as_str()) {
@@ -1437,7 +1437,7 @@ fn check_owner(handle: &ffi::Handle) -> Result<Option<String>, Error> {
 /// made readable by every account, and what is made in it takes that list.
 fn check_readable_object(handle: &ffi::Handle) -> Result<Option<String>, Error> {
     if let Some(finding) = acl::changeable_by_others_on(handle, false)? {
-        return Ok(Some(finding));
+        return Ok(Some(finding.to_string()));
     }
     check_owner(handle)
 }
@@ -1832,7 +1832,7 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
         if let Some(why) =
             acl::replaceable_by_others_on(&handle).map_err(|error| unreadable(&error))?
         {
-            return Err(refuse(Fault::List(&why)));
+            return Err(refuse(Fault::List(&why.to_string())));
         }
     }
     Ok(())
@@ -1931,7 +1931,7 @@ pub fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), 
         if let Some(why) =
             acl::changeable_by_others_on(&handle, false).map_err(|error| unreadable(&error))?
         {
-            return Err(refuse(Fault::Writable(&why)));
+            return Err(refuse(Fault::Writable(&why.to_string())));
         }
     }
     Ok(())
@@ -2550,9 +2550,10 @@ pub fn qualify_git() -> Result<GitSet, Error> {
         })?;
         if let Some(finding) = acl::changeable_by_others(&path, false)? {
             // text: qualify_git-2
-            return Err(Error::Refused(format!(
-                "{} can be changed by others: {finding}",
-                path.display()
+            return Err(Error::Refused(remedy::git_permissions_refusal(
+                &path.display().to_string(),
+                &finding,
+                false,
             )));
         }
         let mut ancestor = path.parent();
@@ -2562,9 +2563,10 @@ pub fn qualify_git() -> Result<GitSet, Error> {
             }
             if let Some(finding) = acl::changeable_by_others(parent, true)? {
                 // text: qualify_git-3
-                return Err(Error::Refused(format!(
-                    "{} can be replaced by others: {finding}",
-                    parent.display()
+                return Err(Error::Refused(remedy::git_permissions_refusal(
+                    &parent.display().to_string(),
+                    &finding,
+                    true,
                 )));
             }
             ancestor = parent.parent();
