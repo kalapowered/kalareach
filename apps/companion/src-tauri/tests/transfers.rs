@@ -101,10 +101,11 @@ impl Drop for Serving {
 
 /// The daemon of one test, with the tasks that serve its two endpoints.
 struct Daemon {
-    tree: TempHost,
     /// Held so the daemon lives exactly as long as its test.
     controller: Arc<Controller>,
     serving: Serving,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    tree: TempHost,
     /// The tree whose address the chunk listener borrows when a relay stands at this
     /// environment's own, kept so its directory outlives the listener.
     _elsewhere: Option<TempHost>,
