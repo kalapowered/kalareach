@@ -2050,7 +2050,9 @@ async fn a_registration_held_for_a_binding_that_goes_is_given_up_for_the_binding
     // The runtime goes on: it answers what it was sent, and what it registered for the binding that
     // went is removed, so that it holds the two bindings the broker holds. The case waits for the
     // removal and not for the count, which is two as soon as the third binding's registration is
-    // made, before the second's is.
+    // made, before the second's is. A link that loses the connection first has nothing to remove:
+    // the runtime drops what a connection registered with it, and the two bindings are registered
+    // again on the next.
     resume(&host);
     world.components_are(2, ComponentState::Registered).await;
     let identifier = second_binding.to_string();
@@ -2060,10 +2062,10 @@ async fn a_registration_held_for_a_binding_that_goes_is_given_up_for_the_binding
     );
     until_found(
         PATIENCE,
-        "the link to remove what the runtime holds for the second binding",
+        "the link to remove what the runtime holds for the second binding, or to lose the connection",
         || async {
             let account = world.link_traces_after_a_look().await;
-            if account.contains(&removal) {
+            if account.contains(&removal) || account.contains(" lost ") {
                 Ok(())
             } else {
                 Err(String::new())
