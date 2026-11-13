@@ -594,15 +594,22 @@ fn installation_lays_down_and_removal_restores() {
         assert!(late.detail.contains("deadline"), "{}", late.detail);
 
         // A search that ends at its own deadline still reads the log's last words, from the time kept
-        // for them, and ends inside the proof's deadline: the manifest names the wrong identifier for
-        // the account, so no event of the log ever matches and the search has to give up.
+        // for them, and ends inside the proof's deadline: the manifest names the other account's
+        // identifier for the checkout account, so the proof finds that account, launches the program
+        // under it, and no event of the log names the checkout rule for it: the search has to give up.
         let mut wrong = Manifest::load(&paths.manifest).unwrap();
+        let connects = wrong
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Account && object.id == CONNECT)
+            .and_then(|object| object.detail.clone())
+            .expect("the connect account's identifier is recorded");
         wrong
             .objects
             .iter_mut()
             .find(|object| object.kind == ObjectKind::Account && object.id == CHECKOUT)
             .expect("the checkout account is recorded")
-            .detail = Some("S-1-5-21-1-2-3-1999".to_owned());
+            .detail = Some(connects);
         let bound = std::time::Duration::from_secs(30);
         let began = std::time::Instant::now();
         let gave_up = kr_boundary_windows::win::proof::prove(
