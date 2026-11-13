@@ -109,6 +109,36 @@ fn worker(method: &str, event: &str) -> Value {
     })
 }
 
+/// A name that a worker table lists twice is refused with a finding that names it: the second row
+/// would replace the first, and a change of the first would never be compared.
+#[test]
+fn a_method_or_an_event_listed_twice_in_a_worker_table_is_refused() {
+    for (list, row, wanted) in [
+        (
+            "methods",
+            json!({ "name": "session.read", "params": "PeerResult", "result": "PeerResult" }),
+            "lists the method session.read twice",
+        ),
+        (
+            "events",
+            json!({ "name": "session.output", "payload": "PeerParams" }),
+            "lists the event session.output twice",
+        ),
+    ] {
+        let mut table = worker("session.read", "session.output");
+        table[list].as_array_mut().expect("rows").push(row);
+        let error = WorkerSurface::parse(&table.to_string()).expect_err("a name twice");
+        assert!(error.contains(wanted), "{list}: {error}");
+    }
+    // Two different names are two rows, as ever.
+    let mut table = worker("session.read", "session.output");
+    table["methods"]
+        .as_array_mut()
+        .expect("rows")
+        .push(json!({ "name": "session.write", "params": "PeerParams", "result": "PeerResult" }));
+    WorkerSurface::parse(&table.to_string()).expect("two names");
+}
+
 impl Tree {
     /// A release of level 0.76 as it was made before the lease: no `lease` member, and no table of
     /// what the worker serves.

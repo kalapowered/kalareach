@@ -146,10 +146,16 @@ impl WorkerSurface {
             .and_then(Value::as_array)
             .ok_or("no methods")?
         {
-            methods.insert(
-                field(item, "name")?,
-                (field(item, "params")?, field(item, "result")?),
-            );
+            let name = field(item, "name")?;
+            if methods
+                .insert(
+                    name.clone(),
+                    (field(item, "params")?, field(item, "result")?),
+                )
+                .is_some()
+            {
+                return Err(format!("the table lists the method {name} twice"));
+            }
         }
         let mut events = BTreeMap::new();
         for item in document
@@ -157,7 +163,13 @@ impl WorkerSurface {
             .and_then(Value::as_array)
             .ok_or("no events")?
         {
-            events.insert(field(item, "name")?, field(item, "payload")?);
+            let name = field(item, "name")?;
+            if events
+                .insert(name.clone(), field(item, "payload")?)
+                .is_some()
+            {
+                return Err(format!("the table lists the event {name} twice"));
+            }
         }
         Ok(Self {
             surface_roots: texts("surface_roots")?,
