@@ -659,8 +659,10 @@ listed | #[error] | win/journal.rs | 7 | reaches no person: the other errors of 
 listed | #[error] | win/root.rs | 3 | reaches no person: create_root and remove_root have no production caller
 listed | #[error] | win/walk.rs | 5 | reaches no person: a child that is gone is passed over, the walk of a tree has one caller that no person reaches, and the anchor's reparse point has its own words in the refusal
 listed | Handle::new( | win/job.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | Handle::new( | win/launch.rs | 1 | reaches no person: the handle that a unit case makes for itself, in a module that is compiled only for the cases
 listed | Handle::new( | win/pipe.rs | 2 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
 listed | Handle::new( | win/privilege.rs | 3 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
+listed | Handle::new( | win/stop.rs | 1 | reaches no person: the handle that a unit case makes for itself, in a module that is compiled only for the cases
 listed | Handle::new( | win/token.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
 listed | eprint!( | bin/kr-launch-stand-in.rs | 1 | the stand-in program of the tests, which a test runs and no person does
 listed | eprintln!( | bin/kr-launch-stand-in.rs | 3 | the stand-in program of the tests, which a test runs and no person does
