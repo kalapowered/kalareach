@@ -3322,9 +3322,11 @@ async fn performed_with_a_fence_landing_before_the_telling(
     told
 }
 
-/// KR-REQ-09.09: what `organisation.policy.apply` answers is made from the policies the host holds,
-/// so the door tells it only while no fence is owed: with none, a request that names no policy is
-/// given its refusal as it is; with a fence owed once the route has answered, it is not shown.
+/// KR-REQ-09.09: every answer of `organisation.policy.apply` is given as a copy of the policies the
+/// host holds, a refusal included, so the door tells it only while no fence is owed: with none, a
+/// request with no parameters is given its refusal as it is; with a fence owed once the route has
+/// answered, it is not shown. The request fails at its parameters, before any policy is read, so
+/// the case holds the label of the route's refusals and not the adapter list's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_organisation_policy_apply_answers_is_not_shown_when_a_fence_lands_after_the_read() {
     let (temp, controller, _clock) = daemon().await;
@@ -3537,7 +3539,7 @@ async fn the_refusal_from_a_stored_subject_is_not_shown_when_a_fence_lands_after
 /// KR-REQ-09.09: a repeat of `account.sign_out` is answered from the claim the first attempt left.
 /// The method takes no admission into the service, so the door's entry check is all that stands
 /// before the lookup, and a fence this host comes to owe at the lookup, after that check, is what
-/// the door's strict check meets: the repeat is not shown. The control: with no fence the repeat is
+/// the service's own check of the recorded answer meets: the repeat is not shown. The control: with no fence the repeat is
 /// given the first attempt's answer, and is again once the fence is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sign_out_answered_from_its_claim_is_not_shown_when_a_fence_lands_at_the_lookup() {
