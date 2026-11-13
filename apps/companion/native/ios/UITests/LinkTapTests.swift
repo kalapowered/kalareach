@@ -130,6 +130,7 @@ final class LinkTapTests: HarnessTestCase {
         "at-start": "1",
         "at-end": "2",
         "last-line": "a link",
+        "short-last": "a short link",
     ]
 
     /// Where the page's coordinates lie on the screen: the button a link is has a frame the system
