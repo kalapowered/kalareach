@@ -2229,7 +2229,7 @@ fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of
             "{text}"
         );
         assert!(
-            text.contains("Run the setup program again when it can be opened."),
+            text.contains("Run the setup program again when it can be read."),
             "{text}"
         );
         assert!(!text.contains("holds it open"), "{text}");
