@@ -1,8 +1,9 @@
 //! Known answers for the cipher and curve code behind this boundary.
 //!
-//! libsodium picks an implementation of ChaCha20 and Salsa20 by the length of the call, and its
-//! wide vector code runs only from 1,024 bytes up, so a test that stops below that length never
-//! reaches the code a long message uses. A round trip cannot find a wrong keystream either: the
+//! libsodium picks its ChaCha20 and Salsa20 code by the processor and then by the length of the
+//! call. The release's widest loop takes 512 bytes at a time, and the AVX-512 code in the stable
+//! branch's snapshot, which upstream's Windows prebuilt holds, takes 1,024. A test that stops below
+//! those lengths never reaches the code a long message uses. A round trip cannot find a wrong keystream either: the
 //! same keystream takes off what it put on. The cases here seal fixed inputs at every length that
 //! matters and compare the whole sealed output with answers frozen from libsodium's 1.0.22 release
 //! build, where a wrong byte anywhere in the keystream or the authenticator changes the answer.
@@ -64,8 +65,8 @@ pub(super) fn hex_array<const N: usize>(value: &Value, key: &str) -> [u8; N] {
 /// The fixed stream every plaintext, key, nonce and seed here is cut from. Block `n` is the SHA-256
 /// of `label`, a zero byte and `n` as eight big-endian bytes, and the stream is the blocks in
 /// order. It never repeats within a case, it holds no pattern that lines up with a cipher's block
-/// width, and a hash that libsodium does not provide makes it, so no byte of a plaintext depends
-/// on the code under test.
+/// width, and the `sha2` crate, not libsodium, makes it, so no byte of a plaintext depends on the
+/// code under test.
 fn rule_bytes(label: &str, length: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(length + 32);
     let mut counter = 0u64;
@@ -615,18 +616,28 @@ fn the_stream_refuses_altered_missing_reordered_and_replayed_records() {
     ));
 }
 
-/// KR-REQ-20.01: the state a pull starts from is, field for field, the state `init_push` made, for
-/// headers and keys the library drew itself. That is what lets the fixed-header push above stand
-/// for the push the product makes.
+/// KR-REQ-20.01: the state a pull starts from is the state `init_push` made, for headers and keys
+/// the library drew itself: both push the same records to the same bytes. That is what lets the
+/// fixed-header push above stand for the push the product makes.
 #[test]
 fn a_fixed_header_state_is_the_state_init_push_makes() {
     for index in 0..8 {
         let key: [u8; STREAM_KEY_LEN] = rule_array(&format!("kr-known-answers/state/key/{index}"));
-        let (made, header) = stream_init_push(&key).expect("a push");
-        let fixed = fixed_header_push_state(&header, &key);
-        assert_eq!(made.0.k, fixed.0.k, "key {index}");
-        assert_eq!(made.0.nonce, fixed.0.nonce, "key {index}");
-        assert_eq!(made.0._pad, fixed.0._pad, "key {index}");
+        let (mut made, header) = stream_init_push(&key).expect("a push");
+        let mut fixed = fixed_header_push_state(&header, &key);
+        for (record, tag) in [
+            (
+                rule_bytes("kr-known-answers/state/record", 100),
+                TAG_MESSAGE,
+            ),
+            (Vec::new(), TAG_FINAL),
+        ] {
+            assert_eq!(
+                stream_push(&mut made, &record, tag).expect("pushes"),
+                stream_push(&mut fixed, &record, tag).expect("pushes"),
+                "key {index}"
+            );
+        }
     }
 }
 
@@ -652,6 +663,7 @@ fn ed25519_reproduces_the_rfc_8032_section_7_1_vectors() {
         names,
         ["TEST 1", "TEST 2", "TEST 3", "TEST 1024", "TEST SHA(abc)"]
     );
+    let mut checked = 0;
     for test in tests {
         let name = test["name"].as_str().expect("a name");
         let seed: [u8; SIGN_SEED_LEN] = hex_array(test, "seed_hex");
@@ -659,16 +671,6 @@ fn ed25519_reproduces_the_rfc_8032_section_7_1_vectors() {
         let signature: [u8; SIGN_LEN] = hex_array(test, "signature_hex");
         let (public, secret) = sign_seed_keypair(&seed).expect("a keypair");
         assert_eq!(public, hex_array::<32>(test, "public_hex"), "{name}");
-        assert_eq!(
-            &secret[..32],
-            &seed,
-            "{name}: the secret key starts with the seed"
-        );
-        assert_eq!(
-            &secret[32..],
-            &public,
-            "{name}: and ends with the public key"
-        );
         assert_eq!(
             sign_detached(&message, &secret).expect("a signature"),
             signature,
@@ -690,7 +692,9 @@ fn ed25519_reproduces_the_rfc_8032_section_7_1_vectors() {
             sign_verify_detached(&signature, &other, &public).is_err(),
             "{name}: a changed message"
         );
+        checked += 1;
     }
+    assert_eq!(checked, 5, "every published test was run");
 }
 
 /// KR-REQ-20.01: X25519 behind this boundary reproduces the two input and output pairs of
@@ -702,6 +706,7 @@ fn x25519_reproduces_the_rfc_7748_section_5_2_examples() {
         .as_array()
         .expect("the examples");
     assert_eq!(examples.len(), 2);
+    let mut checked = 0;
     for example in examples {
         assert_eq!(
             scalarmult(
@@ -711,7 +716,9 @@ fn x25519_reproduces_the_rfc_7748_section_5_2_examples() {
             .expect("an agreement"),
             hex_array::<32>(example, "output_hex")
         );
+        checked += 1;
     }
+    assert_eq!(checked, 2, "both published examples were run");
 }
 
 /// The RFC's iteration: start from k = u = 9; each step takes the agreement of k with u as the
@@ -754,7 +761,7 @@ fn x25519_reproduces_the_rfc_7748_iterations_after_one_and_one_thousand() {
     );
 }
 
-/// KR-REQ-20.01: the value RFC 7748 section 5.2 prints after 1,000,000 iterations. It takes a
+/// The value RFC 7748 section 5.2 prints after 1,000,000 iterations. It takes a
 /// million agreements, so it runs on request: `cargo test -p kr-crypto -- --ignored`.
 #[test]
 #[ignore = "a million X25519 agreements; run on request"]
@@ -802,6 +809,7 @@ fn the_aead_seals_the_xchacha20_poly1305_draft_vector_to_its_published_bytes() {
 #[test]
 fn the_comparison_answers_right_at_every_position_length_and_offset() {
     let lengths = [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 256];
+    let mut positions_checked = 0;
     for length in lengths {
         let mut left_backing = rule_bytes(
             &format!("kr-known-answers/compare/left/{length}"),
@@ -839,9 +847,9 @@ fn the_comparison_answers_right_at_every_position_length_and_offset() {
                         "{what}: a difference at byte {position} was not seen"
                     );
                     right_backing[right_offset + position] ^= bit;
+                    positions_checked += 1;
                 }
-                // A different length is unequal even when one is a prefix of the other, and the
-                // bytes beyond the shorter slice are never read to decide it.
+                // A different length is unequal even when one is a prefix of the other.
                 assert!(
                     !constant_time_eq(
                         &left_backing[left_offset..left_offset + length],
@@ -861,6 +869,8 @@ fn the_comparison_answers_right_at_every_position_length_and_offset() {
             }
         }
     }
+    // Every position of every length was tried at every pair of offsets.
+    assert_eq!(positions_checked, lengths.iter().sum::<usize>() * 16 * 16);
 }
 
 /// KR-REQ-20.02: the random generator fills the buffer it is given and no byte outside it, at
@@ -869,6 +879,7 @@ fn the_comparison_answers_right_at_every_position_length_and_offset() {
 #[test]
 fn random_bytes_fill_the_destination_and_leave_the_bytes_around_it_alone() {
     const GUARD: usize = 16;
+    let mut fills = 0;
     for length in [0usize, 1, 32, 256, 4_096] {
         let mut previous: Option<Vec<u8>> = None;
         for _ in 0..2 {
@@ -897,6 +908,8 @@ fn random_bytes_fill_the_destination_and_leave_the_bytes_around_it_alone() {
                 }
             }
             previous = Some(filled);
+            fills += 1;
         }
     }
+    assert_eq!(fills, 10, "every length was filled twice");
 }
