@@ -1170,6 +1170,23 @@ pub fn payload_file_not_reached(path: &str, error: &std::io::Error) -> String {
     not_reached(path, "is not in the payload directory", error)
 }
 
+/// What a repair says where the executable collection holds rules whose identifiers are none of the
+/// installation's own: that they are there, with their identifiers, and what a repair would do to
+/// them. The read shows the identifiers and nothing of who made the rules or when.
+#[must_use]
+// text: foreign_rules_refusal
+pub fn foreign_rules_refusal(ids: &[&str]) -> String {
+    match ids {
+        [one] => format!(
+            "a rule that the installation did not make is in the executable collection (identifier {one}), so a repair would change what that rule means"
+        ),
+        _ => format!(
+            "rules that the installation did not make are in the executable collection (identifiers {}), so a repair would change what those rules mean",
+            ids.join(", ")
+        ),
+    }
+}
+
 /// The refusal for an effective application control policy that is not empty: the collections that
 /// it enforces and the collections that hold rules, as the read of the policy showed them, and
 /// what this run had already changed before it read the policy.

@@ -2870,11 +2870,9 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         let (xml, effective) = channel.effective()?;
         let foreign = effective.foreign_exe_rules();
         if !foreign.is_empty() {
+            let ids: Vec<&str> = foreign.iter().map(|rule| rule.id.as_str()).collect();
             // text: lay_down-3
-            return Err(Error::Refused(
-                "an administrator has added a rule to the executable collection since the installation, so a repair would change what that rule means"
-                    .to_owned(),
-            ));
+            return Err(Error::Refused(remedy::foreign_rules_refusal(&ids)));
         }
         (xml, effective)
     } else {
