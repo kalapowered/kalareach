@@ -632,7 +632,7 @@ fn a_root_that_is_not_there_is_refused_before_a_change_by_every_run() {
             format!("{letter}\\ is a folder above the boundary's {tree}"),
             "the root of its volume is not there".to_owned(),
             "Nothing was changed".to_owned(),
-            "Run the setup program again when it can be opened.".to_owned(),
+            "Run the setup program again when it can be read.".to_owned(),
         ] {
             assert!(text.contains(&needle), "{needle}: {text}");
         }

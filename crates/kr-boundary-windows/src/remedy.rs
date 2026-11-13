@@ -600,7 +600,7 @@ impl Ending {
     fn words(self, tree: Tree) -> String {
         match self {
             Ending::Layout => supported_layout(tree),
-            Ending::Retry => "Run the setup program again when it can be opened.".to_owned(),
+            Ending::Retry => "Run the setup program again when it can be read.".to_owned(),
         }
     }
 }

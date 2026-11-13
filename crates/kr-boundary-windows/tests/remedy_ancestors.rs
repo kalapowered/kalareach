@@ -18,7 +18,7 @@ const GENERIC_WRITE: u32 = 0x4000_0000;
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 
 /// The ending of a state that can pass.
-const RETRY: &str = "Run the setup program again when it can be opened.";
+const RETRY: &str = "Run the setup program again when it can be read.";
 
 /// The sentence that ends the words of every folder that the installation does not make.
 const CLOSING: &str = "The setup program directs no change to a folder that other programs share.";
