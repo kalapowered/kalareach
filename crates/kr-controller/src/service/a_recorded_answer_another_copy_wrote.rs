@@ -969,6 +969,93 @@ async fn a_catalogue_receipt_kept_before_a_late_attempts_claim_is_not_given_back
     controller.hold_fence(false);
 }
 
+/// KR-REQ-09.09, the catalogue's reused identifier: a request that carries the identifier of an
+/// action another request spent, on other parameters, is refused as a reused identifier and is no
+/// copy of that action's receipt. A fence that lands once the receipt is in hand is the answer
+/// instead, as the fence's own definite refusal: the request was not performed, and it is not told
+/// as a copy a service withheld, which says it may have been carried out. The control: with
+/// nothing owed the request is told the identifier is reused, and a copy of the receipt under the
+/// same fence is still withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_catalogue_identifier_is_refused_for_a_fence_and_is_no_copy_of_the_receipt() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let pinning = |generation: u64| {
+        mutation_of(
+            &temp,
+            Method::CataloguePin,
+            ParamsValue::from_typed(&kr_protocol::catalogue::CataloguePinParams {
+                environment_id: temp.environment_id(),
+                catalogue_id: "nobody-enrolled-this".to_owned(),
+                generation: Nullable(Some(kr_protocol::ids::RepositoryGeneration::new(
+                    generation,
+                ))),
+            })
+            .expect("encodes"),
+        )
+    };
+    let first = pinning(1);
+    let reused = MutationRequest {
+        params: pinning(2).params,
+        ..first.clone()
+    };
+    let admission = carried(&controller, connection_id);
+    let attempt = async |mutation: &MutationRequest, landing: bool| {
+        let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(FenceAtTheRetainedCheck {
+            inner: crate::catalogue::DaemonAdmission::new(Arc::clone(&controller), admission),
+            controller: Arc::clone(&controller),
+            landing: std::sync::atomic::AtomicBool::new(landing),
+        });
+        controller
+            .catalogue()
+            .write(
+                &actor_id,
+                mutation,
+                Method::CataloguePin,
+                None,
+                admission,
+                None,
+            )
+            .await
+    };
+    attempt(&first, false)
+        .await
+        .into_answer()
+        .expect_err("a catalogue nobody enrolled is refused");
+
+    let control = attempt(&reused, false).await;
+    assert!(
+        !control.is_copied() && !control.is_withheld(),
+        "a reused identifier is the host's own word and no copy of the receipt"
+    );
+    assert_eq!(
+        control
+            .into_answer()
+            .expect_err("the identifier is reused")
+            .code,
+        ErrorCode::IdConflict
+    );
+
+    let fenced = attempt(&reused, true).await;
+    assert!(
+        !fenced.is_withheld() && !fenced.is_copied(),
+        "the fence's refusal answers for this request alone"
+    );
+    refused_for_a_fence(
+        &fenced
+            .into_answer()
+            .expect_err("a fence that landed stops it"),
+    );
+    controller.hold_fence(false);
+
+    let copy = attempt(&first, true).await;
+    assert!(
+        copy.is_withheld(),
+        "a copy of the receipt is still withheld"
+    );
+    controller.hold_fence(false);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The attention store
 // ---------------------------------------------------------------------------------------------

@@ -1506,6 +1506,8 @@ impl CatalogueModule {
     /// count only when it commits right after that revision.
     ///
     /// An answer read from the record of an earlier submission of the action is given as a copy.
+    /// An identifier another request spent on other parameters is refused as reused, which is this
+    /// host's word about the identifier and no copy of what that action's record holds.
     ///
     /// # Errors
     ///
@@ -1520,7 +1522,7 @@ impl CatalogueModule {
         removal: Option<(u64, u64)>,
     ) -> Given<Answer<ParamsValue>> {
         let mut catalogue = self.catalogue.lock().await;
-        let mut copied = false;
+        let mut basis = Basis::Effect;
         let standing = Arc::clone(&admission);
         let answer = self
             .off_the_executor_async(self.write_locked(
@@ -1531,14 +1533,19 @@ impl CatalogueModule {
                 confirmations,
                 admission,
                 removal,
-                &mut copied,
+                &mut basis,
             ))
             .await;
         // A receipt another attempt left goes back only under the authority this attempt arrived
-        // under, asked with the answer in hand, and its refusal is a copy that was withheld.
-        Given::checked(answer, copied, false, || {
-            standing.check_retained().map_err(ProtocolError::from)
-        })
+        // under, asked with the answer in hand, and its refusal is a copy that was withheld. A
+        // reused identifier is no copy: the check's refusal replaces it and answers for this
+        // request alone.
+        Given::checked(
+            answer,
+            basis == Basis::Receipt,
+            basis == Basis::ReusedIdentifier,
+            || standing.check_retained().map_err(ProtocolError::from),
+        )
     }
 
     /// Serves one catalogue or plugin mutation under the catalogue's lock: the claim, the change,
@@ -1555,7 +1562,7 @@ impl CatalogueModule {
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: Arc<dyn Admission>,
         removal: Option<(u64, u64)>,
-        copied: &mut bool,
+        basis: &mut Basis,
     ) -> Answer<ParamsValue> {
         #[cfg(feature = "testing")]
         let admission: Arc<dyn Admission> = match self.testing_hook() {
@@ -1574,14 +1581,14 @@ impl CatalogueModule {
         // asks of it. Only an action that has no receipt is held to the whole admission.
         match catalogue.receipt(&key) {
             Ok(Some(record)) => {
-                *copied = true;
+                *basis = Basis::of(&record, &digest);
                 return answered(&record, &digest, mutation.action_id);
             }
             Ok(None) => {}
             Err(error) => {
                 // A receipt that cannot be read says that one exists. What it refuses with goes
                 // back only under the authority this attempt arrived under, as a receipt does.
-                *copied = true;
+                *basis = Basis::Receipt;
                 return Err(error.into());
             }
         }
@@ -1602,7 +1609,7 @@ impl CatalogueModule {
         {
             // Another attempt's receipt, found by the claim: `write` gives it back only under the
             // authority this attempt arrived under.
-            *copied = true;
+            *basis = Basis::of(&record, &digest);
             return answered(&record, &digest, mutation.action_id);
         }
         // Every change the action makes commits through this recording, so what it left behind
@@ -2356,13 +2363,41 @@ fn receipt_key(actor_id: &ActorId, action_id: ActionId) -> ReceiptKey {
     ReceiptKey::new(actor_id.as_str(), action_id.to_string())
 }
 
+/// What an answer of the catalogue's write rests on, which is what the authority check at its end
+/// is asked about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Basis {
+    /// This attempt's own effect.
+    Effect,
+    /// The receipt another attempt of the same action left, or the fact that one exists.
+    Receipt,
+    /// The receipt of an action another request spent this identifier on, whose parameters differ.
+    ReusedIdentifier,
+}
+
+impl Basis {
+    /// What answering from `record` rests on, for a request with `digest`.
+    fn of(record: &ReceiptRecord, digest: &Digest256) -> Self {
+        if spent_on_other_parameters(record, digest) {
+            Self::ReusedIdentifier
+        } else {
+            Self::Receipt
+        }
+    }
+}
+
+/// Whether `record` is the receipt of an action another request spent this identifier on.
+fn spent_on_other_parameters(record: &ReceiptRecord, digest: &Digest256) -> bool {
+    record.claim.digest != digest.as_bytes()
+}
+
 /// Returns the answer a retained receipt gives a resubmission of the same action.
 fn answered(
     record: &ReceiptRecord,
     digest: &Digest256,
     action_id: ActionId,
 ) -> Answer<ParamsValue> {
-    if record.claim.digest != digest.as_bytes() {
+    if spent_on_other_parameters(record, digest) {
         return Err(ProtocolError::new(
             ErrorCode::IdConflict,
             format!("action {action_id} was already used with different parameters"),
