@@ -110,21 +110,27 @@ const WRITE_DAC: u32 = 0x0004_0000;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The installation refuses to go on, for a reason the person can act on.
+    // text: install_error-1
     #[error("{0}")]
     Refused(String),
     /// A call into the platform failed.
+    // text: install_error-2
     #[error(transparent)]
     Win(#[from] ffi::Error),
     /// A known folder of the system could not be read.
+    // text: install_error-3
     #[error(transparent)]
     KnownFolder(#[from] ffi::KnownFolderError),
     /// A record could not be read or written.
+    // text: install_error-4
     #[error(transparent)]
     Store(#[from] StoreError),
     /// Application control could not be read or written.
+    // text: install_error-5
     #[error(transparent)]
     Applocker(#[from] applocker::Error),
     /// A file operation failed.
+    // text: install_error-6
     #[error("{what}: {source}")]
     Io {
         /// What was being done.
@@ -133,6 +139,7 @@ pub enum Error {
         source: io::Error,
     },
     /// A step failed in a way that is not one of the above.
+    // text: install_error-7
     #[error("{0}")]
     Failed(String),
 }
@@ -356,6 +363,7 @@ pub enum Entry {
 }
 
 fn say(line: &str) {
+    // text: print_say-1
     println!("{line}");
 }
 
@@ -393,6 +401,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     if !matches!(records::look(&paths.program), records::Look::NotThere)
         && let Err(refusal) = DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)?
     {
+        // text: refusal_entry-1
         return Err(anchor_refusal(paths, &refusal, false));
     }
     for name in [CHECKOUT, CONNECT] {
@@ -501,6 +510,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
             std::ptr::null_mut(),
         )
     };
+    // text: install_check_data_parent_at-1
     let handle = match ffi::Handle::new(raw, "opening the data directory's parent folder") {
         Ok(handle) => handle,
         // The data parent is not there: the installation makes it.
@@ -524,6 +534,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
             )));
         }
         Err(failure) if failure.code == ERROR_SHARING_VIOLATION => {
+            // text: refusal_check_data_parent_at-5
             return Err(parent_refusal(
                 paths,
                 "another program holds it open: with a right to delete or rename it, or without sharing it for reading and writing, and the check needs both so that it can hold the folder against a rename or a delete",
@@ -533,6 +544,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
         // Nothing shows who made a folder that cannot be opened: it is moved aside, never corrected
         // into place and never removed.
         Err(failure) => {
+            // text: refusal_check_data_parent_at-4
             return Err(parent_refusal(
                 paths,
                 &format!("it could not be opened to be checked ({failure})"),
@@ -554,9 +566,11 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
         )
     } == 0
     {
+        // text: install_check_data_parent_at-2
         return Err(ffi::last("reading the data directory's parent folder").into());
     }
     if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        // text: refusal_check_data_parent_at-3
         return Err(parent_refusal(
             paths,
             "it is a reparse point, such as a link or a mounted folder",
@@ -564,6 +578,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
         ));
     }
     if tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        // text: refusal_check_data_parent_at-2
         return Err(parent_refusal(
             paths,
             "it is not a folder",
@@ -577,6 +592,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
         } else {
             ParentCure::Correct(presence_of(&paths.data))
         };
+        // text: refusal_check_data_parent_at-1
         return Err(parent_refusal(paths, &finding.to_string(), cure));
     }
     Ok(Some(handle))
@@ -712,11 +728,13 @@ impl DataHolds {
         })?;
         let shown = which.path(&self.paths).display().to_string();
         if let Some(why) = not_a_plain_directory(&handle, &shown)? {
+            // text: refusal_directory-2
             return Err(child_refusal(&self.paths, &name, why, &Origin::Foreign));
         }
         if !created {
             // It appeared between the listing and this call: it is checked like one that was there.
             if let Some(why) = check_held_object(&handle)? {
+                // text: refusal_directory-1
                 return Err(child_refusal(&self.paths, &name, &why, &origin_of(&handle)));
             }
             protect_handle(&handle, &descriptor, &shown)?;
@@ -950,6 +968,7 @@ fn case_sensitive_reason(handle: &ffi::Handle) -> Result<Option<String>, Error> 
         if code == ERROR_INVALID_PARAMETER {
             return Ok(None);
         }
+        // text: install_case_sensitive_reason-1
         return Err(ffi::error(
             code,
             "reading whether the data directory separates names by case",
@@ -1005,6 +1024,7 @@ fn protect_handle(handle: &ffi::Handle, descriptor: &sd::OwnedSd, what: &str) ->
     if status < 0 {
         // SAFETY: converts a status the platform just returned.
         let code = unsafe { RtlNtStatusToDosError(status) };
+        // text: install_protect_handle-1
         return Err(ffi::error(code, format!("setting the permissions of {what}")).into());
     }
     Ok(())
@@ -1026,6 +1046,7 @@ fn attributes_of(handle: &ffi::Handle, what: &str) -> Result<u32, Error> {
         )
     } == 0
     {
+        // text: install_attributes_of-1
         return Err(ffi::last(format!("reading {what}")).into());
     }
     Ok(tag.FileAttributes)
@@ -1062,6 +1083,7 @@ fn file_key(handle: &ffi::Handle) -> Result<FileKey, Error> {
         )
     } == 0
     {
+        // text: install_file_key-1
         return Err(ffi::last("reading an object's identity").into());
     }
     Ok(FileKey {
@@ -1160,6 +1182,7 @@ fn open_directory_relative(
         )
         .into());
     }
+    // text: install_open_directory_relative-1
     let handle = ffi::Handle::new(raw, "opening a directory beneath a held directory")?;
     Ok(Some((handle, status_block.Information == FILE_CREATED)))
 }
@@ -1291,6 +1314,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             // A child that is gone since the listing is absent, and nothing of it is left to check.
             Err(Lost::Gone) => continue,
             Err(lost) => {
+                // text: refusal_inspect_data_directory-6
                 return Err(child_refusal(
                     paths,
                     &shown,
@@ -1301,6 +1325,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
         };
         match (opened.kind, *expected) {
             (Kind::ReparsePoint, _) => {
+                // text: refusal_inspect_data_directory-5
                 return Err(child_refusal(
                     paths,
                     &shown,
@@ -1310,6 +1335,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             }
             (Kind::File, Kind::File) | (Kind::Directory, Kind::Directory) => {}
             (Kind::Directory, _) => {
+                // text: refusal_inspect_data_directory-4
                 return Err(child_refusal(
                     paths,
                     &shown,
@@ -1318,6 +1344,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 ));
             }
             (Kind::File, _) => {
+                // text: refusal_inspect_data_directory-3
                 return Err(child_refusal(
                     paths,
                     &shown,
@@ -1327,6 +1354,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             }
         }
         if opened.kind == Kind::File && opened.links > 1 {
+            // text: refusal_inspect_data_directory-2
             return Err(child_refusal(
                 paths,
                 &shown,
@@ -1335,6 +1363,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             ));
         }
         if let Some(why) = check_held_object(&opened.handle)? {
+            // text: refusal_inspect_data_directory-1
             return Err(child_refusal(
                 paths,
                 &shown,
@@ -1719,6 +1748,7 @@ fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, recorded: bool) -> Err
         AnchorRefusal::ReparsePoint => ("it is a reparse point".to_owned(), Cure::RemoveLink),
         AnchorRefusal::NotADirectory => (refusal.to_string(), Cure::RemoveEntry),
     };
+    // text: refusal_anchor_refusal-1
     program_refusal(
         paths,
         paths.program.parent().unwrap_or(&paths.program),
@@ -1747,6 +1777,7 @@ fn opened_final_path(folder: &Path) -> Result<String, String> {
         )
     };
     let handle =
+        // text: install_opened_final_path-1
         ffi::Handle::new(raw, "opening a known folder").map_err(|error| error.to_string())?;
     final_path_of(&handle).map_err(|error| error.to_string())
 }
@@ -1838,6 +1869,7 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
                 std::ptr::null_mut(),
             )
         };
+        // text: install_check_ancestors-1
         let handle = match ffi::Handle::new(raw, "opening a folder above the installation") {
             Ok(handle) => handle,
             // Every folder of this walk is a known folder or above one, so none is the
@@ -1939,6 +1971,7 @@ pub fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), 
                 std::ptr::null_mut(),
             )
         };
+        // text: install_check_program_parents-1
         let handle = match ffi::Handle::new(raw, "opening a folder above the program directory") {
             Ok(handle) => handle,
             // Only a folder strictly below the known folder is the installation's to make, and
@@ -2013,6 +2046,7 @@ fn final_path_of(handle: &ffi::Handle) -> Result<String, Error> {
             )
         };
         if length == 0 {
+            // text: install_final_path_of-1
             return Err(ffi::last("reading a folder's final path").into());
         }
         if (length as usize) < buffer.len() {
@@ -2042,9 +2076,11 @@ fn check_program_directory(
     let program = paths.program.file_name().unwrap_or_default().to_owned();
     let held = match DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)? {
         Ok(held) => held,
+        // text: refusal_check_program_directory-2
         Err(refusal) => return Err(anchor_refusal(paths, &refusal, recorded)),
     };
     if let Some(why) = check_readable_object(held.handle())? {
+        // text: refusal_check_program_directory-1
         return Err(program_refusal(
             paths,
             paths.program.parent().unwrap_or(&paths.program),
@@ -2240,6 +2276,7 @@ fn inspect_within(
         // the reason decides what is corrected or removed.
         let refuse = |why: &str, cure: Cure, origin: &Origin| match scope {
             Scope::Staging => removal_refusal(paths, dir, &shown, why, origin),
+            // text: refusal_inspect_within-2
             Scope::Program { recorded } => program_refusal(paths, dir, &shown, why, cure, recorded),
         };
         let opened = match held.open_child(&child, LIST | READ_CONTROL)? {
@@ -2298,6 +2335,7 @@ fn inspect_within(
                 } else {
                     Cure::RemoveEntry
                 };
+                // text: refusal_inspect_within-1
                 return Err(program_refusal(paths, dir, &shown, why, cure, recorded));
             }
         }
@@ -2689,22 +2727,27 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
             .share_mode(0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&source)
+            // text: install_stage_payload-1
             .map_err(io_error(format!("opening {}", source.display())))?;
         let mut bytes = Vec::new();
         handle
             .read_to_end(&mut bytes)
+            // text: install_stage_payload-2
             .map_err(io_error(format!("reading {}", source.display())))?;
         drop(handle);
         let (mut made, path) = fresh::named_file(staging, "payload", ".exe", SdKind::AdminFile)
+            // text: install_stage_payload-3
             .map_err(io_error(format!("staging {name}")))?;
         made.write_all(&bytes)
             .and_then(|()| made.sync_all())
+            // text: install_stage_payload-4
             .map_err(io_error(format!("staging {}", path.display())))?;
         drop(made);
         let checked = OpenOptions::new()
             .read(true)
             .share_mode(0)
             .open(&path)
+            // text: install_stage_payload-5
             .map_err(io_error(format!("opening {}", path.display())))?;
         let subject = verify::signer(&checked, &path)?;
         if subject != verify::PUBLISHER {
@@ -2725,6 +2768,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
 }
 
 fn sha256_of(path: &Path) -> Result<String, Error> {
+    // text: install_sha256_of-1
     let bytes = fs::read(path).map_err(io_error(format!("reading {}", path.display())))?;
     Ok(hex::encode(Sha256::digest(&bytes)))
 }
@@ -2788,12 +2832,14 @@ pub fn confirm(person: Option<&str>, action: &str) -> Result<(), Error> {
         // text: confirm-3
         say(&format!("The broker will serve the account {person}."));
     }
+    // text: print_confirm-1
     print!("Type yes to {action}: ");
     let _ = io::stdout().flush();
     let mut answer = String::new();
     io::stdin()
         .lock()
         .read_line(&mut answer)
+        // text: install_confirm-1
         .map_err(io_error("reading the answer"))?;
     if answer.trim().eq_ignore_ascii_case("yes") {
         Ok(())
@@ -3052,6 +3098,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     };
     check_program_parents(&paths, after)?;
     fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)
+        // text: install_lay_down-1
         .map_err(io_error("making the program directory"))?;
     // What the broker points Git's global file, hooks path and template directory at: empty, and
     // readable by every account, never writable by one.
@@ -3080,6 +3127,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     )?;
     if !empty_config.exists() {
         fresh::file_at(&empty_config, SdKind::ProgramFile, true)
+            // text: install_lay_down-2
             .map_err(io_error("making the empty global configuration"))?;
     }
     for file in &staged {
@@ -3090,6 +3138,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             Some(&file.sha256),
         )?;
         install_program_file(&file.path, &target)
+            // text: install_lay_down-3
             .map_err(io_error(format!("installing {}", file.name)))?;
         if sha256_of(&target)? != file.sha256 {
             // text: lay_down-10
@@ -3599,6 +3648,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                     records::not_there_at_the_inspection(&paths.staging)
                 )));
             }
+            // text: install_remove_at-1
             Err(error) => return Err(io_error("making the staging directory")(error)),
         }
     }
@@ -3824,6 +3874,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     }
     if program_checked {
         keep(
+            // text: install_remove_at-2
             fs::remove_dir_all(&paths.program).map_err(io_error("removing the program directory")),
             "removing the program directory",
             &mut failures,
@@ -3947,6 +3998,7 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
         Ok(entries) => {
             for entry in entries {
                 let entry =
+                    // text: install_refuse_while_unfinished-1
                     entry.map_err(io_error("reading the directory of the private roots"))?;
                 found.push(format!(
                     "a private root {}",
@@ -3956,6 +4008,7 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
+            // text: install_refuse_while_unfinished-2
             return Err(io_error("reading the directory of the private roots")(
                 error,
             ));

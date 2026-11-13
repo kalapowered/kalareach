@@ -262,6 +262,7 @@ pub fn changeable_by_others(path: &Path, replacement_only: bool) -> Result<Optio
             null_mut(),
         )
     };
+    // text: acl_changeable_by_others-1
     let handle = super::ffi::Handle::new(
         raw,
         &format!("opening {} to read its permissions", path.display()),
@@ -368,6 +369,7 @@ fn judged(handle: &super::ffi::Handle, counts: Counts) -> Result<Option<Finding>
         )
     };
     if status != 0 {
+        // text: acl_judged-1
         return Err(error(status, "reading the permissions of an open object"));
     }
     // SAFETY: the call returned a valid descriptor with the owner and the list inside it, and
@@ -423,6 +425,7 @@ unsafe fn finding_in(
         )
     } == 0
     {
+        // text: acl_finding_in-1
         return Err(last("reading the size of a permission list"));
     }
     let mask_of_interest = match counts {
@@ -434,6 +437,7 @@ unsafe fn finding_in(
         let mut entry: *mut c_void = null_mut();
         // SAFETY: the index is below the entry count the list reported.
         if unsafe { GetAce(dacl, index, &raw mut entry) } == 0 {
+            // text: acl_finding_in-2
             return Err(last("reading an entry of a permission list"));
         }
         let allowed = entry.cast::<ACCESS_ALLOWED_ACE>();

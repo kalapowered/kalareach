@@ -46,6 +46,7 @@ pub fn open(subkey: &str) -> Result<Option<Key>> {
     match status {
         ERROR_SUCCESS => Ok(Some(Key(key))),
         ERROR_FILE_NOT_FOUND => Ok(None),
+        // text: registry_open-1
         other => Err(error(other, format!("opening the key {subkey}"))),
     }
 }
@@ -91,6 +92,7 @@ pub fn delete_key(subkey: &str) -> Result<()> {
     let status = unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, name.as_ptr()) };
     match status {
         ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+        // text: registry_delete_key-1
         other => Err(error(other, format!("deleting the key {subkey}"))),
     }
 }
@@ -110,6 +112,7 @@ impl Key {
         if status == ERROR_SUCCESS {
             Ok(())
         } else {
+            // text: registry_set_dword-1
             Err(error(status, format!("setting the value {name}")))
         }
     }
@@ -143,6 +146,7 @@ impl Key {
                 format!("the value {name} is not a DWORD (type {kind})"),
             )),
             ERROR_FILE_NOT_FOUND => Ok(None),
+            // text: registry_dword-1
             other => Err(error(other, format!("reading the value {name}"))),
         }
     }
@@ -158,6 +162,7 @@ impl Key {
         let status = unsafe { RegDeleteValueW(self.0, wide_name.as_ptr()) };
         match status {
             ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+            // text: registry_delete_value-1
             other => Err(error(other, format!("deleting the value {name}"))),
         }
     }
@@ -220,6 +225,7 @@ impl Key {
             match status {
                 ERROR_SUCCESS => names.push(String::from_utf16_lossy(&buffer[..length as usize])),
                 ERROR_NO_MORE_ITEMS => break,
+                // text: registry_subkey_names-1
                 other => return Err(error(other, "listing the subkeys")),
             }
         }

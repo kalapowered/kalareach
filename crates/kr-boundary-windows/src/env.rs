@@ -63,6 +63,7 @@ pub enum EnvError {
     #[error("the {0:?} block needs the repository's paths")]
     NoTree(Kind),
     /// A path is empty or holds a NUL, which no environment value can.
+    // text: env-1
     #[error("the {0} path is not usable")]
     BadPath(&'static str),
 }

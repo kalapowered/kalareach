@@ -99,6 +99,7 @@ pub fn system_windows_directory() -> Result<String> {
         )
     } as usize;
     if length == 0 || length >= buffer.len() {
+        // text: ffi_system_windows_directory-1
         return Err(last("reading the system's Windows directory"));
     }
     Ok(String::from_utf16_lossy(&buffer[..length]))
@@ -309,6 +310,7 @@ impl Sid {
         // SAFETY: the text is NUL-terminated and the identifier is an out-parameter freed below.
         unsafe {
             if ConvertStringSidToSidW(wide_text.as_ptr(), &raw mut sid) == 0 {
+                // text: ffi_parse-1
                 return Err(last(format!("reading the identifier {text}")));
             }
             let copy = Sid::from_ptr(sid);
@@ -341,6 +343,7 @@ impl Sid {
             );
         }
         if sid_length == 0 {
+            // text: ffi_of_account-1
             return Err(last(format!("looking up the account {name}")));
         }
         let mut storage = vec![0_u64; (sid_length as usize).div_ceil(8)];
@@ -358,6 +361,7 @@ impl Sid {
             )
         };
         if found == 0 {
+            // text: ffi_of_account-2
             return Err(last(format!("looking up the account {name}")));
         }
         Ok(Sid { storage })

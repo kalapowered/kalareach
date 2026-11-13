@@ -37,6 +37,7 @@ pub struct LogEvent {
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
     /// The text is not the log's XML.
+    // text: events-1
     #[error("the application-control log could not be read: {0}")]
     Unreadable(String),
 }

@@ -149,6 +149,7 @@ fn s4u(account: &str, group: Option<&Sid>) -> Result<Handle> {
     unsafe {
         let status = LsaRegisterLogonProcess(&raw const process_name, &raw mut lsa, &raw mut mode);
         if status != 0 {
+            // text: token_s4u-1
             return Err(error(
                 LsaNtStatusToWinError(status),
                 "registering with the logon service",
@@ -175,6 +176,7 @@ fn s4u_with(
     unsafe {
         let status = LsaLookupAuthenticationPackage(lsa, package_name, &raw mut package);
         if status != 0 {
+            // text: token_s4u_with-1
             return Err(error(
                 LsaNtStatusToWinError(status),
                 "finding the logon package",
@@ -261,6 +263,7 @@ fn s4u_with(
     if status != 0 {
         // SAFETY: converts a status the platform returned.
         let code = unsafe { LsaNtStatusToWinError(status) };
+        // text: token_s4u_with-2
         return Err(error(
             code,
             format!("logging {account} on without its password (sub-status {substatus})"),
@@ -272,6 +275,7 @@ fn s4u_with(
             LsaFreeReturnBuffer(profile);
         }
     }
+    // text: token_s4u_with-3
     let impersonation = Handle::new(token, "the logon's token")?;
     let mut primary: HANDLE = null_mut();
     // SAFETY: the token is open; the duplicate is an out-parameter owned below.
@@ -285,9 +289,11 @@ fn s4u_with(
             &raw mut primary,
         ) == 0
         {
+            // text: token_s4u_with-4
             return Err(last("making the logon's token a primary token"));
         }
     }
+    // text: token_s4u_with-5
     Handle::new(primary, "the primary token")
 }
 
@@ -326,6 +332,7 @@ pub fn user_of(token: &Handle) -> Result<Sid> {
             &raw mut needed,
         ) == 0
         {
+            // text: token_user_of-1
             return Err(last("reading the token's account"));
         }
         let entry = &*buffer.as_ptr().cast::<SID_AND_ATTRIBUTES>();
@@ -361,9 +368,11 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
             &raw mut restricted,
         ) == 0
         {
+            // text: token_boundary_token-1
             return Err(last("marking the account's own identifier deny-only"));
         }
     }
+    // text: token_boundary_token-2
     let token = Handle::new(restricted, "the restricted token")?;
     let owner = TOKEN_OWNER {
         Owner: group.as_ptr(),
@@ -377,6 +386,7 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
             size_of::<TOKEN_OWNER>() as u32,
         ) == 0
         {
+            // text: token_boundary_token-3
             return Err(last("making the invocation's group the token's owner"));
         }
     }
@@ -393,6 +403,7 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
             null_mut(),
         ) == 0
         {
+            // text: token_boundary_token-4
             return Err(last("reading the default permission list"));
         }
         let mut present = 0;
@@ -413,6 +424,7 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
         );
         LocalFree(descriptor);
         if set == 0 {
+            // text: token_boundary_token-5
             return Err(last("setting the token's default permission list"));
         }
     }
@@ -440,9 +452,11 @@ pub fn current_user() -> Result<Sid> {
     // SAFETY: the current process's token is opened for reading and owned below.
     unsafe {
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) == 0 {
+            // text: token_current_user-1
             return Err(last("opening this process's token"));
         }
     }
+    // text: token_current_user-2
     user_of(&Handle::new(token, "opening this process's token")?)
 }
 
@@ -458,6 +472,7 @@ pub fn current_is_administrator() -> Result<bool> {
     // SAFETY: a null token means this thread's own, and the identifier is valid.
     unsafe {
         if CheckTokenMembership(null_mut(), administrators.as_ptr(), &raw mut member) == 0 {
+            // text: token_current_is_administrator-1
             return Err(last("checking whether this process is an administrator"));
         }
     }

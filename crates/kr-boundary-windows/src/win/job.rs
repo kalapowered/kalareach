@@ -139,6 +139,7 @@ impl Job {
     pub fn new(limits: Limits) -> Result<Job> {
         // SAFETY: no attributes and no name: the job is unnamed and its handle is not inheritable.
         let raw = unsafe { CreateJobObjectW(null(), null()) };
+        // text: job_new-1
         let handle = Handle::new(raw, "making the job")?;
         // SAFETY: a zeroed record is the documented starting point.
         let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
@@ -155,10 +156,12 @@ impl Job {
             )
         };
         if set == 0 {
+            // text: job_new-2
             return Err(last("setting the job's limits"));
         }
         // SAFETY: a completion port made with no file is the documented way to make a new one.
         let port_raw = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 1) };
+        // text: job_new-3
         let port = Handle::new(port_raw, "making the job's completion port")?;
         let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
             CompletionKey: null_mut(),
@@ -174,6 +177,7 @@ impl Job {
             )
         };
         if associated == 0 {
+            // text: job_new-4
             return Err(last("attaching the completion port to the job"));
         }
         let job = Job {
@@ -187,6 +191,7 @@ impl Job {
             || read.active_processes != limits.active_processes
             || read.memory_bytes != limits.memory_bytes
         {
+            // text: job_new-5
             return Err(error(
                 0,
                 format!("the job's limits read back as {read:?}, not as set ({limits:?})"),
@@ -237,6 +242,7 @@ impl Job {
             )
         };
         if queried == 0 {
+            // text: job_read_back-1
             return Err(last("reading the job's limits"));
         }
         Ok(ReadBack {
@@ -354,6 +360,7 @@ impl Job {
         // SAFETY: both handles are open.
         let asked = unsafe { IsProcessInJob(process.raw(), self.handle.raw(), &raw mut inside) };
         if asked == 0 {
+            // text: job_contains-1
             return Err(last("asking whether a process is in the job"));
         }
         Ok(inside != 0)
@@ -375,6 +382,7 @@ impl Job {
         self.state = State::Ended;
         // SAFETY: the handle is open.
         let terminated = unsafe { TerminateJobObject(self.handle.raw(), 1) } != 0;
+        // text: job_end-1
         let terminate_error = (!terminated).then(|| last("ending the job"));
         loop {
             let all_exited = retained.iter().all(|child| {

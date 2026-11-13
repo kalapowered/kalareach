@@ -87,6 +87,7 @@ pub fn create(name: &str) -> Result<Sid> {
     // Nothing keeps the password: overwrite the copy this function made.
     secret.fill(0);
     if status != NERR_Success {
+        // text: account_create-1
         return Err(error(status, format!("making the account {name}")));
     }
     Sid::of_account(name)
@@ -104,6 +105,7 @@ pub fn delete(name: &str) -> Result<()> {
     if status == NERR_Success || status == NERR_UserNotFound {
         Ok(())
     } else {
+        // text: account_delete-1
         Err(error(status, format!("deleting the account {name}")))
     }
 }
@@ -139,6 +141,7 @@ fn policy() -> Result<isize> {
     };
     if status != 0 {
         // SAFETY: converts a status the platform returned.
+        // text: account_policy-1
         return Err(error(
             unsafe { LsaNtStatusToWinError(status) },
             "opening the security policy",
@@ -166,6 +169,7 @@ pub fn grant_rights(sid: &Sid, rights: &[&str]) -> Result<()> {
         Ok(())
     } else {
         // SAFETY: converts a status the platform returned.
+        // text: account_grant_rights-1
         Err(error(
             unsafe { LsaNtStatusToWinError(status) },
             "granting user rights",
@@ -192,6 +196,7 @@ pub fn revoke_all_rights(sid: &Sid) -> Result<()> {
         0 | 2 => Ok(()),
         // The account holds no rights: the platform answers that the file is not found.
         _ if code == ERROR_FILE_NOT_FOUND => Ok(()),
+        // text: account_revoke_all_rights-1
         other => Err(error(other, "taking away user rights")),
     }
 }
@@ -275,6 +280,7 @@ pub fn delete_profile(sid: &Sid) -> Result<()> {
     if removed != 0 {
         return Ok(());
     }
+    // text: account_delete_profile-1
     let failure = last("deleting a profile");
     // The profile is missing: error 2 (file not found) or 3 (path not found).
     if failure.code == 2 || failure.code == 3 {

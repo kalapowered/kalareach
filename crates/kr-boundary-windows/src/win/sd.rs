@@ -137,6 +137,7 @@ impl OwnedSd {
             )
         };
         if converted == 0 {
+            // text: sd_from_text-1
             return Err(last(format!("reading the descriptor {text}")));
         }
         Ok(OwnedSd { raw, text })
@@ -182,6 +183,7 @@ impl std::fmt::Debug for OwnedSd {
 }
 
 fn needed<'a>(sid: Option<&'a Sid>, what: &str) -> Result<&'a Sid> {
+    // text: sd_needed-1
     sid.ok_or_else(|| error(0, format!("a descriptor needs {what} and none was given")))
 }
 
@@ -296,9 +298,11 @@ unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
     let mut defaulted = 0;
     // SAFETY: the caller promises the descriptor is valid; the out-parameters are local.
     if unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut defaulted) } == 0 {
+        // text: sd_summarise-1
         return Err(last("reading a descriptor's owner"));
     }
     if owner.is_null() {
+        // text: sd_summarise-2
         return Err(error(0, "the descriptor has no owner"));
     }
     // SAFETY: the owner pointer is inside the valid descriptor.
@@ -308,6 +312,7 @@ unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
     // SAFETY: as above.
     if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) } == 0
     {
+        // text: sd_summarise-3
         return Err(last("reading a descriptor's flags"));
     }
     let mut present = 0;
@@ -322,6 +327,7 @@ unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
         )
     } == 0
     {
+        // text: sd_summarise-4
         return Err(last("reading a descriptor's list"));
     }
     let entries = if present == 0 || list.is_null() {
@@ -334,6 +340,7 @@ unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
             let mut ace: *mut c_void = null_mut();
             // SAFETY: the index is below the entry count.
             if unsafe { GetAce(list, index, &raw mut ace) } == 0 {
+                // text: sd_summarise-5
                 return Err(last("reading a list entry"));
             }
             // SAFETY: an access-allowed or access-denied entry is a header, a mask and a
@@ -410,6 +417,7 @@ fn summary_of_object(object: *mut c_void, kind: i32) -> Result<Summary> {
         )
     };
     if code != 0 {
+        // text: sd_summary_of_object-1
         return Err(error(code, "reading an object's descriptor"));
     }
     // SAFETY: the call returned a valid descriptor, which is freed once after it is read.

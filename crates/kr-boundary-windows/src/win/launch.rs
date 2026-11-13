@@ -502,6 +502,7 @@ fn end_unresumed(process: &Handle, pid: u32, reports: &Reports, deadline: Option
     let skipped = false;
     // SAFETY: the process handle is open and the process is the caller's own child.
     let terminated = !skipped && unsafe { TerminateProcess(process.raw(), 1) } != 0;
+    // text: launch_end_unresumed-1
     let terminate_error = (!terminated).then(|| last("ending a suspended child"));
     let wait_ms = deadline.map_or(END_WAIT_MS, |deadline| {
         u32::try_from(
@@ -563,6 +564,7 @@ impl SuspendedChild {
         if previous != 1 {
             // Dropping `self` ends the child.
             return Err(if previous == u32::MAX {
+                // text: launch_resume-1
                 LaunchError::Platform(last("resuming the child"))
             } else {
                 LaunchError::NotSuspendedOnce
@@ -637,6 +639,7 @@ impl Child {
         }
         // SAFETY: the process has ended and the handle is open.
         if unsafe { GetExitCodeProcess(self.process.raw(), &raw mut code) } == 0 {
+            // text: launch_exit_code-1
             return Err(last("reading the exit code"));
         }
         Ok(Some(code))
@@ -685,6 +688,7 @@ fn inheritable_null_device(access: u32) -> Result<Handle, ffi::Error> {
             null_mut(),
         )
     };
+    // text: launch_inheritable_null_device-1
     Handle::new(handle, "opening the null device")
 }
 
@@ -710,9 +714,12 @@ pub fn pipe() -> Result<(Handle, OwnedPipeEnd), ffi::Error> {
     let mut write: HANDLE = null_mut();
     // SAFETY: the out-parameters and the attributes are this function's own for the call.
     if unsafe { CreatePipe(&raw mut read, &raw mut write, &raw const attributes, 0) } == 0 {
+        // text: launch_pipe-1
         return Err(last("making a pipe"));
     }
+    // text: launch_pipe-2
     let read = Handle::new(read, "the pipe's read end")?;
+    // text: launch_pipe-3
     let write = Handle::new(write, "the pipe's write end")?;
     #[cfg(feature = "testing")]
     if testing::take_hold() {
@@ -730,10 +737,12 @@ pub fn pipe() -> Result<(Handle, OwnedPipeEnd), ffi::Error> {
                 windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
             );
         }
+        // text: launch_pipe-4
         testing::keep(Handle::new(copy, "a held copy of the pipe's write end")?);
     }
     // SAFETY: the read end is open; the broker alone keeps it.
     if unsafe { SetHandleInformation(read.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+        // text: launch_pipe-5
         return Err(last("keeping the pipe's read end from children"));
     }
     Ok((read, OwnedPipeEnd(write)))
@@ -805,6 +814,7 @@ fn attributes(handles: &[HANDLE; 3], job: &HANDLE) -> Result<Attributes, LaunchE
         InitializeProcThreadAttributeList(null_mut(), count, 0, &raw mut size);
     }
     if size == 0 {
+        // text: launch_attributes-1
         return Err(LaunchError::Platform(last("sizing the attribute list")));
     }
     let mut list = Attributes {
@@ -812,6 +822,7 @@ fn attributes(handles: &[HANDLE; 3], job: &HANDLE) -> Result<Attributes, LaunchE
     };
     // SAFETY: the buffer is the size the first call asked for and is aligned for the list.
     if unsafe { InitializeProcThreadAttributeList(list.list(), count, 0, &raw mut size) } == 0 {
+        // text: launch_attributes-2
         return Err(LaunchError::Platform(last("making the attribute list")));
     }
     // SAFETY: the list is initialised; the values outlive the call that uses the list because the
@@ -828,6 +839,7 @@ fn attributes(handles: &[HANDLE; 3], job: &HANDLE) -> Result<Attributes, LaunchE
         )
     } != 0;
     if !handle_list {
+        // text: launch_attributes-3
         return Err(LaunchError::Platform(last("listing the inherited handles")));
     }
     // SAFETY: as above.
@@ -843,6 +855,7 @@ fn attributes(handles: &[HANDLE; 3], job: &HANDLE) -> Result<Attributes, LaunchE
         )
     } != 0;
     if !job_list {
+        // text: launch_attributes-4
         return Err(LaunchError::Job(last("naming the job at creation")));
     }
     Ok(list)
@@ -867,6 +880,7 @@ fn time_of(process: &Handle) -> Result<u64, ffi::Error> {
         )
     };
     if read == 0 {
+        // text: launch_time_of-1
         return Err(last("reading the process's creation time"));
     }
     Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
@@ -884,6 +898,7 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
     testing::count_launch();
     // A job that has been ended is closed to new children: the platform would still take one.
     if spec.job.state() == State::Ended {
+        // text: launch_launch-1
         return Err(LaunchError::Job(ffi::error(
             0,
             "the job has ended and takes no new process",
@@ -947,7 +962,9 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
             windows_sys::Win32::Foundation::GetLastError()
         }));
     }
+    // text: launch_launch-2
     let process = Handle::new(created.hProcess, "the started process")?;
+    // text: launch_launch-3
     let thread = match Handle::new(created.hThread, "the started process's thread") {
         Ok(thread) => thread,
         Err(error) => {
