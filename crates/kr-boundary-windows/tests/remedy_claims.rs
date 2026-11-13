@@ -265,15 +265,32 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
 /// leaves nothing to move, to correct or to run against.
 #[test]
 fn the_ending_of_a_directory_this_run_made_says_what_was_removed_and_gives_no_step() {
-    let gone = data_made_ending(&[]);
+    let gone = data_made_ending(true, &[]);
     assert!(gone.contains("removed what it made"), "{gone}");
-    let stayed = data_made_ending(&["C:\\Kala (e)".to_owned(), "C:\\Kala\\Data (f)".to_owned()]);
+    let stayed = data_made_ending(
+        false,
+        &["C:\\Kala (e)".to_owned(), "C:\\Kala\\Data (f)".to_owned()],
+    );
     assert!(stayed.contains("could not remove what it made"), "{stayed}");
     assert!(
         stayed.contains("C:\\Kala (e); C:\\Kala\\Data (f)"),
         "{stayed}"
     );
-    for text in [&gone, &stayed] {
+    // The directory is gone and the folder above it stays: the words say that, and not that the
+    // directory stays or that nothing is left.
+    let folder_stays = data_made_ending(true, &["C:\\Kala (f)".to_owned()]);
+    assert!(
+        folder_stays.contains("removed the data directory that it made"),
+        "{folder_stays}"
+    );
+    assert!(
+        folder_stays.contains("could not remove the folder above it that it also made: C:\\Kala (f). That folder stays."),
+        "{folder_stays}"
+    );
+    for wrong in ["could not remove what it made", "nothing of it is left"] {
+        assert!(!folder_stays.contains(wrong), "{folder_stays}");
+    }
+    for text in [&gone, &stayed, &folder_stays] {
         for step in [
             "Move it aside",
             "Turn the flag",

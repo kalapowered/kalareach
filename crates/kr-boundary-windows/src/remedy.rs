@@ -1163,15 +1163,21 @@ pub fn data_ending(grounds: &Grounds<'_>, origin: &Origin, case_sensitive: bool)
     }
 }
 
-/// The words that end the refusal of a data directory that this run made itself: what the run did
-/// with what it made. They name no step, since a refusal after the run made the directory leaves
-/// nothing of the run for the person to move or to correct; `stayed` is what the run could not
-/// remove, each with its reason.
+/// The words that end the failure of a step after this run made the data directory, or the folder
+/// above it: what the run did with what it made. They name no step, since a failure after the run
+/// made them leaves nothing of the run for the person to move or to correct. `directory_gone` says
+/// that the data directory that this run made was marked for removal (or that this run made none),
+/// and `stayed` is each object of the run that the platform did not let it mark, with its reason.
 #[must_use]
 // text: data_made_ending
-pub fn data_made_ending(stayed: &[String]) -> String {
+pub fn data_made_ending(directory_gone: bool, stayed: &[String]) -> String {
     if stayed.is_empty() {
         "This run removed what it made, so nothing of it is left.".to_owned()
+    } else if directory_gone {
+        format!(
+            "This run removed the data directory that it made. It could not remove the folder above it that it also made: {}. That folder stays.",
+            stayed.join("; ")
+        )
     } else {
         format!(
             "This run could not remove what it made: {}.",

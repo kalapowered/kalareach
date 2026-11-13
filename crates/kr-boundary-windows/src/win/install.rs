@@ -42,7 +42,7 @@ use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Purpose, Shap
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF,
     FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, NtSetSecurityObject,
 };
 use windows_sys::Win32::Foundation::{
@@ -53,9 +53,9 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128,
-    FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    CreateFileW, DELETE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128, FILE_ID_INFO,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FileAttributeTagInfo, FileCaseSensitiveInfo, FileIdInfo,
     GetFileInformationByHandleEx, GetFileSizeEx, GetVolumeInformationByHandleW, OPEN_EXISTING,
 };
@@ -574,6 +574,18 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
             ));
         }
     };
+    check_data_parent_handle(paths, &handle, stage)?;
+    Ok(Some(handle))
+}
+
+/// The checks of the folder above the data directory that rest on its own handle: not a reparse
+/// point, a folder, and no list that another account may change. The handle is the one that opened
+/// the folder, or the one of the call that made it.
+fn check_data_parent_handle(
+    paths: &Paths,
+    handle: &ffi::Handle,
+    stage: remedy::Stage,
+) -> Result<(), Error> {
     let mut tag = FILE_ATTRIBUTE_TAG_INFO {
         FileAttributes: 0,
         ReparseTag: 0,
@@ -607,16 +619,16 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
             ParentCure::NotAFolder,
         ));
     }
-    if let Some(finding) = acl::changeable_by_others_on(&handle, false)? {
+    if let Some(finding) = acl::changeable_by_others_on(handle, false)? {
         // The handle's own owner tells whether the system's class made the folder.
-        let cure = match owner_outside_class(&handle)? {
+        let cure = match owner_outside_class(handle)? {
             Some(owner) => ParentCure::Owned(owner),
             None => ParentCure::Correct(presence_of(&paths.data)),
         };
         // text: refusal_check_data_parent_at-1
         return Err(parent_refusal(paths, &finding.to_string(), cure));
     }
-    Ok(Some(handle))
+    Ok(())
 }
 
 fn presence_of(path: &Path) -> Presence {
@@ -683,20 +695,90 @@ pub struct DataHolds {
     /// what the purpose allows.
     purpose: Purpose,
     _parent: ffi::Handle,
-    /// Set where this run made the data directory: whether it made the folder above it too.
-    made: Option<Made>,
+    /// What this run made of the data directory's place, each object through the handle of the
+    /// call that made it. Empty where the directory and the folder above it were there.
+    made: Made,
     data: DirHandle,
     staging: Option<DirHandle>,
     journal: Option<DirHandle>,
     run: Option<DirHandle>,
 }
 
-/// What a run made of the data directory's place: the directory, and whether the folder above it
-/// too. A rollback that cannot read the directory again removes what the run made while it is
-/// empty.
-#[derive(Clone, Copy, Debug)]
+/// What a run made of the data directory's place, each object held through the handle of the call
+/// that made it, opened with the right to delete it. A cleanup marks these objects for removal
+/// through these handles and never by path, so that an object that was put at the path since (or a
+/// link) is never taken for what this run made. The handles are held until the first manifest is
+/// written: after that a removal finds the objects by the manifest.
+#[derive(Debug, Default)]
 struct Made {
-    parent: bool,
+    /// The folder above the data directory, where this run's own call made it.
+    parent: Option<ffi::Handle>,
+    /// The data directory, where this run's own call made it.
+    directory: Option<ffi::Handle>,
+}
+
+impl Made {
+    /// Whether this run made nothing of the data directory's place.
+    fn is_empty(&self) -> bool {
+        self.parent.is_none() && self.directory.is_none()
+    }
+
+    /// Marks what this run made for removal through its own handles: the data directory first, and
+    /// the folder above it where this run made that too once the directory is gone. Returns whether
+    /// the directory that this run made is gone (or was not made by it), and each object that
+    /// stays, with the platform's answer: a refused mark, or a folder that stays because the
+    /// directory in it stays.
+    fn take_away(&self, paths: &Paths) -> (bool, Vec<String>) {
+        let mut stayed = Vec::new();
+        let mut directory_gone = true;
+        if let Some(handle) = &self.directory
+            && let Err(failure) = super::root::delete(handle)
+        {
+            directory_gone = false;
+            stayed.push(format!(
+                "{} ({})",
+                paths.data.display(),
+                remedy::platform_error("the platform refused to mark it for removal", failure.code)
+            ));
+        }
+        if let Some(handle) = &self.parent {
+            if !directory_gone {
+                stayed.push(format!(
+                    "{} (the data directory in it stays)",
+                    paths.data_parent().display()
+                ));
+            } else if let Err(failure) = super::root::delete(handle) {
+                stayed.push(format!(
+                    "{} ({})",
+                    paths.data_parent().display(),
+                    remedy::platform_error(
+                        "the platform refused to mark it for removal",
+                        failure.code
+                    )
+                ));
+            }
+        }
+        (directory_gone, stayed)
+    }
+
+    /// The error of a step that failed after this run made something of the data directory's place,
+    /// with what was done about what it made: the words of the failure, then what was removed and
+    /// what stays. An error where this run made nothing is returned as it is.
+    fn after(&self, paths: &Paths, error: Error) -> Error {
+        if self.is_empty() {
+            return error;
+        }
+        let (directory_gone, stayed) = self.take_away(paths);
+        let ending = remedy::data_made_ending(directory_gone, &stayed);
+        let words = error.to_string();
+        if matches!(error, Error::Refused(_)) {
+            // text: made_after-1
+            Error::Refused(format!("{words} {ending}"))
+        } else {
+            // text: made_after-2
+            Error::Failed(format!("{words}. {ending}"))
+        }
+    }
 }
 
 impl std::fmt::Debug for DataHolds {
@@ -915,24 +997,14 @@ fn data_directory_reason(
     Ok(check_data_object(handle)?.map(|why| (why, origin_of(handle))))
 }
 
-/// The refusal of a data directory that this run made and then refused: the handles are closed, what
-/// the run made (the directory, and the folder above it where the run made that too) is removed
-/// while it holds nothing else, and the words say what was done and what could not be.
-fn refuse_made_data_directory(
-    paths: &Paths,
-    parent: ffi::Handle,
-    made: Option<ffi::Handle>,
-    why: &str,
-    parent_made: bool,
-) -> Error {
-    drop(made);
-    drop(parent);
-    let stayed = records::remove_made(&paths.data, parent_made.then(|| paths.data_parent()));
+/// The refusal of a data directory that this run made and then refused. The words that say what was
+/// done about what the run made, and what could not be, are added by [`Made::after`], which takes the
+/// objects away through the handles of the calls that made them.
+fn refuse_made_data_directory(paths: &Paths, why: &str) -> Error {
     // text: data_made_refusal-1
     Error::Refused(format!(
-        "{} is the boundary's data directory. This run made it, and it is refused because {why}. {}",
-        paths.data.display(),
-        remedy::data_made_ending(&stayed)
+        "{} is the boundary's data directory. This run made it, and it is refused because {why}.",
+        paths.data.display()
     ))
 }
 
@@ -1344,11 +1416,25 @@ fn held_directory(handle: ffi::Handle) -> Result<DirHandle, Error> {
 /// and never through a path, without following a reparse point: a link is opened as itself. With
 /// [`FILE_OPEN_IF`] a directory that is not there is made in the same call with `descriptor` as its
 /// own list, so that it is never there with a list it took from `parent`; with [`FILE_OPEN`] it is
-/// only opened. The handle shares read and write only, so nothing renames or deletes the directory
-/// while it is held. Returns the handle and whether this call made the directory, or none when
-/// [`FILE_OPEN`] found nothing.
+/// only opened, and with [`FILE_CREATE`] it is only made. The handle shares read and write only, so
+/// nothing renames or deletes the directory while it is held. Returns the handle and whether this
+/// call made the directory, or none when [`FILE_OPEN`] found nothing or [`FILE_CREATE`] found
+/// something there.
 fn open_directory_relative(
     parent: &ffi::Handle,
+    name: &OsStr,
+    disposition: u32,
+    descriptor: Option<&sd::OwnedSd>,
+    access: u32,
+) -> Result<Option<(ffi::Handle, bool)>, Error> {
+    open_directory_at(Some(parent), name, disposition, descriptor, access)
+}
+
+/// [`open_directory_relative`] with no parent handle where `name` is a full path in the platform's own
+/// form (`\??\C:\...`): the call that makes a directory returns the handle of the directory that it
+/// made. With [`FILE_CREATE`] the call only makes: it returns none where something was there already.
+fn open_directory_at(
+    parent: Option<&ffi::Handle>,
     name: &OsStr,
     disposition: u32,
     descriptor: Option<&sd::OwnedSd>,
@@ -1364,7 +1450,7 @@ fn open_directory_relative(
     };
     let attributes = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.raw(),
+        RootDirectory: parent.map_or(std::ptr::null_mut(), ffi::Handle::raw),
         ObjectName: &raw const text,
         Attributes: 0,
         SecurityDescriptor: descriptor
@@ -1401,18 +1487,26 @@ fn open_directory_relative(
         {
             return Ok(None);
         }
+        if disposition == FILE_CREATE && code == ERROR_ALREADY_EXISTS {
+            return Ok(None);
+        }
         // text: open_directory_relative-1
         return Err(ffi::error(
             code,
             format!(
-                "{} {} beneath a held directory",
+                "{} {}{}",
                 // With `FILE_OPEN_IF` the same call makes a directory that is not there.
-                if disposition == FILE_OPEN {
-                    "opening"
-                } else {
-                    "opening or making"
+                match disposition {
+                    FILE_OPEN => "opening",
+                    FILE_CREATE => "making",
+                    _ => "opening or making",
                 },
-                name.to_string_lossy()
+                name.to_string_lossy(),
+                if parent.is_some() {
+                    " beneath a held directory"
+                } else {
+                    ""
+                }
             ),
         )
         .into());
@@ -2683,36 +2777,60 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
     make_data_directory_for(paths, Purpose::Install)
 }
 
-/// [`make_data_directory`] for a run with this purpose.
+/// [`make_data_directory`] for a run with this purpose. What the run makes of the data directory's
+/// place is held through the handle of the call that made it. A failure after the first of those
+/// calls marks what the run made for removal through those handles, and the failure's words say what
+/// that did.
 fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds, Error> {
-    let (held, parent_made) = match check_data_parent(paths)? {
-        Some(held) => (held, false),
-        None => {
-            // The words say that this run made the folder only where its own call did: a folder
-            // that appeared between the look and the call is another program's, and the run has
-            // changed nothing yet.
-            let made = create_data_parent(paths.data_parent())?;
-            let stage = if made {
-                remedy::Stage::DataParentMade
-            } else {
-                remedy::Stage::Before
-            };
-            let held = check_data_parent_at(paths, stage)?.ok_or_else(|| {
+    let mut made = Made::default();
+    match open_data_directory(paths, purpose, &mut made) {
+        Ok((held, data, inspected)) => Ok(DataHolds {
+            paths: paths.clone(),
+            purpose,
+            _parent: held,
+            made,
+            data,
+            staging: inspected.staging,
+            journal: inspected.journal,
+            run: inspected.run,
+        }),
+        Err(error) => Err(made.after(paths, error)),
+    }
+}
+
+/// The folder above the data directory and the data directory, each held and checked, and what the
+/// directory holds. What this call makes is put in `made` as soon as its call returns, so that a
+/// failure of any step after it finds it there.
+fn open_data_directory(
+    paths: &Paths,
+    purpose: Purpose,
+    made: &mut Made,
+) -> Result<(ffi::Handle, DirHandle, Inspected), Error> {
+    let held = match check_data_parent(paths)? {
+        Some(held) => held,
+        None => match create_data_parent(paths.data_parent())? {
+            Some(created) => {
+                // The folder is checked on the handle of the call that made it, not opened again
+                // by its path: that handle can delete it, and an open that does not share delete
+                // would meet it. The copy that this run holds beneath it cannot delete it.
+                let copy = created.duplicate(LIST | FILE_ADD_SUBDIRECTORY);
+                made.parent = Some(created);
+                let held = copy?;
+                let stage = remedy::Stage::DataParentMade;
+                check_ancestors(paths.data_parent(), remedy::Tree::Data, stage)?;
+                check_data_parent_handle(paths, &held, stage)?;
+                held
+            }
+            // A folder that appeared between the look and the call is another program's: the run
+            // has changed nothing yet, and it is opened and checked like one that was there.
+            None => check_data_parent_at(paths, remedy::Stage::Before)?.ok_or_else(|| {
                 // text: make_data_directory-1
-                Error::Failed(if made {
-                    format!(
-                        "{} was made and is gone again",
-                        paths.data_parent().display()
-                    )
-                } else {
-                    format!(
-                        "something was at {} when this run tried to make it, and the open after that answered not found",
-                        paths.data_parent().display()
-                    )
-                })
-            })?;
-            (held, made)
-        }
+                Error::Failed(format!(
+                    "something was at {} when this run tried to make it, and the open after that answered not found",
+                    paths.data_parent().display()
+                ))
+            })?,
+        },
     };
     let name = paths
         .data
@@ -2720,18 +2838,38 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
         // text: make_data_directory-2
         .ok_or_else(|| Error::Failed("the data directory has no name".to_owned()))?;
     let descriptor = data_descriptor()?;
-    // A directory that is there is opened, one that is not is made with the descriptor, and a link
-    // is opened as the link and refused below.
-    let (made, created) = open_directory_relative(
-        &held,
-        name,
-        FILE_OPEN_IF,
-        Some(&descriptor),
-        LIST | WRITE_DAC,
-    )?
-    // text: make_data_directory-3
-    .ok_or_else(|| Error::Failed("the data directory was made and is gone again".to_owned()))?;
-    let verdict = data_directory_reason(paths, &made);
+    // A directory that is there is opened with no right to delete it (a running broker may hold it
+    // without sharing delete), and a link is opened as the link and refused below. One that is not
+    // there is made with the descriptor, through a handle that can mark it for removal.
+    let (opened, created) =
+        match open_directory_relative(&held, name, FILE_OPEN, None, LIST | WRITE_DAC)? {
+            Some(found) => found,
+            None => match open_directory_relative(
+                &held,
+                name,
+                FILE_CREATE,
+                Some(&descriptor),
+                LIST | WRITE_DAC | DELETE,
+            )? {
+                Some(made_here) => made_here,
+                // Another program made it between the two calls: it is opened, and was not made here.
+                None => open_directory_relative(&held, name, FILE_OPEN, None, LIST | WRITE_DAC)?
+                    .ok_or_else(|| {
+                        // text: make_data_directory-3
+                        Error::Failed("the data directory was made and is gone again".to_owned())
+                    })?,
+            },
+        };
+    // A directory that this run made is held through the handle of the call, which stays in `made`.
+    // The handle that the checks and the steps use is a copy that cannot delete it.
+    let handle = if created {
+        let copy = opened.duplicate(LIST | WRITE_DAC);
+        made.directory = Some(opened);
+        copy?
+    } else {
+        opened
+    };
+    let verdict = data_directory_reason(paths, &handle);
     if created {
         // A directory that this run made and then refuses is taken away again, with the folder
         // above it where the run made that too, so the refusal leaves nothing of the run behind
@@ -2742,13 +2880,7 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
             Err(error) => Some(format!("a read of it failed ({error})")),
         };
         if let Some(why) = why {
-            return Err(refuse_made_data_directory(
-                paths,
-                held,
-                Some(made),
-                &why,
-                parent_made,
-            ));
+            return Err(refuse_made_data_directory(paths, &why));
         }
     } else {
         match verdict {
@@ -2759,15 +2891,12 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
     }
     // The reads of the directory's identity, its attributes and its final path are inside the
     // cleanup's reach where this run made it: a failed read leaves nothing of the run behind.
-    let data = match held_directory(made) {
+    let data = match held_directory(handle) {
         Ok(data) => data,
         Err(error) if created => {
             return Err(refuse_made_data_directory(
                 paths,
-                held,
-                None,
                 &format!("a read of it failed ({error})"),
-                parent_made,
             ));
         }
         Err(error) => return Err(error),
@@ -2784,42 +2913,42 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
     } else {
         inspect_data_directory(paths, purpose, &data)?
     };
-    Ok(DataHolds {
-        paths: paths.clone(),
-        purpose,
-        _parent: held,
-        made: created.then_some(Made {
-            parent: parent_made,
-        }),
-        data,
-        staging: inspected.staging,
-        journal: inspected.journal,
-        run: inspected.run,
-    })
+    Ok((held, data, inspected))
 }
 
-/// Makes the folder above the data directory with the protected list, in one call. Returns whether
-/// this call made it: a folder that appeared between the look and the call is opened and checked
-/// next, and was not made here.
-fn create_data_parent(parent: &Path) -> Result<bool, Error> {
+/// Makes the folder above the data directory with the protected list, in one call that returns the
+/// handle of the folder that it made. The handle is open with the right to delete the folder and
+/// shares read and write only, so that nothing renames or deletes the folder while it is held.
+/// Returns none where something was there already: a folder that appeared between the look and the
+/// call is opened and checked next, and was not made here.
+fn create_data_parent(parent: &Path) -> Result<Option<ffi::Handle>, Error> {
     let descriptor = sd::descriptor(SdKind::DataParent, &Principals::default())?;
-    let attributes = descriptor.attributes();
-    let wide = ffi::wide_path(parent);
-    // SAFETY: the path is NUL-terminated and the attributes point at a descriptor that lives
-    // through the call.
-    if unsafe { CreateDirectoryW(wide.as_ptr(), &raw const attributes) } == 0 {
-        // SAFETY: reads the calling thread's last error.
-        let code = unsafe { GetLastError() };
-        if code != ERROR_ALREADY_EXISTS {
-            // text: create_data_parent-1
-            return Err(Error::Failed(format!(
-                "making {}: Windows error {code}",
-                parent.display()
-            )));
-        }
-        return Ok(false);
-    }
-    Ok(true)
+    // The platform's own form of an absolute path on a drive: `\??\` before the path, which the
+    // call takes whole where it has no directory to be relative to.
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let units: Vec<u16> = parent
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                unit
+            }
+        })
+        .collect();
+    let rest = units.strip_prefix(verbatim.as_slice()).unwrap_or(&units);
+    let name = OsString::from_wide(
+        &[r"\??\".encode_utf16().collect::<Vec<u16>>(), rest.to_vec()].concat(),
+    );
+    Ok(open_directory_at(
+        None,
+        &name,
+        FILE_CREATE,
+        Some(&descriptor),
+        LIST | FILE_ADD_SUBDIRECTORY | DELETE,
+    )?
+    .map(|(handle, _)| handle))
 }
 
 /// Reads the state of every kind of application control and refuses when any is in force. Anything
@@ -3107,8 +3236,6 @@ fn sha256_of(path: &Path) -> Result<String, Error> {
 struct Run {
     paths: Paths,
     manifest: Manifest,
-    /// What this run made of the data directory's place, once it made it.
-    made: Option<Made>,
 }
 
 impl Run {
@@ -3240,7 +3367,6 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
     let mut run = Run {
         paths: paths.clone(),
         manifest,
-        made: None,
     };
     if !run.manifest.persons.contains(&person) {
         run.manifest.persons.push(person);
@@ -3265,33 +3391,11 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
                 say(&format!(
                     "the removal after the failure also failed: {error}"
                 ));
-                if let Some(made) = run.made {
-                    remove_what_the_run_made(paths, made);
-                }
             }
         }
         return Err(failure);
     }
     Ok(())
-}
-
-/// What a rollback that did not finish does with the data directory that this run made: the
-/// directory goes while it is empty, and the folder above it too where the run made that. The
-/// removal's own inspection may be what failed (a read of the directory that cannot be repeated),
-/// and the identity that it would show cannot be read then, so the removal goes by the path that the
-/// run made and only while nothing is in it.
-fn remove_what_the_run_made(paths: &Paths, made: Made) {
-    let stayed = records::remove_made(&paths.data, made.parent.then(|| paths.data_parent()));
-    if stayed.is_empty() {
-        // text: install-8
-        say("the data directory that this run made is not there now");
-    } else {
-        // text: install-9
-        say(&format!(
-            "the data directory that this run made stays: {}",
-            stayed.join("; ")
-        ));
-    }
 }
 
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
@@ -3307,13 +3411,20 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             Purpose::Install
         },
     )?;
-    run.made = holds.made;
-    holds.protect()?;
+    // Until the first manifest is written a removal finds nothing of what this run made, so a failure
+    // of the next two steps takes it away through the handles that made it.
+    holds
+        .protect()
+        .map_err(|error| holds.made.after(&paths, error))?;
     run.record(
         ObjectKind::Directory,
         &paths.data.display().to_string(),
         None,
-    )?;
+    )
+    .map_err(|error| holds.made.after(&paths, error))?;
+    // The manifest records the directory now: a removal finds it by the manifest, and the handles
+    // that could mark what this run made for removal are closed.
+    holds.made = Made::default();
     // The staging directory, the journal and the parent of the private roots: administrators and
     // the system only, so no boundary token can list, create in or delete from any of them. Each is
     // recorded before it is made.
