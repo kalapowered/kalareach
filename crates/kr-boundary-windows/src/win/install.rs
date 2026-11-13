@@ -594,6 +594,7 @@ fn entered(paths: &Paths, purpose: Purpose) -> Result<Entry, Error> {
 /// Makes a directory with its descriptor unless one is there: what is there was checked on its
 /// handle when the installation was entered.
 fn made_if_missing(path: &Path, readable: &Principals, what: &str) -> Result<(), Error> {
+    // Base: `path` is a full path that the caller built from `Paths`, which `Paths::system` makes from the system's known folders; the call resolves it from the volume's root and never against the current directory
     if path
         .try_exists()
         // text: made_if_missing-1
@@ -608,7 +609,7 @@ fn made_if_missing(path: &Path, readable: &Principals, what: &str) -> Result<(),
 /// a file that an earlier run of this installation put there was checked on its handle when the
 /// installation was entered, and is overwritten as it is, keeping the descriptor that was checked.
 fn install_program_file(source: &Path, target: &Path) -> io::Result<()> {
-    // Base: `source` is a file of the payload directory that the caller names and `target` a file of the program directory, each a full path; neither is resolved against the current directory
+    // Base: `source` is the staged copy of a payload file, in the staging directory, and `target` a file of the program directory, each a full path that the caller built from `Paths`; neither is resolved against the current directory
     let mut from = fs::File::open(source)?;
     let there = target.try_exists().map_err(|error| {
         io::Error::new(
@@ -3763,7 +3764,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
     let mut staged = Vec::new();
     for name in [BROKER, CREDENTIAL] {
         let source = payload.join(name);
-        // Base: `payload` is the payload directory that the caller names, a full path; the name beneath it is a bare file name
+        // Base: `payload` is the payload directory as the setup arguments give it, which is accepted unchanged and can be a relative path, so it is resolved against the process's current directory then; the name beneath it is a bare file name
         let metadata = fs::symlink_metadata(&source).map_err(|error| {
             // text: stage_payload-1
             Error::Refused(remedy::payload_file_not_reached(
@@ -3780,7 +3781,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
                 source.display()
             )));
         }
-        // Base: `source`, the payload file named above, a full path
+        // Base: `source`, the payload file named above: `payload` joined with a bare file name, a relative path where `payload` is one
         let mut handle = OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -4195,7 +4196,16 @@ impl Run {
         // The folder above the program directory, only where this run's own call made it: it goes
         // once the program directory is gone, and stays where it holds anything else.
         if let Some(folder) = self.paths.program.parent() {
-            take(object(program_folder), folder, false);
+            let path = folder.display().to_string();
+            match object(program_folder) {
+                Some(Taken::Marked) => rolled.marked.push(path),
+                // A folder that stays is not in the data directory's place: it has a clause of its
+                // own in the ending.
+                Some(taken @ (Taken::NotFound | Taken::Stays(_) | Taken::Unconfirmed(_))) => {
+                    rolled.folder.extend(remedy::rollback_entry(&taken, &path));
+                }
+                Some(Taken::NotMade) | None => {}
+            }
         }
         drop(directory);
         let (directory, folder) = made.take_away();
@@ -4224,6 +4234,9 @@ struct Rolled {
     marked: Vec<String>,
     /// Each object that stays or whose name was not found, with the words of the call that failed.
     stayed: Vec<String>,
+    /// The folder above the program directory, where this run made it and it stays or was not
+    /// found: apart from `stayed`, since it is not in the data directory's place.
+    folder: Vec<String>,
     /// Whether the run wrote records and the rollback marked each of them.
     records_deleted: bool,
 }
@@ -4685,6 +4698,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         &empty_config.display().to_string(),
         Some(&hex::encode(Sha256::digest(b""))),
     )?;
+    // Base: `empty_config` is the full path of a file beneath `paths.git`, which `Paths::system` makes from the system's known folders; the call resolves it from the volume's root and never against the current directory
     if !empty_config
         .try_exists()
         // text: install_lay_down-4
@@ -6218,7 +6232,7 @@ fn undo_recorded(
                 // directory's own removal names it.
                 run.sweep(Layout::Staging);
                 let rolled = run.take_away();
-                if rolled.stayed.is_empty() {
+                if rolled.stayed.is_empty() && rolled.folder.is_empty() {
                     // text: remove_at-28
                     say(&format!(
                         "{}{unread_prior}",
@@ -6229,6 +6243,7 @@ fn undo_recorded(
                     // text: remove_at-27
                     Err(Error::Failed(remedy::rollback_laid_stays(
                         &rolled.stayed,
+                        &rolled.folder,
                         &rolled.marked,
                     )))
                 }
@@ -7319,6 +7334,25 @@ mod tests {
             "{rolled:?}"
         );
         assert!(!folder.try_exists().unwrap());
+        // Where another process put an entry in the folder, it stays with a clause of its own and is
+        // not counted in the data directory's place.
+        let mut run = laid_run(top.path());
+        run.paths.program = folder.join("program");
+        let object = create_folder_above(&folder, SdKind::AdminDir, &readable)
+            .unwrap()
+            .unwrap();
+        ffi::locked(&run.laid).program_folder = Some(object);
+        std::fs::write(folder.join("other.txt"), b"x").unwrap();
+        let rolled = run.take_away();
+        assert!(rolled.stayed.is_empty(), "{rolled:?}");
+        assert_eq!(rolled.folder.len(), 1, "{rolled:?}");
+        assert!(
+            rolled.folder[0].starts_with(&folder.display().to_string()),
+            "{rolled:?}"
+        );
+        assert!(is_folder(&folder));
+        std::fs::remove_file(folder.join("other.txt")).unwrap();
+        std::fs::remove_dir(&folder).unwrap();
         // Where the folder stood before the run, the run holds nothing of it and it stays.
         let mut run = laid_run(top.path());
         run.paths.program = folder.join("program");
