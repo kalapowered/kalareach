@@ -1490,6 +1490,9 @@ fn open_directory_at(
         if disposition == FILE_CREATE && code == ERROR_ALREADY_EXISTS {
             return Ok(None);
         }
+        // The name that has no parent is a path in the platform's own form, shown in the usual one.
+        let shown = name.to_string_lossy();
+        let shown = shown.strip_prefix(r"\??\").unwrap_or(&shown);
         // text: open_directory_relative-1
         return Err(ffi::error(
             code,
@@ -1501,7 +1504,7 @@ fn open_directory_at(
                     FILE_CREATE => "making",
                     _ => "opening or making",
                 },
-                name.to_string_lossy(),
+                shown,
                 if parent.is_some() {
                     " beneath a held directory"
                 } else {
@@ -1512,7 +1515,14 @@ fn open_directory_at(
         .into());
     }
     // text: install_open_directory_relative-1
-    let handle = ffi::Handle::new(raw, "opening a directory beneath a held directory")?;
+    let handle = ffi::Handle::new(
+        raw,
+        if parent.is_some() {
+            "opening a directory beneath a held directory"
+        } else {
+            "opening a directory by its full path"
+        },
+    )?;
     Ok(Some((handle, status_block.Information == FILE_CREATED)))
 }
 
@@ -2761,8 +2771,8 @@ fn inspect_existing_data(
 /// Holds the folder above the data directory, made first when it is not there, and makes the data
 /// directory beneath it, relative to the held folder, in one call that carries the directory's own
 /// protected list, so that it is never there with the list it would take from the folder. The
-/// folder is made in one call that carries its protected list, and is then opened and checked like
-/// one that was there. A data directory that is already there is not trusted for being there: its
+/// folder is made in one call that carries its protected list, and is then checked like one that
+/// was there, on the handle of the call that made it. A data directory that is already there is not trusted for being there: its
 /// owner and its list are read on the handle that opened it and must be the installation's own, a
 /// link is refused, and every entry in it must be one the installation made, each checked on its
 /// own handle (its owner, every entry of its list, no link, one name for a file). The handles are returned, so the folder that passed
@@ -2774,7 +2784,13 @@ fn inspect_existing_data(
 /// Returns [`Error::Refused`] naming the reason when the folder, the directory or anything in it is
 /// not the installation's own, and the platform's error when a call fails.
 pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
-    make_data_directory_for(paths, Purpose::Install)
+    let mut holds = make_data_directory_for(paths, Purpose::Install)?;
+    // The handles that can mark what the run made for removal belong to an installation run, which
+    // holds them until its first manifest is written. This entry returns the holds without them: a
+    // caller that opens the folder or the directory by a path meets no handle that has the right to
+    // delete it.
+    holds.made = Made::default();
+    Ok(holds)
 }
 
 /// [`make_data_directory`] for a run with this purpose. What the run makes of the data directory's
