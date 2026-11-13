@@ -230,6 +230,7 @@ kernel_storage_errors() {
     read_ok=0
     for attempt in sudo plain; do
         if [ "$attempt" = sudo ]; then
+            # shellcheck disable=SC2024 # the runner's own shell writes the file, in its directory
             sudo -n /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate" > "$out" 2> /dev/null &
         else
             /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate" > "$out" 2> /dev/null &
