@@ -73,12 +73,13 @@ struct Created {
 
 /// A host tree, its daemon, and the sessions this test created in it.
 struct Host {
-    temp: kr_ipc::testing::TempHost,
     work: PathBuf,
     home: PathBuf,
     _controller: Option<Arc<Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     created: Mutex<Vec<Created>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 /// Whether the process `pid` has ended: it is gone, or it is a zombie nobody has waited for. Asked

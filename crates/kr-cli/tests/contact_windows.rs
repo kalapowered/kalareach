@@ -55,13 +55,14 @@ const PATIENCE: Duration = Duration::from_secs(60);
 ///
 /// The host tree is shared, so a second session can be started in the same environment.
 struct Hosted {
-    temp: Arc<kr_ipc::testing::TempHost>,
     session_id: SessionId,
     descriptor: WorkerDescriptor,
     journal: PathBuf,
     binary: PathBuf,
     client: RunningService<rmcp::RoleClient, ()>,
     service: Arc<WorkerService>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: Arc<kr_ipc::testing::TempHost>,
 }
 
 impl Drop for Hosted {

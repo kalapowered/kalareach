@@ -124,7 +124,6 @@ fn terminal(session_id: SessionId) -> SessionAttachParams {
 /// write deadlines therefore never pass because the case was slow to answer on a loaded machine,
 /// and a case that is about a deadline passing says so with [`Wired::pass`].
 struct Wired {
-    _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
     _serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
     _bridge_task: tokio::task::JoinHandle<()>,
@@ -134,6 +133,8 @@ struct Wired {
     endpoint: kr_ipc::paths::Endpoint,
     bridge: ScriptedBridge,
     clock: Arc<kr_transport::clock::ManualClock>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Wired {
@@ -202,7 +203,6 @@ impl Wired {
 /// point: what a client's own request releases has to reach the terminal on that request's own
 /// boundary, and a bridge timer running beside it would hide whether it did.
 struct Unpumped {
-    _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
     _serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
     runtime: Arc<SessionRuntime>,
@@ -210,6 +210,8 @@ struct Unpumped {
     environment_id: kr_protocol::ids::EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     clock: Arc<kr_transport::clock::ManualClock>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Unpumped {
@@ -2708,7 +2710,6 @@ async fn a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_sti
 /// A real qualified package launched as this host's root shell, registered and qualified on the
 /// host's own endpoint.
 struct RealShell {
-    _temp: kr_ipc::testing::TempHost,
     /// The shell's home, which is also the directory it starts in, kept for as long as it runs.
     _home: tempfile::TempDir,
     runtime: Arc<SessionRuntime>,
@@ -2719,6 +2720,8 @@ struct RealShell {
     kind: ShellKind,
     /// The shell the session qualified as, once it has: not yet while a profile is still asking.
     qualified: Option<ShellKind>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl RealShell {

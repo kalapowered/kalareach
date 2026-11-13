@@ -242,7 +242,6 @@ fn approval_table() -> DeclarativeTable {
 /// A worker serving one session, with one instance whose package's decoder may interpret and
 /// answer approval requests, and the native connection its requests arrive on.
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -258,6 +257,8 @@ struct Host {
     observations: Option<Observations>,
     /// The delivery of those transitions to the session's views, once it has started.
     delivering: Option<tokio::task::JoinHandle<()>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Host {

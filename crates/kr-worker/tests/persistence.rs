@@ -50,7 +50,6 @@ use common::{carried_times, carries, produced, retained};
 // ---------------------------------------------------------------------------------------------
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     #[cfg_attr(not(unix), allow(dead_code))]
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
@@ -58,6 +57,8 @@ struct Host {
     journal_path: std::path::PathBuf,
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: kr_protocol::ids::EnvironmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

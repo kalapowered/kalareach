@@ -132,13 +132,14 @@ fn bundled(also: &[PluginCapability]) -> Vec<(String, ConnectorSource)> {
 /// A host tree with the shipped packages admitted, and one session's adoptions on a broker of its
 /// own.
 struct Setup {
-    host: kr_ipc::testing::TempHost,
     broker: Arc<Broker>,
     adoptions: Adoptions,
     /// The connectors the worker installed from what it admitted: what a session's command
     /// integrations are looked up in.
     sources: ConnectorSources,
     packages: Vec<(String, ConnectorSource)>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: kr_ipc::testing::TempHost,
 }
 
 impl Setup {

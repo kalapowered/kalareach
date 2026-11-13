@@ -40,10 +40,11 @@ const ECHOES_ITS_INPUT: &str = "stty raw -echo; printf 'kr-ready.'; exec cat";
 
 /// A session this test hosts, with its descriptor published where `kr` will find it.
 struct Hosted {
-    temp: kr_ipc::testing::TempHost,
     display: DisplayNumber,
     runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 /// A directory of files a session's application waits on, so this test decides when it acts.
 ///

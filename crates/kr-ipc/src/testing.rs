@@ -63,9 +63,10 @@ pub const UNANSWERED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
 /// nothing else did.
 #[derive(Debug)]
 pub struct TempHost {
-    root: PrivateTempDir,
     paths: HostPaths,
     environment_id: EnvironmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    root: PrivateTempDir,
 }
 
 impl TempHost {

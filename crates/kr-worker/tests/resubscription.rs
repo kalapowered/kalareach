@@ -64,12 +64,13 @@ const REPLACING: u64 = 1000;
 
 /// A session this test hosts, served on its own endpoint.
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Host {

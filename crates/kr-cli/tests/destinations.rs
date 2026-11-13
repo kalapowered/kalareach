@@ -53,10 +53,11 @@ impl WorkerSupervisor for NoWorkers {
 
 /// A host tree and its running daemon.
 struct Host {
-    temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
     work: tempfile::TempDir,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Host {

@@ -62,7 +62,6 @@ impl WorkerSupervisor for RefusingSupervisor {
 }
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     voice: Arc<kr_controller::voice::VoiceModule>,
     environment_id: EnvironmentId,
@@ -71,6 +70,8 @@ struct Host {
     device_id: DeviceId,
     device_key: AuthorisationKeyPair,
     session_id: SessionId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

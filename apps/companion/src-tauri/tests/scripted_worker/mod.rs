@@ -120,8 +120,6 @@ static NEXT_DISPLAY: AtomicU64 = AtomicU64::new(1);
 
 /// One scripted worker, the host tree it is published in and the connections views open to it.
 pub struct ScriptedWorker {
-    /// The host tree, when this worker was started in one of its own.
-    host: Option<TempHost>,
     environment: EnvironmentPaths,
     environment_id: EnvironmentId,
     pub session_id: SessionId,
@@ -132,6 +130,9 @@ pub struct ScriptedWorker {
     /// Connections the view closed while the worker held them before the view could attach.
     abandoned: tokio::sync::mpsc::UnboundedReceiver<()>,
     serving: tokio::task::JoinHandle<()>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    /// The host tree, when this worker was started in one of its own.
+    host: Option<TempHost>,
 }
 
 impl Drop for ScriptedWorker {

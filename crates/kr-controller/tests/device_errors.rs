@@ -40,8 +40,9 @@ struct World {
     host: Host,
     device: RawDevice,
     home: PathBuf,
-    _scratch: kr_ipc::testing::PrivateTempDir,
     _paired: Device,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _scratch: kr_ipc::testing::PrivateTempDir,
 }
 
 impl World {

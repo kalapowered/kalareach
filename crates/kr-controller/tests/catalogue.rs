@@ -51,12 +51,13 @@ async fn put_allowed(
 }
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     module: CatalogueModule,
     environment_id: EnvironmentId,
     working: std::path::PathBuf,
     _working_temp: tempfile::TempDir,
     ceremony: Ceremony,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Host {

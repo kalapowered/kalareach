@@ -34,7 +34,6 @@ use kr_worker::session::{Session, SessionConfig};
 const LIVENESS: Duration = Duration::from_secs(30);
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
     _runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -42,6 +41,8 @@ struct Host {
     endpoint: kr_ipc::paths::Endpoint,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

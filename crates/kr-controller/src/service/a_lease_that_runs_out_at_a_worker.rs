@@ -122,8 +122,6 @@ where
 
 /// One daemon and one real worker on a clock the test moves.
 struct World {
-    _daemon_tree: kr_ipc::testing::TempHost,
-    _worker_tree: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     clock: ManualClock,
     runtime: Arc<SessionRuntime>,
@@ -151,6 +149,9 @@ struct World {
     actor: ActorEnvelope,
     /// The action forwarded last, which the worker's receipt for it says what became of.
     last_action: Option<ActionId>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _daemon_tree: kr_ipc::testing::TempHost,
+    _worker_tree: kr_ipc::testing::TempHost,
 }
 
 /// Starts the daemon and the worker on one manual clock, with the worker's serial boundary free

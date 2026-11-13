@@ -64,7 +64,6 @@ impl WorkerSupervisor for RendezvousSupervisor {
 
 /// A daemon on a tree of its own, asked for workers through [`RendezvousSupervisor`].
 struct Daemon {
-    temp: kr_ipc::testing::TempHost,
     client_endpoint: kr_ipc::paths::Endpoint,
     rendezvous_endpoint: kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
@@ -72,6 +71,8 @@ struct Daemon {
     refuse: Arc<std::sync::atomic::AtomicBool>,
     controller: Arc<Controller>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 async fn daemon() -> Daemon {

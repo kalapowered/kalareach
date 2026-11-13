@@ -380,7 +380,6 @@ async fn answer(
 
 /// One worker service with a real session behind it, and the daemon identity to forward through.
 struct Wired {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -391,6 +390,8 @@ struct Wired {
     /// The root shell's side of a managed session's bridge, which this test plays, and the task
     /// serving the worker's side. Neither exists for an unmanaged session.
     bridge: Option<(ScriptedBridge, tokio::task::JoinHandle<()>)>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Wired {

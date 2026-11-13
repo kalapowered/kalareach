@@ -188,7 +188,6 @@ fn approval_table() -> DeclarativeTable {
 
 /// A worker serving one session, with one instance whose native requests the broker holds.
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -200,6 +199,8 @@ struct Host {
     boot: kr_protocol::identity::BootIdentity,
     /// The native connection the requests arrive on.
     connection: GatewayConnectionId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Host {

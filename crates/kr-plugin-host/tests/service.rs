@@ -99,9 +99,10 @@ fn component(name: &str) -> Option<Vec<u8>> {
 
 /// A host tree on the internal disk, with the plugin host executable beside it.
 struct Host {
-    temp: kr_ipc::testing::TempHost,
     plugin_host: PathBuf,
     packages: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Host {

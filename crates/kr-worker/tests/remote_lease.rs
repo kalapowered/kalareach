@@ -48,13 +48,14 @@ const WAIT: Duration = Duration::from_secs(60);
 const TWO_MINUTES_MS: u64 = 120_000;
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
     environment_id: kr_protocol::ids::EnvironmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

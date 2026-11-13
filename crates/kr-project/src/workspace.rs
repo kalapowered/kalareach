@@ -1361,11 +1361,12 @@ mod tests {
     /// Two files in a source directory, a destination beside it, and the entries that include both.
     #[cfg(unix)]
     struct Copying {
-        _root: kr_ipc::testing::PrivateTempDir,
         to: std::path::PathBuf,
         source: AuthorisedDirectory,
         destination: AuthorisedDirectory,
         entries: Vec<SurveyEntry>,
+        // Declared last: the directory is removed after every field above has let go of its files.
+        _root: kr_ipc::testing::PrivateTempDir,
     }
 
     #[cfg(unix)]

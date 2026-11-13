@@ -68,13 +68,14 @@ const SECOND: u32 = 4;
 /// A managed session this test hosts, with its descriptor published where the application finds it
 /// and its reader scripted by this test.
 struct Hosted {
-    temp: kr_ipc::testing::TempHost,
     session_id: SessionId,
     runtime: Arc<SessionRuntime>,
     bridge: ScriptedBridge,
     _service: Arc<WorkerService>,
     serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
     bridge_task: tokio::task::JoinHandle<()>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Hosted {

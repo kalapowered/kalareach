@@ -1693,12 +1693,13 @@ impl crate::bridge::store::Observer for SteppedPlatform {
 /// A daemon with three enrolled environments and one connection, for tests of what a fence that
 /// lands while an environment refresh runs stops.
 struct Refreshing {
-    temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     carried: crate::authority::AdmittedMutation,
     actor_id: ActorId,
     connection_id: ConnectionId,
     clock: ManualClock,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Refreshing {

@@ -14,9 +14,10 @@ use kr_protocol::frame::StreamKind;
 
 /// A connection over a real local endpoint, as its two ends hold it.
 struct Pair {
-    _tree: kr_ipc::testing::TempHost,
     server: (FrameReader, FrameWriter),
     client: (FrameReader, FrameWriter),
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _tree: kr_ipc::testing::TempHost,
 }
 
 async fn pair() -> Pair {
@@ -285,9 +286,10 @@ const ROUNDS: usize = 5_000;
 /// A listener that serves one connection after another, for a case that needs many.
 #[cfg(unix)]
 struct Rounds {
-    _tree: kr_ipc::testing::TempHost,
     endpoint: kr_ipc::paths::Endpoint,
     listener: Listener,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _tree: kr_ipc::testing::TempHost,
 }
 
 /// One connection, as its two ends hold it.

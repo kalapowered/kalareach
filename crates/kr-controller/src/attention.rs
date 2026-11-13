@@ -5582,12 +5582,13 @@ pub(crate) mod tests {
     /// process, so what it was asked for is what the test reads from it, and what has been written
     /// is what the test puts in the store.
     struct Summarised {
-        temp: kr_ipc::testing::TempHost,
         module: Arc<AttentionModule>,
         descriptions: Arc<crate::describe::DescribeModule>,
         host: crate::describe::host::tests::ByHand,
         privacy: crate::privacy::PrivacyState,
         session_id: SessionId,
+        // Declared last: the directory is removed after every field above has let go of its files.
+        temp: kr_ipc::testing::TempHost,
     }
 
     impl Summarised {

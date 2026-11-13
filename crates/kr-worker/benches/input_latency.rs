@@ -150,12 +150,13 @@ fn build() -> BuildId {
 }
 
 struct Hosted {
-    _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Hosted {

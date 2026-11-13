@@ -348,8 +348,6 @@ fn read_in_the_background(
 
 /// A host of this test's own: its tree, the worker it starts, and its control daemon.
 struct Host {
-    /// The runtime and state directories, held in an option so a failed test can keep them.
-    temp: Option<kr_ipc::testing::TempHost>,
     /// The directory every session's shell starts in. The scripted agent and its gates are here.
     work: PathBuf,
     /// The home directory every process this test starts is given, so none of them reads the
@@ -361,6 +359,9 @@ struct Host {
     started: Mutex<Vec<(ProcessStartIdentity, String)>>,
     /// Reads of the worker and the daemon over their local endpoints.
     runtime: tokio::runtime::Runtime,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    /// The runtime and state directories, held in an option so a failed test can keep them.
+    temp: Option<kr_ipc::testing::TempHost>,
 }
 
 impl Host {

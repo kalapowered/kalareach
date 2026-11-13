@@ -40,10 +40,11 @@ use support::terminal::{self, Answering, Collected, Keys};
 
 /// A session this test hosts, with its descriptor published where `kr` will find it.
 struct Hosted {
-    temp: kr_ipc::testing::TempHost,
     display: DisplayNumber,
     runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 async fn hosted(script: &str) -> Hosted {

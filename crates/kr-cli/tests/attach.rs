@@ -37,12 +37,13 @@ use support::{close_plants, command_binaries, kr, kr_attach_guard};
 
 /// A session this test hosts, with its descriptor published where `kr` will find it.
 struct Hosted {
-    temp: kr_ipc::testing::TempHost,
     session_id: SessionId,
     display: DisplayNumber,
     descriptor: WorkerDescriptor,
     runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 /// Returns the one terminal attachment a hosted session has.
 ///

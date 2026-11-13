@@ -101,12 +101,13 @@ impl Drop for Hold {
 
 /// A host tree of its own, with the forwarder copied into it.
 pub struct Placed {
-    /// The tree, removed when this is dropped.
-    pub host: kr_ipc::testing::TempHost,
     /// The copy of the forwarder a test starts.
     pub forwarder: PathBuf,
     /// Where a program placed and run one at a time is held to that; ended after the tree.
     _hold: Option<Hold>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    /// The tree, removed when this is dropped.
+    pub host: kr_ipc::testing::TempHost,
 }
 
 impl Placed {

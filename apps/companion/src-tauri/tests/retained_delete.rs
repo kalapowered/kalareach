@@ -160,7 +160,6 @@ impl Confirm for Person {
 /// A host that has made two backups and published them, an application connected to it, and the
 /// storage service the backups are at.
 struct Rig {
-    host: kr_ipc::testing::TempHost,
     served: Served,
     controller: Arc<Controller>,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
@@ -168,6 +167,8 @@ struct Rig {
     connection: Connection,
     /// This computer's settings and the sync that keeps copies at the service, which hold none here.
     settings: Settings,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Rig {

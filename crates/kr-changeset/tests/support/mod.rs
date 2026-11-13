@@ -30,10 +30,11 @@ use kr_protocol::scalars::Nullable;
 
 /// A host tree with both services open on it.
 pub struct Fixture {
-    host: TempHost,
     project: Arc<ProjectService>,
     changesets: ChangeSetService,
     work: tempfile::TempDir,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: TempHost,
 }
 
 impl Fixture {

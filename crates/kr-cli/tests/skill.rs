@@ -113,11 +113,12 @@ impl Drop for Daemon {
 
 /// The tree, the copied commands and the daemon one test runs against.
 struct Setup {
-    host: kr_ipc::testing::TempHost,
     kr: PathBuf,
     home: PathBuf,
     project: PathBuf,
     _daemon: Daemon,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: kr_ipc::testing::TempHost,
 }
 
 impl Setup {

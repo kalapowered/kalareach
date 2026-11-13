@@ -257,9 +257,10 @@ mod tests {
 
     /// A host started over an earlier build's state directory and device store.
     struct Host {
-        temp: kr_ipc::testing::TempHost,
         wall: Arc<AtomicU64>,
         boot_clock: ManualSharedClock,
+        // Declared last: the directory is removed after every field above has let go of its files.
+        temp: kr_ipc::testing::TempHost,
     }
 
     impl Host {

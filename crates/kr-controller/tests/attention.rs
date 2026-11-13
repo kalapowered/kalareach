@@ -56,7 +56,6 @@ use kr_worker::session::{Session, SessionConfig};
 // ---------------------------------------------------------------------------------------------
 
 struct Worker {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     session_id: SessionId,
     journal_path: PathBuf,
@@ -66,6 +65,8 @@ struct Worker {
     /// The task that serves the worker's endpoint, which a restart ends.
     #[cfg_attr(not(unix), allow(dead_code))]
     serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {
@@ -3993,13 +3994,14 @@ async fn a_daemon_that_stops_before_the_journal_is_told_leaves_the_next_to_tell_
 /// read through `recorded`, where `first` was enabled again. `third` and then `second` were paused
 /// in between, with a run's events among them.
 struct RolledBack {
-    temp: kr_ipc::testing::TempHost,
     journal: Arc<kr_automation::WorkflowStore>,
     first: WorkflowDefinition,
     second: WorkflowDefinition,
     third: WorkflowDefinition,
     kept: u64,
     recorded: u64,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 async fn rolled_back() -> RolledBack {

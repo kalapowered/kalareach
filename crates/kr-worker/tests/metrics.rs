@@ -41,9 +41,10 @@ fn session_id() -> SessionId {
 
 /// A worker service over a live session whose root shell runs `script`.
 struct World {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl World {

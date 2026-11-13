@@ -1662,7 +1662,6 @@ async fn nothing_journals_a_keystroke_and_reaching_the_terminal_is_not_an_effect
 // ---------------------------------------------------------------------------------------------
 
 struct Wired {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -1672,6 +1671,8 @@ struct Wired {
     controller: Arc<ControllerIdentity>,
     /// The boot identity a generation token is signed over.
     boot: kr_protocol::identity::BootIdentity,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Wired {

@@ -68,10 +68,11 @@ const PTYXIS: Application = Application {
 
 /// A person with a home, a keyfile settings backend of their own, and the application's program.
 struct Person {
-    tree: kr_ipc::testing::TempHost,
     home: PathBuf,
     programs: PathBuf,
     application: &'static Application,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    tree: kr_ipc::testing::TempHost,
 }
 
 impl Person {

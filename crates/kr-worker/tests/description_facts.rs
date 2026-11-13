@@ -46,7 +46,6 @@ const LIVENESS: Duration = Duration::from_secs(30);
 const VIEW: AttachmentId = AttachmentId::new(Uuid::from_bytes([5; 16]));
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -56,6 +55,8 @@ struct Host {
     boot: kr_protocol::identity::BootIdentity,
     epoch: u64,
     _view: kr_worker::output::OutputStream,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

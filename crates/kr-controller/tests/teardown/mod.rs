@@ -71,8 +71,9 @@ const ASKING_BOUND: Duration = Duration::from_secs(35);
 /// worker reading a directory removed underneath it is a worse state to leave the machine in than
 /// a directory to remove.
 pub struct Tree {
-    tree: Option<TempHost>,
     launches: Arc<Launches>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    tree: Option<TempHost>,
 }
 
 /// What the tree's own supervisor has started, whether it may start anything more, and how many of

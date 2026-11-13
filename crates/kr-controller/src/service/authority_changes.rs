@@ -3533,11 +3533,12 @@ mod tests {
     /// The device the registrations here are for, its destination in the delivery journal and the
     /// clocks the daemon decides on.
     struct Host {
-        _temp: kr_ipc::testing::TempHost,
         controller: Arc<Controller>,
         continuous: kr_transport::clock::ManualClock,
         wall: Arc<std::sync::atomic::AtomicU64>,
         device_id: DeviceId,
+        // Declared last: the directory is removed after every field above has let go of its files.
+        _temp: kr_ipc::testing::TempHost,
     }
 
     impl Host {

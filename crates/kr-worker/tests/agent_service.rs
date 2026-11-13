@@ -43,7 +43,6 @@ mod common;
 use common::LIVENESS_DEADLINE;
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
@@ -53,6 +52,8 @@ struct Host {
     controller: Arc<ControllerIdentity>,
     /// The boot the daemon proves its generation against.
     boot: kr_protocol::identity::BootIdentity,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {
