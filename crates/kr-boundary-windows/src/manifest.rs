@@ -276,6 +276,42 @@ impl Prior {
     }
 }
 
+/// A failure that a case forces at a named step, once, in the test build only. The steps are
+/// `"protect"` and `"record"` (the installation's first two steps after it made the data directory)
+/// and `"replacement"` (inside the write of a record, after its replacement file was made).
+#[cfg(feature = "testing")]
+pub mod forced {
+    use std::sync::{Mutex, PoisonError};
+
+    static POINT: Mutex<Option<&'static str>> = Mutex::new(None);
+
+    /// Makes the next arrival at the named step fail, once.
+    pub fn fail_the_next(point: &'static str) {
+        let mut held = match POINT.lock() {
+            Ok(held) => held,
+            Err(poisoned) => PoisonError::into_inner(poisoned),
+        };
+        *held = Some(point);
+    }
+
+    /// The failure of the step, where a case forced one there; it is forced once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the words of the forced failure.
+    pub fn failure_at(point: &str) -> Result<(), String> {
+        let mut held = match POINT.lock() {
+            Ok(held) => held,
+            Err(poisoned) => PoisonError::into_inner(poisoned),
+        };
+        if *held == Some(point) {
+            *held = None;
+            return Err(format!("a failure forced for a case at the step {point}"));
+        }
+        Ok(())
+    }
+}
+
 /// Opens a record for writing: new when `only_new` (the call fails when anything is at the name),
 /// else emptied. On Windows the call that makes the file carries its whole descriptor, owner
 /// included, so the record is the Administrators group's whoever runs the installation.
@@ -321,6 +357,22 @@ fn replacement_name(path: &Path) -> PathBuf {
 /// beside the first error. A replacement that this call did not make (the name was taken) is not
 /// touched.
 fn replace_through(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
+    // On Windows the replacement is written, renamed and, where a step fails, marked for removal
+    // through its one handle. The form below is for the other systems: they have no handle that
+    // renames or marks a file by itself, so the replacement is removed by its name.
+    #[cfg(windows)]
+    {
+        crate::win::fresh::replace_whole(path, staging, bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        replace_by_name(path, staging, bytes)
+    }
+}
+
+/// The form of [`replace_through`] for systems other than Windows.
+#[cfg(not(windows))]
+fn replace_by_name(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file: File = create(staging, true)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
