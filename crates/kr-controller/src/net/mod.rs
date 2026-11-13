@@ -544,6 +544,34 @@ impl Network {
         self.guard.host.chunks.gate_waits()
     }
 
+    /// Holds the task that reads the next ending connection's control stream after it has seen the
+    /// stream end and before it declares the loss. Returns the end that says the reader has
+    /// arrived, and the end that lets it go. The hold fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_the_declaration_of_the_loss(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.guard.host.end_hold.hold_the_declaration()
+    }
+
+    /// Holds the cleanup of the next ending connection after its handler has been dropped and
+    /// before it revokes the connection's streams. The ends are as for
+    /// [`Self::hold_the_declaration_of_the_loss`].
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_the_cleanup_of_a_connection(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.guard.host.end_hold.hold_the_cleanup()
+    }
+
     /// How many tasks that serve a data stream have ended, however they ended, as a count a suite
     /// can wait on to know that the task of a stream it dropped is gone.
     #[cfg(feature = "testing")]
@@ -737,6 +765,9 @@ pub struct NetworkHost {
     /// The connections each device holds, in the order they were counted, which
     /// [`DEVICE_LIVE_CONNECTIONS`] bounds.
     device_connections: Arc<DeviceConnections>,
+    /// Where a suite holds the end of a connection.
+    #[cfg(feature = "testing")]
+    end_hold: kr_transport::listener::EndHold,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -2019,6 +2050,8 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         reconnects: reconnects::Reconnects::new(Arc::clone(controller.metrics())),
         chunks: Arc::default(),
         device_connections: Arc::default(),
+        #[cfg(feature = "testing")]
+        end_hold: kr_transport::listener::EndHold::default(),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a
@@ -2079,6 +2112,10 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     }
     if let Some(deadlines) = setup.settings.data_stream_deadlines.clone() {
         config.deadlines = deadlines;
+    }
+    #[cfg(feature = "testing")]
+    {
+        config.end_hold = host.end_hold.clone();
     }
     let listener = kr_transport::listener::register_with_clock(
         config,

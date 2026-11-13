@@ -89,6 +89,9 @@ pub struct ListenerConfig {
     /// each answer it is sent. A host that does not choose them gets [`TimerDeadlines`]; a test
     /// that must not wait for a clock supplies its own.
     pub deadlines: Arc<dyn Deadlines>,
+    /// Where a test holds the end of a connection.
+    #[cfg(feature = "testing")]
+    pub end_hold: EndHold,
 }
 
 impl ListenerConfig {
@@ -114,6 +117,8 @@ impl ListenerConfig {
             unauthorised_refill: DEFAULT_UNAUTHORISED_REFILL,
             accepted_kinds: Vec::new(),
             deadlines: Arc::new(TimerDeadlines::default()),
+            #[cfg(feature = "testing")]
+            end_hold: EndHold::default(),
         }
     }
 }
@@ -1186,7 +1191,10 @@ async fn serve_authorised<H: HostHandler>(
         authorised.selection.limits,
         Arc::clone(&state.config.deadlines),
     ));
-    let lost = Arc::new(ControlLoss::new(Arc::clone(&streams)));
+    let lost = ControlLoss::new(Arc::clone(&streams));
+    #[cfg(feature = "testing")]
+    let lost = lost.held_by(state.config.end_hold.clone());
+    let lost = Arc::new(lost);
     let (frames_in, frames) = tokio::sync::mpsc::channel(CONTROL_QUEUE_DEPTH);
     let control = ControlChannel {
         writer: Arc::new(Mutex::new(authorised.control_writer)),
@@ -1217,6 +1225,8 @@ async fn serve_authorised<H: HostHandler>(
         data_accept: None,
         issuing: Arc::clone(&issuing),
         connection: connection.clone(),
+        #[cfg(feature = "testing")]
+        hold: state.config.end_hold.clone(),
     };
     let actor = ConnectionActor::network_device(
         state.handler.principal_for(&authorised.peer_device_id),
@@ -1304,6 +1314,104 @@ async fn serve_authorised<H: HostHandler>(
     Ok(())
 }
 
+/// Where a test holds the end of a connection, so that an order of its parts that one connection in
+/// a great many takes is the order of the connection the test is looking at. Each hold fires once,
+/// for the next connection that reaches it. Compiled only with the `testing` feature.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug, Default)]
+pub struct EndHold {
+    declaration: Arc<Gate>,
+    cleanup: Arc<Gate>,
+}
+
+#[cfg(feature = "testing")]
+impl EndHold {
+    /// Holds the task that reads a connection's control stream once it has seen the stream end, and
+    /// before it declares the loss. Returns the end that says the reader has arrived, and the end
+    /// that lets it go.
+    #[must_use]
+    pub fn hold_the_declaration(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.declaration.arm()
+    }
+
+    /// Holds a connection's cleanup after its handler has been dropped and before it revokes the
+    /// connection's streams and runs the host's hook. The ends are as for
+    /// [`Self::hold_the_declaration`].
+    #[must_use]
+    pub fn hold_the_cleanup(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.cleanup.arm()
+    }
+}
+
+/// A point that says it has been reached and waits there until it is let go. Armed once, it fires
+/// once.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct Gate(
+    std::sync::Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+);
+
+#[cfg(feature = "testing")]
+impl Gate {
+    fn arm(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    fn take(
+        &self,
+    ) -> Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Waits here, blocking the thread: for a destructor, which cannot wait any other way.
+    fn wait(&self) {
+        if let Some((arrived, go)) = self.take() {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// Waits here without holding the task's thread.
+    async fn wait_without_blocking(&self) {
+        if let Some((arrived, go)) = self.take() {
+            let _ = arrived.send(());
+            let _ = tokio::task::spawn_blocking(move || go.recv()).await;
+        }
+    }
+}
+
 /// Ends a connection's authority whatever way the connection ended.
 #[derive(Debug)]
 struct ConnectionCleanup {
@@ -1316,6 +1424,8 @@ struct ConnectionCleanup {
     data_accept: Option<tokio::task::JoinHandle<()>>,
     issuing: Arc<std::sync::atomic::AtomicBool>,
     connection: Connection,
+    #[cfg(feature = "testing")]
+    hold: EndHold,
 }
 
 impl Drop for ConnectionCleanup {
@@ -1336,6 +1446,8 @@ impl Drop for ConnectionCleanup {
         }
         self.connection
             .close(CONTROL_LOST.into(), b"the connection ended");
+        #[cfg(feature = "testing")]
+        self.hold.cleanup.wait();
         self.streams.revoke_all();
         self.windows.retire_connection(self.connection_id);
     }
@@ -1357,6 +1469,8 @@ struct ControlLoss {
     lost: std::sync::atomic::AtomicBool,
     woken: tokio::sync::Notify,
     streams: Arc<StreamRegistry>,
+    #[cfg(feature = "testing")]
+    hold: EndHold,
 }
 
 impl ControlLoss {
@@ -1365,7 +1479,23 @@ impl ControlLoss {
             lost: std::sync::atomic::AtomicBool::new(false),
             woken: tokio::sync::Notify::new(),
             streams,
+            #[cfg(feature = "testing")]
+            hold: EndHold::default(),
         }
+    }
+
+    /// The loss held by `hold`, for a test that decides when the control reader declares it.
+    #[cfg(feature = "testing")]
+    fn held_by(mut self, hold: EndHold) -> Self {
+        self.hold = hold;
+        self
+    }
+
+    /// The declaration of the task that reads the control stream, once it has seen the stream end.
+    async fn declared_by_the_reader(&self) {
+        #[cfg(feature = "testing")]
+        self.hold.declaration.wait_without_blocking().await;
+        self.declare();
     }
 
     fn declare(&self) {
@@ -1424,7 +1554,7 @@ async fn control_read_loop(
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
-    lost.declare();
+    lost.declared_by_the_reader().await;
 }
 
 /// Takes every stream the device opens on an authorised connection, until the connection ends.

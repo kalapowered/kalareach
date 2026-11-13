@@ -957,6 +957,30 @@ async fn a_revoked_stream_does_not_replace_the_live_stream_of_its_transfer() {
 /// written when the loss is declared, is in the upload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_loss_of_the_control_stream_ends_the_chunks_that_have_not_begun_their_effect() {
+    a_lost_control_stream_ends_the_chunks_that_have_not_begun_their_effect(End::LossFirst).await;
+}
+
+/// The same, for a connection whose end reaches the listener before its control reader has
+/// declared the loss: the connection's stream tasks are gone, and so are their registrations, when
+/// the listener ends the connection, and the loss is declared after that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_loss_ends_the_chunks_that_have_not_begun_their_effect_where_the_connection_ends_first()
+{
+    a_lost_control_stream_ends_the_chunks_that_have_not_begun_their_effect(End::ConnectionFirst)
+        .await;
+}
+
+/// Which part of a connection's end reaches the listener first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// The control reader declares the loss, as it does when nothing delays it.
+    LossFirst,
+    /// The connection's end is seen by the listener while the reader is held before it declares,
+    /// and the listener's cleanup is held until the connection's stream tasks have ended.
+    ConnectionFirst,
+}
+
+async fn a_lost_control_stream_ends_the_chunks_that_have_not_begun_their_effect(end: End) {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
@@ -975,7 +999,26 @@ async fn the_loss_of_the_control_stream_ends_the_chunks_that_have_not_begun_thei
         .await
         .expect("the frame is written");
     arrived(held).await;
+    let held_end = (end == End::ConnectionFirst).then(|| {
+        (
+            host.network().hold_the_declaration_of_the_loss(),
+            host.network().hold_the_cleanup_of_a_connection(),
+        )
+    });
     device.raw.close();
+    let _reader = if let Some(((reading, reader), (cleaning, cleanup))) = held_end {
+        arrived(reading).await;
+        arrived(cleaning).await;
+        let mut ended = host.network().chunk_tasks_ended();
+        tokio::time::timeout(WAIT, ended.wait_for(|ended| *ended >= 1))
+            .await
+            .expect("the dropped connection's stream task ends")
+            .expect("the count stays open");
+        cleanup.send(()).expect("the cleanup goes on");
+        Some(reader)
+    } else {
+        None
+    };
     // The withdrawal of the control stream's connection announces itself once the loss is declared,
     // which is after the connection's streams are revoked; the connection's own end is held with it.
     tokio::time::timeout(WAIT, deregistering)

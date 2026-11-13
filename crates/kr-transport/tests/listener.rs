@@ -990,3 +990,162 @@ async fn a_control_frame_is_sent_only_while_each_attempt_to_hand_bytes_over_is_a
     drop(authorised);
     listener.shutdown().await;
 }
+
+/// A host that keeps each data stream it takes only while it serves, so that a stream's registration
+/// goes with the handler: when the handler returns or is dropped, as the listener drops it when the
+/// connection ends before the control reader has declared the loss.
+#[derive(Debug)]
+struct ServingHandler {
+    client: PairedPeer,
+    /// How many connections lost their control stream.
+    lost: AtomicUsize,
+    /// The data streams the handler has taken, which it still holds while it serves.
+    streams: Mutex<Vec<kr_transport::streams::StreamHandle>>,
+    /// Ends the handler by itself.
+    finish: tokio::sync::Notify,
+}
+
+impl PairedDirectory for ServingHandler {
+    fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
+        (endpoint_id == &self.client.endpoint_id).then_some(self.client)
+    }
+}
+
+impl HostHandler for ServingHandler {
+    fn principal_for(&self, device_id: &DeviceId) -> ActorId {
+        kr_transport::listener::device_principal(device_id)
+    }
+
+    fn authority_revision(&self) -> AuthorityRevision {
+        AuthorityRevision::default()
+    }
+
+    fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
+        None
+    }
+
+    fn serve(self: Arc<Self>, mut session: AuthorisedSession) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let mut held = Vec::new();
+            loop {
+                tokio::select! {
+                    Some(stream) = session.data_streams.recv() => {
+                        self.streams.lock().await.push(stream.handle());
+                        held.push(stream);
+                    }
+                    () = self.finish.notified() => break,
+                    frame = session.control.recv() => if frame.is_none() { break },
+                }
+            }
+        })
+    }
+
+    fn control_stream_lost(&self, _connection_id: ConnectionId) {
+        self.lost.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Which part of a connection's end the listener sees first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum First {
+    /// The control reader declares the loss.
+    TheLoss,
+    /// The handler returns.
+    TheHandler,
+    /// The connection closes, while the reader is held before it declares the loss.
+    TheConnection,
+}
+
+/// A data stream is revoked with the control stream's loss whichever part of the
+/// connection's end the listener sees first, and whether or not the stream is still registered when
+/// the loss is declared. The handler holds each stream while it serves, so a handler that returns
+/// or is dropped takes its streams out of the registry before the connection's cleanup runs.
+async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(ServingHandler {
+        client: client.record,
+        lost: AtomicUsize::new(0),
+        streams: Mutex::new(Vec::new()),
+        finish: tokio::sync::Notify::new(),
+    });
+    let hold = kr_transport::listener::EndHold::default();
+    let config = ListenerConfig {
+        accepted_kinds: vec![StreamKind::TerminalOutput],
+        end_hold: hold.clone(),
+        ..ListenerConfig::new(
+            EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                ..EndpointConfig::default()
+            },
+            epochs(),
+            ControllerGeneration::new(1),
+        )
+    };
+    let listener = register(
+        config,
+        Arc::clone(&host.identity),
+        &host.keys.transport,
+        Arc::clone(&handler),
+    )
+    .await
+    .expect("a listener");
+    let connection = client
+        .endpoint
+        .connect(listener_addr(&listener), ALPN)
+        .await
+        .expect("a connection");
+    let mut authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let registry = Arc::new(StreamRegistry::new(
+        authorised.connection_id,
+        Arc::new(kr_transport::scheduler::StreamBudget::new(
+            SendLimits::default(),
+        )),
+        None,
+    ));
+    let _stream = registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a data stream");
+    let handle = loop {
+        if let Some(handle) = handler.streams.lock().await.first().cloned() {
+            break handle;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    // The reader is held where the connection or the handler ends the session first, so that the
+    // listener has dropped the handler, and the handler's streams with it, before the loss is
+    // declared.
+    let reader = (first != First::TheLoss).then(|| hold.hold_the_declaration());
+    match first {
+        First::TheLoss => authorised.control_writer.finish().expect("the stream ends"),
+        First::TheHandler => handler.finish.notify_one(),
+        First::TheConnection => connection.close(0u32.into(), b"done"),
+    }
+    wait_until(|| handler.lost.load(Ordering::Acquire) == 1).await;
+    assert!(
+        handle.is_revoked(),
+        "the stream is revoked when the loss is declared"
+    );
+    if let Some((_, release)) = reader {
+        drop(release);
+    }
+    listener.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stream_is_revoked_where_the_control_reader_declares_the_loss_first() {
+    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::TheLoss).await;
+}
+
+#[tokio::test]
+async fn a_stream_is_revoked_where_the_handler_returns_before_the_loss_is_declared() {
+    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::TheHandler).await;
+}
+
+#[tokio::test]
+async fn a_stream_is_revoked_where_the_connection_closes_before_the_loss_is_declared() {
+    a_stream_is_revoked_with_the_loss_of_the_control_stream(First::TheConnection).await;
+}
