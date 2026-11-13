@@ -149,3 +149,60 @@ fn the_shared_steps_have_two_callers_and_each_passes_its_own_data_tree() {
     assert!(steps.contains("run.take_away()"));
     assert!(steps.contains("remove_approved_records(paths, &approved)"));
 }
+
+#[test]
+fn the_steps_act_on_an_account_the_service_and_the_identity_service_only_behind_a_result() {
+    let source = install_source();
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    // The accounts: the one step that deletes an account is behind the rule, and the rule's refusal
+    // leaves the account before anything of it is read or changed.
+    let gate = steps
+        .find("if !object.acted_on_by(rollback) {")
+        .expect("the account step asks whether a result lets it act");
+    let first_change = steps.find("account::revoke_all_rights(").unwrap();
+    assert!(
+        gate < first_change,
+        "the rule stands before the first change"
+    );
+    assert!(steps[gate..first_change].contains("continue;"));
+    // The service: the maintenance step and the deletion both start from the same value.
+    assert!(steps.contains(".is_some_and(|object| object.acted_on_by(rollback));"));
+    assert_eq!(
+        count(&steps, "if service_is_ours && let Some(service) ="),
+        2
+    );
+    assert_eq!(count(&steps, "manager.open(SERVICE)"), 2);
+    // The Application Identity service: the rollback's stop needs this run's own start on record.
+    let stop = steps.find("Identity(&appid).stop()?").unwrap();
+    let rule = steps
+        .find("if rollback\n")
+        .expect("the stop asks whether this is a rollback");
+    assert!(rule < stop);
+    assert!(steps[rule..stop].contains("ObjectKind::AppIdentityStarted"));
+}
+
+#[test]
+fn the_installation_records_each_result_after_the_call_that_made_the_object() {
+    let source = install_source();
+    let lay = code_of(body_of(&source, "fn lay_down("));
+    let at = |needle: &str| {
+        lay.find(needle)
+            .unwrap_or_else(|| panic!("lay_down has no {needle}"))
+    };
+    // An account: the intent, the platform's call that makes it alone, the result, then the read of
+    // its identifier (a failed read of the identifier follows a made account).
+    let intent = at("run.record(ObjectKind::Account, name, None)?;");
+    let made = at("account::add(name)?;");
+    let result = at("run.conclude(ObjectKind::Account, name, Outcome::Made)?;");
+    let sid = at("account::sid_of(name)?");
+    assert!(intent < made && made < result && result < sid);
+    // The service: the intent, the call that makes it, the result.
+    let intent = at("run.record(ObjectKind::Service, SERVICE, None)?;");
+    let made = at("manager.create(");
+    let result = at("run.conclude(ObjectKind::Service, SERVICE, Outcome::Made)?;");
+    assert!(intent < made && made < result);
+    // The Application Identity service's start is recorded where the manager accepted the request.
+    assert!(lay.contains(
+        ".start(|| run.conclude(ObjectKind::AppIdentityStarted, APPID, Outcome::Made))?;"
+    ));
+}

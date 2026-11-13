@@ -156,13 +156,33 @@ pub fn account_domain() -> Result<String> {
 /// does not change.
 const COMMENT: &str = "KalaReach repository boundary account";
 
-/// Makes a local account: no group, a password nobody keeps that never expires and cannot be
-/// changed.
+/// Makes a local account and reads its identifier: [`add`] and then [`sid_of`].
+///
+/// # Errors
+///
+/// Returns the platform's error when the account cannot be made or its identifier cannot be read.
+pub fn create(name: &str) -> Result<Sid> {
+    add(name)?;
+    sid_of(name)
+}
+
+/// The identifier of the account that has the name, by the plain name that [`add`] was given.
+///
+/// # Errors
+///
+/// Returns the platform's error when the lookup fails.
+pub fn sid_of(name: &str) -> Result<Sid> {
+    Sid::of_account(name)
+}
+
+/// Makes a local account and nothing else: no group, a password nobody keeps that never expires and
+/// cannot be changed. An answer of `Ok` is the platform's own word that this call made the account;
+/// any failure, "the account exists already" among them, made none.
 ///
 /// # Errors
 ///
 /// Returns the platform's error when the account cannot be made.
-pub fn create(name: &str) -> Result<Sid> {
+pub fn add(name: &str) -> Result<()> {
     let mut account = wide(name);
     let mut secret = wide(&random_password());
     let mut comment = wide(COMMENT);
@@ -185,7 +205,7 @@ pub fn create(name: &str) -> Result<Sid> {
         // text: account_create-1
         return Err(error(status, format!("making the account {name}")));
     }
-    Sid::of_account(name)
+    Ok(())
 }
 
 /// The names of the local accounts that carry the comment which the installation gives its accounts

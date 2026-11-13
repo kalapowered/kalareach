@@ -8,9 +8,13 @@
 //! the installation's.
 //!
 //! The manifest is written first as `in-progress` and gains each object before the step that
-//! makes it, so a failure at any point leaves a record that names everything that may exist. The
-//! earlier-state record is written once, before the first change, and never rewritten: a repair
-//! keeps the first baseline.
+//! makes it, so a failure at any point leaves a record that names everything that may exist. That
+//! record is an intent: it says what the step was to make and nothing of what the step did. The
+//! result is written after the step: an account or a service that the step made carries the result
+//! `made`, and one that stood there already carries `found`. An object with no result is an intent
+//! that no read of the object followed; a run that died between the two leaves one. The earlier-state
+//! record is written once, before the first change, and never rewritten: a repair keeps the first
+//! baseline.
 
 use std::fs::{self, File};
 use std::io::{self, Write as _};
@@ -80,6 +84,20 @@ pub enum ObjectKind {
     PolicyRule,
     /// The Application Identity service's start type; the detail is what the installation set.
     AppIdentity,
+    /// The Application Identity service was stopped and the installation started it: the identifier
+    /// is its name. It is recorded after the service manager accepted the start, and never before,
+    /// so its presence is a result and no intent.
+    AppIdentityStarted,
+}
+
+/// What a step did to an object that the run recorded before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Outcome {
+    /// The step made the object: the call that makes it answered that it did.
+    Made,
+    /// The object stood there when the step looked, and the step did not make it.
+    Found,
 }
 
 /// One object the installation laid down.
@@ -93,6 +111,25 @@ pub struct Object {
     /// A digest or an identifier, by kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// What the step did to it. None is an intent with no result: the step may have made the object,
+    /// found it or never run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+}
+
+impl Object {
+    /// Whether a step that undoes may act on the object. The rollback of a failed new installation
+    /// acts on what that run made and on nothing else. The removal acts on what a run made and on
+    /// what a run found and used (a repair finds what an earlier run made); an object with no result
+    /// is not acted on, since nothing shows that the installation made it.
+    #[must_use]
+    pub fn acted_on_by(&self, rollback: bool) -> bool {
+        match self.outcome {
+            Some(Outcome::Made) => true,
+            Some(Outcome::Found) => !rollback,
+            None => false,
+        }
+    }
 }
 
 /// One program of Git's installation as the installation found it.
@@ -176,6 +213,29 @@ impl Manifest {
                 kind,
                 id: id.to_owned(),
                 detail,
+                outcome: None,
+            });
+        }
+    }
+
+    /// Writes the result of a step on the object that the run recorded before it (or records the
+    /// object with the result where none was recorded). A result of `made` is never replaced by
+    /// `found`: a repair that finds what an earlier run made leaves it made.
+    pub fn conclude(&mut self, kind: ObjectKind, id: &str, outcome: Outcome) {
+        if let Some(object) = self
+            .objects
+            .iter_mut()
+            .find(|object| object.kind == kind && object.id.eq_ignore_ascii_case(id))
+        {
+            if object.outcome != Some(Outcome::Made) {
+                object.outcome = Some(outcome);
+            }
+        } else {
+            self.objects.push(Object {
+                kind,
+                id: id.to_owned(),
+                detail: None,
+                outcome: Some(outcome),
             });
         }
     }
