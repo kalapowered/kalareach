@@ -13,6 +13,7 @@ use kr_protocol::method::Method;
 
 use super::super::proxy::Vouched;
 use crate::error::Result;
+use crate::given::network_door::{self, noting};
 use crate::given::{Given, Origin};
 
 use super::super::Retained;
@@ -767,13 +768,7 @@ impl RemoteConnection {
         // its reply is answered there rather than dispatched again.
         let mut held = self
             .controller
-            .retained(
-                &actor_id,
-                mutation,
-                entry.method,
-                self.connection_id,
-                Some(validated),
-            )
+            .retained(&actor_id, mutation, entry.method)
             .await;
         if held.is_none() && crate::project::ProjectModule::serves(entry.method) {
             held = self
@@ -880,7 +875,7 @@ impl RemoteConnection {
                 #[cfg(feature = "testing")]
                 self.controller.after_the_retained_lookup.wait().await;
                 return match self.admitted_to_answer(validated) {
-                    Ok(()) => Ok(answered.copied().into_answer()),
+                    Ok(()) => Ok(network_door::kept(answered)),
                     Err(_) => Err(outcome_not_shown()),
                 };
             }
@@ -2024,11 +2019,4 @@ fn framed_protocol(
             Err(error) => Outcome::Error(error),
         },
     })
-}
-
-/// The frame of an answer a service gave, noting in `origin` when the service read it from a
-/// record, or read the record and withheld it.
-fn noting(origin: &mut Origin, given: Given<ControlFrame>) -> ControlFrame {
-    origin.note(given.origin());
-    given.into_answer()
 }

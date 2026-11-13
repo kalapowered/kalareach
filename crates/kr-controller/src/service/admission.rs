@@ -432,14 +432,19 @@ impl Controller {
     }
 
     /// Refuses a request on a connection whose registration has been withdrawn.
-    pub(super) fn authorised(&self, connection_id: ConnectionId) -> Result<ActorId> {
+    pub(crate) fn authorised(
+        &self,
+        connection_id: ConnectionId,
+    ) -> std::result::Result<ActorId, Unauthorised> {
         let admitted = self.admitted_read();
         match admitted.get(&connection_id) {
             Some(connection) => Ok(connection.actor_id.clone()),
-            None => Err(ControllerError::PermissionDenied {
-                detail: "the authority this connection was admitted under has been withdrawn; \
-                         open a new connection"
-                    .to_owned(),
+            None => Err(Unauthorised {
+                error: ControllerError::PermissionDenied {
+                    detail: "the authority this connection was admitted under has been \
+                             withdrawn; open a new connection"
+                        .to_owned(),
+                },
             }),
         }
     }
@@ -467,7 +472,7 @@ impl Controller {
     ///
     /// Returns what [`Self::check_registration`] returns, and
     /// [`ControllerError::PermissionDenied`] when there is no revision to check against.
-    pub(super) fn check_retained_answer(
+    pub(crate) fn check_retained_answer(
         &self,
         connection_id: ConnectionId,
         admitted: Option<AuthorityRevision>,
@@ -558,8 +563,7 @@ impl Controller {
         >,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let given = self.retained_given(carried, answer.await).await;
-        origin.note(given.origin());
-        given.into_answer()
+        crate::given::network_door::noting(origin, given)
     }
 
     /// What an earlier attempt of an action recorded, given back as a copy under the authority
@@ -593,8 +597,7 @@ impl Controller {
         found: ControllerError,
     ) -> ControllerError {
         let given = self.conflict_given(carried, found).await;
-        origin.note(given.origin());
-        given.into_answer()
+        crate::given::network_door::noting(origin, given)
     }
 
     /// [`Self::conflict_under_authority`], with where the refusal came from in its type.
@@ -1056,6 +1059,17 @@ impl Controller {
     /// is a first admission the host will accept at all. Both are checked before the create token
     /// reaches the registry, so an expired window never reserves a session.
     pub(super) fn check_envelope(
+        &self,
+        connection_id: ConnectionId,
+        mutation: &MutationRequest,
+        method: Method,
+        received_at: kr_transport::clock::ContinuousInstant,
+    ) -> std::result::Result<AcceptedDeadline, EnvelopeRefused> {
+        self.envelope_checked(connection_id, mutation, method, received_at)
+            .map_err(|error| EnvelopeRefused { error })
+    }
+
+    fn envelope_checked(
         &self,
         connection_id: ConnectionId,
         mutation: &MutationRequest,
@@ -1720,6 +1734,60 @@ pub(super) struct AdmittedConnection {
     shares: std::sync::Mutex<
         std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::grant::Grant>,
     >,
+}
+
+/// The refusal of a request on a connection whose registration has been withdrawn.
+///
+/// Only [`Controller::authorised`] makes one: it names no record and no effect, so a door that
+/// declines a request with it says what the registration's check found and nothing else. There is
+/// no conversion into it from an error, so a refusal that came from anywhere else cannot be
+/// passed off as this one.
+#[derive(Debug)]
+pub(crate) struct Unauthorised {
+    error: ControllerError,
+}
+
+impl Unauthorised {
+    /// The refusal as the protocol states it, for the network door's callers.
+    pub(crate) fn to_protocol_error(&self) -> ProtocolError {
+        self.error.to_protocol_error()
+    }
+}
+
+impl std::fmt::Display for Unauthorised {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl From<Unauthorised> for ControllerError {
+    fn from(refusal: Unauthorised) -> Self {
+        refusal.error
+    }
+}
+
+/// The refusal of a mutation's envelope: the method, the version, the target, the subject its
+/// parameters name, or the window it carries.
+///
+/// Only [`Controller::check_envelope`] makes one. The checks read nothing a store holds, so the
+/// refusal names no record; an error a service kept in a record cannot be given as one.
+#[derive(Debug)]
+pub(crate) struct EnvelopeRefused {
+    error: ControllerError,
+}
+
+impl EnvelopeRefused {
+    /// Whether the window the mutation carries admits nothing: a copy, or a repeat that claimed an
+    /// effect, is still owed what the host holds for it.
+    pub(crate) const fn is_window_expired(&self) -> bool {
+        matches!(self.error, ControllerError::WindowExpired { .. })
+    }
+}
+
+impl From<EnvelopeRefused> for ControllerError {
+    fn from(refusal: EnvelopeRefused) -> Self {
+        refusal.error
+    }
 }
 
 /// The grants a remote request stands on, copied when the work starts

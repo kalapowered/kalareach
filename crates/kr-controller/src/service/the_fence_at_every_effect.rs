@@ -109,7 +109,8 @@ async fn performed_once(
             Some(accepted(controller)),
             Some(revision),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     assert!(
         matches!(
             answered,
@@ -121,6 +122,29 @@ async fn performed_once(
         "the first admission is answered: {answered:?}"
     );
     (connection_id, actor_id, mutation)
+}
+
+/// What the local door tells of what a write came to, once the write has been performed: the
+/// reply for `mutation` on `connection_id` under the authority the connection stands on now.
+pub(super) async fn told_now(
+    controller: &Controller,
+    connection_id: ConnectionId,
+    mutation: &MutationRequest,
+    settled: impl std::future::Future<Output = crate::given::Settled<ControlFrame>>,
+) -> ControlFrame {
+    let settled = settled.await;
+    let admitted = controller.admitted_revision(connection_id).ok();
+    crate::given::local_door::told(
+        settled,
+        &crate::given::local_door::Standing::new(
+            controller,
+            connection_id,
+            admitted,
+            mutation.request_id,
+        ),
+    )
+    .await
+    .into_frame()
 }
 
 /// The refusal a frame carries, when it carries one.
@@ -334,7 +358,8 @@ async fn a_create_admitted_before_a_revocation_starts_nothing_after_it() {
             Some(accepted(&controller)),
             Some(captured),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     let error = refusal(&answered).unwrap_or_else(|| {
         panic!("a create admitted before the revocation is refused: {answered:?}")
     });
@@ -363,7 +388,8 @@ async fn a_create_admitted_before_a_revocation_starts_nothing_after_it() {
             Some(accepted(&controller)),
             Some(current),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     assert_eq!(
         launches.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -413,7 +439,8 @@ async fn a_close_admitted_before_a_revocation_is_not_forwarded_after_it() {
             Some(window),
             Some(captured),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     let error = refusal(&answered).unwrap_or_else(|| {
         panic!("a close admitted before the revocation is refused: {answered:?}")
     });
@@ -438,7 +465,8 @@ async fn a_close_admitted_before_a_revocation_is_not_forwarded_after_it() {
             Some(window),
             Some(current),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     assert_eq!(
         forwarded(),
         1,
@@ -488,7 +516,8 @@ async fn an_authority_change_admitted_before_a_revocation_changes_nothing_after_
             Some(accepted(&controller)),
             Some(captured),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     let error = refusal(&answered).unwrap_or_else(|| {
         panic!("a change admitted before the revocation is refused: {answered:?}")
     });
@@ -517,7 +546,8 @@ async fn an_authority_change_admitted_before_a_revocation_changes_nothing_after_
             Some(accepted(&controller)),
             Some(current),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     assert!(
         refusal(&answered).is_none(),
         "a change under the revision in force is performed: {answered:?}"
@@ -575,7 +605,8 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
                 Some(accepted(&controller)),
                 Some(captured),
             )
-            .await;
+            .await
+            .into_answer_for_test();
         assert!(
             refusal(&answered).is_none_or(|error| !error.message.contains("withdrawn")),
             "{method:?} on a standing registration: {answered:?}"
@@ -594,7 +625,8 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
                 Some(accepted(&controller)),
                 Some(captured),
             )
-            .await;
+            .await
+            .into_answer_for_test();
         let error = refusal(&answered)
             .unwrap_or_else(|| panic!("{method:?} on a withdrawn registration: {answered:?}"));
         assert_eq!(error.code, ErrorCode::PermissionDenied, "{method:?}");
@@ -972,7 +1004,8 @@ async fn a_transfer_action_recorded_before_a_late_attempt_is_not_given_back_whil
             Some(accepted(&controller)),
             controller.admitted_revision(connection_id).ok(),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     assert!(refusal(&first).is_none(), "the first attempt: {first:?}");
 
     // The late attempt reaches the service itself, as one does that began before the record was
@@ -1037,14 +1070,19 @@ async fn a_transfer_copy_a_service_withheld_is_told_at_the_local_door_as_not_sho
     // Performed as the local door does once its own look for a record has found none, which is what
     // a copy admitted before another copy records reaches.
     let attempt = || {
-        controller.write_method(
-            &actor_id,
-            &mutation,
-            Method::DraftCreate,
+        told_now(
+            &controller,
             connection_id,
-            None,
-            Some(accepted(&controller)),
-            controller.admitted_revision(connection_id).ok(),
+            &mutation,
+            controller.write_method(
+                &actor_id,
+                &mutation,
+                Method::DraftCreate,
+                connection_id,
+                None,
+                Some(accepted(&controller)),
+                controller.admitted_revision(connection_id).ok(),
+            ),
         )
     };
     let first = attempt().await;
@@ -1163,14 +1201,19 @@ async fn a_privacy_change_recorded_before_a_late_attempts_claim_is_not_given_bac
     let (temp, controller, _clock) = daemon().await;
     let (connection_id, actor_id, mutation) = performed_once(&temp, &controller).await;
     let late = || {
-        controller.write_method(
-            &actor_id,
-            &mutation,
-            Method::PrivacySet,
+        told_now(
+            &controller,
             connection_id,
-            None,
-            Some(accepted(&controller)),
-            controller.admitted_revision(connection_id).ok(),
+            &mutation,
+            controller.write_method(
+                &actor_id,
+                &mutation,
+                Method::PrivacySet,
+                connection_id,
+                None,
+                Some(accepted(&controller)),
+                controller.admitted_revision(connection_id).ok(),
+            ),
         )
     };
     let answered = late().await;
@@ -1211,6 +1254,7 @@ async fn a_privacy_change_recorded_before_a_late_attempts_claim_is_not_given_bac
                     admitted,
                 )
                 .await
+                .into_answer_for_test()
         }
     });
     tokio::time::timeout(Duration::from_secs(30), arrived)
@@ -1252,6 +1296,7 @@ async fn a_privacy_change_that_was_applied_is_not_answered_as_failed_when_its_re
                     controller.admitted_revision(connection_id).ok(),
                 )
                 .await
+                .into_answer_for_test()
         }
     };
     assert!(!enabled(), "privacy mode starts off");
@@ -1334,6 +1379,7 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
                     Some(captured),
                 )
                 .await
+                .into_answer_for_test()
         }
     };
     for method in methods {
@@ -1449,7 +1495,8 @@ async fn every_local_write_method_the_daemon_performs_is_placed() {
                 Some(accepted(&controller)),
                 Some(captured),
             )
-            .await;
+            .await
+            .into_answer_for_test();
         let error = refusal(&answered)
             .unwrap_or_else(|| panic!("{method:?} is performed and is placed on no list"));
         assert!(
@@ -2296,14 +2343,19 @@ async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given
         .expect("encodes"),
     );
     let attempt = || {
-        controller.write_method(
-            &actor_id,
-            &mutation,
-            Method::MachineSplit,
+        told_now(
+            &controller,
             connection_id,
-            None,
-            Some(accepted(&controller)),
-            controller.admitted_revision(connection_id).ok(),
+            &mutation,
+            controller.write_method(
+                &actor_id,
+                &mutation,
+                Method::MachineSplit,
+                connection_id,
+                None,
+                Some(accepted(&controller)),
+                controller.admitted_revision(connection_id).ok(),
+            ),
         )
     };
     let first = attempt().await;
@@ -2379,6 +2431,7 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
                     controller.admitted_revision(connection_id).ok(),
                 )
                 .await
+                .into_answer_for_test()
         }
     };
     let first = attempt(Arc::clone(&controller)).await;
@@ -2494,6 +2547,7 @@ async fn an_installation_recorded_before_a_late_attempts_lookup_is_not_given_bac
                     Some(captured),
                 )
                 .await
+                .into_answer_for_test()
         }
     };
     let mutation = installing(project.path());
@@ -2592,6 +2646,7 @@ async fn an_environment_change_recorded_before_a_late_attempts_claim_is_not_give
                     controller.admitted_revision(connection_id).ok(),
                 )
                 .await
+                .into_answer_for_test()
         }
     };
     let first = attempt(Arc::clone(&controller)).await;
@@ -2666,6 +2721,7 @@ async fn a_refresh_refused_for_the_bridge_it_came_over_is_not_given_back_while_a
                     controller.admitted_revision(connection_id).ok(),
                 )
                 .await
+                .into_answer_for_test()
         }
     };
     let refused_for_the_bridge = |answer: &ControlFrame| {
@@ -3081,6 +3137,7 @@ async fn the_refusal_from_a_stored_subject_is_given_back_as_a_copy_of_the_record
             Some(captured),
         )
         .await
+        .into_answer_for_test()
     else {
         panic!("a create is answered with a response");
     };

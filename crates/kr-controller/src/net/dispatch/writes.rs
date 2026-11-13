@@ -13,7 +13,7 @@ use super::super::chunks::ChunkAdmission;
 use super::forwarding::OwnClaim;
 use super::routes::Unserved;
 use super::{RemoteConnection, failure, outcome_unknown};
-use crate::given::Given;
+use crate::given::{Given, network_door};
 
 /// How this host answers one mutation a paired device may send: which service performs it, or the
 /// reason it is refused.
@@ -186,7 +186,7 @@ impl RemoteConnection {
             .check_subject_of_record(&actor_id, mutation, method)
             .await?
         {
-            return Err(refused.copied().into_answer());
+            return Err(network_door::kept(refused));
         }
         if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
             return Err(refusal.into_error());
