@@ -87,6 +87,7 @@ impl Approved {
             clippy::disallowed_methods,
             reason = "a helper of the tests alone: a listing that fails approves no replacement, and what is not approved stays and is named by the removal"
         )]
+        // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
         let replacements = fs::read_dir(data)
             .into_iter()
             .flatten()
@@ -168,6 +169,7 @@ pub fn remove(records: &Records<'_>) -> Vec<String> {
 
 /// The names in a directory, each with the error that listing it gave.
 fn list_names(dir: &Path) -> io::Result<Vec<io::Result<OsString>>> {
+    // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
     Ok(fs::read_dir(dir)?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect())
@@ -236,6 +238,7 @@ pub fn remove_with(
 ) -> Vec<String> {
     let mut stayed = Vec::new();
     let mut gone = if records.approved.prior {
+        // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
         leave(&mut stayed, records.prior, fs::remove_file(records.prior))
     } else {
         unseen(&mut stayed, records.prior)
@@ -247,6 +250,7 @@ pub fn remove_with(
                     Ok(name) if is_manifest_replacement(&name.to_string_lossy()) => {
                         let path = records.data.join(&name);
                         gone &= if records.approved.replacements.contains(&name) {
+                            // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
                             leave(&mut stayed, &path, fs::remove_file(&path))
                         } else {
                             unseen(&mut stayed, &path)
@@ -268,6 +272,7 @@ pub fn remove_with(
             leave(
                 &mut stayed,
                 records.staging,
+                // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
                 fs::remove_dir_all(records.staging),
             )
         } else {
@@ -278,9 +283,11 @@ pub fn remove_with(
         leave(
             &mut stayed,
             records.manifest,
+            // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
             fs::remove_file(records.manifest),
         );
     }
+    // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
     leave(&mut stayed, records.data, fs::remove_dir(records.data));
     stayed
 }
@@ -355,6 +362,7 @@ pub fn begin<M>(
 // text: remove_empty
 pub fn remove_empty(data: &Path) -> Vec<String> {
     let mut stayed = Vec::new();
+    // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
     leave(&mut stayed, data, fs::remove_dir(data));
     stayed
 }
@@ -387,6 +395,7 @@ pub fn is_journal_file_name(name: &str) -> bool {
 /// [`is_journal_file_name`] gives), not objects of the run that made the directory; an entry that
 /// stays, and an entry of another name, is found by the removal of the directory.
 pub fn delete_journal_files(journal: &Path, approved: bool) {
+    // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
     if approved && let Ok(entries) = fs::read_dir(journal) {
         #[expect(
             clippy::disallowed_methods,
@@ -420,6 +429,7 @@ pub fn finish_journal_and_run(
             stayed.extend(looked_at_again(directory));
             continue;
         }
+        // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
         match fs::remove_dir(directory) {
             Ok(()) => stayed.extend(found_after_removal(directory)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -485,6 +495,7 @@ pub enum Held {
 /// Lists a directory as far as its first entry.
 #[must_use]
 pub fn held_in(directory: &Path) -> Held {
+    // Base: a full path from `Paths`, resolved from the volume's root and never against the current directory
     match fs::read_dir(directory) {
         Ok(mut entries) => match entries.next() {
             None => Held::Nothing,
