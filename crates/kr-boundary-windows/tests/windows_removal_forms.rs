@@ -1,11 +1,11 @@
-//! A probe of the platform's forms of taking away an object that a run made, through the handle of
-//! the call that made it. For a directory made relative to its parent's held handle, and for a file
-//! made relative to a directory's held handle, each made with no right to delete and sharing
-//! everything, it prints what the platform answers to: a reopen of the object's own handle with the
-//! right to delete, and an open of the object by its bare name relative to the parent's handle with
-//! the right to delete, followed by the comparison of the two identities and the removal mark on
-//! the handle of that open. It runs only in a disposable Windows guest, as SYSTEM, in a temporary
-//! folder.
+//! The platform's answers that the removal of an object that a run made rests on. For a directory
+//! made relative to its parent's held handle, and for a file made relative to a directory's held
+//! handle, each made with no right to delete and sharing everything, the cases read what the
+//! platform answers to a reopen of the object's own handle with the right to delete (refused for a
+//! directory) and to an open of the object by its bare name relative to the parent's handle with the
+//! right to delete (the same object, which the removal mark on that handle takes away when the
+//! handle is closed). A later change of either answer meets a red case. The cases run only in a
+//! disposable Windows guest, as SYSTEM, in a temporary folder.
 
 #![cfg(windows)]
 #![allow(unsafe_code)]
@@ -192,62 +192,80 @@ fn reopen(handle: HANDLE) -> Result<HANDLE, String> {
     }
 }
 
-/// What the two forms answer for one object that was made through `identity_handle` relative to
+/// What the two forms answered for one object that was made through `identity_handle` relative to
 /// `parent`, named `name` there, at `path`.
+#[derive(Debug)]
+struct Forms {
+    /// The answer to the reopen of the object's own handle with the right to delete.
+    reopen: String,
+    /// The answer to the open by the bare name relative to the parent's handle with the right to
+    /// delete.
+    open_by_name: String,
+    /// Whether the object that that open reached has the identity of the object that was made.
+    same_identity: bool,
+    /// The answer to the removal mark on the handle of that open.
+    mark: String,
+    /// Whether the name still answered right after the mark, with the made object's own handle open.
+    present_after_the_mark: bool,
+    /// Whether the name still answered after the handle of that open was closed.
+    present_after_the_close: bool,
+}
+
 fn forms_for(
-    what: &str,
     parent: HANDLE,
     name: &str,
     identity_handle: HANDLE,
     path: &Path,
     directory: bool,
-) {
+) -> Forms {
     let made = identity(identity_handle);
-    match reopen(identity_handle) {
+    let reopen = match reopen(identity_handle) {
         Ok(again) => {
-            println!(
-                "REMOVAL {what}: ReOpenFile with DELETE | FILE_READ_ATTRIBUTES: ok; identity {} the made object's",
-                if identity(again) == made {
-                    "equals"
-                } else {
-                    "differs from"
-                }
-            );
             // SAFETY: the handle was just opened.
             unsafe { CloseHandle(again) };
+            "ok".to_owned()
         }
-        Err(error) => {
-            println!("REMOVAL {what}: ReOpenFile with DELETE | FILE_READ_ATTRIBUTES: {error}")
-        }
-    }
+        Err(error) => error,
+    };
     match open_by_name(parent, name, DELETE, FILE_OPEN, directory) {
         Ok(opened) => {
-            let same = identity(opened) == made;
-            let marked = mark(opened);
-            let gone_at_mark = !path.exists();
+            let same_identity = identity(opened) == made;
+            let mark = mark(opened);
+            let present_after_the_mark = path.exists();
             // SAFETY: the handle was just opened.
             unsafe { CloseHandle(opened) };
-            println!(
-                "REMOVAL {what}: open by bare name relative to the parent's handle with DELETE: ok; identity {} the made object's; mark for removal: {marked}; path gone right after the mark: {gone_at_mark}; gone after the close: {}",
-                if same { "equals" } else { "differs from" },
-                !path.exists()
-            );
+            Forms {
+                reopen,
+                open_by_name: "ok".to_owned(),
+                same_identity,
+                mark,
+                present_after_the_mark,
+                present_after_the_close: path.exists(),
+            }
         }
-        Err(error) => println!(
-            "REMOVAL {what}: open by bare name relative to the parent's handle with DELETE: {error}"
-        ),
+        Err(error) => Forms {
+            reopen,
+            open_by_name: error,
+            same_identity: false,
+            mark: "not tried".to_owned(),
+            present_after_the_mark: path.exists(),
+            present_after_the_close: path.exists(),
+        },
     }
 }
 
-#[test]
-#[ignore = "needs a disposable Windows guest, as SYSTEM (see windows_install.rs)"]
-fn the_forms_of_taking_away_what_a_run_made_through_its_handles_are_tried() {
+/// A folder of its own in the temporary directory.
+fn scratch_folder(label: &str) -> std::path::PathBuf {
     let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
-    let top = std::env::temp_dir().join(format!("krremoval-{id}"));
+    let top = std::env::temp_dir().join(format!("krremoval-{label}-{id}"));
     std::fs::create_dir(&top).unwrap();
+    top
+}
 
-    // A directory made relative to its parent's handle, with the rights that the installation's
-    // handles carry: listing and the right to change the list, and no right to delete.
+/// The forms for a directory made relative to its parent's handle, with the rights that the
+/// installation's handles carry: listing and the right to change the list, and no right to delete.
+fn forms_for_a_made_directory() -> Forms {
+    let top = scratch_folder("directory");
     let parent = folder(
         &top,
         FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY | SYNCHRONIZE,
@@ -260,31 +278,71 @@ fn the_forms_of_taking_away_what_a_run_made_through_its_handles_are_tried() {
         true,
     )
     .expect("the directory is made");
-    forms_for("a directory", parent, "made", made, &top.join("made"), true);
-
-    // A file made relative to a directory's handle that may add a file.
-    std::fs::create_dir(top.join("holder")).unwrap();
-    let holder = folder(
-        &top.join("holder"),
-        FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_TRAVERSE | SYNCHRONIZE,
-    );
-    let file = open_by_name(holder, "record.json", FILE_WRITE_DATA, FILE_CREATE, false)
-        .expect("the file is made");
-    forms_for(
-        "a file",
-        holder,
-        "record.json",
-        file,
-        &top.join("holder").join("record.json"),
-        false,
-    );
-
+    let forms = forms_for(parent, "made", made, &top.join("made"), true);
     // SAFETY: the handles were opened above and are closed once.
     unsafe {
-        CloseHandle(file);
-        CloseHandle(holder);
         CloseHandle(made);
         CloseHandle(parent);
     }
     let _ = std::fs::remove_dir_all(&top);
+    forms
+}
+
+/// The forms for a file made relative to the handle of a directory that may add a file.
+fn forms_for_a_made_file() -> Forms {
+    let top = scratch_folder("file");
+    let holder = folder(
+        &top,
+        FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_TRAVERSE | SYNCHRONIZE,
+    );
+    let file = open_by_name(holder, "record.json", FILE_WRITE_DATA, FILE_CREATE, false)
+        .expect("the file is made");
+    let forms = forms_for(holder, "record.json", file, &top.join("record.json"), false);
+    // SAFETY: the handles were opened above and are closed once.
+    unsafe {
+        CloseHandle(file);
+        CloseHandle(holder);
+    }
+    let _ = std::fs::remove_dir_all(&top);
+    forms
+}
+
+#[test]
+#[ignore = "needs a disposable Windows guest, as SYSTEM (see windows_install.rs)"]
+fn the_reopen_of_a_made_directory_with_the_right_to_delete_is_refused() {
+    let forms = forms_for_a_made_directory();
+    assert_eq!(
+        forms.reopen, "error 5",
+        "the reopen of a directory's own handle with DELETE was not refused with access denied: {forms:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs a disposable Windows guest, as SYSTEM (see windows_install.rs)"]
+fn a_made_directory_and_a_made_file_are_removed_through_a_delete_open_relative_to_their_parent() {
+    for (what, forms) in [
+        ("directory", forms_for_a_made_directory()),
+        ("file", forms_for_a_made_file()),
+    ] {
+        assert_eq!(
+            forms.open_by_name, "ok",
+            "the open of the {what} by its bare name relative to the parent's handle with DELETE failed: {forms:?}"
+        );
+        assert!(
+            forms.same_identity,
+            "the {what} that the open reached is not the object that was made: {forms:?}"
+        );
+        assert_eq!(
+            forms.mark, "ok",
+            "the removal mark on the handle of the open failed for the {what}: {forms:?}"
+        );
+        assert!(
+            forms.present_after_the_mark,
+            "the {what} was gone while another handle to it was open: {forms:?}"
+        );
+        assert!(
+            !forms.present_after_the_close,
+            "the {what} stands after the handle that marked it was closed: {forms:?}"
+        );
+    }
 }
