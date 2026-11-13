@@ -544,27 +544,60 @@ impl Drop for UnlessFinished {
     }
 }
 
-/// A shared marker that revokes one stream.
+/// The loss of one connection's control stream, as a state of the connection.
+///
+/// Every data stream of the connection holds it, so that a stream reads the loss whether or not it
+/// is still registered when the loss is declared: a stream the host dropped earlier, or whose
+/// registration has gone for any other reason, is no more outside the loss than one that is open.
+#[derive(Debug, Default)]
+struct ControlLost {
+    lost: std::sync::atomic::AtomicBool,
+    woken: tokio::sync::Notify,
+}
+
+impl ControlLost {
+    /// Sets the mark and wakes everything waiting on a stream of the connection. Returns whether it
+    /// was set already.
+    fn declare(&self) -> bool {
+        let before = self.lost.swap(true, std::sync::atomic::Ordering::AcqRel);
+        self.woken.notify_waiters();
+        before
+    }
+
+    fn is_declared(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// A shared marker that revokes one stream, and reads the loss of its connection's control stream.
 ///
 /// Revocation has to reach a stream that another task is already reading or writing, so the flag is
 /// shared and the waiters are woken. [`StreamHandle::revoked`] is what an operation races against;
-/// resetting the QUIC stream is what the peer sees.
+/// resetting the QUIC stream is what the peer sees. A stream is revoked when its own flag is set or
+/// when its connection's control stream is lost, whichever comes first.
 #[derive(Clone, Debug)]
 pub struct StreamHandle {
     revoked: Arc<std::sync::atomic::AtomicBool>,
     woken: Arc<tokio::sync::Notify>,
+    connection: Arc<ControlLost>,
 }
 
 impl Default for StreamHandle {
     fn default() -> Self {
-        Self {
-            revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            woken: Arc::new(tokio::sync::Notify::new()),
-        }
+        Self::under(Arc::default())
     }
 }
 
 impl StreamHandle {
+    /// A handle of a stream of the connection whose control stream's loss is `connection`.
+    fn under(connection: Arc<ControlLost>) -> Self {
+        Self {
+            revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            woken: Arc::new(tokio::sync::Notify::new()),
+            connection,
+        }
+    }
+
     /// Marks the stream revoked and wakes everything waiting on it.
     pub fn revoke(&self) {
         self.revoked
@@ -572,20 +605,24 @@ impl StreamHandle {
         self.woken.notify_waiters();
     }
 
-    /// Returns true once the stream has been revoked.
+    /// Returns true once the stream has been revoked, or its connection's control stream is lost.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
-        self.revoked.load(std::sync::atomic::Ordering::Acquire)
+        self.revoked.load(std::sync::atomic::Ordering::Acquire) || self.connection.is_declared()
     }
 
     /// Resolves as soon as the stream is revoked.
     pub async fn revoked(&self) {
         loop {
             let waiting = self.woken.notified();
+            let lost = self.connection.woken.notified();
             if self.is_revoked() {
                 return;
             }
-            waiting.await;
+            tokio::select! {
+                () = waiting => {}
+                () = lost => {}
+            }
             if self.is_revoked() {
                 return;
             }
@@ -654,6 +691,8 @@ struct RegistryState {
     /// The places for streams that are waiting for their headers.
     pending: Arc<Semaphore>,
     streams: Mutex<RegistryStreams>,
+    /// The loss of the control stream, which the connection's every stream reads.
+    lost: Arc<ControlLost>,
     /// Woken when the control stream ends, so a stream that is waiting to open or be accepted stops
     /// waiting for a peer that will never answer.
     ended: tokio::sync::Notify,
@@ -663,7 +702,6 @@ struct RegistryState {
 struct RegistryStreams {
     next_key: StreamKey,
     open: HashMap<StreamKey, (StreamKind, StreamHandle)>,
-    revoked: bool,
     /// Set when the revocation hook has run, which it does once.
     hook_ran: bool,
 }
@@ -695,15 +733,15 @@ impl RegistryState {
     }
 
     fn is_revoked(&self) -> bool {
-        self.lock().revoked
+        self.lost.is_declared()
     }
 
     fn register(self: &Arc<Self>, kind: StreamKind) -> Result<(StreamHandle, Registration)> {
         let mut state = self.lock();
-        if state.revoked {
+        if self.lost.is_declared() {
             return Err(TransportError::ControlLost);
         }
-        let handle = StreamHandle::default();
+        let handle = StreamHandle::under(Arc::clone(&self.lost));
         let key = state.next_key;
         state.next_key = state.next_key.wrapping_add(1);
         state.open.insert(key, (kind, handle.clone()));
@@ -859,6 +897,7 @@ impl StreamRegistry {
                 deadlines,
                 pending: Arc::new(Semaphore::new(MAX_PENDING_HEADERS)),
                 streams: Mutex::new(RegistryStreams::default()),
+                lost: Arc::default(),
                 ended: tokio::sync::Notify::new(),
             }),
         }
@@ -987,27 +1026,20 @@ impl StreamRegistry {
 
     /// Revokes every data stream, without running the revocation hook.
     ///
-    /// Every handle is revoked before this returns, whichever call revoked the registry first, and
-    /// a stream opened after this point is refused. A host's hook is a statement about the whole
-    /// connection, which may have more to undo than its streams, so the listener runs it once the
-    /// connection's handler has gone ([`StreamRegistry::revoke_all`]) and revokes the streams as
-    /// soon as the loss is declared.
+    /// The loss is declared first, as a state of the connection that every stream of it reads, a
+    /// stream that has left the registry too: a stream is revoked from that moment, whichever call
+    /// declared the loss, and a stream opened after it is refused. A host's hook is a statement
+    /// about the whole connection, which may have more to undo than its streams, so the listener
+    /// runs it once the connection's handler has gone ([`StreamRegistry::revoke_all`]) and revokes
+    /// the streams as soon as the loss is declared.
     pub fn revoke_streams(&self) {
-        let first = {
-            let mut state = self.state.lock();
-            if state.revoked {
-                false
-            } else {
-                state.revoked = true;
-                // Under the lock, so a second caller that finds the registry revoked finds every
-                // handle revoked too. A handle's revocation is a flag and a wake-up and takes no lock.
-                for (_, (_, handle)) in state.open.drain() {
-                    handle.revoke();
-                }
-                true
-            }
-        };
-        if first {
+        let before = self.state.lost.declare();
+        // The streams that are registered end at once as well: their own flags are set, and their
+        // waiters woken, before this returns. A handle's revocation takes no lock.
+        for (_, (_, handle)) in self.state.lock().open.drain() {
+            handle.revoke();
+        }
+        if !before {
             // A stream that is still waiting to open or be accepted has no handle yet, so it waits
             // on the registry itself.
             self.state.ended.notify_waiters();
