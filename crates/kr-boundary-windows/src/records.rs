@@ -173,8 +173,30 @@ fn list_names(dir: &Path) -> io::Result<Vec<io::Result<OsString>>> {
         .collect())
 }
 
+/// What a read of a name found after its removal answered that it was done: nothing where the read
+/// found no entry at the name, and the words of what stays where it found one or could not tell. A
+/// removal call that answered success shows that the call was made, and the read shows that the
+/// name is gone; nothing is said to be deleted or gone before it.
+#[must_use]
+// text: found_after_removal
+pub fn found_after_removal(path: &Path) -> Option<String> {
+    match look(path) {
+        Look::NotThere => None,
+        Look::There => Some(format!(
+            "{} is still there after its removal answered that it was done",
+            path.display()
+        )),
+        Look::Unread(error) => Some(format!(
+            "a read of {} after its removal failed ({error}), so whether it is gone is not known",
+            path.display()
+        )),
+    }
+}
+
 /// Whether the thing is gone: it stayed when the call failed for any reason but its absence, and
-/// the reason is added to what stayed.
+/// the reason is added to what stayed; where the call answered that it was done, or that nothing
+/// was there, a read of the name afterwards must find nothing there, and what it found is added to
+/// what stayed.
 fn leave(stayed: &mut Vec<String>, path: &Path, result: io::Result<()>) -> bool {
     if let Err(error) = result
         && error.kind() != io::ErrorKind::NotFound
@@ -182,7 +204,13 @@ fn leave(stayed: &mut Vec<String>, path: &Path, result: io::Result<()>) -> bool 
         stayed.push(format!("{} ({error})", path.display()));
         return false;
     }
-    true
+    match found_after_removal(path) {
+        None => true,
+        Some(text) => {
+            stayed.push(text);
+            false
+        }
+    }
 }
 
 /// Whether the path of a record that the inspection did not see is still not there; something that
@@ -326,12 +354,9 @@ pub fn begin<M>(
 /// is named. Returns what could not be removed, with the reason; nothing when it is gone.
 // text: remove_empty
 pub fn remove_empty(data: &Path) -> Vec<String> {
-    match fs::remove_dir(data) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            vec![format!("{} ({error})", data.display())]
-        }
-        _ => Vec::new(),
-    }
+    let mut stayed = Vec::new();
+    leave(&mut stayed, data, fs::remove_dir(data));
+    stayed
 }
 
 /// Which of the data directory's `journal` and `run` directories the removal's inspection opened
@@ -396,8 +421,10 @@ pub fn finish_journal_and_run(
             continue;
         }
         match fs::remove_dir(directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(()) => stayed.extend(found_after_removal(directory)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                stayed.extend(found_after_removal(directory));
+            }
             Err(error) => stayed.push(format!(
                 "removing {} failed ({error}): the call fails for an entry that is still in the directory and for a program that holds it open, and the removal run again reads it",
                 directory.display()

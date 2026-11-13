@@ -272,3 +272,27 @@ fn a_journal_file_name_is_32_lowercase_hexadecimal_digits_and_the_extension() {
         assert!(!is_journal_file_name(not), "{not}");
     }
 }
+
+#[test]
+fn a_name_is_said_to_be_gone_only_where_a_read_of_it_afterwards_found_nothing() {
+    use kr_boundary_windows::records::found_after_removal;
+    let folder = tempfile::tempdir().unwrap();
+    // Nothing at the name: nothing stays.
+    assert_eq!(found_after_removal(&folder.path().join("gone")), None);
+    // An entry at the name, whatever answered that it was removed: it stays and is named.
+    let there = folder.path().join("there");
+    fs::write(&there, b"x").unwrap();
+    let text = found_after_removal(&there).expect("an entry stands at the name");
+    assert!(
+        text.contains(&there.display().to_string())
+            && text.contains("is still there after its removal answered that it was done"),
+        "{text}"
+    );
+    // A look that fails for another reason than not found: whether it is gone is not known.
+    let below_a_file = there.join("child");
+    let text = found_after_removal(&below_a_file).expect("a look below a file cannot tell");
+    assert!(
+        text.contains("so whether it is gone is not known") && !text.contains("is gone."),
+        "{text}"
+    );
+}
