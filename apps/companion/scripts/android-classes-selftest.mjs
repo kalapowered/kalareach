@@ -413,6 +413,19 @@ expectNames(
   'nothing'
 )
 expectNames(
+  'a package of the application\'s own that is called like a platform package is still asked for',
+  'names-own-platform-like.apk',
+  [
+    application(dex({ defined: [] })),
+    library(
+      elf({
+        blobs: [Buffer.from('to/kala/reach/android/os/Thing\0', 'latin1')]
+      })
+    )
+  ],
+  `class to.kala.reach.android.os.Thing (named by ${MEDIA})`
+)
+expectNames(
   'a name that runs into the next string has no end to read, so it is not asked for',
   'names-packed.apk',
   [

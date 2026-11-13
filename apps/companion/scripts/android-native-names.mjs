@@ -40,9 +40,10 @@ const DESCRIPTOR = new RegExp(`${BEFORE_CLASS}L(${PACKAGE}(?:/${PACKAGE})+/${CLA
 /**
  * Whether a name is a platform class that the string before it in the library ran into. Rust packs
  * its literals one after another, so the tail of the literal before can come in front of a name
- * (`result` before `android/os/Build$VERSION`, which reads as the package `resultandroid`). Only a
- * name that starts inside its first package is read this way, so the packages after the first are
- * still the application's own.
+ * (`result` before `android/os/Build$VERSION`, which reads as the package `resultandroid`). Only
+ * the first package can have a prefix glued to it, so the name is cut inside the first package and
+ * nowhere else: a platform name later in the name (a package of the application's own that is
+ * called `android`) is not taken for the platform's.
  */
 function platformAfterAGluedPrefix(name) {
   const firstEnd = name.indexOf('.')
