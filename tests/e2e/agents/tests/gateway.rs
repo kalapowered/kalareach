@@ -2018,7 +2018,9 @@ impl InFlightWatch {
         if let Some(want) = &self.thread {
             match thread_of(binding) {
                 Some(got) if &got == want => {}
-                Some(got) => return Verdict::Failed(format!("it names the thread {got}, not {want}")),
+                Some(got) => {
+                    return Verdict::Failed(format!("it names the thread {got}, not {want}"));
+                }
                 None => return Verdict::Failed(format!("it names no thread, not {want}")),
             }
         }
@@ -2027,7 +2029,9 @@ impl InFlightWatch {
             return Verdict::Open;
         }
         match binding.suspension_reason.0.as_deref() {
-            Some(reason) if binding.rich_mutations_suspended && reason.starts_with(IN_FLIGHT_REASON) => {
+            Some(reason)
+                if binding.rich_mutations_suspended && reason.starts_with(IN_FLIGHT_REASON) =>
+            {
                 let since = self.since.get().unwrap_or(now);
                 self.since.set(Some(since));
                 if now.duration_since(since) >= IN_FLIGHT_BOUND {
@@ -2096,6 +2100,19 @@ impl<'a> Session<'a> {
         not: Option<ApplicationInstanceId>,
         commands: &[Slash],
     ) -> ApplicationInstanceId {
+        self.starts_the_agent_showing(ASKED, extra, not, commands)
+    }
+
+    /// [`Self::starts_the_agent`] with the text that the stand-in's screen shows once it is up
+    /// behind the gateway named: a stand-in that starts no turn of its own never asks for the
+    /// approval that [`ASKED`] names.
+    fn starts_the_agent_showing(
+        &self,
+        stand_in_shows: &str,
+        extra: &[&str],
+        not: Option<ApplicationInstanceId>,
+        commands: &[Slash],
+    ) -> ApplicationInstanceId {
         // Before anything of the agent runs, the probes of a real route included, the shell's own
         // environment is read at its prompt: the first start only, since an agent's start can change
         // what a later read would show.
@@ -2112,7 +2129,7 @@ impl<'a> Session<'a> {
             Route::StandIn => {
                 let _ = self.person.types_until_it_shows(
                     "codex",
-                    ASKED,
+                    stand_in_shows,
                     "the terminal reaches the server through the gateway",
                     &|| self.ctx.checks_the_placed_files(),
                 );
@@ -2892,6 +2909,123 @@ fn gateway_the_terminal_shows_a_turn_the_host_started() {
                 }
             }
         },
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The terminal's helper thread where it stays or comes again: the stand-in's two variants of the
+// title flow.
+// ---------------------------------------------------------------------------------------------
+
+/// A terminal that a person is at starts a thread of its own for the conversation's title and
+/// leaves it when its turn ends. A terminal that never leaves that thread (`keep-the-title-thread`)
+/// and one that asks for a title at every message (`retitle`) are the cases where the helper thread
+/// outlives the turn or comes again. The binding must name the conversation's thread, with no
+/// turn, for as long as the helper flow lasts: the package's hidden start keeps the helper thread
+/// out of it. Only the stand-in is the agent here; a real agent is never asked to keep or repeat
+/// its helper flow. `leaves` is how many of its helper threads the terminal leaves with a
+/// `thread/unsubscribe` by the end: none where it keeps the one it started, one for each prompt
+/// where it asks again (a helper that returns has been left before it comes back).
+fn a_helper_thread_that_stays_or_returns_leaves_the_binding_alone(
+    test: &str,
+    variants: &str,
+    prompts: usize,
+    leaves: usize,
+) {
+    if std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty()) {
+        return;
+    }
+    run_case(
+        "gateway-helper-thread",
+        "gateway-helper-thread",
+        test,
+        variants,
+        |ctx, session| {
+            let instance = session.starts_the_agent_showing("TUI: thread/started", &[], None, &[]);
+            let mut idle = session.binding_until(
+                instance,
+                "the stream names a thread and no turn",
+                |binding| {
+                    binding.thread_id.0.is_some()
+                        && binding.turn_id.0.is_none()
+                        && unsuspended(binding)
+                },
+            );
+            for round in 1..=prompts {
+                let started = ctx
+                    .prompts(
+                        &session.remote,
+                        session.session_id(),
+                        instance,
+                        &idle,
+                        &format!("run it again, time {round}"),
+                    )
+                    .unwrap_or_else(|why| {
+                        panic!(
+                            "the device's prompt is carried: {why:?}\n{}",
+                            session.diagnosis()
+                        )
+                    });
+                assert!(started.turn_id.0.is_some(), "the host started a turn");
+                idle = session.binding_settled_until(
+                    instance,
+                    "the host's turn ends on the thread it ran on",
+                    Some("thread-1"),
+                    |binding| binding.turn_id.0.is_none(),
+                );
+            }
+            // The case shows something only where the terminal did start a thread of its own for
+            // the title at each prompt: the conversation's thread and one helper thread for each
+            // prompt are the starts the server received.
+            let wanted = 1 + prompts;
+            let until = Instant::now() + Duration::from_secs(30);
+            while requests_of(ctx, "thread/start") < wanted && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(
+                requests_of(ctx, "thread/start") >= wanted,
+                "the terminal started a helper thread for the title at each prompt: {:?}",
+                received_lines(ctx)
+            );
+            session.binding_stays_on(
+                instance,
+                "the terminal's helper thread, kept or asked for again, leaves the conversation as it was",
+                "thread-1",
+            );
+            let left = requests_of(ctx, "thread/unsubscribe");
+            assert!(
+                if leaves == 0 {
+                    left == 0
+                } else {
+                    left >= leaves
+                },
+                "the terminal left its helper thread {left} times, where {leaves} is the case: {:?}",
+                received_lines(ctx)
+            );
+            serde_json::json!({ "helper_thread_left_alone": true })
+        },
+    );
+}
+
+/// The terminal never leaves the thread it started for the title (`keep-the-title-thread`).
+#[test]
+fn gateway_a_helper_thread_that_is_kept_with_no_leave_leaves_the_binding_alone() {
+    a_helper_thread_that_stays_or_returns_leaves_the_binding_alone(
+        "gateway_a_helper_thread_that_is_kept_with_no_leave_leaves_the_binding_alone",
+        "write-the-record,keep-reading,stay,keep-the-title-thread",
+        1,
+        0,
+    );
+}
+
+/// The terminal asks for a title again at the next prompt (`retitle`).
+#[test]
+fn gateway_a_title_asked_for_again_at_the_next_prompt_leaves_the_binding_alone() {
+    a_helper_thread_that_stays_or_returns_leaves_the_binding_alone(
+        "gateway_a_title_asked_for_again_at_the_next_prompt_leaves_the_binding_alone",
+        "write-the-record,keep-reading,stay,retitle",
+        2,
+        2,
     );
 }
 
