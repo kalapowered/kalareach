@@ -257,6 +257,11 @@ fn plugin() -> PluginId {
     PluginId::new("kalareach/example-declarative").expect("an identifier")
 }
 
+/// The package whose program is run beside the first's, and which no revocation names.
+fn second_plugin() -> PluginId {
+    PluginId::new("kalareach-two/example-declarative").expect("an identifier")
+}
+
 /// Loads the built test component the package ships, or says why the test cannot run.
 fn well_behaved() -> Option<Vec<u8>> {
     let directory =
@@ -301,8 +306,9 @@ fn directory_url(path: &Path) -> url::Url {
         .expect("an absolute path")
 }
 
-/// Writes the example declarative package with `component` shipped in it, into `into`.
-fn write_package(into: &Path, component: &[u8]) {
+/// Writes the example declarative package with `component` shipped in it, into `into`, as the plugin
+/// `name` of `publisher` and recognising the program whose file stem is `stem`.
+fn write_package(into: &Path, component: &[u8], publisher: &str, name: &str, stem: &str) {
     let example = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/plugins/valid/example-declarative");
     std::fs::create_dir_all(into).expect("a package directory");
@@ -315,6 +321,9 @@ fn write_package(into: &Path, component: &[u8]) {
         &std::fs::read(example.join("plugin.json")).expect("the example manifest"),
     )
     .expect("a manifest");
+    manifest["publisher_id"] = serde_json::json!(publisher);
+    manifest["plugin_name"] = serde_json::json!(name);
+    manifest["match_rules"][0]["executable"]["file_stem"] = serde_json::json!(stem);
     manifest["payloads"]
         .as_array_mut()
         .expect("the manifest lists its payloads")
@@ -617,6 +626,12 @@ fn plain_reason(report: &kr_protocol::admission::ComponentReport) -> Option<&str
         .filter(|reason| !reason.is_empty())
 }
 
+/// The last six characters of a binding's identifier, which is how the link's account names it.
+fn label_of(binding: kr_protocol::ids::BrokerBindingId) -> String {
+    let identifier = binding.to_string();
+    identifier[identifier.len().saturating_sub(6)..].to_owned()
+}
+
 /// Whether a report says the binding's registration is being sent to the runtime.
 fn registering(report: &kr_protocol::admission::ComponentReport) -> bool {
     report.state == ComponentState::Pending
@@ -701,6 +716,8 @@ struct World {
     worker: PathBuf,
     /// The program the package recognises, placed on the internal disk.
     agent: PathBuf,
+    /// The program the second package recognises, in a world that installs one.
+    second_agent: Option<PathBuf>,
     requested: Record,
     /// How much of `requested` an earlier daemon of this tree made: what the current one was asked
     /// to start is what follows.
@@ -709,6 +726,11 @@ struct World {
     /// one look holds only the newest of it.
     link_histories: Mutex<Vec<(SessionId, kr_worker::plugin_link_trace::History)>>,
     _published: tempfile::TempDir,
+    /// What the second package's repository publishes, in a world that installs one.
+    _published_second: Option<tempfile::TempDir>,
+    /// The first package's generation and its package directory, in a world that installs a
+    /// second package, for the next generation that revokes its release.
+    first_published: Option<(generations::Generation, PathBuf)>,
     /// Before the hosts, so a daemon in a process of its own is gone before they are ended.
     apart: Apart,
     /// Before the tree, so every host the daemon started is ended before the tree goes.
@@ -757,6 +779,21 @@ impl World {
 
     /// The tree, the three programs placed on it, and the package installed, with no daemon.
     async fn prepare(component: &[u8]) -> Self {
+        Self::prepare_packages(component, false).await
+    }
+
+    /// A world with two packages installed, each recognising a program of its own. When the first
+    /// package's release is revoked by its repository, under the policy that disables at the next
+    /// admission the binding on it is refused its rich capabilities and the second package's is
+    /// not.
+    async fn start_with_two_packages(component: &[u8]) -> Self {
+        let mut world = Self::prepare_packages(component, true).await;
+        world.run().await;
+        world
+    }
+
+    /// [`Self::prepare`], and with `second` the second package too.
+    async fn prepare_packages(component: &[u8], second: bool) -> Self {
         let tree = teardown::Tree::create();
         // Placed on the internal disk and started once here, where nothing is timed. The runtime
         // is found beside the worker.
@@ -782,16 +819,57 @@ impl World {
 
         let published = tempfile::tempdir().expect("a directory on the internal disk");
         let package = published.path().join("package");
-        write_package(&package, component);
+        write_package(
+            &package,
+            component,
+            "kalareach",
+            "example-declarative",
+            "example-agent",
+        );
         let generation = generations::Generation::build(
             published.path(),
             generations::GenerationSpec {
-                package: Some(package),
+                package: Some(package.clone()),
                 ..generations::GenerationSpec::default()
             },
         )
         .await;
-        install(&tree, &generation).await;
+        install(&tree, &generation, "development", &plugin()).await;
+        let (second_agent, published_second) = if second {
+            let second_agent = tree.root().join("example-agent-two");
+            kr_ipc::testing::place_and_start_once(
+                &std::env::current_exe().expect("this test's own binary"),
+                &second_agent,
+                &["--exact", "the_stand_in_program", "--test-threads", "1"],
+            );
+            let published_second = tempfile::tempdir().expect("a directory on the internal disk");
+            let package_second = published_second.path().join("package");
+            write_package(
+                &package_second,
+                component,
+                "kalareach-two",
+                "example-declarative",
+                "example-agent-two",
+            );
+            let generation_second = generations::Generation::build(
+                published_second.path(),
+                generations::GenerationSpec {
+                    package: Some(package_second),
+                    ..generations::GenerationSpec::default()
+                },
+            )
+            .await;
+            install(
+                &tree,
+                &generation_second,
+                "development-two",
+                &second_plugin(),
+            )
+            .await;
+            (Some(second_agent), Some(published_second))
+        } else {
+            (None, None)
+        };
 
         let requested = Arc::default();
         let environment = tree.environment();
@@ -802,10 +880,13 @@ impl World {
             environment_id: tree.environment_id(),
             worker,
             agent,
+            second_agent,
             requested: Arc::clone(&requested),
             counted_from: 0,
             link_histories: Mutex::new(Vec::new()),
             _published: published,
+            _published_second: published_second,
+            first_published: second.then(|| (generation, package)),
             apart: Apart { child: None },
             _hosts: HostEnding {
                 requested,
@@ -1060,6 +1141,21 @@ impl World {
     /// Types the program the package recognises at an attachment's prompt, and returns its process
     /// once it is running.
     async fn start_agent(&self, typing: &mut Typist, more: &str) -> ProcessStartIdentity {
+        self.start_program(typing, &self.agent, more).await
+    }
+
+    /// As [`Self::start_agent`], for the program the second package recognises.
+    async fn start_second_agent(&self, typing: &mut Typist) -> ProcessStartIdentity {
+        let program = self.second_agent.as_ref().expect("a second package");
+        self.start_program(typing, program, "").await
+    }
+
+    async fn start_program(
+        &self,
+        typing: &mut Typist,
+        program: &Path,
+        more: &str,
+    ) -> ProcessStartIdentity {
         let running = self
             .tree
             .root()
@@ -1070,7 +1166,7 @@ impl World {
                  the_stand_in_program --test-threads 1 --nocapture\n",
                 owner_of(std::process::id()),
                 running.display(),
-                self.agent.display()
+                program.display()
             ))
             .await;
         let pid = until("the program the line started to run", || async {
@@ -1227,6 +1323,108 @@ impl World {
         .await
     }
 
+    /// The first package's repository publishes its next generation, which revokes the release that
+    /// is installed, and the daemon synchronises it: the installation stays, bindings on the release
+    /// are told it was revoked, and the policy in force decides what that does to them. A release
+    /// its repository revoked is bound to no further program.
+    async fn revoke_the_first_release(&self) {
+        let (generation, package) = self
+            .first_published
+            .as_ref()
+            .expect("a world with two packages");
+        generation
+            .rewrite_with(generations::GenerationSpec {
+                generation: 2,
+                package: Some(package.clone()),
+                edit_entry: Some(revoked),
+                ..generations::GenerationSpec::default()
+            })
+            .await;
+        let _: kr_protocol::catalogue::CatalogueSyncResult = self
+            .client()
+            .await
+            .mutate(
+                Method::CatalogueSync,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target(None),
+                &kr_protocol::catalogue::CatalogueSyncParams {
+                    environment_id: self.environment_id,
+                    catalogue_id: "development".to_owned(),
+                },
+            )
+            .await
+            .expect("reaches the daemon")
+            .expect("the repository is synchronised")
+            .to_typed()
+            .expect("decodes");
+        self.looked().await;
+    }
+
+    /// Writes the host's configuration naming `policy` as the disable policy, or none, in the
+    /// document a person edits, accepts it as the next report does, and hands every worker the
+    /// admissions that follow. With the policy that disables at the next admission a binding on a
+    /// release its repository revoked is refused its rich capabilities, and with none the revocation
+    /// only warns and the binding is served again.
+    async fn name_the_policy(&self, policy: Option<&str>) {
+        let controller = self.controller();
+        let document = kr_worker::config::document_path(controller.paths());
+        let mut edited: serde_json::Value = match std::fs::read_to_string(&document) {
+            Ok(contents) => serde_json::from_str(&contents).expect("valid JSON"),
+            Err(_) => serde_json::to_value(
+                kr_protocol::hostinfo::configuration::ConfigurationDocument::empty(),
+            )
+            .expect("a document"),
+        };
+        let revision = edited["revision"].as_u64().expect("a revision") + 1;
+        edited["revision"] = serde_json::json!(revision);
+        match policy {
+            Some(named) => edited["ceilings"]["disable_policy"] = serde_json::json!(named),
+            None => {
+                edited["ceilings"]
+                    .as_object_mut()
+                    .expect("a ceilings section")
+                    .remove("disable_policy");
+            }
+        }
+        kr_ipc::paths::write_owner_only_file(
+            &document,
+            serde_json::to_string(&edited).expect("JSON").as_bytes(),
+        )
+        .expect("the edited document");
+        drop(controller.effective_configuration().await);
+        self.looked().await;
+    }
+
+    /// The plugin host's registration gate: while its file is in the environment's state directory,
+    /// a host built with the testing feature holds each registration it reads, before it reads or
+    /// compiles anything, and makes a second file there when one has reached it.
+    fn gate(&self) -> (PathBuf, PathBuf) {
+        let environment = self.environment();
+        let directory = environment.state_dir();
+        (
+            directory.join("hold-registrations"),
+            directory.join("hold-registrations.reached"),
+        )
+    }
+
+    /// Closes the gate, with no registration yet shown to have reached it.
+    fn close_the_gate(&self) {
+        let (gate, reached) = self.gate();
+        let _ = std::fs::remove_file(&reached);
+        std::fs::write(&gate, b"closed").expect("the gate is closed");
+    }
+
+    /// Opens the gate: the registrations it holds go on.
+    fn open_the_gate(&self) {
+        let (gate, _) = self.gate();
+        std::fs::remove_file(&gate).expect("the gate was closed");
+    }
+
+    /// Whether a registration has reached the closed gate since it was closed.
+    fn a_registration_reached_the_gate(&self) -> bool {
+        self.gate().1.exists()
+    }
+
     /// What the plugin runtime says it holds, asked as a connection of this test's own, which the
     /// runtime counts across every connection in its `live_bindings`.
     async fn health(&self) -> Option<HostHealth> {
@@ -1376,6 +1574,28 @@ impl World {
         self.link_traces_in_words()
     }
 
+    /// How many times the workers' link traces say `what`, after one more look at the reports.
+    async fn traced(&self, what: &str) -> usize {
+        self.link_traces_after_a_look().await.matches(what).count()
+    }
+
+    /// Waits until the workers' link traces say `what` at least `times` times.
+    async fn until_traced(&self, what: &str, times: usize) {
+        until_found(
+            PATIENCE,
+            &format!("the link's account to say '{what}' {times} times"),
+            || async {
+                if self.traced(what).await >= times {
+                    Ok(())
+                } else {
+                    Err(String::new())
+                }
+            },
+            || self.link_traces_after_a_look(),
+        )
+        .await;
+    }
+
     /// What each worker's link to the plugin runtime says it did, oldest first, from every look
     /// this case has taken and the reports the daemon holds now: the tail a worker sends after its
     /// reports' reasons when a file beside its program asks for it. Each time is in seconds on that
@@ -1507,7 +1727,12 @@ impl World {
 
 /// Enrols the generation as the owner acting directly, synchronises it, and installs and enables
 /// its package, before any daemon opens the catalogue.
-async fn install(tree: &teardown::Tree, generation: &generations::Generation) {
+async fn install(
+    tree: &teardown::Tree,
+    generation: &generations::Generation,
+    repository: &str,
+    plugin: &PluginId,
+) {
     let environment = tree.environment();
     let published = generation.directory();
     let mut catalogue = Catalogue::open(
@@ -1517,7 +1742,7 @@ async fn install(tree: &teardown::Tree, generation: &generations::Generation) {
         )),
     )
     .expect("an openable catalogue");
-    let id = RepositoryId::new("development").expect("an identifier");
+    let id = RepositoryId::new(repository).expect("an identifier");
     catalogue
         .enrol(
             Enrolment::new(
@@ -1538,14 +1763,14 @@ async fn install(tree: &teardown::Tree, generation: &generations::Generation) {
     let digest = catalogue
         .index(&id)
         .expect("activated")
-        .find(&plugin(), &version)
+        .find(plugin, &version)
         .expect("the package")
         .manifest_digest;
     catalogue
         .install(
             &id,
             tree.environment_id(),
-            &plugin(),
+            plugin,
             &version,
             digest,
             InstallationGrant::none(),
@@ -1553,9 +1778,19 @@ async fn install(tree: &teardown::Tree, generation: &generations::Generation) {
         .await
         .expect("installed");
     catalogue
-        .set_enabled(tree.environment_id(), &plugin(), true)
+        .set_enabled(tree.environment_id(), plugin, true)
         .await
         .expect("enabled");
+}
+
+/// Marks the example release's entry revoked, as a later generation of its repository publishes it.
+fn revoked(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.revocation = Nullable(Some(kr_plugin_sdk::catalogue::RevocationRecord {
+        reason: kr_plugin_sdk::catalogue::RevocationReason::Vulnerable,
+        revoked_at: kr_plugin_sdk::scalars::TimestampMs::new(1_760_000_100_000),
+        statement: kr_plugin_sdk::text::Summary::new("Replaced by a later release")
+            .expect("a valid statement"),
+    }));
 }
 
 /// KR-REQ-05.06 and KR-REQ-05.08: the plugin runtime is started by the daemon when a worker first
@@ -2069,6 +2304,133 @@ async fn a_registration_held_for_a_binding_that_goes_is_given_up_for_the_binding
                 Ok(())
             } else {
                 Err(String::new())
+            }
+        },
+        || world.link_traces_after_a_look(),
+    )
+    .await;
+    world.holding(2).await;
+}
+
+/// A binding that stops being wanted and is wanted again, twice, while the plugin runtime holds its
+/// registrations, is registered once the runtime has answered: the link removes one registration
+/// for each call it gave up, and not one for the binding.
+///
+/// One program of a package no revocation names is registered, which keeps the connection open. A
+/// second program is run whose package's release its repository then revokes. Under the policy that
+/// only warns it is served; the policy then disables at the next admission and warns again, and the
+/// binding is not wanted while the first holds and wanted while the second does. The host holds the
+/// binding's first registration at its gate and, once the link has given that up, makes it live,
+/// and holds the second at the gate in turn, so that when the link next asks the runtime to
+/// remove what it gave up, the host has one registration of the binding live and one being made.
+/// Both are removed. The binding the broker wants is then registered: a registration left in the
+/// runtime that nothing removes would refuse it for as long as the connection lasts.
+///
+/// The link asks that when the runtime answers its health question, which is every thirty seconds
+/// while a binding is registered; the case begins when one has been answered, so that the calls
+/// it gives up are not removed before the host holds both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_binding_whose_two_registrations_were_given_up_is_registered_when_it_is_wanted_again() {
+    let Some(component) = well_behaved() else {
+        return;
+    };
+    let world = World::start_with_two_packages(&component).await;
+    let created = world.session().await;
+    let mut typing = world.attach_typist(&created).await;
+
+    // The second package's program is run and registered: the connection stays open whatever
+    // happens to the first package's binding. It goes to the background of the session.
+    let _kept_agent = world.start_second_agent(&mut typing).await;
+    world.registering(1).await;
+    world.components_are(1, ComponentState::Registered).await;
+    let kept_binding = world.reported().await[0].0;
+    typing.send("\u{1a}").await;
+    typing.send("bg\n").await;
+
+    // Begun after the runtime has answered a health question, so that the next is some way off.
+    let answered = world.traced("ended health").await;
+    world.until_traced("ended health", answered + 1).await;
+
+    // The first package's program is run with the gate closed: its registration is held.
+    world.close_the_gate();
+    let _agent = world.start_agent(&mut typing, "").await;
+    let binding = until_found(
+        PATIENCE,
+        "the first package's binding's registration to be sent",
+        || async {
+            let look = world.looked().await;
+            match look
+                .reports
+                .iter()
+                .find(|(binding, report)| *binding != kept_binding && registering(report))
+            {
+                Some((binding, _)) => Ok(*binding),
+                None => Err(reports_in_words(
+                    &look.reports,
+                    kept_binding,
+                    counting_in_words(look.counted),
+                )),
+            }
+        },
+        || world.rounds_in_words(),
+    )
+    .await;
+    until("the host to hold that registration at its gate", || async {
+        world.a_registration_reached_the_gate().then_some(())
+    })
+    .await;
+    let label = label_of(binding);
+    let given_up = format!("ended register {label} gone");
+    let removal = format!("ended unbind {label} ");
+
+    // The release's repository revokes it, which under the policy that only warns changes nothing,
+    // and the policy then disables at the next admission: the binding is not wanted, and its
+    // registration is given up. The host goes on with it and makes the binding live, and nothing
+    // waits for the answer.
+    world.revoke_the_first_release().await;
+    world
+        .name_the_policy(Some("disable_at_next_admission"))
+        .await;
+    world.until_traced(&given_up, 1).await;
+    world.open_the_gate();
+    world.holding(2).await;
+
+    // The binding is wanted again, and its next registration is held at the gate; it is not wanted
+    // again, and that registration is given up as well.
+    world.close_the_gate();
+    world.name_the_policy(None).await;
+    until(
+        "the host to hold the second registration at its gate",
+        || async { world.a_registration_reached_the_gate().then_some(()) },
+    )
+    .await;
+    world
+        .name_the_policy(Some("disable_at_next_admission"))
+        .await;
+    world.until_traced(&given_up, 2).await;
+
+    // The runtime answers, and the link removes what it gave up. The host holds one registration
+    // of the binding live and one being made, which the gate still holds.
+    let removed = world.traced(&removal).await;
+    world.until_traced(&removal, removed + 1).await;
+    world.open_the_gate();
+
+    // The binding is wanted again, and is registered, as the broker wants.
+    world.name_the_policy(None).await;
+    until_found(
+        PATIENCE,
+        "the first package's binding to be registered again",
+        || async {
+            let look = world.looked().await;
+            match look.reports.iter().find(|(held, report)| {
+                *held == binding && report.state == ComponentState::Registered
+            }) {
+                Some(_) => Ok(()),
+                None => Err(reports_in_words(
+                    &look.reports,
+                    kept_binding,
+                    counting_in_words(look.counted),
+                )),
             }
         },
         || world.link_traces_after_a_look(),
