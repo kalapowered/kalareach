@@ -66,6 +66,7 @@ struct Worker {
     #[cfg_attr(not(unix), allow(dead_code))]
     serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
     _ending: kr_ipc::testing::Serving,
+    _closing: kr_worker::testing::ClosedOnDrop,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -195,6 +196,7 @@ async fn worker_on(
         endpoint,
     };
     Worker {
+        _closing: kr_worker::testing::ClosedOnDrop::of(&runtime),
         _temp: temp,
         service,
         session_id,

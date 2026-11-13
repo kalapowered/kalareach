@@ -76,6 +76,7 @@ pub struct Worker {
     pub session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
     _runtime: Arc<SessionRuntime>,
+    _closing: kr_worker::testing::ClosedOnDrop,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -319,6 +320,7 @@ impl Worker {
             service,
             session_id,
             endpoint,
+            _closing: kr_worker::testing::ClosedOnDrop::of(&runtime),
             _runtime: runtime,
             serving,
         }
