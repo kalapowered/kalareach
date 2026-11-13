@@ -146,7 +146,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         request,
         client: None,
         registered: BTreeMap::new(),
-        abandoned: BTreeSet::new(),
+        abandoned: BTreeMap::new(),
         refused: BTreeMap::new(),
         told_facts: BTreeMap::new(),
         pace: Pacing::default(),
@@ -269,10 +269,12 @@ struct Link {
     /// was registered: the component holds what it was offered since, whichever generation the
     /// instance has reached.
     registered: BTreeMap<BrokerBindingId, u64>,
-    /// The bindings whose registration on `client` was given up because the binding went while the
-    /// runtime held the call: the runtime may register one all the same, and each is removed when
-    /// the runtime next answers a registration or the health question.
-    abandoned: BTreeSet<BrokerBindingId>,
+    /// How many registration calls on `client` were given up for each binding because the binding
+    /// went while the runtime held the call: the runtime may register any of them all the same, and
+    /// each is removed, one for each call, when the runtime next answers a registration or the
+    /// health question. A binding the runtime then accepts a registration for is taken out of it,
+    /// since the runtime held nothing of the calls that were given up.
+    abandoned: BTreeMap<BrokerBindingId, u32>,
     /// The bindings the runtime refused on `client`, and when each may be offered again.
     refused: BTreeMap<BrokerBindingId, Refusal>,
     /// When the runtime may next be reached for.
@@ -595,7 +597,8 @@ impl Link {
                     .map_or(link_trace::Outcome::Gone, link_trace::Outcome::of),
             );
             let Some(registered) = registered else {
-                self.abandoned.insert(want.binding_id);
+                let given_up = self.abandoned.entry(want.binding_id).or_insert(0);
+                *given_up = given_up.saturating_add(1);
                 return Some(Duration::ZERO);
             };
             match registered {
@@ -676,32 +679,40 @@ impl Link {
     /// made all the same, and which it then holds against any later registration of the same
     /// binding: a binding the broker wants again is refused until it is removed, and is registered
     /// at the end of that refusal's wait. It is done once the runtime has answered something since,
-    /// and not before:
-    /// a runtime that answers nothing would hold every call for its limit and be lost for it, and
-    /// the registrations the broker wants now would wait behind them. Returns false where the
-    /// runtime was lost on the way.
+    /// and not before: a runtime that answers nothing would hold every call for its limit and be lost
+    /// for it, and the registrations the broker wants now would wait behind them. Returns false where
+    /// the runtime was lost on the way.
+    ///
+    /// A binding is unbound once for each call given up for it, since the runtime holds one
+    /// registration of an identifier at a time and may hold one of them live while another is
+    /// still being made. It stops at an unbind that finds nothing, because the calls left held
+    /// nothing either.
     async fn unbind_abandoned(&mut self, broker: &Weak<Broker>) -> bool {
-        while let Some(binding_id) = self.abandoned.pop_first() {
-            let Some(client) = self.client.as_ref() else {
-                self.abandoned.clear();
-                break;
-            };
-            #[cfg(feature = "testing")]
-            let began = link_trace::began(
-                link_trace::Call::Unbind,
-                Some(binding_id),
-                kr_plugin_service::client::DEFAULT_DEADLINE,
-            );
-            let unbound = client.unbind(service_id(binding_id)).await;
-            #[cfg(feature = "testing")]
-            link_trace::ended(began, link_trace::Outcome::of(&unbound));
-            match unbound {
-                Ok(_) | Err(ServiceError::Protocol { .. } | ServiceError::Disabled { .. }) => {}
-                Err(error) => {
-                    #[cfg(feature = "testing")]
-                    link_trace::lost(link_trace::Why::of(&error));
-                    self.lose(broker, &error.to_string());
-                    return false;
+        while let Some((binding_id, given_up)) = self.abandoned.pop_first() {
+            for _ in 0..given_up {
+                let Some(client) = self.client.as_ref() else {
+                    self.abandoned.clear();
+                    return true;
+                };
+                #[cfg(feature = "testing")]
+                let began = link_trace::began(
+                    link_trace::Call::Unbind,
+                    Some(binding_id),
+                    kr_plugin_service::client::DEFAULT_DEADLINE,
+                );
+                let unbound = client.unbind(service_id(binding_id)).await;
+                #[cfg(feature = "testing")]
+                link_trace::ended(began, link_trace::Outcome::of(&unbound));
+                match unbound {
+                    Ok(true)
+                    | Err(ServiceError::Protocol { .. } | ServiceError::Disabled { .. }) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        #[cfg(feature = "testing")]
+                        link_trace::lost(link_trace::Why::of(&error));
+                        self.lose(broker, &error.to_string());
+                        return false;
+                    }
                 }
             }
         }
