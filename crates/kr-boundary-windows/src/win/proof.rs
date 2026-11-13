@@ -308,7 +308,7 @@ pub fn run_captured_until(
         // The end is not proved; a read of a pipe that failed is told with it.
         (Err(LaunchError::EndUncertain(reason)), Err(read)) => {
             return Err(LaunchError::EndUncertain(format!(
-                "{reason}; the reads of the program's pipes, which ended after the job was told to end, gave: {read}"
+                "{reason}; the reads of the program's pipes gave: {read}"
             )));
         }
         (Err(error @ LaunchError::EndUncertain(_)), Ok(_)) => return Err(error),

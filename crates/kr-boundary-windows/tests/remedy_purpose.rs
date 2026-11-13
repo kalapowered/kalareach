@@ -239,9 +239,10 @@ fn the_owner_step_says_all_that_it_rests_on_for_the_folder_the_directory_and_an_
             &Presence::Present,
             None,
         );
+        // The account owned the entry, so the step names the entry and not the directory.
         texts.push((
             format!("the manifest, {purpose:?}"),
-            "the data directory",
+            r"D:\data\manifest.json",
             text,
         ));
     });

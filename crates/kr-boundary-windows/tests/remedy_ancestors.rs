@@ -560,7 +560,37 @@ fn no_stage_says_that_a_folder_is_empty_and_the_data_parents_stage_says_what_the
             made.contains("This run had already made the folder that holds the data directory"),
             "{fault:?}: {made}"
         );
-        assert!(made.contains("the folder stays"), "{fault:?}: {made}");
+        // What becomes of the folder is said by the cleanup that follows, by the platform's answers:
+        // the words of the read claim neither that the folder stays nor that it is removed.
+        for claim in ["stays", "removed", "left"] {
+            assert!(!made.contains(claim), "{fault:?}: {claim}: {made}");
+        }
+    }
+}
+
+/// A folder that the installation makes and that is not a folder names no step at any stage: the
+/// setup program names no move and no removal of an object on the way to a removal, a repair or a
+/// status report, and no stage gives it one.
+#[test]
+fn an_own_folder_that_is_not_a_folder_names_no_step_at_any_stage() {
+    let known = r"C:\Program Files";
+    let own = r"C:\Program Files\KalaReach";
+    for stage in every_stage() {
+        for tree in [Tree::Program, Tree::Data] {
+            let text = ancestor_refusal(
+                &Subject::at(own, known, AncestorFault::NotAFolder),
+                tree,
+                stage,
+            );
+            assert!(text.contains("is not a folder"), "{stage:?}: {text}");
+            assert!(
+                text.contains("The setup program names no step for it."),
+                "{stage:?}: {text}"
+            );
+            for step in ["Remove ", "remove or rename", "Rename", "Move "] {
+                assert!(!text.contains(step), "{stage:?}: {step}: {text}");
+            }
+        }
     }
 }
 

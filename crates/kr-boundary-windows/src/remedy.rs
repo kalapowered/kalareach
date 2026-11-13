@@ -378,7 +378,7 @@ pub fn ending(
         Remedy::NoStep => format!("{basis} The setup program names no step for it."),
         Remedy::OwnerStep(owner) => format!(
             "The handle of {entry} shows an owner that is not the system or the Administrators group: {owner}. The setup program does not use it while that account owns it. {}",
-            owner_step("the data directory")
+            owner_step(&entry.to_string())
         ),
         Remedy::MoveAside(_) => {
             let next = match kind {
@@ -844,8 +844,9 @@ pub enum Stage {
         broker_stopped: bool,
     },
     /// The run had made the folder that holds the data directory with its own call, and nothing
-    /// else, when that folder was read again. No manifest records it, and a later rollback leaves
-    /// it. The words say nothing of what is in it, which nothing has looked at yet.
+    /// else, when that folder was read again. No manifest records it. The words say nothing of what
+    /// is in it, which nothing has looked at yet, and nothing of what becomes of it: the cleanup
+    /// that follows the refusal says that, by the platform's answers.
     DataParentMade,
     /// A removal that undoes an installation that failed read the folder. The removal had removed
     /// nothing yet.
@@ -871,7 +872,7 @@ impl Stage {
                 "This run had already made changes before it read the folder again. A repair has no rollback."
             }
             Stage::DataParentMade => {
-                "This run had already made the folder that holds the data directory before it read the folder again, and the folder stays."
+                "This run had already made the folder that holds the data directory before it read the folder again."
             }
             Stage::Rollback => {
                 "This removal, which undoes the installation that failed, had removed nothing when it read the folder."
@@ -1030,6 +1031,13 @@ fn shared_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: St
 /// The words of a folder that the installation makes, which can tell the administrator what to
 /// correct. A fault that no such folder can have, and a volume that the installation does not use,
 /// say what they say for a folder that the installation does not make.
+///
+/// Only the program tree's walk makes such a subject: a folder strictly below the known folder
+/// `Program Files`, on the way to the program directory (never a folder of the data tree, whose
+/// folder above the directory is read on its own handle and answered by [`parent_advice`]). A
+/// folder of this kind that is not a folder names no step at any purpose, since an object on the
+/// way to a removal, a repair or a status report is not for the setup program to name a move or a
+/// removal of.
 fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage) -> String {
     let below = below(tree);
     let changes = stage.changes();
@@ -1043,7 +1051,7 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
             own_link_words(stage)
         ),
         AncestorFault::NotAFolder => format!(
-            "{folder} is on the path above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} Remove or rename what is in its place if nothing else needs it, then run the setup program again. {kept}"
+            "{folder} is on the path above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} The setup program names no step for it. {kept}"
         ),
         AncestorFault::Leads(found) => format!(
             "{folder} is on the path above the boundary's {below}. It is refused because the folder that it opens is at {found}, not at {folder}. {changes} The setup program makes this folder itself, as a plain folder, at its own path in the system's own known folder, and it directs no change to a folder that other programs share. {kept}"
@@ -1163,17 +1171,38 @@ pub fn data_ending(grounds: &Grounds<'_>, origin: &Origin, case_sensitive: bool)
     }
 }
 
+/// What the cleanup of one object that this run made came to, by the platform's answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// This run did not make the object, so the cleanup did nothing to it.
+    NotMade,
+    /// The object that this run made was marked for removal through the handle of the call that
+    /// made it.
+    Marked,
+    /// The object that this run made stays: the platform's refusal of the reopen or of the mark, or
+    /// the reason that the cleanup did not try (the directory in the folder stays).
+    Stays(String),
+}
+
 /// The words that end the failure of a step after this run made the data directory, or the folder
 /// above it: what the run did with what it made. They name no step, since a failure after the run
-/// made them leaves nothing of the run for the person to move or to correct. `directory_gone` says
-/// that the data directory that this run made was marked for removal (or that this run made none),
-/// and `stayed` is each object of the run that the platform did not let it mark, with its reason.
+/// made them leaves nothing of the run for the person to move or to correct. `directory` and
+/// `folder` are what the cleanup came to for each, with `data` and `above` their paths. The words
+/// say that the data directory was removed only where this run made it and marked it, name each
+/// object that stays with its reason, and say that nothing is left only where nothing stays.
 #[must_use]
 // text: data_made_ending
-pub fn data_made_ending(directory_gone: bool, stayed: &[String]) -> String {
+pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &str) -> String {
+    let mut stayed = Vec::new();
+    if let Taken::Stays(why) = directory {
+        stayed.push(format!("{data} ({why})"));
+    }
+    if let Taken::Stays(why) = folder {
+        stayed.push(format!("{above} ({why})"));
+    }
     if stayed.is_empty() {
         "This run removed what it made, so nothing of it is left.".to_owned()
-    } else if directory_gone {
+    } else if *directory == Taken::Marked {
         format!(
             "This run removed the data directory that it made. It could not remove the folder above it that it also made: {}. That folder stays.",
             stayed.join("; ")
