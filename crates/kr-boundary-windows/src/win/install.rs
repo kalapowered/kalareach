@@ -24,6 +24,7 @@ use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
@@ -42,7 +43,7 @@ use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Purpose, Shap
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
     FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, NtSetSecurityObject,
 };
 use windows_sys::Win32::Foundation::{
@@ -695,9 +696,10 @@ pub struct DataHolds {
     /// what the purpose allows.
     purpose: Purpose,
     _parent: ffi::Handle,
-    /// What this run made of the data directory's place, each object through the handle of the
-    /// call that made it. Empty where the directory and the folder above it were there.
-    made: Made,
+    /// What this run has made, each object held with the handle of the directory that holds it: the
+    /// data directory's place first, then the directories in it, and then, in the run, the records.
+    /// Shared with the run, which keeps it to the end of its work.
+    laid: Arc<Mutex<Laid>>,
     data: DirHandle,
     staging: Option<DirHandle>,
     journal: Option<DirHandle>,
@@ -849,6 +851,36 @@ impl Made {
     }
 }
 
+/// Everything that a run has made of the data directory's place and of what stands in it, each
+/// object held with the handle of the directory that holds it and its bare name. The rollback of an
+/// installation that failed takes away what this run made by this knowledge, and asks no manifest
+/// on the disk about any of it: an object is in it from the call that made it, and is taken away
+/// through its own identity, children before parents.
+#[derive(Debug, Default)]
+struct Laid {
+    /// The folder above the data directory and the data directory, where this run made them.
+    made: Made,
+    /// The staging directory, the journal directory and the directory of the private roots, where
+    /// this run made them.
+    staging: Option<MadeObject>,
+    journal: Option<MadeObject>,
+    run: Option<MadeObject>,
+    /// The earlier-state record, as this run wrote it.
+    prior: Option<MadeObject>,
+    /// The manifest, as the last write put it at its name.
+    manifest: Option<MadeObject>,
+}
+
+impl Laid {
+    fn child(&mut self, which: DataChild) -> &mut Option<MadeObject> {
+        match which {
+            DataChild::Staging => &mut self.staging,
+            DataChild::Journal => &mut self.journal,
+            DataChild::Run => &mut self.run,
+        }
+    }
+}
+
 impl std::fmt::Debug for DataHolds {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("DataHolds").finish_non_exhaustive()
@@ -865,13 +897,16 @@ impl DataHolds {
             paths,
             purpose: _,
             _parent,
-            made,
+            laid,
             data,
             staging,
             journal,
             run,
         } = self;
         drop((_parent, data, staging, journal, run));
+        // Only what the data directory's place holds is taken away here: nothing else is laid
+        // before the first record.
+        let made = std::mem::take(&mut ffi::locked(&laid).made);
         made.after(&paths, error)
     }
 
@@ -915,20 +950,65 @@ impl DataHolds {
             );
         }
         let name = which.name(&self.paths);
-        let (handle, created) = open_directory_relative(
+        // A directory that is there was opened and checked before this. One that is not there is
+        // made in a call that only makes it (full sharing, no right to delete), and the handle of
+        // the directory that holds it is copied first, so that the cleanup can open the new
+        // directory by its bare name relative to that copy.
+        let (handle, holder) = match open_directory_relative(
             self.data.handle(),
             &name,
-            FILE_OPEN_IF,
-            Some(&descriptor),
+            FILE_OPEN,
+            None,
             LIST | WRITE_DAC,
-        )?
-        .ok_or_else(|| {
-            // text: directory-1
-            Error::Failed(format!(
-                "{} was made and is gone again",
-                which.path(&self.paths).display()
-            ))
-        })?;
+        )? {
+            Some((found, _)) => (found, None),
+            None => {
+                let holder = self.data.handle().duplicate(LIST)?;
+                match open_directory_relative(
+                    self.data.handle(),
+                    &name,
+                    FILE_CREATE,
+                    Some(&descriptor),
+                    LIST | WRITE_DAC,
+                )? {
+                    Some((made, _)) => (made, Some(holder)),
+                    // Another program made it between the two calls: it is opened, and was not
+                    // made here.
+                    None => {
+                        let Some((found, _)) = open_directory_relative(
+                            self.data.handle(),
+                            &name,
+                            FILE_OPEN,
+                            None,
+                            LIST | WRITE_DAC,
+                        )?
+                        else {
+                            // text: directory-1
+                            return Err(Error::Failed(format!(
+                                "something was at {} when this run tried to make it, and the open after that answered not found",
+                                which.path(&self.paths).display()
+                            )));
+                        };
+                        (found, None)
+                    }
+                }
+            }
+        };
+        let created = holder.is_some();
+        // A directory that this run made is held at once with the handle of the folder that holds
+        // it and its name; the handle that the checks use is a copy.
+        let handle = match holder {
+            Some(holder) => {
+                let copy = handle.duplicate(LIST | WRITE_DAC);
+                *ffi::locked(&self.laid).child(which) = Some(MadeObject {
+                    identity: handle,
+                    holder,
+                    name: name.clone(),
+                });
+                copy?
+            }
+            None => handle,
+        };
         let shown = which.path(&self.paths).display().to_string();
         if let Some(why) = not_a_plain_directory(&handle, &shown)? {
             // text: refusal_directory-2
@@ -1501,12 +1581,12 @@ fn held_directory(handle: ffi::Handle) -> Result<DirHandle, Error> {
 
 /// Opens, or makes, the directory `name` directly beneath `parent`, relative to the parent's handle
 /// and never through a path, without following a reparse point: a link is opened as itself. With
-/// [`FILE_OPEN_IF`] a directory that is not there is made in the same call with `descriptor` as its
-/// own list, so that it is never there with a list it took from `parent`; with [`FILE_OPEN`] it is
-/// only opened, and with [`FILE_CREATE`] it is only made. The handle shares read and write only, so
-/// nothing renames or deletes the directory while it is held. Returns the handle and whether this
-/// call made the directory, or none when [`FILE_OPEN`] found nothing or [`FILE_CREATE`] found
-/// something there.
+/// [`FILE_OPEN`] it is only opened, and with [`FILE_CREATE`] it is only made, in the same call with
+/// `descriptor` as its own list, so that it is never there with a list it took from `parent`. An
+/// object that is only opened shares read and write only, so nothing renames or deletes it while it
+/// is held; one that is made shares everything and holds no right to delete, for its cleanup.
+/// Returns the handle and whether this call made the directory, or none when [`FILE_OPEN`] found
+/// nothing or [`FILE_CREATE`] found something there.
 fn open_directory_relative(
     parent: &ffi::Handle,
     name: &OsStr,
@@ -1593,11 +1673,10 @@ fn open_directory_at(
             code,
             format!(
                 "{} {}{}",
-                // With `FILE_OPEN_IF` the same call makes a directory that is not there.
-                match disposition {
-                    FILE_OPEN => "opening",
-                    FILE_CREATE => "making",
-                    _ => "opening or making",
+                if disposition == FILE_OPEN {
+                    "opening"
+                } else {
+                    "making"
                 },
                 shown,
                 if parent.is_some() {
@@ -2893,7 +2972,10 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
             paths: paths.clone(),
             purpose,
             _parent: held,
-            made,
+            laid: Arc::new(Mutex::new(Laid {
+                made,
+                ..Laid::default()
+            })),
             data,
             staging: inspected.staging,
             journal: inspected.journal,
@@ -3391,6 +3473,24 @@ struct Run {
     /// end of the run: every replacement of the manifest is named relative to it, and the manifest
     /// is proved to be at its name by opening the name relative to it.
     directory: Option<ffi::Handle>,
+    /// Everything that this run has made of the data directory's place and of what stands in it. It
+    /// is the same value that the data directory's holds put what they make in.
+    laid: Arc<Mutex<Laid>>,
+    /// The earlier-state record as this run wrote it, where it wrote one.
+    prior: Option<Prior>,
+}
+
+/// An object that stands in the data directory, opened by its bare name relative to a copy of the
+/// directory's handle, for its identity alone (no right but to read its attributes, full sharing).
+fn identity_in(directory: &ffi::Handle, name: &OsStr) -> Result<MadeObject, ffi::Error> {
+    let units: Vec<u16> = name.encode_wide().collect();
+    let holder = directory.duplicate(LIST)?;
+    let identity = DirHandle::open_beneath(&holder, &units, 0, true, FILE_OPEN)?;
+    Ok(MadeObject {
+        identity,
+        holder,
+        name: name.to_owned(),
+    })
 }
 
 impl Run {
@@ -3400,7 +3500,8 @@ impl Run {
         self.save()
     }
 
-    /// Writes the manifest, replacing the file whole, beside the held handle of the data directory.
+    /// Writes the manifest, replacing the file whole, beside the held handle of the data directory,
+    /// and holds the identity of what the manifest's name opens afterwards.
     fn save(&self) -> Result<(), Error> {
         let Some(directory) = &self.directory else {
             // text: run_save-1
@@ -3410,7 +3511,79 @@ impl Run {
             ));
         };
         self.manifest.save_beside(&self.paths.manifest, directory)?;
+        let name = self.paths.manifest.file_name().unwrap_or_default();
+        let mut laid = ffi::locked(&self.laid);
+        // The object that was there before is the one that the write replaced.
+        laid.manifest = None;
+        laid.manifest = Some(identity_in(directory, name)?);
         Ok(())
+    }
+
+    /// Holds the identity of the earlier-state record that this run wrote, with the record.
+    fn keep_prior(&mut self, prior: Prior) -> Result<(), Error> {
+        let Some(directory) = &self.directory else {
+            // text: run_keep_prior-1
+            return Err(Error::Failed(
+                "the earlier-state record was written before a handle of the data directory was held"
+                    .to_owned(),
+            ));
+        };
+        let name = self.paths.prior.file_name().unwrap_or_default();
+        ffi::locked(&self.laid).prior = Some(identity_in(directory, name)?);
+        self.prior = Some(prior);
+        Ok(())
+    }
+
+    /// Takes away what this run laid, by the handles that it holds and never by what a manifest
+    /// says: the run's own handle of the data directory is closed, then the objects go through
+    /// their own identities, children before parents. The directories of the journal and of the
+    /// private roots go first (the broker's own files in them were deleted before this), then the
+    /// earlier-state record, then the staging directory (the files that this run staged in it were
+    /// deleted before this), and the manifest, each only once what it follows is gone, so that a
+    /// run that is made again from the records that stay finds them. The data directory goes last,
+    /// and the folder above it where this run made that too, whatever happened before, so that what
+    /// keeps them is named. Returns each object that stays, with the reason.
+    fn take_away(&mut self) -> Vec<String> {
+        self.directory = None;
+        let Laid {
+            made,
+            staging,
+            journal,
+            run,
+            prior,
+            manifest,
+        } = std::mem::take(&mut *ffi::locked(&self.laid));
+        let mut stayed = Vec::new();
+        let mut take = |object: Option<MadeObject>, path: &Path| -> bool {
+            match object.map(MadeObject::take_away) {
+                None | Some(Ok(())) => true,
+                Some(Err(words)) => {
+                    stayed.push(format!("{} ({words})", path.display()));
+                    false
+                }
+            }
+        };
+        let mut gone = take(run, &self.paths.run);
+        gone &= take(journal, &self.paths.journal);
+        if gone {
+            gone = take(prior, &self.paths.prior);
+        }
+        if gone {
+            gone = take(staging, &self.paths.staging);
+        }
+        if gone {
+            take(manifest, &self.paths.manifest);
+        }
+        let (directory, folder) = made.take_away();
+        for (taken, path) in [
+            (directory, &self.paths.data),
+            (folder, &self.paths.data_parent().to_path_buf()),
+        ] {
+            if let Taken::Stays(words) = taken {
+                stayed.push(format!("{} ({words})", path.display()));
+            }
+        }
+        stayed
     }
 }
 
@@ -3535,6 +3708,8 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
         paths: paths.clone(),
         manifest,
         directory: None,
+        laid: Arc::default(),
+        prior: None,
     };
     if !run.manifest.persons.contains(&person) {
         run.manifest.persons.push(person);
@@ -3551,7 +3726,7 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
         }
         // text: install-5
         say("undoing what was done");
-        match remove_at(paths, true, remedy::Stage::Rollback) {
+        match roll_back(&mut run) {
             // text: install-6
             Ok(()) => say("the removal after the failure finished"),
             Err(error) => {
@@ -3564,6 +3739,30 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
         return Err(failure);
     }
     Ok(())
+}
+
+/// Removes what stands in the staging directory under a name that the layout gives its entries: the
+/// files that a run staged and the directories that the policy channel made. An entry whose name
+/// the layout does not give stays.
+fn sweep_staging(staging: &Path) {
+    if let Ok(entries) = fs::read_dir(staging) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a clean-up of what an earlier run left: an entry that cannot be read stays, nothing here says that staging is empty, and this run stages its files under fresh names"
+        )]
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            match layout_kind(Layout::Staging, &name) {
+                Some(Kind::Directory) => {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+                Some(_) => {
+                    let _ = fs::remove_file(entry.path());
+                }
+                None => {}
+            }
+        }
+    }
 }
 
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
@@ -3579,6 +3778,9 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             Purpose::Install
         },
     )?;
+    // What this run makes is held in the one value that the holds and the run share, to the end of
+    // the run: a failure after the first record is rolled back from it, not from a manifest.
+    run.laid = Arc::clone(&holds.laid);
     // The manifest's replacements are named relative to this handle, a copy of the held directory's
     // that stays to the end of the run, so that no path names the directory.
     run.directory = match holds.data.handle().duplicate(LIST) {
@@ -3605,9 +3807,9 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     ) {
         return Err(holds.undo(error));
     }
-    // The manifest records the directory now: a removal finds it by the manifest, and the handles
-    // that could mark what this run made for removal are closed.
-    holds.made = Made::default();
+    // The manifest records the directory now. What this run made stays held in `run.laid`: the
+    // rollback of a failure takes it away by its identity, and a removal after a finished
+    // installation finds it by the manifest.
     // The staging directory, the journal and the parent of the private roots: administrators and
     // the system only, so no boundary token can list, create in or delete from any of them. Each is
     // recorded before it is made.
@@ -3630,27 +3832,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     drop(holds);
     let channel = Channel::new(&paths.staging);
     // What an earlier run left in staging was checked as the layout names it; it is removed.
-    let sweep = |staging: &Path| {
-        if let Ok(entries) = fs::read_dir(staging) {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "a clean-up of what an earlier run left: an entry that cannot be read stays, nothing here says that staging is empty, and this run stages its files under fresh names"
-            )]
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                match layout_kind(Layout::Staging, &name) {
-                    Some(Kind::Directory) => {
-                        let _ = fs::remove_dir_all(entry.path());
-                    }
-                    Some(_) => {
-                        let _ = fs::remove_file(entry.path());
-                    }
-                    None => {}
-                }
-            }
-        }
-    };
-    sweep(&paths.staging);
+    sweep_staging(&paths.staging);
 
     // text: lay_down-2
     say("reading what is on this computer");
@@ -3707,6 +3889,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             // text: lay_down-7
             say("the earlier state is recorded");
         }
+        run.keep_prior(prior)?;
     }
     inject("directories")?;
 
@@ -4303,7 +4486,75 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         }
         records::Begin::Remove(manifest) => manifest,
     };
-    undo_recorded(paths, manifest, approved, seen, program_checked)
+    undo_recorded(
+        paths,
+        manifest,
+        approved,
+        seen,
+        program_checked,
+        Vec::new(),
+        DataTree::ByName,
+    )
+}
+
+/// How the removal's steps reach what stands in the data directory.
+enum DataTree<'a> {
+    /// The ordinary removal: by name, in the directories that an inspection opened and approved.
+    ByName,
+    /// The rollback of an installation that failed: through the identities that the run holds of
+    /// what it made.
+    Laid(&'a mut Run),
+}
+
+/// Undoes what a failed installation did, by what the run itself made and recorded: the run's
+/// manifest in memory (every object is recorded before its step) says what the service, the
+/// accounts, the policy and the program directory are, and what the run laid in the data directory
+/// is taken away through its own identities. No manifest on the disk is read and no inspection of
+/// the data directory is made: an installation's failure is where it can fail before either exists.
+/// Each step runs whatever another answered, and what could not be undone is named in the error.
+fn roll_back(run: &mut Run) -> Result<(), Error> {
+    let paths = run.paths.clone();
+    let manifest = run.manifest.clone();
+    let (approved, seen) = {
+        let laid = ffi::locked(&run.laid);
+        (
+            records::Approved {
+                prior: run.prior.is_some(),
+                staging: laid.staging.is_some(),
+                replacements: Vec::new(),
+            },
+            records::Seen {
+                journal: laid.journal.is_some(),
+                run: laid.run.is_some(),
+            },
+        )
+    };
+    let mut earlier = Vec::new();
+    // The program directory is read only where this run recorded it, which it does before it makes
+    // anything in it; where it did not, nothing of the program directory is this run's.
+    let recorded = manifest
+        .find(ObjectKind::Directory, &paths.program.display().to_string())
+        .is_some();
+    let program_checked = if recorded {
+        match check_program_directory(&paths, true, remedy::Stage::Rollback) {
+            Ok(checked) => checked,
+            Err(error) => {
+                earlier.push(format!("checking the program directory: {error}"));
+                false
+            }
+        }
+    } else {
+        false
+    };
+    undo_recorded(
+        &paths,
+        manifest,
+        approved,
+        seen,
+        program_checked,
+        earlier,
+        DataTree::Laid(run),
+    )
 }
 
 /// The removal's steps for the objects that `manifest` records, after an inspection approved what is
@@ -4319,18 +4570,24 @@ fn undo_recorded(
     mut approved: records::Approved,
     seen: records::Seen,
     program_checked: bool,
+    earlier: Vec<String>,
+    mut tree: DataTree<'_>,
 ) -> Result<(), Error> {
-    // A record that was approved and cannot be loaded is not used, and the last words say so.
-    let (prior, prior_error) = match approved.prior_record(|| Prior::load(&paths.prior)) {
-        Ok(prior) => (prior, None),
-        Err(error) => (None, Some(error.to_string())),
+    // A record that was approved and cannot be loaded is not used, and the last words say so. A
+    // rollback has the record as this run wrote it, and reads none from the disk.
+    let (prior, prior_error) = match &tree {
+        DataTree::Laid(run) => (run.prior.clone(), None),
+        DataTree::ByName => match approved.prior_record(|| Prior::load(&paths.prior)) {
+            Ok(prior) => (prior, None),
+            Err(error) => (None, Some(error.to_string())),
+        },
     };
     // A removal that took `staging` and could not delete the manifest leaves a manifest with no
     // `staging`, and the channel makes its temporary directory there. Where the inspection did not
     // open `staging`, the removal makes it itself, empty, with a creation that fails when anything is
     // there, and it goes with the records; what appeared since the inspection is left and named,
     // before anything is changed.
-    if !approved.staging {
+    if !approved.staging && matches!(tree, DataTree::ByName) {
         match fresh::directory_at(&paths.staging, SdKind::AdminDir, &Principals::default()) {
             Ok(()) => approved.staging = true,
             Err(error) if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) => {
@@ -4346,7 +4603,7 @@ fn undo_recorded(
     }
     let channel = Channel::new(&paths.staging);
     let manager = service::manager()?;
-    let mut failures: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = earlier;
     // (1) the broker stays up and refuses new invocations.
     let mut session = None;
     if manifest.find(ObjectKind::Service, SERVICE).is_some()
@@ -4594,9 +4851,13 @@ fn undo_recorded(
             &mut failures,
         );
     }
+    // A rollback takes away the service only where this run recorded it: it acts on what the run
+    // made and on nothing else.
+    let service_is_ours =
+        matches!(tree, DataTree::ByName) || manifest.find(ObjectKind::Service, SERVICE).is_some();
     keep(
         (|| -> Result<(), Error> {
-            if let Some(service) = manager.open(SERVICE)? {
+            if service_is_ours && let Some(service) = manager.open(SERVICE)? {
                 if service.status()?.running() {
                     service.stop()?;
                     service.wait_for(true, Duration::from_secs(60))?;
@@ -4687,19 +4948,32 @@ fn undo_recorded(
         if let Some(parent) = paths.program.parent() {
             let _ = fs::remove_dir(parent);
         }
-    } else if let Some(text) = records::looked_at_again(&paths.program) {
-        // It was not there when the removal checked, so no check opened it: nothing is deleted.
+    } else if (matches!(tree, DataTree::ByName)
+        || manifest
+            .find(ObjectKind::Directory, &paths.program.display().to_string())
+            .is_some())
+        && let Some(text) = records::looked_at_again(&paths.program)
+    {
+        // It was not there when the removal checked, so no check opened it: nothing is deleted. A
+        // rollback looks only where this run recorded the program directory.
         failures.push(text);
     }
     // The journal's files and the empty `run` and `journal` directories go where the inspection
     // opened and approved them, and nowhere else. Unfinished work was refused before the removal
     // began; what a journal file still holds now is finished or made nothing.
-    for stayed in records::finish_journal_and_run(&paths.journal, &paths.run, seen) {
-        // text: remove_at-21
-        say(&format!("the journal or the private roots stay: {stayed}"));
-        failures.push(format!(
-            "removing the journal or the private roots: {stayed}"
-        ));
+    match &tree {
+        DataTree::ByName => {
+            for stayed in records::finish_journal_and_run(&paths.journal, &paths.run, seen) {
+                // text: remove_at-21
+                say(&format!("the journal or the private roots stay: {stayed}"));
+                failures.push(format!(
+                    "removing the journal or the private roots: {stayed}"
+                ));
+            }
+        }
+        // The broker's own files in the journal's directory go by name; the directories that this
+        // run made go through their identities with the rest of what it laid.
+        DataTree::Laid(_) => records::delete_journal_files(&paths.journal, seen.journal),
     }
     if let Some(prior) = &prior {
         match residue(prior, paths, &manifest) {
@@ -4770,7 +5044,15 @@ fn undo_recorded(
     );
     if failures.is_empty() {
         // The records go last: a failed removal can be run again from them.
-        let stayed = remove_approved_records(paths, &approved);
+        let stayed = match &mut tree {
+            DataTree::ByName => remove_approved_records(paths, &approved),
+            DataTree::Laid(run) => {
+                // What this run staged and what the policy channel made stand in staging under the
+                // layout's names; they go before the directory that holds them.
+                sweep_staging(&paths.staging);
+                run.take_away()
+            }
+        };
         if stayed.is_empty() {
             // text: remove_at-24
             say(&format!(
@@ -5173,5 +5455,81 @@ mod tests {
         );
         assert!(std::fs::metadata(above.join("data")).unwrap().is_dir());
         assert!(std::fs::metadata(above.join("aside")).unwrap().is_dir());
+    }
+
+    /// A run that has laid the folder above, the data directory, its three directories, the
+    /// earlier-state record and the manifest, each held with its own directory's handle.
+    fn laid_run(top: &Path) -> Run {
+        let folder = made_in(held(top), "above");
+        let above = top.join("above");
+        let data = made_in(held(&above), "data");
+        let data_path = above.join("data");
+        let staging = made_in(held(&data_path), "staging");
+        let journal = made_in(held(&data_path), "journal");
+        let private = made_in(held(&data_path), "run");
+        std::fs::write(data_path.join("prior.json"), b"{}").unwrap();
+        std::fs::write(data_path.join("manifest.json"), b"{}").unwrap();
+        let directory = held(&data_path);
+        let prior = identity_in(&directory, OsStr::new("prior.json")).unwrap();
+        let manifest = identity_in(&directory, OsStr::new("manifest.json")).unwrap();
+        Run {
+            paths: Paths {
+                program: top.join("program"),
+                program_top: top.to_path_buf(),
+                data: data_path.clone(),
+                journal: data_path.join("journal"),
+                run: data_path.join("run"),
+                git: top.join("git"),
+                staging: data_path.join("staging"),
+                manifest: data_path.join("manifest.json"),
+                prior: data_path.join("prior.json"),
+            },
+            manifest: Manifest::begin(),
+            directory: Some(directory),
+            laid: Arc::new(Mutex::new(Laid {
+                made: Made {
+                    parent: Some(folder),
+                    directory: Some(data),
+                },
+                staging: Some(staging),
+                journal: Some(journal),
+                run: Some(private),
+                prior: Some(prior),
+                manifest: Some(manifest),
+            })),
+            prior: None,
+        }
+    }
+
+    #[test]
+    fn a_run_takes_away_what_it_laid_by_its_identities_children_before_parents() {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        let stayed = run.take_away();
+        assert!(stayed.is_empty(), "{stayed:?}");
+        assert!(!top.path().join("above").try_exists().unwrap());
+    }
+
+    #[test]
+    fn a_data_directory_that_holds_another_entry_stays_with_the_folder_above_it_and_both_are_named()
+    {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        let foreign = top.path().join("above").join("data").join("foreign.txt");
+        std::fs::write(&foreign, b"x").unwrap();
+        let stayed = run.take_away();
+        assert_eq!(stayed.len(), 2, "{stayed:?}");
+        assert!(
+            stayed[0].starts_with(&run.paths.data.display().to_string()),
+            "{stayed:?}"
+        );
+        assert!(
+            stayed[1].contains("the data directory in it stays"),
+            "{stayed:?}"
+        );
+        assert!(std::fs::metadata(&foreign).unwrap().is_file());
+        // What the run laid in the directory is gone; the entry that it did not lay is not touched.
+        assert!(!run.paths.manifest.try_exists().unwrap());
+        assert!(!run.paths.staging.try_exists().unwrap());
     }
 }
