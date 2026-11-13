@@ -24,7 +24,7 @@
 
 import { useEffect, type RefObject } from 'react'
 
-import { decide, linkAt, type Layout, type Named, type PaneLink, type Press, type Rect } from './link-target'
+import { contestRadius, decide, linkAt, type Layout, type Named, type PaneLink, type Press, type Rect } from './link-target'
 
 /** How far a press may move and still be a tap, in CSS pixels: the platforms' touch slop is 8 to 10. */
 const SLOP = 10
@@ -174,15 +174,17 @@ function linkNear(pane: HTMLElement, x: number, y: number): PaneLink<HTMLElement
 const NO_LINKS: Layout<HTMLElement> = { links: [], reach: { least: 0, beside: 0 }, bounds: { left: 0, top: 0, right: 0, bottom: 0 } }
 
 /**
- * The links of `pane` that a target could reach (`x`, `y`) from, laid out as they are now. The least
- * size is the stylesheet's `--target`: 44 points on iOS and 48 dp on Android, and half of it lies
- * beside the words.
+ * The links of `pane` that the rule weighs at (`x`, `y`), laid out as they are now: every link whose
+ * words lie within `contestRadius` of the point, which holds the links whose areas can hold it and every
+ * link whose words can be nearer to it than theirs. The least size is the stylesheet's `--target`: 44
+ * points on iOS and 48 dp on Android, and half of it lies beside the words.
  *
- * What this reads does not grow with the number of links. Where the pane holds no link in a message
- * (the terminal and the output views, a conversation with no link) it reads no box at all. Otherwise
- * it reads the pane's box, the box of each message that holds a link, and the box of each link of the
- * messages that lie within the least size of the point; of those links only the ones within the least
- * size of the point have their words read.
+ * Where the pane holds no link in a message (the terminal and the output views, a conversation with no
+ * link) this reads no box at all. Otherwise it reads the pane's box, the box of each message that holds
+ * a link, and the box of each link of the messages that lie within the radius of the point; of those
+ * links only the ones within the radius have their words read. The reads grow with the number of
+ * messages that hold links and with the links of the messages near the point, so a message of some
+ * thousand links reads every one of its link boxes at each press and each click.
  */
 function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement> {
   const all = pane.querySelectorAll<HTMLElement>('.m-node .md-link')
@@ -190,8 +192,10 @@ function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement
   const least = parseFloat(getComputedStyle(pane).getPropertyValue('--target'))
   const bounds = pane.getBoundingClientRect()
   if (!Number.isFinite(least) || least <= 0) return { links: [], reach: { least: 0, beside: 0 }, bounds }
-  // A box that lies farther from the point than a target reaches holds no link that could hold it.
-  const near = (box: DOMRect): boolean => x >= box.left - least && x <= box.right + least && y >= box.top - least && y <= box.bottom + least
+  const reach = { least, beside: least / 2 }
+  const radius = contestRadius(reach)
+  // A box that lies farther from the point than the radius holds no link that the rule weighs there.
+  const near = (box: DOMRect): boolean => x >= box.left - radius && x <= box.right + radius && y >= box.top - radius && y <= box.bottom + radius
   const messages = new Map<Element, boolean>()
   const nearMessage = (link: HTMLElement): boolean => {
     const message = link.closest('.m-node')
@@ -206,7 +210,7 @@ function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement
   const links = Array.from(all)
     .filter((link) => nearMessage(link) && near(link.getBoundingClientRect()))
     .map((link) => ({ id: link, destination: link.title, words: wordsOf(link) }))
-  return { links, reach: { least, beside: least / 2 }, bounds }
+  return { links, reach, bounds }
 }
 
 /** The rectangles of a link's words, one for each line its label covers. */

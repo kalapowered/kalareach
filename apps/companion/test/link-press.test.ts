@@ -204,6 +204,62 @@ describe('a tap on plain text beside a link, through the handler', () => {
   })
 })
 
+/** One message holding links with the given boxes (the words are the box), in a pane of the phone's size. */
+function between(...wordsOf: Box[]): { pane: HTMLElement; text: HTMLElement; links: HTMLElement[] } {
+  const pane = document.createElement('div')
+  boxes.set(pane, { left: 0, top: 0, right: 390, bottom: 844 })
+  const message = document.createElement('div')
+  message.className = 'm-node'
+  boxes.set(message, { left: 0, top: 0, right: 390, bottom: 844 })
+  const text = document.createElement('p')
+  const links = wordsOf.map((box, index) => {
+    const link = document.createElement('button')
+    link.className = 'md-link'
+    link.title = `https://example.org/${String(index)}`
+    const label = document.createElement('span')
+    label.className = 'md-link-label'
+    link.append(label)
+    boxes.set(link, box)
+    boxes.set(label, box)
+    link.addEventListener('click', () => {
+      opened.push(link)
+    })
+    text.append(link)
+    return link
+  })
+  message.append(text)
+  pane.append(message)
+  document.body.append(pane)
+  return { pane, text, links }
+}
+
+describe('a tap between two links, through the handler', () => {
+  it('lights and opens neither where the words of a link just past the least size are nearer than the words of the link whose area holds the point', () => {
+    // Link A's words stand at the pane's corner, so its area is given back to 52 by 44 and holds the
+    // point (51, 43), 50.25 px from its words. Link B's words start 47 px to the right of the point,
+    // beyond the least size, and its own area does not hold it: B's words are nearer, so the point is no link's.
+    const { pane, text, links } = between({ left: 0, top: 0, right: 8, bottom: 17 }, { left: 98, top: 43, right: 106, bottom: 60 })
+    startLinkPress(pane)
+    clock(100)
+    fire('pointerdown', pointer(text, { clientX: 51, clientY: 43 }))
+    expect(links.map((link) => link.hasAttribute('data-pressed')), 'the links lit at the press').toEqual([false, false])
+    fire('pointerup', pointer(text, { clientX: 51, clientY: 43, timeStamp: 120 }))
+    fire('click', click(text, { clientX: 51, clientY: 43 }))
+    expect(opened, 'links opened by the click').toEqual([])
+  })
+
+  it('still gives the point to the link at the corner when no other link’s words are nearer', () => {
+    const { pane, text, links } = between({ left: 0, top: 0, right: 8, bottom: 17 })
+    startLinkPress(pane)
+    clock(100)
+    fire('pointerdown', pointer(text, { clientX: 51, clientY: 43 }))
+    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit at the press').toBe(true)
+    fire('pointerup', pointer(text, { clientX: 51, clientY: 43, timeStamp: 120 }))
+    fire('click', click(text, { clientX: 51, clientY: 43 }))
+    expect(opened).toEqual([links[0]])
+  })
+})
+
 describe('the three seconds after the release', () => {
   const y = 328
 
@@ -262,16 +318,17 @@ describe('the boxes the handler reads', () => {
     const { pane, messages, links, texts } = conversation(60, 20)
     startLinkPress(pane)
     clock(100)
-    // Message 30 is under the press; message 29 ends 38 px above it, inside the reach, and message 31 starts 66 px below.
+    // Message 30 is under the press; message 29 ends 38 px above it, inside the radius of 62.2 px that the rule weighs, and
+    // message 31 starts 66 px below.
     fire('pointerdown', pointer(texts[30], { clientY: y + 2700 }))
     // The pane's box, a box for each of the 60 messages, the box of each of the 40 links of messages 29 and 30,
-    // and the words of the 3 links of message 30 that lie within the reach beside the press.
-    const bound = 1 + messages.length + 2 * 20 + 3
+    // and the words of the 4 links of message 30 that lie within the radius beside the press.
+    const bound = 1 + messages.length + 2 * 20 + 4
     expect(reads.length, 'boxes read by the press').toBeLessThanOrEqual(bound)
     expect(reads.length, 'boxes read by the press, against every link').toBeLessThan(links.flat().length / 4)
     const readLinks = new Set(reads.filter((each) => each.classList.contains('md-link')))
-    // Only the 3 links of message 30 that lie within the reach beside the press have their words read.
-    expect(reads.filter((each) => each.classList.contains('md-link-label')).length, 'links whose words were read by the press').toBe(3)
+    // Only the 4 links of message 30 that lie within the radius beside the press have their words read.
+    expect(reads.filter((each) => each.classList.contains('md-link-label')).length, 'links whose words were read by the press').toBe(4)
     expect(readLinks.has(links[10]?.[0]), 'a link of a message far from the press').toBe(false)
     expect(readLinks.has(links[31]?.[0]), 'a link of a message beyond the reach under the press').toBe(false)
     fire('pointerup', pointer(texts[30], { clientY: y + 2700, timeStamp: 120 }))
