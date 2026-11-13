@@ -358,19 +358,22 @@ fn create(path: &Path, only_new: bool) -> io::Result<File> {
 
 /// What a record is written beside, where the caller holds no handle: the directory that holds the
 /// record, opened by the record's path.
+#[cfg(windows)]
 fn beside_parent_of(path: &Path) -> io::Result<Beside> {
-    #[cfg(windows)]
-    {
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("the record has no directory"))?;
-        crate::win::fresh::hold_directory(parent)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Ok(Beside)
-    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("the record has no directory"))?;
+    crate::win::fresh::hold_directory(parent)
+}
+
+/// What a record is written beside, where the caller holds no handle: nothing is held here.
+#[cfg(not(windows))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the same call as on Windows, where opening the directory can fail"
+)]
+fn beside_parent_of(_path: &Path) -> io::Result<Beside> {
+    Ok(Beside)
 }
 
 /// Writes a file whole: to a sibling first, then over the name, so a reader sees the old record or
@@ -396,20 +399,19 @@ fn replacement_name(path: &Path) -> PathBuf {
 /// removed again, so that a failed write leaves no file of its own; a removal that fails too is named
 /// beside the first error. A replacement that this call did not make (the name was taken) is not
 /// touched.
+///
+/// On Windows the replacement is written, renamed relative to the held directory handle, proved to
+/// be at the record's name and, where a step fails, marked for removal through its one handle.
+#[cfg(windows)]
 fn replace_through(beside: &Beside, path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
-    // On Windows the replacement is written, renamed relative to the held directory handle, proved
-    // to be at the record's name and, where a step fails, marked for removal through its one handle.
-    // The form below is for the other systems: they have no handle that renames or marks a file by
-    // itself, so the replacement is removed by its name.
-    #[cfg(windows)]
-    {
-        crate::win::fresh::replace_whole(beside, path, staging, bytes)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = beside;
-        replace_by_name(path, staging, bytes)
-    }
+    crate::win::fresh::replace_whole(beside, path, staging, bytes)
+}
+
+/// [`replace_through`] for the other systems: they have no handle that renames or marks a file by
+/// itself, so the replacement is removed by its name.
+#[cfg(not(windows))]
+fn replace_through(_beside: &Beside, path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
+    replace_by_name(path, staging, bytes)
 }
 
 /// The form of [`replace_through`] for systems other than Windows.
