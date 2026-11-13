@@ -122,7 +122,7 @@ pub struct ListenersHeld {
     emit: Option<std::thread::JoinHandle<()>>,
 }
 
-/// The event that [`ListenersHeld`] emits, to which the application has one listener.
+/// The event that [`ListenersHeld`] emits, to which each try adds one application listener.
 const HOLDING_EVENT: &str = "kr://test-listeners-held";
 
 impl ListenersHeld {
@@ -146,15 +146,17 @@ impl ListenersHeld {
                     false
                 });
             });
-            // The filter says it is asked, inside the listeners' lock, before it waits. An emit
-            // that was queued drops the filter unasked, which ends the channel.
+            // The filter says it is asked, inside the listeners' lock, before it waits. A try whose
+            // emit was queued, or whose listener was, never asks the filter: its thread ends, which
+            // ends the channel.
             if held.recv().is_ok() {
                 return Self {
                     release: Some(release),
                     emit: Some(emit),
                 };
             }
-            let _ = emit.join();
+            emit.join()
+                .expect("the emit that tries to hold the listeners ends without a panic");
         }
     }
 }
@@ -875,9 +877,10 @@ impl Companion {
         }
     }
 
-    /// Everything the page was sent: every event and every answer. An event may be here twice,
-    /// once as a listener heard it and once as the backend handed it over: the listener misses an
-    /// event that is queued behind another emit, and the tap misses an emit that is not tapped.
+    /// The pairing and confirmations events the page was sent, and every answer. An event may be
+    /// here twice, once as a listener heard it and once as the backend handed it over: the
+    /// listener misses an event that is queued behind another emit, and the tap misses an emit
+    /// that is not tapped.
     pub fn sent(&self) -> Vec<String> {
         let mut sent = self.heard.texts();
         sent.extend(self.told.texts());

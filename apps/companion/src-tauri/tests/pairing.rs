@@ -560,7 +560,13 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
         .iter()
         .flat_map(|companion| companion.sent())
         .collect();
-    assert!(sent.len() > 20, "the capture saw the flow: {}", sent.len());
+    // The flow's size is what a listener heard and what was answered, as it was counted before the
+    // events were also handed over by the backend: an event that is in `sent` twice counts once.
+    let counted: usize = companions
+        .iter()
+        .map(|companion| companion.heard.texts().len() + companion.answered.texts().len())
+        .sum();
+    assert!(counted > 20, "the capture saw the flow: {counted}");
     assert_eq!(carrying(&sent, &secrets), Vec::<String>::new());
 
     // A secret planted in an event is found by the same scan. The text is kept as it is planted,
