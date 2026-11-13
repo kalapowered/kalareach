@@ -1048,7 +1048,7 @@ interface Sampled {
 /** Reports the page's shape and the browser's ring apart: the shape by rows, and every tap of the ring with its place and kind. */
 function reportGrid(area: Area): void {
   const ring = area.grid.ring
-  const text = `the page's shape through the words' middle: ${extentsOf(area)}; by rows ${area.grid.shape.join(' | ')}; ${String(area.grid.taps)} grid taps; the browser's own opens outside it (the ring): ${ring.length === 0 ? 'none' : `${String(ring.length)} taps`}`
+  const text = `the page's shape through the words' middle: ${extentsOf(area)}; by rows ${area.grid.shape.join(' | ')}; sides: ${area.grid.sides.join(', ')}; ${String(area.grid.taps)} grid taps; the browser's own opens outside it (the ring): ${ring.length === 0 ? 'none' : `${String(ring.length)} taps`}`
   const name = `${test.info().project.name} ${test.info().title}`
   test.info().annotations.push({ type: 'grid', description: text })
   console.log(`grid ${name}: ${text}`)
@@ -1120,6 +1120,8 @@ interface Area {
     readonly ring: string[]
     /** The shape the grid found, by rows from the top: each lit row's extent, as offsets from the words' middle, with rows of one extent joined. */
     shape: string[]
+    /** For each side: whether the lattice reached one step beyond the lit set, was limited by the pane, or stopped short (which fails the case). */
+    sides: string[]
   }
 }
 
@@ -1141,8 +1143,10 @@ const extentsOf = (area: Area): string => `row ${String(area.width)} px, column 
  * is a hole, which fails with its place. At a point outside the shape, in a corner or beyond an edge, no
  * click that the page's handler made may open anything (the handler's click is the one that the harness
  * sees untrusted); an open that the browser's own click made there is the browser's ring, recorded with its
- * place and what it was. The lattice must reach one step beyond the lit set on every side, unless the pane
- * ends there: a lit point on the lattice's own boundary fails the case. At a point where the click names
+ * place and what it was. The lattice must reach one step beyond the lit set on every side, and the report
+ * says for each side whether it did or whether the pane limited it (no step beyond the last lattice line fits
+ * in the pane, so no unlit outer line was measured there): a lit point on the lattice's own boundary with room
+ * for a step beyond it fails the case. At a point where the click names
  * plain text the page's handler decides, and the look at the press is the open at the release; where the
  * click names an element the browser decides, and the look lit nothing or that same link.
  */
@@ -1285,7 +1289,7 @@ async function areaOf(page: Page, href: string, words: Words, size: number): Pro
   const midX = Math.round(words.x)
   const midY = Math.round(words.y)
   const lit = cells.filter(member)
-  const grid = { taps: 0, wrong: [] as string[], ring: [] as string[], shape: [] as string[] }
+  const grid = { taps: 0, wrong: [] as string[], ring: [] as string[], shape: [] as string[], sides: [] as string[] }
   const onLine = (axis: 'x' | 'y', line: number): Cell[] => lit.filter((cell) => (axis === 'x' ? cell.y : cell.x) === line)
   const along = (axis: 'x' | 'y', line: number): [number, number] | null => {
     const found = onLine(axis, line).map((cell) => cell[axis])
@@ -1319,11 +1323,24 @@ async function areaOf(page: Page, href: string, words: Words, size: number): Pro
   const reachedHighX = xs[xs.length - 1] ?? Number.NaN
   const reachedLowY = ys[0] ?? Number.NaN
   const reachedHighY = ys[ys.length - 1] ?? Number.NaN
-  for (const cell of cells.slice(0, lattice).filter(member)) {
-    if (cell.x === reachedLowX && cell.x - GRID_STEP >= Math.ceil(pane.left)) grid.wrong.push(`${cell.place}: a lit point lies on the lattice's left boundary, which stops short of the shape`)
-    if (cell.x === reachedHighX && cell.x + GRID_STEP <= Math.ceil(pane.right) - 1) grid.wrong.push(`${cell.place}: a lit point lies on the lattice's right boundary, which stops short of the shape`)
-    if (cell.y === reachedLowY && cell.y - GRID_STEP >= Math.ceil(pane.top)) grid.wrong.push(`${cell.place}: a lit point lies on the lattice's top boundary, which stops short of the shape`)
-    if (cell.y === reachedHighY && cell.y + GRID_STEP <= Math.ceil(pane.bottom) - 1) grid.wrong.push(`${cell.place}: a lit point lies on the lattice's bottom boundary, which stops short of the shape`)
+  // Each side says which of three it is: the lattice reached one step beyond the lit set (no lit point on its outermost
+  // line), or a lit point lies on its outermost line and the pane ends there (no step beyond it fits in the pane, so
+  // no unlit outer line was measured: the screen limited that side), or a lit point lies on its outermost line with room
+  // for a step beyond it, which fails the case.
+  const latticeLit = cells.slice(0, lattice).filter(member)
+  const sides: [string, (cell: Cell) => boolean, boolean][] = [
+    ['left', (cell) => cell.x === reachedLowX, reachedLowX - GRID_STEP >= Math.ceil(pane.left)],
+    ['right', (cell) => cell.x === reachedHighX, reachedHighX + GRID_STEP <= Math.ceil(pane.right) - 1],
+    ['top', (cell) => cell.y === reachedLowY, reachedLowY - GRID_STEP >= Math.ceil(pane.top)],
+    ['bottom', (cell) => cell.y === reachedHighY, reachedHighY + GRID_STEP <= Math.ceil(pane.bottom) - 1]
+  ]
+  for (const [name, onLast, roomBeyond] of sides) {
+    const found = latticeLit.filter(onLast)
+    if (found.length === 0) grid.sides.push(`${name} one step beyond`)
+    else if (roomBeyond) {
+      grid.sides.push(`${name} STOPPED SHORT`)
+      for (const cell of found) grid.wrong.push(`${cell.place}: a lit point lies on the lattice's ${name} boundary, which stops short of the shape`)
+    } else grid.sides.push(`${name} limited by the pane`)
   }
   // A point lies in the shape where it lies between the first and the last lit tap of its row or of its column. A tap in
   // the shape that did not light the link is a hole. A point outside the shape, in a corner or beyond an edge, is one at
