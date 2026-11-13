@@ -194,6 +194,10 @@ fn the_steps_act_on_an_account_the_service_and_the_identity_service_only_behind_
         .expect("the stop asks whether this is a rollback");
     assert!(rule < stop);
     assert!(steps[rule..stop].contains("ObjectKind::AppIdentityStarted"));
+    // A record of the start is not enough: its result says that this run made it.
+    assert!(
+        steps[rule..stop].contains(".is_some_and(|object| object.outcome == Some(Outcome::Made))")
+    );
 }
 
 #[test]
@@ -373,6 +377,25 @@ fn the_program_directory_and_the_sweeps_go_through_the_handles_that_the_run_or_t
     assert!(ending.contains("run.sweep(Layout::Staging);"));
     let lay = code_of(body_of(&source, "fn lay_down("));
     assert!(lay.contains("sweep_staging(staging);"));
+    // A sweep removes the entries that the layout names and no other.
+    let sweep = code_of(body_of(&source, "fn sweep_layout("));
+    assert!(sweep.contains("&|child| is_the_layouts_child(layout, child)"));
+    assert!(!sweep.contains("&|_| true"));
+}
+
+#[test]
+fn an_ending_says_deleted_or_gone_only_with_the_read_that_found_it() {
+    let source = install_source();
+    // The removal's ending names the read of each name afterwards.
+    assert!(source.contains(
+        "records are deleted (a read of the name of each afterwards found it gone){unread_prior}"
+    ));
+    // A folder whose data directory did not finish is not tried, and says why; it is not said to
+    // hold the directory.
+    assert!(
+        source.contains("\"not tried: the removal of the data directory did not finish ({why})\"")
+    );
+    assert!(!source.contains("the data directory in it stays"));
 }
 
 #[test]
