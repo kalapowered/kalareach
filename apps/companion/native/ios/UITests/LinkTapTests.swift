@@ -123,6 +123,9 @@ final class LinkTapTests: HarnessTestCase {
         "lower": "the lower link",
         "under-image": "a link under the image",
         "middle": "it",
+        "at-start": "1",
+        "at-end": "2",
+        "last-line": "a link",
     ]
 
     /// Where the page's coordinates lie on the screen: the button a link is has a frame the system
@@ -387,6 +390,36 @@ final class LinkTapTests: HarnessTestCase {
             expectOpened(tap("\(named): the \(edge) edge of the area, 2 points inside", at: inside, shift: middleShift), "middle")
             let beyond = tap("\(named): the \(edge) edge of the area, \(Int(gap)) points outside", at: outside, shift: middleShift)
             XCTAssertTrue(beyond.opened.isEmpty, "\(beyond.label): opened \(beyond.opened)")
+        }
+
+        // The links at the pane's edges and on its last line. A tap at each of nine points of the least-size square about the
+        // words, slid into the pane (the corners and the middles of its sides, 2 points inside), opens the link once, the
+        // outermost points of the area included; so does a tap at the pane's right-most column on the words' row, where the
+        // simulator shows whether the system sends a click that far.
+        for name in ["at-start", "at-end", "last-line"] {
+            let edge = scroll(to: name)
+            let edgeShift = offset(of: edge)
+            let room = pane().room
+            let words = edge.words[0]
+            var left = words.midX - least / 2
+            var right = words.midX + least / 2
+            var top = words.midY - least / 2
+            var bottom = words.midY + least / 2
+            if left < room.minX { right += room.minX - left; left = room.minX }
+            if right > room.maxX { left -= right - room.maxX; right = room.maxX }
+            if top < room.minY { bottom += room.minY - top; top = room.minY }
+            if bottom > room.maxY { top -= bottom - room.maxY; bottom = room.maxY }
+            say("LINKTAP \(named): \(name) words \(words), pane \(room), square \(left) \(top) \(right) \(bottom)")
+            for y in [top + 2, (top + bottom) / 2, bottom - 2] {
+                for x in [left + 2, (left + right) / 2, right - 2] {
+                    let result = tap("\(named): \(name), the point \(Int(x - words.midX)), \(Int(y - words.midY)) of the area", at: CGPoint(x: x, y: y), shift: edgeShift)
+                    expectOpened(result, name)
+                }
+            }
+            if name == "at-end" {
+                let outermost = tap("\(named): \(name), the pane's right-most column", at: CGPoint(x: room.maxX - 1, y: words.midY), shift: edgeShift)
+                expectOpened(outermost, name)
+            }
         }
 
         // A press of one second on a link's words: what the platform does with it stands, and the page adds nothing.
