@@ -32,7 +32,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use super::ffi::{Result, Sid, error, from_wide, last, wide_path};
 use super::sd::OwnedSd;
 use super::walk::{AnchorRefusal, DirHandle, LIST};
-use crate::remedy::Finding;
+use crate::remedy::{Finding, Grant};
 
 const SDDL_REVISION_1: u32 = 1;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -400,18 +400,16 @@ unsafe fn finding_in(
     // SAFETY: the owner points at an identifier inside the descriptor.
     let owner_sid = unsafe { Sid::from_ptr(owner) };
     if !system_class(&owner_sid)? {
-        return Ok(Some(Finding::Granted(format!(
+        return Ok(Some(Finding::Granted(Grant::Owner(format!(
             "it is owned by {}",
             crate::remedy::identity_text(
                 owner_sid.account_name().as_deref(),
                 &owner_sid.to_text()?
             )
-        ))));
+        )))));
     }
     if dacl.is_null() {
-        return Ok(Some(Finding::Granted(
-            "it has no permission list, so anyone may change it".to_owned(),
-        )));
+        return Ok(Some(Finding::Granted(Grant::NoList)));
     }
     let mut information = ACL_SIZE_INFORMATION {
         AceCount: 0,
@@ -481,15 +479,27 @@ unsafe fn finding_in(
         };
         if mask & mask_of_interest != 0 && !system_class(&sid)? {
             if counts == Counts::Above {
-                return Ok(Some(Finding::Granted(crate::remedy::rights_finding(
-                    &crate::remedy::identity_text(sid.account_name().as_deref(), &sid.to_text()?),
-                    mask & mask_of_interest,
+                return Ok(Some(Finding::Granted(Grant::Allows(
+                    crate::remedy::rights_finding(
+                        &crate::remedy::identity_text(
+                            sid.account_name().as_deref(),
+                            &sid.to_text()?,
+                        ),
+                        mask & mask_of_interest,
+                    ),
                 ))));
             }
-            return Ok(Some(Finding::Granted(crate::remedy::entry_rights_finding(
+            let on_it = header.AceFlags & INHERIT_ONLY_ACE == 0;
+            let words = crate::remedy::entry_rights_finding(
                 &sid.to_text()?,
                 mask & mask_of_interest,
-            ))));
+                on_it,
+            );
+            return Ok(Some(Finding::Granted(if on_it {
+                Grant::Allows(words)
+            } else {
+                Grant::OnWhatIsMade(words)
+            })));
         }
     }
     Ok(None)

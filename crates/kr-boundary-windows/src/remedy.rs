@@ -384,33 +384,65 @@ pub fn identity_text(name: Option<&str>, sid: &str) -> String {
 /// of each say which state was read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Finding {
-    /// The object gives an account outside the system's own class a right that counts: an entry
-    /// that allows it, an owner outside the class, or no permission list.
-    Granted(String),
+    /// The object gives an account outside the system's own class a right that counts, of one of
+    /// four kinds.
+    Granted(Grant),
     /// The check cannot evaluate what the object's list grants: an entry of a type that it does not
     /// interpret, or one too small to hold its identifier. No right is known to be given.
     Unevaluated(String),
 }
 
+/// The state that the check read, when it counts a right for an account outside the system's class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Grant {
+    /// The owner is outside the class.
+    Owner(String),
+    /// The object has no permission list at all.
+    NoList,
+    /// An entry that allows rights is for inheritance alone: it gives them over what is made in
+    /// the object and none over the object.
+    OnWhatIsMade(String),
+    /// An entry that allows rights over the object itself.
+    Allows(String),
+}
+
 impl std::fmt::Display for Finding {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Finding::Granted(words) | Finding::Unevaluated(words) => out.write_str(words),
+            Finding::Granted(Grant::NoList) => {
+                out.write_str("it has no permission list, so anyone may change it")
+            }
+            Finding::Granted(
+                Grant::Owner(words) | Grant::OnWhatIsMade(words) | Grant::Allows(words),
+            )
+            | Finding::Unevaluated(words) => out.write_str(words),
         }
     }
 }
 
 /// What the setup program says of one of Git's files, or of a folder above them, whose permissions
 /// the check found a state in: `replacement` is true for a folder above the files, where the check
-/// asks only whether the folder or what it holds can be replaced. An owner or an entry that allows the change is said to be
-/// that, and not as a result; a list that the check cannot evaluate is said to be one that the setup program cannot read.
+/// asks only whether the folder or what it holds can be replaced. The outer sentence follows the
+/// kind of the state: an owner, no list at all, an entry for what is made in the folder, or an
+/// entry that allows the change. Each kind with entries says that the rights of an entry that
+/// denies are not weighed; a list that the check cannot evaluate is said to be one that the setup
+/// program cannot read.
 #[must_use]
 // text: git_permissions_refusal
 pub fn git_permissions_refusal(path: &str, finding: &Finding, replacement: bool) -> String {
     let what = if replacement { "replaced" } else { "changed" };
     match finding {
-        Finding::Granted(words) => format!(
-            "A look at {path} found an owner or an entry of its list that allows it to be {what} by an account outside the system's class: {words}. The check does not read an entry that denies."
+        Finding::Granted(Grant::Owner(words)) => {
+            format!("A look at {path} found an owner outside the system's class: {words}.")
+        }
+        Finding::Granted(Grant::NoList) => {
+            format!("A look at {path} found that {finding}.")
+        }
+        Finding::Granted(Grant::OnWhatIsMade(words)) => format!(
+            "A look at {path} found an entry of its list that applies only to what is made in it, and that allows what is made in it to be {what} by an account outside the system's class: {words}. The rights of an entry that denies are not weighed."
+        ),
+        Finding::Granted(Grant::Allows(words)) => format!(
+            "A look at {path} found an entry of its list that allows it to be {what} by an account outside the system's class: {words}. The rights of an entry that denies are not weighed."
         ),
         Finding::Unevaluated(words) => {
             format!("The setup program cannot tell whether {path} can be {what} by others: {words}")
@@ -431,12 +463,18 @@ pub fn rights_finding(identity: &str, mask: u32) -> String {
 
 /// What the check says of an entry that it counted for a folder's own content or for a replacement:
 /// the identifier and the rights of the entry, which can hold on the object or, through
-/// inheritance, on what is made in it. An entry for inheritance alone is counted, and a deny entry
-/// is not read, so the words give the entry and claim no result.
+/// inheritance, on what is made in it. An entry for inheritance alone is counted (`on_it` is false
+/// for it, and the words say that it applies only to what is made in the object), and the rights of
+/// a deny entry are not weighed, so the words give the entry and claim no result.
 #[must_use]
 // text: entry_rights_finding
-pub fn entry_rights_finding(sid: &str, mask: u32) -> String {
-    format!("an entry of its list allows {sid} rights 0x{mask:x} (on it or on what is made in it)")
+pub fn entry_rights_finding(sid: &str, mask: u32, on_it: bool) -> String {
+    let scope = if on_it {
+        "on it"
+    } else {
+        "only on what is made in it"
+    };
+    format!("an entry of its list allows {sid} rights 0x{mask:x} ({scope})")
 }
 
 /// The reason that a volume that is reached over the network is not used: the words of the volume check's

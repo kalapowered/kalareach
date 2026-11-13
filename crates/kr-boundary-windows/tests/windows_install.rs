@@ -28,7 +28,7 @@ use kr_boundary_windows::messages;
 use kr_boundary_windows::policy::{self, Policy, RULE_ALLOW_ALL};
 use kr_boundary_windows::quote::quote_command_line;
 #[cfg(feature = "testing")]
-use kr_boundary_windows::remedy::Finding;
+use kr_boundary_windows::remedy::{Finding, Grant};
 use kr_boundary_windows::win::applocker::Channel;
 use kr_boundary_windows::win::ffi::{self, Sid};
 use kr_boundary_windows::win::install::{self, CHECKOUT, CONNECT, Paths, SERVICE, STEPS};
@@ -1144,7 +1144,7 @@ fn the_parent_folder_is_checked_on_one_handle_that_is_held_and_an_entry_of_an_un
         .unwrap()
         .unwrap();
     assert!(
-        matches!(&finding, Finding::Granted(words) if words.contains("S-1-5-32-545")),
+        matches!(&finding, Finding::Granted(Grant::Allows(words)) if words.contains("S-1-5-32-545")),
         "{finding}"
     );
     // With replacement_only a right that only adds beside the folder does not count.

@@ -7,7 +7,7 @@ use std::io::{Error, ErrorKind};
 
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CONFIG_NOT_EMPTY_WHY, Finding, appid_start_type_left, application_control_set,
+    CONFIG_NOT_EMPTY_WHY, Finding, Grant, appid_start_type_left, application_control_set,
     code_integrity_refusal, empty_config_advice, foreign_rules_refusal, git_permissions_refusal,
     git_program_not_reached, payload_file_not_reached, platform_error, smart_app_control_refusal,
 };
@@ -197,26 +197,65 @@ fn the_removals_next_step_says_what_the_lookup_found_at_the_manifests_name() {
     }
 }
 
-/// The refusal for Git's permissions says that an owner or an entry of the list allows others to
-/// change or replace a file or a folder only for a state that the check read, and claims no effective
-/// access: it says that entries that deny are not read. A list that the check cannot evaluate
-/// (an entry of a type that it does not interpret) is refused in words of its own, which say that
-/// the setup program cannot tell, and never say that others can change or replace it.
+/// The refusal for Git's permissions says, for each kind of state that the check read, only what
+/// that state is: an owner, no list at all, an entry that applies only to what is made in the
+/// folder, or an entry that allows the change. A kind with entries says that the rights of an entry
+/// that denies are not weighed; the kind with no list at all has no entry to say it of. A list that
+/// the check cannot evaluate (an entry of a type that it does not interpret) is refused in words of
+/// its own, which say that the setup program cannot tell, and never say that others can change or
+/// replace it.
 #[test]
 fn a_permission_list_that_the_check_cannot_evaluate_is_not_said_to_let_others_change_git() {
     let path = r"C:\Program Files\Git\cmd\git.exe";
-    let granted = Finding::Granted("S-1-5-32-545 is allowed rights 0x2".to_owned());
+    let allows = Finding::Granted(Grant::Allows(
+        "S-1-5-32-545 is allowed rights 0x2".to_owned(),
+    ));
+    let inherited = Finding::Granted(Grant::OnWhatIsMade(
+        "S-1-5-32-545 is allowed rights 0x2".to_owned(),
+    ));
+    let owner = Finding::Granted(Grant::Owner("it is owned by S-1-5-32-545".to_owned()));
+    let no_list = Finding::Granted(Grant::NoList);
     let unread = Finding::Unevaluated(
         "its permission list has an entry of type 9, which this check does not read".to_owned(),
     );
     for (replacement, said) in [(false, "changed"), (true, "replaced")] {
-        let confirmed = git_permissions_refusal(path, &granted, replacement);
+        let denies = "The rights of an entry that denies are not weighed.";
         assert_eq!(
-            confirmed,
+            git_permissions_refusal(path, &allows, replacement),
             format!(
-                "A look at {path} found an owner or an entry of its list that allows it to be {said} by an account outside the system's class: S-1-5-32-545 is allowed rights 0x2. The check does not read an entry that denies."
+                "A look at {path} found an entry of its list that allows it to be {said} by an account outside the system's class: S-1-5-32-545 is allowed rights 0x2. {denies}"
             )
         );
+        let applies = git_permissions_refusal(path, &inherited, replacement);
+        assert!(
+            applies.contains("applies only to what is made in it"),
+            "{applies}"
+        );
+        assert!(
+            applies.contains(&format!("allows what is made in it to be {said}")),
+            "{applies}"
+        );
+        assert!(applies.ends_with(denies), "{applies}");
+        let owned = git_permissions_refusal(path, &owner, replacement);
+        assert_eq!(
+            owned,
+            format!(
+                "A look at {path} found an owner outside the system's class: it is owned by S-1-5-32-545."
+            )
+        );
+        let bare = git_permissions_refusal(path, &no_list, replacement);
+        assert_eq!(
+            bare,
+            format!(
+                "A look at {path} found that it has no permission list, so anyone may change it."
+            )
+        );
+        for text in [&allows, &inherited, &owner, &no_list]
+            .map(|finding| git_permissions_refusal(path, finding, replacement))
+        {
+            assert!(!text.contains("does not read an entry"), "{text}");
+            assert!(!text.contains("an owner or an entry"), "{text}");
+        }
         let cannot = git_permissions_refusal(path, &unread, replacement);
         assert!(
             cannot.starts_with("The setup program cannot tell whether "),
