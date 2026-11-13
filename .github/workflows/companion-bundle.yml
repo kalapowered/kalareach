@@ -4,16 +4,16 @@ name: companion-bundle
 # and reads what that makes: the link of the application and both installers.
 #
 # The application links the dynamic Visual C++ runtime. The workspace's linker options leave the
-# static one out of every MSVC link, since the C library it vendors asks for it, and the Tauri command
-# line asks for it again unless the environment says otherwise. The build step below starts with
-# `STATIC_VCRUNTIME=true` in its environment, which is what the command line would have set, so a
-# build that passes shows that the entry replaces it. Two reads then say that one C runtime is in the
-# link: the build's log has no `LNK4098` (the linker's report of objects that ask for two runtimes),
-# and the executable imports the dynamic runtime's libraries and no other runtime's. Each installer is
-# then opened: the NSIS installer is run silently into a directory of the runner's own and removed
-# again, and the MSI is extracted with an administrative install, which registers nothing. In both,
-# the files are listed and the installed executable's imports are read again. The application is never
-# started.
+# static one out of the x86-64 and ARM64 MSVC links, since the C library it vendors asks for it,
+# and the Tauri command line asks for it again unless the environment says otherwise. The build
+# step below starts with `STATIC_VCRUNTIME=true` in its environment, which is what the command
+# line would have set, so a build that passes shows that the entry replaces it. Two reads then say
+# that one C runtime is in the link: the build's log has no `LNK4098` (the linker's report of
+# objects that ask for two runtimes), and the executable imports the dynamic runtime's libraries
+# and no other runtime's. Each installer is then opened: the NSIS installer is run silently into a
+# directory of the runner's own and removed again, and the MSI is extracted with an administrative
+# install, which registers nothing. In both, the files are listed and the installed executable's
+# imports are read again. The application is never started.
 #
 # Nothing is uploaded and no cache is saved. A tool that a read needs and the runner lacks fails the
 # job; no read is skipped.
