@@ -694,6 +694,22 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     expect(isLit(links[3]?.[0]), 'the look after a press outside the pane').toBe(false)
   })
 
+  it('clears the record of a press that the engine’s own click handled when the next press comes outside the pane, so a later click on plain text opens nothing', () => {
+    // The release's click names a control, so the handler leaves the record in place; the next press, outside
+    // the pane, ends it. A trusted click of detail 1 on plain text then, within the three seconds and near the
+    // old press (an assistive technology's, which no press precedes), finds no record to use.
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
+    fire('click', click(links[3]?.[1], { clientY: y }))
+    expect(opened, 'opens by the handler for a click that named a link').toEqual([])
+    fire('pointerdown', pointer(document.body, { clientY: 700 }))
+    fire('click', click(texts[3], { clientY: y }))
+    expect(opened, 'links opened by a click on plain text after a press outside the pane').toEqual([])
+  })
+
   it('lights nothing for a press outside the pane, though a link of the pane lies under its point', () => {
     const { pane, links } = between({ left: 100, top: 100, right: 140, bottom: 117 })
     start(pane)
@@ -847,6 +863,41 @@ describe('a scroll under a held press', () => {
     clip(text, { left: 0, top: 90, right: 390, bottom: 145 }, 'hidden')
     fire('scroll', {} as Event)
     expect(isLit(links[0]), 'the look after an outer scroll that hides the point').toBe(false)
+  })
+
+  it('ends the look of a press on a link’s own element when an outer scroll takes the point out of the part of it that the box leaves in view, at the box’s left, right and top edges', () => {
+    // Each link straddles its box's edge; the press is in view. An outer scroll moves the link and its box
+    // together, so the point stays in the link's own rectangle and leaves what the box shows of it.
+    const scenarios = [
+      { edge: 'left', words: { left: 100, top: 100, right: 140, bottom: 117 }, box: { left: 110, top: 0, right: 300, bottom: 400 }, at: { clientX: 120, clientY: 108 }, move: () => scrolledSideways(-15), after: { left: 125, top: 0, right: 315, bottom: 400 } },
+      { edge: 'right', words: { left: 100, top: 100, right: 140, bottom: 117 }, box: { left: 0, top: 0, right: 130, bottom: 400 }, at: { clientX: 120, clientY: 108 }, move: () => scrolledSideways(15), after: { left: -15, top: 0, right: 115, bottom: 400 } },
+      { edge: 'top', words: { left: 100, top: 150, right: 140, bottom: 167 }, box: { left: 0, top: 160, right: 390, bottom: 400 }, at: { clientX: 120, clientY: 162 }, move: () => scrolled(-10), after: { left: 0, top: 170, right: 390, bottom: 410 } }
+    ]
+    for (const scenario of scenarios) {
+      const { pane, text, links } = between(scenario.words)
+      clip(text, scenario.box, 'hidden')
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(links[0], { ...scenario.at, pointerType: 'mouse' }))
+      expect(isLit(links[0]), `the look of the press at the box’s ${scenario.edge} edge`).toBe(true)
+      scenario.move()
+      clip(text, scenario.after, 'hidden')
+      fire('scroll', {} as Event)
+      expect(isLit(links[0]), `the look after an outer scroll at the box’s ${scenario.edge} edge`).toBe(false)
+      document.body.replaceChildren()
+      listening.clear()
+    }
+  })
+
+  it('ends the look of a press on a link’s own element when a box that the view cannot be measured through comes around it', () => {
+    const { pane, text, links } = between({ left: 100, top: 100, right: 140, bottom: 117 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], { clientX: 120, clientY: 108, pointerType: 'mouse' }))
+    expect(isLit(links[0]), 'the look of the press').toBe(true)
+    styles.set(text.parentElement as HTMLElement, { transform: 'matrix(0.5, 0, 0, 0.5, 0, 0)' })
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after the box was scaled').toBe(false)
   })
 
   it('keeps the look of a touch press on a link’s own element while the rule still names it, and the release on plain text opens it', () => {
@@ -1034,6 +1085,9 @@ describe('a link under a box whose view cannot be measured', () => {
     'a skew': { transform: 'matrix(1, 0, 0.5, 1, 0, 0)' },
     'a 3D scale': { transform: 'matrix3d(0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)' },
     'a 3D rotation': { transform: 'matrix3d(1, 0, 0, 0, 0, 0.8, 0.6, 0, 0, -0.6, 0.8, 0, 0, 0, 0, 1)' },
+    'a scale down the page only': { transform: 'matrix(1, 0, 0, 0.5, 0, 0)' },
+    'a 3D matrix that scales through its last entry': { transform: 'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2)' },
+    'a transform in a form that is not a matrix': { transform: 'scale(0.5)' },
     'the separate scale property': { scale: '0.5' },
     'the separate rotate property': { rotate: '10deg' },
     'contain: paint': { contain: 'paint' },
@@ -1126,6 +1180,26 @@ describe('a link under a box whose view cannot be measured', () => {
     fire('pointerup', pointer(links[0], { clientX: 26, clientY: 128, timeStamp: 120 }))
     fire('click', click(links[0], { clientX: 26, clientY: 128 }))
     expect(opened, 'the handler’s own opens').toEqual([])
+  })
+})
+
+describe('a page whose root clips', () => {
+  it('takes the root’s client box, wherever the page has scrolled, for what is in view: the root’s own rectangle moves with the page', () => {
+    // The page has scrolled by 300 px, so the root's rectangle lies at y -300 to 1544; its client box is the
+    // viewport, 390 by 844. A link at y 600 to 617 is in view of the viewport and below the rectangle's client part.
+    const root = document.documentElement
+    overflows.set(root, { x: 'auto', y: 'auto' })
+    boxes.set(root, { left: 0, top: -300, right: 390, bottom: 1544 })
+    clientBox(root, 390, 844)
+    try {
+      const { pane, text, links } = between({ left: 100, top: 600, right: 140, bottom: 617 })
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, { clientX: 150, clientY: 608 }))
+      expect(isLit(links[0]), 'the look of a press beside a link in view of the viewport').toBe(true)
+    } finally {
+      for (const key of ['clientLeft', 'clientTop', 'clientWidth', 'clientHeight']) Reflect.deleteProperty(root, key)
+    }
   })
 })
 
