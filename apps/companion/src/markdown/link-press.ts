@@ -29,12 +29,13 @@
  *
  * Where the listeners stand: all on the document (the window's blur excepted), in the capture phase for
  * the pointer down and the click. A press outside the pane must end the pane's record and its look, so
- * the pointer down is not on the pane; the pointer move, up and cancel, the scroll of any box (a scroll
- * does not bubble, so only the capture phase on the document hears every box) and the visual viewport's
- * scroll and resize stand from a press to its end, because a release or a cancel can come outside the pane
- * when the finger slides out; for a press that lit a link the loss of the pointer's capture, the page's
- * visibility change and the window's blur stand too, and each removes them with the rest at every end;
- * and the click acts only on a click whose target lies in the pane. A click listener on the
+ * the pointer down is not on the pane; from a press that lit a link to its end stand the pointer move, up
+ * and cancel, the loss of the pointer's capture, the page's visibility change, the window's blur, the
+ * scroll of any box (a scroll does not bubble, so only the capture phase on the document hears every box)
+ * and the visual viewport's scroll and resize (a release or a cancel can come outside the pane when the
+ * finger slides out), and `stop` removes every one of them at every end; a press that lights nothing opens
+ * nothing and has no look to keep, so it keeps no record and registers none of them, and no end has to
+ * reach it; and the click acts only on a click whose target lies in the pane. A click listener on the
  * pane itself gave no click at any point where the document's gives none: the points that get none in a
  * desktop WebKit are its scroll bar's strip at the pane's right edge, which no listener changes and
  * which the phones do not have. iOS sends a click on plain text because the page's own listeners sit on
@@ -60,6 +61,8 @@ const OTHER_CONTROLS = 'button:not(.md-link), a[href], input, select, textarea, 
 
 /** What the pane keeps of the press that is going on or that ended last. */
 interface Recorded extends Press<HTMLElement> {
+  /** The link that the press lit and what a click on it opens: a press that lights nothing keeps no record. */
+  readonly start: { readonly link: HTMLElement; readonly destination: string }
   readonly pointer: number
   /** Whether the press went down on the link's own element, which the browser's click opens. */
   readonly own: boolean
@@ -117,13 +120,13 @@ export function startLinkPress(element: HTMLElement): () => void {
       return
     }
     press.current = { x: event.clientX, y: event.clientY }
-    if (press.start !== null && !opensByRule(press.pointerType)) light(releaseOpens(element, press) ? press.start.link : null)
+    if (!opensByRule(press.pointerType)) light(releaseOpens(element, press) ? press.start.link : null)
   }
   // The scroll of any box (scroll events do not bubble, so the capture phase on the document hears them
   // all) and the visual viewport's scroll and resize move the page under a held finger: the look is kept
   // only where a release at the press's point would still open the lit link (`releaseOpens`).
   const recheck = (): void => {
-    if (press === null || press.start === null) return
+    if (press === null) return
     if (!releaseOpens(element, press)) die()
     else light(press.start.link)
   }
@@ -170,28 +173,30 @@ export function startLinkPress(element: HTMLElement): () => void {
     die()
     if (!here(event.target)) return
     const found = pressedLink(element, event)
+    // A press that lights nothing opens nothing and has no look to keep: it keeps no record and registers
+    // no listener, so no end has to reach it (a lost capture, a blur or a hidden page would otherwise
+    // leave its listeners standing until the next press).
+    if (found === null) return
     press = {
       pointer: event.pointerId,
       pointerType: event.pointerType,
       at: { x: event.clientX, y: event.clientY },
-      start: found === null ? null : { link: found.id, destination: found.destination },
-      own: found?.own === true,
+      start: { link: found.id, destination: found.destination },
+      own: found.own,
       current: { x: event.clientX, y: event.clientY },
       moved: false,
       upAt: null
     }
-    light(found?.id ?? null)
+    light(found.id)
     document.addEventListener('pointermove', move)
     document.addEventListener('pointerup', up)
     document.addEventListener('pointercancel', cancel)
-    if (found !== null) {
-      document.addEventListener('lostpointercapture', lost)
-      document.addEventListener('visibilitychange', hide)
-      window.addEventListener('blur', blur)
-      document.addEventListener('scroll', recheck, true)
-      window.visualViewport?.addEventListener('scroll', recheck)
-      window.visualViewport?.addEventListener('resize', recheck)
-    }
+    document.addEventListener('lostpointercapture', lost)
+    document.addEventListener('visibilitychange', hide)
+    window.addEventListener('blur', blur)
+    document.addEventListener('scroll', recheck, true)
+    window.visualViewport?.addEventListener('scroll', recheck)
+    window.visualViewport?.addEventListener('resize', recheck)
   }
   const click = (event: MouseEvent): void => {
     if (!here(event.target)) return
@@ -252,7 +257,6 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
  * click (the rule, with the same pointer test, and the element's own click by the browser).
  */
 function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
-  if (press.start === null) return false
   const by = opensByRule(press.pointerType)
   // A touch's or a pen's click comes from the press's first point; a mouse's from where it is released.
   if (press.own && liesInView(pane, press.start.link, by ? press.at : press.current)) return true
