@@ -129,7 +129,6 @@ fn skewing(revision: &str) -> Value {
 /// Everything one test holds: a daemon whose lease service is the stand-in, which also publishes
 /// the signed release matrix, and the clocks.
 struct Rig {
-    host: Host,
     served: Served,
     timer: Arc<HeldTimer>,
     matrix_timer: Arc<HeldTimer>,
@@ -137,6 +136,8 @@ struct Rig {
     owner: DeviceKeys,
     matrix_key: AuthorisationKeyPair,
     sign_in: SignIn,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Rig {

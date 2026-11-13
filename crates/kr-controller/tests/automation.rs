@@ -69,8 +69,6 @@ impl WorkerSupervisor for RefusingSupervisor {
 }
 
 struct Host {
-    /// The host tree. Whatever workers its daemon started are ended before it goes.
-    _temp: teardown::Tree,
     controller: Arc<Controller>,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
@@ -78,6 +76,9 @@ struct Host {
     /// The rendezvous of a daemon that starts workers.
     _rendezvous: Option<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: tempfile::TempDir,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    /// The host tree. Whatever workers its daemon started are ended before it goes.
+    _temp: teardown::Tree,
 }
 
 impl Host {

@@ -698,13 +698,14 @@ impl Drop for Fixture {
 
 /// A daemon with its workers, and the stub it starts.
 struct Environment {
-    host: Host,
     workers: Vec<Worker>,
     placed: kr_controller::describe::hooks::Placed,
     runtime_dir: PathBuf,
     state_dir: PathBuf,
     /// The profiles the daemon chooses from.
     catalogue: kr_describe::Catalogue,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 /// The host's turn, armed to stop between a description reaching the store and the snapshot that

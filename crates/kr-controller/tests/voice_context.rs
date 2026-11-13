@@ -42,7 +42,6 @@ const OUTSIDE_BOUND: &str = "outside the grant's history lower bound";
 /// A daemon with one session, a paired device that may be told about it, and a call that device
 /// started over it.
 struct World {
-    adopted: Adopted,
     voice: Arc<kr_controller::voice::VoiceModule>,
     device_id: DeviceId,
     voice_session_id: VoiceSessionId,
@@ -50,6 +49,8 @@ struct World {
     /// The moment the session was created, which the device's history bound is set at: what the
     /// daemon holds of the session is produced then, and an entry stamped earlier is outside it.
     started_ms: u64,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    adopted: Adopted,
 }
 
 impl World {

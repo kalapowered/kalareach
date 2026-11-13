@@ -86,7 +86,6 @@ fn transport(origin: &str) -> (GatewayOrigin, Arc<dyn ServiceHttp>) {
 /// Everything one test holds: a daemon whose configuration selects the authority feed at the
 /// stand-in, which also holds the host's mailbox, the stand-in, and the clocks.
 struct Rig {
-    host: Host,
     served: Served,
     timer: Arc<HeldTimer>,
     wall: MovedWall,
@@ -96,6 +95,8 @@ struct Rig {
     feed: AuthorityFeedClient,
     /// The owner, as a device that leaves an item in a mailbox reaches the service.
     mailbox: MailboxClient,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Rig {

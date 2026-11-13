@@ -3680,7 +3680,6 @@ struct Rig {
     #[cfg_attr(windows, allow(dead_code))]
     received: std::path::PathBuf,
     trigger: std::path::PathBuf,
-    wired: Wired,
     client: LocalClient,
     attachment: AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
@@ -3688,6 +3687,8 @@ struct Rig {
     /// What the application has been typed so far, in the order it was handed to the worker.
     typed: Vec<u8>,
     questions: u32,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    wired: Wired,
 }
 
 impl Rig {
@@ -5413,13 +5414,14 @@ async fn a_client_that_goes_after_a_key_sent_behind_its_mutation_leaves_nothing_
 struct Proxied {
     _kept: tempfile::TempDir,
     received: std::path::PathBuf,
-    wired: Wired,
     link: BoundLink,
     actor: kr_protocol::actor::ActorEnvelope,
     attachment: AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
     sequence: u64,
     typed: Vec<u8>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    wired: Wired,
 }
 
 impl Proxied {
@@ -5734,11 +5736,12 @@ async fn a_forwarded_key_sent_after_a_forwarded_mutation_reaches_the_application
 /// The application puts the terminal into raw mode with the echo off and copies its input to its
 /// output, so the session's retained output is, in order, the bytes the application received.
 struct Typing {
-    wired: Wired,
     client: LocalClient,
     attachment: AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
     sequence: u64,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    wired: Wired,
 }
 
 impl Typing {

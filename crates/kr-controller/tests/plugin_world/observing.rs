@@ -353,7 +353,6 @@ impl Terminal {
 
 /// The world.
 pub struct Observing {
-    pub hosted: Hosted,
     /// What a case sends the worker as the upstream.
     sender: tokio::sync::mpsc::UnboundedSender<String>,
     /// What the worker forwards to the native terminal.
@@ -362,6 +361,8 @@ pub struct Observing {
     pub written: Arc<Mutex<Vec<String>>>,
     _owner: Arc<kr_worker::broker::Duplex>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    pub hosted: Hosted,
 }
 
 impl Observing {

@@ -3098,11 +3098,12 @@ fn owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem() {
 /// shut is there too.
 #[cfg(unix)]
 struct LeftBehind {
-    fixture: Fixture,
     workspace_id: WorkspaceId,
     location: ProjectLocationId,
     staging: std::path::PathBuf,
     shut: std::path::PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    fixture: Fixture,
 }
 
 #[cfg(unix)]
@@ -3296,11 +3297,12 @@ fn a_workspace_staging_directory_whose_row_cannot_be_settled_is_not_removed() {
 /// cannot empty while it is shut is there too.
 #[cfg(unix)]
 struct KeptClone {
-    fixture: Fixture,
     operation: ActionId,
     location: ProjectLocationId,
     projects: std::path::PathBuf,
     shut: std::path::PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    fixture: Fixture,
 }
 
 #[cfg(unix)]

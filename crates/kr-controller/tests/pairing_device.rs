@@ -323,11 +323,6 @@ struct Run {
     /// The name the phone reaches the other service of the `code` phase by.
     service_peer: String,
     owner: DeviceKeys,
-    /// The daemon, while it runs: a phase that ends it takes it, and a phase that starts it again
-    /// puts the new one here.
-    host: tokio::sync::RwLock<Option<Host>>,
-    /// What the daemon left when it ended, for the one that starts on its records.
-    stopped: std::sync::Mutex<Option<Stopped>>,
     /// The port the daemon's endpoint listens on, which its next start listens on again, since a
     /// phone's record of the host names it.
     port: std::sync::atomic::AtomicU16,
@@ -336,10 +331,16 @@ struct Run {
     workers: Vec<Worker>,
     /// What the agent in the first session was sent.
     upstream: Arc<Upstream>,
-    /// The second host: a daemon of its own that holds no session.
-    second_host: Box<Adopted>,
     /// The device the second host made of the phone, once it approved it.
     phone_of_second: std::sync::Mutex<Option<DeviceId>>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    /// The daemon, while it runs: a phase that ends it takes it, and a phase that starts it again
+    /// puts the new one here.
+    host: tokio::sync::RwLock<Option<Host>>,
+    /// What the daemon left when it ended, for the one that starts on its records.
+    stopped: std::sync::Mutex<Option<Stopped>>,
+    /// The second host: a daemon of its own that holds no session.
+    second_host: Box<Adopted>,
 }
 
 impl Run {

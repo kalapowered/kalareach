@@ -160,15 +160,16 @@ const AFTER_COMMAND: &str = "printf 'kala%s-after\n' reach\n";
 
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
-    /// The host tree, which ends every worker its daemon started before it goes, and is kept
-    /// instead when one of them cannot be established as ended.
-    temp: teardown::Tree,
     /// The environment's scheduled task, through which a Windows daemon here starts each worker.
     /// Declared after the tree, so it is removed once the tree has ended what was started.
     #[cfg(windows)]
     task: kr_controller::supervision::windows::testing::TestTask,
     worker: PathBuf,
     environment_id: EnvironmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    /// The host tree, which ends every worker its daemon started before it goes, and is kept
+    /// instead when one of them cannot be established as ended.
+    temp: teardown::Tree,
 }
 
 impl Host {
@@ -2223,7 +2224,6 @@ fn refused_for_the_lease(error: &kr_client::ClientError) {
 /// the chain, which is all the managed service does for the host. `start` presents no lease; a
 /// test does, with [`Membership::present`].
 struct Membership {
-    host: Host,
     daemon: RunningDaemon,
     moved: Moved,
     organisation: organisation_support::Organisation,
@@ -2231,6 +2231,8 @@ struct Membership {
     device: Device,
     record: DeviceRecord,
     session_id: SessionId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Membership {
@@ -2581,12 +2583,13 @@ async fn a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_o
 /// worker reads the machine's clock, so a lease that ends is a lease of a few real seconds, and the
 /// tests wait on a condition and never on a measured delay.
 struct Exclusive {
-    host: Host,
     daemon: RunningDaemon,
     owner: DeviceKeys,
     organisation: organisation_support::Organisation,
     session_id: SessionId,
     display: kr_protocol::session::DisplayNumber,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 /// How long a lease the tests present lasts. The host ends a lease five seconds early on its

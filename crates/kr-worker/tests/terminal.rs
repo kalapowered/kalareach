@@ -983,11 +983,12 @@ async fn read_output(
 /// A terminal attached to an application that floods the host with questions, at the moment the
 /// host has reported the flood as degraded and before anything is typed.
 struct Flooded {
-    host: Host,
     client: LocalClient,
     keys: Keys,
     /// Everything the attached terminal has been sent so far.
     seen: Vec<u8>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 /// Starts the flooding application and waits until the host has reported the flood as degraded.
