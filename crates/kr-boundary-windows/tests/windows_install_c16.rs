@@ -228,7 +228,9 @@ fn a_folder_above_the_data_parent_that_an_ordinary_account_may_delete_in_is_refu
     let parent = middle.join("KalaReach");
     owned_dir(&parent);
     parent_of(&parent);
-    let paths = paths_with(&parent, &parent.join("Program"), &parent);
+    // The program directory is in a folder of its own: the two known folders may not overlap.
+    let programs = inherited_folder(&mut clean);
+    let paths = paths_with(&parent, &programs.join("Program"), &programs);
     installed_data_directory(&paths);
     install::check_data_parent(&paths).expect("the inherited list gives no such right");
     install::check_data_parent(&Paths::system().unwrap())
@@ -812,7 +814,9 @@ fn a_data_tree_known_folder_taken_away_after_the_shape_check_is_refused_by_the_d
     ] {
         assert!(text.contains(&needle), "{needle}: {text}");
     }
-    for word in ["volume", "root", "holds it open"] {
+    // The data directory's own words name "the roots of its operations": what is refused here is
+    // the words of a volume's root and of a program that holds the folder open.
+    for word in ["volume", "root of", "holds it open"] {
         assert!(!text.contains(word), "{word}: {text}");
     }
     assert!(!parent.exists(), "nothing was made");

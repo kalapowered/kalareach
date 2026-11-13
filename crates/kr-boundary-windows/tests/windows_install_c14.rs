@@ -171,7 +171,9 @@ fn a_directory_made_after_its_parent_was_found_absent_is_not_deleted_from() {
     let folder = inherited_folder();
     parent_of(&folder);
     let top = folder.join("KalaReach");
-    let paths = paths_at(&folder, top.join("Boundary"));
+    // The program directory is in a folder of its own: the two known folders may not overlap.
+    let programs = inherited_folder();
+    let paths = paths_at(&programs, top.join("Boundary"));
     for quiet in [true, false] {
         let data = paths.data.clone();
         install::testing::after_the_removal_inspects_the_data_directory(move || {
