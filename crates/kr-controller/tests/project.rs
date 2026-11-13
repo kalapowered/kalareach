@@ -2421,7 +2421,7 @@ async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services
             None,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the adoption does not begin");
     assert_eq!(
         asked.load(std::sync::atomic::Ordering::SeqCst),
@@ -3985,7 +3985,7 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
             .project()
             .write(&actor, mutation, method, lapsed, || Ok(()), None)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("the admission lapsed");
         assert_eq!(copy.code, ErrorCode::OutcomeUnknown, "{what}: {copy:?}");
     }
@@ -3994,7 +3994,7 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
         .project()
         .write(&actor, &fresh, Method::ProjectInit, lapsed, || Ok(()), None)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the admission lapsed");
     assert_eq!(first.code, ErrorCode::PermissionDenied, "{first:?}");
 
@@ -4063,7 +4063,7 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
     assert!(given.is_copied(), "the answer is the record's");
     let answered: ProjectInitResult = typed(
         &given
-            .into_answer()
+            .into_answer_for_test()
             .expect("the copy is answered with the record the first copy left"),
     );
     assert_eq!(answered, made);

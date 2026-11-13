@@ -7,27 +7,31 @@
 //! an outcome that is unknown, whatever the answer was. A device that may not read the record would
 //! otherwise tell a result from a refusal by the word it is given. So every service says which of
 //! the three an answer is, in the type it returns, and the door asks.
+//!
+//! The representation of [`Given`] is private to this module, so that nothing outside it can take
+//! the answer of a copy out and give the value again as an answer made now.
 
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
 /// A service's answer to one action.
+///
+/// It is one of three: the answer to the submission that performed the action, or that was
+/// refused before it could ([`Self::fresh`]); the answer an earlier submission of the action left
+/// in the service's own record ([`Self::copied`]); or the refusal of a copy the service read from
+/// its own record and would not give back, because the authority the copy arrived under no longer
+/// stands ([`Self::withheld`]).
+///
+/// A withheld refusal says nothing of what the record holds, which is not the copy's to be told,
+/// and nothing of whether the action took effect. A door that tells a device a recorded answer
+/// asks its own check once more; if that one passes, because the fence that stopped the service
+/// has gone meanwhile, a refusal told as the kept answer would say the action did not happen. So
+/// the door never tells this one as an answer: a device is told the outcome is not shown, whatever
+/// its authority is by then. The answer is what a caller that is told every answer whole is given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the door tells a copy of a recorded answer differently from a fresh one"]
-pub enum Given<T> {
-    /// The answer to the submission that performed the action, or that was refused before it could.
-    Fresh(T),
-    /// The answer an earlier submission of the action left in the service's own record.
-    Copied(T),
-    /// The refusal of a copy the service read from its own record and would not give back, because
-    /// the authority the copy arrived under no longer stands.
-    ///
-    /// It says nothing of what the record holds, which is not the copy's to be told, and nothing of
-    /// whether the action took effect. A door that tells a device a recorded answer asks its own
-    /// check once more; if that one passes, because the fence that stopped the service has gone
-    /// meanwhile, a refusal told as the kept answer would say the action did not happen. So the door
-    /// never tells this one as an answer: a device is told the outcome is not shown, whatever its
-    /// authority is by then. The answer is what a caller that is told every answer whole is given.
-    Withheld(T),
+pub struct Given<T> {
+    origin: Origin,
+    answer: T,
 }
 
 /// Where a door has found the answers it was given to come from.
@@ -53,55 +57,84 @@ impl Origin {
 }
 
 impl<T> Given<T> {
+    /// The answer to the submission that performed the action, or that was refused before it
+    /// could.
+    pub const fn fresh(answer: T) -> Self {
+        Self {
+            origin: Origin::Fresh,
+            answer,
+        }
+    }
+
+    /// The answer an earlier submission of the action left in the service's own record.
+    pub const fn copied(answer: T) -> Self {
+        Self {
+            origin: Origin::Copied,
+            answer,
+        }
+    }
+
+    /// The refusal of a copy the service read from its own record and would not give back.
+    pub const fn withheld(answer: T) -> Self {
+        Self {
+            origin: Origin::Withheld,
+            answer,
+        }
+    }
+
     /// `answer`, a copy of a record when `copied` says so.
     pub const fn of(answer: T, copied: bool) -> Self {
         if copied {
-            Self::Copied(answer)
+            Self::copied(answer)
         } else {
-            Self::Fresh(answer)
+            Self::fresh(answer)
         }
     }
 
     /// `answer`, from where `origin` says the service found it.
     pub(crate) const fn from_origin(answer: T, origin: Origin) -> Self {
-        match origin {
-            Origin::Fresh => Self::Fresh(answer),
-            Origin::Copied => Self::Copied(answer),
-            Origin::Withheld => Self::Withheld(answer),
-        }
+        Self { origin, answer }
     }
 
     /// Whether the service read this answer from the record of an earlier submission and gave it
     /// back.
     #[must_use]
     pub const fn is_copied(&self) -> bool {
-        matches!(self, Self::Copied(_))
+        matches!(self.origin, Origin::Copied)
     }
 
     /// Whether the service read the record of an earlier submission and withheld what it holds.
     #[must_use]
     pub const fn is_withheld(&self) -> bool {
-        matches!(self, Self::Withheld(_))
+        matches!(self.origin, Origin::Withheld)
     }
 
     /// Where the answer came from, for a door that tells a device the answer.
     pub(crate) const fn origin(&self) -> Origin {
-        match self {
-            Self::Fresh(_) => Origin::Fresh,
-            Self::Copied(_) => Origin::Copied,
-            Self::Withheld(_) => Origin::Withheld,
-        }
+        self.origin
+    }
+
+    /// The answer, borrowed, for a service that records what it came to and then gives the
+    /// answer on whole. It cannot be taken out of the provenance by this.
+    pub(crate) const fn answer_ref(&self) -> &T {
+        &self.answer
     }
 
     /// The refusal of a copy the service withheld, for a case that asks why a record was not given
     /// back. Panics when the service gave the record back or answered for itself.
     #[cfg(test)]
     pub(crate) fn into_withheld(self) -> T {
-        match self {
-            Self::Withheld(answer) => answer,
-            Self::Fresh(_) => panic!("the service answered for itself and withheld nothing"),
-            Self::Copied(_) => panic!("the service gave the record back"),
+        match self.origin {
+            Origin::Withheld => self.answer,
+            Origin::Fresh => panic!("the service answered for itself and withheld nothing"),
+            Origin::Copied => panic!("the service gave the record back"),
         }
+    }
+
+    /// The answer, without where it came from, for a case that asks what a service answered.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn into_answer_for_test(self) -> T {
+        self.answer
     }
 
     /// The answer, without where it came from, for a caller that is told every answer whole except
@@ -109,25 +142,22 @@ impl<T> Given<T> {
     /// service's refusal of the authority, which says what the caller may not be told, that the
     /// action did not happen.
     pub(crate) fn into_answer_or(self, unknown: impl FnOnce() -> T) -> T {
-        match self {
-            Self::Withheld(_) => unknown(),
-            Self::Fresh(answer) | Self::Copied(answer) => answer,
+        match self.origin {
+            Origin::Withheld => unknown(),
+            Origin::Fresh | Origin::Copied => self.answer,
         }
     }
 
     /// The answer, without where it came from. For a caller that is told every answer whole.
     pub fn into_answer(self) -> T {
-        match self {
-            Self::Fresh(answer) | Self::Copied(answer) | Self::Withheld(answer) => answer,
-        }
+        self.answer
     }
 
     /// The same provenance on another form of the answer.
     pub fn map<U>(self, form: impl FnOnce(T) -> U) -> Given<U> {
-        match self {
-            Self::Fresh(answer) => Given::Fresh(form(answer)),
-            Self::Copied(answer) => Given::Copied(form(answer)),
-            Self::Withheld(answer) => Given::Withheld(form(answer)),
+        Given {
+            origin: self.origin,
+            answer: form(self.answer),
         }
     }
 }
@@ -151,9 +181,9 @@ impl<T, E> Given<Result<T, E>> {
             && let Err(refusal) = check()
         {
             return if copied {
-                Self::Withheld(Err(refusal))
+                Self::withheld(Err(refusal))
             } else {
-                Self::Fresh(Err(refusal))
+                Self::fresh(Err(refusal))
             };
         }
         Self::of(answer, copied)
@@ -180,7 +210,7 @@ impl<T> Recorded<T> {
 
     /// An answer a record supplied, given back as a copy.
     pub(crate) fn copied(self) -> Given<T> {
-        Given::Copied(self.0)
+        Given::copied(self.0)
     }
 
     /// What the lookup read, for a test in another crate that asks a lookup directly. A test
@@ -194,7 +224,7 @@ impl<T> Recorded<T> {
     /// withheld. The record itself is dropped.
     pub(crate) fn refused_by(self, refusal: T) -> Given<T> {
         drop(self.0);
-        Given::Withheld(refusal)
+        Given::withheld(refusal)
     }
 }
 
@@ -246,7 +276,7 @@ impl Recorded<ControlFrame> {
         check: impl FnOnce() -> Result<(), crate::error::ControllerError>,
     ) -> Given<ControlFrame> {
         match check() {
-            Ok(()) => Given::Copied(self.0),
+            Ok(()) => Given::copied(self.0),
             Err(refusal) => self.refused_by(crate::service::error_reply(
                 id,
                 refusal.code(),
@@ -301,12 +331,12 @@ mod tests {
     fn a_record_is_given_back_only_through_its_check() {
         let given = Recorded::read(Ok::<_, ControllerError>(7)).checked(|| Ok(()));
         assert!(given.is_copied());
-        assert_eq!(given.into_answer().ok(), Some(7));
+        assert_eq!(given.into_answer_for_test().ok(), Some(7));
 
         let given = Recorded::read(Ok::<_, ControllerError>(7)).checked(|| Err(refusal()));
         assert!(given.is_withheld());
         assert!(matches!(
-            given.into_answer(),
+            given.into_answer_for_test(),
             Err(ControllerError::PermissionDenied { .. })
         ));
     }
@@ -322,7 +352,7 @@ mod tests {
         let failed = Recorded::read(Err::<Option<u8>, _>(refusal()))
             .present()
             .expect("a read that failed names a record that could not be read");
-        assert!(failed.checked(|| Ok(())).into_answer().is_err());
+        assert!(failed.checked(|| Ok(())).into_answer_for_test().is_err());
     }
 
     /// A frame the check stops is replaced by a refusal frame for the request, and a record that
@@ -340,7 +370,7 @@ mod tests {
         let ControlFrame::Response(Response {
             outcome: Outcome::Error(told),
             ..
-        }) = given.into_answer()
+        }) = given.into_answer_for_test()
         else {
             panic!("the refusal is an error frame");
         };
@@ -363,7 +393,7 @@ mod tests {
             .answered(id)
             .expect("an answer is framed");
         assert!(matches!(
-            answer.copied().into_answer(),
+            answer.copied().into_answer_for_test(),
             ControlFrame::Response(Response {
                 outcome: Outcome::Ok(_),
                 ..

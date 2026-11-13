@@ -151,11 +151,11 @@ async fn a_chunk_another_attempt_recorded_is_not_given_back_while_a_fence_is_owe
         "the attempt that stages the chunk is not told as a copy of an answer it recorded itself"
     );
     first
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first attempt stages the chunk");
     let late = attempt().await;
     assert!(late.is_copied(), "the late attempt is given the record");
-    late.into_answer()
+    late.into_answer_for_test()
         .expect("with nothing owed the late attempt is answered from the record");
 
     controller.hold_fence(true);
@@ -167,7 +167,7 @@ async fn a_chunk_another_attempt_recorded_is_not_given_back_while_a_fence_is_owe
     refused_for_a_fence(&refused);
     attempt()
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("once the fence is gone it is answered again");
     let status = controller
         .transfer()

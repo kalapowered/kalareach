@@ -1148,7 +1148,7 @@ async fn a_stop_the_connection_stopped_waiting_for_is_recorded_and_given_again()
             .voice_answered(&actor, &stop)
             .await
             .copied()
-            .into_answer()
+            .into_answer_for_test()
             .is_ok_and(|recorded| recorded.is_some())
     })
     .await;
@@ -1296,7 +1296,7 @@ async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_und
     .await;
     assert!(late.is_copied(), "the late copy read the other's record");
     let late = late
-        .into_answer()
+        .into_answer_for_test()
         .expect("the record's answer is given back");
     assert_eq!(
         late.to_typed::<VoiceStopResult>().expect("a stop result"),
@@ -1388,7 +1388,9 @@ async fn a_stops_conflict_with_another_copys_claim_is_told_only_under_its_author
     let late =
         a_stop_that_meets_a_conflicting_claim_where_it_claims(&call, |_controller, _admission| {})
             .await;
-    let told = late.into_answer().expect_err("the conflict is told");
+    let told = late
+        .into_answer_for_test()
+        .expect_err("the conflict is told");
     assert_eq!(told.code(), ErrorCode::IdConflict, "{told}");
     call.world.serving.abort();
 
@@ -1399,7 +1401,7 @@ async fn a_stops_conflict_with_another_copys_claim_is_told_only_under_its_author
         })
         .await;
     let refused = late
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the conflict is not told while a fence is owed");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert!(refused.to_string().contains("fence"), "{refused}");

@@ -123,9 +123,10 @@ pub(super) enum DoorReply {
 /// The reply for an answer a record supplied, once the check it is owed has been asked: written
 /// as an answer when the check passed, and as the check's own refusal when it did not.
 fn door_reply(given: Given<ControlFrame>) -> DoorReply {
-    match given {
-        Given::Fresh(frame) | Given::Copied(frame) => DoorReply::Answered(frame),
-        Given::Withheld(refusal) => DoorReply::Refused(refusal),
+    if given.is_withheld() {
+        DoorReply::Refused(given.into_answer())
+    } else {
+        DoorReply::Answered(given.into_answer())
     }
 }
 

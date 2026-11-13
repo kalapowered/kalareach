@@ -162,7 +162,7 @@ pub(super) async fn ask_voice(
 ) -> crate::error::Result<ParamsValue> {
     ask_voice_given(controller, actor_id, device_id, method, mutation)
         .await
-        .into_answer()
+        .into_answer_for_test()
 }
 
 /// As [`ask_voice`], with where the answer came from.
@@ -438,7 +438,7 @@ async fn a_receipt_another_copy_kept_before_a_delegations_claim_goes_back_only_t
         .await;
         if revoked {
             let refused = late
-                .into_answer()
+                .into_answer_for_test()
                 .expect_err("a device that is no longer paired is given nothing");
             assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
             assert!(
@@ -448,7 +448,7 @@ async fn a_receipt_another_copy_kept_before_a_delegations_claim_goes_back_only_t
         } else {
             assert!(late.is_copied(), "the late copy read the other's receipt");
             assert_eq!(
-                late.into_answer()
+                late.into_answer_for_test()
                     .expect("a paired device is given its receipt")
                     .to_typed::<VoiceDelegateResult>()
                     .expect("a result"),
@@ -885,7 +885,7 @@ async fn a_receipt_for_an_effect_is_given_back_as_it_was_kept() {
     )
     .await;
     assert!(asked.is_copied(), "the receipt is a copy of the record");
-    let given = asked.into_answer().expect("the receipt goes back");
+    let given = asked.into_answer_for_test().expect("the receipt goes back");
     assert_eq!(
         given.to_typed::<VoiceDelegateResult>().expect("a result"),
         kept
@@ -1007,7 +1007,7 @@ async fn a_challenges_route_goes_back_while_its_claim_is_still_held() {
             carried,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first submission is answered");
     assert!(
         matches!(

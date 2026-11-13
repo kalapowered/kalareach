@@ -2769,7 +2769,7 @@ mod tests {
             installer
                 .retained(&actor, action, &digest)
                 .copied()
-                .into_answer()
+                .into_answer_for_test()
                 .expect("reads")
                 .is_none()
         );
@@ -2781,7 +2781,7 @@ mod tests {
         let error = installer
             .retained(&actor, action, &digest)
             .copied()
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("uncertain");
         assert_eq!(
             error.to_protocol_error().code,
@@ -2802,14 +2802,14 @@ mod tests {
             installer
                 .retained(&actor, action, &digest)
                 .copied()
-                .into_answer()
+                .into_answer_for_test()
                 .expect("reads"),
             Some(result)
         );
         let error = installer
             .retained(&actor, action, &other)
             .copied()
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("conflict");
         assert_eq!(
             error.to_protocol_error().code,
@@ -3123,7 +3123,7 @@ mod tests {
         let answer = installer
             .retained(&actor, action, &digest)
             .copied()
-            .into_answer()
+            .into_answer_for_test()
             .expect("reads")
             .expect("an answer");
 
@@ -3174,7 +3174,7 @@ mod tests {
         let answered = installer
             .retained(&actor, action, &digest)
             .copied()
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a marker with no outcome is uncertain");
         assert!(matches!(answered, ControllerError::Uncertain { .. }));
         assert_eq!(read(&path)["version"], ACTION_RECORD_VERSION);
@@ -3187,7 +3187,7 @@ mod tests {
                 installer
                     .retained(&actor, action, &digest)
                     .copied()
-                    .into_answer(),
+                    .into_answer_for_test(),
                 Err(ControllerError::InvalidArgument(_))
             ),
             "a record of a later format is refused"

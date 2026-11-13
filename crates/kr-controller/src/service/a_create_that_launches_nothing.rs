@@ -273,7 +273,7 @@ async fn a_create_whose_token_cannot_be_read_is_told_the_outcome_is_unknown() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer();
+        .into_answer_for_test();
     assert!(
         controller
             .registry
@@ -300,7 +300,7 @@ async fn a_create_whose_token_cannot_be_read_is_told_the_outcome_is_unknown() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a reservation that cannot be read does not answer the repeat");
     assert_eq!(told.code(), ErrorCode::OutcomeUnknown, "{told}");
 }
@@ -332,7 +332,7 @@ async fn a_create_whose_first_attempt_reserved_its_token() -> (
     let _ = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer();
+        .into_answer_for_test();
     assert!(
         controller
             .registry
@@ -368,7 +368,7 @@ async fn a_create_asked_again_whose_closure_cannot_be_read_is_told_the_outcome_i
     let told = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a closure that cannot be read does not answer the repeat");
     registry
         .execute_batch("ALTER TABLE tombstones_aside RENAME TO tombstones;")
@@ -407,7 +407,7 @@ async fn a_create_asked_again_whose_launch_failed_is_told_so_though_the_host_can
     let told = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a launch that failed leaves no session to answer with");
     registry
         .execute_batch("ALTER TABLE tombstones_aside RENAME TO tombstones;")
@@ -429,7 +429,7 @@ async fn a_create_asked_again_whose_launch_failed_is_told_so_though_the_host_can
     let told = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a claimed launch that failed is not shown to have made no session");
     registry
         .execute_batch("ALTER TABLE tombstones_aside RENAME TO tombstones;")
@@ -454,7 +454,7 @@ async fn a_create_asked_again_whose_launch_failed_is_told_so_though_the_host_can
         .replay_create(&reservation)
         .await
         .copied()
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a launch that failed leaves no session to answer with");
     assert_eq!(
         told.code(),
@@ -495,7 +495,7 @@ async fn a_create_asked_again_whose_worker_is_gone_is_told_what_the_reservation_
         let told = controller
             .session_create(&actor_id, &request, carried)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a worker that is gone leaves no session to answer with");
         assert_eq!(told.code(), owed, "a reservation {phase}: {told}");
     }
@@ -511,7 +511,7 @@ async fn a_create_asked_again_whose_worker_is_gone_is_told_what_the_reservation_
     let told = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a worker that is gone leaves no session to answer with");
     assert_eq!(
         told.code(),
@@ -559,7 +559,7 @@ async fn a_create_short_of(
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a host short of a resource accepted another session");
     assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
     assert!(
@@ -594,7 +594,7 @@ async fn a_create_short_of(
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer();
+        .into_answer_for_test();
     assert_eq!(
         asked.lock().expect("the record is not poisoned").len(),
         1,
@@ -739,7 +739,7 @@ async fn an_invisible_creation_cannot_adopt_a_probed_palette() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("an invisible session has no terminal to have probed");
     assert_eq!(
         error.code(),
@@ -777,7 +777,7 @@ async fn an_invisible_creation_cannot_adopt_a_probed_palette() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer();
+        .into_answer_for_test();
     assert!(
         outcome.is_err(),
         "this test's supervisor starts nothing, so the create cannot succeed"
@@ -818,7 +818,7 @@ async fn a_create_that_waited_across_a_revocation_launches_nothing() {
                     carried(&controller, connection_id, accepted),
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
         }
     });
     // The reservation is durable before the launch, so its row is what says the create has
@@ -899,7 +899,7 @@ async fn a_create_whose_deadline_passed_while_it_waited_launches_nothing() {
                     carried(&controller, connection_id, accepted),
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
         }
     });
     // Long enough for the deadline to pass while the create is held here. The registry lock
@@ -990,7 +990,7 @@ async fn a_create_admitted_before_a_revision_is_refused_though_its_connection_st
     let error = controller
         .session_create(&actor_id, &create_request(environment_id), admitted_at)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create admitted under the revision before is refused");
     assert!(
         matches!(error, ControllerError::PermissionDenied { .. }),
@@ -1033,7 +1033,7 @@ async fn a_managed_create_that_did_not_pass_a_local_envelope_is_refused_the_same
             carried(&controller, connection_id, half_a_minute(&controller)),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a shell no package qualifies is refused");
     assert_eq!(
         error.code(),
@@ -1741,7 +1741,7 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_its_package_went_a
             carried(&controller, connection_id, half_a_minute(&controller)),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the reservation has no worker behind it in this test");
     assert_ne!(
         error.code(),
@@ -1805,7 +1805,7 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke
             carried(&controller, connection_id, half_a_minute(&controller)),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the reservation has no worker behind it in this test");
     assert_ne!(
         retried.code(),
@@ -1825,7 +1825,7 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke
             carried(&controller, connection_id, half_a_minute(&controller)),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a token with no outcome yet is refused");
     assert_eq!(refused.code(), ErrorCode::HostNotConfigured, "{refused}");
     // And a repeat of the refused token is refused the same way, by the document, before a
@@ -1837,7 +1837,7 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke
             carried(&controller, connection_id, half_a_minute(&controller)),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the refused token is refused again");
     assert_eq!(again.code(), ErrorCode::HostNotConfigured, "{again}");
     assert!(
@@ -1874,7 +1874,7 @@ async fn a_create_that_waited_across_an_unusable_document_launches_nothing() {
                     carried(&controller, connection_id, half_a_minute(&controller)),
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
         }
     });
     reserved(&controller).await;
@@ -1968,7 +1968,7 @@ async fn a_create_whose_directory_cannot_be_made_releases_its_reservation() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create that cannot be prepared starts nothing");
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
@@ -2010,7 +2010,7 @@ async fn a_create_that_ends_before_it_asks_for_a_worker_settles_its_reservation(
     let first = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create whose look at where the session starts is lost starts nothing");
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
@@ -2033,7 +2033,7 @@ async fn a_create_that_ends_before_it_asks_for_a_worker_settles_its_reservation(
     let told = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create that started nothing leaves no session to answer with");
     assert_eq!(told.code(), ErrorCode::ResourceUnavailable, "{told}");
 }
@@ -2087,7 +2087,7 @@ async fn a_create_that_started_nothing_and_cannot_write_that_it_failed_still_tel
         let first = controller
             .session_create(&actor_id, &request, carried)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a create that cannot go on starts nothing");
         assert!(
             asked.lock().expect("the record is not poisoned").is_empty(),
@@ -2097,7 +2097,7 @@ async fn a_create_that_started_nothing_and_cannot_write_that_it_failed_still_tel
         let told = controller
             .session_create(&actor_id, &request, carried)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a create that started nothing leaves no session to answer with");
         assert_eq!(
             told.code(),
@@ -2109,7 +2109,7 @@ async fn a_create_that_started_nothing_and_cannot_write_that_it_failed_still_tel
         let told = controller
             .session_create(&actor_id, &request, carried)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a create that started nothing leaves no session to answer with");
         assert_eq!(
             told.code(),
@@ -2150,7 +2150,7 @@ async fn a_repeat_that_read_the_reservation_before_it_was_settled_is_told_the_la
     controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create whose look at where the session starts is lost starts nothing");
     let settled = controller
         .registry
@@ -2170,7 +2170,7 @@ async fn a_repeat_that_read_the_reservation_before_it_was_settled_is_told_the_la
             .replay_create(&stale)
             .await
             .copied()
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a create that started nothing leaves no session to answer with");
         assert_eq!(
             told.code(),
@@ -2195,7 +2195,7 @@ async fn a_create_whose_reservation_cannot_move_to_spawned_settles_it_as_failed(
     let first = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create whose reservation cannot move to spawned starts nothing");
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
@@ -2217,7 +2217,7 @@ async fn a_create_whose_reservation_cannot_move_to_spawned_settles_it_as_failed(
     let told = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create that started nothing leaves no session to answer with");
     assert_eq!(told.code(), ErrorCode::ResourceUnavailable, "{told}");
 }
@@ -2258,7 +2258,7 @@ async fn a_create_whose_worker_has_no_address_to_meet_its_daemon_at_settles_its_
     let first = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a worker with no address to meet its daemon at is not started");
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
@@ -2280,7 +2280,7 @@ async fn a_create_whose_worker_has_no_address_to_meet_its_daemon_at_settles_its_
     let told = controller
         .session_create(&actor_id, &request, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create that started nothing leaves no session to answer with");
     assert_eq!(told.code(), ErrorCode::ResourceUnavailable, "{told}");
 }
@@ -2314,7 +2314,7 @@ async fn a_create_that_fails_after_registering_its_wait_leaves_nothing_registere
             carried(&controller, connection_id, half_a_minute(&controller)),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create whose reservation cannot move to spawned starts nothing");
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
@@ -2353,7 +2353,7 @@ async fn a_failed_create_leaves_nothing_registered_while_the_waits_are_contended
                 carried(&controller, connection_id, half_a_minute(&controller)),
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a create whose reservation cannot move to spawned starts nothing");
     }
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -2460,7 +2460,7 @@ async fn a_create_whose_launch_never_started_leaves_no_directory() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("this supervisor starts nothing");
     assert_eq!(
         asked.lock().expect("the record is not poisoned").len(),
@@ -2501,7 +2501,7 @@ async fn a_refused_create_leaves_no_directory() {
                     carried(&controller, connection_id, accepted),
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
         }
     });
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -2586,7 +2586,7 @@ async fn a_launch_carries_paths_the_worker_can_use_from_its_own_directory() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("this supervisor starts nothing");
 
     let asked = asked.lock().expect("the record is not poisoned");
@@ -2838,7 +2838,7 @@ async fn a_project_mutation_does_not_act_while_a_fence_is_owed() {
             None,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the project service's own check refuses it");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(
@@ -3587,7 +3587,7 @@ async fn a_create_a_paired_device_makes_with_variables_of_its_own_is_refused() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a device's variables are refused");
     assert_eq!(error.code(), ErrorCode::InvalidArgument, "{error}");
     assert!(!error.to_string().contains("/a/phones/own"), "{error}");
@@ -3611,7 +3611,7 @@ async fn a_create_a_paired_device_makes_with_variables_of_its_own_is_refused() {
             carried(&controller, connection_id, accepted),
         )
         .await
-        .into_answer();
+        .into_answer_for_test();
     assert!(outcome.is_err(), "this supervisor starts nothing");
     assert_eq!(
         asked.lock().expect("the record is not poisoned").len(),
@@ -3801,7 +3801,7 @@ async fn a_launch_waiting_on_the_service_manager_does_not_hold_up_the_daemon() {
             controller
                 .session_create(&actor_id, &create_request(environment_id), carried)
                 .await
-                .into_answer()
+                .into_answer_for_test()
         })
     };
     // Bounded: a create that ends before it reaches the supervisor holds the sender through the
