@@ -4931,3 +4931,71 @@ async fn a_project_module_that_goes_leaves_nothing_of_its_owner_to_the_challenge
     );
     let _ = owned.stop().await;
 }
+
+/// KR-REQ-09.09, 09.12: the result of a project operation whose effect has run is told only while
+/// the authority it ended with stands. A fence this host comes to owe once the route has answered
+/// keeps the project from the caller, who is told that what became of the action is not shown; the
+/// repository stands, and the same request asked once the fence is gone is answered with the
+/// project the first attempt made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_project_made_is_not_shown_when_a_fence_lands_after_the_route_answers_and_the_project_stands()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let environment_id = host.environment_id;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = ProjectInitParams {
+        destination: host.destination("made"),
+        label: "made".to_owned(),
+        initial_branch: Nullable::null(),
+    };
+
+    let (arrived, release) = host.controller.pause_after_a_route_answers();
+    let telling = tokio::spawn({
+        let params = params.clone();
+        async move {
+            let told = control
+                .mutate(
+                    Method::ProjectInit,
+                    action,
+                    ActionTarget::environment(environment_id),
+                    &params,
+                )
+                .await;
+            (control, told)
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
+        .await
+        .expect("the route answers")
+        .expect("the pause is armed");
+    host.controller.hold_fence(true);
+    release.send(()).expect("the door goes on");
+    let (mut control, told) = telling.await.expect("the door tells it");
+    host.controller.hold_fence(false);
+    let told = failure(told.expect("the call reaches the daemon"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        host.work().join("made/.git").is_dir(),
+        "the repository was made"
+    );
+
+    let made: ProjectInitResult = typed(
+        &control
+            .mutate(
+                Method::ProjectInit,
+                action,
+                ActionTarget::environment(environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the same request is answered once the fence is gone"),
+    );
+    assert_eq!(made.operation.state, OperationState::Completed);
+    let _ = host.stop().await;
+}

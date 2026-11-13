@@ -179,7 +179,11 @@ async fn a_result_is_not_shown_while_a_fence_is_owed_after_the_route_answers() {
 /// whatever answer a module gives, a result is not shown once the connection is withdrawn or a fence
 /// is owed, and a refusal that says nothing was done is the check's own; a registration restamped
 /// by a withdrawal that did not take this one changes nothing for either. Each leg runs on a daemon
-/// of its own, so that every request is a first attempt.
+/// of its own, so that every request is a first attempt. The project and change-set routes answer
+/// here with the refusals of requests that name nothing held, and the attention and automation
+/// routes with results; a project made, a version captured and an automation run, whose effects
+/// need a repository and a workflow, are told under a fence in the cases of `tests/project.rs`,
+/// `tests/changeset.rs` and `tests/automation.rs` that name them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_four_modules_first_admissions_are_told_under_the_authority_they_end_with() {
     use super::a_recorded_answer_another_copy_wrote::{

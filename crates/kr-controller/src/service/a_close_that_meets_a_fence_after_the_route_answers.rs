@@ -5,12 +5,19 @@
 //! and the door tells it only under the strict check. The same holds for the answer a duplicate
 //! close is given from the closure record, which is a record of what an earlier close did.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kr_protocol::envelope::{ControlFrame, MutationRequest};
-use kr_protocol::ids::{ActorId, ConnectionId};
+use kr_ipc::endpoint::Listener;
+use kr_ipc::framed::split;
+use kr_ipc::verify::WorkerIdentity;
+use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue, Response};
+use kr_protocol::frame::StreamKind;
+use kr_protocol::ids::{ActionId, ActorId, ConnectionId, SessionId};
 use kr_protocol::method::Method;
+use kr_protocol::scalars::{CanonicalSet, Nullable};
+use kr_protocol::session::{Durability, SessionCloseResult, SessionState};
+use kr_protocol::worker::AuthorityRevisionAck;
 use kr_transport::window::AcceptedDeadline;
 
 use super::a_close_a_worker_never_answers as world;
@@ -177,18 +184,155 @@ async fn a_duplicate_close_answered_from_the_closure_record_is_not_shown_when_a_
     serving.abort();
 }
 
-/// KR-REQ-09.09: the accepted price of telling a worker's answer as a copy. Another device's
-/// withdrawal that completes between a first close's route answer and its reply stamps the
-/// connection's registration with a new revision, and the answer is not shown although the
-/// connection stands and no fence is owed. The worker was sent the close once; the same close asked
-/// again on the same connection is admitted under the new revision, is forwarded to the worker and
-/// is told as the worker answers it. The worker here refuses every frame and keeps no receipt, so
-/// the case shows the word at the door and that the repeat is forwarded and told, and not that a
-/// close took effect or that a receipt answers the repeat.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn another_devices_withdrawal_between_a_first_closes_effect_and_its_reply_is_not_shown_and_the_close_stands()
- {
-    let recorded: world::Recorded = Arc::default();
+/// What a worker that accepts a close has kept of the closes it was sent.
+#[derive(Default)]
+struct Kept {
+    /// The closes it carried out: one for each action it was sent, whatever the repeats.
+    closes: usize,
+    /// Every close frame it was sent, repeats included.
+    forwarded: usize,
+    /// The answer it gave each action, which it gives again to a repeat of that action instead of
+    /// closing again.
+    answers: Vec<(ActionId, ParamsValue)>,
+}
+
+/// The acceptance a worker gives a close: the session is closing, as the worker describes it.
+fn acceptance(session_id: SessionId) -> ParamsValue {
+    let mut session = world::read_result(session_id).session;
+    session.state = SessionState::Closing;
+    ParamsValue::from_typed(&SessionCloseResult {
+        session_id,
+        state: SessionState::Closing,
+        durability: Durability::Durable,
+        closure: Nullable::null(),
+        session: Some(session),
+    })
+    .expect("encodes")
+}
+
+/// What an accepting worker answers `frame` with, after the handshake: the revision announced to it
+/// is installed, a close it has not seen is carried out and accepted, a repeat of one it has seen is
+/// answered with the answer it kept, and the daemon's own read of the session is answered.
+fn accepting_answers(
+    frame: &ControlFrame,
+    identity: &WorkerIdentity,
+    kept: &Mutex<Kept>,
+) -> Vec<ControlFrame> {
+    let answer = |request_id, outcome| {
+        vec![ControlFrame::Response(Response {
+            request_id,
+            outcome,
+        })]
+    };
+    match frame {
+        ControlFrame::AuthorityRevision(notice) => {
+            vec![ControlFrame::AuthorityRevisionAck(AuthorityRevisionAck {
+                session_id: identity.session_id(),
+                revision: notice.revision,
+                fence: None,
+            })]
+        }
+        ControlFrame::Forwarded(forwarded) => {
+            let mutation = &forwarded.mutation;
+            let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+            kept.forwarded += 1;
+            let kept_answer = kept
+                .answers
+                .iter()
+                .find(|(action, _)| *action == mutation.action_id)
+                .map(|(_, answer)| answer.clone());
+            let given = kept_answer.unwrap_or_else(|| {
+                kept.closes += 1;
+                let accepted = acceptance(identity.session_id());
+                kept.answers.push((mutation.action_id, accepted.clone()));
+                accepted
+            });
+            answer(mutation.request_id, Outcome::Ok(given))
+        }
+        ControlFrame::Request(request) if request.method == Method::SessionRead.into() => answer(
+            request.request_id,
+            Outcome::Ok(
+                ParamsValue::from_typed(&world::read_result(identity.session_id()))
+                    .expect("encodes"),
+            ),
+        ),
+        _ => Vec::new(),
+    }
+}
+
+/// An endpoint that proves itself as a worker and then accepts every close it is sent, keeping its
+/// answer to each action so that a repeat is answered from it and closes nothing again.
+fn serve_accepting_worker(
+    listener: Listener,
+    identity: Arc<WorkerIdentity>,
+    endpoint_text: String,
+    kept: Arc<Mutex<Kept>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((connection, peer)) = listener.accept().await else {
+                return;
+            };
+            let (identity, endpoint_text, kept) = (
+                Arc::clone(&identity),
+                endpoint_text.clone(),
+                Arc::clone(&kept),
+            );
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = split(connection, StreamKind::Control);
+                let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                    let answers = world::handshake(
+                        &frame,
+                        &identity,
+                        &endpoint_text,
+                        connection_id,
+                        &peer,
+                        &CanonicalSet::new(),
+                    )
+                    .unwrap_or_else(|| accepting_answers(&frame, &identity, &kept));
+                    for answer in answers {
+                        if writer.write_message(&answer).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    })
+}
+
+/// The close result a frame carries, when it carries one.
+fn close_result(frame: &ControlFrame) -> Option<SessionCloseResult> {
+    match frame {
+        ControlFrame::Response(Response {
+            outcome: Outcome::Ok(value),
+            ..
+        }) => value.to_typed().ok(),
+        _ => None,
+    }
+}
+
+/// A close, and the same close asked again, to a worker that accepts it and keeps its answer.
+struct Closed {
+    /// What the door told of the close, with `between` happening once the route had answered.
+    first: ControlFrame,
+    /// What the door told of the same close asked again with nothing between.
+    repeat: ControlFrame,
+    /// The closes the worker had carried out when the first was told.
+    closes_after_the_first: usize,
+    /// The closes it had carried out when the repeat was told.
+    closes: usize,
+    /// The close frames it had been sent when the repeat was told.
+    forwarded: usize,
+    /// Whether this daemon held the session as closing when the first was told.
+    closing: bool,
+}
+
+/// Asks a worker that accepts closes to close its session, with `between` happening once the route
+/// has answered and before the answer is told, and then asks the same close again.
+async fn a_close_and_its_repeat(between: Between) -> Closed {
+    let kept: Arc<Mutex<Kept>> = Arc::default();
     let world::Silent {
         _temp,
         controller,
@@ -197,43 +341,114 @@ async fn another_devices_withdrawal_between_a_first_closes_effect_and_its_reply_
         accepted: window,
         serving,
         ..
-    } = world::fake_worker(Some(Arc::clone(&recorded))).await;
+    } = world::fake_world({
+        let kept = Arc::clone(&kept);
+        move |listener, identity, endpoint_text| {
+            serve_accepting_worker(listener, identity, endpoint_text, kept)
+        }
+    })
+    .await;
     world::acknowledged(&controller, session_id);
     let who = admitted(&controller).await;
-    let forwarded = || {
-        recorded
-            .lock()
-            .expect("the record is not poisoned")
-            .iter()
-            .filter(|frame| matches!(frame, ControlFrame::Forwarded(_)))
-            .count()
-    };
     let close = world::close_request(environment_id, session_id);
+    let counts = || {
+        let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+        (kept.closes, kept.forwarded)
+    };
 
-    let told = close_told(
-        &controller,
-        &who,
-        window,
-        &close,
-        Between::AnotherDevicesWithdrawal,
-    )
-    .await;
-    assert!(is_not_shown(&told), "the answer is not shown: {told:?}");
-    assert_eq!(forwarded(), 1, "the worker was sent the close once");
-    assert!(
-        controller.admitted_revision(who.0).is_ok(),
-        "the connection stands"
-    );
+    let first = close_told(&controller, &who, window, &close, between).await;
+    let (closes_after_the_first, _) = counts();
+    let closing = controller
+        .directory
+        .lock()
+        .await
+        .ending(session_id)
+        .is_some_and(|read| read.session.state == SessionState::Closing);
+    let repeat = close_told(&controller, &who, window, &close, Between::Nothing).await;
+    let (closes, forwarded) = counts();
+    serving.abort();
+    Closed {
+        first,
+        repeat,
+        closes_after_the_first,
+        closes,
+        forwarded,
+        closing,
+    }
+}
 
-    let again = close_told(&controller, &who, window, &close, Between::Nothing).await;
+/// KR-REQ-09.09: a close that a worker accepts is told as the worker accepted it while no fence is
+/// owed, and the worker answers the same close asked again from the answer it kept, closing nothing
+/// again. The control of the cases below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_a_worker_accepts_is_told_and_its_repeat_is_answered_from_the_workers_receipt() {
+    let closed = a_close_and_its_repeat(Between::Nothing).await;
+    let accepted = close_result(&closed.first)
+        .unwrap_or_else(|| panic!("the acceptance is told: {:?}", closed.first));
+    assert_eq!(accepted.state, SessionState::Closing);
     assert!(
-        refusal(&again).is_some() && !is_not_shown(&again),
-        "the close asked again is told as the worker answers it: {again:?}"
+        closed.closing,
+        "this daemon holds the session as closing once the acceptance is settled"
     );
     assert_eq!(
-        forwarded(),
-        2,
-        "the repeat reached the worker, which answers from its receipt"
+        closed.closes_after_the_first, 1,
+        "one close was carried out"
     );
-    serving.abort();
+    assert_eq!(
+        close_result(&closed.repeat),
+        Some(accepted),
+        "the repeat is answered with the answer the worker kept"
+    );
+    assert_eq!(closed.closes, 1, "the repeat closed nothing again");
+    assert_eq!(closed.forwarded, 2, "the repeat reached the worker");
+}
+
+/// What a close that a worker accepted leaves when the door does not tell the acceptance: the
+/// worker carried the close out once and this daemon holds the session as closing, so the effect
+/// stands, and the same close asked again is answered from what the worker kept, with nothing
+/// closed a second time.
+fn the_close_stands_and_its_repeat_is_answered(closed: &Closed) {
+    assert!(
+        is_not_shown(&closed.first),
+        "the acceptance is not shown: {:?}",
+        closed.first
+    );
+    assert_eq!(
+        closed.closes_after_the_first, 1,
+        "the close was carried out"
+    );
+    assert!(
+        closed.closing,
+        "this daemon holds the session as closing: the acceptance was settled before it was withheld"
+    );
+    let repeat = close_result(&closed.repeat)
+        .unwrap_or_else(|| panic!("the repeat is answered: {:?}", closed.repeat));
+    assert_eq!(repeat.state, SessionState::Closing);
+    assert_eq!(closed.closes, 1, "the repeat closed nothing again");
+    assert_eq!(
+        closed.forwarded, 2,
+        "the repeat reached the worker, which answered from the answer it kept"
+    );
+}
+
+/// KR-REQ-09.09: a fence this host comes to owe after a worker's acceptance of a close has arrived
+/// keeps the acceptance from the caller, who is told that what became of the action is not shown;
+/// the close stands, and the same close asked once the fence is gone is answered from the worker's
+/// receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_a_worker_accepts_is_not_shown_when_a_fence_lands_after_it_and_the_close_stands() {
+    the_close_stands_and_its_repeat_is_answered(&a_close_and_its_repeat(Between::AFence).await);
+}
+
+/// KR-REQ-09.09: the accepted price of telling a worker's answer as a copy. Another device's
+/// withdrawal that completes between a first close's route answer and its reply stamps the
+/// connection's registration with a new revision, and the acceptance is not shown although the
+/// connection stands and no fence is owed. The close stands; the same close asked again on the same
+/// connection is admitted under the new revision and answered from the worker's receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_devices_withdrawal_between_a_first_closes_effect_and_its_reply_is_not_shown_and_the_close_stands()
+ {
+    the_close_stands_and_its_repeat_is_answered(
+        &a_close_and_its_repeat(Between::AnotherDevicesWithdrawal).await,
+    );
 }

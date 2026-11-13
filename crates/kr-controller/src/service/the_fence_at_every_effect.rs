@@ -2389,11 +2389,13 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
     );
 }
 
-/// KR-REQ-09.09, the authority part, at the local door: an agent-tool installation another attempt
+/// KR-REQ-09.09, the authority part, at the route: an agent-tool installation another attempt
 /// recorded is not shown to a late attempt while this host owes a fence it could not raise, and the
-/// conflict a reused identifier meets is the fence's own refusal, which says nothing was done. The
-/// control: with nothing owed the late attempt is given what the first was told, and the reused
-/// identifier is a conflict.
+/// conflict a reused identifier meets there is the fence's own refusal, which says nothing was done
+/// (a request that reaches the route finds no retained answer before it: the door's own look,
+/// which tells a conflict as not shown, is held by the case after this one). The control: with
+/// nothing owed the late attempt is given what the first was told, and the reused identifier is a
+/// conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_installation_recorded_before_a_late_attempts_lookup_is_not_shown_at_the_door_while_a_fence_is_owed()
  {
@@ -2465,6 +2467,100 @@ async fn an_installation_recorded_before_a_late_attempts_lookup_is_not_shown_at_
         refusal(&conflict).unwrap_or_else(|| panic!("the fence's own refusal: {conflict:?}")),
     );
     controller.hold_fence(false);
+}
+
+/// KR-REQ-09.09, 09.12, at the local door: the lookup the door itself makes for an agent-tool
+/// installation another attempt recorded (the installer's record, asked before anything of a first
+/// admission) tells a duplicate, and the conflict a reused identifier meets, only under the
+/// authority the request was admitted under, asked once the lookup has answered. A fence this host
+/// comes to owe at that point, or the replacement of the request's registration by another device's
+/// revocation, stops both: each is told as not shown. The controls: with nothing in between the
+/// duplicate is given what the first attempt was told and the reused identifier is a conflict, and
+/// they are again once the fence is gone or on the connection's new registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_the_doors_lookup_finds_is_not_shown_when_a_fence_or_a_replacement_lands_after_it()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let project = tempfile::TempDir::new().expect("a project directory of this test's own");
+    let installing = installation_in(&temp, project.path());
+    let reused = MutationRequest {
+        action_id: installing.action_id,
+        ..installation_in(&temp, &project.path().join("another"))
+    };
+    // The door's future is large: it is kept off this case's own stack.
+    let performing = |mutation: MutationRequest| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        Box::pin(async move {
+            controller
+                .perform(&actor_id, connection_id, None, mutation)
+                .await
+        })
+    };
+    // A first admission is made at the route, which asks for no window of its own; a retry is what
+    // the door looks up.
+    let first = told_now(
+        &controller,
+        connection_id,
+        &installing,
+        controller.write_method(
+            &actor_id,
+            &installing,
+            Method::AgentToolsInstall,
+            connection_id,
+            None,
+            Some(accepted(&controller)),
+            controller.admitted_revision(connection_id).ok(),
+        ),
+    )
+    .await;
+    assert!(
+        refusal(&first).is_none(),
+        "the first attempt installs: {first:?}"
+    );
+    let controls = || async {
+        assert_eq!(
+            performing(installing.clone()).await,
+            first,
+            "with nothing in between the duplicate is answered from the record"
+        );
+        assert_eq!(
+            refusal(&performing(reused.clone()).await)
+                .expect("a reused identifier is a conflict")
+                .code,
+            ErrorCode::IdConflict
+        );
+    };
+    controls().await;
+
+    for replaced in [false, true] {
+        for mutation in [&installing, &reused] {
+            let (arrived, release) = controller.pause_retained_lookup();
+            let attempt = performing(mutation.clone());
+            tokio::pin!(attempt);
+            tokio::select! {
+                reached = tokio::time::timeout(Duration::from_secs(30), arrived) => {
+                    reached
+                        .expect("the attempt reaches its lookup")
+                        .expect("the pause is armed");
+                }
+                _ = &mut attempt => panic!("the attempt was told before it reached the place it is stopped at"),
+            }
+            if replaced {
+                another_devices_revocation_lands(&controller).await;
+            } else {
+                controller.hold_fence(true);
+            }
+            release.send(()).expect("the attempt goes on");
+            let told = attempt.await;
+            controller.hold_fence(false);
+            told_as_not_shown(
+                refusal(&told).unwrap_or_else(|| panic!("a record is not given back: {told:?}")),
+            );
+        }
+        controls().await;
+    }
 }
 
 /// KR-REQ-09.09, the authority part: an agent-tool installation another attempt recorded after the
