@@ -782,3 +782,113 @@ fn the_aead_seals_the_xchacha20_poly1305_draft_vector_to_its_published_bytes() {
         plaintext
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The comparison and the random bytes.
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-20.02: the comparison reports equal buffers equal and any one differing byte unequal, at
+/// every position of every length that straddles a word, a vector or a cache line, whatever the
+/// alignment of either slice, and reports slices of different lengths unequal. This is a test of
+/// the answer, not of timing.
+#[test]
+fn the_comparison_answers_right_at_every_position_length_and_offset() {
+    let lengths = [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 256];
+    for length in lengths {
+        let mut left_backing = rule_bytes(
+            &format!("kr-known-answers/compare/left/{length}"),
+            length + 16,
+        );
+        let mut right_backing = left_backing.clone();
+        for left_offset in 0..16 {
+            for right_offset in 0..16 {
+                let content = rule_bytes(
+                    &format!(
+                        "kr-known-answers/compare/content/{length}/{left_offset}/{right_offset}"
+                    ),
+                    length,
+                );
+                left_backing[left_offset..left_offset + length].copy_from_slice(&content);
+                right_backing[right_offset..right_offset + length].copy_from_slice(&content);
+                let what = format!("{length} bytes at offsets {left_offset} and {right_offset}");
+
+                assert!(
+                    constant_time_eq(
+                        &left_backing[left_offset..left_offset + length],
+                        &right_backing[right_offset..right_offset + length]
+                    ),
+                    "{what}: equal buffers were reported unequal"
+                );
+                for position in 0..length {
+                    // Every bit of a byte, over the positions, and the byte's other seven bits left alone.
+                    let bit = 1u8 << (position % 8);
+                    right_backing[right_offset + position] ^= bit;
+                    assert!(
+                        !constant_time_eq(
+                            &left_backing[left_offset..left_offset + length],
+                            &right_backing[right_offset..right_offset + length]
+                        ),
+                        "{what}: a difference at byte {position} was not seen"
+                    );
+                    right_backing[right_offset + position] ^= bit;
+                }
+                // A different length is unequal even when one is a prefix of the other, and the
+                // bytes beyond the shorter slice are never read to decide it.
+                assert!(
+                    !constant_time_eq(
+                        &left_backing[left_offset..left_offset + length],
+                        &right_backing[right_offset..right_offset + length + 1]
+                    ),
+                    "{what}: a longer buffer was reported equal"
+                );
+                if length > 0 {
+                    assert!(
+                        !constant_time_eq(
+                            &left_backing[left_offset..left_offset + length],
+                            &right_backing[right_offset..right_offset + length - 1]
+                        ),
+                        "{what}: a shorter buffer was reported equal"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// KR-REQ-20.02: the random generator fills the buffer it is given and no byte outside it, at
+/// every length from nothing to a page, and two fills of 32 bytes or more are not the same and are
+/// not all one value.
+#[test]
+fn random_bytes_fill_the_destination_and_leave_the_bytes_around_it_alone() {
+    const GUARD: usize = 16;
+    for length in [0usize, 1, 32, 256, 4_096] {
+        let mut previous: Option<Vec<u8>> = None;
+        for _ in 0..2 {
+            let mut buffer = vec![0xa5u8; GUARD + length + GUARD];
+            random_bytes(&mut buffer[GUARD..GUARD + length]).expect("random bytes");
+            assert!(
+                buffer[..GUARD].iter().all(|byte| *byte == 0xa5),
+                "{length} bytes: the bytes before the destination changed"
+            );
+            assert!(
+                buffer[GUARD + length..].iter().all(|byte| *byte == 0xa5),
+                "{length} bytes: the bytes after the destination changed"
+            );
+            let filled = buffer[GUARD..GUARD + length].to_vec();
+            if length >= 32 {
+                assert!(
+                    filled.iter().any(|byte| *byte != filled[0]),
+                    "{length} bytes: one value fills the destination"
+                );
+                assert!(
+                    filled.iter().any(|byte| *byte != 0xa5),
+                    "{length} bytes: nothing was written"
+                );
+                if let Some(earlier) = &previous {
+                    assert_ne!(earlier, &filled, "{length} bytes: two fills are equal");
+                }
+            }
+            previous = Some(filled);
+        }
+    }
+}
