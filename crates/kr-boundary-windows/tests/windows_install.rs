@@ -1392,13 +1392,17 @@ fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_
         .collect();
     assert_eq!(named, [SYSTEM, ADMINISTRATORS]);
 
-    // The two handles are held: neither the folder nor the directory can be renamed or deleted
-    // while the protection step runs, and the step works on the handle.
+    // The folder was there, so the handle that the check keeps blocks its rename while the holds
+    // live. The directory is the one that this run made: its handles share delete and hold no
+    // right to delete (the cleanup takes it away through an identity of its own), so another
+    // handle's rename of it succeeds while the holds live, and the protection step works on the
+    // handle, wherever the directory then stands.
     let moved = paths.data.with_extension("moved");
-    assert!(std::fs::rename(&paths.data, &moved).is_err());
-    assert!(std::fs::remove_dir(&paths.data).is_err());
     assert!(std::fs::rename(&folder, folder.with_extension("moved")).is_err());
+    std::fs::rename(&paths.data, &moved)
+        .expect("a directory that this run made shares delete while the holds live");
     holds.protect().unwrap();
+    std::fs::rename(&moved, &paths.data).unwrap();
     drop(holds);
     std::fs::rename(&paths.data, &moved).expect("the directory moves once it is let go");
     std::fs::rename(&moved, &paths.data).unwrap();
