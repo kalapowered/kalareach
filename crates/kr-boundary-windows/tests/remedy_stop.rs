@@ -61,16 +61,18 @@ fn run(
     (result, fake.requests.get(), fake.waits.get())
 }
 
-use ServiceState::{Other, Pending, Running, Stopped};
+use ServiceState::{ContinuePending, PausePending, Paused, Pending, Running, Stopped, Unknown};
 
-/// Each state decides one step: a stopped service is done, a pending one is waited for (a stop
-/// request is refused there), and any other is asked to stop.
+/// Each state decides one step: a stopped service is done, one on its way to running or to stopped
+/// is waited for (a stop request is refused there), and any other is asked to stop: running, paused,
+/// on its way to either of those, and a state number that is not known.
 #[test]
 fn each_state_of_the_service_decides_one_step() {
     assert_eq!(stop_step(Stopped), StopStep::Done);
     assert_eq!(stop_step(Pending), StopStep::Wait);
-    assert_eq!(stop_step(Running), StopStep::Request);
-    assert_eq!(stop_step(Other), StopStep::Request);
+    for asked in [Running, Paused, PausePending, ContinuePending, Unknown(9)] {
+        assert_eq!(stop_step(asked), StopStep::Request, "{asked:?}");
+    }
 }
 
 /// A stopped service is read once and never asked to stop.
@@ -141,14 +143,18 @@ fn a_service_that_does_not_stop_is_never_said_to_be_stopped() {
 /// says stopped ends the run with success at once, even when the bound has run out.
 #[test]
 fn a_refused_request_ends_the_run_unless_the_state_changed() {
-    assert_eq!(
-        run(&[Running, Running], 5, true),
-        (Err(StopFailure::Refused("the request is refused")), 1, 0)
-    );
-    assert_eq!(
-        run(&[Running, Other], 5, true),
-        (Err(StopFailure::Refused("the request is refused")), 1, 0)
-    );
+    // The failure carries the state of the read after the request, whichever it is.
+    for after in [Running, Paused, PausePending, ContinuePending, Unknown(9)] {
+        assert_eq!(
+            run(&[Running, after], 5, true),
+            (
+                Err(StopFailure::Refused("the request is refused", after)),
+                1,
+                0
+            ),
+            "{after:?}"
+        );
+    }
     assert_eq!(run(&[Running, Pending, Stopped], 5, true), (Ok(true), 1, 1));
     assert_eq!(run(&[Running, Stopped], 5, true), (Ok(true), 1, 0));
 }
@@ -235,10 +241,10 @@ fn a_read_that_fails_is_never_a_stopped_service() {
 /// was waited for) nor that it stays stopped.
 #[test]
 fn the_words_for_a_refused_stop_request_are_a_repairs() {
-    let words = broker_stop_refused("access is denied (error 5)");
+    let words = broker_stop_refused("access is denied (error 5)", Running);
     assert!(
         words.starts_with(
-            "The broker's service refused the request to stop it (access is denied (error 5))"
+            "The request to stop the broker's service failed (access is denied (error 5))"
         ),
         "{words}"
     );
@@ -250,8 +256,9 @@ fn the_words_for_a_refused_stop_request_are_a_repairs() {
         words.contains("What it had already changed stays, and a repair has no rollback."),
         "{words}"
     );
+    assert!(words.ends_with("Run the setup program again."), "{words}");
     assert!(
-        words.ends_with("Run the setup program again when the service is stopped or running."),
+        words.contains("showed it running, so this run stopped"),
         "{words}"
     );
     assert!(
@@ -274,7 +281,7 @@ fn the_words_for_a_service_that_does_not_stop_are_chosen_by_the_run() {
         "{repair}"
     );
     assert!(
-        repair.ends_with("Run the setup program again when the service is stopped or running."),
+        repair.ends_with("Run the setup program again when the service is stopped."),
         "{repair}"
     );
     let installation = broker_not_stopped(false);
@@ -284,4 +291,31 @@ fn the_words_for_a_service_that_does_not_stop_are_chosen_by_the_run() {
     }
     assert!(!installation.contains("stays"), "{installation}");
     assert!(!installation.contains("rollback"), "{installation}");
+}
+
+/// The refused-stop words say only what the last read returned: a state is named as that state, the
+/// pause and continue transitions as transitions, and no state is called "not changing". The last
+/// sentence gives no condition that a read of the state can already have met.
+#[test]
+fn the_refused_stop_words_say_only_what_the_last_read_returned() {
+    for (after, said) in [
+        (Running, "showed it running,"),
+        (Paused, "showed it paused,"),
+        (PausePending, "showed it changing from running to paused,"),
+        (
+            ContinuePending,
+            "showed it changing from paused to running,",
+        ),
+        (
+            Unknown(9),
+            "showed it in a state that the setup program does not know (9),",
+        ),
+    ] {
+        let words = broker_stop_refused("error", after);
+        assert!(words.contains(said), "{words}");
+        assert!(!words.contains("changing state"), "{words}");
+        assert!(!words.contains("stopped or running"), "{words}");
+        assert!(!words.contains("refused"), "{words}");
+        assert!(words.ends_with("Run the setup program again."), "{words}");
+    }
 }

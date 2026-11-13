@@ -86,7 +86,7 @@ known_folder_unreadable | A removal cannot go on while the folder cannot be read
 known_folder_unreadable | If the boundary is installed, the broker's service, its two accounts and its rules in the policy stay | read: the removal could not read the known folder, so it removed nothing
 broker_not_stopped | The broker's service did not reach the stopped state | read: stop_broker returned Ok(false): the last read at the bound did not say stopped
 broker_not_stopped | What it had already changed stays, and a repair has no rollback | rule of a repair; flow: the run stopped before the program directory
-broker_stop_refused | The broker's service refused the request to stop it (error), and a read of its state after that showed it neither stopped nor changing state | read: the stop request's error, then service.status() showed a state that accepts a request
+broker_stop_refused | The request to stop the broker's service failed (error), and a read of its state after that showed it S | read: the stop request's error, then service.status() returned the state S (running, paused, changing from running to paused, changing from paused to running, or a number that is none of the seven)
 broker_stop_refused | What it had already changed stays, and a repair has no rollback | rule of a repair; flow: the run stopped before the program directory
 git_program_not_reached | Git's program X is not where the policy expects it | read: fs::read failed with the kind not found
 git_program_not_reached | Git's program X could not be read (error) | read: fs::read failed with any other error, printed

@@ -1037,8 +1037,15 @@ pub enum ServiceState {
     Pending,
     /// The service is running.
     Running,
-    /// Any other state, such as paused: a stop request is the way to the stopped state.
-    Other,
+    /// The service is paused.
+    Paused,
+    /// The service is on its way from running to paused.
+    PausePending,
+    /// The service is on its way from paused to running.
+    ContinuePending,
+    /// A state number that the setup program does not know. A stop request is the way to the
+    /// stopped state from here, as from the other states that are not pending.
+    Unknown(u32),
 }
 
 /// What a run does next about the broker's service, which is stopped before the program directory
@@ -1059,7 +1066,11 @@ pub fn stop_step(state: ServiceState) -> StopStep {
     match state {
         ServiceState::Stopped => StopStep::Done,
         ServiceState::Pending => StopStep::Wait,
-        ServiceState::Running | ServiceState::Other => StopStep::Request,
+        ServiceState::Running
+        | ServiceState::Paused
+        | ServiceState::PausePending
+        | ServiceState::ContinuePending
+        | ServiceState::Unknown(_) => StopStep::Request,
     }
 }
 
@@ -1070,8 +1081,9 @@ pub enum StopFailure<E> {
     /// A read of the service's state failed: nothing shows what state it is in.
     Read(E),
     /// The service refused the request to stop, and a read after that showed it neither stopped
-    /// nor on its way to either state.
-    Refused(E),
+    /// nor on its way to running or to stopped: the error is the request's, and the state is what
+    /// that last read returned.
+    Refused(E, ServiceState),
 }
 
 /// Stops the broker's service and waits for it, bounded: reads its state, asks it to stop where the
@@ -1099,10 +1111,11 @@ pub fn stop_broker<E>(
                 // A refusal where the service has moved on since the read is a race, and the read
                 // after it decides.
                 if let Err(error) = request() {
-                    match stop_step(read().map_err(StopFailure::Read)?) {
+                    let after = read().map_err(StopFailure::Read)?;
+                    match stop_step(after) {
                         StopStep::Done => return Ok(true),
                         StopStep::Wait => {}
-                        StopStep::Request => return Err(StopFailure::Refused(error)),
+                        StopStep::Request => return Err(StopFailure::Refused(error, after)),
                     }
                 }
             }
@@ -1124,21 +1137,39 @@ pub fn broker_not_stopped(repair: bool) -> String {
     let first = "The broker's service did not reach the stopped state, so this run stopped before it changed the program directory.";
     if repair {
         format!(
-            "{first} What it had already changed stays, and a repair has no rollback. Run the setup program again when the service is stopped or running."
+            "{first} What it had already changed stays, and a repair has no rollback. Run the setup program again when the service is stopped."
         )
     } else {
         first.to_owned()
     }
 }
 
-/// What a repair says when the broker's service refused the request to stop: the platform's error,
-/// what was read after it, and what the run left. A repair has no rollback; an installation's own
-/// failure path says what is undone, so only a repair uses these words.
+/// The state that a read of the broker's service returned, in words that say only that.
+fn service_state_words(state: ServiceState) -> String {
+    match state {
+        ServiceState::Stopped => "stopped".to_owned(),
+        ServiceState::Pending => "on its way to running or to stopped".to_owned(),
+        ServiceState::Running => "running".to_owned(),
+        ServiceState::Paused => "paused".to_owned(),
+        ServiceState::PausePending => "changing from running to paused".to_owned(),
+        ServiceState::ContinuePending => "changing from paused to running".to_owned(),
+        ServiceState::Unknown(number) => {
+            format!("in a state that the setup program does not know ({number})")
+        }
+    }
+}
+
+/// What a repair says when the request to stop the broker's service failed: the platform's error,
+/// the state that the read after it returned, and what the run left. A repair has no rollback; an
+/// installation's own failure path says what is undone, so only a repair uses these words. The last
+/// sentence gives no condition on the service's state: the state that the read returned can be one
+/// that such a condition names.
 #[must_use]
 // text: broker_stop_refused
-pub fn broker_stop_refused(error: &str) -> String {
+pub fn broker_stop_refused(error: &str, last: ServiceState) -> String {
+    let state = service_state_words(last);
     format!(
-        "The broker's service refused the request to stop it ({error}), and a read of its state after that showed it neither stopped nor changing state, so this run stopped before it changed the program directory. What it had already changed stays, and a repair has no rollback. Run the setup program again when the service is stopped or running."
+        "The request to stop the broker's service failed ({error}), and a read of its state after that showed it {state}, so this run stopped before it changed the program directory. What it had already changed stays, and a repair has no rollback. Run the setup program again."
     )
 }
 

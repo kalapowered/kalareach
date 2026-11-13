@@ -2922,11 +2922,11 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         .map_err(|failure| match failure {
             // A repair has no rollback, so its words say what the refusal was and what the run left;
             // an installation's own failure path says what is undone.
-            remedy::StopFailure::Refused(error) if existing => {
+            remedy::StopFailure::Refused(error, last) if existing => {
                 // text: lay_down-8
-                Error::Failed(remedy::broker_stop_refused(&error.to_string()))
+                Error::Failed(remedy::broker_stop_refused(&error.to_string(), last))
             }
-            remedy::StopFailure::Refused(error) | remedy::StopFailure::Read(error) => {
+            remedy::StopFailure::Refused(error, _) | remedy::StopFailure::Read(error) => {
                 Error::from(error)
             }
         })?;
