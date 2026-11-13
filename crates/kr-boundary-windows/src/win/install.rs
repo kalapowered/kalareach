@@ -914,6 +914,20 @@ impl MadeObject {
     /// the object and nothing was done with it), and [`Taken::Stays`] with the platform's refusal,
     /// or what was found at the name.
     fn take_away(self) -> Taken {
+        self.take_away_with(false)
+    }
+
+    /// As [`MadeObject::take_away`] for a directory that holds entries of its own: what it holds is
+    /// removed first, each entry through a handle that is opened relative to the handle of the
+    /// directory that holds it and never through a path (a link is removed as itself and never
+    /// entered), and then the directory is marked on the handle that was opened with the right to
+    /// delete it, after its identity was compared with the object that was held. An entry that
+    /// stays keeps the directory and is named.
+    fn take_away_tree(self) -> Taken {
+        self.take_away_with(true)
+    }
+
+    fn take_away_with(self, tree: bool) -> Taken {
         let MadeObject {
             identity,
             holder,
@@ -922,7 +936,8 @@ impl MadeObject {
         } = self;
         let units: Vec<u16> = name.encode_wide().collect();
         let marked = (|| {
-            let at_name = match DirHandle::open_beneath(&holder, &units, DELETE, true, FILE_OPEN) {
+            let access = if tree { DELETE | LIST } else { DELETE };
+            let at_name = match DirHandle::open_beneath(&holder, &units, access, true, FILE_OPEN) {
                 Ok(at_name) => at_name,
                 Err(failure)
                     if failure.code == ERROR_FILE_NOT_FOUND
@@ -950,7 +965,7 @@ impl MadeObject {
             if found != made {
                 return Err("another object stands at its name, so nothing was marked".to_owned());
             }
-            super::root::delete(&at_name).map_err(|failure| {
+            let refused = |failure: super::ffi::Error| {
                 let words = remedy::platform_error(
                     "the platform refused to mark it for removal",
                     failure.code,
@@ -962,10 +977,33 @@ impl MadeObject {
                 } else {
                     words
                 }
-            })?;
-            // The handle that set the mark is closed, and then the name is read: the object is
-            // said to be gone only where that read answers not found.
-            drop(at_name);
+            };
+            if tree {
+                let held = held_directory(at_name).map_err(|error| {
+                    format!(
+                        "its own handle could not be read ({error}), so nothing was removed from it"
+                    )
+                })?;
+                let leftovers = super::root::remove_children(&held, &|_| true)
+                    .map_err(|error| format!("a listing of it failed ({error}), so it stays"))?;
+                if !leftovers.is_empty() {
+                    return Err(format!(
+                        "what it holds was not all removed: {}",
+                        leftovers
+                            .iter()
+                            .map(|left| format!("{} ({})", left.path, left.reason))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
+                super::root::delete(held.handle()).map_err(refused)?;
+                drop(held);
+            } else {
+                super::root::delete(&at_name).map_err(refused)?;
+                // The handle that set the mark is closed, and then the name is read: the object
+                // is said to be gone only where that read answers not found.
+                drop(at_name);
+            }
             read_back(&holder, &units)
         })();
         // The handle of the open is closed, then the object's own, then the directory's.
@@ -2835,18 +2873,18 @@ fn final_path_of(handle: &ffi::Handle) -> Result<String, Error> {
 
 /// Reads the program directory on a handle that is held, and everything in it on its own handle:
 /// no link, one name for a file, the installation's own owner, and no right for another account to
-/// change it. Nothing is done to the directory before this has passed. Returns whether the
-/// directory was there to be opened and approved: a removal deletes the directory only when it was.
-fn check_program_directory(
+/// change it. Nothing is done to the directory before this has passed. Returns the handle that read
+/// it, or none where the directory was not there to be opened and approved.
+fn read_program_directory(
     paths: &Paths,
     recorded: bool,
     stage: remedy::Stage,
-) -> Result<bool, Error> {
+) -> Result<Option<DirHandle>, Error> {
     check_program_parents(paths, stage)?;
     // The look follows no link: a link that points nowhere is there, and gets the link's own remedy
     // from the open below, as does a name that the look could not read.
     if matches!(records::look(&paths.program), records::Look::NotThere) {
-        return Ok(false);
+        return Ok(None);
     }
     let program = paths.program.file_name().unwrap_or_default().to_owned();
     let held = match DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)? {
@@ -2866,7 +2904,61 @@ fn check_program_directory(
         ));
     }
     inspect_within(paths, Scope::Program { recorded }, &paths.program, &held, 1)?;
-    Ok(true)
+    Ok(Some(held))
+}
+
+/// Reads the program directory as [`read_program_directory`] does, and answers whether it was
+/// there to be opened and approved.
+fn check_program_directory(
+    paths: &Paths,
+    recorded: bool,
+    stage: remedy::Stage,
+) -> Result<bool, Error> {
+    Ok(read_program_directory(paths, recorded, stage)?.is_some())
+}
+
+/// Reads the program directory as [`read_program_directory`] does and holds what it read for its
+/// removal: the folder that holds it, opened by its path once and kept, and the directory itself
+/// opened relative to that handle with full sharing and no right to delete, whose identity is the
+/// one that the read had (an object that stands at the name by now is refused). The handle of the
+/// read is closed after that. The removal opens the name again relative to the held folder with
+/// the right to delete, compares the identity, and removes the tree through handles beneath it.
+/// Returns none where the directory was not there to be opened and approved.
+fn hold_program_directory(
+    paths: &Paths,
+    recorded: bool,
+    stage: remedy::Stage,
+) -> Result<Option<MadeObject>, Error> {
+    let Some(read) = read_program_directory(paths, recorded, stage)? else {
+        return Ok(None);
+    };
+    let Some((above, name)) = paths.program.parent().zip(paths.program.file_name()) else {
+        return Ok(None);
+    };
+    let Some((holder, _)) = open_directory_at(None, &native_path(above), FILE_OPEN, None, LIST)?
+    else {
+        // text: hold_program_directory-1
+        return Err(Error::Failed(format!(
+            "the folder that holds {} was not found after the directory was read",
+            paths.program.display()
+        )));
+    };
+    let units: Vec<u16> = name.encode_wide().collect();
+    let identity = DirHandle::open_beneath(&holder, &units, LIST, true, FILE_OPEN)?;
+    if file_key(&identity)? != read.key() {
+        // text: hold_program_directory-2
+        return Err(Error::Failed(format!(
+            "another object stands at {} than the one that was read, so nothing was held of it",
+            paths.program.display()
+        )));
+    }
+    drop(read);
+    Ok(Some(MadeObject {
+        identity,
+        holder,
+        name: name.to_owned(),
+        directory: true,
+    }))
 }
 
 /// The one name a proof directory holds: the unlisted program. Its bytes are those of the system's
@@ -3940,6 +4032,29 @@ impl Run {
         Ok(true)
     }
 
+    /// Removes what stands under the layout's names in the staging or the journal directory that
+    /// this run made, through a copy of the run's handle of that directory that can list it: a
+    /// directory that the run did not make is not the run's to sweep. Returns each entry that stayed,
+    /// with the reason.
+    fn sweep(&self, layout: Layout) -> Vec<String> {
+        let copy = {
+            let laid = ffi::locked(&self.laid);
+            let made = match layout {
+                Layout::Staging => laid.staging.as_ref(),
+                Layout::Journal => laid.journal.as_ref(),
+                Layout::Run => None,
+            };
+            made.map(|made| made.identity.duplicate(LIST))
+        };
+        match copy.map(|copy| copy.map_err(Error::from).and_then(held_directory)) {
+            None => Vec::new(),
+            Some(Ok(directory)) => sweep_layout(&directory, layout),
+            Some(Err(error)) => vec![format!(
+                "the run's handle of it could not be opened for a listing ({error})"
+            )],
+        }
+    }
+
     /// Takes away what this run laid, by the handles that it holds and never by what a manifest
     /// says: the objects go through their own identities, children before parents, and the run's
     /// own handle of the data directory is closed before the data directory is taken. The directories of the journal and of the
@@ -4226,28 +4341,37 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
     Ok(())
 }
 
-/// Removes what stands in the staging directory under a name that the layout gives its entries: the
-/// files that a run staged and the directories that the policy channel made. An entry whose name
-/// the layout does not give stays.
-fn sweep_staging(staging: &Path) {
-    if let Ok(entries) = fs::read_dir(staging) {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a clean-up of what an earlier run left: an entry that cannot be read stays, nothing here says that staging is empty, and this run stages its files under fresh names"
-        )]
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            match layout_kind(Layout::Staging, &name) {
-                Some(Kind::Directory) => {
-                    let _ = fs::remove_dir_all(entry.path());
-                }
-                Some(_) => {
-                    let _ = fs::remove_file(entry.path());
-                }
-                None => {}
-            }
-        }
+/// Whether a child of a directory of the installation stands under a name that the layout gives its
+/// entries, as the kind of object that the layout gives it (a file, or a directory that is not a
+/// link): a link, an object of another kind and a name that the layout does not give stay.
+fn is_the_layouts_child(layout: Layout, child: &Child) -> bool {
+    let directory = child.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let link = child.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    !link
+        && layout_kind(layout, &child.display())
+            .is_some_and(|kind| (kind == Kind::Directory) == directory)
+}
+
+/// Removes what stands in a directory under the names that the layout gives its entries, through
+/// the held handle of the directory: each entry is listed on that handle and removed through a
+/// handle that is opened relative to it, never through a path. An entry whose name the layout does
+/// not give stays. Returns each entry that stayed, with the reason: nothing here says that the
+/// directory is empty, and the removal of the directory names what it still holds.
+fn sweep_layout(directory: &DirHandle, layout: Layout) -> Vec<String> {
+    match super::root::remove_children(directory, &|child| is_the_layouts_child(layout, child)) {
+        Ok(leftovers) => leftovers
+            .iter()
+            .map(|left| format!("{} ({})", left.path, left.reason))
+            .collect(),
+        Err(error) => vec![format!("a listing of it failed ({error})")],
     }
+}
+
+/// Removes what stands in the staging directory under a name that the layout gives its entries: the
+/// files that a run staged and the directories that the policy channel made, through the held
+/// handle of the staging directory.
+fn sweep_staging(staging: &DirHandle) -> Vec<String> {
+    sweep_layout(staging, Layout::Staging)
 }
 
 /// Makes the folder directly above the program directory where it is not there, and records what
@@ -4339,10 +4463,13 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             other => Error::Failed(format!("making or protecting {what}: {other}")),
         })?;
     }
+    // What an earlier run left in staging was checked as the layout names it; it is removed through
+    // the handle that is held. An entry that stays is found by the directory's own removal.
+    if let Some(staging) = &holds.staging {
+        sweep_staging(staging);
+    }
     drop(holds);
     let channel = Channel::new(&paths.staging);
-    // What an earlier run left in staging was checked as the layout names it; it is removed.
-    sweep_staging(&paths.staging);
 
     // text: lay_down-2
     say("reading what is on this computer");
@@ -4998,7 +5125,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     #[cfg(feature = "testing")]
     testing::after_the_removal_inspection();
     // The program directory is read on a held handle before the removal deletes anything in it.
-    let program_checked = check_program_directory(
+    let program = hold_program_directory(
         paths,
         matches!(found, records::Inspection::Recorded(_)),
         stage,
@@ -5045,7 +5172,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         manifest,
         approved,
         seen,
-        program_checked,
+        program,
         Vec::new(),
         DataTree::ByName,
     )
@@ -5096,29 +5223,29 @@ fn roll_back(run: &mut Run) -> Result<(), Error> {
     let recorded = manifest
         .find(ObjectKind::Directory, &paths.program.display().to_string())
         .is_some();
-    let program_checked = if recorded {
+    let program = if recorded {
         // The refusal's words say that the manifest records the installation and stays where it
         // is only where a read just now found the manifest as this run holds it.
-        match check_program_directory(
+        match hold_program_directory(
             &paths,
             matches!(run.manifest_on_disk(), Ok(())),
             remedy::Stage::Rollback,
         ) {
-            Ok(checked) => checked,
+            Ok(held) => held,
             Err(error) => {
                 earlier.push(format!("checking the program directory: {error}"));
-                false
+                None
             }
         }
     } else {
-        false
+        None
     };
     undo_recorded(
         &paths,
         manifest,
         approved,
         seen,
-        program_checked,
+        program,
         earlier,
         DataTree::Laid(run),
     )
@@ -5289,14 +5416,14 @@ fn remove_program_folder(paths: &Paths, manifest: &Manifest, failures: &mut Vec<
 /// Identity service's start type, the release proved through the broker, the service, the accounts,
 /// the program directory, the journal's directories and the records. Each step is tried whatever an
 /// earlier one answered, and the steps that failed are returned together. `approved` and `seen` are
-/// what the inspection opened; `program_checked` says whether the program directory was opened and
-/// approved.
+/// what the inspection opened; `program` is the program directory as it was read and is held for
+/// its removal, or none where it was not there to be opened and approved.
 fn undo_recorded(
     paths: &Paths,
     manifest: Manifest,
     mut approved: records::Approved,
     seen: records::Seen,
-    program_checked: bool,
+    program: Option<MadeObject>,
     earlier: Vec<String>,
     mut tree: DataTree<'_>,
 ) -> Result<(), Error> {
@@ -5806,13 +5933,24 @@ fn undo_recorded(
             &mut failures,
         );
     }
-    if program_checked {
-        keep(
-            // text: install_remove_at-2
-            fs::remove_dir_all(&paths.program).map_err(io_error("removing the program directory")),
-            "removing the program directory",
-            &mut failures,
-        );
+    if let Some(program) = program {
+        // The directory goes through the handles that the check held, children before it, and its
+        // name is read afterwards: it is said to be gone only where that read found nothing.
+        match program.take_away_tree() {
+            Taken::Marked | Taken::NotMade => {}
+            Taken::NotFound => {
+                // text: remove_at-40
+                say(&format!(
+                    "{}: its name was not found when the removal opened it to remove it, so the removal did nothing with it",
+                    paths.program.display()
+                ));
+            }
+            Taken::Stays(why) => {
+                // text: install_remove_at-2
+                say(&format!("removing the program directory failed: {why}"));
+                failures.push(format!("removing the program directory: {why}"));
+            }
+        }
     } else if (matches!(tree, DataTree::ByName)
         || manifest
             .find(ObjectKind::Directory, &paths.program.display().to_string())
@@ -5843,7 +5981,11 @@ fn undo_recorded(
         }
         // The broker's own files in the journal's directory go by name; the directories that this
         // run made go through their identities with the rest of what it laid.
-        DataTree::Laid(_) => records::delete_journal_files(&paths.journal, seen.journal),
+        DataTree::Laid(run) => {
+            for stayed in run.sweep(Layout::Journal) {
+                failures.push(format!("removing the journal's files: {stayed}"));
+            }
+        }
     }
     if let Some(prior) = &prior {
         match residue(prior, paths, &manifest) {
@@ -5940,8 +6082,10 @@ fn undo_recorded(
             }
             DataTree::Laid(run) => {
                 // What this run staged and what the policy channel made stand in staging under the
-                // layout's names; they go before the directory that holds them.
-                sweep_staging(&paths.staging);
+                // layout's names; they go before the directory that holds them, through the
+                // handle that the run holds of it. An entry that stays keeps the directory, and the
+                // directory's own removal names it.
+                run.sweep(Layout::Staging);
                 let rolled = run.take_away();
                 if rolled.stayed.is_empty() {
                     // text: remove_at-28
@@ -6581,7 +6725,10 @@ mod tests {
             let mut run = laid_run(top.path());
             run.manifest
                 .conclude(ObjectKind::Service, SERVICE, Outcome::Made);
-            let journal = run.paths.journal.join("a.journal");
+            let journal = run
+                .paths
+                .journal
+                .join(format!("{}.journal", "ab".repeat(16)));
             std::fs::write(&journal, b"x").unwrap();
             crate::manifest::forced::fail_the_next(point);
             let error = roll_back(&mut run).unwrap_err().to_string();
@@ -6869,5 +7016,116 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         assert!(run_with(&Manifest::begin()).is_empty());
         assert!(is_folder(&folder));
+    }
+
+    /// A directory held as the removal holds the program directory: the folder above it by its path,
+    /// the directory relative to that handle with full sharing and no right to delete.
+    fn held_at(path: &Path) -> MadeObject {
+        let above = path.parent().unwrap();
+        let name = path.file_name().unwrap();
+        let (holder, _) = open_directory_at(None, &native_path(above), FILE_OPEN, None, LIST)
+            .unwrap()
+            .unwrap();
+        let units: Vec<u16> = name.encode_wide().collect();
+        let identity = DirHandle::open_beneath(&holder, &units, LIST, true, FILE_OPEN).unwrap();
+        MadeObject {
+            identity,
+            holder,
+            name: name.to_owned(),
+            directory: true,
+        }
+    }
+
+    #[test]
+    fn a_program_directory_goes_through_the_handles_that_held_it_with_everything_in_it() {
+        let top = tempfile::tempdir().unwrap();
+        let program = top.path().join("program");
+        std::fs::create_dir_all(program.join("git").join("hooks")).unwrap();
+        std::fs::write(program.join("kr-boundary-broker.exe"), b"x").unwrap();
+        std::fs::write(program.join("git").join("config"), b"").unwrap();
+        let held = held_at(&program);
+        assert_eq!(held.take_away_tree(), Taken::Marked);
+        assert!(!program.try_exists().unwrap());
+        // A directory that is not at its name is not found, and nothing is done.
+        let held = held_at(top.path());
+        let gone = top.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let held_gone = held_at(&gone);
+        std::fs::remove_dir(&gone).unwrap();
+        assert_eq!(held_gone.take_away_tree(), Taken::NotFound);
+        drop(held);
+    }
+
+    #[test]
+    fn a_program_directory_that_was_replaced_since_it_was_held_stays_with_what_it_holds() {
+        let top = tempfile::tempdir().unwrap();
+        let program = top.path().join("program");
+        std::fs::create_dir(&program).unwrap();
+        let held = held_at(&program);
+        std::fs::remove_dir(&program).unwrap();
+        std::fs::create_dir(&program).unwrap();
+        std::fs::write(program.join("other.txt"), b"y").unwrap();
+        let Taken::Stays(words) = held.take_away_tree() else {
+            panic!("another object stood at the name");
+        };
+        assert!(
+            words.contains("another object stands at its name"),
+            "{words}"
+        );
+        assert!(program.join("other.txt").try_exists().unwrap());
+    }
+
+    #[test]
+    fn a_sweep_removes_only_the_entries_that_stand_under_the_layouts_names() {
+        let top = tempfile::tempdir().unwrap();
+        let staging = top.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let hex = "ab".repeat(16);
+        let names = [
+            format!("policy-{hex}.xml"),
+            format!("payload-{hex}.exe"),
+            format!("proof-{hex}"),
+            format!("shell-{hex}"),
+        ];
+        for name in &names[..2] {
+            std::fs::write(staging.join(name), b"x").unwrap();
+        }
+        for name in &names[2..] {
+            std::fs::create_dir(staging.join(name)).unwrap();
+            std::fs::write(staging.join(name).join("unlisted.exe"), b"x").unwrap();
+        }
+        // Names that the layout does not give, and a directory at a file's name, stay.
+        std::fs::write(staging.join("notes.txt"), b"x").unwrap();
+        std::fs::create_dir(staging.join(format!("policy-{hex}.xml.d"))).unwrap();
+        let directory = DirHandle::open_anchor(&staging).unwrap().unwrap();
+        assert!(sweep_staging(&directory).is_empty());
+        for name in &names {
+            assert!(!staging.join(name).try_exists().unwrap(), "{name}");
+        }
+        assert!(staging.join("notes.txt").try_exists().unwrap());
+        assert!(
+            staging
+                .join(format!("policy-{hex}.xml.d"))
+                .try_exists()
+                .unwrap()
+        );
+        // The journal's files: the form of the broker's names (32 lowercase hexadecimal digits and
+        // the extension) goes, every other name stays.
+        let journal = top.path().join("journal");
+        std::fs::create_dir(&journal).unwrap();
+        let mine = journal.join(format!("{hex}.journal"));
+        std::fs::write(&mine, b"x").unwrap();
+        for other in [
+            "a.journal".to_owned(),
+            format!("{}.journal", "AB".repeat(16)),
+            format!("{hex}.journal.old"),
+            format!("{hex}.txt"),
+        ] {
+            std::fs::write(journal.join(other), b"x").unwrap();
+        }
+        let directory = DirHandle::open_anchor(&journal).unwrap().unwrap();
+        assert!(sweep_layout(&directory, Layout::Journal).is_empty());
+        assert!(!mine.try_exists().unwrap());
+        assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 4);
     }
 }

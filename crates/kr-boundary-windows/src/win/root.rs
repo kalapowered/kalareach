@@ -277,6 +277,28 @@ pub fn remove_root_within(
     Ok(state.leftovers)
 }
 
+/// Removes the children of `dir` that `select` takes, and everything below them, each through a
+/// handle that is opened relative to the handle of the directory that holds it and never through a
+/// path: a link is removed as itself and never entered. `dir` is held open with the right to list
+/// it. Returns each object that stayed, with the reason. A caller that removes the directory
+/// itself does so after this, on a handle that has the right to delete it.
+///
+/// # Errors
+///
+/// Returns an error when a directory cannot be listed.
+pub(super) fn remove_children(
+    dir: &DirHandle,
+    select: &dyn Fn(&Child) -> bool,
+) -> Result<Vec<Leftover>, RootError> {
+    let mut state = Removal {
+        bounds: ROOT_BOUNDS,
+        seen: 0,
+        leftovers: Vec::new(),
+    };
+    state.empty_where(dir, "", 1, select)?;
+    Ok(state.leftovers)
+}
+
 struct Removal {
     bounds: Bounds,
     seen: usize,
@@ -293,7 +315,22 @@ impl Removal {
 
     /// Removes every child of `dir`, which is held open with the right to delete it.
     fn empty(&mut self, dir: &DirHandle, at: &str, depth: usize) -> Result<(), RootError> {
+        self.empty_where(dir, at, depth, &|_| true)
+    }
+
+    /// Removes the children of `dir` that `select` takes; every other child stays untouched and is
+    /// not counted.
+    fn empty_where(
+        &mut self,
+        dir: &DirHandle,
+        at: &str,
+        depth: usize,
+        select: &dyn Fn(&Child) -> bool,
+    ) -> Result<(), RootError> {
         for child in dir.children()? {
+            if !select(&child) {
+                continue;
+            }
             self.seen += 1;
             let path = if at.is_empty() {
                 child.display()
