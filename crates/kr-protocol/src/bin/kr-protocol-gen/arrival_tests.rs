@@ -1510,6 +1510,118 @@ fn a_definition_named_like_the_roots_place_is_refused() {
     assert!(outcome.is_err(), "{outcome:?}");
 }
 
+/// A rule excuses a line only where every keyword that the walk meets is one that it models:
+/// the applicators, the validation keywords whose value is plain data, the annotations and the
+/// product's own two (`tsType` and the read-only marker). A keyword that is none of these, beside
+/// the use of the definition or above it, may change what a place accepts in a way that the walk
+/// does not read, so the line is reported. The keyword is the same in both schemas, so the target's
+/// difference is the only one. The method rule, the listed arrival and the read-only member each
+/// read the uses through the walk; the new section needs no reference at all, and its definition
+/// is read by its own keys.
+#[test]
+fn an_unmodelled_keyword_beside_a_use_or_above_it_excuses_nothing() {
+    let place = |reference: &str, position: &str| {
+        let (member, outer) = match position {
+            "beside" => (
+                json!({ "$ref": reference, "x-unmodelled": true }),
+                json!({}),
+            ),
+            _ => (
+                json!({ "$ref": reference }),
+                json!({ "x-unmodelled": true }),
+            ),
+        };
+        let mut holder = json!({ "type": "object", "properties": { "m": member } });
+        for (keyword, value) in outer.as_object().into_iter().flatten() {
+            holder[keyword] = value.clone();
+        }
+        holder
+    };
+    for position in ["beside", "above"] {
+        // The method rule: `Holder.m` is a use of `Method`.
+        let extra = json!({ "Holder": place("#/$defs/Method", position) });
+        let lines = level_lines(
+            &with_methods(&extra, &["a"]),
+            &with_methods(&extra, &["a", "b"]),
+        );
+        assert!(
+            lines.contains(&added("b")),
+            "the method rule, {position}: {lines:?}"
+        );
+        // The listed arrival: `Holder.m` is a use of `Route`.
+        let protocol = protocol_schema();
+        let mut old = sdk_schema();
+        old["$defs"]["Holder"] = place("#/$defs/Route", position);
+        let new = with_hidden(&old);
+        let outcome = compare(
+            &old,
+            &new,
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", Some(LISTED)),
+        );
+        assert!(
+            outcome
+                .lines
+                .contains(&"Route.hidden added: a member".to_owned())
+                && outcome.passed.is_empty(),
+            "the listed arrival, {position}: {:?}",
+            outcome.lines
+        );
+        // The read-only member: `Holder.m` is a use of `Info`.
+        let object = |with_member: bool| {
+            let mut definition = json!({ "type": "object", "x-kalareach-read-only-metadata": true,
+                "properties": { "id": { "type": "string" } }, "required": ["id"] });
+            if with_member {
+                definition["properties"]["note"] = json!({ "type": "string" });
+            }
+            definition
+        };
+        let schema = |with_member: bool| {
+            json!({ "$schema": DIALECT, "$defs": { "Info": object(with_member),
+                "Holder": place("#/$defs/Info", position) } })
+        };
+        let lines =
+            crate::public_contract::compare(&schema(false), &schema(true)).expect("compares");
+        assert!(
+            lines.contains(&"Info.note added: a member".to_owned()),
+            "the read-only member, {position}: {lines:?}"
+        );
+    }
+    // At the place itself: the keys of the configuration document and of a read-only object are
+    // read as a list, so a key that is none of them is a difference.
+    let document = |with_push: bool| {
+        let mut properties = json!({ "version": { "type": "integer" } });
+        if with_push {
+            properties["push"] = json!({ "type": "object" });
+        }
+        json!({ "$defs": { "ConfigurationDocument": { "type": "object", "properties": properties,
+            "additionalProperties": false, "x-unmodelled": true } } })
+    };
+    let (lines, passed) = section_lines(&document(false), &document(true));
+    assert_eq!(
+        (lines, passed),
+        (
+            vec!["ConfigurationDocument.push added: a member".to_owned()],
+            vec![]
+        ),
+        "the new section"
+    );
+    let info = |with_note: bool| {
+        let mut definition = json!({ "$schema": DIALECT, "$defs": { "Info": {
+            "type": "object", "x-kalareach-read-only-metadata": true, "x-unmodelled": true,
+            "properties": { "id": { "type": "string" } } } } });
+        if with_note {
+            definition["$defs"]["Info"]["properties"]["note"] = json!({ "type": "string" });
+        }
+        definition
+    };
+    let lines = crate::public_contract::compare(&info(false), &info(true)).expect("compares");
+    assert!(
+        lines.contains(&"Info.note added: a member".to_owned()),
+        "the read-only member: {lines:?}"
+    );
+}
 /// A change of a keyword of the root beside a new method is a difference of its own: the old
 /// schema accepts the texts of `Method` as a whole (its root is a string that is also a `Method`);
 /// the new one, whose root is a number that is also a `Method`, accepts no value. Nothing under
@@ -1569,9 +1681,9 @@ fn a_new_method_passes_where_every_use_of_method_widens() {
             "definitions": { "$id": true },
             "dependentSchemas": { "id": { "required": ["x"] } },
             "dependencies": { "$anchor": ["x"] } },
-        // Data that holds no keyword that the walk refuses.
+        // Data under the plain keywords that holds no keyword that the walk refuses.
         "Data": { "default": { "kind": 1 }, "examples": [{ "m": "a" }], "const": null,
-            "x-vendor": { "properties": { "kind": 1 } } },
+            "tsType": "Kind", "format": "uuid", "minLength": 1 },
     });
     assert!(
         level_lines(

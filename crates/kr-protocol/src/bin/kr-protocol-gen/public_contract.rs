@@ -217,7 +217,8 @@ fn plain_method_names(schema: &Value) -> Option<BTreeSet<&str>> {
 /// wider definition can make the place refuse a value that it accepted, and the walk does not tell
 /// those from the rest. A schema that has an `unevaluatedItems` or an `unevaluatedProperties`
 /// anywhere is refused whole: they read what the keywords beside them evaluated, which a
-/// definition changes both ways. The walk reads every definition and the keywords of the schema beside
+/// definition changes both ways; so is one that has a keyword that is neither an applicator nor in
+/// [`PLAIN_KEYWORDS`]. The walk reads every definition and the keywords of the schema beside
 /// `$defs` (the root must name the dialect of [`DIALECT`], and nothing below it may name another),
 /// and it refuses any form that it cannot read (see [`widens_at`]).
 fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
@@ -370,9 +371,50 @@ fn widens_at(keyword: &str, member: &Value, reaching: &BTreeSet<&str>, widening:
         "unevaluatedItems" | "unevaluatedProperties" => false,
         "oneOf" | "not" | "if" | "then" | "else" | "contains" | "propertyNames"
         | "additionalItems" | "contentSchema" => widens_with(member, reaching, false),
-        _ => is_plain_data(member, reaching),
+        _ if PLAIN_KEYWORDS.contains(&keyword) => is_plain_data(member, reaching),
+        _ => false,
     }
 }
+
+/// The keywords that the walk reads as plain data: the validation keywords that judge the instance
+/// alone, the annotations, and the two that the product's schemas add (`tsType` and the read-only
+/// marker, which no validator reads). Any other keyword at a place that the walk reads is refused,
+/// so a line is excused only where every keyword of both schemas is one that the walk models.
+const PLAIN_KEYWORDS: [&str; 33] = [
+    "type",
+    "enum",
+    "const",
+    "required",
+    "format",
+    "pattern",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+    "dependentRequired",
+    "minContains",
+    "maxContains",
+    "contentEncoding",
+    "contentMediaType",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "description",
+    "title",
+    "$comment",
+    "tsType",
+    READ_ONLY_METADATA,
+];
 
 /// Whether `node`, a value that the walk does not read as a schema, holds no keyword that the walk
 /// refuses: every key is read as a keyword, none as a name, and no place widens.
