@@ -4469,6 +4469,26 @@ struct ChunkGate {
     letting_go: std::sync::Condvar,
 }
 
+impl ChunkGate {
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.letting_go.notify_all();
+    }
+}
+
+/// Lets the content go when the case ends, so that a case that fails before its own release does
+/// not leave a thread of the runtime waiting.
+struct Releasing(Arc<ChunkGate>);
+
+impl Drop for Releasing {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// Content that reads like [`kr_client::uploads::Held`] and holds at the second chunk.
 #[derive(Debug)]
 struct HeldAtTheSecondChunk {
@@ -4540,6 +4560,7 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
         .expect("the host takes an attachment stream from a connection that holds a place");
 
     let gate = Arc::new(ChunkGate::default());
+    let _releasing = Releasing(Arc::clone(&gate));
     let bytes: Vec<u8> = (0..2 * UPLOAD_CHUNK_LEN + 1_000)
         .map(|index| u8::try_from(index % 251).unwrap_or(0))
         .collect();
@@ -4598,11 +4619,7 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
         held_before,
         "the place is free when the close returns"
     );
-    *gate
-        .released
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-    gate.letting_go.notify_all();
+    gate.release();
     let (sent, route) = tokio::time::timeout(WATCHDOG, sending)
         .await
         .expect("an upload on a closed connection ends")
