@@ -606,6 +606,20 @@ it pins belongs to `kr-client` rather than to the vector generator:
 | `organisation.json` | Ed25519 signatures over an organisation's policy-signing chain, its head statement and two device-bound membership leases, with the negative cases a verifier must reject |
 | `recovery-kit.json` | The printable and QR recovery kit for the same test seed: its profile version, checksum, grouped base32 seed, locator, origins and the exact document bytes |
 
+Three further sets are not generated, and `kr-crypto-vectors` does not write them. They are checked in
+as they are, and a build that does not reproduce them is the build that is wrong.
+
+| File | Contents |
+| --- | --- |
+| `cipher-known-answers.json` | The XChaCha20-Poly1305 AEAD, `crypto_box_easy` and the secretstream, sealed from inputs that a stated fixed stream makes, at 26 lengths from 0 to 1,048,577 bytes. Each case holds the SHA-256 and the 16-byte authenticator of the whole sealed output, taken from libsodium's 1.0.22 release build |
+| `published-vectors.json` | RFC 8032 section 7.1 tests 1, 2, 3, 1024 and SHA(abc); the two examples of RFC 7748 section 5.2 and its results after 1, 1,000 and 1,000,000 iterations; appendix A.3.1 of the XChaCha20-Poly1305 draft |
+| `wycheproof/` | The X25519, Ed25519 and XChaCha20-Poly1305 files of the Wycheproof project at a named commit, unchanged and with their Apache License 2.0 text, and `ed25519-verdicts.json`, libsodium's verdict on each Ed25519 case |
+
+libsodium runs its widest ChaCha20 and Salsa20 code only on a call of 1,024 bytes or more. A test that
+stops below that length never reaches it, and a round trip cannot find a wrong keystream, because the same
+keystream takes off what it put on. The cipher cases therefore run up to a mebibyte and compare the whole
+sealed output. The tests that read these files are in `crates/kr-crypto/src/sodium/`.
+
 Only domain-separated transcripts are signed. `fixtures/cbor/digests.json` also publishes a complete
 mutation object, which is hashed rather than signed: section 23 authenticates a live mutation
 through its connection and its receipt digest, so a signature vector for it would describe an
