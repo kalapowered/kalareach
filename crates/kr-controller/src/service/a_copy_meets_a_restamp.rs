@@ -132,8 +132,9 @@ async fn a_module_copy_across_a_restamp_is_not_shown_and_its_repeat_is_answered(
 
 /// KR-REQ-09.09: every answer to `membership.present` is a copy, a refusal of the lease included,
 /// so a restamp between the route and the reply has the door tell it is not shown where it tells
-/// the refusal when nothing moved. The lease of a real presentation, with its repeat, is the case
-/// of the organisation's suite.
+/// the refusal when nothing moved. The request here carries no lease the host can take, so the
+/// answer is the refusal of it; the lease of a real presentation, with its repeat, is the case of
+/// the organisation's suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_membership_answer_across_a_restamp_is_not_shown() {
     let (temp, controller, _clock) = daemon().await;
@@ -195,8 +196,10 @@ async fn a_claimed_actions_repeat_is_a_copy_across_a_restamp_and_its_first_attem
     );
 }
 
-/// KR-REQ-09.09: a report that lists what earlier exports left is a copy whatever it says, so a
-/// restamp has the door tell it is not shown, where the answer is given when nothing moved.
+/// KR-REQ-09.09: the whole answer of a deletion of the copies privacy mode lists is a copy of what
+/// earlier exports left, whatever it says. The request here names no copy the host holds, so the
+/// answer is the route's refusal of it, and a restamp has the door tell it is not shown, where the
+/// refusal is given when nothing moved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_derived_report_across_a_restamp_is_not_shown() {
     let (temp, controller, _clock) = daemon().await;
