@@ -3,21 +3,28 @@
 // with the one setting that build needs on Windows.
 //
 // The application links the dynamic Visual C++ runtime. `.cargo/config.toml` leaves the static one out
-// of every MSVC link, because the C library this workspace vendors asks for the static runtime and the
-// two must not both be linked. The command line tool sets `STATIC_VCRUNTIME=true` for a desktop build
+// of the x86-64 and ARM64 MSVC links, because the C library this workspace vendors asks for the static
+// runtime and the two must not both be linked. The command line tool sets `STATIC_VCRUNTIME=true` for a desktop build
 // unless the variable is already `false`, the Tauri build step reads it before the attribute this
 // package gives it, and the package's build script then refuses the build. So on Windows this gives
 // the build `STATIC_VCRUNTIME=false`, whatever the caller's environment holds, and says so when it
 // replaces another value. On the other platforms the build gets the caller's environment as it is.
 //
-// Only the bundle build is run, and what would change what it holds is refused:
+// Only the bundle build is run, with cargo as its runner (a build's configuration can name another
+// runner, and the command line tool takes that one unless it is given one), and what would change what
+// it holds is refused:
 //
-// - a runner other than cargo: the setting above is read by cargo's build step;
-// - `--no-bundle`: it leaves no bundle to read;
-// - a Windows target on a machine that is not Windows: the setting is made for the machine this runs on;
-// - on Windows, an environment that gives the compiler flags (`RUSTFLAGS` and the like): the link
-//   options of `.cargo/config.toml` are what keep the static runtime out of the link, and an
-//   environment that supplies flags of its own replaces them, after which the link only warns.
+// - a runner of the caller's own: the setting above is read by cargo's build step;
+// - `--no-bundle`, and `--bundles` with no value: they leave no bundle to read;
+// - a Windows target on a machine that is not Windows, and on Windows an MSVC target that the
+//   link options of `.cargo/config.toml` do not name (x86-64 and ARM64): the setting is made for the
+//   machine this runs on, and those options are what keep the static runtime out of the link;
+// - after a bare `--`, cargo's own `--config` and `--target`: either can set the environment, the
+//   flags or the target that this command holds;
+// - a target given by `CARGO_BUILD_TARGET`, held to the same rule as `--target`;
+// - on Windows, an environment that gives the compiler flags (`RUSTFLAGS` and the like):
+//   `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` replace the link options of `.cargo/config.toml`, after
+//   which the link only warns, and the others are a second source of flags that this build does not take.
 import { spawnSync } from 'node:child_process'
 import { startedAs } from './entry-point.mjs'
 
@@ -26,7 +33,7 @@ import { toolPath } from './tools.mjs'
 const WINDOWS = 'win32'
 const RUNTIME_VARIABLE = 'STATIC_VCRUNTIME'
 
-/** The long options of `tauri build`, each with whether it takes a value that must follow it. */
+/** The long options of `tauri build`, each with whether it takes the one value that must follow it. */
 const LONG = new Map([
   ['runner', true],
   ['target', true],
@@ -44,6 +51,12 @@ const LONG = new Map([
   ['help', false],
   ['version', false]
 ])
+
+/** The options that take any number of values, none included. */
+const MANY = new Set(['features', 'bundles'])
+
+/** The MSVC targets that the link options of `.cargo/config.toml` name. */
+const LINKED_MSVC = new Set(['x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc'])
 
 /** The short options that take a value (the rest of their bundle, or the next word), with their long names. */
 const SHORT = new Map([
@@ -85,6 +98,8 @@ function optionsOf(words) {
       if (value === null && name !== null && LONG.get(name) && following(i) !== null) {
         value = words[(i = following(i))]
       }
+      // The options that take any number of values keep their first one, and the word is not consumed.
+      if (value === null && MANY.has(name) && following(i) !== null) value = words[following(i)]
       found.push({ name: name ?? given, value })
     } else if (word.length > 1 && word.startsWith('-')) {
       for (let k = 1; k < word.length; k++) {
@@ -93,6 +108,7 @@ function optionsOf(words) {
         let value = word.slice(k + 1)
         if (value.startsWith('=')) value = value.slice(1)
         if (value === '' && LONG.get(name) && following(i) !== null) value = words[(i = following(i))]
+        if (value === '' && MANY.has(name) && following(i) !== null) value = words[following(i)]
         found.push({ name, value: value === '' ? null : value })
         break
       }
@@ -108,10 +124,34 @@ function givesCompilerFlags(name) {
   )
 }
 
+/** The value of an environment variable, with Windows naming variables without regard to case. */
+function environmentValue(env, name, platform) {
+  const key = Object.keys(env).find((k) => (platform === WINDOWS ? k.toUpperCase() === name : k === name))
+  return key === undefined ? undefined : env[key]
+}
+
 /**
- * What is wrong with the arguments, or with the environment on Windows, that this was given, or null
- * when it can run them. The platform and the environment are passed in, so that each platform's
- * answer can be held on any machine.
+ * Why a target cannot be built here, or null. A Windows target needs a Windows machine, since the
+ * setting this gives the build is made for the machine it runs on; and on Windows an MSVC target is
+ * one that the link options of `.cargo/config.toml` name, since those keep the static runtime out.
+ */
+function targetProblem(triple, platform) {
+  if (platform !== WINDOWS) {
+    return /-windows(-|$)/.test(triple) ? 'it builds a Windows bundle on Windows only' : null
+  }
+  if (/-windows-msvc$/.test(triple) && !LINKED_MSVC.has(triple)) {
+    return (
+      'the link options that keep the static Visual C++ runtime out of the link are set for ' +
+      `${[...LINKED_MSVC].join(' and ')} only`
+    )
+  }
+  return null
+}
+
+/**
+ * What is wrong with the arguments, or with the environment, that this was given, or null when it can
+ * run them. The platform and the environment are passed in, so that each platform's answer can be held
+ * on any machine.
  */
 export function refusal(argv, platform = process.platform, env = process.env) {
   const [command, ...rest] = argv
@@ -132,18 +172,31 @@ export function refusal(argv, platform = process.platform, env = process.env) {
       'build the program alone with `cargo build -p companion-tauri --release --features custom-protocol`.'
     )
   }
-  if (platform !== WINDOWS) {
-    const windows = options.find(
-      (option) => option.name === 'target' && /-windows(-|$)/.test(option.value ?? '')
-    )
-    if (windows) {
-      return (
-        `pnpm desktop builds a Windows bundle on Windows only (it was given \`${given}\`): ` +
-        'it sets the C runtime for the machine it runs on.'
-      )
-    }
-    return null
+  if (options.some((option) => option.name === 'bundles' && (option.value ?? '') === '')) {
+    return `pnpm desktop makes the bundles, and \`--bundles\` with no value selects none (it was given \`${given}\`).`
   }
+  // What follows a bare `--` goes to cargo, whose own `--config` can set the environment and the flags
+  // of the build and whose `--target` is read by none of the checks here.
+  const cargo = rest.includes('--') ? rest.slice(rest.indexOf('--') + 1) : []
+  const own = cargo.find((word) => /^--(config|target)(=|$)/.test(word))
+  if (own !== undefined) {
+    return (
+      `pnpm desktop does not pass \`${own}\` on to cargo (it was given \`${given}\`): it can change the environment, ` +
+      'the compiler flags or the target that this command holds. Give a target as `--target` before the `--`.'
+    )
+  }
+  for (const option of options) {
+    const why = option.name === 'target' && option.value !== null ? targetProblem(option.value, platform) : null
+    if (why !== null) {
+      return `pnpm desktop does not build for \`${option.value}\` here (it was given \`${given}\`): ${why}.`
+    }
+  }
+  const fromEnvironment = environmentValue(env, 'CARGO_BUILD_TARGET', platform)
+  const environmentWhy = fromEnvironment ? targetProblem(fromEnvironment, platform) : null
+  if (environmentWhy !== null) {
+    return `pnpm desktop does not build with CARGO_BUILD_TARGET=${fromEnvironment} in the environment: ${environmentWhy}.`
+  }
+  if (platform !== WINDOWS) return null
   const flags = Object.keys(env).find(givesCompilerFlags)
   if (flags !== undefined) {
     return (
@@ -154,6 +207,15 @@ export function refusal(argv, platform = process.platform, env = process.env) {
     )
   }
   return null
+}
+
+/**
+ * The arguments of the command line tool: the build, with cargo as its runner. A configuration that
+ * the caller gives can name another runner, and the tool takes that one only when it is not given one.
+ */
+export function childArguments(argv) {
+  const [command, ...rest] = argv
+  return [command, '--runner', 'cargo', ...rest]
 }
 
 /**
@@ -188,7 +250,7 @@ if (startedAs(import.meta.url)) {
   }
   const { env, said } = childEnvironment(process.platform, process.env)
   if (said !== null) console.error(said)
-  const result = spawnSync(process.execPath, [toolPath('@tauri-apps/cli'), ...argv], {
+  const result = spawnSync(process.execPath, [toolPath('@tauri-apps/cli'), ...childArguments(argv)], {
     stdio: 'inherit',
     env
   })
