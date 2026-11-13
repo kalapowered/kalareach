@@ -870,18 +870,33 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
         #[cfg(feature = "testing")]
         for point in ["prior", "prior-flush", "prior-identity"] {
-            let other = dir.path().join(format!("{point}.json"));
+            // A name of its own for each point: a name that is taken (the record that this case wrote
+            // above is `prior.json`) is found taken before the forced failure is reached.
+            let other = dir.path().join(format!("{point}-record.json"));
+            assert!(!other.try_exists().unwrap(), "{point}: the name is free");
             told.lock().unwrap().clear();
             crate::manifest::forced::fail_the_next(point);
             let error = write_new_beneath(&directory, &other, b"x", &hold)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains(point), "{error}");
+            assert!(error.contains(point), "{point}: {error}");
+            // The record was made (the run was told its handle), then marked through that handle (the
+            // run was told that it is gone), and its name is free again.
             assert_eq!(
                 *told.lock().unwrap(),
-                [Some(other.display().to_string()), None]
+                [Some(other.display().to_string()), None],
+                "{point}"
             );
             assert!(!other.try_exists().unwrap(), "{point}");
+            // The forced failure was used up by that write: the next write at the same name is made.
+            told.lock().unwrap().clear();
+            assert!(
+                write_new_beneath(&directory, &other, b"x", &hold)
+                    .unwrap()
+                    .is_some(),
+                "{point}: a write after the forced one is made"
+            );
+            assert_eq!(std::fs::read_to_string(&other).unwrap(), "x", "{point}");
         }
     }
 
