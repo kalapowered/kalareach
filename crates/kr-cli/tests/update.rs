@@ -3302,6 +3302,7 @@ fn small_release(signer: &Ed25519KeyPair) -> (ReleaseManifest, BTreeMapFiles, St
             lock_sha256: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
             pinned: Vec::new(),
             vectors: Vec::new(),
+            prebuilt_archive: None,
         }),
         stores: release_stores(),
         files: files
