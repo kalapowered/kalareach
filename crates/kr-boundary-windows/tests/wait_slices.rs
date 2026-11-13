@@ -97,6 +97,8 @@ fn no_other_wait_on_the_stop_is_made_in_one_call() {
         assert_eq!(count(body, "ffi::wait("), 0, "{signature}: {body}");
     }
     assert!(body_of(&stop, "fn waited(").contains("self.wait_for("));
+    // A wait that failed reads as the stop: the failure was kept, and every reader sees it set.
+    assert!(body_of(&stop, "fn waited(").contains("Err(_) => true,"));
     assert!(body_of(&stop, "pub fn wait(").contains("self.waited("));
     assert!(body_of(&stop, "pub fn is_set(").contains("self.waited(0)"));
 
