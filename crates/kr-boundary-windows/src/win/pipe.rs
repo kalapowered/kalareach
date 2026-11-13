@@ -280,14 +280,15 @@ fn cancel(pipe: HANDLE, transfer: &mut Transfer) -> ffi::Result<bool> {
     Ok(matches!(ended, ffi::Waited::Signalled(_)))
 }
 
-/// How long a wait with no deadline of its own waits before it looks at the stop again. It exists
+/// How long a wait, with a deadline or without, waits before it looks at the stop again. It exists
 /// because a stop event that could not be set wakes nobody: the failure is kept in the stop, and
 /// only a wait that comes back to read it sees it, so a failed set ends every listener within one
 /// slice. The cost is one idle wake-up a second for each listener.
 const STOP_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Waits for a transfer, up to the deadline and until the stop event is set. A wait with no
-/// deadline waits in slices of [`STOP_SLICE`], and each slice reads the stop again. When it does not
+/// Waits for a transfer, up to the deadline and until the stop event is set. Every wait, with a
+/// deadline or without, waits in slices of [`STOP_SLICE`] at most, and each slice reads the stop
+/// again. When it does not
 /// finish in time it is cancelled and waited for for at most [`CANCEL_GRACE_MS`]; a transfer that
 /// still has not ended is left to end by itself, its record and buffer kept for the life of the
 /// process, and `stuck` is set so that the caller takes no more transfers on that pipe.
@@ -301,18 +302,24 @@ fn wait(
     // The stop is waited on first: when both are signalled the call reports the stop, so a transfer
     // that finished at once never wins over it, and a wait that fails is kept as the unread stop.
     let waited = loop {
-        let left = deadline.map_or(STOP_SLICE, |deadline| {
-            deadline.saturating_duration_since(Instant::now())
+        // Every wait is a slice at most, whatever its deadline: the longest a stop that could not be
+        // set can keep a wait is one slice.
+        let slice = deadline.map_or(STOP_SLICE, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(STOP_SLICE)
         });
         // One less than the longest wait, which means "forever".
         let waited = stop.wait_for(
             &[transfer.event.raw()],
-            super::ffi::milliseconds(left, INFINITE - 1),
+            super::ffi::milliseconds(slice, INFINITE - 1),
             "waiting for the other end",
         );
-        // A slice of a wait with no deadline that ended with nothing signalled is waited on again:
-        // the next call reads the stop's kept failure first.
-        if deadline.is_none() && matches!(waited, Ok(ffi::Waited::TimedOut)) {
+        // A slice that ended with nothing signalled is waited on again while the deadline, if there
+        // is one, has not come: the next call reads the stop's kept failure first.
+        if matches!(waited, Ok(ffi::Waited::TimedOut))
+            && deadline.is_none_or(|deadline| Instant::now() < deadline)
+        {
             continue;
         }
         break waited;
@@ -1069,11 +1076,11 @@ pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
 mod tests {
     use super::*;
 
-    /// A wait with no deadline on a pipe that no client comes to ends within two slices of a stop
-    /// that could not be set: the event is never signalled, the failure is only kept, and the wait
-    /// that comes back every slice reads it and ends the transfer with the stop's reason.
-    #[test]
-    fn a_wait_with_no_deadline_ends_within_two_slices_of_a_stop_that_could_not_be_set() {
+    /// A wait on a pipe that no client comes to ends within two slices of a stop that could not be
+    /// set: the event is never signalled, the failure is only kept, and the wait that comes back
+    /// every slice reads it and ends the transfer with the stop's reason. The deadline is the
+    /// wait's own, or none.
+    fn a_stop_that_could_not_be_set_ends_the_wait(deadline: Option<std::time::Duration>) {
         let name = wide(&format!(
             r"\\.\pipe\kr-slice-{}-{}",
             std::process::id(),
@@ -1111,7 +1118,8 @@ mod tests {
         });
         let started = Instant::now();
         let mut stuck = false;
-        let Err(error) = wait(pipe.raw(), transfer, &stop, None, &mut stuck) else {
+        let deadline = deadline.map(|long| started + long);
+        let Err(error) = wait(pipe.raw(), transfer, &stop, deadline, &mut stuck) else {
             panic!("the wait ended with a transfer, not with the stop");
         };
         let took = started.elapsed();
@@ -1126,5 +1134,15 @@ mod tests {
             "{error}"
         );
         assert!(!stuck);
+    }
+
+    #[test]
+    fn a_wait_with_no_deadline_ends_within_two_slices_of_a_stop_that_could_not_be_set() {
+        a_stop_that_could_not_be_set_ends_the_wait(None);
+    }
+
+    #[test]
+    fn a_wait_with_a_long_deadline_ends_within_two_slices_of_a_stop_that_could_not_be_set() {
+        a_stop_that_could_not_be_set_ends_the_wait(Some(std::time::Duration::from_secs(900)));
     }
 }
