@@ -307,10 +307,25 @@ fn a_late_failure_with_a_damaged_manifest(how: &str) -> String {
         text.contains("undoing what was done"),
         "{how}: the rollback did not start: {text}"
     );
-    assert!(
-        text.contains("the removal after the failure finished") && !text.contains("also failed"),
-        "{how}: the rollback did not end without a failure: {text}"
-    );
+    if how == "absent" {
+        // A manifest that is not at its name is not a record that the rollback marked: the ending
+        // lists it with the words of a name that was not found, and does not say that records are
+        // deleted.
+        assert!(
+            text.contains("the removal after the failure also failed")
+                && text.contains(
+                    "manifest.json (its name was not found in the directory that holds it, and the rollback did nothing with it)"
+                )
+                && !text.contains("its records are deleted"),
+            "{how}: the ending does not name the manifest as not found: {text}"
+        );
+    } else {
+        assert!(
+            text.contains("the removal after the failure finished")
+                && !text.contains("also failed"),
+            "{how}: the rollback did not end without a failure: {text}"
+        );
+    }
     assert_eq!(
         snapshot(),
         before,
