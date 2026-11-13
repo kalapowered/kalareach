@@ -2100,10 +2100,11 @@ impl Catalogue {
             &Effect::Package(entry.manifest_digest),
             move |permit| staged.activate(permit),
         )?;
-        // What was moved into place is read back and checked like any package already here, so
-        // the only way to a ready package is through that check.
+        // What was moved into place is read back and checked like any package already here, and
+        // given back through the package check: a directory that was there before holds what the
+        // repair left of it, and the only way to a ready package is through that check.
         match store.check_package(entry.manifest_digest, limits)? {
-            PackageCheck::Complete(package) => Ok(*package),
+            PackageCheck::Complete(package) => admit_kept(store, *package, &subject),
             PackageCheck::PastALimit(limit) => Err(limit.into()),
             PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
                 Err(CatalogueError::PublicationUncertain {

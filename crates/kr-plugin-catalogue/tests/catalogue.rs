@@ -3810,6 +3810,94 @@ async fn a_package_in_the_store_that_the_package_check_admits_is_installed_witho
     assert_eq!(installed.package_digest, entry.manifest_digest);
 }
 
+/// A package that is fetched into a stored directory that holds a file its manifest does not
+/// declare, and lacks a declared one, is given back through the same package check as any other
+/// package: the repair of the directory restores the declared files and leaves the other, and the
+/// installation is refused with the check's words while the installed release stays.
+#[tokio::test]
+async fn a_package_fetched_into_a_directory_with_an_undeclared_file_is_refused() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = connector_release(home.path(), "0.1.0", ">=0.1.1, <0.2.0", false);
+    let second = connector_release(home.path(), "0.2.0", ">=0.1.7, <0.2.0", true);
+    let manifest_bytes = std::fs::read(second.join("plugin.json")).expect("reads");
+    let manifest: kr_plugin_sdk::plugin::PluginManifest =
+        serde_json::from_slice(&manifest_bytes).expect("a manifest");
+    let entry = kr_plugin_sdk::catalogue::IndexEntry::from_manifest(
+        &manifest,
+        PayloadDigest::of(&manifest_bytes),
+        manifest_bytes.len() as u64,
+    );
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            package: Some(first),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    let first_version = PackageVersion::parse("0.1.0").expect("a valid version");
+    install_connector(
+        &mut catalogue,
+        &entry,
+        &first_version,
+        generation.manifest_digest(),
+    )
+    .await
+    .expect("the first release installs");
+
+    // The repository publishes the second release, whose directory in the store holds one of its
+    // files and a file that its manifest does not declare.
+    generation
+        .rewrite_with(GenerationSpec {
+            generation: 2,
+            package: Some(second.clone()),
+            ..GenerationSpec::default()
+        })
+        .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the next generation");
+    let store = catalogue.store(&repository()).expect("enrolled");
+    let directory = store.package_dir(entry.manifest_digest);
+    std::fs::create_dir_all(&directory).expect("a directory");
+    for name in ["plugin.json", "connector.json"] {
+        std::fs::copy(second.join(name), directory.join(name)).expect("copies");
+    }
+    std::fs::write(directory.join("undeclared.bin"), b"not declared").expect("writes");
+    assert!(
+        !complete(&store, entry.manifest_digest),
+        "a declared file is missing"
+    );
+
+    let refusal = install_connector(
+        &mut catalogue,
+        &entry,
+        &entry.version,
+        entry.manifest_digest,
+    )
+    .await
+    .expect_err("the package check refuses the repaired directory");
+    let CatalogueError::UnsafePackage { detail } = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert!(detail.contains("undeclared.bin"), "{detail}");
+    let installed = catalogue
+        .installation(environment(), &connector_id())
+        .expect("readable")
+        .expect("still installed");
+    assert_eq!(installed.version, first_version);
+    assert_eq!(installed.package_digest, generation.manifest_digest());
+}
+
 /// Reads the local repository, and records every address fetched with the bytes its answer
 /// delivered.
 #[derive(Clone, Debug, Default)]
