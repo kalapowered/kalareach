@@ -255,6 +255,55 @@ final class LinkTapTests: HarnessTestCase {
 
     // MARK: The taps
 
+    /// Taps the nine points of the least-size square about a link's words, slid into the pane, and counts the opens.
+    private func tapAround(_ edge: Link, named: String) {
+        let least: CGFloat = 44
+        let edgeShift = offset(of: edge)
+        let room = pane().room
+        let words = edge.words[0]
+        var left = words.midX - least / 2
+        var right = words.midX + least / 2
+        var top = words.midY - least / 2
+        var bottom = words.midY + least / 2
+        if left < room.minX { right += room.minX - left; left = room.minX }
+        if right > room.maxX { left -= right - room.maxX; right = room.maxX }
+        if top < room.minY { bottom += room.minY - top; top = room.minY }
+        if bottom > room.maxY { top -= bottom - room.maxY; bottom = room.maxY }
+        say("LINKTAP \(named): \(edge.name) words \(words), pane \(room), square \(left) \(top) \(right) \(bottom)")
+        for y in [top + 2, (top + bottom) / 2, bottom - 2] {
+            for x in [left + 2, (left + right) / 2, right - 2] {
+                let result = tap("\(named): \(edge.name), the point \(Int(x - words.midX)), \(Int(y - words.midY)) of the area", at: CGPoint(x: x, y: y), shift: edgeShift)
+                expectOpened(result, edge.name)
+            }
+        }
+        if edge.name == "at-end" {
+            let outermost = tap("\(named): \(edge.name), the pane's right-most column", at: CGPoint(x: room.maxX - 1, y: words.midY), shift: edgeShift)
+            expectOpened(outermost, edge.name)
+        }
+    }
+
+    /// Scrolls the conversation to its end, a drag at a time.
+    private func scrollToEnd() {
+        let shift = offset(of: link("table-1"))
+        for _ in 0..<60 {
+            let place = pane()
+            if place.top >= place.most - 2 { return }
+            let start = screenPoint(CGPoint(x: place.room.midX, y: place.room.midY), shift)
+            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -300)), withVelocity: .slow, thenHoldForDuration: 0.3)
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+    }
+
+    /// The link on the conversation's last line, at the end of the conversation: the pane's bottom cuts the area under its words.
+    private func runLastLine(size: String?, named: String) {
+        continueAfterFailure = true
+        start(size: size)
+        say("LINKTAP size \(named)")
+        scrollToEnd()
+        tapAround(link("last-line"), named: named)
+    }
+
+
     /// The taps at one text size. Each is made with the finger on the glass; the page reports what it saw.
     private func runTaps(size: String?, named: String) {
         continueAfterFailure = true
@@ -392,35 +441,11 @@ final class LinkTapTests: HarnessTestCase {
             XCTAssertTrue(beyond.opened.isEmpty, "\(beyond.label): opened \(beyond.opened)")
         }
 
-        // The links at the pane's edges and on its last line. A tap at each of nine points of the least-size square about the
-        // words, slid into the pane (the corners and the middles of its sides, 2 points inside), opens the link once, the
-        // outermost points of the area included; so does a tap at the pane's right-most column on the words' row, where the
-        // simulator shows whether the system sends a click that far.
-        for name in ["at-start", "at-end", "last-line"] {
-            let edge = scroll(to: name)
-            let edgeShift = offset(of: edge)
-            let room = pane().room
-            let words = edge.words[0]
-            var left = words.midX - least / 2
-            var right = words.midX + least / 2
-            var top = words.midY - least / 2
-            var bottom = words.midY + least / 2
-            if left < room.minX { right += room.minX - left; left = room.minX }
-            if right > room.maxX { left -= right - room.maxX; right = room.maxX }
-            if top < room.minY { bottom += room.minY - top; top = room.minY }
-            if bottom > room.maxY { top -= bottom - room.maxY; bottom = room.maxY }
-            say("LINKTAP \(named): \(name) words \(words), pane \(room), square \(left) \(top) \(right) \(bottom)")
-            for y in [top + 2, (top + bottom) / 2, bottom - 2] {
-                for x in [left + 2, (left + right) / 2, right - 2] {
-                    let result = tap("\(named): \(name), the point \(Int(x - words.midX)), \(Int(y - words.midY)) of the area", at: CGPoint(x: x, y: y), shift: edgeShift)
-                    expectOpened(result, name)
-                }
-            }
-            if name == "at-end" {
-                let outermost = tap("\(named): \(name), the pane's right-most column", at: CGPoint(x: room.maxX - 1, y: words.midY), shift: edgeShift)
-                expectOpened(outermost, name)
-            }
-        }
+        // The links at the pane's edges. A tap at each of nine points of the least-size square about the words, slid into the
+        // pane (the corners and the middles of its sides, 2 points inside), opens the link once, the outermost points of the
+        // area included; so does a tap at the pane's right-most column on the words' row, where the simulator shows whether
+        // the system sends a click that far.
+        for name in ["at-start", "at-end"] { tapAround(scroll(to: name), named: named) }
 
         // A press of one second on a link's words: what the platform does with it stands, and the page adds nothing.
         let pressed = scroll(to: "table-2")
@@ -477,5 +502,13 @@ final class LinkTapTests: HarnessTestCase {
 
     func testTapsAtTheLargestTextSize() {
         runTaps(size: Self.largest, named: "largest size")
+    }
+
+    func testTheLastLineAtTheDefaultTextSize() {
+        runLastLine(size: nil, named: "default size")
+    }
+
+    func testTheLastLineAtTheLargestTextSize() {
+        runLastLine(size: Self.largest, named: "largest size")
     }
 }
