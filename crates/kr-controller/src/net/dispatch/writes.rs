@@ -186,7 +186,10 @@ impl RemoteConnection {
             .check_subject_of_record(&actor_id, mutation, method)
             .await?
         {
-            return Err(network_door::kept(refused));
+            return Err(network_door::kept(
+                crate::service::net::AtTheNetworkDoor::here(),
+                refused,
+            ));
         }
         if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
             return Err(refusal.into_error());

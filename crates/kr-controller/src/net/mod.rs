@@ -42,6 +42,19 @@
 //! after the worker has acknowledged that revision. Local input and stopping owned execution never
 //! depend on that lease, because neither is remote dispatch.
 
+/// What a call into the network door's boundary ([`crate::given::network_door`]) holds: it can be
+/// made only inside this module and its descendants, so a service elsewhere in the crate cannot
+/// take a copy's answer out of its provenance by the door's helpers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AtTheNetworkDoor(());
+
+impl AtTheNetworkDoor {
+    /// The token, for a place in the network door.
+    const fn here() -> Self {
+        Self(())
+    }
+}
+
 pub(crate) mod arrivals;
 pub(crate) mod chunks;
 pub mod clock_trust;
@@ -2350,6 +2363,7 @@ impl Controller {
             // whether this device may be told it.
             *retained = Retained::Record;
             return crate::given::network_door::kept(
+                crate::service::net::AtTheNetworkDoor::here(),
                 self.answer_from_the_closure(session_id).await,
             );
         }
@@ -2395,6 +2409,7 @@ impl Controller {
             Err(ControllerError::UnknownSession { .. }) => {
                 *retained = Retained::Record;
                 return crate::given::network_door::kept(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     self.answer_from_the_closure(session_id).await,
                 );
             }

@@ -875,7 +875,10 @@ impl RemoteConnection {
                 #[cfg(feature = "testing")]
                 self.controller.after_the_retained_lookup.wait().await;
                 return match self.admitted_to_answer(validated) {
-                    Ok(()) => Ok(network_door::kept(answered)),
+                    Ok(()) => Ok(network_door::kept(
+                        crate::service::net::AtTheNetworkDoor::here(),
+                        answered,
+                    )),
                     Err(_) => Err(outcome_not_shown()),
                 };
             }
@@ -986,6 +989,7 @@ impl RemoteConnection {
                 // that attempt launched a session or failed to, and it says so. It is told as any
                 // answer read from a record is.
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     settled_by_a_service(
                         request_id,
@@ -1132,6 +1136,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
+                        crate::service::net::AtTheNetworkDoor::here(),
                         &mut origin,
                         given.map(|outcome| framed_protocol(request_id, outcome)),
                     ),
@@ -1174,6 +1179,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
+                        crate::service::net::AtTheNetworkDoor::here(),
                         &mut origin,
                         given.map(super::narrowing::shown_materialisation),
                     ),
@@ -1218,6 +1224,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
+                        crate::service::net::AtTheNetworkDoor::here(),
                         &mut origin,
                         given.map(|answer| {
                             super::narrowing::shown_working_tree_change(answer, method)
@@ -1279,6 +1286,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
+                        crate::service::net::AtTheNetworkDoor::here(),
                         &mut origin,
                         given.map(|outcome| framed_protocol(request_id, outcome)),
                     ),
@@ -1320,7 +1328,11 @@ impl RemoteConnection {
                         .await
                 });
                 match self.controller.within_effect_wait(effect).await {
-                    Ok(Ok(given)) => noting(&mut origin, given),
+                    Ok(Ok(given)) => noting(
+                        crate::service::net::AtTheNetworkDoor::here(),
+                        &mut origin,
+                        given,
+                    ),
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
@@ -1375,6 +1387,7 @@ impl RemoteConnection {
                     )
                     .await;
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     given.map(|answer| framed(mutation.request_id, answer)),
                 )
@@ -1462,6 +1475,7 @@ impl RemoteConnection {
                     Given::fresh(outcome)
                 });
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     settled_by_a_service(
                         request_id,
@@ -1500,6 +1514,7 @@ impl RemoteConnection {
                         .into_given()
                 });
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     settled_by_a_service(
                         request_id,
@@ -1576,6 +1591,7 @@ impl RemoteConnection {
                         .into_given()
                 });
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     settled_by_a_service(
                         request_id,
@@ -1607,6 +1623,7 @@ impl RemoteConnection {
                         .await
                 });
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     settled_by_a_service(
                         request_id,
@@ -1687,6 +1704,7 @@ impl RemoteConnection {
                     deadline: Some(accepted.deadline),
                 };
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     self.controller
                         .preview_key_update_action(&actor_id, mutation, carried)
@@ -1719,6 +1737,7 @@ impl RemoteConnection {
                     deadline: Some(accepted.deadline),
                 };
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     self.controller
                         .push_register_action(&actor_id, mutation, carried)
@@ -1741,6 +1760,7 @@ impl RemoteConnection {
                     deadline: Some(accepted.deadline),
                 };
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     self.controller
                         .device_keys_declared(&actor_id, self.device.device_id, mutation, carried)
@@ -1777,6 +1797,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
+                        crate::service::net::AtTheNetworkDoor::here(),
                         &mut origin,
                         given.map(|outcome| framed_protocol(request_id, outcome)),
                     ),
@@ -1824,6 +1845,7 @@ impl RemoteConnection {
                     .controller
                     .pairing_standing(self.connection_id(), Some(validated));
                 noting(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     self.controller
                         .pairing_write(
@@ -1855,7 +1877,13 @@ impl RemoteConnection {
                     on_stream.map_or(Arrival::Control, Arrival::Stream),
                 )
                 .await
-                .map(|given| noting(&mut origin, given))?,
+                .map(|given| {
+                    noting(
+                        crate::service::net::AtTheNetworkDoor::here(),
+                        &mut origin,
+                        given,
+                    )
+                })?,
             // A method this host refuses by name was refused above, before anything was recorded.
             DeviceWrite::Refused(unserved) => return Err(unserved.refusal(entry)),
             // Everything else the worker's own table lists belongs to the worker that owns the
@@ -1933,7 +1961,13 @@ impl RemoteConnection {
                         Arrival::Settling,
                     )
                     .await
-                    .map(|given| noting(&mut origin, given))?;
+                    .map(|given| {
+                        noting(
+                            crate::service::net::AtTheNetworkDoor::here(),
+                            &mut origin,
+                            given,
+                        )
+                    })?;
                 match origin {
                     Origin::Fresh => Ok(Some(answer)),
                     Origin::Copied => self

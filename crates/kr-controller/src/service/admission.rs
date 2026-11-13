@@ -563,7 +563,7 @@ impl Controller {
         >,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let given = self.retained_given(carried, answer.await).await;
-        crate::given::network_door::noting(origin, given)
+        crate::given::network_door::noting_for_a_shared_wrapper(origin, given)
     }
 
     /// What an earlier attempt of an action recorded, given back as a copy under the authority
@@ -597,7 +597,7 @@ impl Controller {
         found: ControllerError,
     ) -> ControllerError {
         let given = self.conflict_given(carried, found).await;
-        crate::given::network_door::noting(origin, given)
+        crate::given::network_door::noting_for_a_shared_wrapper(origin, given)
     }
 
     /// [`Self::conflict_under_authority`], with where the refusal came from in its type.

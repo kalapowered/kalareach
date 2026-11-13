@@ -766,14 +766,20 @@ impl RemoteConnection {
             return Err(outcome_not_shown());
         }
         if reused {
-            return Ok(network_door::kept(kept));
+            return Ok(network_door::kept(
+                crate::service::net::AtTheNetworkDoor::here(),
+                kept,
+            ));
         }
         // The answer is a read of what an earlier submission produced, and is written under the
         // decision that read is ([`Self::read_of_retained`]). A create's answer is a read of the
         // reservation its token holds, whichever way the first attempt ended, and the session that
         // reservation holds is its subject.
         let reserved = if method == Method::SessionCreate {
-            match network_door::kept(self.reserved_session(mutation).await) {
+            match network_door::kept(
+                crate::service::net::AtTheNetworkDoor::here(),
+                self.reserved_session(mutation).await,
+            ) {
                 Ok(reserved) => reserved,
                 Err(()) => return Err(outcome_not_shown()),
             }
@@ -785,7 +791,10 @@ impl RemoteConnection {
             Ok(None) => {}
             Err(_) => return Err(outcome_not_shown()),
         }
-        Ok(network_door::kept(kept))
+        Ok(network_door::kept(
+            crate::service::net::AtTheNetworkDoor::here(),
+            kept,
+        ))
     }
 
     /// [`Self::kept_answer`] for a copy a service gave when it performed the action, which it read
@@ -908,6 +917,7 @@ impl RemoteConnection {
             // what says so.
             Err(error @ ControllerError::UnknownSession { .. }) => {
                 return Err(network_door::kept(
+                    crate::service::net::AtTheNetworkDoor::here(),
                     self.controller.closed_or(session_id, error).await,
                 ));
             }
