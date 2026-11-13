@@ -516,20 +516,21 @@ impl Controller {
                 })
             })
         };
-        // A reused identifier, a row that cannot be read and a fence that stopped the record's
-        // answer end the call here: the cleanup is for an answer that was written or answered.
-        let begun = match begun {
-            Begun::Given(given) => return framed(given),
-            other => other,
-        };
-        self.forget_old_capability_answers();
-        // The hold ended before the cleanup, which waits for locks and for storage, and nothing in
-        // it keeps a fence this host owes, or a registration withdrawn, from landing. The record's
-        // answer is checked again with it in hand.
         let given = match begun {
-            Begun::Started(view) => Given::Fresh(Ok(view)),
-            Begun::Answer(recorded) => self.retained_given(&carried, recorded).await,
+            // A reused identifier, a row that cannot be read and a fence that stopped the record's
+            // answer end the call here: the cleanup is for an answer that was written or answered.
             Begun::Given(given) => given,
+            Begun::Started(view) => {
+                self.forget_old_capability_answers();
+                Given::Fresh(Ok(view))
+            }
+            Begun::Answer(recorded) => {
+                self.forget_old_capability_answers();
+                // The hold ended before the cleanup, which waits for locks and for storage, and
+                // nothing in it keeps a fence this host owes, or a registration withdrawn, from
+                // landing. The record's answer is checked again with it in hand.
+                self.retained_given(&carried, recorded).await
+            }
         };
         framed(given)
     }
