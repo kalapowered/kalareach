@@ -241,6 +241,98 @@ describe('a link at each edge of the pane', () => {
   })
 })
 
+describe('a link the pane has scrolled out of view', () => {
+  // The pane scrolls, so its box is the part of the conversation in view. A link takes part only by
+  // what is in view of its words: words wholly outside the pane have no area, never take a point and
+  // keep no other link's area from growing. Words are 17 px tall.
+  const first = [words(100, 100, 120)]
+
+  it('has no area at the top: words 10 and 30 px above the pane take no tap on the plain text below its edge', () => {
+    for (const above of [10, 30]) {
+      const hidden = [words(100, -above - 17, 120)]
+      for (const y of [0, 2, 6, 12, 24, 36, 44, 48]) {
+        expect(press(150, y, [hidden]), `${String(above)} px above, tap at y ${String(y)}`).toBeNull()
+        expect(press(150, y, [hidden, first]), `${String(above)} px above, tap at y ${String(y)}, a link in view`).toBeNull()
+      }
+    }
+  })
+
+  it('has no area at the bottom: words 10 and 30 px below the pane take no tap on the plain text above its edge', () => {
+    for (const below of [10, 30]) {
+      const hidden = [words(100, 844 + below, 120)]
+      for (const y of [844, 842, 838, 832, 820, 808, 800, 796]) {
+        expect(press(150, y, [hidden]), `${String(below)} px below, tap at y ${String(y)}`).toBeNull()
+      }
+    }
+  })
+
+  it('has no area beside the pane where it scrolls sideways: words left or right of the pane take no tap', () => {
+    const left = [words(-150, 100, 120)]
+    const right = [words(400, 100, 120)]
+    for (const x of [0, 6, 24, 48]) expect(press(x, 108, [left]), `left, tap at x ${String(x)}`).toBeNull()
+    for (const x of [390, 384, 366, 342]) expect(press(x, 108, [right]), `right, tap at x ${String(x)}`).toBeNull()
+  })
+
+  it('is no link’s though its words are nearer to a point than the words of a link whose area holds it', () => {
+    // The link at the start of the line gets back to the right what the pane cuts on the left, out to
+    // x 56. The point (40, 30) is 32.8 px from its words; the hidden link's words are 32 px away.
+    const atStart = [words(0, 6, 8)]
+    const hidden = [words(36, -19, 24)]
+    expect(press(40, 30, [atStart])).toBe(0)
+    expect(press(40, 30, [atStart, hidden])).toBe(0)
+    expect(press(40, 30, [hidden, atStart])).toBe(1)
+  })
+
+  it('takes part by the line of its words that is in view', () => {
+    const wrapped = [words(16, -30, 300), words(16, -6, 200), words(16, 18, 120)]
+    expect(press(60, 50, [wrapped])).toBe(0)
+    expect(press(60, 4, [wrapped])).toBe(0)
+    expect(press(60, 60, [wrapped])).toBeNull()
+    const hidden = [words(16, -60, 300), words(16, -36, 200)]
+    expect(press(60, 4, [hidden])).toBeNull()
+    expect(press(60, 30, [hidden])).toBeNull()
+  })
+})
+
+describe('a link whose line the pane’s edge cuts', () => {
+  // It keeps what is in view of its words and their reach, held to the pane. Nothing is given back
+  // on the axis the edge cuts, since words that are partly seen are where the person sees them.
+  it('at the top, keeps the half of its target that is in view and takes nothing more below it', () => {
+    const cut = [words(100, -8.5, 120)]
+    // The words' middle is on the edge; the target reaches 24 px each way on Android, 22 on iOS.
+    expect(press(150, 0, [cut], ANDROID)).toBe(0)
+    expect(press(150, 24, [cut], ANDROID)).toBe(0)
+    expect(press(150, 24.1, [cut], ANDROID)).toBeNull()
+    expect(press(150, 48, [cut], ANDROID)).toBeNull()
+    expect(press(150, 22, [cut], IOS)).toBe(0)
+    expect(press(150, 22.1, [cut], IOS)).toBeNull()
+  })
+
+  it('at the bottom, keeps the half of its target that is in view and takes nothing more above it', () => {
+    const cut = [words(100, 835.5, 120)]
+    expect(press(150, 844, [cut], ANDROID)).toBe(0)
+    expect(press(150, 820, [cut], ANDROID)).toBe(0)
+    expect(press(150, 819.9, [cut], ANDROID)).toBeNull()
+    expect(press(150, 796, [cut], ANDROID)).toBeNull()
+  })
+
+  it('at the side of a pane that scrolls sideways, keeps what is in view and takes nothing more past the words', () => {
+    // Words from x 380 to 400 with the pane ending at 390: the target is the words and 24 px each side.
+    const cut = [words(380, 100, 20)]
+    expect(press(390, 108.5, [cut], ANDROID)).toBe(0)
+    expect(press(356, 108.5, [cut], ANDROID)).toBe(0)
+    expect(press(355.9, 108.5, [cut], ANDROID)).toBeNull()
+  })
+
+  it('gets back what the pane cuts on the axis where its words are in view', () => {
+    // Cut at the top (nothing given back below), at the start of the line (given back to the right).
+    const cut = [words(0, -8.5, 8)]
+    expect(press(56, 24, [cut], ANDROID)).toBe(0)
+    expect(press(56.1, 10, [cut], ANDROID)).toBeNull()
+    expect(press(30, 24.1, [cut], ANDROID)).toBeNull()
+  })
+})
+
 describe('equal distance', () => {
   it('goes to the earlier link', () => {
     const left = [words(0, 100, 10)]
