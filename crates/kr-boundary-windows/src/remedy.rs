@@ -939,11 +939,92 @@ pub fn known_folder_unreadable(error: &str, removal: bool) -> String {
     format!("{error}. Nothing was changed.{limit} {SHARED_CLOSING}")
 }
 
-/// What a repair says when the broker's service did not reach the stopped state: it stops before it
-/// changes the program directory, and a repair has no rollback.
+/// A state of the broker's service, as the service manager reports it, said apart from the
+/// platform's numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceState {
+    /// The service is stopped.
+    Stopped,
+    /// The service is on its way to running or to stopped: the manager refuses a stop request there.
+    Pending,
+    /// The service is running.
+    Running,
+    /// Any other state, such as paused: a stop request is the way to the stopped state.
+    Other,
+}
+
+/// What a run does next about the broker's service, which is stopped before the program directory
+/// changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopStep {
+    /// The service is stopped.
+    Done,
+    /// The service is pending: wait, and read again.
+    Wait,
+    /// Ask the service to stop.
+    Request,
+}
+
+/// The step that a state decides.
 #[must_use]
-pub fn broker_not_stopped() -> String {
-    "The broker's service did not reach the stopped state, so this run stopped before it changed the program directory. What it had already changed stays, and a repair has no rollback. Run the setup program again when the service is stopped or running.".to_owned()
+pub fn stop_step(state: ServiceState) -> StopStep {
+    match state {
+        ServiceState::Stopped => StopStep::Done,
+        ServiceState::Pending => StopStep::Wait,
+        ServiceState::Running | ServiceState::Other => StopStep::Request,
+    }
+}
+
+/// Stops the broker's service and waits for it, bounded: reads its state, asks it to stop where the
+/// state accepts a request, waits where it is pending (running is waited for as well as stopped, and
+/// a service that runs again is asked again), and returns `Ok(true)` only after a read that said
+/// stopped. `wait` pauses for one poll and says whether the bound has not run out; where it has,
+/// the result is `Ok(false)`. A request that is refused where the state read again is still not
+/// pending or stopped ends the run with its error; a read that fails ends it with that error.
+///
+/// # Errors
+///
+/// Returns the error of a read that failed, or of a request that was refused while the service
+/// stayed in a state that accepts one.
+pub fn stop_broker<E>(
+    mut read: impl FnMut() -> Result<ServiceState, E>,
+    mut request: impl FnMut() -> Result<(), E>,
+    mut wait: impl FnMut() -> bool,
+) -> Result<bool, E> {
+    loop {
+        match stop_step(read()?) {
+            StopStep::Done => return Ok(true),
+            StopStep::Wait => {}
+            StopStep::Request => {
+                // A refusal where the service has moved on since the read is a race, and the next
+                // read decides.
+                if let Err(error) = request()
+                    && stop_step(read()?) == StopStep::Request
+                {
+                    return Err(error);
+                }
+            }
+        }
+        if !wait() {
+            return Ok(false);
+        }
+    }
+}
+
+/// What a run says when the broker's service did not reach the stopped state, chosen by the run: a
+/// repair says that what it had changed stays and that it has no rollback; an installation says only
+/// that it stopped before it changed the program directory, since its own failure path says what is
+/// undone.
+#[must_use]
+pub fn broker_not_stopped(repair: bool) -> String {
+    let first = "The broker's service did not reach the stopped state, so this run stopped before it changed the program directory.";
+    if repair {
+        format!(
+            "{first} What it had already changed stays, and a repair has no rollback. Run the setup program again when the service is stopped or running."
+        )
+    } else {
+        first.to_owned()
+    }
 }
 
 /// A folder's final path as a person can use it: without the `\\?\` prefix of the extended form, and
