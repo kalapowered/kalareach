@@ -352,6 +352,10 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("removes");
     }
 
+    /// KR-REQ-27.03, the part about the platform-resolved directory: the evidence directory has to
+    /// resolve inside the platform's temporary directory (`/tmp` and the system's own on Unix, the
+    /// system's temporary folder on Windows), the temporary directory itself holds none, and a
+    /// directory outside it is refused before anything is made.
     #[test]
     fn a_directory_outside_the_temporary_directory_is_refused_and_never_made() {
         let inside = tempfile_directory("inside");
@@ -387,6 +391,8 @@ mod tests {
         std::fs::remove_dir_all(&inside).expect("removes");
     }
 
+    /// KR-REQ-27.03, the part about the platform-resolved directory: a directory that reaches out of
+    /// the temporary directory through a link is outside it, however the path is written.
     #[cfg(unix)]
     #[test]
     fn a_link_out_of_the_temporary_directory_is_refused_however_it_is_reached() {
