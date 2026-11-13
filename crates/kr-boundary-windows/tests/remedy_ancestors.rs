@@ -241,10 +241,15 @@ fn a_finding_names_the_entry_of_the_list_and_claims_no_result() {
         "an entry of its list allows S-1-5-11 the right to delete it (rights 0x10000)"
     );
     assert!(!finding.contains("is allowed"), "{finding}");
-    let inherited = entry_rights_finding("S-1-5-11", DELETE | DELETE_CHILD);
+    let here = entry_rights_finding("S-1-5-11", DELETE | DELETE_CHILD, true);
+    assert_eq!(
+        here,
+        "an entry of its list allows S-1-5-11 rights 0x10040 (on it)"
+    );
+    let inherited = entry_rights_finding("S-1-5-11", DELETE | DELETE_CHILD, false);
     assert_eq!(
         inherited,
-        "an entry of its list allows S-1-5-11 rights 0x10040 (on it or on what is made in it)"
+        "an entry of its list allows S-1-5-11 rights 0x10040 (only on what is made in it)"
     );
 }
 

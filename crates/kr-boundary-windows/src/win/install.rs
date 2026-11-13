@@ -3822,18 +3822,27 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         }
     }
 
-    // (2) the policy: our rules go; an administrator's rule keeps the allow-all rule beside it.
+    // (2) the policy: our rules go; a rule that the installation did not make keeps the allow-all rule beside it.
     let has_rules = manifest.of_kind(ObjectKind::PolicyRule).next().is_some();
     if has_rules {
         keep(
             (|| -> Result<(), Error> {
                 let (xml, effective) = channel.effective()?;
                 let (_, kept) = effective.without_ours();
-                if kept {
-                    // text: remove_at-8
-                    say(
-                        "a rule that the installation did not make is in the executable collection, so the allow-all rule and the collection's mode stay in force beside it",
-                    );
+                if let Some(shared) = shared_rules(&effective) {
+                    if kept {
+                        // text: remove_at-8
+                        say(&format!(
+                            "{}, so the allow-all rule and the collection's mode stay in force beside it",
+                            shared.words()
+                        ));
+                    } else {
+                        // text: remove_at-8-without-allow-all
+                        say(&format!(
+                            "{}, and the installation's allow-all rule is not there, so the collection's mode stays as it is",
+                            shared.words()
+                        ));
+                    }
                 }
                 let drop: &[&str] = if kept {
                     &[policy::RULE_CHECKOUT, policy::RULE_CONNECT]
@@ -4038,12 +4047,18 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     }
     if let Some(prior) = &prior {
         match residue(prior, paths) {
-            Ok((left, present_policy)) if left.is_empty() => {
-                if present_policy {
+            Ok((left, shared)) if left.is_empty() => {
+                if let Some(shared) = shared {
                     // text: remove_at-22-present
-                    say(
-                        "the policy shows no difference from the present policy without the installation's two deny rules (an administrator's rule is in the executable collection, so the allow-all rule stays and the earlier-state record is not the comparison); the two accounts and the sign-in list's values for them are not there, the broker's service is not there or is marked for deletion, and the program directory is not there",
-                    );
+                    say(&format!(
+                        "the policy shows no difference from the present policy without the installation's rules ({}, so the earlier-state record is not the comparison{}); the two accounts and the sign-in list's values for them are not there, the broker's service is not there or is marked for deletion, and the program directory is not there",
+                        shared.words(),
+                        if shared.allow_all_stays {
+                            "; the allow-all rule stays"
+                        } else {
+                            ""
+                        }
+                    ));
                 } else {
                     // text: remove_at-22
                     say(
@@ -4093,7 +4108,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             );
             // text: remove_at-25
             Err(Error::Failed(format!(
-                "the removal ended without a failure, but the data directory stays: {}. {next}{unread_prior}",
+                "the removal's steps ended without a failure, but the removal of its records left: {}. {next}{unread_prior}",
                 stayed.join("; ")
             )))
         }
@@ -4202,10 +4217,44 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
     }
 }
 
+/// The rules of the executable collection that the installation did not make, by their
+/// identifiers, and whether the installation's allow-all rule is in the collection beside them.
+pub struct Shared {
+    /// The identifiers of the rules that the installation did not make.
+    pub ids: Vec<String>,
+    /// Whether the allow-all rule is there, and so stays.
+    pub allow_all_stays: bool,
+}
+
+impl Shared {
+    /// Says what is in the collection: the rules, by that and by their identifiers.
+    fn words(&self) -> String {
+        match self.ids.as_slice() {
+            [id] => format!(
+                "a rule that the installation did not make, with the identifier {id}, is in the executable collection"
+            ),
+            ids => format!(
+                "rules that the installation did not make, with the identifiers {}, are in the executable collection",
+                ids.join(", ")
+            ),
+        }
+    }
+}
+
+/// The rules in the policy's executable collection that the installation did not make, none where
+/// there is no such rule.
+fn shared_rules(policy: &Policy) -> Option<Shared> {
+    let others = policy.foreign_exe_rules();
+    (!others.is_empty()).then(|| Shared {
+        ids: others.iter().map(|rule| rule.id.clone()).collect(),
+        allow_all_stays: policy.without_ours().1,
+    })
+}
+
 /// What the machine shows of the installation after a removal, and what the policy was compared
-/// with. The policy is compared with the earlier-state record, or, where an administrator's rule has
-/// joined the executable collection, with the present policy without the installation's two deny
-/// rules (the second part is true then). The accounts, the sign-in list, the broker's service and the
+/// with. The policy is compared with the earlier-state record, or, where a rule that the
+/// installation did not make has joined the executable collection, with the present policy without
+/// the installation's rules (the second part is the rules that are there then). The accounts, the sign-in list, the broker's service and the
 /// program directory are compared with their not being there. An empty list means that each
 /// comparison holds. The data directory is not counted: it holds the records this check reads, and
 /// goes last.
@@ -4213,7 +4262,7 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns the failure of a call that could not look.
-pub fn residue(prior: &Prior, paths: &Paths) -> Result<(Vec<String>, bool), Error> {
+pub fn residue(prior: &Prior, paths: &Paths) -> Result<(Vec<String>, Option<Shared>), Error> {
     let mut left = Vec::new();
     let (_, effective) = Channel::new(&paths.staging).effective()?;
     let baseline = Policy::parse(&prior.policy_xml).map_err(|error| {
@@ -4222,10 +4271,11 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<(Vec<String>, bool), Erro
             "the policy in the earlier-state record could not be read: {error}"
         ))
     })?;
-    // Where an administrator's rule has since joined the executable collection, the removal keeps the
-    // allow-all rule and the collection's mode beside it on purpose; everything else of ours is gone.
-    let present_policy = !effective.foreign_exe_rules().is_empty();
-    let expected = if present_policy {
+    // Where a rule that the installation did not make has since joined the executable collection, the
+    // removal keeps the allow-all rule, where it is there, and the collection's mode beside it on
+    // purpose; everything else of ours is gone.
+    let shared = shared_rules(&effective);
+    let expected = if shared.is_some() {
         effective.without_ours().0
     } else {
         baseline
@@ -4256,5 +4306,5 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<(Vec<String>, bool), Erro
             paths.program.display()
         )),
     }
-    Ok((left, present_policy))
+    Ok((left, shared))
 }
