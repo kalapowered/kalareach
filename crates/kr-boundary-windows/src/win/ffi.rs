@@ -8,13 +8,18 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, LocalFree,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NONE_MAPPED,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 use windows_sys::Win32::Security::{
     CopySid, EqualSid, GetLengthSid, LookupAccountNameW, SID_NAME_USE,
 };
+use windows_sys::Win32::Storage::FileSystem::ReadFile;
+use windows_sys::Win32::System::IO::OVERLAPPED;
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
 
 /// A failed call: the platform's error number and what was being done.
 #[derive(Debug)]
@@ -46,6 +51,190 @@ pub struct Named {
 
 /// The result of a call into the platform.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// How a wait that did not fail ended: an object was signalled, or the bound ran out. A wait has a
+/// third answer, that it failed, and that is the error of [`wait`] and [`wait_any`]: it says nothing
+/// of any object, so no caller may take it for either of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waited {
+    /// The object at this index (0 for [`wait`]) was signalled.
+    Signalled(usize),
+    /// The bound ran out first.
+    TimedOut,
+}
+
+/// Waits on one object for up to `milliseconds`, as [`wait_any`] does for one handle.
+///
+/// # Errors
+///
+/// Returns the platform's error, in words that start with `what`, when the wait failed, and an
+/// error with no number when it answered neither signalled nor timed out (an abandoned mutex).
+pub fn wait(handle: HANDLE, milliseconds: u32, what: &str) -> Result<Waited> {
+    wait_any(&[handle], milliseconds, what)
+}
+
+/// Waits until any of the objects is signalled or the bound runs out. Where several are signalled
+/// the lowest index is the answer, so an object that must win goes first. The only place of the
+/// crate that calls the platform's wait.
+///
+/// # Errors
+///
+/// Returns the platform's error, in words that start with `what`, when the wait failed, and an
+/// error with no number when it answered neither an object nor a timeout (an abandoned mutex).
+pub fn wait_any(handles: &[HANDLE], milliseconds: u32, what: &str) -> Result<Waited> {
+    // SAFETY: every handle is open for the length of the wait, and the count is the slice's.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the wrapper: it turns the platform's one number into signalled, timed out or failed"
+    )]
+    let answer =
+        unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, milliseconds) };
+    let index = answer.wrapping_sub(WAIT_OBJECT_0) as usize;
+    if answer == WAIT_TIMEOUT {
+        Ok(Waited::TimedOut)
+    } else if answer == WAIT_FAILED {
+        // text: ffi_wait_any-1
+        Err(last(what))
+    } else if index < handles.len() {
+        Ok(Waited::Signalled(index))
+    } else {
+        // text: ffi_wait_any-2
+        Err(error(0, format!("{what} gave the answer {answer:#x}")))
+    }
+}
+
+/// What a read of a pipe answered, other than a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeRead {
+    /// This many bytes were read.
+    Data(u32),
+    /// Nothing is waiting, and a writer is still there.
+    Empty,
+    /// Every writer has closed its handle: the pipe's end.
+    Ended,
+}
+
+/// Reads what a pipe holds now, into the buffer, with no wait: the bytes waiting (up to the
+/// buffer's length), nothing, or the end. The answers of the two calls it makes are told apart: a
+/// broken pipe is the end, and any other failure is the error, never the end and never nothing.
+/// The only place of the crate that peeks at a pipe or reads one in a loop.
+///
+/// # Errors
+///
+/// Returns the platform's error when the look or the read failed, or when a read of waiting bytes
+/// gave none.
+pub fn pipe_read(pipe: &Handle, buffer: &mut [u8]) -> Result<PipeRead> {
+    let mut available = 0_u32;
+    // SAFETY: the pipe is open and only the available-bytes out-parameter is used.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the wrapper: it turns the platform's failure into the end or the error"
+    )]
+    let peeked = unsafe {
+        PeekNamedPipe(
+            pipe.raw(),
+            null_mut(),
+            0,
+            null_mut(),
+            &raw mut available,
+            null_mut(),
+        )
+    };
+    if peeked == 0 {
+        // SAFETY: reads the calling thread's last error.
+        let code = unsafe { GetLastError() };
+        if code == ERROR_BROKEN_PIPE {
+            return Ok(PipeRead::Ended);
+        }
+        // text: ffi_pipe_read-1
+        return Err(error(code, "looking at what a pipe holds"));
+    }
+    let wanted = available.min(buffer.len() as u32);
+    if wanted == 0 {
+        return Ok(PipeRead::Empty);
+    }
+    let mut read = 0_u32;
+    // SAFETY: the pipe is open, `wanted` bytes are waiting and the buffer is at least that long.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the wrapper: it turns the platform's failure into the end or the error"
+    )]
+    let ok = unsafe {
+        ReadFile(
+            pipe.raw(),
+            buffer.as_mut_ptr().cast(),
+            wanted,
+            &raw mut read,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        // SAFETY: reads the calling thread's last error.
+        let code = unsafe { GetLastError() };
+        if code == ERROR_BROKEN_PIPE {
+            return Ok(PipeRead::Ended);
+        }
+        // text: ffi_pipe_read-2
+        return Err(error(code, "reading a pipe"));
+    }
+    if read == 0 {
+        // text: ffi_pipe_read-3
+        return Err(error(0, "a read of a pipe that held bytes gave none"));
+    }
+    Ok(PipeRead::Data(read))
+}
+
+/// How the start of an overlapped read of a pipe answered, other than a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadStarted {
+    /// The read is under way or done: its record says when, and its result is read there.
+    Going,
+    /// Every writer has closed its handle: the pipe's end.
+    Ended,
+}
+
+/// Starts an overlapped read of a pipe into `buffer`, with `record` as its record. A broken pipe is
+/// the end and any other failure but "pending" is the error.
+///
+/// # Safety
+///
+/// The buffer and the record must stay where they are until the read has completed or has been
+/// cancelled and seen to end.
+///
+/// # Errors
+///
+/// Returns the platform's error when the read could not be started.
+pub unsafe fn read_overlapped(
+    pipe: HANDLE,
+    buffer: &mut [u8],
+    record: *mut OVERLAPPED,
+) -> Result<ReadStarted> {
+    // SAFETY: the caller keeps the buffer and the record in place, as the contract says.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the wrapper: it turns the platform's failure into the end, going or the error"
+    )]
+    let started = unsafe {
+        ReadFile(
+            pipe,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            null_mut(),
+            record,
+        )
+    };
+    if started != 0 {
+        return Ok(ReadStarted::Going);
+    }
+    // SAFETY: reads the calling thread's last error.
+    let code = unsafe { GetLastError() };
+    match code {
+        ERROR_IO_PENDING => Ok(ReadStarted::Going),
+        ERROR_BROKEN_PIPE => Ok(ReadStarted::Ended),
+        // text: ffi_read_overlapped-1
+        other => Err(error(other, "starting a read of a pipe")),
+    }
+}
 
 /// An error with an explicit number; the number 0 is for a failure that no call returned.
 #[must_use]

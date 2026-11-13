@@ -47,6 +47,8 @@ const CALLS: &[&str] = &[
     "error(",
     "ffi::last(",
     "ffi::error(",
+    "ffi::wait(",
+    "ffi::wait_any(",
     "Handle::new(",
 ];
 

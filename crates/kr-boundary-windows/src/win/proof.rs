@@ -258,6 +258,13 @@ pub fn run_captured_until(
     // incomplete and the end is uncertain, whatever the error says that the run failed on.
     let readers = match (out, err) {
         (Ok(out), Ok(err)) if out.ended && err.ended => Ok((out, err)),
+        // A read that failed shows nothing of the pipe: it is told as that, and not as a pipe that
+        // stayed open.
+        (Ok(out), Ok(err)) if out.failed.is_some() || err.failed.is_some() => Err(format!(
+            "a read of a pipe of the program failed, so whether the pipe ended is not known (standard output: {}; standard error: {})",
+            read_failure(&out),
+            read_failure(&err)
+        )),
         (Ok(out), Ok(err)) => Err(format!(
             "a pipe of the program was still open after the end of its job (standard output ended {}, standard error ended {})",
             out.ended, err.ended
@@ -317,6 +324,14 @@ fn end_by(deadline: Instant, stop: Option<&Stop>) -> Instant {
 
 /// Whether the end of a job is proved and nothing reported otherwise: the job's own count and its
 /// retained processes agree, and no child told the owner that it was not seen to end.
+/// What a reader of a pipe found, for the words of a proof that a read failed.
+fn read_failure(piped: &super::launch::Piped) -> String {
+    piped
+        .failed
+        .as_ref()
+        .map_or_else(|| "no failure".to_owned(), ToString::to_string)
+}
+
 fn settled(job: &Job, ended: Ended) -> Result<(), LaunchError> {
     if ended.proved() && job.unproved_reasons().is_empty() {
         Ok(())
