@@ -7016,8 +7016,10 @@ mod tests {
     /// A later save whose rename succeeded and whose proof then failed has published the manifest:
     /// the earlier manifest's identity is dropped, the rollback takes the published object after the
     /// other records, the manifest is neither named as not found nor counted twice, and nothing stays.
+    #[cfg(feature = "testing")]
     #[test]
     fn a_published_replacement_is_taken_as_the_manifest_after_the_other_records() {
+        let _one = ffi::locked(&FORCED);
         let top = tempfile::tempdir().unwrap();
         let mut run = laid_run(top.path());
         crate::manifest::forced::fail_the_next("proof");
@@ -7058,9 +7060,11 @@ mod tests {
 
     /// Where another record cannot go, the published manifest stays with it, so that the
     /// administrator's removal has its record.
+    #[cfg(feature = "testing")]
     #[test]
     fn a_published_manifest_stays_where_another_record_cannot_go() {
         use std::os::windows::fs::OpenOptionsExt as _;
+        let _one = ffi::locked(&FORCED);
         let top = tempfile::tempdir().unwrap();
         let mut run = laid_run(top.path());
         crate::manifest::forced::fail_the_next("proof");
