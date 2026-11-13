@@ -533,7 +533,7 @@ fn a_removal_sweeps_the_entries_of_staging_that_stand_under_the_layouts_names() 
     let proof = paths.staging.join(format!("proof-{hex}"));
     std::fs::write(&policy, b"<AppLockerPolicy/>").unwrap();
     std::fs::create_dir(&proof).unwrap();
-    std::fs::write(proof.join("inside.txt"), b"x").unwrap();
+    std::fs::write(proof.join("unlisted.exe"), b"x").unwrap();
 
     let (code, text) = ordinary_removal();
     observed(&format!(
