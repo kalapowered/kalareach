@@ -1,0 +1,65 @@
+name: perf-probe
+
+# Measures the transport's scheduling case once on each of 24 hosted runners, with the processor
+# each one ran on, so that the figure can be read by processor. It starts on a push to this one
+# branch and nowhere else.
+on:
+  push:
+    branches: ["scratch/T-FLAKE-73-probe"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  probe:
+    name: probe ${{ matrix.n }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Build the performance test
+        run: cargo test --locked --release -p kr-transport --test perf --no-run
+
+      - name: Run the performance test once
+        id: perf
+        continue-on-error: true
+        shell: bash
+        run: |
+          mkdir -p "$KR_TEST_ARTIFACTS_DIR"
+          cargo test --locked --release -p kr-transport --test perf -- --nocapture --test-threads=1 2>&1 | tee "$KR_TEST_ARTIFACTS_DIR/test-output.txt"
+
+      - name: Show the processor and the record
+        if: ${{ !cancelled() }}
+        env:
+          PERF_OUTCOME: ${{ steps.perf.outcome }}
+        run: |
+          mkdir -p "$KR_TEST_ARTIFACTS_DIR"
+          echo "$PERF_OUTCOME" > "$KR_TEST_ARTIFACTS_DIR/outcome.txt"
+          grep -m1 'model name' /proc/cpuinfo | tee "$KR_TEST_ARTIFACTS_DIR/cpu.txt"
+          cat "$KR_TEST_ARTIFACTS_DIR/kr-transport-scheduling.md" || true
+
+      - name: Keep the record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: probe-${{ matrix.n }}
+          path: /tmp/kr-test-artifacts
