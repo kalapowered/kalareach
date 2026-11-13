@@ -402,7 +402,7 @@ struct Limit<'a> {
 /// each query and before and after each program, so that a stop does not wait for the proof's own
 /// deadline.
 fn stopped(stop: &Stop) -> Option<Proof> {
-    stop.is_set().then(|| fail("the service is stopping"))
+    stop.is_set().then(|| fail(stop.reason()))
 }
 
 fn same_path(left: &str, right: &Path) -> bool {
@@ -637,7 +637,7 @@ pub fn prove(
     let mut last = String::from("no launch was made");
     loop {
         if stop.is_set() {
-            return fail("the service is stopping");
+            return fail(stop.reason());
         }
         if over || Instant::now() >= search_until {
             // The log's last words come from the time kept for them, and the query stays within the
@@ -759,8 +759,11 @@ pub fn prove(
         if over {
             continue;
         }
-        // The pause ends at the stop, and the next pass of the loop sees it.
-        let _ = stop.wait(LAUNCH_EVERY.min(search_until.saturating_duration_since(Instant::now())));
+        // The pause ends at the stop, or at a wait on the stop that failed, and the next pass of the
+        // loop ends the proof with the reason.
+        if stop.wait(LAUNCH_EVERY.min(search_until.saturating_duration_since(Instant::now()))) {
+            continue;
+        }
     }
     #[cfg(feature = "testing")]
     testing::search_ended();
@@ -784,7 +787,7 @@ pub fn prove(
         &environment,
         Limit { by, stop },
     ) {
-        _ if stop.is_set() => return fail("the service is stopping"),
+        _ if stop.is_set() => return fail(stop.reason()),
         Ok(Captured {
             outcome: Outcome::Ran(0),
             ..
@@ -813,7 +816,7 @@ pub fn prove(
         &environment,
         Limit { by, stop },
     ) {
-        _ if stop.is_set() => return fail("the service is stopping"),
+        _ if stop.is_set() => return fail(stop.reason()),
         Ok(Captured {
             outcome: Outcome::Ran(0),
             ..
@@ -878,7 +881,7 @@ pub fn release(
     let mut attempts = 0_u32;
     loop {
         if stop.is_set() {
-            return fail("the service is stopping");
+            return fail(stop.reason());
         }
         let by = match program_deadline(deadline, deadline) {
             Ok(by) => by,
@@ -894,7 +897,7 @@ pub fn release(
             &environment,
             Limit { by, stop },
         ) {
-            _ if stop.is_set() => return fail("the service is stopping"),
+            _ if stop.is_set() => return fail(stop.reason()),
             Ok(Captured {
                 outcome: Outcome::Ran(0),
                 ..

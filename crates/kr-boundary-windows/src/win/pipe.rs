@@ -97,8 +97,9 @@ impl Kind {
 /// An event that, once set, ends every wait of every connection that holds it.
 ///
 /// A wait on the event has three answers: set, not set, and failed. A failed wait says nothing about
-/// the event, so it does not count as "not set": the stop counts as set, which ends the work, and
-/// the failure is kept for [`Stop::unread`], which the service reports.
+/// the event, so it does not count as "not set": it sets the stop for good, which ends the work,
+/// and the failure is kept for [`Stop::unread`], which the service reports. Every reader after it
+/// sees the stop set, and [`Stop::reason`] says which of the two it is.
 pub struct Stop {
     event: Handle,
     unread: std::sync::OnceLock<String>,
@@ -141,9 +142,25 @@ impl Stop {
         self.unread.get().map(String::as_str)
     }
 
+    /// What ended the work, in words, for a reader that finds the stop set: that the service is
+    /// stopping, or, where a wait on the event failed, that the stop could not be read, with the
+    /// error. A failed wait is never told as a stop that someone asked for.
+    #[must_use]
+    // text: stop_reason
+    pub fn reason(&self) -> String {
+        match self.unread() {
+            Some(unread) => format!("the stop could not be read ({unread})"),
+            None => "the service is stopping".to_owned(),
+        }
+    }
+
     /// Waits on the event for up to the milliseconds. Returns whether it is set, or whether the wait
-    /// failed, which is kept in `unread`.
+    /// failed, which is kept in `unread` and sets the event, so that every later wait and every later
+    /// reader sees the stop set.
     fn waited(&self, milliseconds: u32) -> bool {
+        if self.unread.get().is_some() {
+            return true;
+        }
         // SAFETY: the event handle is open for the length of the wait.
         let waited = unsafe { WaitForSingleObject(self.event.raw(), milliseconds) };
         match waited {
@@ -161,6 +178,7 @@ impl Stop {
                     )
                 };
                 let _ = self.unread.set(failure.to_string());
+                self.set();
                 true
             }
         }
@@ -399,7 +417,7 @@ fn wait(
                 "the other end did not answer before the deadline",
             )
         } else if signalled == WAIT_OBJECT_0 {
-            stopping()
+            stopping(stop)
         } else {
             io::Error::other(format!(
                 "waiting for the other end gave the answer {signalled:#x}"
@@ -417,8 +435,8 @@ fn wait(
 /// The error of a transfer that the stop ended. It is not `Interrupted`: the frame reader, `read_exact`
 /// and `write_all` retry that kind, each retry starts a transfer that the set stop ends again at
 /// once, and the connection would never let go of the thread that serves it.
-fn stopping() -> io::Error {
-    io::Error::new(io::ErrorKind::ConnectionAborted, "the service is stopping")
+fn stopping(stop: &Stop) -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, stop.reason())
 }
 
 fn stuck_error() -> io::Error {
@@ -437,7 +455,7 @@ impl Read for Connection {
             return Err(stuck_error());
         }
         if self.stop.is_set() {
-            return Err(stopping());
+            return Err(stopping(&self.stop));
         }
         let length = buffer.len().min(MAX_TRANSFER);
         let mut transfer = Transfer::new(vec![0; length])?;
@@ -491,7 +509,7 @@ impl Write for Connection {
             return Err(stuck_error());
         }
         if self.stop.is_set() {
-            return Err(stopping());
+            return Err(stopping(&self.stop));
         }
         let length = buffer.len().min(MAX_TRANSFER);
         let mut transfer = Transfer::new(buffer[..length].to_vec())?;
@@ -829,7 +847,9 @@ impl Listener {
                 None => match self.refill()? {
                     Refill::Waiting(pipe) => pipe,
                     Refill::Busy | Refill::Failed(_) => {
-                        let _ = self.stop.wait(RETRY_PAUSE);
+                        if self.stop.wait(RETRY_PAUSE) {
+                            return Ok(None);
+                        }
                         continue;
                     }
                 },
@@ -837,7 +857,9 @@ impl Listener {
             // An event that cannot be made ends this attempt and nothing else.
             let Ok(mut transfer) = Transfer::new(Vec::new()) else {
                 self.next = Some(pipe);
-                let _ = self.stop.wait(RETRY_PAUSE);
+                if self.stop.wait(RETRY_PAUSE) {
+                    return Ok(None);
+                }
                 continue;
             };
             let mut gone = false;
@@ -873,8 +895,8 @@ impl Listener {
                     DisconnectNamedPipe(pipe.raw());
                 }
                 self.next = Some(pipe);
-                if failed_in_a_row > 1 {
-                    let _ = self.stop.wait(RETRY_PAUSE);
+                if failed_in_a_row > 1 && self.stop.wait(RETRY_PAUSE) {
+                    return Ok(None);
                 }
                 continue;
             }

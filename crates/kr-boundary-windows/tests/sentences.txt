@@ -426,6 +426,8 @@ launch_launch-2 | the started process | the started process: Windows error N | r
 launch_launch-3 | the started process's thread | the started process's thread: Windows error N | read: the step that the words name, in `launch`, returned an error
 pipe_new-1 | making the stop event | making the stop event: Windows error N | read: the step that the words name, in `new`, returned an error
 unread | self.unread.get() | the words of pipe_stop_waited-1 or -2: waiting on the stop event: Windows error N, or waiting on the stop event gave the answer 0xN | read: a wait on the stop event failed or gave an answer that is none of set and not set (Stop::waited); the service ends with this text
+stop_reason | the stop could not be read ({unread}) | the stop could not be read (the error of the failed wait) | read: a wait on the stop event failed (WAIT_FAILED or an answer that is none of the three), and the first such error is what `unread` holds
+stop_reason | the service is stopping | the service is stopping | read: no wait on the stop event failed, so the event was set by a request to stop
 pipe_stop_waited-1 | waiting on the stop event | waiting on the stop event: Windows error N | read: WaitForSingleObject on the stop event answered WAIT_FAILED, and GetLastError gave the code; the stop then counts as set and this error is the one the service reports
 pipe_stop_waited-2 | gave the answer | waiting on the stop event gave the answer 0xN | read: WaitForSingleObject on the stop event answered none of the set, timeout or failed answers
 pipe_new-2 | making an event | making an event: Windows error N | read: the step that the words name, in `new`, returned an error
