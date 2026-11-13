@@ -2282,7 +2282,7 @@ async fn a_revocation_before_the_store_s_transaction_writes_nothing() {
             &admission,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the admission no longer stands");
     assert_eq!(refused.code, ErrorCode::PermissionDenied);
     let reach = controller.attention_reach();
@@ -2675,7 +2675,7 @@ async fn one_more_actor_than_the_store_admits_is_refused() {
                 &admission,
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect("the store admits an actor inside its bound");
     }
     let refused = control
@@ -2817,7 +2817,7 @@ async fn a_deadline_that_passes_while_the_action_waits_for_the_store_refuses_it(
                     &admission,
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
         })
     };
     // Bounded, because the module keeps the other end of this channel: an action that answered
@@ -4461,7 +4461,7 @@ async fn an_attention_action_whose_record_cannot_be_read_where_it_is_performed_i
                     &admission,
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
         })
     };
     tokio::task::spawn_blocking(move || {
@@ -4502,7 +4502,7 @@ async fn an_attention_action_whose_record_cannot_be_read_where_it_is_performed_i
             &admission,
         )
         .await
-        .into_answer();
+        .into_answer_for_test();
     assert!(performed.is_ok(), "{performed:?}");
     host.stop().await;
 }
@@ -4559,7 +4559,7 @@ async fn a_visit_that_finds_the_store_taken_before_it_is_performed_is_told_the_o
                     &admission,
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
         })
     };
     tokio::task::spawn_blocking(move || {

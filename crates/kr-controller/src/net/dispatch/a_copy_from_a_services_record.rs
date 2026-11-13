@@ -783,9 +783,9 @@ async fn the_project_service_gives_a_refusal_another_copy_recorded_first_as_a_co
     );
     let (first, second) = (
         recorded_first
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("the label is empty"),
-        held.into_answer().expect_err("the label is empty"),
+        held.into_answer_for_test().expect_err("the label is empty"),
     );
     assert_eq!(first.code, second.code);
     assert!(super::is_definite(&first), "{first:?}");

@@ -410,7 +410,7 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<ParamsValue>> {
-        Given::Copied(self.organisation_policy_answer(mutation, carried).await)
+        Given::copied(self.organisation_policy_answer(mutation, carried).await)
     }
 
     /// `organisation.policy.apply`: applies the policy an organisation signed, and puts the

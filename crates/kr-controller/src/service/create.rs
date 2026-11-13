@@ -424,11 +424,11 @@ impl Controller {
         // for an update of the host starts nothing new, and waits for what it has started.
         let under_way = match self.handover.admit() {
             Ok(under_way) => under_way,
-            Err(refusal) => return Given::Fresh(Err(refusal)),
+            Err(refusal) => return Given::fresh(Err(refusal)),
         };
         let create: SessionCreateParams = match parse(&mutation.params) {
             Ok(create) => create,
-            Err(refusal) => return Given::Fresh(Err(refusal)),
+            Err(refusal) => return Given::fresh(Err(refusal)),
         };
         // Before anything reads what is in force, the environment a host-context session is given
         // among it: a document put right since the last acceptance is accepted first, so this
@@ -438,7 +438,7 @@ impl Controller {
         // Whose environment the session is started with, from where the create came through. A
         // connection that is no longer registered has no door and no create.
         let Some(door) = self.door_of(carried.connection_id) else {
-            return Given::Fresh(Err(ControllerError::PermissionDenied {
+            return Given::fresh(Err(ControllerError::PermissionDenied {
                 detail: "the authority this connection was admitted under has been withdrawn; \
                          open a new connection"
                     .to_owned(),
@@ -446,12 +446,12 @@ impl Controller {
         };
         let origin = match decide_origin(door, &create) {
             Ok(origin) => origin,
-            Err(refusal) => return Given::Fresh(Err(refusal)),
+            Err(refusal) => return Given::fresh(Err(refusal)),
         };
         let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
             Ok(digest) => digest,
             Err(error) => {
-                return Given::Fresh(Err(ControllerError::InvalidArgument(error.to_string())));
+                return Given::fresh(Err(ControllerError::InvalidArgument(error.to_string())));
             }
         };
         // The admission this create carries is asked at the launch transition, against the
@@ -507,9 +507,9 @@ impl Controller {
             .create_reserving(under_way, who, create, launch, admit)
             .await
         {
-            Ok(Created::Made(answer)) => Given::Fresh(Ok(answer)),
+            Ok(Created::Made(answer)) => Given::fresh(Ok(answer)),
             Ok(Created::Held(given)) => given,
-            Err(refusal) => Given::Fresh(Err(refusal)),
+            Err(refusal) => Given::fresh(Err(refusal)),
         }
     }
 
@@ -525,7 +525,7 @@ impl Controller {
     ) -> Given<Result<ParamsValue>> {
         match carried {
             Some(carried) => self.conflict_given(&carried, found).await.map(Err),
-            None => Given::Fresh(Err(found)),
+            None => Given::fresh(Err(found)),
         }
     }
 

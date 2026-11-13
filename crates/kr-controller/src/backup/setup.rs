@@ -591,7 +591,7 @@ impl BackupSetup {
         admission: Arc<dyn SetupAdmission>,
     ) -> Given<Result<BackupEnableResult>> {
         if params.kit_fingerprint != kit_fingerprint(&params.recovery_public_key) {
-            return Given::Fresh(Err(ControllerError::InvalidArgument(
+            return Given::fresh(Err(ControllerError::InvalidArgument(
                 "the kit fingerprint is not the recovery public key's".to_owned(),
             )));
         }
@@ -618,8 +618,7 @@ impl BackupSetup {
         drop(serial);
         // A call the admission stopped ended with no answer of its own, and what `backup.status`
         // last said about an attempt stays as it was.
-        let (Given::Fresh(result) | Given::Copied(result) | Given::Withheld(result)) = &ended;
-        if let Ok(answer) = result {
+        if let Ok(answer) = ended.answer_ref() {
             let mut calls = self.calls();
             calls.last = match answer {
                 BackupEnableResult::Enabled { .. } => None,
@@ -646,9 +645,9 @@ impl BackupSetup {
     ) -> Given<Result<BackupEnableResult>> {
         match self.steps(params, mark, &admission).await {
             Ok(Step::Held(given)) => given,
-            Err(done) => Given::Fresh(Ok(done)),
-            Ok(Step::Record(record)) => Given::Fresh(self.record(record, params, admission).await),
-            Ok(Step::Stopped(refusal)) => Given::Fresh(Err(refusal)),
+            Err(done) => Given::fresh(Ok(done)),
+            Ok(Step::Record(record)) => Given::fresh(self.record(record, params, admission).await),
+            Ok(Step::Stopped(refusal)) => Given::fresh(Err(refusal)),
         }
     }
 
@@ -1269,7 +1268,7 @@ mod tests {
             .await;
         assert!(given.is_copied(), "a repeat with nothing owed is a copy");
         assert!(matches!(
-            given.into_answer(),
+            given.into_answer_for_test(),
             Ok(BackupEnableResult::Enabled { .. })
         ));
 
@@ -1282,7 +1281,7 @@ mod tests {
             "a repeat while a fence is owed is withheld"
         );
         assert!(matches!(
-            given.into_answer(),
+            given.into_answer_for_test(),
             Err(ControllerError::PermissionDenied { .. })
         ));
     }
@@ -1304,7 +1303,7 @@ mod tests {
                 assert!(given.is_copied(), "fence owed: {owed}");
                 assert!(
                     matches!(
-                        given.into_answer(),
+                        given.into_answer_for_test(),
                         Ok(BackupEnableResult::Declined {
                             cause: BackupEnableCause::AlreadySetUp {}
                         })

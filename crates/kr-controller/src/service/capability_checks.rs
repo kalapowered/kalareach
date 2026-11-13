@@ -404,10 +404,10 @@ impl Controller {
     ) -> Given<Result<ParamsValue>> {
         let params: EnvironmentCapabilitiesCheckParams = match parse(&mutation.params) {
             Ok(params) => params,
-            Err(refusal) => return Given::Fresh(Err(refusal)),
+            Err(refusal) => return Given::fresh(Err(refusal)),
         };
         if params.environment_id != self.paths.environment_id() {
-            return Given::Fresh(Err(ControllerError::InvalidArgument(format!(
+            return Given::fresh(Err(ControllerError::InvalidArgument(format!(
                 "this daemon owns environment {}",
                 self.paths.environment_id()
             ))));
@@ -420,7 +420,7 @@ impl Controller {
             let directory = self.directory_workers().await;
             match Self::without_a_closure(&registry, directory) {
                 Ok(workers) => workers,
-                Err(refusal) => return Given::Fresh(Err(refusal)),
+                Err(refusal) => return Given::fresh(Err(refusal)),
             }
         };
         let worker = worker_for(workers, evidence.worker_profile);
@@ -429,7 +429,7 @@ impl Controller {
         let digest = match mutation_digest(mutation, actor_id) {
             Ok(digest) => digest,
             Err(error) => {
-                return Given::Fresh(Err(ControllerError::InvalidArgument(error.to_string())));
+                return Given::fresh(Err(ControllerError::InvalidArgument(error.to_string())));
             }
         };
         let begun = self.under_registration_until_it_begins(&carried, |begin| -> Result<Begun> {
@@ -456,7 +456,7 @@ impl Controller {
                 }
                 Ok(Some(_)) => {
                     self.check_fence()?;
-                    return Ok(Begun::Given(Given::Fresh(Err(
+                    return Ok(Begun::Given(Given::fresh(Err(
                         ControllerError::IdConflict {
                             token: mutation.action_id.to_string(),
                         },
@@ -506,7 +506,7 @@ impl Controller {
         });
         let begun = match begun {
             Ok(Ok(begun)) => begun,
-            Ok(Err(refusal)) | Err(refusal) => return Given::Fresh(Err(refusal)),
+            Ok(Err(refusal)) | Err(refusal) => return Given::fresh(Err(refusal)),
         };
         let framed = |given: Given<Result<CapabilityChecks>>| {
             given.map(|view| {
@@ -522,7 +522,7 @@ impl Controller {
             Begun::Given(given) => given,
             Begun::Started(view) => {
                 self.forget_old_capability_answers();
-                Given::Fresh(Ok(view))
+                Given::fresh(Ok(view))
             }
             Begun::Answer(recorded) => {
                 self.forget_old_capability_answers();

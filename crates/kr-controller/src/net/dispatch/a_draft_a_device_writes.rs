@@ -1574,7 +1574,9 @@ async fn a_create_whose_deadline_passes_after_the_doors_check_writes_nothing() {
         release.send(()).expect("the create goes on");
     });
     assert!(!given.is_copied(), "a refusal of this attempt is no copy");
-    let refused = given.into_answer().expect_err("the deadline passed");
+    let refused = given
+        .into_answer_for_test()
+        .expect_err("the deadline passed");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(refused.message.contains("deadline"), "{refused:?}");
 
@@ -1584,6 +1586,6 @@ async fn a_create_whose_deadline_passes_after_the_doors_check_writes_nothing() {
         "nothing was recorded for the action, so this is a first admission"
     );
     served
-        .into_answer()
+        .into_answer_for_test()
         .expect("an admission that stands is served");
 }

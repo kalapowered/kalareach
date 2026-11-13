@@ -1853,7 +1853,7 @@ impl crate::service::Controller {
         mutation: &kr_protocol::envelope::MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<kr_protocol::envelope::ParamsValue>> {
-        Given::Copied(self.privacy_set_answer(mutation, carried).await)
+        Given::copied(self.privacy_set_answer(mutation, carried).await)
     }
 
     /// Performs `privacy.set` under the admission it carries, and answers the report.
@@ -1980,7 +1980,7 @@ impl crate::service::Controller {
         mutation: &kr_protocol::envelope::MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<kr_protocol::envelope::ParamsValue>> {
-        Given::Copied(self.privacy_retained_delete_answer(mutation, carried).await)
+        Given::copied(self.privacy_retained_delete_answer(mutation, carried).await)
     }
 
     /// Performs `privacy.retained.delete`: asks the service that holds one copy privacy mode lists

@@ -897,7 +897,7 @@ impl DeviceDirectory {
         .map_err(ControllerError::registry)?;
         if let Some(recorded) = read_declaration(&transaction, actor_id, action_id)? {
             transaction.commit().map_err(ControllerError::registry)?;
-            return Ok(Given::Copied(recorded));
+            return Ok(Given::copied(recorded));
         }
         let outcome = match admitted() {
             Err(
@@ -927,7 +927,7 @@ impl DeviceDirectory {
             )
             .map_err(ControllerError::registry)?;
         transaction.commit().map_err(ControllerError::registry)?;
-        Ok(Given::Fresh(RecordedDeclaration {
+        Ok(Given::fresh(RecordedDeclaration {
             payload_digest,
             outcome,
         }))
@@ -2375,7 +2375,7 @@ mod tests {
             )
             .expect("answered");
         assert!(again.is_copied(), "an earlier attempt's outcome is a copy");
-        assert_eq!(again.into_answer(), first);
+        assert_eq!(again.into_answer_for_test(), first);
 
         // The record is the actor's own: another actor's action under the same identifier is not
         // it.
@@ -2409,7 +2409,7 @@ mod tests {
                 TimestampMs::new(1_764_003_800_000),
             )
             .expect("decided")
-            .into_answer();
+            .into_answer_for_test();
         assert_eq!(
             lapsed.outcome,
             KeyDeclaration::Refused {
@@ -2491,7 +2491,7 @@ mod tests {
                 TimestampMs::new(1_764_003_800_000),
             )
             .expect("decided")
-            .into_answer();
+            .into_answer_for_test();
         assert!(asked);
         assert!(matches!(
             completed.outcome,

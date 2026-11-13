@@ -2322,9 +2322,9 @@ impl AttentionModule {
         {
             let refusal = Err(refusal.to_protocol_error());
             return if copied {
-                Given::Withheld(refusal)
+                Given::withheld(refusal)
             } else {
-                Given::Fresh(refusal)
+                Given::fresh(refusal)
             };
         }
         Given::of(answer, copied)
@@ -5861,7 +5861,7 @@ pub(crate) mod tests {
                 .retained(caller, actor, mutation, Method::VisitAcknowledge)
                 .expect("the store holds the action")
                 .copied()
-                .into_answer()
+                .into_answer_for_test()
             else {
                 panic!("the repeat is answered");
             };
@@ -5924,7 +5924,7 @@ pub(crate) mod tests {
             )
             .expect("a repeat the store cannot be asked about is answered")
             .copied()
-            .into_answer();
+            .into_answer_for_test();
         let ControlFrame::Response(Response {
             outcome: Outcome::Error(error),
             ..

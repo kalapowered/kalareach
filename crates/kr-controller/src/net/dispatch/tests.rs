@@ -6281,7 +6281,7 @@ async fn a_key_registration_recorded_after_the_first_lookup_is_not_answered_when
             controller
                 .preview_key_update_action(&device.principal(), &registration, earlier_attempt)
                 .await
-                .into_answer()
+                .into_answer_for_test()
                 .expect("the earlier attempt registers the key");
             look_again.send(()).expect("the registration goes on");
             tokio::time::timeout(std::time::Duration::from_secs(30), found)

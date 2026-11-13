@@ -292,7 +292,7 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
         .await
         .expect("this host holds a claim on the action")
         .copied()
-        .into_answer()
+        .into_answer_for_test()
     else {
         panic!("a retry is answered with a response");
     };
@@ -336,7 +336,7 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
         .await
         .expect("this host holds a claim on the action")
         .copied()
-        .into_answer()
+        .into_answer_for_test()
     else {
         panic!("a retry is answered with a response");
     };

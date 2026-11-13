@@ -286,12 +286,12 @@ impl Controller {
     ) -> Given<Result<ParamsValue>> {
         let (movement, expected) = match read_step(method, &mutation.params) {
             Ok(step) => step,
-            Err(error) => return Given::Fresh(Err(error)),
+            Err(error) => return Given::fresh(Err(error)),
         };
         // A daemon with no usable record takes no step, and claims nothing: the answer is the same
         // however often it is asked, and a claim would turn it into an outcome nobody knows.
         if matches!(self.machine.held, Held::Refused(_)) {
-            return Given::Fresh(Err(ControllerError::Storage {
+            return Given::fresh(Err(ControllerError::Storage {
                 operation: "change the machine group record",
                 detail: NO_RECORD.to_owned(),
             }));
@@ -299,7 +299,7 @@ impl Controller {
         // A step that carries no freshness is a retry of an action this host may already hold,
         // which has been answered before this point; what it may not do is be performed.
         if carried.deadline.is_none() {
-            return Given::Fresh(Err(ControllerError::WindowExpired {
+            return Given::fresh(Err(ControllerError::WindowExpired {
                 detail: "this action carries no freshness, so it may be answered from what this \
                          host holds and may not be performed"
                     .to_owned(),
@@ -315,7 +315,7 @@ impl Controller {
         })
         .await
         .unwrap_or_else(|_| {
-            Given::Fresh(Err(ControllerError::Uncertain {
+            Given::fresh(Err(ControllerError::Uncertain {
                 detail: "the task that took this step ended before it answered, and this host's \
                          records may not show what it did; ask again with the same action to be \
                          told what it did"

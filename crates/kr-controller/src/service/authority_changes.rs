@@ -1098,12 +1098,12 @@ impl Controller {
         let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
             Ok(digest) => digest,
             Err(error) => {
-                return Given::Fresh(Err(ControllerError::InvalidArgument(error.to_string())));
+                return Given::fresh(Err(ControllerError::InvalidArgument(error.to_string())));
             }
         };
         let declared = match self.declared_keys(device_id, mutation) {
             Ok(declared) => declared,
-            Err(error) => return Given::Fresh(Err(error)),
+            Err(error) => return Given::fresh(Err(error)),
         };
         let recorded = {
             let registry = self.registry.lock().await;
@@ -1121,7 +1121,7 @@ impl Controller {
             Ok(recorded) => {
                 recorded.map(|recorded| declaration_answer(mutation, &digest, recorded))
             }
-            Err(error) => Given::Fresh(Err(error)),
+            Err(error) => Given::fresh(Err(error)),
         }
     }
 
@@ -1205,7 +1205,7 @@ impl Controller {
                 Method::GrantCreate | Method::GrantRevoke | Method::GrantRedeem
             )
         {
-            return Given::Fresh(Err(ControllerError::PermissionDenied {
+            return Given::fresh(Err(ControllerError::PermissionDenied {
                 detail: format!("{} is made by the owner at this machine", method.as_str()),
             }));
         }
@@ -1216,12 +1216,12 @@ impl Controller {
         let intent = match method {
             Method::OrganisationEnrol => match self.organisation_enrol_intent(mutation) {
                 Ok(intent) => Some(OrganisationIntent::Enrol(Box::new(intent))),
-                Err(refusal) => return Given::Fresh(Err(refusal)),
+                Err(refusal) => return Given::fresh(Err(refusal)),
             },
             Method::OrganisationExclusiveSet => {
                 match self.organisation_exclusive_intent(mutation) {
                     Ok(intent) => Some(OrganisationIntent::Exclusive(intent)),
-                    Err(refusal) => return Given::Fresh(Err(refusal)),
+                    Err(refusal) => return Given::fresh(Err(refusal)),
                 }
             }
             _ => None,
@@ -1309,10 +1309,10 @@ impl Controller {
             if method == Method::GrantCreate {
                 hold.doubt();
             }
-            return Given::Fresh(Err(unrecorded));
+            return Given::fresh(Err(unrecorded));
         }
         drop(hold);
-        Given::Fresh(outcome)
+        Given::fresh(outcome)
     }
 
     /// Keeps the credential an external notification destination sends with.
@@ -2053,10 +2053,10 @@ impl Controller {
             .device_preview_key_update(actor_id, mutation, carried)
             .await;
         if let Err(error) = self.settle_claim(&hold, &outcome) {
-            return Given::Fresh(Err(error));
+            return Given::fresh(Err(error));
         }
         drop(hold);
-        Given::Fresh(outcome)
+        Given::fresh(outcome)
     }
 
     /// Registers a paired device's push destination under the action it arrived with, and keeps
@@ -2099,10 +2099,10 @@ impl Controller {
         };
         let outcome = self.device_push_register(actor_id, mutation, carried).await;
         if let Err(error) = self.settle_claim(&hold, &outcome) {
-            return Given::Fresh(Err(error));
+            return Given::fresh(Err(error));
         }
         drop(hold);
-        Given::Fresh(outcome)
+        Given::fresh(outcome)
     }
 
     /// Makes a paired device a destination this host delivers notifications to.
@@ -3717,7 +3717,7 @@ mod tests {
             controller
                 .preview_key_update_action(&actor, &mutation, admission)
                 .await
-                .into_answer()
+                .into_answer_for_test()
         });
         tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
             .await
@@ -3841,7 +3841,7 @@ mod tests {
                 admission,
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("an expired admission writes nothing");
         assert!(
             matches!(error, crate::error::ControllerError::WindowExpired { .. }),
@@ -3857,7 +3857,7 @@ mod tests {
                 admission,
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect("a standing admission registers");
         assert_eq!(host.revisions(), (2, None));
     }
@@ -3878,7 +3878,7 @@ mod tests {
                 host.admission(Duration::from_secs(10)),
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect("the registration is made");
         host.controller.hold_fence(true);
         let refused = host
@@ -3889,7 +3889,7 @@ mod tests {
                 host.admission(Duration::from_secs(10)),
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a recorded answer is not given back while a fence is owed");
         assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
         assert!(refused.to_string().contains("fence"), "{refused}");
@@ -3904,7 +3904,7 @@ mod tests {
             .await;
         assert!(again.is_copied(), "the receipt is a copy of the record");
         again
-            .into_answer()
+            .into_answer_for_test()
             .expect("the receipt is given back once nothing is owed");
         assert_eq!(
             host.revisions(),
@@ -3932,7 +3932,7 @@ mod tests {
                 host.admission(Duration::from_secs(10)),
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect("the registration is made");
 
         // A repeat stopped where its receipt has been read, let go as it is.
@@ -3956,7 +3956,7 @@ mod tests {
         let given = waiting.await.expect("the repeat finishes");
         assert!(given.is_copied(), "the receipt is a copy of the record");
         given
-            .into_answer()
+            .into_answer_for_test()
             .expect("with nothing changed the receipt is given back");
 
         // The same repeat, with the revocation of its device acknowledged while it is stopped.
@@ -3993,7 +3993,7 @@ mod tests {
              refusal is a copy the service withheld"
         );
         let withheld = refused
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a revoked device is not given the receipt");
         assert_eq!(withheld.code(), ErrorCode::PermissionDenied, "{withheld}");
         assert_eq!(

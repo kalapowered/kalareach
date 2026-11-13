@@ -92,7 +92,7 @@ async fn a_record_that_cannot_be_read_is_told_only_under_its_authority(
         "a record that cannot be read says that it exists, so it is a copy"
     );
     let told = control
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a record that cannot be read does not answer the copy");
     assert_eq!(told.code(), ErrorCode::OutcomeUnknown, "{told}");
 
@@ -249,20 +249,20 @@ async fn an_attention_action_that_meets_another_requests_identifier_is_not_told_
     let admission = carried(&controller, connection_id);
     attention_answer(&controller, &actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the window is set");
     let other = another_request_under(&mutation);
 
     let told = a_late_attention_copy_at_the_store(&controller, &actor_id, &other, admission, false)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("with nothing owed the conflict is told");
     assert_eq!(told.code, ErrorCode::IdConflict, "{told:?}");
 
     let refused =
         a_late_attention_copy_at_the_store(&controller, &actor_id, &other, admission, true)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a fence that landed at the store is the answer");
     refused_for_a_fence(&refused);
 }
@@ -279,7 +279,7 @@ async fn an_attention_action_whose_row_cannot_be_decoded_is_not_told_after_a_fen
     let admission = carried(&controller, connection_id);
     attention_answer(&controller, &actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the window is set");
     let store =
         rusqlite::Connection::open(temp.environment().state_dir().join("attention.sqlite3"))
@@ -294,14 +294,14 @@ async fn an_attention_action_whose_row_cannot_be_decoded_is_not_told_after_a_fen
     let told =
         a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, false)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a row that cannot be decoded does not answer the copy");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
     let refused =
         a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, true)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a fence that landed at the store is the answer");
     refused_for_a_fence(&refused);
 }
@@ -346,7 +346,7 @@ async fn a_catalogue_receipt_that_cannot_be_decoded_is_not_told_after_a_fence_la
     };
     attempt(false)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a catalogue nobody enrolled is refused, and the refusal is kept");
     let receipts = rusqlite::Connection::open(
         temp.environment()
@@ -364,13 +364,13 @@ async fn a_catalogue_receipt_that_cannot_be_decoded_is_not_told_after_a_fence_la
 
     let told = attempt(false)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a receipt that cannot be decoded does not answer the copy");
     assert_ne!(told.code, ErrorCode::PermissionDenied, "{told:?}");
 
     let refused = attempt(true)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a fence that landed once the refusal was in hand is the answer");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
@@ -399,13 +399,13 @@ async fn an_automation_action_that_meets_another_requests_identifier_is_not_told
     };
     ask(&mutation)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first copy installs it");
     let other = another_request_under(&mutation);
 
     let told = ask(&other)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("with nothing owed the conflict is told");
     assert_eq!(told.code, ErrorCode::IdConflict, "{told:?}");
 
@@ -415,7 +415,7 @@ async fn an_automation_action_that_meets_another_requests_identifier_is_not_told
         ask(&other),
     )
     .await
-    .into_answer()
+    .into_answer_for_test()
     .expect_err("a fence that landed before the journal is the answer");
     refused_for_a_fence(&refused);
 }
@@ -485,7 +485,7 @@ async fn a_create_that_meets_the_token_another_request_reserved_is_not_told_afte
         controller
             .session_create(&actor_id, &other, admission)
             .await
-            .into_answer()
+            .into_answer_for_test()
     };
 
     let told = attempt()
@@ -516,7 +516,7 @@ async fn a_create_whose_reservation_cannot_be_read_is_not_told_after_a_fence_lan
         controller
             .session_create(&actor_id, &mutation, admission)
             .await
-            .into_answer()
+            .into_answer_for_test()
     };
     let registry = rusqlite::Connection::open(temp.environment().registry_database())
         .expect("the registry opens beside the daemon's own handle");
@@ -561,7 +561,7 @@ async fn a_conflict_the_project_service_meets_is_told_only_under_its_authority(
     let (mutation, begin) = scenario();
     let told = project_answer(controller, actor_id, &mutation, admission, begin)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("with nothing owed the conflict is told");
     assert_eq!(told.code, ErrorCode::IdConflict, "{told:?}");
 
@@ -569,7 +569,7 @@ async fn a_conflict_the_project_service_meets_is_told_only_under_its_authority(
     controller.hold_fence(true);
     let refused = project_answer(controller, actor_id, &mutation, admission, begin)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a fence this host owes stops the conflict");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
@@ -626,14 +626,14 @@ async fn a_project_action_whose_journal_cannot_be_read_is_not_told_while_a_fence
 
     let told = project_answer(&controller, &actor_id, &mutation, admission, begin())
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a journal that cannot be read does not answer the copy");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
     controller.hold_fence(true);
     let refused = project_answer(&controller, &actor_id, &mutation, admission, begin())
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a fence this host owes stops what the look refuses with");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
@@ -719,7 +719,7 @@ async fn a_project_action_whose_admission_refuses_beside_a_journal_it_cannot_rea
         "a journal that cannot be read says that a record may exist, so it is a copy"
     );
     let told = control
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a journal that cannot be read does not answer the copy");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
     beside_the_journal()
@@ -771,7 +771,7 @@ async fn a_change_set_action_whose_records_cannot_be_read_is_not_told_after_a_fe
         "records that cannot be read say that one may exist, so the answer is a copy"
     );
     let told = control
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("records that cannot be read do not answer the copy");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
@@ -801,20 +801,20 @@ async fn a_change_set_action_that_meets_another_requests_record_is_not_told_whil
     let mutation = materialisation(&temp);
     changeset_answer(&controller, &actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a version nobody captured is refused, and the refusal is kept");
     let other = another_request_under(&mutation);
 
     let told = changeset_answer(&controller, &actor_id, &other, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("with nothing owed the conflict is told");
     assert_eq!(told.code, ErrorCode::IdConflict, "{told:?}");
 
     refused_for_the_fence(&controller, async || {
         changeset_answer(&controller, &actor_id, &other, admission)
             .await
-            .into_answer()
+            .into_answer_for_test()
     })
     .await;
 }
@@ -870,20 +870,20 @@ async fn a_confirmation_request_that_meets_another_requests_identifier_is_not_to
     };
     attempt(&asking(false))
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first request is answered");
     let other = asking(true);
 
     let told = attempt(&other)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("with nothing owed the conflict is told");
     assert_eq!(told.to_protocol_error().code, ErrorCode::IdConflict);
 
     controller.hold_fence(true);
     let refused = attempt(&other)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a fence this host owes stops the conflict");
     refused_for_a_fence(&refused.to_protocol_error());
     controller.hold_fence(false);
@@ -988,7 +988,7 @@ async fn an_attention_change_a_store_withheld_is_told_at_the_local_door_as_not_s
     let admission = carried(&controller, connection_id);
     attention_answer(&controller, &actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the window is set");
     let store =
         rusqlite::Connection::open(temp.environment().state_dir().join("attention.sqlite3"))

@@ -278,7 +278,7 @@ async fn the_closure_record_is_given_back_as_a_copy_when_it_answers_a_close_or_n
         .copied();
     assert!(answer.is_copied(), "the closure answers a repeated close");
     let closed: SessionCloseResult = answer
-        .into_answer()
+        .into_answer_for_test()
         .expect("a closed session's close is answered")
         .to_typed()
         .expect("decodes");
@@ -298,7 +298,7 @@ async fn the_closure_record_is_given_back_as_a_copy_when_it_answers_a_close_or_n
         "the closure says the session is closed"
     );
     assert!(matches!(
-        refusal.into_answer(),
+        refusal.into_answer_for_test(),
         ControllerError::SessionClosed { .. }
     ));
 }
@@ -397,7 +397,7 @@ async fn a_create_asked_again_whose_worker_cannot_be_reached_is_told_the_outcome
         .replay_create(&gone.reservation)
         .await
         .copied()
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a worker that cannot be reached leaves no answer");
     assert!(
         matches!(told, ControllerError::Uncertain { .. }),
@@ -458,7 +458,7 @@ async fn a_create_asked_again_whose_worker_ended_before_it_was_described_is_answ
             .replay_create(&gone.reservation)
             .await
             .copied()
-            .into_answer()
+            .into_answer_for_test()
             .expect("the create asked again is answered"),
     );
     assert_a_closed_session(&replayed, gone.reservation.session_id);
@@ -546,7 +546,7 @@ async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_
                 .replay_create(&reservation)
                 .await
                 .copied()
-                .into_answer()
+                .into_answer_for_test()
         })
     })
     .await
@@ -580,7 +580,7 @@ async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_
             .replay_create(&reservation)
             .await
             .copied()
-            .into_answer()
+            .into_answer_for_test()
             .expect("the worker describes its session"),
     );
     assert_ne!(described.session.state, SessionState::Closed);
@@ -720,7 +720,7 @@ async fn a_create_whose_worker_still_says_its_session_closed_is_given_no_endpoin
                 .replay_create(&reservation)
                 .await
                 .copied()
-                .into_answer()
+                .into_answer_for_test()
                 .expect("the create asked again is answered"),
         )
     };

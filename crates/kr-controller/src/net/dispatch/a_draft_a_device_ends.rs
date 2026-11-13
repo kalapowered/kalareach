@@ -960,10 +960,10 @@ async fn a_copy_of_a_performed_discard_is_withheld_while_a_fence_is_owed() {
 
     let first = attempt().await;
     assert!(!first.is_copied(), "the first attempt performs");
-    first.into_answer().expect("the draft is ended");
+    first.into_answer_for_test().expect("the draft is ended");
     let copy = attempt().await;
     assert!(copy.is_copied(), "the repeat is given the record");
-    copy.into_answer()
+    copy.into_answer_for_test()
         .expect("with nothing owed the repeat is answered from the record");
 
     controller.hold_fence(true);
@@ -975,7 +975,7 @@ async fn a_copy_of_a_performed_discard_is_withheld_while_a_fence_is_owed() {
     controller.hold_fence(false);
     attempt()
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("once the fence is gone it is answered again");
 }
 
