@@ -116,7 +116,7 @@ fn with_no_manifest_a_record_takes_its_remedy_from_its_own_handle() {
     assert!(made.status.success(), "{made:?}");
     let text = refusal(&paths);
     moved_aside(&text);
-    assert!(!text.contains("stay where they are"), "{text}");
+    assert!(!text.contains("the manifest stays where it is"), "{text}");
     std::fs::remove_dir(&paths.journal).unwrap();
 
     // The earlier-state record with a second name.
@@ -130,7 +130,7 @@ fn with_no_manifest_a_record_takes_its_remedy_from_its_own_handle() {
     // stay beside it, since no manifest is there.
     let text = refusal(&paths);
     assert!(text.contains("Remove "), "{text}");
-    assert!(!text.contains("stay where they are"), "{text}");
+    assert!(!text.contains("the manifest stays where it is"), "{text}");
     assert!(!text.contains("Move it aside"), "{text}");
 
     // A name that the layout does not give is removed.
@@ -164,7 +164,7 @@ fn a_private_root_that_no_journal_names_takes_its_remedy_from_its_own_handle() {
     give_to(&root, "*S-1-5-32-544");
     let text = refusal(&paths);
     assert!(text.contains("Remove "), "{text}");
-    assert!(text.contains("stay where they are"), "{text}");
+    assert!(text.contains("the manifest stays where it is"), "{text}");
     let _ = std::fs::remove_dir_all(&folder);
 }
 

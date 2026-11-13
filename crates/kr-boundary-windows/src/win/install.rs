@@ -688,39 +688,10 @@ fn data_descriptor() -> Result<sd::OwnedSd, Error> {
     Ok(sd::descriptor(SdKind::DataParent, &Principals::default())?)
 }
 
-/// The words the refusal of the data directory itself ends with when its handle shows the system's
-/// class as its owner: what the administrator does. Nothing the installation recorded is removed.
-const DATA_REMEDY: &str = "Make the Administrators group its owner and leave the system and the Administrators group as the only entries of its list, then run the setup program again. The manifest and the journal stay where they are.";
-
-/// The words the refusal of a data directory ends with when its handle shows that the installation
-/// did not make it (another account owns it, or it is a link or not a directory).
-const DATA_NOT_MADE: &str = "The handle of this directory shows that the installation did not make it, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
-
-/// The words the refusal of a data directory ends with when its list refuses the open, or the open
-/// failed for a reason that shows nothing: the installation's lists never refuse the administrator,
-/// so it did not make a directory whose list does, and nothing is known of one that cannot be read.
-const DATA_UNKNOWN: &str = "Nothing shows that the installation made this directory, because its own list refuses the check or it could not be read, and it can hold files that another account wrote. Do not correct its owner or its list, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
-
-/// The words the refusal of a data directory ends with when a program holds it open.
-const DATA_UNREADABLE: &str = "Nothing shows who made this directory, because it could not be read. Do not correct its owner or its list, and do not remove it: either would hide what it is. Close the program that holds it open, then run the setup program again, which reads it again.";
-
-/// The words the refusal of a data directory that separates names by case ends with, when the
-/// system's class owns it.
-const CASE_REMEDY: &str = "Turn the flag off (`fsutil.exe file setCaseSensitiveInfo <the directory> disable`), then run the setup program again. The manifest and the journal stay where they are.";
-
-/// Why a data directory is refused when it separates names that differ only by case.
-const CASE_SENSITIVE_WHY: &str = "it separates names that differ only by case, and the installation compares names without regard to case";
-
 /// The refusal of a data directory that is there and is not the installation's own. The remedy comes
 /// from what the directory's own handle showed, and one refusal gives one remedy.
 fn data_refusal(paths: &Paths, why: &str, origin: &Origin) -> Error {
-    let remedy = match origin {
-        Origin::Foreign => DATA_NOT_MADE,
-        Origin::Held(_) => DATA_UNREADABLE,
-        Origin::Refused(_) | Origin::Unknown(_) => DATA_UNKNOWN,
-        Origin::System if why == CASE_SENSITIVE_WHY => CASE_REMEDY,
-        Origin::System => DATA_REMEDY,
-    };
+    let remedy = remedy::data_ending(origin, why == remedy::CASE_SENSITIVE_WHY);
     Error::Refused(format!(
         "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system. {remedy}",
         paths.data.display()
@@ -914,7 +885,7 @@ fn case_sensitive_reason(handle: &ffi::Handle) -> Result<Option<String>, Error> 
     }
     // The flag that says the directory separates names that differ only by case.
     const CASE_SENSITIVE_DIRECTORY: u32 = 1;
-    Ok((info.Flags & CASE_SENSITIVE_DIRECTORY != 0).then(|| CASE_SENSITIVE_WHY.to_owned()))
+    Ok((info.Flags & CASE_SENSITIVE_DIRECTORY != 0).then(|| remedy::CASE_SENSITIVE_WHY.to_owned()))
 }
 
 /// What the data directory itself must be on its handle: a directory that compares names without
@@ -1493,7 +1464,7 @@ fn inspect_layout(
                 paths,
                 dir,
                 &shown,
-                "no journal names it as unfinished work, so the broker is not working in it",
+                remedy::UNNAMED_ROOT_WHY,
                 &origin,
             ));
         }
@@ -1629,16 +1600,8 @@ fn program_refusal(
     recorded: bool,
 ) -> Error {
     let entry = dir.join(name);
-    let kept = if recorded {
-        "Do not remove it: the manifest records it and stays where it is."
-    } else {
-        "Do not remove it."
-    };
-    let kept_directory = if recorded {
-        "Do not remove the program directory: the manifest records it and stays where it is."
-    } else {
-        "Do not remove the program directory."
-    };
+    let kept = remedy::program_keeping(recorded, false);
+    let kept_directory = remedy::program_keeping(recorded, true);
     let remedy = match cure {
         Cure::OwnerAndList => format!(
             "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. {kept}"
@@ -1663,10 +1626,7 @@ fn program_refusal(
             entry.display(),
             remedy::supported_layout(remedy::Tree::Program)
         ),
-        Cure::Open => format!(
-            "Close the program that holds {} open, or correct who may open it, and if it is a link remove the link itself and not what it points to, or if it is not a folder remove that entry and nothing else, then run the setup program again. {kept_directory}",
-            entry.display()
-        ),
+        Cure::Open => remedy::program_open_advice(&entry.display().to_string(), kept_directory),
     };
     Error::Refused(format!(
         "{} is the boundary's program directory (the program that the service runs as the system). It is refused because of {}: {why}. Whoever owns it, or can change its list, could replace that program. {remedy}",
@@ -1921,11 +1881,12 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
         if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(refuse(Fault::NotAFolder));
         }
-        // The folder that the path leads to is the one that was asked for: a link, a mounted
-        // folder or an alias above it would lead somewhere else.
+        // The folder that the path leads to is the one that was asked for. A final path that is
+        // another is said as what it is, and no cause is named: a link, a mounted folder, a short
+        // name or another spelling all lead somewhere else.
         let found = final_path_of(&handle).map_err(|error| unreadable(&error))?;
         if !remedy::is_the_place_asked_for(&shown, &found) {
-            return Err(refuse(Fault::Link));
+            return Err(refuse(Fault::Leads(&remedy::dos_path_of(&found))));
         }
         if let Some(why) =
             acl::changeable_by_others_on(&handle, false).map_err(|error| unreadable(&error))?
@@ -3386,7 +3347,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 if let Some(parent) = paths.data.parent() {
                     let _ = fs::remove_dir(parent);
                 }
-                say("the empty data directory that an earlier removal left is removed");
+                say("the empty data directory is removed");
                 return Ok(());
             }
             return Err(Error::Failed(format!(

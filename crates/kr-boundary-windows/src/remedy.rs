@@ -172,8 +172,9 @@ pub fn choose(kind: EntryKind, origin: &Origin, manifest: &Presence) -> Remedy {
 }
 
 /// The words that end the refusal of an entry: the one remedy, with what the next run then finds.
-/// The manifest and the journal are said to stay only where a manifest is there and the entry is
-/// not the journal; "the next run makes it new" is said only of what the installation makes.
+/// The manifest is said to stay only where the lookup found one; nothing is said of the journal or
+/// of what the entry holds, which no read showed; "the next run makes it new" is said only of what
+/// the installation makes.
 #[must_use]
 pub fn ending(
     entry: &std::path::Path,
@@ -185,9 +186,9 @@ pub fn ending(
     let entry = entry.display();
     match remedy {
         Remedy::Remove => {
-            if matches!(manifest, Presence::Present) && kind != EntryKind::Journal {
+            if matches!(manifest, Presence::Present) {
                 format!(
-                    "Remove {entry}, and nothing else, then run the setup program again: the manifest and the journal stay where they are."
+                    "Remove {entry}, and nothing else, then run the setup program again: the manifest stays where it is."
                 )
             } else {
                 format!("Remove {entry}, and nothing else, then run the setup program again.")
@@ -226,7 +227,7 @@ pub fn ending(
             "Nothing shows who made {entry}, because a program holds it open and it could not be read. Do not correct its owner or its list, and do not remove it: either would hide what it is. Close the program that holds it open, then run the setup program again, which reads it again."
         ),
         Remedy::Correct => format!(
-            "Correct what the reason names (the Administrators group, or the system, owns it, and the system and the Administrators group are the only entries of its list), then run the setup program again. Do not remove {entry}: the manifest and the journal record what is installed and stay where they are."
+            "Correct what the reason names (the Administrators group, or the system, owns it, and the system and the Administrators group are the only entries of its list), then run the setup program again. Do not remove {entry}: by its name it is one of the installation's own entries, which may hold records of what is installed."
         ),
     }
 }
@@ -240,8 +241,9 @@ pub enum ParentCure {
     /// The handle shows that the installation did not make the folder (a link, not a folder, or an
     /// owner that is not the system's class): move it aside, and do not correct it into place.
     MoveAside,
-    /// The system's class owns it and its list is wrong: correct the list. Whether it holds the
-    /// data directory is known only from a lookup, which decides whether removal is offered.
+    /// The system's class owns it and its list is wrong: correct the list. Only a lookup of the
+    /// data directory's name in it is known, which decides whether removal is offered: an entry at
+    /// that name is not read, so it is said to be something that can hold an installation.
     Correct(Presence),
     /// The folder could not be opened to be checked, for a reason that is no program holding it
     /// open (that is [`ParentCure::Close`]): nothing shows who made it, so it is neither corrected
@@ -258,7 +260,7 @@ pub fn parent_advice(cure: &ParentCure) -> String {
         ParentCure::Close => "Close the program that holds it open, then run the setup program again: a change of its owner or its list does not close a handle. Do not remove it.".to_owned(),
         ParentCure::MoveAside => "The installation did not make this folder, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned(),
         ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again."),
-        ParentCure::Correct(Presence::Present) => "Do not remove it: it holds the data directory, with the manifest, the journals and the private roots of an installation, and removing it would destroy what they say. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
+        ParentCure::Correct(Presence::Present) => "Do not remove it: something is at the data directory's name in it, and that can hold the manifest, the journals and the private roots of an installation, which removing this folder would destroy. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
         ParentCure::Correct(Presence::Absent) => "It holds no data directory of the boundary. If nothing else needs what is in it, remove or rename the folder, then run the setup program again.".to_owned(),
     }
 }
@@ -742,6 +744,75 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
         | AncestorFault::Leads(_)
         | AncestorFault::List(_) => shared_refusal(folder, tree, fault, stage),
     }
+}
+
+/// The words the refusal of the data directory itself ends with when its handle shows the system's
+/// class as its owner: what the administrator does. Nothing the installation recorded is removed.
+const DATA_REMEDY: &str = "Make the Administrators group its owner and leave the system and the Administrators group as the only entries of its list, then run the setup program again. Nothing in it is removed.";
+
+/// The words the refusal of a data directory ends with when its handle shows that the installation
+/// did not make it (another account owns it, or it is a link or not a directory).
+const DATA_NOT_MADE: &str = "The handle of this directory shows that the installation did not make it, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
+
+/// The words the refusal of a data directory ends with when its list refuses the open, or the open
+/// failed for a reason that shows nothing: the installation's lists never refuse the administrator,
+/// so it did not make a directory whose list does, and nothing is known of one that cannot be read.
+const DATA_UNKNOWN: &str = "Nothing shows that the installation made this directory, because its own list refuses the check or it could not be read, and it can hold files that another account wrote. Do not correct its owner or its list, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
+
+/// The words the refusal of a data directory ends with when a program holds it open.
+const DATA_UNREADABLE: &str = "Nothing shows who made this directory, because it could not be read. Do not correct its owner or its list, and do not remove it: either would hide what it is. Close the program that holds it open, then run the setup program again, which reads it again.";
+
+/// The words the refusal of a data directory that separates names by case ends with, when the
+/// system's class owns it.
+const CASE_REMEDY: &str = "Turn the flag off (`fsutil.exe file setCaseSensitiveInfo <the directory> disable`), then run the setup program again. Nothing in it is removed.";
+
+/// Why a data directory is refused when it separates names that differ only by case.
+pub const CASE_SENSITIVE_WHY: &str = "it separates names that differ only by case, and the installation compares names without regard to case";
+
+/// The words that end the refusal of the data directory itself, from what its own handle showed
+/// (`origin`) and whether the reason is the directory's case-sensitive flag. One refusal gets one
+/// remedy. Only a directory that the system's class owns is told what to correct, and no remedy
+/// says what the directory holds, which no read of it showed.
+#[must_use]
+pub fn data_ending(origin: &Origin, case_sensitive: bool) -> &'static str {
+    match origin {
+        Origin::Foreign => DATA_NOT_MADE,
+        Origin::Held(_) => DATA_UNREADABLE,
+        Origin::Refused(_) | Origin::Unknown(_) => DATA_UNKNOWN,
+        Origin::System if case_sensitive => CASE_REMEDY,
+        Origin::System => DATA_REMEDY,
+    }
+}
+
+/// Why a private root is refused when no journal names it: what the journals say, and nothing of
+/// what the broker is doing.
+pub const UNNAMED_ROOT_WHY: &str = "no journal names it as unfinished work";
+
+/// What a refusal in the program directory says is kept: the program directory or the entry in it
+/// is not removed, and the manifest is said to record the installation and stay only where one was
+/// read (`recorded`).
+#[must_use]
+pub fn program_keeping(recorded: bool, whole_directory: bool) -> &'static str {
+    match (recorded, whole_directory) {
+        (true, false) => {
+            "Do not remove it: the manifest records the installation and stays where it is."
+        }
+        (false, false) => "Do not remove it.",
+        (true, true) => {
+            "Do not remove the program directory: the manifest records the installation and stays where it is."
+        }
+        (false, true) => "Do not remove the program directory.",
+    }
+}
+
+/// What to do about an entry of the program directory that could not be opened to be checked. No
+/// word says that a program holds it: every cause is a condition, and the one that applies is for
+/// the person to find. `keeping` is what the refusal keeps ([`program_keeping`]).
+#[must_use]
+pub fn program_open_advice(entry: &str, keeping: &str) -> String {
+    format!(
+        "If a program holds {entry} open, close that program. If its list refuses the check, correct who may open it. If it is a link, remove the link itself and not what it points to; if it is not a folder, remove that entry and nothing else. Then run the setup program again. {keeping}"
+    )
 }
 
 /// What to do about an entry of the program directory that the installation does not make there.
