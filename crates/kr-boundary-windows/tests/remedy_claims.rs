@@ -10,9 +10,9 @@ use kr_boundary_windows::remedy::{
     CASE_SENSITIVE_WHY, EntryKind, FolderAct, FolderRead, FolderRecord, Grounds, IntentAct,
     IntentRead, NotProved, Origin, ParentCure, Presence, Purpose, RecordLeft, Standing, Taken,
     choose, data_ending, data_made_ending, ending, folder_act, folder_words, intent_words,
-    left_alone, parent_advice, program_keeping, program_open_advice, rollback_ending,
-    rollback_entry, rollback_failed, rollback_laid_stays, rollback_not_changed, service_program_is,
-    unnamed_root_why,
+    is_this_trees_to_remove, left_alone, parent_advice, program_keeping, program_open_advice,
+    residue_tail, rollback_ending, rollback_entry, rollback_failed, rollback_laid_stays,
+    rollback_not_changed, service_program_is, unnamed_root_why,
 };
 
 /// An installation whose reads found nothing of the installation: the one run that may name a move.
@@ -922,4 +922,52 @@ fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_insta
     assert!(holds.contains("found 1 entry in it"), "{holds}");
     let other = folder_words(folder, FolderRecord::Made, Some(&FolderRead::Other));
     assert!(other.contains("another identity"), "{other}");
+}
+
+#[test]
+fn the_check_after_a_removal_holds_to_gone_only_what_the_tree_acted_on() {
+    // A rollback acts on an object that its own run made, and on no other: an account whose create
+    // failed (an intent), one that the run found, and one that no record holds are not its leftover.
+    assert!(is_this_trees_to_remove(true, Some(Outcome::Made), false));
+    assert!(!is_this_trees_to_remove(true, None, false));
+    assert!(!is_this_trees_to_remove(true, Some(Outcome::Found), false));
+    // The ordinary removal acts on what the manifest holds by result; what a step read and left
+    // alone is not its leftover in either tree.
+    assert!(is_this_trees_to_remove(false, Some(Outcome::Found), false));
+    assert!(is_this_trees_to_remove(false, None, false));
+    assert!(!is_this_trees_to_remove(false, Some(Outcome::Made), true));
+    assert!(!is_this_trees_to_remove(true, Some(Outcome::Made), true));
+    // The clause is the same words as before where nothing stands, and says only what was read.
+    let names = ["krb-checkout".to_owned(), "krb-connect".to_owned()];
+    let accounts = "no account has the identifier that the manifest records for krb-checkout; no account has the identifier that the manifest records for krb-connect";
+    let clean = residue_tail(accounts, &names, true, &[]);
+    assert_eq!(
+        clean,
+        format!(
+            "{accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there"
+        )
+    );
+    // An account that stands and was left alone is named, its sign-in list and the service are not
+    // claimed where no read held them, and the words give no step.
+    let stands = ["the account krb-checkout stands there and this run did not make it".to_owned()];
+    let text = residue_tail(
+        "no account has the identifier that the manifest records for krb-connect",
+        &names[1..],
+        false,
+        &stands,
+    );
+    assert!(text.contains("the account krb-checkout stands there and this run did not make it"));
+    assert!(text.contains("the sign-in list has no value for krb-connect"));
+    assert!(!text.contains("either name") && !text.contains("service is not there"));
+    assert!(
+        text.ends_with(", and the program directory is not there"),
+        "{text}"
+    );
+    for forbidden in ["remove ", "delete ", "by hand", "move "] {
+        assert!(!text.contains(forbidden), "{forbidden} in {text}");
+    }
+    assert_eq!(
+        residue_tail("", &[], false, &[]),
+        "the program directory is not there"
+    );
 }

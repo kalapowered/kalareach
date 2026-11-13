@@ -5454,6 +5454,9 @@ fn undo_recorded(
     // the removal on what a run made or found. An object that is on record as an intent with no
     // result is not acted on, and a line says so.
     let rollback = tree.is_rollback();
+    // What the steps leave alone because it is not theirs to remove; the check after the removal
+    // names it where it stands and holds to "gone" only what a step acted on.
+    let mut left_alone = LeftAlone::default();
     // A rollback has failed already and undoes what it can: a read that fails in one of its steps
     // is kept in the result and the other steps run. The removal stops at the service manager's
     // open and at the broker's first open and status read, before it has changed anything but the
@@ -5505,6 +5508,7 @@ fn undo_recorded(
         }
         _ => false,
     };
+    left_alone.service = !service_is_ours && manifest.find(ObjectKind::Service, SERVICE).is_some();
     // (1) the broker stays up and refuses new invocations.
     let mut session = None;
     let broker_is_there = match service_is_ours
@@ -5878,6 +5882,7 @@ fn undo_recorded(
             read.act() == remedy::IntentAct::Remove
         };
         if !acts {
+            left_alone.accounts.push(name);
             continue;
         }
         keep(
@@ -6012,14 +6017,20 @@ fn undo_recorded(
         }
     }
     if let Some(prior) = &prior {
-        match residue(prior, paths, &manifest) {
-            Ok(Residue {
-                left,
-                shared,
-                unread,
-                stays,
-                accounts,
-            }) if left.is_empty() => {
+        match residue(prior, paths, &manifest, rollback, &left_alone) {
+            Ok(found) if found.left.is_empty() => {
+                let tail = remedy::residue_tail(
+                    &found.accounts,
+                    &found.sign_in_clear,
+                    found.service_clear,
+                    &found.stands,
+                );
+                let Residue {
+                    shared,
+                    unread,
+                    stays,
+                    ..
+                } = found;
                 if let Some(why) = &unread {
                     // text: remove_at-22-unread
                     say(&format!(
@@ -6029,7 +6040,7 @@ fn undo_recorded(
                 if let Some(shared) = shared {
                     // text: remove_at-22-present
                     say(&format!(
-                        "the policy shows no difference from the present policy without the installation's two deny rules ({}, so the earlier-state record is not the comparison{}); {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there",
+                        "the policy shows no difference from the present policy without the installation's two deny rules ({}, so the earlier-state record is not the comparison{}); {tail}",
                         shared.words(),
                         if shared.allow_all_stays {
                             "; the allow-all rule stays"
@@ -6040,18 +6051,18 @@ fn undo_recorded(
                 } else if let Some(stays) = stays {
                     // text: remove_at-22-stays
                     say(&format!(
-                        "the policy shows no difference from the earlier-state record except the executable collection's mode: the collection has the mode {:?}, which stays, and the record held {:?}; {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there",
+                        "the policy shows no difference from the earlier-state record except the executable collection's mode: the collection has the mode {:?}, which stays, and the record held {:?}; {tail}",
                         stays.present, stays.recorded
                     ));
                 } else if unread.is_some() {
                     // text: remove_at-22-unread-rules
                     say(&format!(
-                        "the policy holds no rule of the installation; {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there"
+                        "the policy holds no rule of the installation; {tail}"
                     ));
                 } else {
                     // text: remove_at-22
                     say(&format!(
-                        "the policy shows no difference from the earlier-state record; {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there"
+                        "the policy shows no difference from the earlier-state record; {tail}"
                     ));
                 }
             }
@@ -6310,6 +6321,26 @@ pub struct Residue {
     /// What the check read of the two accounts where nothing of them was found: for each, that no
     /// account has the identifier that the manifest records, or the name where it records none.
     pub accounts: String,
+    /// The objects of the installation's reserved names that stand and are not this tree's to
+    /// remove (see [`LeftAlone`]): one clause each. They are no failure.
+    pub stands: Vec<String>,
+    /// The accounts whose sign-in value was read and found not there.
+    pub sign_in_clear: Vec<String>,
+    /// Whether the broker's service was read and found not there or marked for deletion.
+    pub service_clear: bool,
+}
+
+/// What the steps of a removal or a rollback left alone because it is not theirs to remove: the
+/// accounts and the service that the manifest holds with no result that the installation made
+/// them (the create answered that one stood there, or the run found it), and that a read showed
+/// are not the installation's. The check after the removal holds to "gone" only what a step acted
+/// on; what stands and was left alone is named and is no failure.
+#[derive(Debug, Default)]
+pub struct LeftAlone {
+    /// The names of the accounts that the account step left alone.
+    pub accounts: Vec<String>,
+    /// Whether the service step left the service alone.
+    pub service: bool,
 }
 
 /// What the machine shows of the installation after a removal, and what the policy was compared
@@ -6324,8 +6355,16 @@ pub struct Residue {
 /// # Errors
 ///
 /// Returns the failure of a call that could not look.
-pub fn residue(prior: &Prior, paths: &Paths, manifest: &Manifest) -> Result<Residue, Error> {
+pub fn residue(
+    prior: &Prior,
+    paths: &Paths,
+    manifest: &Manifest,
+    rollback: bool,
+    left_alone: &LeftAlone,
+) -> Result<Residue, Error> {
     let mut left = Vec::new();
+    let mut stands = Vec::new();
+    let mut sign_in_clear = Vec::new();
     let (_, effective) = Channel::new(&paths.staging).effective()?;
     // The record's policy is read here as the removal read it. Where it does not parse, nothing is
     // compared with it: the present policy is only looked at for the installation's rules, and the
@@ -6357,6 +6396,32 @@ pub fn residue(prior: &Prior, paths: &Paths, manifest: &Manifest) -> Result<Resi
     }
     let mut read = Vec::new();
     for name in [CHECKOUT, CONNECT] {
+        // An account that no result shows this tree acted on is not the tree's leftover: a rollback
+        // acts on an account that its run made, and a step that left an account alone said so. It
+        // is looked up by its name, and where it stands it is named and is no failure.
+        let not_theirs = !remedy::is_this_trees_to_remove(
+            rollback,
+            manifest
+                .find(ObjectKind::Account, name)
+                .and_then(|object| object.outcome),
+            left_alone.accounts.iter().any(|left| left == name),
+        );
+        if not_theirs {
+            match account::find(name) {
+                Ok(Some(_)) => stands.push(if rollback {
+                    format!("the account {name} stands there and this run did not make it")
+                } else {
+                    format!(
+                        "the account {name} stands there and the manifest holds no result that the installation made it"
+                    )
+                }),
+                Ok(None) => {}
+                Err(error) => stands.push(format!(
+                    "a lookup of the account {name} failed ({error}), and no result shows that this tree made it"
+                )),
+            }
+            continue;
+        }
         // Each account is looked up by the identifier that the manifest records for it, so an
         // account that has been renamed is found; where the manifest records none, by its name.
         let recorded = manifest
@@ -6389,12 +6454,29 @@ pub fn residue(prior: &Prior, paths: &Paths, manifest: &Manifest) -> Result<Resi
         }
         if account::hidden_from_sign_in(name)? {
             left.push(format!("the sign-in list still has a value for {name}"));
+        } else {
+            sign_in_clear.push(name.to_owned());
         }
     }
-    if let Some(service) = service::manager()?.open(SERVICE)?
-        && !service.marked_for_deletion()?
-    {
-        left.push("the broker's service is still there".to_owned());
+    let service_not_theirs = !remedy::is_this_trees_to_remove(
+        rollback,
+        manifest
+            .find(ObjectKind::Service, SERVICE)
+            .and_then(|object| object.outcome),
+        left_alone.service,
+    );
+    let mut service_clear = false;
+    match service::manager()?.open(SERVICE)? {
+        Some(_) if service_not_theirs => stands.push(if rollback {
+            "the broker's service stands there and this run did not make it".to_owned()
+        } else {
+            "the broker's service stands there and the manifest holds no result that the installation made it"
+                .to_owned()
+        }),
+        Some(service) if !service.marked_for_deletion()? => {
+            left.push("the broker's service is still there".to_owned());
+        }
+        Some(_) | None => service_clear = !service_not_theirs,
     }
     match records::look(&paths.program) {
         records::Look::There => left.push(format!("{} is there", paths.program.display())),
@@ -6410,6 +6492,9 @@ pub fn residue(prior: &Prior, paths: &Paths, manifest: &Manifest) -> Result<Resi
         unread,
         stays,
         accounts: read.join("; "),
+        stands,
+        sign_in_clear,
+        service_clear,
     })
 }
 

@@ -437,3 +437,18 @@ fn the_jobs_proof_and_its_diagnostics_are_two_lists() {
     // A proved run tells the diagnostics beside the outcome.
     assert!(proof.contains("Ok(Some(code)) => Ok((Outcome::Ran(code), job.diagnostics())),"));
 }
+
+#[test]
+fn the_check_after_the_removal_holds_to_gone_only_what_a_step_acted_on() {
+    let source = install_source();
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    // An account or the service that its step left alone is recorded as such, and the check gets
+    // it with the tree's kind.
+    assert!(steps.contains("left_alone.accounts.push(name);"));
+    assert!(steps.contains("left_alone.service ="));
+    assert!(steps.contains("residue(prior, paths, &manifest, rollback, &left_alone)"));
+    let check = code_of(body_of(&source, "pub fn residue("));
+    assert_eq!(count(&check, "remedy::is_this_trees_to_remove("), 2);
+    // The words of what the check read come from one place, and the four endings use it.
+    assert_eq!(count(&steps, "{tail}"), 4);
+}
