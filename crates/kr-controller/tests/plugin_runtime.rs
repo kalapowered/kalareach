@@ -2328,9 +2328,17 @@ struct Held {
     binding: kr_protocol::ids::BrokerBindingId,
     /// What the account says when the link gives that registration up.
     given_up: String,
+    /// What the account says when the runtime refuses a registration of the binding.
+    refused: String,
     /// What the account says when the link has removed what the runtime holds of the binding.
     removal: String,
 }
+
+/// What a case says when the link removed what the runtime holds of the binding before the step
+/// the case relies on: the runtime answered its health question inside the case's setup, which the
+/// case is built to fit between two answers, thirty seconds apart.
+const OVERRUN: &str = "the link removed what the runtime holds of the binding before the step this \
+    case relies on: its setup did not fit inside one health interval of the runtime";
 
 impl World {
     /// Runs the second package's program and registers its binding, which keeps the connection to
@@ -2392,8 +2400,53 @@ impl World {
             kept_binding,
             binding,
             given_up: format!("ended register {label} gone"),
+            refused: format!("ended register {label} refused"),
             removal: format!("ended unbind {label} "),
         }
+    }
+
+    /// Waits until the runtime holds `bindings` bindings, as [`Self::holding`] does, and fails at
+    /// once, naming the cause, if the link has removed anything of the binding meanwhile: a
+    /// registration of it that the runtime made would then be one the link had already removed.
+    async fn holding_before_any_removal(&self, held: &Held, bindings: u64) {
+        until_found(
+            PATIENCE,
+            "the plugin runtime to hold the bindings",
+            || async {
+                assert_eq!(self.traced(&held.removal).await, 0, "{OVERRUN}");
+                self.health()
+                    .await
+                    .filter(|health| health.live_bindings == bindings)
+                    .map(|_| ())
+                    .ok_or_else(String::new)
+            },
+            || self.link_traces_after_a_look(),
+        )
+        .await;
+    }
+
+    /// Waits until the link's account says `marker` the `nth` time and says `removal` after it, and
+    /// fails at once, naming the cause, if it says `removal` before: the link removed what the
+    /// runtime holds of the binding before the step `marker` is.
+    async fn until_removed_after(&self, held: &Held, marker: &str, nth: usize) {
+        until_found(
+            PATIENCE,
+            &format!(
+                "the link to remove what the runtime holds of the binding after '{marker}' \
+                 {nth} times"
+            ),
+            || async {
+                let account = self.link_traces_after_a_look().await;
+                let marked = account.match_indices(marker).nth(nth - 1).map(|(at, _)| at);
+                match (marked, account.find(&held.removal)) {
+                    (Some(marked), Some(removed)) if removed > marked => Ok(()),
+                    (_, Some(_)) => panic!("{OVERRUN}"),
+                    (_, None) => Err(String::new()),
+                }
+            },
+            || self.link_traces_after_a_look(),
+        )
+        .await;
     }
 
     /// Waits until the first package's binding is registered, and the runtime holds it and the
@@ -2438,7 +2491,9 @@ impl World {
 ///
 /// The link asks that when the runtime answers its health question, which is every thirty seconds
 /// while a binding is registered; the case begins when one has been answered, so that the calls
-/// it gives up are not removed before the host holds both.
+/// it gives up are not removed before the host holds both. It says so, and does not pass or wait
+/// for what cannot come, when the link removed anything of the binding before the second call was
+/// given up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_binding_whose_two_registrations_were_given_up_is_registered_when_it_is_wanted_again() {
     let Some(component) = well_behaved() else {
@@ -2456,7 +2511,7 @@ async fn a_binding_whose_two_registrations_were_given_up_is_registered_when_it_i
         .await;
     world.until_traced(&held.given_up, 1).await;
     world.open_the_gate();
-    world.holding(2).await;
+    world.holding_before_any_removal(&held, 2).await;
 
     // The binding is wanted again, and its next registration is held at the gate; it is not wanted
     // again, and that registration is given up as well.
@@ -2472,10 +2527,10 @@ async fn a_binding_whose_two_registrations_were_given_up_is_registered_when_it_i
         .await;
     world.until_traced(&held.given_up, 2).await;
 
-    // The runtime answers, and the link removes what it gave up. The host holds one registration
-    // of the binding live and one being made, which the gate still holds.
-    let removed = world.traced(&held.removal).await;
-    world.until_traced(&held.removal, removed + 1).await;
+    // The runtime answers, and the link removes what it gave up, and not before both calls were
+    // given up. The host holds one registration of the binding live and one being made, which the
+    // gate still holds.
+    world.until_removed_after(&held, &held.given_up, 2).await;
     world.open_the_gate();
 
     // The binding is wanted again, and is registered, as the broker wants.
@@ -2492,26 +2547,31 @@ async fn a_binding_whose_two_registrations_were_given_up_is_registered_when_it_i
 /// it the binding is restored while the host still holds its registration at the gate: the
 /// registration it is then sent is refused, the link removes the one being made, and the host goes
 /// on with it and finds it removed.
+///
+/// The link removes what it gave up when the runtime answers, and the case is begun after the
+/// runtime has answered its health question and says so if that comes again before the step the
+/// case relies on: the binding is restored while the runtime holds the registration live or being
+/// made, which is shown by the refusal of the registration it is then sent.
 async fn revoked_and_restored_once(answer_first: bool) {
     let Some(component) = well_behaved() else {
         return;
     };
     let world = World::start_with_two_packages(&component).await;
     let created = world.session().await;
-    let held = world.hold_a_registration(&created, false).await;
+    let held = world.hold_a_registration(&created, true).await;
     world
         .name_the_policy(Some("disable_at_next_admission"))
         .await;
     world.until_traced(&held.given_up, 1).await;
     if answer_first {
         world.open_the_gate();
-        world.holding(2).await;
+        world.holding_before_any_removal(&held, 2).await;
         world.name_the_policy(None).await;
+        world.until_removed_after(&held, &held.refused, 1).await;
     } else {
         world.name_the_policy(None).await;
-        // Refused while the host holds the first, before the gate is opened.
-        let refused = held.given_up.replace("gone", "refused");
-        world.until_traced(&refused, 1).await;
+        // Refused while the host holds the first, and the first removed, before the gate is opened.
+        world.until_removed_after(&held, &held.refused, 1).await;
         world.open_the_gate();
     }
     world.registered_once(&held).await;
