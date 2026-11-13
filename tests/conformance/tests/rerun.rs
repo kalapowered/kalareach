@@ -187,25 +187,27 @@ fn a_step_that_fails_in_another_way_is_not_run_again() {
     );
 }
 
-/// A file under the target directory that is not a program a build wrote, such as a program a
-/// test of the repository leaves there, is not a reason to run a step again, whatever the log says
-/// of it.
+/// A file under the target directory that is not a program Cargo built, such as a program a test
+/// of the repository leaves there or one that is in a profile directory with no record of it in
+/// Cargo's, is not a reason to run a step again, whatever the log says of it.
 #[cfg(unix)]
 #[test]
 fn a_file_that_no_build_wrote_is_not_a_reason_to_run_a_step_again() {
-    let tree = Tree::new();
-    let program = tree.root.join("target/fixtures/helper");
-    let done = fault::execute(
-        &step(&[&tree.marker, &program]),
-        1,
-        &tree.place(),
-        &[],
-        &mut Duration::from_secs(3600),
-        &mut |_| {},
-    );
-    assert_eq!(done.exit, Some(101), "the step ran once");
-    assert!(done.rerun.is_none());
-    assert!(program.exists(), "the file is left where it is");
+    for program in ["target/fixtures/helper", "target/debug/helper"] {
+        let tree = Tree::new();
+        let program = tree.root.join(program);
+        let done = fault::execute(
+            &step(&[&tree.marker, &program]),
+            1,
+            &tree.place(),
+            &[],
+            &mut Duration::from_secs(3600),
+            &mut |_| {},
+        );
+        assert_eq!(done.exit, Some(101), "the step ran once");
+        assert!(done.rerun.is_none(), "{}", program.display());
+        assert!(program.exists(), "the file is left where it is");
+    }
 }
 
 /// Two runs of a step that took longer than the time the report leaves for second runs would end
@@ -214,6 +216,7 @@ fn a_file_that_no_build_wrote_is_not_a_reason_to_run_a_step_again() {
 #[test]
 fn a_step_whose_first_run_took_longer_than_the_time_left_is_not_run_again() {
     let tree = Tree::new();
+    std::fs::create_dir_all(tree.profile.join(".fingerprint/x-0123456789abcdef")).unwrap();
     let program = tree
         .profile
         .join("build/x-0123456789abcdef/build-script-build");
@@ -225,6 +228,62 @@ fn a_step_whose_first_run_took_longer_than_the_time_left_is_not_run_again() {
     assert!(done.rerun.is_none());
     let error = done.error.expect("the step has the reason");
     assert!(error.contains("is not run again"), "{error}");
+}
+
+/// What a second run takes is taken from the time left for second runs, so that a step after it
+/// finds less, and none, there.
+#[cfg(unix)]
+#[test]
+fn the_time_a_second_run_takes_is_taken_from_the_time_left_for_second_runs() {
+    let mut left = Duration::from_secs(1);
+    let run = |left: &mut Duration| {
+        let tree = Tree::new();
+        std::fs::create_dir_all(tree.profile.join(".fingerprint/x-0123456789abcdef")).unwrap();
+        let program = tree
+            .profile
+            .join("build/x-0123456789abcdef/build-script-build");
+        let mut slow = step(&[&tree.marker, &program]);
+        slow.command[2] = format!("sleep 1; {SCRIPT}");
+        fault::execute(&slow, 1, &tree.place(), &[], left, &mut |_| {})
+    };
+    let first = run(&mut left);
+    assert!(first.rerun.is_some(), "the first step was run again");
+    assert_eq!(left, Duration::ZERO, "its second run took the second left");
+    let second = run(&mut left);
+    assert!(
+        second.rerun.is_none(),
+        "nothing was left for the second step"
+    );
+    assert_eq!(second.exit, Some(101));
+    let error = second.error.expect("the step has the reason");
+    assert!(error.contains("is not run again"), "{error}");
+}
+
+/// A step run again whose first run's evidence could not be kept ends red, whatever its second run
+/// came to.
+#[cfg(unix)]
+#[test]
+fn a_step_run_again_whose_first_runs_evidence_was_not_kept_ends_red() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.profile.join(".fingerprint/x-0123456789abcdef")).unwrap();
+    // The directory for the facts cannot be made where a file stands.
+    std::fs::create_dir_all(tree.evidence.join("conformance")).unwrap();
+    std::fs::write(tree.evidence.join("conformance/faults"), "").unwrap();
+    let program = tree
+        .profile
+        .join("build/x-0123456789abcdef/build-script-build");
+    let done = fault::execute(
+        &step(&[&tree.marker, &program]),
+        1,
+        &tree.place(),
+        &[],
+        &mut Duration::from_secs(3600),
+        &mut |_| {},
+    );
+    assert_eq!(done.exit, Some(0), "the second run passed");
+    assert!(done.rerun.is_some());
+    let error = done.error.expect("the step has an error");
+    assert!(error.contains("evidence was not kept"), "{error}");
 }
 
 /// The report over the `forms` tree with `step` as its only step, building into `target`.
@@ -265,7 +324,7 @@ fn rerun_report(source: Option<&Path>) -> (Document, tempfile::TempDir, PathBuf)
         .tempdir()
         .expect("an evidence directory");
     let target = directory.path().join("target");
-    std::fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
+    std::fs::create_dir_all(target.join("debug/.fingerprint/x-0123456789abcdef")).unwrap();
     let program = target
         .join("debug/build/x-0123456789abcdef")
         .join("build-script-build");
@@ -276,7 +335,15 @@ fn rerun_report(source: Option<&Path>) -> (Document, tempfile::TempDir, PathBuf)
     (document, evidence, program)
 }
 
-/// A run in which a step linked a program that was cut short and the second run passed: the run
+/// Whether the cause is the kernel's own evidence. On a machine whose kernel log holds a storage
+/// error from the last minutes, the cause of a whole file is the runner's disk, with that evidence
+/// in the reason, and a case about the file has nothing to judge there.
+#[cfg(unix)]
+fn blamed_on_the_kernel_log(rerun: &fault::Rerun) -> bool {
+    rerun.cause == Cause::RunnerDisk && rerun.reason.contains("the kernel logged")
+}
+
+/// A run in which a step linked a program that was empty and the second run passed: the run
 /// passes, with one warning annotation naming the step and the program, and the count as its last
 /// line.
 #[cfg(unix)]
@@ -310,6 +377,9 @@ fn a_run_with_a_step_run_again_for_a_whole_program_ends_red_with_no_warning() {
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
     let (document, _evidence, _) = rerun_report(Some(&script));
     let rerun = document.steps[0].rerun.as_ref().expect("run again");
+    if blamed_on_the_kernel_log(rerun) {
+        return;
+    }
     assert_eq!(rerun.cause, Cause::Unexplained, "{}", rerun.reason);
     assert_eq!(document.steps[0].exit, Some(0), "the second run passed");
     assert!(!document.passed());
@@ -327,6 +397,9 @@ fn a_whole_program_the_linker_signed_is_not_taken_for_the_runner_s_disk() {
     let program = std::env::current_exe().unwrap();
     let (document, _evidence, _) = rerun_report(Some(&program));
     let rerun = document.steps[0].rerun.as_ref().expect("run again");
+    if blamed_on_the_kernel_log(rerun) {
+        return;
+    }
     assert_eq!(rerun.cause, Cause::Unexplained, "{}", rerun.reason);
     assert!(
         rerun.reason.contains("signature is valid"),
