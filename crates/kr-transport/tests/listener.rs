@@ -1007,6 +1007,25 @@ struct ServingHandler {
     let_go: tokio::sync::Notify,
     /// How many times the handler has let go of its streams.
     let_go_done: AtomicUsize,
+    /// Whether each stream was revoked at the moment the handler let go of it, in the order they
+    /// were let go of.
+    revoked_when_let_go: std::sync::Mutex<Vec<bool>>,
+}
+
+/// Notes whether its stream is revoked when the handler lets go of it.
+struct Noting {
+    handler: Arc<ServingHandler>,
+    handle: kr_transport::streams::StreamHandle,
+}
+
+impl Drop for Noting {
+    fn drop(&mut self) {
+        self.handler
+            .revoked_when_let_go
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(self.handle.is_revoked());
+    }
 }
 
 impl PairedDirectory for ServingHandler {
@@ -1034,8 +1053,9 @@ impl HostHandler for ServingHandler {
             loop {
                 tokio::select! {
                     Some(stream) = session.data_streams.recv() => {
-                        self.streams.lock().await.push(stream.handle());
-                        held.push(stream);
+                        let handle = stream.handle();
+                        self.streams.lock().await.push(handle.clone());
+                        held.push((stream, Noting { handler: Arc::clone(&self), handle }));
                     }
                     () = self.let_go.notified() => {
                         held.clear();
@@ -1062,6 +1082,20 @@ enum First {
     Handler,
     /// The connection closes, while the reader is held before it declares the loss.
     Connection,
+}
+
+/// The first data stream the handler takes, which it waits for no longer than a hang needs.
+async fn first_stream(handler: &ServingHandler) -> kr_transport::streams::StreamHandle {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(handle) = handler.streams.lock().await.first().cloned() {
+                return handle;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the handler takes the data stream")
 }
 
 /// Starts a listener for `handler` whose connections end under `hold`.
@@ -1109,6 +1143,7 @@ async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
         finish: tokio::sync::Notify::new(),
         let_go: tokio::sync::Notify::new(),
         let_go_done: AtomicUsize::new(0),
+        revoked_when_let_go: std::sync::Mutex::new(Vec::new()),
     });
     let hold = EndHold::default();
     let listener = start_serving(&host, Arc::clone(&handler), hold.clone()).await;
@@ -1131,12 +1166,7 @@ async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
         .open(&connection, terminal_header(authorised.connection_id))
         .await
         .expect("a data stream");
-    let handle = loop {
-        if let Some(handle) = handler.streams.lock().await.first().cloned() {
-            break handle;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    let handle = first_stream(&handler).await;
 
     // The reader is held where the connection or the handler ends the session first, so that the
     // listener has dropped the handler, and the handler's streams with it, before the loss is
@@ -1161,6 +1191,18 @@ async fn a_stream_is_revoked_with_the_loss_of_the_control_stream(first: First) {
             handle.is_revoked(),
             "the stream is revoked when the handler has gone"
         );
+        if first == First::Connection {
+            // The listener ended the session while the handler was serving, and revoked the streams
+            // before it dropped the handler: the handler let go of a revoked stream.
+            assert_eq!(
+                *handler
+                    .revoked_when_let_go
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                [true],
+                "the stream is revoked before the handler lets go of it"
+            );
+        }
         release_cleanup.send(()).expect("the cleanup goes on");
         reader = Some(release_reader);
     }
@@ -1200,6 +1242,7 @@ async fn a_stream_the_handler_let_go_of_is_revoked_with_the_loss_of_the_control_
         finish: tokio::sync::Notify::new(),
         let_go: tokio::sync::Notify::new(),
         let_go_done: AtomicUsize::new(0),
+        revoked_when_let_go: std::sync::Mutex::new(Vec::new()),
     });
     let listener = start_serving(&host, Arc::clone(&handler), EndHold::default()).await;
     let connection = client
@@ -1221,12 +1264,7 @@ async fn a_stream_the_handler_let_go_of_is_revoked_with_the_loss_of_the_control_
         .open(&connection, terminal_header(authorised.connection_id))
         .await
         .expect("a data stream");
-    let handle = loop {
-        if let Some(handle) = handler.streams.lock().await.first().cloned() {
-            break handle;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    let handle = first_stream(&handler).await;
 
     handler.let_go.notify_one();
     wait_until(|| handler.let_go_done.load(Ordering::Acquire) == 1).await;

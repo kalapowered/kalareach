@@ -1305,18 +1305,29 @@ async fn serve_authorised<H: HostHandler>(
     // direction, has the consequence section 23 gives it straight away rather than waiting for a
     // handler that may be blocked on a worker.
     let mut served = Arc::clone(&state.handler).serve(session);
+    // Declared after the handler, so that it is dropped before it wherever this task ends: the
+    // streams are revoked before the handler is dropped, whichever of the three ended the session,
+    // and when the task is cancelled or the handler panics. Dropping the handler ends the streams
+    // it holds and takes them out of the registry.
+    let revoking = RevokeStreams(Arc::clone(&streams));
     tokio::select! {
         () = &mut served => {}
         () = lost.happened() => {}
         _ = connection.closed() => {}
     }
-    // The streams are revoked before the handler is dropped: dropping it ends the streams it holds
-    // and takes them out of the registry, and the loss has to be declared to them first, whichever
-    // of the three ended the session.
-    streams.revoke_streams();
+    drop(revoking);
     drop(served);
     drop(cleanup);
     Ok(())
+}
+
+/// Revokes a connection's streams when it is dropped.
+struct RevokeStreams(Arc<StreamRegistry>);
+
+impl Drop for RevokeStreams {
+    fn drop(&mut self) {
+        self.0.revoke_streams();
+    }
 }
 
 /// Where a test holds the end of a connection, so that an order of its parts that one connection in
@@ -1344,8 +1355,8 @@ impl EndHold {
         self.declaration.arm()
     }
 
-    /// Holds a connection's cleanup after its handler has been dropped and before it revokes the
-    /// connection's streams and runs the host's hook. The ends are as for
+    /// Holds a connection's cleanup after its handler has been dropped, and its streams revoked,
+    /// and before the cleanup runs the host's hook. The ends are as for
     /// [`Self::hold_the_declaration`].
     #[must_use]
     pub fn hold_the_cleanup(

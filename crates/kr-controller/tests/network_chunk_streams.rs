@@ -962,7 +962,7 @@ async fn the_loss_of_the_control_stream_ends_the_chunks_that_have_not_begun_thei
 
 /// The same, for a connection whose end reaches the listener before its control reader has
 /// declared the loss: the connection's stream tasks are gone, and so are their registrations, when
-/// the listener ends the connection, and the loss is declared after that.
+/// the listener ends the connection, and the reader never declares the loss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_loss_ends_the_chunks_that_have_not_begun_their_effect_where_the_connection_ends_first()
 {
@@ -1006,8 +1006,9 @@ async fn a_lost_control_stream_ends_the_chunks_that_have_not_begun_their_effect(
         )
     });
     device.raw.close();
-    let _reader = if let Some(((reading, reader), (cleaning, cleanup))) = held_end {
-        arrived(reading).await;
+    // The reader may be stopped at its hold, or may never reach it: the listener ends the connection
+    // first, and the cleanup stops a reader that has not run. Either way it has not declared.
+    let _reader = if let Some(((_reading, reader), (cleaning, cleanup))) = held_end {
         arrived(cleaning).await;
         let mut ended = host.network().chunk_tasks_ended();
         tokio::time::timeout(WAIT, ended.wait_for(|ended| *ended >= 1))

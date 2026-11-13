@@ -559,7 +559,7 @@ impl Network {
     }
 
     /// Holds the cleanup of the next ending connection after its handler has been dropped and
-    /// before it revokes the connection's streams. The ends are as for
+    /// before it runs the host's hook. The ends are as for
     /// [`Self::hold_the_declaration_of_the_loss`].
     #[cfg(feature = "testing")]
     #[must_use]

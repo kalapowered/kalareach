@@ -140,9 +140,9 @@ impl ChunkStreams {
     ///
     /// A stream that is revoked already replaces nothing and is given no place: a stream the
     /// transport queued before its connection was lost must not revoke the stream the same device
-    /// holds on its new connection. The revoked state is read under the registry's lock, and the
-    /// transport revokes a lost connection's streams under its own, so a stream seen live here that
-    /// is revoked a moment later is revoked by whoever replaces it next as any other is.
+    /// holds on its new connection. The revoked state is read under the registry's lock, and a lost
+    /// connection's loss is a state every stream of it reads, so a stream seen live here that is
+    /// revoked a moment later is revoked by whoever replaces it next as any other is.
     pub(super) fn stand(
         self: &Arc<Self>,
         principal: &ActorId,
