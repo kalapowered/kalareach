@@ -4216,6 +4216,23 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         }
         records::Begin::Remove(manifest) => manifest,
     };
+    undo_recorded(paths, manifest, approved, seen, program_checked)
+}
+
+/// The removal's steps for the objects that `manifest` records, after an inspection approved what is
+/// in the data directory: the broker held in maintenance, the policy put back, the Application
+/// Identity service's start type, the release proved through the broker, the service, the accounts,
+/// the program directory, the journal's directories and the records. Each step is tried whatever an
+/// earlier one answered, and the steps that failed are returned together. `approved` and `seen` are
+/// what the inspection opened; `program_checked` says whether the program directory was opened and
+/// approved.
+fn undo_recorded(
+    paths: &Paths,
+    manifest: Manifest,
+    mut approved: records::Approved,
+    seen: records::Seen,
+    program_checked: bool,
+) -> Result<(), Error> {
     // A record that was approved and cannot be loaded is not used, and the last words say so.
     let (prior, prior_error) = match approved.prior_record(|| Prior::load(&paths.prior)) {
         Ok(prior) => (prior, None),
