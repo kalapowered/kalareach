@@ -3560,6 +3560,256 @@ async fn a_package_extracted_for_a_newer_sdk_is_refused_by_its_range_and_the_ins
     assert_eq!(installed.package_digest, generation.manifest_digest());
 }
 
+fn connector_id() -> PluginId {
+    PluginId::new("kalareach/example-connector").expect("a valid plugin identifier")
+}
+
+/// The example connector package, copied under `into` as the release `version` that states
+/// `range`, with a table that carries the member that arrived at SDK 0.1.7 when `hidden_when` is
+/// set. The manifest declares the table's digest and size, so the copy is a whole package.
+fn connector_release(
+    into: &std::path::Path,
+    version: &str,
+    range: &str,
+    hidden_when: bool,
+) -> std::path::PathBuf {
+    let directory = into.join(format!("connector-{version}"));
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/plugins/valid/example-connector");
+    for name in ["plugin.json", "presentation.json", "connector.json"] {
+        std::fs::copy(example.join(name), directory.join(name)).expect("copies");
+    }
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(directory.join(name)).expect("reads")).expect("JSON")
+    };
+    let mut table = read("connector.json");
+    if hidden_when {
+        table["messages"] =
+            serde_json::json!({ "params": "params", "result": "result", "error": "error" });
+        table["observation"] = serde_json::json!({ "selections": [{
+            "method": "status.read",
+            "thread": { "segments": [
+                { "type": "member", "name": "result" },
+                { "type": "member", "name": "thread" },
+                { "type": "member", "name": "id" },
+            ] },
+            "hidden_when": [{
+                "place": { "segments": [
+                    { "type": "member", "name": "params" },
+                    { "type": "member", "name": "marked" },
+                ] },
+                "values": ["x"],
+            }],
+        }] });
+    }
+    let table_bytes = serde_json::to_vec_pretty(&table).expect("writes");
+    std::fs::write(directory.join("connector.json"), &table_bytes).expect("writes");
+    let mut manifest = read("plugin.json");
+    manifest["version"] = serde_json::json!(version);
+    manifest["sdk_range"] = serde_json::json!(range);
+    let record = manifest["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .iter_mut()
+        .find(|payload| payload["path"] == "connector.json")
+        .expect("the table's payload");
+    record["digest"] = serde_json::json!(PayloadDigest::of(&table_bytes).to_string());
+    record["size_bytes"] = serde_json::json!(table_bytes.len().to_string());
+    std::fs::write(
+        directory.join("plugin.json"),
+        serde_json::to_vec_pretty(&manifest).expect("writes"),
+    )
+    .expect("writes");
+    directory
+}
+
+/// Installs a release of the example connector as the owner, who confirms the grant that gives it
+/// every capability it asks for.
+async fn install_connector(
+    catalogue: &mut Catalogue,
+    entry: &kr_plugin_sdk::catalogue::IndexEntry,
+    version: &PackageVersion,
+    digest: PayloadDigest,
+) -> CatalogueResult<Installation> {
+    let grant =
+        InstallationGrant::with(entry.capabilities.iter().map(|request| request.capability));
+    catalogue
+        .install_with(
+            &repository(),
+            environment(),
+            &connector_id(),
+            version,
+            digest,
+            grant,
+            None,
+            &mut Change::new(&Owner::confirming()),
+        )
+        .await
+        .map(|view| view.installation)
+}
+
+/// A catalogue with the first release of the example connector installed, and a second release
+/// that its repository lists and that another host extracted into the store: the second release
+/// states `range` and carries the table that `hidden_when` says. Nothing of the second release was
+/// fetched. Returns the catalogue, the first release's digest, the second release's entry, the
+/// record of fetches and how many there were.
+async fn connector_with_an_extracted_release(
+    home: &std::path::Path,
+    range: &str,
+    hidden_when: bool,
+) -> (
+    Catalogue,
+    PayloadDigest,
+    kr_plugin_sdk::catalogue::IndexEntry,
+    Metered,
+    usize,
+) {
+    let first = connector_release(home, "0.1.0", ">=0.1.1, <0.2.0", false);
+    let second = connector_release(home, "0.2.0", range, hidden_when);
+    let manifest_bytes = std::fs::read(second.join("plugin.json")).expect("reads");
+    let manifest: kr_plugin_sdk::plugin::PluginManifest =
+        serde_json::from_slice(&manifest_bytes).expect("a manifest");
+    let entry = kr_plugin_sdk::catalogue::IndexEntry::from_manifest(
+        &manifest,
+        PayloadDigest::of(&manifest_bytes),
+        manifest_bytes.len() as u64,
+    );
+    let generation = Generation::build(
+        home,
+        GenerationSpec {
+            package: Some(first),
+            listed_only: vec![entry.clone()],
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home,
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a generation that lists the second release is taken");
+    let metered = Metered::default();
+    catalogue.set_transport(Arc::new(metered.clone()));
+    install_connector(
+        &mut catalogue,
+        &entry,
+        &PackageVersion::parse("0.1.0").expect("a valid version"),
+        generation.manifest_digest(),
+    )
+    .await
+    .expect("the first release installs");
+    let fetched = metered.fetches("/packages/");
+
+    // The other host's extraction: the files are where an activation puts them, whole.
+    let store = catalogue.store(&repository()).expect("enrolled");
+    let directory = store.package_dir(entry.manifest_digest);
+    std::fs::create_dir_all(&directory).expect("a directory");
+    for name in ["plugin.json", "presentation.json", "connector.json"] {
+        std::fs::copy(second.join(name), directory.join(name)).expect("copies");
+    }
+    assert!(
+        complete(&store, entry.manifest_digest),
+        "the extracted package checks out as a package held here"
+    );
+    (
+        catalogue,
+        generation.manifest_digest(),
+        entry,
+        metered,
+        fetched,
+    )
+}
+
+/// A package in the store that the package check refuses is not installed, by its digest or
+/// through its entry: the refusal has the check's own words, nothing is fetched, and the release
+/// that is installed stays. The check is the one the worker runs on an installed package, so the
+/// installation never records a package that the worker then refuses.
+#[tokio::test]
+async fn a_package_in_the_store_that_the_package_check_refuses_is_not_installed() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let (mut catalogue, first, entry, metered, fetched) =
+        connector_with_an_extracted_release(home.path(), ">=0.1.7, <0.2.0-rc.1", true).await;
+
+    let by_digest = install_connector(
+        &mut catalogue,
+        &entry,
+        &entry.version,
+        entry.manifest_digest,
+    )
+    .await
+    .expect_err("the package check refuses the extracted package");
+    let through_entry = catalogue
+        .activate_package(
+            &repository(),
+            &connector_id(),
+            &entry.version,
+            FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect_err("the package check refuses the extracted package");
+    for refusal in [&by_digest, &through_entry] {
+        let CatalogueError::UnsafePackage { detail } = refusal else {
+            panic!("{refusal:?}");
+        };
+        assert!(
+            detail.contains("SelectionRoute.hidden_when") && detail.contains("SDK 0.1.7"),
+            "{detail}"
+        );
+    }
+    assert_eq!(metered.fetches("/packages/"), fetched, "nothing is fetched");
+    let installed = catalogue
+        .installation(environment(), &connector_id())
+        .expect("readable")
+        .expect("still installed");
+    assert_eq!(
+        installed.version,
+        PackageVersion::parse("0.1.0").expect("a valid version")
+    );
+    assert_eq!(installed.package_digest, first);
+}
+
+/// A package in the store that the package check admits is installed from the store without a
+/// fetch, by its digest and through its entry.
+#[tokio::test]
+async fn a_package_in_the_store_that_the_package_check_admits_is_installed_without_a_fetch() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let (mut catalogue, _first, entry, metered, fetched) =
+        connector_with_an_extracted_release(home.path(), ">=0.1.7, <0.2.0", true).await;
+
+    let digest = catalogue
+        .activate_package(
+            &repository(),
+            &connector_id(),
+            &entry.version,
+            FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect("the package check admits the extracted package");
+    assert_eq!(digest, entry.manifest_digest);
+    install_connector(
+        &mut catalogue,
+        &entry,
+        &entry.version,
+        entry.manifest_digest,
+    )
+    .await
+    .expect("the package check admits the extracted package");
+    assert_eq!(metered.fetches("/packages/"), fetched, "nothing is fetched");
+    let installed = catalogue
+        .installation(environment(), &connector_id())
+        .expect("readable")
+        .expect("installed");
+    assert_eq!(installed.version, entry.version);
+    assert_eq!(installed.package_digest, entry.manifest_digest);
+}
+
 /// Reads the local repository, and records every address fetched with the bytes its answer
 /// delivered.
 #[derive(Clone, Debug, Default)]
@@ -8161,6 +8411,45 @@ async fn a_package_whose_repository_was_removed_is_held_to_the_limits_in_force_w
             .expect("within the limits it is enabled");
         assert!(enabled.enabled, "{resource}");
     }
+}
+
+/// A package whose repository was removed is held to the package check when it is enabled, as a
+/// package enabled through its repository is: a package that every declared file is whole in, and
+/// that the check refuses for another reason, stays disabled and the refusal has the check's own
+/// words.
+#[tokio::test]
+async fn a_package_whose_repository_was_removed_is_held_to_the_package_check_when_enabled() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+    let store = catalogue.store(&repository()).expect("enrolled");
+    std::fs::write(
+        store
+            .package_dir(generation.manifest_digest())
+            .join("undeclared.bin"),
+        b"a file the manifest does not declare",
+    )
+    .expect("writes");
+    assert!(complete(&store, generation.manifest_digest()));
+    catalogue
+        .remove_repository(&repository())
+        .expect("the owner stopped trusting this root");
+
+    let refusal = catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect_err("the package check refuses the package");
+    let CatalogueError::UnsafePackage { detail } = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert!(detail.contains("undeclared.bin"), "{detail}");
+    assert!(
+        !catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("still installed")
+            .enabled
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

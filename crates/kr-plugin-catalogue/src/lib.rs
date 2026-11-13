@@ -1915,17 +1915,13 @@ impl Catalogue {
         // where it lies. Its name is not the package: one that is incomplete or altered is fetched
         // again and replaced, and one this host cannot read is its disk's failure. The same check
         // holds it to the limits in force: a limit lowered since it was extracted refuses it here
-        // rather than letting a kept copy through.
+        // rather than letting a kept copy through. The package check of its directory, which the
+        // worker runs on an installed package, then holds it too: a package that the worker would
+        // refuse is not given back as installable.
         if let Some(hash) = package_hash {
             match store.check_package(hash, limits)? {
                 PackageCheck::Complete(package) => {
-                    // A package a host of a later SDK extracted into this store is not installed by
-                    // its digest for a host that cannot run it.
-                    extract::check_extracted_sdk_range(
-                        package.manifest(),
-                        &format!("{plugin_id} {version}"),
-                    )?;
-                    return Ok(*package);
+                    return admit_kept(store, *package, &format!("{plugin_id} {version}"));
                 }
                 PackageCheck::PastALimit(limit) => return Err(limit.into()),
                 PackageCheck::Missing { .. } | PackageCheck::Corrupt { .. } => {}
@@ -1964,7 +1960,7 @@ impl Catalogue {
         match store.check_package(entry.manifest_digest, limits)? {
             PackageCheck::Complete(package) => {
                 extract::reconcile(&entry, package.manifest(), &subject)?;
-                return Ok(*package);
+                return admit_kept(store, *package, &subject);
             }
             PackageCheck::PastALimit(limit) => return Err(limit.into()),
             PackageCheck::Missing { .. } | PackageCheck::Corrupt { .. } => {}
@@ -2727,7 +2723,13 @@ impl Catalogue {
                     match store
                         .check_package(installation.package_digest, self.limits.get().package)?
                     {
-                        PackageCheck::Complete(_) => {}
+                        PackageCheck::Complete(package) => {
+                            admit_kept(
+                                &store,
+                                *package,
+                                &format!("{plugin_id} {}", installation.version),
+                            )?;
+                        }
                         PackageCheck::PastALimit(limit) => return Err(limit.into()),
                         PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
                             return Err(CatalogueError::UnavailableOffline {
@@ -3152,6 +3154,24 @@ fn reclaim(
     // dropping it commits nothing.
     drop(pending);
     Ok(())
+}
+
+/// Gives back a package that is already here, once the package check of its directory passes: the
+/// check that the worker runs on an installed package before it runs a connector. A package whose
+/// files are whole may still be one that this host's worker refuses (another host with other rules
+/// extracted it into the same store), and an installation never records such a package. A refusal
+/// has the check's own words.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::UnsafePackage`] listing every finding of the check.
+fn admit_kept(
+    store: &Store,
+    package: ReadyPackage,
+    subject: &str,
+) -> CatalogueResult<ReadyPackage> {
+    extract::check_staged(&store.package_dir(package.digest()), subject)?;
+    Ok(package)
 }
 
 /// Checks that an installation may proceed: the ceiling and the grant, the pin on what it
