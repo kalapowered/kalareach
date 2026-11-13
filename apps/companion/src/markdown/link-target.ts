@@ -10,8 +10,10 @@
  *
  * Among the links of a message, a point belongs to the link whose words are nearest to it. A point
  * that no link's target holds is no link's. A link's target is the region of its words, grown to the
- * least size and to the room beside them, and held to the pane. At an equal distance the earlier link
- * in the message takes the point.
+ * least size and to the room beside them, and held to the pane. Where the pane cuts one side of a
+ * target, the other side grows by what was cut, so a link at the pane's edge keeps the least size
+ * too; the room that gives back goes to a link only where no other link's words are nearer. At an
+ * equal distance the earlier link in the message takes the point.
  */
 
 /** A point in the page's coordinates. */
@@ -52,12 +54,18 @@ const EQUAL = 1e-6
  * gives: no target reaches past it.
  */
 export function linkAt(point: Point, links: readonly Link[], reach: Reach, bounds: Rect): number | null {
+  const distances = links.map(({ words }) => Math.min(...words.map((rect) => distanceTo(rect, point))))
+  const closest = Math.min(...distances)
   let chosen: number | null = null
   let nearest = Number.POSITIVE_INFINITY
   for (let index = 0; index < links.length; index += 1) {
     const { words } = links[index] ?? { words: [] }
-    if (!words.some((rect) => holds(within(targetOf(rect, reach), bounds), point))) continue
-    const distance = Math.min(...words.map((rect) => distanceTo(rect, point)))
+    const distance = distances[index] ?? Number.POSITIVE_INFINITY
+    const own = words.some((rect) => holds(within(targetOf(rect, reach), bounds), point))
+    // What the pane's edge cut from one side is given back on the other, but not where it takes a
+    // point from the link whose words are nearer.
+    const given = !own && distance <= closest + EQUAL && words.some((rect) => holds(fitted(targetOf(rect, reach), bounds), point))
+    if (!own && !given) continue
     if (distance < nearest - EQUAL) {
       chosen = index
       nearest = distance
@@ -83,6 +91,32 @@ function within(rect: Rect, bounds: Rect): Rect {
     top: Math.max(rect.top, bounds.top),
     bottom: Math.min(rect.bottom, bounds.bottom)
   }
+}
+
+/**
+ * `rect` held to `bounds`, with each cut given back: where an edge of `bounds` cuts one side of the
+ * rectangle, the opposite side grows by what was cut, in both directions. A rectangle larger than
+ * `bounds` in a direction fills `bounds` there.
+ */
+function fitted(rect: Rect, bounds: Rect): Rect {
+  const across = fit(rect.left, rect.right, bounds.left, bounds.right)
+  const down = fit(rect.top, rect.bottom, bounds.top, bounds.bottom)
+  return { left: across[0], right: across[1], top: down[0], bottom: down[1] }
+}
+
+/** The span from `low` to `high` held to the span from `min` to `max`, a cut on one side given to the other. */
+function fit(low: number, high: number, min: number, max: number): readonly [number, number] {
+  let from = low
+  let to = high
+  if (from < min) {
+    to += min - from
+    from = min
+  }
+  if (to > max) {
+    from -= to - max
+    to = max
+  }
+  return [Math.max(from, min), to]
 }
 
 function holds(rect: Rect, point: Point): boolean {

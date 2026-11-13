@@ -151,29 +151,93 @@ describe('a plain line between two links', () => {
 })
 
 describe('a link at each edge of the pane', () => {
-  const atStart = [words(16, 100, 8)]
-  const atEnd = [words(366, 100, 8)]
+  // The pane gives no room beside its words: a line's words start at the pane's left edge and end at
+  // its right edge, and the last line of a conversation ends 10.7 px above the pane's bottom edge.
+  const atStart = [words(0, 100, 8)]
+  const atEnd = [words(382, 100, 8)]
 
-  it('is pressable out to the pane’s edge and no further', () => {
-    expect(press(1, 108, [atStart])).toBe(0)
-    expect(press(0, 108, [atStart])).toBe(0)
-    expect(press(389, 108, [atEnd])).toBe(0)
-    expect(press(390, 108, [atEnd])).toBe(0)
-    expect(press(392, 108, [atEnd])).toBeNull()
+  it('keeps its least size where the pane cuts one side: the cut room goes to the other side', () => {
+    // 8 px of words are 56 wide as a target on Android (24 each side) and 52 on iOS (22 each side);
+    // the pane cuts 24 and 22 of them at the start, and the target takes them back after the words.
+    expect(press(0, 108.5, [atStart], ANDROID)).toBe(0)
+    expect(press(48, 108.5, [atStart], ANDROID)).toBe(0)
+    expect(press(56, 108.5, [atStart], ANDROID)).toBe(0)
+    expect(press(56.1, 108.5, [atStart], ANDROID)).toBeNull()
+    expect(press(44, 108.5, [atStart], IOS)).toBe(0)
+    expect(press(52, 108.5, [atStart], IOS)).toBe(0)
+    expect(press(52.1, 108.5, [atStart], IOS)).toBeNull()
   })
 
-  it('has the room the pane gives, so a narrow label beside the edge keeps what is left of its target', () => {
-    // A label 8 wide is 56 wide as a target, 28 each side of its middle at 20: the pane holds it at 0.
-    expect(press(0, 108, [[words(16, 100, 8)]])).toBe(0)
-    expect(press(48, 108, [[words(16, 100, 8)]])).toBe(0)
-    expect(press(48.5, 108, [[words(16, 100, 8)]])).toBeNull()
+  it('does the same at the end of a line, sideways the other way', () => {
+    expect(press(390, 108.5, [atEnd], ANDROID)).toBe(0)
+    expect(press(342, 108.5, [atEnd], ANDROID)).toBe(0)
+    expect(press(334, 108.5, [atEnd], ANDROID)).toBe(0)
+    expect(press(333.9, 108.5, [atEnd], ANDROID)).toBeNull()
+    expect(press(346, 108.5, [atEnd], IOS)).toBe(0)
+    expect(press(338, 108.5, [atEnd], IOS)).toBe(0)
+    expect(press(337.9, 108.5, [atEnd], IOS)).toBeNull()
+  })
+
+  it('is no wider than the pane where the pane is narrower than the least size', () => {
+    const narrow: Rect = { left: 0, top: 0, right: 40, bottom: 844 }
+    expect(press(-1, 108.5, [atStart], ANDROID, narrow)).toBeNull()
+    expect(press(0, 108.5, [atStart], ANDROID, narrow)).toBe(0)
+    expect(press(40, 108.5, [atStart], ANDROID, narrow)).toBe(0)
+    expect(press(41, 108.5, [atStart], ANDROID, narrow)).toBeNull()
+  })
+
+  it('has the same least size above, where the last line of a conversation is cut below its words', () => {
+    // The words end 10.7 px above the pane's bottom: the target's 48 dp reach 15.5 px under the
+    // words, so the pane cuts 4.8 px of it, and the target takes them back above the words.
+    const last = [words(100, 816.3, 120)]
+    expect(press(150, 844, [last], ANDROID)).toBe(0)
+    expect(press(150, 796, [last], ANDROID)).toBe(0)
+    expect(press(150, 795.9, [last], ANDROID)).toBeNull()
+    expect(press(150, 800, [last], IOS)).toBe(0)
+    expect(press(150, 799.9, [last], IOS)).toBeNull()
+  })
+
+  it('has the same least size below, where the first line is cut above its words', () => {
+    const first = [words(100, 4, 120)]
+    expect(press(150, 0, [first], ANDROID)).toBe(0)
+    expect(press(150, 48, [first], ANDROID)).toBe(0)
+    expect(press(150, 48.1, [first], ANDROID)).toBeNull()
+  })
+
+  it('keeps the least size in both directions at a corner of the pane', () => {
+    const corner = [words(0, 816.3, 8)]
+    expect(press(0, 844, [corner], ANDROID)).toBe(0)
+    expect(press(56, 796, [corner], ANDROID)).toBe(0)
+    expect(press(56.1, 796, [corner], ANDROID)).toBeNull()
+    expect(press(56, 795.9, [corner], ANDROID)).toBeNull()
+  })
+
+  it('takes no point that is nearer to another link’s words than to its own', () => {
+    // At the start of the line the first link's target takes back 24 px to the right, out to x 56.
+    // The point (40, 108) is 32 px from its words; the second link's words are 16 px under it and
+    // its own target (which reaches 15.5 px above its words) does not hold it, but they are nearer.
+    const first = [words(0, 100, 8)]
+    const second = [words(36, 124, 24)]
+    expect(press(40, 108, [first, second])).toBeNull()
+    expect(press(40, 108, [second, first])).toBeNull()
+    // Where no other link's words are nearer, the room given back is the first link's.
+    expect(press(40, 108, [first])).toBe(0)
+  })
+
+  it('takes a point in the room given back where another link’s words are only as near', () => {
+    const first = [words(0, 100, 8)]
+    const second = [words(64, 100, 8)]
+    expect(press(36, 108.5, [first, second])).toBe(0)
+    expect(press(36, 108.5, [second, first])).toBe(1)
   })
 
   it('takes a press at each edge for the link there, when both edges have a link', () => {
-    const start = [words(16, 100, 8)]
-    const end = [words(366, 100, 8)]
-    expect(press(388, 108, [start, end])).toBe(1)
-    expect(press(2, 108, [start, end])).toBe(0)
+    expect(press(388, 108.5, [atStart, atEnd])).toBe(1)
+    expect(press(2, 108.5, [atStart, atEnd])).toBe(0)
+  })
+
+  it('is pressable out to the pane’s edge and no further', () => {
+    expect(press(392, 108.5, [atEnd])).toBeNull()
   })
 })
 
