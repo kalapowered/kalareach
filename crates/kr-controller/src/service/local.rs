@@ -6,20 +6,21 @@ use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
 use kr_ipc::peer::PeerIdentity;
 use kr_protocol::authority::EffectClass;
-use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Outcome, Response};
+use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{ActionWindow, ProtocolVersion, ReceiveLimits};
-use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, RequestId};
+use kr_protocol::ids::{ActorId, ConnectionId, RequestId};
 use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_transport::window::MAX_WINDOW_VALIDITY;
 
 use crate::error::{ControllerError, Result};
-use crate::given::{Given, Recorded};
+use crate::given::local_door::{Declined, DoorReply, ReplySink, Standing, declined, told};
+use crate::given::{Given, Recorded, Settled};
 
-use super::identifiers::Arrival;
+use super::identifiers::{Arrival, SpendError};
 use super::{Controller, error_reply, net, respond};
 
 /// How often the daemon replaces a live connection's action window.
@@ -107,38 +108,6 @@ pub const RETAINED_MACHINE_ANSWERS: [Method; 3] = [
     Method::MachineMerge,
     Method::MachineSplit,
 ];
-
-/// What the local door answers a mutation with, and so how the answer is written.
-pub(super) enum DoorReply {
-    /// A refusal that carries no result: for example the connection's registration was withdrawn,
-    /// no lease is live, the method is not in the registry, the admission refuses the request (its
-    /// window, target or parameters), or the authority an answer already held is asked again and
-    /// refuses it. Nothing is withheld, and the refusal is written as it is.
-    Refused(ControlFrame),
-    /// What the mutation produced, or the answer its action already had. A held method's answer is
-    /// a result and is written only while the local owner's lease holds.
-    Answered(ControlFrame),
-}
-
-/// The reply for an answer a record supplied, once the check it is owed has been asked: written
-/// as an answer when the check passed, and as the check's own refusal when it did not.
-fn door_reply(given: Given<ControlFrame>) -> DoorReply {
-    if given.is_withheld() {
-        DoorReply::Refused(given.into_answer())
-    } else {
-        DoorReply::Answered(given.into_answer())
-    }
-}
-
-impl DoorReply {
-    /// The frame, whichever it is.
-    #[cfg(test)]
-    fn into_frame(self) -> ControlFrame {
-        match self {
-            Self::Refused(frame) | Self::Answered(frame) => frame,
-        }
-    }
-}
 
 /// Serves each connection `listener` accepts on a task of its own, until accepting fails or `serve`
 /// declines a connection by answering `None`.
@@ -328,7 +297,7 @@ impl Controller {
     /// no room it is asked again each time the peer reads, so an answer that waited for a peer is
     /// not finished under a lease that ended meanwhile: one none of which has gone is taken back
     /// and its refusal written, and one the peer has part of ends the connection.
-    pub(super) async fn write_answer(
+    pub(crate) async fn write_answer(
         &self,
         writer: &mut kr_ipc::framed::FrameWriter,
         kind: StreamKind,
@@ -522,13 +491,9 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-        connection_id: ConnectionId,
-        admitted: Option<AuthorityRevision>,
     ) -> Option<Recorded<ControlFrame>> {
         if matches!(method, Method::AgentToolsInstall | Method::AgentToolsRemove) {
-            return self
-                .retained_installation(actor_id, mutation, connection_id, admitted)
-                .await;
+            return self.retained_installation(actor_id, mutation).await;
         }
         self.retained_by_store(actor_id, mutation, method).await
     }
@@ -805,15 +770,6 @@ impl Controller {
                         crate::transfer::WRONG_ENDPOINT,
                     )
                 }
-                ControlFrame::Mutation(mutation)
-                    if negotiated && !crate::transfer::carries(kind, mutation.method.method()) =>
-                {
-                    error_reply(
-                        mutation.request_id,
-                        ErrorCode::PermissionDenied,
-                        crate::transfer::WRONG_ENDPOINT,
-                    )
-                }
                 ControlFrame::Request(request) if negotiated && Self::releases(&request) => {
                     // The attention store's reads carry session text and a session's description
                     // carries what a model wrote. Neither leaves this daemon except under the
@@ -916,31 +872,20 @@ impl Controller {
                     }
                 }
                 ControlFrame::Mutation(mutation) if negotiated => {
-                    let confirm = mutation.action_id;
-                    let request_id = mutation.request_id;
-                    let method = mutation.method.method();
-                    // Receipt time, before anything this daemon waits for.
-                    let received_at = self.clock.now();
-                    let reply = self
-                        .perform_at(&actor_id, connection_id, origin, *mutation, received_at)
-                        .await;
-                    // The acceptance reaches the caller here. A worker that is holding a close for
-                    // this action learns that it has, and only then starts signalling. A refusal
-                    // made before anything ran carries no result and is written as it is. The
-                    // answer of a held method is written only while the lease holds, asked again
-                    // before every transport write; a result that waited for a worker or a store
-                    // is withheld once the lease has ended.
-                    let written = match &reply {
-                        DoorReply::Refused(refusal) => writer.write_message(refusal).await.is_ok(),
-                        DoorReply::Answered(answer) => {
-                            self.write_answer(writer, kind, answer, method, request_id)
-                                .await
-                        }
-                    };
-                    if !written {
+                    // The reply is written only by the sink, which this arm hands the connection's
+                    // writer to for the one request.
+                    if !self
+                        .serve_mutation(
+                            ReplySink::new(writer, kind),
+                            &actor_id,
+                            connection_id,
+                            origin,
+                            *mutation,
+                        )
+                        .await
+                    {
                         break;
                     }
-                    self.confirm_delivery(confirm).await;
                     continue;
                 }
                 _ => error_reply(
@@ -954,6 +899,44 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    /// Performs one mutation that arrived on a local connection and writes its reply, and says
+    /// whether the connection goes on.
+    ///
+    /// The reply is written only by `sink`, which consumes it: a mutation on a stream of the wrong
+    /// kind is declined, and every other reply is the one [`Self::perform_at`] made. The loop that
+    /// serves the connection holds no writer for this request and no reply of its own.
+    pub(super) async fn serve_mutation(
+        self: &Arc<Self>,
+        sink: ReplySink<'_>,
+        actor_id: &ActorId,
+        connection_id: ConnectionId,
+        origin: Option<kr_protocol::local::BridgeOrigin>,
+        mutation: MutationRequest,
+    ) -> bool {
+        let confirm = mutation.action_id;
+        let request_id = mutation.request_id;
+        let method = mutation.method.method();
+        if !crate::transfer::carries(sink.kind(), method) {
+            let reply = declined(Declined::WrongEndpoint, request_id);
+            return sink.write(self, reply, method).await;
+        }
+        // Receipt time, before anything this daemon waits for.
+        let received_at = self.clock.now();
+        let reply = self
+            .perform_at(actor_id, connection_id, origin, mutation, received_at)
+            .await;
+        // The acceptance reaches the caller here. A worker that is holding a close for this action
+        // learns that it has, and only then starts signalling. A refusal made before anything ran
+        // carries no result and is written as it is; the answer of a held method is written only
+        // while the lease holds, asked again before every transport write, and a result that
+        // waited for a worker or a store is withheld once the lease has ended.
+        if !sink.write(self, reply, method).await {
+            return false;
+        }
+        self.confirm_delivery(confirm).await;
+        true
     }
 
     /// Admits one mutation as [`Self::perform_at`] does, for a request that has just arrived, for
@@ -999,29 +982,18 @@ impl Controller {
         mutation: MutationRequest,
         received_at: kr_transport::clock::ContinuousInstant,
     ) -> DoorReply {
-        if let Err(error) = self.authorised(connection_id) {
-            return DoorReply::Refused(error_reply(
-                mutation.request_id,
-                ErrorCode::PermissionDenied,
-                error.to_string(),
-            ));
+        let request_id = mutation.request_id;
+        if let Err(refusal) = self.authorised(connection_id) {
+            return declined(Declined::Unauthorised(refusal), request_id);
         }
         let Some(method) = mutation.method.method() else {
-            return DoorReply::Refused(error_reply(
-                mutation.request_id,
-                ErrorCode::PermissionDenied,
-                "the method is not in the registry",
-            ));
+            return declined(Declined::NotInRegistry, request_id);
         };
         // On a host that is exclusively organisation-managed the local owner answers to a
         // membership lease like a member, so a held method is refused here, before a retained
         // answer is looked for, once no lease is live.
-        if let Err(error) = self.local_hold(method) {
-            return DoorReply::Refused(error_reply(
-                mutation.request_id,
-                error.code(),
-                error.to_string(),
-            ));
+        if let Err(refusal) = self.local_hold(method) {
+            return declined(Declined::Lease(refusal), request_id);
         }
         // The arrival is recorded as soon as the door has the mutation, so that a copy that arrives
         // on another connection while this arrival looks for a retained answer, or reads the other
@@ -1047,9 +1019,10 @@ impl Controller {
         // authority the other door refuses the same mutation under. A retained answer is checked
         // against it, and so is every effect this door performs.
         let admitted = self.admitted_revision(connection_id).ok();
-        let mut retained = self
-            .retained(actor_id, &mutation, method, connection_id, admitted)
-            .await;
+        // What every reply is told under: the connection the request arrived on and the revision it
+        // was admitted under.
+        let standing = Standing::new(self, connection_id, admitted, request_id);
+        let mut retained = self.retained(actor_id, &mutation, method).await;
         if retained.is_none() && crate::transfer::TransferModule::serves(method) {
             retained = self.transfer.retained(actor_id, &mutation, method).await;
         }
@@ -1085,30 +1058,21 @@ impl Controller {
         #[cfg(feature = "testing")]
         self.after_the_retained_lookup.wait().await;
         if let Some(retained) = retained {
-            return door_reply(retained.checked_frame(mutation.request_id, || {
-                self.check_retained_answer(connection_id, admitted)
-            }));
+            return told(Settled::of(retained.copied()), &standing).await;
         }
         // A first admission spends an identifier no other method of this actor has spent, and holds
         // it until its effect has ended.
         let spending = match self.spend_the_identifier(actor_id, &mutation, method).await {
             Ok(spending) => spending,
-            Err(error) => {
-                // The conflict says that another request spent the identifier, which is another
-                // attempt's word. The search waited for a blocking task, so it goes back only under
-                // the authority this arrival still has, asked with the conflict in hand.
-                let error = if matches!(error, ControllerError::IdConflict { .. })
-                    && let Err(lapsed) = self.check_retained_answer(connection_id, admitted)
-                {
-                    lapsed
-                } else {
-                    error
-                };
-                return DoorReply::Refused(error_reply(
-                    mutation.request_id,
-                    error.code(),
-                    error.to_string(),
-                ));
+            // The conflict says that another request spent the identifier, which is another
+            // attempt's word. The search waited for a blocking task, so it is told only under the
+            // authority this arrival still has, asked with the conflict in hand.
+            Err(SpendError::Conflict(error)) => {
+                let conflict = Given::fresh(respond(request_id, Err(error)));
+                return told(Settled::of(conflict), &standing).await;
+            }
+            Err(SpendError::Failed(failed)) => {
+                return declined(Declined::Spend(failed), request_id);
             }
         };
         let accepted = match self.check_envelope(connection_id, &mutation, method, received_at) {
@@ -1119,14 +1083,14 @@ impl Controller {
             // the only thing that knows whether it holds one. So the mutation goes on with no
             // freshness at all: a retry finds its receipt there, and a first admission is refused
             // there for the same reason it would have been refused here.
-            Err(ControllerError::WindowExpired { .. }) if forwarded_to_worker(method) => None,
+            Err(error) if error.is_window_expired() && forwarded_to_worker(method) => None,
             // The same holds for an exact repeat of a transfer action that claimed an effect and
             // was interrupted before it settled. The repeat is the original request, window
             // included, and on a connection that did not issue that window, or on one where it has
             // expired, it admits nothing. The service finishes what the claim began and begins
             // nothing.
-            Err(error @ ControllerError::WindowExpired { .. })
-                if crate::transfer::TransferModule::serves(method) =>
+            Err(error)
+                if error.is_window_expired() && crate::transfer::TransferModule::serves(method) =>
             {
                 // Asked before the claim is, so that a first attempt that writes its claim and ends
                 // between the two is read as its claim and not missed as an absent one.
@@ -1141,11 +1105,7 @@ impl Controller {
                     #[cfg(feature = "testing")]
                     self.after_a_copy_looked_for_a_claim.wait().await;
                     if another_may_carry_it_out(&mut arrival).await {
-                        return self.the_attempt_that_holds_the_action(
-                            &mutation,
-                            connection_id,
-                            admitted,
-                        );
+                        return the_attempt_that_holds_the_action(&standing, request_id).await;
                     }
                     settling = self.transfer.settles(actor_id, &mutation, method).await;
                 }
@@ -1155,17 +1115,12 @@ impl Controller {
                     // of the action or by the sweep: what it recorded is the answer, under the
                     // check any retained answer is owed.
                     crate::transfer::Settling::Answered(answer) => {
-                        return door_reply(answer.checked_frame(mutation.request_id, || {
-                            self.check_retained_answer(connection_id, admitted)
-                        }));
+                        return told(Settled::of(answer.copied()), &standing).await;
                     }
                     // No claim, and no arrival that may carry the action out: a first admission,
                     // which has no window.
                     crate::transfer::Settling::No => {
-                        return DoorReply::Refused(ControlFrame::Response(Response {
-                            request_id: mutation.request_id,
-                            outcome: Outcome::Error(error.to_protocol_error()),
-                        }));
+                        return declined(Declined::Envelope(error), request_id);
                     }
                 }
             }
@@ -1176,8 +1131,8 @@ impl Controller {
             // first admission, and is refused for its window, unless another arrival may carry
             // the action out: a copy that arrives before the first attempt has written its claim
             // is told that what became of the action is not known.
-            Err(error @ ControllerError::WindowExpired { .. })
-                if crate::project::ProjectModule::serves(method) =>
+            Err(error)
+                if error.is_window_expired() && crate::project::ProjectModule::serves(method) =>
             {
                 // Asked before the claim is, as for a transfer action above.
                 let another_holds = another_may_carry_it_out(&mut arrival).await;
@@ -1188,37 +1143,22 @@ impl Controller {
                     #[cfg(feature = "testing")]
                     self.after_a_copy_looked_for_a_claim.wait().await;
                     if another_may_carry_it_out(&mut arrival).await {
-                        return self.the_attempt_that_holds_the_action(
-                            &mutation,
-                            connection_id,
-                            admitted,
-                        );
+                        return the_attempt_that_holds_the_action(&standing, request_id).await;
                     }
                     held = self.project.held_answer(actor_id, &mutation, method).await;
                 }
                 let Some(held) = held else {
-                    return DoorReply::Refused(ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Error(error.to_protocol_error()),
-                    }));
+                    return declined(Declined::Envelope(error), request_id);
                 };
-                return door_reply(held.checked_frame(mutation.request_id, || {
-                    self.check_retained_answer(connection_id, admitted)
-                }));
+                return told(Settled::of(held.copied()), &standing).await;
             }
-            Err(error) => {
-                return DoorReply::Refused(ControlFrame::Response(Response {
-                    request_id: mutation.request_id,
-                    outcome: Outcome::Error(error.to_protocol_error()),
-                }));
-            }
+            Err(error) => return declined(Declined::Envelope(error), request_id),
         };
         // From here this arrival carries the action out, and a copy that finds no claim yet asks
         // whether it may.
         if let Some(arrival) = arrival.as_mut() {
             arrival.runs();
         }
-        let request_id = mutation.request_id;
         let controller = Arc::clone(self);
         let actor_id = actor_id.clone();
         let effect = tokio::spawn(async move {
@@ -1238,36 +1178,15 @@ impl Controller {
                 )
                 .await
         });
-        DoorReply::Answered(effect.await.unwrap_or_else(|_| {
-            error_reply(
+        // The join error is the daemon's own word, and may follow an effect that ran.
+        let settled = effect.await.unwrap_or_else(|_| {
+            Settled::of(Given::fresh(error_reply(
                 request_id,
                 ErrorCode::OutcomeUnknown,
                 "the daemon could not report what happened to this action",
-            )
-        }))
-    }
-
-    /// The answer to a copy of an action that no claim answers while another arrival may carry the
-    /// action out: its first attempt has not written the claim and goes on to carry the action out,
-    /// so it may have been done by the time the copy asks again. It passes the check any
-    /// retained answer is owed, as the answers about a claim do.
-    fn the_attempt_that_holds_the_action(
-        &self,
-        mutation: &MutationRequest,
-        connection_id: ConnectionId,
-        admitted: Option<AuthorityRevision>,
-    ) -> DoorReply {
-        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
-            return DoorReply::Refused(error_reply(
-                mutation.request_id,
-                error.code(),
-                error.to_string(),
-            ));
-        }
-        DoorReply::Answered(respond(
-            mutation.request_id,
-            Err(ControllerError::attempt_still_running()),
-        ))
+            )))
+        });
+        told(settled, &standing).await
     }
 
     /// Returns the answer a retained installation action is owed.
@@ -1279,24 +1198,29 @@ impl Controller {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-        connection_id: ConnectionId,
-        admitted: Option<AuthorityRevision>,
     ) -> Option<Recorded<ControlFrame>> {
         let installer = self.installer().ok()?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        // Waiting for the lock takes time, and a retained result is a read of somebody's action:
+        // the door asks the authority the caller still has once the lookups have ended.
         let _admission = self.agent_tools.lock().await;
-        // Waiting for that lock takes time, and a retained result is a read of somebody's action.
-        // Section 9 checks current authority before returning one, so it is checked after the wait
-        // rather than before it. A refusal made here goes out as a retained answer does, through
-        // the check every retained answer is owed once the lookups have ended.
-        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
-            return Some(Recorded::read(respond(mutation.request_id, Err(error))));
-        }
         installer
             .retained(actor_id, mutation.action_id, &digest)
             .present()
             .map(|found| found.respond(mutation.request_id))
     }
+}
+
+/// The answer to a copy of an action that no claim answers while another arrival may carry the
+/// action out: its first attempt has not written the claim and goes on to carry the action out, so
+/// it may have been done by the time the copy asks again. It is a record of that attempt's claim,
+/// and is told under the check any such answer is owed.
+async fn the_attempt_that_holds_the_action(
+    standing: &Standing<'_>,
+    request_id: RequestId,
+) -> DoorReply {
+    let answer = respond(request_id, Err(ControllerError::attempt_still_running()));
+    told(Settled::of(Given::copied(answer)), standing).await
 }
 
 /// Whether another arrival under the identifier may carry the action out, asked by a copy that is

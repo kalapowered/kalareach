@@ -3462,7 +3462,8 @@ async fn an_installation_admitted_before_a_revocation_is_refused_at_its_marker()
             Some(accepted),
             Some(admitted_at),
         )
-        .await;
+        .await
+        .into_answer_for_test();
 
     let ControlFrame::Response(Response {
         outcome: Outcome::Error(refused),

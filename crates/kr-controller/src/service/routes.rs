@@ -6,14 +6,17 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, ControllerGeneration, GrantId};
+use kr_protocol::ids::{
+    ActorId, AuthorityRevision, ConnectionId, ControllerGeneration, GrantId, RequestId,
+};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
-use crate::given::Given;
+use crate::given::{Given, Settled};
 
+use super::writes::LocalWrite;
 use super::{Controller, encode, error_reply, net, parse, respond};
 
 /// The local write methods this daemon performs itself that take no admission into a service:
@@ -380,395 +383,328 @@ impl Controller {
         origin: Option<kr_protocol::local::BridgeOrigin>,
         accepted: Option<AcceptedDeadline>,
         admitted: Option<AuthorityRevision>,
-    ) -> ControlFrame {
-        if net::methods::serves(method) {
-            // Pairing and owner confirmation are the network module's, and a local caller reaches
-            // them as the host's own account: the issuing owner of what it invites.
-            let caller = self.local_caller(actor_id);
-            let admission = self.pairing_admission(
-                connection_id,
-                admitted,
-                accepted.map(|accepted| accepted.deadline),
-            );
-            let guard = self.pairing_guard(
-                connection_id,
-                admitted,
-                accepted.map(|accepted| accepted.deadline),
-            );
-            let life = self.pairing_life(accepted.map(|accepted| accepted.deadline));
-            let retained = self.pairing_standing(connection_id, admitted);
-            let outcome = self
-                .pairing_write(caller, method, mutation, admission, retained, guard, life)
-                .await
-                .into_answer_or(|| Err(ControllerError::outcome_not_shown()));
-            return respond(mutation.request_id, outcome);
-        }
-        if crate::transfer::TransferModule::serves(method) {
-            // The stored subject is read first, because reading it waits: for a blocking thread
-            // and for the journal's lock. The admission is asked after it, inside the service's
-            // own work, so that answer is the last thing between this mutation and its effect
-            // rather than one more thing with waits after it.
-            match self
-                .transfer
-                .check_subject_of_record(actor_id, mutation, method)
-                .await
-            {
-                Ok(None) => {}
-                // What the stored subject says goes back as it is, which is the word this door
-                // gives it without a check.
-                Ok(Some(refused)) => {
-                    return ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Error(refused.copied().into_answer()),
-                    });
-                }
-                Err(error) => {
-                    return ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Error(error),
-                    });
-                }
-            }
-            let Some(admitted_revision) = admitted else {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    "the authority this connection was admitted under has been withdrawn; open a \
-                     new connection",
-                );
-            };
-            // The admission travels into the service's blocking work and is asked there, once no
-            // retained record has answered and immediately before the action: this task, a
-            // blocking thread and the journal are all waited for before it. It is the check every
-            // service asks from inside its work, so a fence this host owes, a registration it has
-            // withdrawn or replaced, and a deadline that has passed each stop the action.
-            let carried = crate::authority::AdmittedMutation {
-                connection_id,
-                admitted_revision,
-                deadline: accepted.map(|accepted| accepted.deadline),
-            };
-            // This service answers its own retained actions before this point, so anything still
-            // travelling is a first admission, which needs the deadline it was admitted under, or
-            // an exact repeat of an action that claimed an effect and was interrupted. A mutation
-            // carrying no freshness is only ever the second: the service refuses it unless its
-            // action has such a claim, and lets it finish that and begin nothing.
-            let admission = match accepted {
-                Some(_) => crate::transfer::TransferAdmission::new(Arc::clone(self), carried),
-                None => crate::transfer::TransferAdmission::settling(Arc::clone(self), carried),
-            };
-            // The person at this machine has no bound on the drafts it keeps, and is told every
-            // answer whole except a copy the service withheld, which is told as not shown.
-            return self
-                .transfer
-                .write_frame(actor_id, mutation, method, admission, None)
-                .await
-                .into_answer_or(|| {
-                    error_reply(
-                        mutation.request_id,
-                        ErrorCode::OutcomeUnknown,
-                        ControllerError::outcome_not_shown().to_string(),
-                    )
-                });
-        }
-        if crate::voice::VoiceModule::serves(method) {
-            // Section 23 gives `voice.grant` both ingresses: a paired device changes its own voice
-            // grant, and the person at this machine changes a device's. The other four are a
-            // paired device's alone, which the registry refuses before this, and an actor on this
-            // socket that resolves to no device reaches none of them.
-            let actor = match self.paired_device(actor_id) {
-                Some(device_id) => crate::voice::VoiceActor::Device(device_id),
-                None if method == Method::VoiceGrant => crate::voice::VoiceActor::Owner,
-                None => {
-                    return error_reply(
-                        mutation.request_id,
-                        ErrorCode::PermissionDenied,
-                        "voice is reachable from a paired device",
-                    );
-                }
-            };
-            // Everything between the envelope check and here can wait: for this task to be
-            // scheduled, for a blocking thread, for the coordinator's own lock. An action whose
-            // accepted deadline passed while it queued does not go on to write. A retry of a
-            // completed voice change is answered from its record before this, so anything still
-            // travelling is a first admission, and a first admission needs a deadline.
-            let Some(accepted) = accepted.filter(|accepted| self.clock.now() < accepted.deadline)
-            else {
-                return respond(
-                    mutation.request_id,
-                    Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
-                );
-            };
-            if let Err(error) = self.authorised(connection_id) {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    error.to_string(),
-                );
-            }
-            let Some(admitted_revision) = admitted else {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    "the authority this connection was admitted under has been withdrawn; open a \
-                     new connection",
-                );
-            };
-            // The admission travels with the change, as it does with a project or an automation
-            // mutation, and the voice service asks it again where it writes.
-            let carried = crate::authority::AdmittedMutation {
-                connection_id,
-                admitted_revision,
-                deadline: Some(accepted.deadline),
-            };
-            // The revision this daemon is at, read now: a voice grant is written under the
-            // authority in force at the moment of the write rather than the one a connection was
-            // admitted under.
-            let authority_revision = self.policy.lock().map_or_else(
-                |_| AuthorityRevision::new(0),
-                |policy| policy.authority_revision(),
-            );
-            return respond(
-                mutation.request_id,
-                self.voice_mutation(
-                    super::voice_actions::VoiceIngress {
-                        actor_id: actor_id.clone(),
-                        actor,
-                        route: None,
-                    },
-                    mutation,
-                    method,
-                    authority_revision,
-                    carried,
-                )
-                .await
-                .into_answer_or(|| Err(ControllerError::outcome_not_shown())),
-            );
-        }
-        if crate::catalogue::CatalogueModule::serves(method) {
-            let Some(admitted_revision) = admitted else {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    "the authority this connection was admitted under has been withdrawn; open a \
-                     new connection",
-                );
-            };
-            let carried = crate::authority::AdmittedMutation {
-                connection_id,
-                admitted_revision,
-                deadline: accepted.map(|accepted| accepted.deadline),
-            };
-            // The admission travels into the catalogue and is asked again where the change
-            // becomes durable, holding the change's registration standing for that commit.
-            let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(
-                crate::catalogue::DaemonAdmission::new(Arc::clone(self), carried),
-            );
-            // The owner's own ceremony, checked by this host's pairing service against its owner
-            // devices. `None` is a host that is not on the network and so has no owner device, and
-            // every method that needs the owner's confirmation (adopting a root, a grant, an
-            // installation that widens what a package may do) is then refused rather than
-            // performed under the identity of whoever asked.
-            let pairing = self.network.get().map(|guard| Arc::clone(guard.pairing()));
-            let confirmations = pairing
-                .as_deref()
-                .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
-            return crate::catalogue::frame(
-                mutation.request_id,
-                self.catalogue_write(actor_id, mutation, method, confirmations, admission)
-                    .await
-                    .into_answer_or(|| {
-                        Err(ControllerError::outcome_not_shown().to_protocol_error())
-                    }),
-            );
-        }
-        if crate::project::ProjectModule::serves(method) {
-            let Some(admitted_revision) = admitted else {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    "the authority this connection was admitted under has been withdrawn; open a \
-                     new connection",
-                );
-            };
-            let carried = crate::authority::AdmittedMutation {
-                connection_id,
-                admitted_revision,
-                deadline: accepted.map(|accepted| accepted.deadline),
-            };
-            return crate::project::frame(
-                mutation.request_id,
-                // The machine's own socket: the caller holds no grant.
-                self.project_mutation(actor_id, mutation, method, carried, None)
-                    .await
-                    .into_answer_or(|| {
-                        Err(ControllerError::outcome_not_shown().to_protocol_error())
-                    }),
-            );
-        }
-        if crate::automation::AutomationModule::serves(method) {
-            let Some(admitted_revision) = admitted else {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    "the authority this connection was admitted under has been withdrawn; open a \
-                     new connection",
-                );
-            };
-            let carried = crate::authority::AdmittedMutation {
-                connection_id,
-                admitted_revision,
-                deadline: accepted.map(|accepted| accepted.deadline),
-            };
-            let answered = crate::automation::frame(
-                mutation.request_id,
-                self.automation_mutation(actor_id, mutation, method, carried, None)
-                    .await
-                    .into_answer_or(|| {
-                        Err(ControllerError::outcome_not_shown().to_protocol_error())
-                    }),
-            );
-            // A run dispatches its nodes and waits for each of them, so the effect and its reply
-            // are separated by however long that took, and a revocation can land in the interval.
-            // What this host must not do is **disclose** an answer under authority that has since
-            // been withdrawn, so the check is made again here, where the reply is about to go out.
-            if let Err(error) = self.authorised(connection_id) {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    error.to_string(),
-                );
-            }
-            return answered;
-        }
-        if crate::attention::AttentionModule::serves(method) {
-            // The attention store's actions are the daemon's own, committed with their records
-            // inside this daemon's guarded operation, so a revocation that begins while one is
-            // committing finishes after it. The deadline is not asked here: a receipt outlives the
-            // window that admitted its action (section 9), so the store reads its record first and
-            // asks the deadline where the action begins.
-            let Some(admitted_revision) = admitted else {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    "the authority this connection was admitted under has been withdrawn; open a \
-                     new connection",
-                );
-            };
-            let carried = crate::authority::AdmittedMutation {
-                connection_id,
-                admitted_revision,
-                deadline: accepted.map(|accepted| accepted.deadline),
-            };
-            let answered = self
-                .attention
-                .write_frame(
-                    self,
-                    &crate::attention::Caller::Owner,
-                    actor_id,
-                    mutation,
-                    method,
-                    &carried,
-                )
-                .await
-                .into_answer_or(|| {
-                    error_reply(
-                        mutation.request_id,
-                        ErrorCode::OutcomeUnknown,
-                        ControllerError::outcome_not_shown().to_string(),
-                    )
-                });
-            if let Err(error) = self.authorised(connection_id) {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    error.to_string(),
-                );
-            }
-            return answered;
-        }
-        if crate::changeset::ChangeSetModule::serves(method) {
-            // Everything between the envelope check and this point can wait: for this task to be
-            // scheduled and for a blocking thread. An action whose connection lost its authority in
-            // the meantime does not go on to write. The deadline is not asked here: a receipt
-            // outlives the window that admitted its action (section 9), so the service reads its
-            // record first and asks the deadline where the action begins.
-            if let Err(error) = self.authorised(connection_id) {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    error.to_string(),
-                );
-            }
-            let Some(admitted_revision) = admitted else {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    "the authority this connection was admitted under has been withdrawn; open a \
-                     new connection",
-                );
-            };
-            // What the change-set service holds its effects under: the connection this mutation
-            // arrived on, the authority revision it was admitted under, and the deadline this
-            // daemon accepted. Between this point and the transaction that commits an effect lie
-            // a blocking task, the journal's own lock and, for a capture, a whole working tree
-            // being read, and authority can run out inside any of them. The service runs each of
-            // those transactions inside this daemon's own guarded operation, so a revocation that
-            // begins while one is committing finishes after it.
-            let carried = crate::authority::AdmittedMutation {
-                connection_id,
-                admitted_revision,
-                deadline: accepted.map(|accepted| accepted.deadline),
-            };
-            let controller = Arc::clone(self);
-            let answered = self
-                .changesets
-                .write_frame(actor_id, mutation, method, carried, controller, None)
-                .await
-                .into_answer_or(|| {
-                    error_reply(
-                        mutation.request_id,
-                        ErrorCode::OutcomeUnknown,
-                        ControllerError::outcome_not_shown().to_string(),
-                    )
-                });
-            // The effect and its reply are separated by everything a blocking task waits for, and
-            // a revocation can land in that interval. What this host must not do is **disclose**
-            // an answer under authority that has since been withdrawn, so the check is made again
-            // here, where the reply is about to go out.
-            if let Err(error) = self.authorised(connection_id) {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    error.to_string(),
-                );
-            }
-            return answered;
-        }
-        // The admission the mutation carries into its transaction: the deadline this daemon
-        // accepted, the authority revision it was admitted under, and the connection it arrived
-        // on. Every service re-checks all three inside its own transaction.
+    ) -> Settled<ControlFrame> {
+        let request_id = mutation.request_id;
+        // A refusal made before the service is asked: nothing of this request's is in it.
+        let refused =
+            |error: ControllerError| Settled::of(Given::fresh(respond(request_id, Err(error))));
+        // What a service answered with a result or a refusal, framed, with where it came from.
+        let framed = |given: Given<Result<ParamsValue>>| {
+            Settled::of(given.map(|outcome| respond(request_id, outcome)))
+        };
+        let withdrawn = || ControllerError::PermissionDenied {
+            detail: "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection"
+                .to_owned(),
+        };
+        let window_passed = || ControllerError::WindowExpired {
+            detail: "the deadline this action was admitted under passed before it could run"
+                .to_owned(),
+        };
+        let Some(kind) = LocalWrite::of(method) else {
+            return refused(ControllerError::InvalidArgument(format!(
+                "{} is not a mutation this daemon serves",
+                method.as_str()
+            )));
+        };
+        // The admission the mutation carries into its service's transaction: the deadline this
+        // daemon accepted, the authority revision it was admitted under, and the connection it
+        // arrived on. Every service re-checks all three inside its own transaction.
         //
-        // The revision is the one `perform` read beside the registration check, before anything
+        // The revision is the one `perform_at` read beside the registration check, before anything
         // waited, and never one read here. A revocation of another device stamps every surviving
         // registration with the revision it advanced to, so a change admitted before it and
         // checked against a revision read afterwards would be checked against the authority that
         // replaced the one it was admitted under.
-        let Some(admitted_revision) = admitted else {
-            return error_reply(
-                mutation.request_id,
-                ErrorCode::PermissionDenied,
-                "the authority this connection was admitted under has been withdrawn; open a new \
-                 connection",
-            );
-        };
-        let carried = crate::authority::AdmittedMutation {
+        let carried = admitted.map(|admitted_revision| crate::authority::AdmittedMutation {
             connection_id,
             admitted_revision,
             deadline: accepted.map(|accepted| accepted.deadline),
+        });
+        match kind {
+            LocalWrite::Pairing => {
+                // Pairing and owner confirmation are the network module's, and a local caller
+                // reaches them as the host's own account: the issuing owner of what it invites.
+                let caller = self.local_caller(actor_id);
+                let deadline = accepted.map(|accepted| accepted.deadline);
+                let admission = self.pairing_admission(connection_id, admitted, deadline);
+                let guard = self.pairing_guard(connection_id, admitted, deadline);
+                let life = self.pairing_life(deadline);
+                let retained = self.pairing_standing(connection_id, admitted);
+                Settled::of(
+                    self.pairing_write(caller, method, mutation, admission, retained, guard, life)
+                        .await
+                        .map(|outcome| respond(request_id, outcome)),
+                )
+            }
+            LocalWrite::Transfer => {
+                // The stored subject is read first, because reading it waits: for a blocking thread
+                // and for the journal's lock. The admission is asked after it, inside the
+                // service's own work, so that answer is the last thing between this mutation and
+                // its effect rather than one more thing with waits after it.
+                match self
+                    .transfer
+                    .check_subject_of_record(actor_id, mutation, method)
+                    .await
+                {
+                    Ok(None) => {}
+                    // What the stored subject says is the record's, a copy of what an earlier
+                    // request left.
+                    Ok(Some(refused)) => {
+                        return Settled::of(refused.copied().map(|error| {
+                            ControlFrame::Response(Response {
+                                request_id,
+                                outcome: Outcome::Error(error),
+                            })
+                        }));
+                    }
+                    Err(error) => {
+                        return Settled::of(Given::fresh(ControlFrame::Response(Response {
+                            request_id,
+                            outcome: Outcome::Error(error),
+                        })));
+                    }
+                }
+                let Some(carried) = carried else {
+                    return refused(withdrawn());
+                };
+                // The admission travels into the service's blocking work and is asked there, once
+                // no retained record has answered and immediately before the action: this task, a
+                // blocking thread and the journal are all waited for before it. It is the check
+                // every service asks from inside its work, so a fence this host owes, a
+                // registration it has withdrawn or replaced, and a deadline that has passed each
+                // stop the action. This service answers its own retained actions before this
+                // point, so anything still travelling is a first admission, which needs the
+                // deadline it was admitted under, or an exact repeat of an action that claimed an
+                // effect and was interrupted: a mutation carrying no freshness is only ever the
+                // second, and the service lets it finish that and begin nothing.
+                let admission = match accepted {
+                    Some(_) => crate::transfer::TransferAdmission::new(Arc::clone(self), carried),
+                    None => crate::transfer::TransferAdmission::settling(Arc::clone(self), carried),
+                };
+                // The person at this machine has no bound on the drafts it keeps.
+                Settled::of(
+                    self.transfer
+                        .write_frame(actor_id, mutation, method, admission, None)
+                        .await,
+                )
+            }
+            LocalWrite::Voice => {
+                // Section 23 gives `voice.grant` both ingresses: a paired device changes its own
+                // voice grant, and the person at this machine changes a device's. The other four
+                // are a paired device's alone, which the registry refuses before this, and an
+                // actor on this socket that resolves to no device reaches none of them.
+                let actor = match self.paired_device(actor_id) {
+                    Some(device_id) => crate::voice::VoiceActor::Device(device_id),
+                    None if method == Method::VoiceGrant => crate::voice::VoiceActor::Owner,
+                    None => {
+                        return refused(ControllerError::PermissionDenied {
+                            detail: "voice is reachable from a paired device".to_owned(),
+                        });
+                    }
+                };
+                // Everything between the envelope check and here can wait: for this task to be
+                // scheduled, for a blocking thread, for the coordinator's own lock. An action whose
+                // accepted deadline passed while it queued does not go on to write. A retry of a
+                // completed voice change is answered from its record before this, so anything
+                // still travelling is a first admission, and a first admission needs a deadline.
+                let Some(accepted) =
+                    accepted.filter(|accepted| self.clock.now() < accepted.deadline)
+                else {
+                    return refused(window_passed());
+                };
+                if let Err(error) = self.authorised(connection_id) {
+                    return refused(error.into());
+                }
+                let Some(admitted_revision) = admitted else {
+                    return refused(withdrawn());
+                };
+                // The admission travels with the change, and the voice service asks it again
+                // where it writes.
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id,
+                    admitted_revision,
+                    deadline: Some(accepted.deadline),
+                };
+                // The revision this daemon is at, read now: a voice grant is written under the
+                // authority in force at the moment of the write rather than the one a connection
+                // was admitted under.
+                let authority_revision = self.policy.lock().map_or_else(
+                    |_| AuthorityRevision::new(0),
+                    |policy| policy.authority_revision(),
+                );
+                framed(
+                    self.voice_mutation(
+                        super::voice_actions::VoiceIngress {
+                            actor_id: actor_id.clone(),
+                            actor,
+                            route: None,
+                        },
+                        mutation,
+                        method,
+                        authority_revision,
+                        carried,
+                    )
+                    .await,
+                )
+            }
+            LocalWrite::Catalogue => {
+                let Some(carried) = carried else {
+                    return refused(withdrawn());
+                };
+                // The admission travels into the catalogue and is asked again where the change
+                // becomes durable, holding the change's registration standing for that commit.
+                let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(
+                    crate::catalogue::DaemonAdmission::new(Arc::clone(self), carried),
+                );
+                // The owner's own ceremony, checked by this host's pairing service against its
+                // owner devices. `None` is a host that is not on the network and so has no owner
+                // device, and every method that needs the owner's confirmation (adopting a root, a
+                // grant, an installation that widens what a package may do) is then refused
+                // rather than performed under the identity of whoever asked.
+                let pairing = self.network.get().map(|guard| Arc::clone(guard.pairing()));
+                let confirmations = pairing
+                    .as_deref()
+                    .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
+                Settled::of(
+                    self.catalogue_write(actor_id, mutation, method, confirmations, admission)
+                        .await
+                        .map(|outcome| crate::catalogue::frame(request_id, outcome)),
+                )
+            }
+            LocalWrite::Project => {
+                let Some(carried) = carried else {
+                    return refused(withdrawn());
+                };
+                // The machine's own socket: the caller holds no grant.
+                Settled::of(
+                    self.project_mutation(actor_id, mutation, method, carried, None)
+                        .await
+                        .map(|outcome| crate::project::frame(request_id, outcome)),
+                )
+            }
+            LocalWrite::Automation => {
+                let Some(carried) = carried else {
+                    return refused(withdrawn());
+                };
+                // A run dispatches its nodes and waits for each of them, so the effect and its
+                // reply are separated by however long that took, and a revocation can land in the
+                // interval. The reply is told under the authority the caller has by then.
+                Settled::of(
+                    self.automation_mutation(actor_id, mutation, method, carried, None)
+                        .await
+                        .map(|outcome| crate::automation::frame(request_id, outcome)),
+                )
+            }
+            LocalWrite::Attention => {
+                // The attention store's actions are the daemon's own, committed with their records
+                // inside this daemon's guarded operation, so a revocation that begins while one is
+                // committing finishes after it. The deadline is not asked here: a receipt outlives
+                // the window that admitted its action (section 9), so the store reads its record
+                // first and asks the deadline where the action begins.
+                let Some(carried) = carried else {
+                    return refused(withdrawn());
+                };
+                Settled::of(
+                    self.attention
+                        .write_frame(
+                            self,
+                            &crate::attention::Caller::Owner,
+                            actor_id,
+                            mutation,
+                            method,
+                            &carried,
+                        )
+                        .await,
+                )
+            }
+            LocalWrite::ChangeSet => {
+                // Everything between the envelope check and this point can wait: for this task to
+                // be scheduled and for a blocking thread. An action whose connection lost its
+                // authority in the meantime does not go on to write. The deadline is not asked
+                // here: a receipt outlives the window that admitted its action (section 9), so the
+                // service reads its record first and asks the deadline where the action begins.
+                if let Err(error) = self.authorised(connection_id) {
+                    return refused(error.into());
+                }
+                let Some(carried) = carried else {
+                    return refused(withdrawn());
+                };
+                // What the change-set service holds its effects under: the connection this
+                // mutation arrived on, the authority revision it was admitted under, and the
+                // deadline this daemon accepted. Between this point and the transaction that
+                // commits an effect lie a blocking task, the journal's own lock and, for a
+                // capture, a whole working tree being read, and authority can run out inside any
+                // of them. The service runs each of those transactions inside this daemon's own
+                // guarded operation, so a revocation that begins while one is committing
+                // finishes after it.
+                let controller = Arc::clone(self);
+                Settled::of(
+                    self.changesets
+                        .write_frame(actor_id, mutation, method, carried, controller, None)
+                        .await,
+                )
+            }
+            LocalWrite::NotServed => refused(ControllerError::InvalidArgument(format!(
+                "{} is not a mutation this daemon serves",
+                method.as_str()
+            ))),
+            LocalWrite::SessionCreate
+            | LocalWrite::Authority
+            | LocalWrite::MachineGroup
+            | LocalWrite::Claimed
+            | LocalWrite::Installation
+            | LocalWrite::Checks
+            | LocalWrite::Setup
+            | LocalWrite::Worker
+            | LocalWrite::Derived(_)
+            | LocalWrite::Unrecorded(_) => {
+                let Some(carried) = carried else {
+                    return refused(withdrawn());
+                };
+                self.write_of_this_daemon(
+                    kind,
+                    actor_id,
+                    mutation,
+                    method,
+                    connection_id,
+                    origin,
+                    accepted,
+                    admitted,
+                    carried,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The writes the daemon performs itself, once the admission they carry is in hand.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a write is the actor, the request, the connection it arrived on and where that \
+                  began, and the admission it carries"
+    )]
+    async fn write_of_this_daemon(
+        self: &Arc<Self>,
+        kind: LocalWrite,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        connection_id: ConnectionId,
+        origin: Option<kr_protocol::local::BridgeOrigin>,
+        accepted: Option<AcceptedDeadline>,
+        admitted: Option<AuthorityRevision>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Settled<ControlFrame> {
+        let request_id = mutation.request_id;
+        let refused =
+            |error: ControllerError| Settled::of(Given::fresh(respond(request_id, Err(error))));
+        let framed = |given: Given<Result<ParamsValue>>| {
+            Settled::of(given.map(|outcome| respond(request_id, outcome)))
+        };
+        let window_passed = || ControllerError::WindowExpired {
+            detail: "the deadline this action was admitted under passed before it could run"
+                .to_owned(),
         };
         // The methods in [`NO_ADMISSION`] take no admission into a service. They still do not run
         // for a connection whose registration was withdrawn while the call waited, and they do not
@@ -777,27 +713,29 @@ impl Controller {
         if NO_ADMISSION.contains(&method)
             && let Err(error) = self
                 .authorised(connection_id)
+                .map_err(ControllerError::from)
                 .and_then(|_| self.check_fence())
         {
-            return error_reply(mutation.request_id, error.code(), error.to_string());
+            return Settled::of(Given::fresh(error_reply(
+                request_id,
+                error.code(),
+                error.to_string(),
+            )));
         }
-        let outcome = match method {
+        match (kind, method) {
             // A create needs freshness of its own. An admission that carries none is a retry of an
             // action this host may already hold: section 9 keeps its record readable after the
-            // window that admitted it is gone, and the reservation above is where such a retry is
+            // window that admitted it is gone, and the reservation is where such a retry is
             // answered from. What it may not do is start a session.
-            Method::SessionCreate => match accepted {
-                Some(_) => self
-                    .session_create(actor_id, mutation, carried)
-                    .await
-                    .into_answer_or(|| Err(ControllerError::outcome_not_shown())),
-                None => Err(ControllerError::WindowExpired {
+            (LocalWrite::SessionCreate, _) => match accepted {
+                Some(_) => framed(self.session_create(actor_id, mutation, carried).await),
+                None => refused(ControllerError::WindowExpired {
                     detail: "this action carries no freshness, so it may be answered from what \
                              this host holds and may not start a session"
                         .to_owned(),
                 }),
             },
-            Method::SessionClose => {
+            (LocalWrite::Worker, Method::SessionClose) => {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
                 let closed = self
                     .session_close(mutation, &actor, accepted, carried)
@@ -806,76 +744,76 @@ impl Controller {
                 // the setting decides whether that keeps the machine awake while it finishes. The
                 // caller's answer does not wait for that decision.
                 self.review_power_soon();
-                closed
+                framed(closed)
             }
             // A prompt a caller at this machine sends to a session's agent. The daemon records the
             // draft it names, if it names one, and passes it to the session's worker as it does a
             // paired device's.
-            Method::AgentPromptSubmit | Method::AgentPromptQueue => {
+            (LocalWrite::Worker, _) => framed(
                 self.local_prompt(actor_id, mutation, connection_id, accepted, carried)
-                    .await
-            }
-            Method::AgentToolsInstall | Method::AgentToolsRemove => {
-                // A record the installation holds, or cannot read, goes back as the check says: the
-                // refusal of the check is this door's word for it.
+                    .await,
+            ),
+            // A record the installation holds, or cannot read, is a copy of what an earlier
+            // attempt left.
+            (LocalWrite::Installation, _) => framed(
                 self.agent_tools_change(actor_id, mutation, method, carried)
-                    .await
-                    .into_answer()
-            }
-            Method::GrantCreate
-            | Method::GrantRevoke
-            | Method::GrantTransfer
-            | Method::DeviceRevoke
-            | Method::DevicePreviewKeyUpdate
-            | Method::DeliveryDestinationConfigure
-            | Method::DeliveryDestinationRemove
-            | Method::DeliveryDestinationSecretSet
-            | Method::OrganisationEnrol
-            | Method::OrganisationExclusiveSet
-            | Method::OrganisationWithdraw => self
-                .authority_change(
+                    .await,
+            ),
+            (LocalWrite::Authority, _) => framed(
+                self.authority_change(
                     actor_id,
                     super::authority_changes::AuthorityCaller::Owner,
                     mutation,
                     method,
                     carried,
                 )
-                .await
-                .into_answer_or(|| Err(ControllerError::outcome_not_shown())),
+                .await,
+            ),
             // The policy an organisation signed, applied under the registry's guard and kept in the
             // store of applied policies: no action is claimed and no answer is kept, since the same
             // policy again is accepted and puts its list in force again.
-            Method::OrganisationPolicyApply => self
-                .organisation_policy_apply(mutation, carried)
-                .await
-                .into_answer(),
+            (LocalWrite::Derived(_), Method::OrganisationPolicyApply) => {
+                framed(self.organisation_policy_apply(mutation, carried).await)
+            }
             // The host presenting the lease its organisation signed for its own local owner, who
             // answers to a membership lease like a member while the host is exclusively
             // organisation-managed. The same function the paired door calls does the work, as the
             // host's own device identity and key: the local caller proves no key, the operating
-            // system identity the socket authenticated is the proof.
-            Method::MembershipPresent => {
+            // system identity the socket authenticated is the proof. The event it answers with
+            // derives from the one an earlier presentation left.
+            (LocalWrite::Derived(_), Method::MembershipPresent) => framed(Given::copied(
                 self.membership_present(
                     self.local_owner_device(),
                     &self.host_authorisation_key,
                     mutation,
                     carried,
                 )
-                .await
+                .await,
+            )),
+            // Deleting a copy privacy mode lists as having left this host is the person's own
+            // action, apart from turning privacy mode on, and privacy mode does not stop it. The
+            // registration it was admitted under is asked again in the write that records the
+            // request, and the daemon keeps no record of the action: asked again it asks again.
+            (LocalWrite::Derived(_), Method::PrivacyRetainedDelete) => {
+                match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
+                    Some(_) => framed(self.privacy_retained_delete(mutation, carried).await),
+                    None => refused(window_passed()),
+                }
             }
-            Method::EnvironmentEnrol | Method::EnvironmentForget | Method::EnvironmentRefresh => {
-                // The envelope this host built for the connection, not anything the caller sent.
-                // A refresh may open a bridge, and what may cross one is decided by this.
+            (LocalWrite::Claimed, Method::EnvironmentEnrol)
+            | (LocalWrite::Claimed, Method::EnvironmentForget)
+            | (LocalWrite::Claimed, Method::EnvironmentRefresh) => {
+                // The envelope this host built for the connection, not anything the caller sent. A
+                // refresh may open a bridge, and what may cross one is decided by this.
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
                 // Each is performed once per actor's action: claimed first, and what it came to is
                 // kept under the claim before it is answered, so a retry is answered from that
                 // record rather than enrolling, forgetting or observing again. A retry that finds
                 // the record is answered under the same check as any retained answer. A connection
-                // that came over a process bridge has already crossed its one: the helper that made
-                // it refuses to carry a request that would open another, and this is the rule kept
-                // where only the destination can keep it.
-                return respond(
-                    mutation.request_id,
+                // that came over a process bridge has already crossed its one: the helper that
+                // made it refuses to carry a request that would open another, and this is the
+                // rule kept where only the destination can keep it.
+                framed(
                     self.claimed_action(
                         actor_id,
                         mutation,
@@ -889,223 +827,158 @@ impl Controller {
                             carried,
                         ),
                     )
-                    .await
-                    .into_answer(),
-                );
-            }
-            // The disclosed checks are started once per actor's action: what the start came to is
-            // written down for 30 days before it is given, and a retry is answered from that record
-            // ([`Controller::retained`]), so a retry does not start another run.
-            Method::EnvironmentCapabilitiesCheck => {
-                return respond(
-                    mutation.request_id,
-                    self.start_capability_checks(actor_id, mutation, carried)
-                        .await
-                        .into_answer(),
-                );
+                    .await,
+                )
             }
             // Privacy mode and a session's pinned name are this daemon's own, each changed once per
             // actor's action: the action is claimed first, and what it came to is kept under the
             // claim before it is answered, so a retry is answered from that record.
-            Method::PrivacySet
-            | Method::SessionRename
-            | Method::DescriptionConfigure
-            | Method::DescriptionDownload => {
-                return respond(
-                    mutation.request_id,
-                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        if method == Method::PrivacySet {
-                            let outcome = self.privacy_set(mutation, carried).await;
-                            // The state is published: the description host looks again, with its
-                            // fences following it.
-                            self.descriptions.wake_host();
-                            outcome
-                        } else if crate::describe::serves(method) {
-                            Given::fresh(self.description_write(method, mutation, carried).await)
-                        } else {
-                            let summary = match mutation.target.session_id.as_ref().copied() {
-                                Some(session_id) => self.session_summary(session_id).await,
-                                None => Err(ControllerError::InvalidArgument(
-                                    "a rename names the session it renames".to_owned(),
-                                )),
-                            };
-                            Given::fresh(match summary {
-                                Ok(summary) => {
-                                    self.session_rename(actor_id, mutation, summary, carried)
-                                        .await
-                                }
-                                Err(error) => Err(error),
-                            })
-                        }
-                    })
-                    .await
-                    .into_answer(),
-                );
-            }
+            (LocalWrite::Claimed, Method::PrivacySet)
+            | (LocalWrite::Claimed, Method::SessionRename)
+            | (LocalWrite::Claimed, Method::DescriptionConfigure)
+            | (LocalWrite::Claimed, Method::DescriptionDownload) => framed(
+                self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                    if method == Method::PrivacySet {
+                        let outcome = self.privacy_set(mutation, carried).await;
+                        // The state is published: the description host looks again, with its
+                        // fences following it.
+                        self.descriptions.wake_host();
+                        outcome
+                    } else if crate::describe::serves(method) {
+                        Given::fresh(self.description_write(method, mutation, carried).await)
+                    } else {
+                        let summary = match mutation.target.session_id.as_ref().copied() {
+                            Some(session_id) => self.session_summary(session_id).await,
+                            None => Err(ControllerError::InvalidArgument(
+                                "a rename names the session it renames".to_owned(),
+                            )),
+                        };
+                        Given::fresh(match summary {
+                            Ok(summary) => {
+                                self.session_rename(actor_id, mutation, summary, carried)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        })
+                    }
+                })
+                .await,
+            ),
             // The host's own sign-in to the managed account service is this daemon's, started once
             // per actor's action: the action is claimed first, and what it came to is kept under
-            // the claim before it is answered, so a retry is answered from that record.
-            Method::AccountSignIn => {
-                return respond(
-                    mutation.request_id,
+            // the claim before it is answered, so a retry is answered from that record. Signing out
+            // is claimed the same way: a retry of a request whose answer was lost is answered from
+            // the first, and does not sign out an account signed in since. The sign-in and
+            // sign-out of the account at a storage service the person runs are claimed the same
+            // way, and act on that account alone.
+            (LocalWrite::Claimed, Method::AccountSignIn) => framed(
+                self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                    Given::fresh(self.account_sign_in(mutation).await)
+                })
+                .await,
+            ),
+            (LocalWrite::Claimed, Method::AccountSignOut) => framed(
+                self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                    Given::fresh(self.account_sign_out(mutation).await)
+                })
+                .await,
+            ),
+            (LocalWrite::Claimed, Method::AccountStorageSignIn) => framed(
+                self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                    Given::fresh(self.account_storage_sign_in(mutation).await)
+                })
+                .await,
+            ),
+            (LocalWrite::Claimed, Method::AccountStorageSignOut) => framed(
+                self.claimed_action(actor_id, mutation, connection_id, admitted, async {
+                    Given::fresh(self.account_storage_sign_out(mutation).await)
+                })
+                .await,
+            ),
+            // Only the owner at this machine replaces what the host runs. A step is performed once
+            // per actor's action: it is claimed first, and what it came to is kept under the claim
+            // before it is answered, so a caller whose answer was lost is told it again rather
+            // than beginning a second attempt.
+            (LocalWrite::Claimed, Method::HostUpdateHandover) => {
+                if !is_owners_own_socket(actor_id) {
+                    return refused(ControllerError::PermissionDenied {
+                        detail: "only the owner at this machine hands its control daemon over to \
+                                 an update"
+                            .to_owned(),
+                    });
+                }
+                framed(
                     self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::fresh(self.account_sign_in(mutation).await)
+                        Given::fresh(self.update_handover(mutation).await)
                     })
-                    .await
-                    .into_answer(),
-                );
+                    .await,
+                )
             }
-            // Signing out is claimed the same way: a retry of a request whose answer was lost is
-            // answered from the first, and does not sign out an account signed in since.
-            Method::AccountSignOut => {
-                return respond(
-                    mutation.request_id,
-                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::fresh(self.account_sign_out(mutation).await)
-                    })
-                    .await
-                    .into_answer(),
-                );
-            }
-            // The sign-in and sign-out of the account at a storage service the person runs are
-            // claimed the same way, and act on that account alone.
-            Method::AccountStorageSignIn => {
-                return respond(
-                    mutation.request_id,
-                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::fresh(self.account_storage_sign_in(mutation).await)
-                    })
-                    .await
-                    .into_answer(),
-                );
-            }
-            Method::AccountStorageSignOut => {
-                return respond(
-                    mutation.request_id,
-                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::fresh(self.account_storage_sign_out(mutation).await)
-                    })
-                    .await
-                    .into_answer(),
-                );
-            }
+            // The disclosed checks are started once per actor's action: what the start came to is
+            // written down for 30 days before it is given, and a retry is answered from that record
+            // ([`Controller::retained`]), so a retry does not start another run.
+            (LocalWrite::Checks, _) => framed(
+                self.start_capability_checks(actor_id, mutation, carried)
+                    .await,
+            ),
             // A machine group step changes this environment's own record under the revision it was
             // admitted at, read before anything waited rather than again here: a revocation of
             // another device stamps every surviving connection with the revision it advanced to,
             // and a step checked against a revision read afterwards would be checked against the
             // authority that replaced the one it was admitted under.
-            Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => match admitted {
-                Some(admitted_revision) => self
-                    .machine_step(
-                        actor_id,
-                        mutation,
-                        method,
-                        crate::authority::AdmittedMutation {
-                            admitted_revision,
-                            ..carried
-                        },
-                    )
-                    .await
-                    .into_answer_or(|| Err(ControllerError::outcome_not_shown())),
-                None => Err(ControllerError::PermissionDenied {
-                    detail: "the authority this connection was admitted under has been \
-                             withdrawn; open a new connection"
-                        .to_owned(),
-                }),
-            },
-            // Only the owner at this machine replaces what the host runs. A step is performed once
-            // per actor's action: it is claimed first, and what it came to is kept under the claim
-            // before it is answered, so a caller whose answer was lost is told it again rather
-            // than beginning a second attempt.
-            Method::HostUpdateHandover => {
-                if !is_owners_own_socket(actor_id) {
-                    return respond(
-                        mutation.request_id,
-                        Err(ControllerError::PermissionDenied {
-                            detail: "only the owner at this machine hands its control daemon over \
-                                     to an update"
-                                .to_owned(),
-                        }),
-                    );
-                }
-                return respond(
-                    mutation.request_id,
-                    self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::fresh(self.update_handover(mutation).await)
-                    })
-                    .await
-                    .into_answer(),
-                );
+            (LocalWrite::MachineGroup, _) => {
+                framed(self.machine_step(actor_id, mutation, method, carried).await)
             }
             // Setting this host's backups up changes the host's own record and the account's
             // storage at the service, and nothing a session holds. A call is idempotent on its
             // archive, and its repeats are answered from what the first left.
-            Method::BackupEnable => {
+            (LocalWrite::Setup, _) => {
                 match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
                     Some(_) => match self.authorised(connection_id) {
-                        Ok(_) => self.backup_enable(mutation, carried).await.into_answer(),
-                        Err(error) => Err(error),
+                        Ok(_) => framed(self.backup_enable(mutation, carried).await),
+                        Err(error) => refused(error.into()),
                     },
-                    None => Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
+                    None => refused(window_passed()),
                 }
             }
             // Moving the recovery bundle on writes the account's storage at the service and
             // nothing a session holds. A call carries a new identity each time.
-            Method::BackupBundleWrite => {
+            (LocalWrite::Unrecorded(_), Method::BackupBundleWrite) => {
                 match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
                     Some(_) => match self.authorised(connection_id) {
-                        Ok(_) => self.backup_bundle_write(mutation).await,
-                        Err(error) => Err(error),
+                        Ok(_) => {
+                            unrecorded_write(request_id, self.backup_bundle_write(mutation).await)
+                        }
+                        Err(error) => refused(error.into()),
                     },
-                    None => Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
+                    None => refused(window_passed()),
                 }
             }
             // The person at this machine confirms the policy this host found restored, which ends
             // the wait that refuses every other grant. It changes no policy and no grant, so it
             // takes no admission, and the daemon keeps no record of the action: asked again it
             // answers that it lifted nothing.
-            Method::HostPolicyConfirm => {
+            (LocalWrite::Unrecorded(_), Method::HostPolicyConfirm) => {
                 match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
-                    Some(_) => self.confirm_the_restored_policy(carried).await,
-                    None => Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
+                    Some(_) => unrecorded_write(
+                        request_id,
+                        self.confirm_the_restored_policy(carried).await,
+                    ),
+                    None => refused(window_passed()),
                 }
             }
-            // Deleting a copy privacy mode lists as having left this host is the person's own
-            // action, apart from turning privacy mode on, and privacy mode does not stop it. The
-            // registration it was admitted under is asked again in the write that records the
-            // request, and the daemon keeps no record of the action: asked again it asks again.
-            Method::PrivacyRetainedDelete => {
-                match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
-                    Some(_) => self
-                        .privacy_retained_delete(mutation, carried)
-                        .await
-                        .into_answer(),
-                    None => Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
-                }
-            }
-            _ => Err(ControllerError::InvalidArgument(format!(
+            _ => refused(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
                 method.as_str()
             ))),
-        };
-        respond(mutation.request_id, outcome)
+        }
     }
+}
+
+/// The reply of a write that keeps no record of its action and reads none: the only place a plain
+/// result becomes a reply, so a result that was read from a record cannot reach it by this way.
+fn unrecorded_write(request_id: RequestId, result: Result<ParamsValue>) -> Settled<ControlFrame> {
+    Settled::of(Given::fresh(respond(request_id, result)))
 }
 
 /// Builds the actor envelope a local caller acts under.

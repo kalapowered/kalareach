@@ -167,7 +167,8 @@ async fn a_repeated_create_is_given_what_its_first_attempt_made_only_under_its_a
             Some(accepted(&controller)),
             controller.admitted_revision(connection_id).ok(),
         )
-        .await;
+        .await
+        .into_answer_for_test();
     assert!(
         refusal(&first).is_some_and(|error| error.code != ErrorCode::PermissionDenied),
         "the first copy's launch fails: {first:?}"
