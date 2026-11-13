@@ -571,6 +571,7 @@ async fn a_close_that_cannot_read_this_daemons_authority_in_time_gives_the_link_
             carried,
         )
         .await
+        .into_answer_for_test()
         .expect_err("a close that cannot read this daemon's authority closes nothing");
     let waited = started.elapsed();
     drop(held);
@@ -630,6 +631,7 @@ async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
             admission(&controller, accepted).await,
         )
         .await
+        .into_answer_for_test()
         .expect_err("a worker that never answers produces no closure");
     assert_eq!(
         first.code(),
@@ -689,6 +691,7 @@ async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
             admission(&controller, accepted).await,
         )
         .await
+        .into_answer_for_test()
         .expect_err("the second close meets the same silent worker");
     assert_eq!(second.code(), ErrorCode::OutcomeUnknown);
     assert!(
@@ -735,6 +738,7 @@ async fn the_link_a_close_fences_is_the_one_it_ran_over() {
             controller
                 .session_close(&mutation, &actor, Some(accepted), admission)
                 .await
+                .into_answer_for_test()
         }
     });
     // Long enough for the close to be queueing for the slot.

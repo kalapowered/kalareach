@@ -207,6 +207,7 @@ async fn a_close_that_a_closure_overtakes_is_answered_from_the_closure() {
             controller
                 .session_close(&request, &actor, Some(accepted), carried)
                 .await
+                .into_answer_for_test()
         }
     });
     arrived.await.expect("the close has read its worker");

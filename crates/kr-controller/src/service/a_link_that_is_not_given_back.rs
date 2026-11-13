@@ -284,6 +284,7 @@ async fn a_close_dropped_part_way_gives_up_its_link() {
         controller
             .session_close(&mutation, &actor, Some(accepted), carried)
             .await
+            .into_answer_for_test()
     })
     .await;
     the_link_was_given_up(&silent, &heard, 1).await;
@@ -433,6 +434,7 @@ async fn a_refusal_the_worker_gives_leaves_its_link_and_the_lease() {
             carried,
         )
         .await
+        .into_answer_for_test()
         .expect_err("the worker refuses the close");
     assert!(!refused.to_string().is_empty());
     assert!(

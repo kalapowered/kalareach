@@ -17,7 +17,7 @@ use kr_protocol::worker::ReservationId;
 use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
-use crate::given::Recorded;
+use crate::given::{Given, Recorded};
 use crate::supervision::JobRetirement;
 
 use super::admission::remaining_deadline;
@@ -113,6 +113,38 @@ pub(super) enum Watch {
     Waiting,
 }
 
+/// How a route that goes to a session's worker ends when it is not that worker's answer.
+///
+/// The closure record can answer in the worker's place, or refuse for it: those are read from a
+/// record, and leave this module only as the copies they are ([`Ended::given`]).
+pub(super) enum Ended {
+    /// An error the route met on its own.
+    Plain(ControllerError),
+    /// The closure record's answer to a close of a session that is no longer in the directory.
+    Answer(Recorded<Result<ParamsValue>>),
+    /// The closure test's refusal: the session is closed where its closure is recorded, or the
+    /// error that was met.
+    Refusal(Recorded<ControllerError>),
+}
+
+impl From<ControllerError> for Ended {
+    fn from(error: ControllerError) -> Self {
+        Self::Plain(error)
+    }
+}
+
+impl Ended {
+    /// What the route gives: the whole result is a copy, because the worker's own receipts cannot
+    /// be told from a first answer.
+    pub(super) fn given(self) -> Given<Result<ParamsValue>> {
+        match self {
+            Self::Plain(error) => Given::copied(Err(error)),
+            Self::Answer(record) => record.copied(),
+            Self::Refusal(record) => record.copied().map(Err),
+        }
+    }
+}
+
 impl Controller {
     /// Tells every worker holding a close for this action that the caller has its acceptance.
     ///
@@ -145,22 +177,40 @@ impl Controller {
     /// identity of the caller's action, and rewriting it here would give the worker a different
     /// action from the one the caller asked for: a retry would then find no receipt, and the
     /// caller's own identifier would name nothing.
+    ///
+    /// The whole answer is a copy: the worker keeps its own receipts and the daemon cannot tell its
+    /// first answer from one it gave before, and the closure record is a copy of what an earlier
+    /// close left. The door tells it under the check a copy is owed.
     pub(super) async fn session_close(
         self: &Arc<Self>,
         mutation: &MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
         accepted: Option<AcceptedDeadline>,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
+    ) -> Given<Result<ParamsValue>> {
+        match self
+            .close_exchange(mutation, actor, accepted, carried)
+            .await
+        {
+            Ok(answer) => Given::copied(Ok(answer)),
+            Err(ended) => ended.given(),
+        }
+    }
+
+    async fn close_exchange(
+        self: &Arc<Self>,
+        mutation: &MutationRequest,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        accepted: Option<AcceptedDeadline>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> std::result::Result<ParamsValue, Ended> {
         let params: SessionCloseParams = parse(&mutation.params)?;
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         let Some(worker) = worker else {
             // A duplicate close returns the existing state rather than closing anything again.
-            return self
-                .answer_from_the_closure(params.session_id)
-                .await
-                .copied()
-                .into_answer();
+            return Err(Ended::Answer(
+                self.answer_from_the_closure(params.session_id).await,
+            ));
         };
         // One budget for the whole exchange, started before the wait for the connection. Section 7
         // gives a closure five seconds to stop its processes and two more to drain them, and this
@@ -181,20 +231,19 @@ impl Controller {
                 // closure was recorded in between, and the record is the answer, as it is to a
                 // close that came after the closure.
                 Ok(Err(ControllerError::UnknownSession { .. })) => {
-                    return self
-                        .answer_from_the_closure(params.session_id)
-                        .await
-                        .copied()
-                        .into_answer();
+                    return Err(Ended::Answer(
+                        self.answer_from_the_closure(params.session_id).await,
+                    ));
                 }
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => return Err(error.into()),
                 // Nothing was dispatched: this close never reached the worker, and the link it
                 // was queueing for belongs to whoever is holding it. The caller can ask again.
                 Err(_) => {
                     return Err(ControllerError::supervision(
                         "the connection to the worker that owns this session did not come free in \
                          time, so nothing was closed",
-                    ));
+                    )
+                    .into());
                 }
             };
             // The admission is checked here rather than before the wait, because this is where
@@ -236,7 +285,7 @@ impl Controller {
                 Ok(lease_deadline) => lease_deadline,
                 Err(error) => {
                     link.give_back();
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
             // What the worker is told is the accepted deadline itself, on the machine's own
@@ -279,7 +328,7 @@ impl Controller {
                 // dispatch lease be renewed only after the worker has acknowledged the revision,
                 // and this daemon can no longer hear an acknowledgement from that worker. The link
                 // is closed and the path given up as it goes out of scope.
-                Ok(Err(error)) => return Err(error.into()),
+                Ok(Err(error)) => return Err(ControllerError::from(error).into()),
                 // The close was written and no answer came back inside the time a closure is
                 // allowed to take. The client is retired rather than returned to the shared slot:
                 // its exchange was abandoned part way through, so the next caller to pick it up
@@ -292,7 +341,8 @@ impl Controller {
                             "the worker did not answer this close within the time a closure is \
                                  given, so whether the session is stopping is not known"
                                 .to_owned(),
-                    });
+                    }
+                    .into());
                 }
             }
         };
@@ -314,9 +364,10 @@ impl Controller {
             Err(error) if error.code == ErrorCode::OutcomeUnknown => {
                 Err(ControllerError::Uncertain {
                     detail: error.message,
-                })
+                }
+                .into())
             }
-            Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
+            Err(error) => Err(ControllerError::InvalidArgument(error.to_string()).into()),
         }
     }
 

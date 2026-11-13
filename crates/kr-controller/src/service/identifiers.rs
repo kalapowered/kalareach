@@ -444,6 +444,32 @@ impl Drop for Spending {
     }
 }
 
+/// Why a first admission could not take its identifier.
+#[derive(Debug)]
+pub(crate) enum SpendError {
+    /// Another request spent the identifier. That is another attempt's word, which the door tells
+    /// only under the authority the caller still has.
+    Conflict(ControllerError),
+    /// The identifier could not be looked for.
+    Failed(SpendFailed),
+}
+
+/// The refusal of a first admission whose identifier could not be looked for: a digest that could
+/// not be made, or a record the daemon keeps that could not be read.
+///
+/// Only [`Controller::spend_the_identifier`] makes one, before any effect. There is no conversion
+/// into it from an error.
+#[derive(Debug)]
+pub(crate) struct SpendFailed {
+    error: ControllerError,
+}
+
+impl From<SpendFailed> for ControllerError {
+    fn from(refusal: SpendFailed) -> Self {
+        refusal.error
+    }
+}
+
 impl Controller {
     /// Records the arrival of a mutation at the local door, so that a copy that arrives on another
     /// connection while this one looks for a retained answer or reads the other stores knows that
@@ -480,14 +506,19 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> Result<Option<Spending>> {
+    ) -> std::result::Result<Option<Spending>, SpendError> {
         let Some(own) = Domain::of(method) else {
             return Ok(None);
         };
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let conflict = || ControllerError::IdConflict {
-            token: mutation.action_id.to_string(),
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).map_err(|error| {
+            SpendError::Failed(SpendFailed {
+                error: ControllerError::InvalidArgument(error.to_string()),
+            })
+        })?;
+        let conflict = || {
+            SpendError::Conflict(ControllerError::IdConflict {
+                token: mutation.action_id.to_string(),
+            })
         };
         // Taken before the stores are read, so an arrival that is still performing its effect when
         // this one reads is met here and not missed there.
@@ -508,7 +539,9 @@ impl Controller {
         .await
         .map_err(|_| {
             storage("the check was stopped before it had read every record the daemon keeps")
-        })??;
+        })
+        .and_then(|read| read)
+        .map_err(|error| SpendError::Failed(SpendFailed { error }))?;
         if spent_elsewhere {
             return Err(conflict());
         }
