@@ -7763,6 +7763,73 @@ async fn a_repeat_answered_from_the_recorded_setup_is_refused_when_its_registrat
     ));
 }
 
+/// KR-REQ-09.09: the refusal that a setup already stands for another archive is read from the setup
+/// the host recorded, so it is a copy: told to a caller whose registration stands with no fence
+/// owed, and not shown to one whose request meets a fence before it is answered, who is told that
+/// what became of the action is not shown. The call waits behind a replacement that the fence ends;
+/// the control is the same call made again with the fence let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refusal_that_a_setup_already_stands_is_not_shown_when_a_fence_lands_before_it_is_answered()
+ {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+
+    // A replacement holds the service's turn at its bundle write; the declined call waits behind it.
+    let replacement = rig.prepared_setup(archive_two(), true);
+    let another = rig.prepared_setup(archive_two(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let holding = rig.enable_outcome_in_the_background(&replacement.params);
+    within(
+        "the replacement's bundle write",
+        web.requests_reach(SYNC, 2),
+    )
+    .await;
+    let declined = rig.enable_outcome_in_the_background(&another.params);
+    within("both calls are told", async {
+        loop {
+            if let BackupSetupState::InProgress { kit_fingerprints } =
+                rig.backup_status().await.setup
+                && kit_fingerprints.len() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    rig.controller.hold_fence(true);
+    web.release_held();
+    let held = holding
+        .await
+        .expect("the call ends")
+        .expect_err("a call that has something to do is refused while a fence is owed");
+    let told = declined
+        .await
+        .expect("the call ends")
+        .expect_err("a refusal read from the setup is not shown while a fence is owed");
+    assert_eq!(held.code, ErrorCode::PermissionDenied, "{held:?} {told:?}");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{held:?} {told:?}");
+    assert!(
+        told.message.contains("may have been carried out"),
+        "{}",
+        told.message
+    );
+
+    rig.controller.hold_fence(false);
+    assert_eq!(
+        rig.enable(&another.params).await,
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::AlreadySetUp {}
+        }
+    );
+}
+
 /// KR-REQ-09.09: a repeat of a call that finished is answered from the setup it recorded when its
 /// deadline has passed, as a receipt outlives the deadline it was accepted under. The repeat waits
 /// behind a call of another kit, and the deadline passes while it waits: the other call is refused
