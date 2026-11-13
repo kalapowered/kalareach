@@ -492,6 +492,14 @@ fn a_link_above_the_data_parent_is_refused() {
         !text.to_lowercase().contains("remove the link"),
         "an administrator is never told to remove it: {text}"
     );
+    // The folder is another program's, not one that the setup program makes.
+    assert!(!text.contains("makes this folder itself"), "{text}");
+    assert!(
+        text.ends_with(
+            "The setup program directs no change to a folder that other programs share."
+        ),
+        "{text}"
+    );
 }
 
 /// A substituted drive letter is no volume's root: the folders above its target are not read, so a
@@ -617,17 +625,28 @@ fn a_root_that_is_not_there_is_refused_before_a_change_and_a_removal_goes_on() {
         "{repair}"
     );
     let unreached = remedy::program_unreached(&paths.program.display().to_string());
-    match install::remove(&paths, false) {
-        Ok(()) => assert!(!paths.data.exists(), "the removal finished its data"),
-        Err(error) => {
-            let text = error.to_string();
-            assert!(
-                !text.contains("is a folder above the boundary's"),
-                "the removal went on: {text}"
-            );
-            assert!(text.contains(&unreached), "{text}");
-        }
-    }
+    // A journal and a run directory that appear after the removal's inspection stop it at a step of
+    // its own, after the program tree, so the case sees its last words.
+    std::fs::remove_dir(&paths.journal).unwrap();
+    std::fs::remove_dir(&paths.run).unwrap();
+    let (journal, run) = (paths.journal.clone(), paths.run.clone());
+    clean.hook();
+    install::testing::after_the_removal_inspects_the_data_directory(move || {
+        std::fs::create_dir(&journal).unwrap();
+        std::fs::create_dir(&run).unwrap();
+    });
+    let text = install::remove(&paths, false)
+        .expect_err("a step of the removal's own stops it")
+        .to_string();
+    assert!(
+        !text.contains("is a folder above the boundary's"),
+        "the removal went on: {text}"
+    );
+    assert!(
+        text.contains("was not there when the removal looked for it"),
+        "{text}"
+    );
+    assert!(text.ends_with(&unreached), "{text}");
 }
 
 /// A link that points nowhere at the program directory's name is a link, and gets the link's own
