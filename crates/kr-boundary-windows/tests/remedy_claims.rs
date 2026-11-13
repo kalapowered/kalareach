@@ -4,10 +4,11 @@
 
 use std::path::Path;
 
+use kr_boundary_windows::manifest::Outcome;
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
     CASE_SENSITIVE_WHY, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Standing, Taken,
-    choose, data_ending, data_made_ending, ending, parent_advice, program_keeping,
+    choose, data_ending, data_made_ending, ending, left_alone, parent_advice, program_keeping,
     program_open_advice, rollback_ending, rollback_entry, rollback_laid_stays, unnamed_root_why,
 };
 
@@ -651,4 +652,31 @@ fn the_ending_of_a_rollback_says_records_are_deleted_only_where_the_run_wrote_an
             assert!(!text.contains(step), "{step}: {text}");
         }
     }
+}
+
+#[test]
+fn the_words_for_an_object_that_was_left_say_what_the_record_holds_and_give_no_step() {
+    let words = [
+        left_alone("account", "krb-checkout", None, true),
+        left_alone("account", "krb-checkout", Some(Outcome::Found), true),
+        left_alone("the service", "KalaReachBoundary", None, false),
+    ];
+    for text in &words {
+        assert!(text.contains("left it as it is"), "{text}");
+        // They name the record and the decision, never the object's own state, and tell nobody to
+        // move, remove or correct anything.
+        for forbidden in [
+            "exists",
+            "is gone",
+            "deleted",
+            "remove it",
+            "delete it",
+            "move",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
+    }
+    assert!(words[0].contains("holds no result that the step made it"));
+    assert!(words[1].contains("found it where it looked and did not make it"));
+    assert!(words[2].contains("nothing shows that the installation made it"));
 }

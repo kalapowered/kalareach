@@ -5,7 +5,9 @@ use std::io::{Cursor, Read};
 
 use kr_boundary_windows::events::{self, BLOCKED};
 use kr_boundary_windows::frame::{self, FrameError, Request, Response};
-use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior, STORE_VERSION};
+use kr_boundary_windows::manifest::{
+    InstallState, Manifest, ObjectKind, Outcome, Prior, STORE_VERSION,
+};
 use kr_boundary_windows::policy::{
     self, Action, Emptied, Kind, Mode, Policy, RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT,
     Recorded, Restore, Stays,
@@ -379,6 +381,129 @@ fn the_manifests_replacement_is_a_new_file_under_a_name_nothing_could_have_made(
         2,
         "the replacement is gone once it is renamed over the manifest: {names:?}"
     );
+}
+
+#[test]
+fn a_step_records_its_intent_before_it_and_its_result_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.json");
+    let mut manifest = Manifest::begin();
+    // The intent, written before the step, says nothing of what the step did.
+    manifest.record(ObjectKind::Account, "krb-checkout", None);
+    manifest.record(ObjectKind::Service, "KalaReachBoundary", None);
+    manifest.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("outcome"),
+        "an intent carries no result: {text}"
+    );
+    let intent = Manifest::load(&path).unwrap();
+    assert_eq!(
+        intent
+            .find(ObjectKind::Account, "krb-checkout")
+            .unwrap()
+            .outcome,
+        None
+    );
+    // The results come after the steps, each on its own object.
+    manifest.conclude(ObjectKind::Account, "krb-checkout", Outcome::Made);
+    manifest.conclude(ObjectKind::Service, "KalaReachBoundary", Outcome::Found);
+    manifest.save(&path).unwrap();
+    let read = Manifest::load(&path).unwrap();
+    assert_eq!(read, manifest);
+    assert_eq!(
+        read.find(ObjectKind::Account, "krb-checkout")
+            .unwrap()
+            .outcome,
+        Some(Outcome::Made)
+    );
+    assert_eq!(
+        read.find(ObjectKind::Service, "KalaReachBoundary")
+            .unwrap()
+            .outcome,
+        Some(Outcome::Found)
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"outcome\": \"made\""), "{text}");
+    assert!(text.contains("\"outcome\": \"found\""), "{text}");
+    // A later record of the same object changes its detail and keeps its result.
+    manifest.record(
+        ObjectKind::Account,
+        "krb-checkout",
+        Some("S-1-5-21-1-2-3-1001"),
+    );
+    assert_eq!(
+        manifest
+            .find(ObjectKind::Account, "krb-checkout")
+            .unwrap()
+            .outcome,
+        Some(Outcome::Made)
+    );
+}
+
+#[test]
+fn a_result_of_made_is_never_replaced_by_found_and_a_result_can_stand_alone() {
+    let mut manifest = Manifest::begin();
+    manifest.record(ObjectKind::Account, "krb-connect", None);
+    manifest.conclude(ObjectKind::Account, "krb-connect", Outcome::Made);
+    // A repair that finds what an earlier run made leaves it made.
+    manifest.conclude(ObjectKind::Account, "KRB-CONNECT", Outcome::Found);
+    assert_eq!(
+        manifest
+            .find(ObjectKind::Account, "krb-connect")
+            .unwrap()
+            .outcome,
+        Some(Outcome::Made)
+    );
+    // An intent that no result followed takes the result of a later step.
+    manifest.record(ObjectKind::Service, "KalaReachBoundary", None);
+    manifest.conclude(ObjectKind::Service, "KalaReachBoundary", Outcome::Found);
+    assert_eq!(
+        manifest
+            .find(ObjectKind::Service, "KalaReachBoundary")
+            .unwrap()
+            .outcome,
+        Some(Outcome::Found)
+    );
+    // The Application Identity service's start is a result with no intent before it.
+    assert!(
+        manifest
+            .find(ObjectKind::AppIdentityStarted, "AppIDSvc")
+            .is_none()
+    );
+    manifest.conclude(ObjectKind::AppIdentityStarted, "AppIDSvc", Outcome::Made);
+    assert_eq!(
+        manifest
+            .find(ObjectKind::AppIdentityStarted, "AppIDSvc")
+            .unwrap()
+            .outcome,
+        Some(Outcome::Made)
+    );
+}
+
+#[test]
+fn a_rollback_acts_on_what_a_run_made_and_the_removal_on_what_a_run_made_or_found() {
+    let mut manifest = Manifest::begin();
+    manifest.record(ObjectKind::Account, "none", None);
+    manifest.record(ObjectKind::Account, "found", None);
+    manifest.conclude(ObjectKind::Account, "found", Outcome::Found);
+    manifest.record(ObjectKind::Account, "made", None);
+    manifest.conclude(ObjectKind::Account, "made", Outcome::Made);
+    let acts = |name: &str, rollback: bool| {
+        manifest
+            .find(ObjectKind::Account, name)
+            .unwrap()
+            .acted_on_by(rollback)
+    };
+    // An account whose create failed has an intent and no result: neither undoing step touches it.
+    assert!(!acts("none", true));
+    assert!(!acts("none", false));
+    // An object that the run found was not the run's to take away; the removal takes what a repair
+    // found where the manifest listed it.
+    assert!(!acts("found", true));
+    assert!(acts("found", false));
+    assert!(acts("made", true));
+    assert!(acts("made", false));
 }
 
 #[test]

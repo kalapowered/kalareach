@@ -15,6 +15,8 @@
 //! name that the layout does not give takes the same four states as a record. When nothing is
 //! known of who made it, neither is offered.
 
+use crate::manifest::Outcome;
+
 /// Whether something is there, as a lookup shows it: confirmed absent only by an answer of not
 /// found. Any other error leaves it unknown, and nothing that could destroy a record is offered
 /// then.
@@ -1301,6 +1303,27 @@ pub fn rollback_ending(marked: &[String], records_deleted: bool) -> String {
         "{opening}. The rollback marked for removal, each through the identity that this run kept of it, and a read of its name afterwards found it gone: {}",
         marked.join("; ")
     )
+}
+
+/// The words for an object that an undoing step did not act on, because no result shows that the
+/// run, or an installation, made it: what the manifest or the run's own record holds of the step
+/// that was to make it, and that the step left it as it is. A rollback leaves an object that its
+/// run did not make, one that its run found and one with no result; the removal leaves one with no
+/// result. They say what the record holds and nothing of the object itself.
+#[must_use]
+// text: left_alone
+pub fn left_alone(what: &str, name: &str, outcome: Option<Outcome>, rollback: bool) -> String {
+    match (rollback, outcome) {
+        (true, None) => format!(
+            "{what} {name}: this run recorded the step that was to make it and holds no result that the step made it, so the rollback left it as it is"
+        ),
+        (true, Some(_)) => format!(
+            "{what} {name}: this run found it where it looked and did not make it, so the rollback left it as it is"
+        ),
+        (false, _) => format!(
+            "{what} {name}: the manifest records the step that was to make it and no result of that step, so nothing shows that the installation made it, and the removal left it as it is"
+        ),
+    }
 }
 
 /// The entry of the rollback's list for one object that this run made, or none where the cleanup
