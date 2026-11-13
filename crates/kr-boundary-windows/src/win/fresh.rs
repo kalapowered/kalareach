@@ -78,6 +78,7 @@ pub fn directory_at(path: &Path, kind: SdKind, principals: &Principals) -> io::R
     let wide = ffi::wide_path(path);
     // SAFETY: the path is NUL-terminated and the attributes point at a descriptor that lives
     // through the call.
+    // Base: `path` is the full path that the caller gives (built from `Paths`, or beneath one); the call resolves it from the volume's root and never against the current directory
     if unsafe { CreateDirectoryW(wide.as_ptr(), &raw const attributes) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -160,6 +161,7 @@ fn file_with_access(
     // SAFETY: the path is NUL-terminated and the attributes point at a descriptor that lives
     // through the call.
     let raw = unsafe {
+        // Base: `path` is the full path that the caller gives (built from `Paths`, or beneath one); the call resolves it from the volume's root and never against the current directory, and the data directory in it is resolved again by this call (only the system and the administrators can change it)
         CreateFileW(
             wide.as_ptr(),
             access,
@@ -212,6 +214,7 @@ pub fn record_file(path: &Path, only_new: bool) -> io::Result<File> {
 pub fn hold_directory(directory: &Path) -> io::Result<ffi::Handle> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    // Base: `directory` is the full path that the caller names, resolved from the volume's root and never against the current directory
     // The flag lets the open of a directory succeed.
     let file = std::fs::OpenOptions::new()
         .read(true)

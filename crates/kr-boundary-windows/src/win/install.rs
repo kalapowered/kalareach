@@ -313,6 +313,7 @@ fn inject(_run: &Run, _step: &str) -> Result<(), Error> {
 #[cfg(feature = "testing")]
 fn note_call(call: &str) {
     if let Some(path) = std::env::var_os("KR_BOUNDARY_CALL_LOG")
+        // Base: the path that the environment variable names, a seam of the cases that sets a full path
         && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
     {
         let _ = writeln!(file, "{call}");
@@ -607,6 +608,7 @@ fn made_if_missing(path: &Path, readable: &Principals, what: &str) -> Result<(),
 /// a file that an earlier run of this installation put there was checked on its handle when the
 /// installation was entered, and is overwritten as it is, keeping the descriptor that was checked.
 fn install_program_file(source: &Path, target: &Path) -> io::Result<()> {
+    // Base: `source` is a file of the payload directory that the caller names and `target` a file of the program directory, each a full path; neither is resolved against the current directory
     let mut from = fs::File::open(source)?;
     let there = target.try_exists().map_err(|error| {
         io::Error::new(
@@ -658,6 +660,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
     let wide = ffi::wide_path(parent);
     // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
     let raw = unsafe {
+        // Base: the full path that the caller built from `Paths`, which `Paths::system` makes from the system's known folders; the call resolves it from the volume's root and never against the current directory
         CreateFileW(
             wide.as_ptr(),
             FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
@@ -768,6 +771,7 @@ fn check_data_parent_handle(
 }
 
 fn presence_of(path: &Path) -> Presence {
+    // Base: the full path that the caller built from `Paths`, which `Paths::system` makes from the system's known folders; the call resolves it from the volume's root and never against the current directory
     match std::fs::symlink_metadata(path) {
         Ok(_) => Presence::Present,
         Err(error) if error.kind() == io::ErrorKind::NotFound => Presence::Absent,
@@ -821,10 +825,12 @@ impl DataChild {
 /// with its descriptor in the call that makes it, and every other entry was checked on its own
 /// handle before.
 ///
-/// None of these handles lets another program rename or delete what it holds (they share read and
-/// write only). Every list the installation changes in the data directory is changed on one of these
-/// handles and never by path: a path can name another object a moment later, and the platform's
-/// change by path follows a link and rewrites the tree it leads to.
+/// The handle of a directory that was there before the run shares read and write only, so that
+/// nothing renames or deletes it while it is held; the handle of what the run made shares
+/// everything and holds no right to delete, and so does the holder of a folder that the installation
+/// did not make (opened by its full path). Every list the installation changes in the data directory
+/// is changed on one of these handles and never by path: a path can name another object a moment
+/// later, and the platform's change by path follows a link and rewrites the tree it leads to.
 pub struct DataHolds {
     paths: Paths,
     /// What the run that holds these does: a refusal of a child that appeared since the check says only
@@ -1018,9 +1024,10 @@ impl MadeObject {
 /// What a run made of the data directory's place, each object held with the handle of the directory
 /// that holds it. A cleanup takes each object away through its own directory's handle and the
 /// object's identity, never through a path, and turns to the folder above only once every handle of
-/// the data directory is closed, so that an object that was put at a path since (or a link) is never
-/// taken for what this run made. The handles are held until the first manifest is written: after
-/// that a removal finds the objects by the manifest.
+/// the data directory are closed, so that an object that was put at a path since (or a link) is never
+/// taken for what this run made. The handles are held to the end of the run, and the rollback of a
+/// failure takes the objects away by them; a removal after a finished installation finds the objects
+/// by the manifest.
 #[derive(Debug, Default)]
 struct Made {
     /// The folder above the data directory, where this run's own call made it.
@@ -1872,8 +1879,11 @@ fn open_directory_relative(
 }
 
 /// [`open_directory_relative`] with no parent handle where `name` is a full path in the platform's own
-/// form (`\??\C:\...`): the call that makes a directory returns the handle of the directory that it
-/// made. With [`FILE_CREATE`] the call only makes: it returns none where something was there already.
+/// form (`\??\C:\...`; the path is the base, absolute, and nothing is resolved against the current
+/// directory): the call that makes a directory returns the handle of the directory that it made.
+/// With [`FILE_CREATE`] the call only makes: it returns none where something was there already. A
+/// folder that is opened this way is a holder of a folder that the installation did not make, and
+/// shares everything.
 fn open_directory_at(
     parent: Option<&ffi::Handle>,
     name: &OsStr,
@@ -1912,9 +1922,13 @@ fn open_directory_at(
             FILE_ATTRIBUTE_DIRECTORY,
             // An object that this call makes is held for the run's cleanup, which opens it again
             // through this handle: it shares everything and holds no right to delete, so that no
-            // open of the product or of the system is refused by it. An object that is only opened
-            // is held against a rename or a delete.
-            if disposition == FILE_CREATE {
+            // open of the product or of the system is refused by it. A folder that is opened by its
+            // full path is the holder of a folder that the installation did not make (the system's
+            // `Program Files` or `ProgramData`): it shares everything too, since every open
+            // beneath it is relative to its handle and keeps the right object whatever happens to
+            // the folder's name. An object that is opened beneath a held directory is held against
+            // a rename or a delete.
+            if disposition == FILE_CREATE || parent.is_none() {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
             } else {
                 FILE_SHARE_READ | FILE_SHARE_WRITE
@@ -2576,6 +2590,7 @@ fn opened_final_path(folder: &Path) -> Result<String, String> {
     let wide = ffi::wide_path(folder);
     // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
     let raw = unsafe {
+        // Base: the full path that the caller built from `Paths`, which `Paths::system` makes from the system's known folders; the call resolves it from the volume's root and never against the current directory
         CreateFileW(
             wide.as_ptr(),
             FILE_READ_ATTRIBUTES,
@@ -2669,6 +2684,7 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
         let wide = ffi::wide_path(folder);
         // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
         let raw = unsafe {
+            // Base: the full path that the caller built from `Paths`, which `Paths::system` makes from the system's known folders; the call resolves it from the volume's root and never against the current directory
             CreateFileW(
                 wide.as_ptr(),
                 FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
@@ -2771,6 +2787,7 @@ pub fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), 
         let wide = ffi::wide_path(folder);
         // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
         let raw = unsafe {
+            // Base: the full path that the caller built from `Paths`, which `Paths::system` makes from the system's known folders; the call resolves it from the volume's root and never against the current directory
             CreateFileW(
                 wide.as_ptr(),
                 FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
@@ -3673,6 +3690,7 @@ pub fn qualify_git() -> Result<GitSet, Error> {
     let mut images = Vec::new();
     for relative in policy::git_images() {
         let path = dir.join(relative);
+        // Base: `dir` is Git's installation folder from the system's known folders, a full path
         let bytes = fs::read(&path).map_err(|error| {
             // text: qualify_git-1
             Error::Refused(remedy::git_program_not_reached(
@@ -3742,6 +3760,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
     let mut staged = Vec::new();
     for name in [BROKER, CREDENTIAL] {
         let source = payload.join(name);
+        // Base: `payload` is the payload directory that the caller names, a full path; the name beneath it is a bare file name
         let metadata = fs::symlink_metadata(&source).map_err(|error| {
             // text: stage_payload-1
             Error::Refused(remedy::payload_file_not_reached(
@@ -3758,6 +3777,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
                 source.display()
             )));
         }
+        // Base: `source`, the payload file named above, a full path
         let mut handle = OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -3779,6 +3799,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
             // text: install_stage_payload-4
             .map_err(io_error(format!("staging {}", path.display())))?;
         drop(made);
+        // Base: `path`, the staged file beneath the staging directory of `Paths`, a full path
         let checked = OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -3804,6 +3825,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
 }
 
 fn sha256_of(path: &Path) -> Result<String, Error> {
+    // Base: `path` is the full path of a file that the caller names (a staged file or Git's own program)
     // text: install_sha256_of-1
     let bytes = fs::read(path).map_err(io_error(format!("reading {}", path.display())))?;
     Ok(hex::encode(Sha256::digest(&bytes)))
@@ -4626,6 +4648,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
                 file.name
             )));
         }
+        // Base: `file.path`, the staged file beneath the staging directory of `Paths`, a full path
         let _ = fs::remove_file(&file.path);
     }
 
@@ -5138,6 +5161,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             let stayed = records::remove_empty(&paths.data);
             if stayed.is_empty() {
                 if let Some(parent) = paths.data.parent() {
+                    // Base: `parent` is the folder above the data directory of `Paths`, a full path
                     let _ = fs::remove_dir(parent);
                 }
                 // text: remove_at-3
@@ -6181,6 +6205,7 @@ fn remove_approved_records(paths: &Paths, approved: &records::Approved) -> Vec<S
         approved,
     });
     if let Some(parent) = paths.data.parent() {
+        // Base: `parent` is the folder above the data directory of `Paths`, a full path
         let _ = fs::remove_dir(parent);
     }
     stayed
@@ -6198,6 +6223,7 @@ fn remove_approved_records(paths: &Paths, approved: &records::Approved) -> Vec<S
 pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
     use crate::journal::rows::Row;
     let mut found = Vec::new();
+    // Base: `paths.run` is the directory of the private roots beneath the data directory of `Paths`, a full path
     match fs::read_dir(&paths.run) {
         Ok(entries) => {
             for entry in entries {
