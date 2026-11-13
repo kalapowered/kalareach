@@ -3240,6 +3240,8 @@ pub async fn terminal_view_open<R: tauri::Runtime>(
             links.note_recheck();
             tauri::async_runtime::spawn(async move {
                 let emit: crate::standing::Emitter = std::sync::Arc::new(move |event| {
+                    #[cfg(feature = "testing")]
+                    crate::told::tap(&emitter, crate::standing::STANDING_EVENT, &event);
                     let _ = emitter.emit(crate::standing::STANDING_EVENT, event);
                 });
                 links.recheck(&emit, session_id, &opening).await;

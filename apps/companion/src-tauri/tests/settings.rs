@@ -56,9 +56,9 @@ use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner, installation_id}
 use kr_protocol::sync::SyncObjectKind;
 use kr_service_stand_in::{Moment, Served, serve};
 use serde_json::{Value, json};
+use tauri::Manager as _;
 use tauri::test::{INVOKE_KEY, MockRuntime, mock_builder, mock_context, noop_assets};
 use tauri::webview::InvokeRequest;
-use tauri::{Listener as _, Manager as _};
 
 const SYNC_PATH: &str = "/api/sync/exchange";
 
@@ -523,7 +523,18 @@ impl Computer {
         &self,
         clients: Option<Arc<dyn companion_tauri::services::SyncServices>>,
     ) -> Page {
+        // Each view of the settings the application tells the page, as the application hands it
+        // over: a listener would miss one that is told while another emit holds the listeners.
+        let heard = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let listening = Arc::clone(&heard);
         let app = mock_builder()
+            .manage(companion_tauri::told::Tap::new(move |event, text| {
+                assert_eq!(event, SETTINGS_EVENT, "the one event this suite reads");
+                listening
+                    .lock()
+                    .expect("the record")
+                    .push(serde_json::from_str(&text).expect("a view"));
+            }))
             .manage(AppState::new())
             .invoke_handler(tauri::generate_handler![
                 companion_tauri::commands::sync_service_set,
@@ -559,14 +570,6 @@ impl Computer {
         )
         .expect("settings sync opens");
         companion_tauri::watch_settings(app.handle());
-        let heard = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let listening = Arc::clone(&heard);
-        app.listen(SETTINGS_EVENT, move |event| {
-            listening
-                .lock()
-                .expect("the record")
-                .push(serde_json::from_str(event.payload()).expect("a view"));
-        });
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("a window");

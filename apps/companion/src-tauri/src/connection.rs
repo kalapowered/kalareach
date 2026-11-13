@@ -804,7 +804,10 @@ pub async fn keep<R, A, F>(
                 if !state.connected_for(choice, connection) {
                     return;
                 }
-                let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                let now = state.connection_state();
+                #[cfg(feature = "testing")]
+                crate::told::tap(&app, CONNECTION_EVENT, &now);
+                let _ = app.emit(CONNECTION_EVENT, now);
                 // A host that is reached again is asked once more for what a call left owed it.
                 if let (Some(host), Some(calls)) =
                     (paired_host, app.try_state::<crate::voice::Calls>())
@@ -846,7 +849,10 @@ pub async fn keep<R, A, F>(
                                 if stopped != LeaseStop::ConnectionEnded
                                     && state.disconnected_for(choice, stopped.to_string())
                                 {
-                                    let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                                    let now = state.connection_state();
+                                    #[cfg(feature = "testing")]
+                                    crate::told::tap(&app, CONNECTION_EVENT, &now);
+                                    let _ = app.emit(CONNECTION_EVENT, now);
                                 }
                                 session.close();
                             }
@@ -862,7 +868,10 @@ pub async fn keep<R, A, F>(
                 if !state.disconnected_for(choice, error.message) {
                     return;
                 }
-                let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                let now = state.connection_state();
+                #[cfg(feature = "testing")]
+                crate::told::tap(&app, CONNECTION_EVENT, &now);
+                let _ = app.emit(CONNECTION_EVENT, now);
                 if let Some(first) = first.take() {
                     let _ = first.send(());
                 }
@@ -992,7 +1001,10 @@ pub async fn forward_events<R: Runtime>(
                         |refusal| refusal.message,
                     );
                 state.disconnected_from(&session, why);
-                let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                let now = state.connection_state();
+                #[cfg(feature = "testing")]
+                crate::told::tap(&app, CONNECTION_EVENT, &now);
+                let _ = app.emit(CONNECTION_EVENT, now);
                 return;
             }
         };

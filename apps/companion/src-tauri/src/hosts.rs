@@ -56,7 +56,10 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
         },
     )?;
     // The page is told at once that the host it was talking to is no longer the one in use.
-    let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+    let now = state.connection_state();
+    #[cfg(feature = "testing")]
+    crate::told::tap(app, CONNECTION_EVENT, &now);
+    let _ = app.emit(CONNECTION_EVENT, now);
     let _ = tokio::time::timeout(FIRST_ATTEMPT_WITHIN, reached).await;
     Ok(state.connection_state())
 }
@@ -86,7 +89,10 @@ pub fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> Result<
             .requests()
             .forget_host(&crate::device::hosts::reference_of(host));
     }
-    let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+    let now = state.connection_state();
+    #[cfg(feature = "testing")]
+    crate::told::tap(app, CONNECTION_EVENT, &now);
+    let _ = app.emit(CONNECTION_EVENT, now);
     Ok(state.connection_state())
 }
 

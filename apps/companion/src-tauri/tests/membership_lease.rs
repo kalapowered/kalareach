@@ -74,7 +74,6 @@ use std::time::Duration;
 
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
-use companion_tauri::connection::CONNECTION_EVENT;
 use companion_tauri::inbox::{HostInbox, HostInboxState, InboxDesk};
 use companion_tauri::lease::LeaseDesk;
 use companion_tauri::owner::Owner;
@@ -111,7 +110,6 @@ use serde_json::json;
 use support::{
     Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, govern, pair_under, parts,
 };
-use tauri::Listener as _;
 use tokio::sync::{oneshot, watch};
 
 /// The account the device is signed in as, and the token it holds for the organisation's service.
@@ -434,10 +432,6 @@ struct Rig {
     phone: Phone,
     /// The account the device is signed in as.
     tokens: Arc<SignedInAccount>,
-    /// Counts each time the application tells the page where its connection stands.
-    changes: watch::Receiver<u64>,
-    /// Counts each change of an opened session's standing the page was told.
-    standings: watch::Receiver<u64>,
     /// What the test does to the application's connections to the host.
     control: Arc<LinkControl>,
     /// The sessions the host serves, which stop with the rig.
@@ -518,23 +512,6 @@ impl Rig {
         let control = LinkControl::new();
         let (phone, tokens) =
             signed_in_phone(&fixture, &served, &waits, &control, None, Arc::new(NoOwner)).await;
-        let changes = {
-            let (heard, changes) = watch::channel(0_u64);
-            phone.companion.app.listen_any(CONNECTION_EVENT, move |_| {
-                heard.send_modify(|count| *count += 1);
-            });
-            changes
-        };
-        let standings = {
-            let (heard, standings) = watch::channel(0_u64);
-            phone
-                .companion
-                .app
-                .listen_any(companion_tauri::standing::STANDING_EVENT, move |_| {
-                    heard.send_modify(|count| *count += 1);
-                });
-            standings
-        };
         let grant = ProposedGrant {
             organisation: Nullable::some(OrganisationRequirement {
                 organisation_id: fixture.organisation.organisation_id,
@@ -550,8 +527,6 @@ impl Rig {
             waits,
             phone,
             tokens,
-            changes,
-            standings,
             control,
             workers,
         }
@@ -574,9 +549,9 @@ impl Rig {
         &self,
         wanted: impl Fn(&serde_json::Value) -> bool,
     ) -> serde_json::Value {
-        let mut changes = self.changes.clone();
         tokio::time::timeout(WATCHDOG, async {
             loop {
+                let told = self.companion().connection.len();
                 let state = self
                     .companion()
                     .call("connection_state", json!({}))
@@ -584,10 +559,7 @@ impl Rig {
                 if wanted(&state) {
                     return state;
                 }
-                changes
-                    .changed()
-                    .await
-                    .expect("the application goes on telling the page");
+                self.companion().connection.kept_beyond(told).await;
             }
         })
         .await
@@ -858,20 +830,18 @@ impl Rig {
         opening: &str,
         wanted: impl Fn(&serde_json::Value) -> bool,
     ) -> serde_json::Value {
-        let mut changes = self.standings.clone();
+        let standing_of =
+            |text: &str| -> serde_json::Value { serde_json::from_str(text).expect("an event") };
         tokio::time::timeout(WATCHDOG, async {
-            loop {
-                for text in self.companion().standing.texts() {
-                    let event: serde_json::Value = serde_json::from_str(&text).expect("an event");
-                    if event["opening"] == opening && wanted(&event["standing"]) {
-                        return event["standing"].clone();
-                    }
-                }
-                changes
-                    .changed()
-                    .await
-                    .expect("the application goes on telling the page");
-            }
+            let text = self
+                .companion()
+                .standing
+                .text_where(|text| {
+                    let event = standing_of(text);
+                    event["opening"] == opening && wanted(&event["standing"])
+                })
+                .await;
+            standing_of(&text)["standing"].clone()
         })
         .await
         .unwrap_or_else(|_| {
@@ -2535,7 +2505,6 @@ impl Ceremony for GatedCeremony {
 struct OwnerDevice {
     phone: Phone,
     tokens: Arc<SignedInAccount>,
-    pairings: watch::Receiver<u64>,
 }
 
 impl OwnerDevice {
@@ -2552,16 +2521,6 @@ impl OwnerDevice {
             ceremony,
         )
         .await;
-        let pairings = {
-            let (heard, pairings) = watch::channel(0_u64);
-            phone
-                .companion
-                .app
-                .listen_any(companion_tauri::pairing::PAIRING_EVENT, move |_| {
-                    heard.send_modify(|count| *count += 1);
-                });
-            pairings
-        };
         support::record_owned_under(
             &phone.companion.device(),
             &rig.fixture.host,
@@ -2571,11 +2530,7 @@ impl OwnerDevice {
                 policy_revision: rig.fixture.revision,
             },
         );
-        Self {
-            phone,
-            tokens,
-            pairings,
-        }
+        Self { phone, tokens }
     }
 
     /// The watcher of the hosts this device owns, which the application started with the device. A
@@ -2596,9 +2551,9 @@ impl OwnerDevice {
 
     /// Waits until the pairing screen's row for the host is one `wanted` accepts.
     async fn row_where(&self, wanted: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
-        let mut changes = self.pairings.clone();
         tokio::time::timeout(WATCHDOG, async {
             loop {
+                let told = self.phone.companion.told.len();
                 let screen = serde_json::to_value(self.phone.companion.device().view())
                     .expect("the screen as the page gets it");
                 if let Some(row) = screen["hosts"].as_array().and_then(|rows| rows.first())
@@ -2606,10 +2561,7 @@ impl OwnerDevice {
                 {
                     return row.clone();
                 }
-                changes
-                    .changed()
-                    .await
-                    .expect("the application goes on telling the page");
+                self.phone.companion.told.kept_beyond(told).await;
             }
         })
         .await

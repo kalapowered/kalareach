@@ -1585,6 +1585,8 @@ pub async fn open_session<R: tauri::Runtime>(
     };
     let emitter = app.clone();
     let emit: Emitter = Arc::new(move |event| {
+        #[cfg(feature = "testing")]
+        crate::told::tap(&emitter, STANDING_EVENT, &event);
         let _ = emitter.emit(STANDING_EVENT, event);
     });
     state

@@ -70,6 +70,8 @@ pub mod state;
 pub mod sync_service;
 pub mod target;
 pub mod terminal;
+#[cfg(feature = "testing")]
+pub mod told;
 pub mod transfers;
 pub mod verify;
 pub mod voice;
@@ -830,7 +832,10 @@ pub fn watch_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let handle = app.clone();
     settings.told().by(move || {
         if let Ok(settings) = handle.state::<AppState>().settings() {
-            let _ = handle.emit(settings::SETTINGS_EVENT, settings.view());
+            let view = settings.view();
+            #[cfg(feature = "testing")]
+            told::tap(&handle, settings::SETTINGS_EVENT, &view);
+            let _ = handle.emit(settings::SETTINGS_EVENT, view);
         }
     });
 }
@@ -1038,6 +1043,8 @@ pub fn start_pairing<R: tauri::Runtime>(
                 view.state,
                 kr_client::pairing::candidate::AttemptState::Paired { .. }
             );
+            #[cfg(feature = "testing")]
+            told::tap(&emitter, pairing::PAIRING_EVENT, &view);
             let _ = emitter.emit(pairing::PAIRING_EVENT, view);
             if paired {
                 // A computer that reaches no host takes the first one it pairs with as the one its
@@ -1060,7 +1067,10 @@ pub fn start_pairing<R: tauri::Runtime>(
     let emitter = app.clone();
     let owner = owner::Owner::new(Arc::clone(&device), ceremony, move || {
         if let Ok(owner) = emitter.state::<AppState>().owner() {
-            let _ = emitter.emit(pairing::CONFIRMATIONS_EVENT, owner.view());
+            let view = owner.view();
+            #[cfg(feature = "testing")]
+            told::tap(&emitter, pairing::CONFIRMATIONS_EVENT, &view);
+            let _ = emitter.emit(pairing::CONFIRMATIONS_EVENT, view);
         }
     });
     let reading = Arc::clone(&intake);

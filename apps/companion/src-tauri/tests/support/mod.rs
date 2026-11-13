@@ -79,6 +79,25 @@ impl Capture {
         self.texts.lock().expect("the capture").clone()
     }
 
+    /// How many texts were kept.
+    pub fn len(&self) -> usize {
+        self.texts.lock().expect("the capture").len()
+    }
+
+    /// Waits until more than `seen` texts were kept, which a caller counted before it read what it
+    /// is waiting on, so that nothing kept after the read goes unseen.
+    pub async fn kept_beyond(&self, seen: usize) {
+        loop {
+            let kept = self.kept.notified();
+            tokio::pin!(kept);
+            kept.as_mut().enable();
+            if self.len() > seen {
+                return;
+            }
+            kept.await;
+        }
+    }
+
     /// Waits until a kept text is one `wanted` accepts, and returns it. It decides by what was
     /// kept and wakes when more is, so it ends when the text is kept and never by a time.
     pub async fn text_where(&self, wanted: impl Fn(&str) -> bool) -> String {
@@ -635,12 +654,20 @@ const BUNDLE: &str = "tauri://localhost";
 pub struct Companion {
     pub app: tauri::App<tauri::test::MockRuntime>,
     window: tauri::WebviewWindow<tauri::test::MockRuntime>,
-    /// Each event the page was sent, as its payload.
+    /// Each event the page was sent, as its payload, as a listener on the event system hears it.
+    /// A listener misses an event that is told while another emit holds the listeners, so a wait
+    /// for an event reads [`Self::told`], and this serves what a scan reads over everything heard.
     pub heard: Arc<Capture>,
+    /// Each pairing and confirmations event the backend told the page, as its payload, as the
+    /// backend handed it over: no other emit holds one back.
+    pub told: Arc<Capture>,
     /// Each command's answer or refusal, as the page received it.
     pub answered: Arc<Capture>,
-    /// Each change of an opened session's standing, as its event reached the page.
+    /// Each change of an opened session's standing, as the backend handed it over.
     pub standing: Arc<Capture>,
+    /// Each time the application told the page where its connection stands, as the backend handed
+    /// it over.
+    pub connection: Arc<Capture>,
     /// Every state each channel a command was given was sent.
     pub channels: Arc<Mutex<std::collections::BTreeMap<u32, Vec<serde_json::Value>>>>,
 }
@@ -683,7 +710,27 @@ impl Companion {
         let channels: Arc<Mutex<std::collections::BTreeMap<u32, Vec<serde_json::Value>>>> =
             Arc::default();
         let heard_on_channels = Arc::clone(&channels);
+        let told = Arc::new(Capture::default());
+        let standing = Arc::new(Capture::default());
+        let connection = Arc::new(Capture::default());
+        let tap = {
+            let (told, standing, connection) = (
+                Arc::clone(&told),
+                Arc::clone(&standing),
+                Arc::clone(&connection),
+            );
+            companion_tauri::told::Tap::new(move |event, text| match event {
+                companion_tauri::connection::CONNECTION_EVENT => connection.keep_text(text),
+                companion_tauri::standing::STANDING_EVENT => standing.keep_text(text),
+                companion_tauri::pairing::PAIRING_EVENT
+                | companion_tauri::pairing::CONFIRMATIONS_EVENT => told.keep_text(text),
+                // The settings views are read by the suite that starts the settings sync.
+                companion_tauri::settings::SETTINGS_EVENT => {}
+                other => panic!("the tap was handed {other}, which no capture keeps"),
+            })
+        };
         let builder = tauri::test::mock_builder()
+            .manage(tap)
             .manage(state)
             .manage(calls)
             .manage(account)
@@ -799,16 +846,6 @@ impl Companion {
             let heard = Arc::clone(&heard);
             app.listen_any(event, move |published| heard.keep_text(published.payload()));
         }
-        let standing = Arc::new(Capture::default());
-        {
-            let standing = Arc::clone(&standing);
-            app.listen_any(
-                companion_tauri::standing::STANDING_EVENT,
-                move |published| {
-                    standing.keep_text(published.payload());
-                },
-            );
-        }
         companion_tauri::start_pairing(
             app.handle(),
             data,
@@ -822,8 +859,10 @@ impl Companion {
             app,
             window,
             heard,
+            told,
             answered: Arc::new(Capture::default()),
             standing,
+            connection,
             channels,
         }
     }

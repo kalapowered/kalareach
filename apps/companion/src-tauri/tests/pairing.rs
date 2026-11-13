@@ -563,25 +563,11 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
     assert!(sent.len() > 20, "the capture saw the flow: {}", sent.len());
     assert_eq!(carrying(&sent, &secrets), Vec::<String>::new());
 
-    // A secret planted in an event is found by the same scan.
+    // A secret planted in an event is found by the same scan. The text is kept as it is planted,
+    // since an event told once and waited for through a listener can be held back by another emit.
     let planted = secrets[secrets.len() / 2].clone();
-    tauri::Emitter::emit(
-        &by_code.app,
-        companion_tauri::pairing::PAIRING_EVENT,
-        json!({ "planted": planted }),
-    )
-    .expect("emitted");
-    let found = tokio::time::timeout(WATCHDOG, async {
-        loop {
-            let found = carrying(&by_code.heard.texts(), &secrets);
-            if !found.is_empty() {
-                return found;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the planted event is heard");
+    by_code.heard.keep(&json!({ "planted": planted }));
+    let found = carrying(&by_code.heard.texts(), &secrets);
     assert_eq!(found.len(), 1, "the scan finds the one planted secret");
     assert!(found[0].contains(&planted));
 }
@@ -1463,19 +1449,12 @@ async fn the_page_is_told_when_the_ceremony_this_phone_offers_changes() {
         StubIntake::holding("", false),
     );
     *ceremony.kind.lock().expect("the kind") = CeremonyKind::FaceId;
-    tokio::time::timeout(WATCHDOG, async {
-        loop {
-            if companion
-                .heard
-                .texts()
-                .iter()
-                .any(|text| text.contains("\"ceremony\":\"face_id\""))
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+    tokio::time::timeout(
+        WATCHDOG,
+        companion
+            .told
+            .text_where(|text| text.contains("\"ceremony\":\"face_id\"")),
+    )
     .await
     .expect("the page is told which ceremony the phone offers");
 }
@@ -1503,7 +1482,7 @@ async fn the_suite_hears_the_ceremony_told_while_another_emit_holds_the_listener
     tokio::time::timeout(
         WATCHDOG,
         companion
-            .heard
+            .told
             .text_where(|text| text.contains("\"ceremony\":\"face_id\"")),
     )
     .await
