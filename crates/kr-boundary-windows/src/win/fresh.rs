@@ -31,7 +31,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, ReOpenFile,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -407,16 +408,42 @@ pub fn replace_whole(
     }
 }
 
+/// Opens the object behind a handle again, through that handle and not by its name, for its
+/// attributes only and with full sharing: a separate file object that holds the object's identity
+/// and no right to anything, and that shares everything, so that no later open of the object is
+/// refused by it. The handle that it is taken from can then be closed with the access and the
+/// sharing mode of its own open.
+fn identity_of(handle: &ffi::Handle) -> io::Result<ffi::Handle> {
+    // SAFETY: the handle is open, and the call reads nothing else.
+    let raw = unsafe {
+        ReOpenFile(
+            handle.raw(),
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    // text: identity_of-1
+    ffi::Handle::new(
+        raw,
+        "opening a file again through its own handle for its identity",
+    )
+    .map_err(|error| io::Error::other(error.to_string()))
+}
+
 /// Writes a record new beneath the directory that `directory` holds, the earlier-state record that
 /// an installation writes once: the file is made relative to that handle (no path of the data tree
 /// is resolved for the create), in the one call that carries its whole descriptor, with the right to
 /// delete it as well as to read and write it, and shares read only. The file is the run's from the
 /// call that made it: `hold` is called with its handle the moment the create returns, with nothing
 /// that can fail between the two (the only steps are the move of the handle into a shared pointer
-/// and the call), and the run keeps the handle to the end of its work, so that its rollback marks the
-/// file through it. Where the write or the flush fails, the same handle marks the file for removal
-/// and `hold` is called with `None`; where that mark fails, the run still holds the handle. Returns
-/// `false`, having made nothing, where anything is at the name.
+/// and the call). That handle, which holds a right to delete and a restricted sharing mode, lives
+/// only until the write and the flush are done and an identity handle has been taken from it. A
+/// failure of any of the three marks the file for removal through the same handle and calls
+/// `hold` with `None`; where that mark fails, the run still holds the handle. On success the
+/// identity handle is returned (the object's attributes only, full sharing, taken through the
+/// creating handle and never by name), `hold` is called with `None`, and the creating handle is
+/// closed. Returns `None`, having made nothing, where anything is at the name.
 ///
 /// # Errors
 ///
@@ -426,7 +453,7 @@ pub fn write_new_beneath(
     path: &Path,
     bytes: &[u8],
     hold: &Hold<'_>,
-) -> io::Result<bool> {
+) -> io::Result<Option<ffi::Handle>> {
     let name: Vec<u16> = path
         .file_name()
         .ok_or_else(|| io::Error::other("the record has no file name"))?
@@ -440,12 +467,12 @@ pub fn write_new_beneath(
         FILE_SHARE_READ,
     ) {
         Ok(created) => created,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
         Err(error) => return Err(error),
     };
     let handle = Arc::new(created);
     hold(Some((&handle, path)));
-    let written = (|| -> io::Result<()> {
+    let written = (|| -> io::Result<ffi::Handle> {
         #[cfg(feature = "testing")]
         crate::manifest::forced::failure_at("prior").map_err(io::Error::other)?;
         // The file borrows the handle for the write and is never dropped, which would close it.
@@ -454,10 +481,16 @@ pub fn write_new_beneath(
         file.write_all(bytes)?;
         #[cfg(feature = "testing")]
         crate::manifest::forced::failure_at("prior-flush").map_err(io::Error::other)?;
-        file.sync_all()
+        file.sync_all()?;
+        #[cfg(feature = "testing")]
+        crate::manifest::forced::failure_at("prior-identity").map_err(io::Error::other)?;
+        identity_of(&handle)
     })();
     match written {
-        Ok(()) => Ok(true),
+        Ok(identity) => {
+            hold(None);
+            Ok(Some(identity))
+        }
         Err(failure) => Err(match super::root::delete(&handle) {
             Ok(()) => {
                 hold(None);
@@ -796,8 +829,11 @@ mod tests {
     }
 
     /// The earlier-state record is made new beneath the held directory and the run holds it from the
-    /// call that made it, to the end; a second write finds the name taken and makes nothing; a write
-    /// or a flush that fails marks it through its own handle and the run is told that it is gone.
+    /// call that made it until the write, the flush and the identity are done; what is returned is
+    /// an identity handle of the same object, and no handle of the write is left, so that the
+    /// record can be opened for writing and deleting afterwards. A second write finds the name
+    /// taken and makes nothing; a write, a flush or an identity that fails marks the record through
+    /// its own handle and the run is told that it is gone.
     #[test]
     fn the_earlier_state_record_is_the_runs_from_its_create_and_is_never_written_over() {
         let _one = one_at_a_time();
@@ -810,15 +846,30 @@ mod tests {
                 .unwrap()
                 .push(made.map(|(_, path)| path.display().to_string()));
         };
-        assert!(write_new_beneath(&directory, &path, b"first", &hold).unwrap());
-        assert_eq!(*told.lock().unwrap(), [Some(path.display().to_string())]);
+        let identity = write_new_beneath(&directory, &path, b"first", &hold)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *told.lock().unwrap(),
+            [Some(path.display().to_string()), None]
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        // The identity is the record's own object.
+        let units: Vec<u16> = "prior.json".encode_utf16().collect();
+        let at_name = DirHandle::open_beneath(&directory, &units, 0, true, FILE_OPEN).unwrap();
+        assert_eq!(key_of(&identity).unwrap(), key_of(&at_name).unwrap());
+        // Nothing of the write keeps a right or a sharing mode that refuses a later open.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         // A record that is there is not written over, and the run is told of nothing.
-        assert!(!write_new_beneath(&directory, &path, b"second", &hold).unwrap());
-        assert_eq!(told.lock().unwrap().len(), 1);
+        assert!(
+            write_new_beneath(&directory, &path, b"second", &hold)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(told.lock().unwrap().len(), 2);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
         #[cfg(feature = "testing")]
-        for point in ["prior", "prior-flush"] {
+        for point in ["prior", "prior-flush", "prior-identity"] {
             let other = dir.path().join(format!("{point}.json"));
             told.lock().unwrap().clear();
             crate::manifest::forced::fail_the_next(point);

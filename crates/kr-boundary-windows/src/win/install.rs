@@ -996,8 +996,13 @@ struct Laid {
     /// The replacement of the manifest that a write is making, from the call that made it until it
     /// is proved to be the manifest or is marked for removal.
     replacement: Option<MadeFile>,
-    /// The earlier-state record, held through the handle of the call that made it.
-    prior: Option<MadeFile>,
+    /// The creating handle of the earlier-state record, from the call that made it until the write,
+    /// the flush and the taking of its identity are done (or marked for removal): it holds a right
+    /// to delete and shares read only, so it is held no longer than that.
+    prior_creating: Option<MadeFile>,
+    /// The earlier-state record, as this run wrote it: the identity handle that was taken through
+    /// the creating handle.
+    prior: Option<MadeObject>,
     /// The manifest, as the last write proved it to be at its name.
     manifest: Option<MadeObject>,
 }
@@ -3699,8 +3704,11 @@ impl Run {
     /// it with the run. The file is the run's from the call that made it: the write tells the run
     /// its handle at once (no call that can fail stands between the create and this record, since
     /// the only steps are the move of the handle into a shared pointer and the call itself), a
-    /// failed write or flush marks it through that handle, and the rollback marks it through the
-    /// same handle. Returns whether the record was written: a record that is there is kept.
+    /// failed write, flush or identity marks it through that handle, and the rollback marks it
+    /// through the same handle while it is held. When the write is done the run holds an identity
+    /// handle of the same object (attributes only, full sharing, taken through the creating
+    /// handle), and the creating handle, which holds a right to delete and shares read only, is
+    /// closed. Returns whether the record was written: a record that is there is kept.
     fn write_prior(&mut self, prior: Prior) -> Result<bool, Error> {
         let Some(directory) = &self.directory else {
             // text: run_write_prior-1
@@ -3710,18 +3718,29 @@ impl Run {
             ));
         };
         let bytes = prior.to_bytes()?;
+        // The directory's handle that goes with the record's identity is copied before anything is
+        // made, so that no call that can fail stands between the identity and its record.
+        let holder = directory.duplicate(LIST)?;
+        let name = self.paths.prior.file_name().unwrap_or_default();
         let hold = |made: Option<(&Arc<ffi::Handle>, &Path)>| {
-            ffi::locked(&self.laid).prior = made.map(|(handle, path)| MadeFile {
+            ffi::locked(&self.laid).prior_creating = made.map(|(handle, path)| MadeFile {
                 handle: Arc::clone(handle),
                 path: path.to_path_buf(),
             });
         };
-        let wrote = fresh::write_new_beneath(directory, &self.paths.prior, &bytes, &hold)
+        let written = fresh::write_new_beneath(directory, &self.paths.prior, &bytes, &hold)
             .map_err(StoreError::from)?;
-        if wrote {
-            self.prior = Some(prior);
-        }
-        Ok(wrote)
+        let Some(identity) = written else {
+            return Ok(false);
+        };
+        ffi::locked(&self.laid).prior = Some(MadeObject {
+            identity,
+            holder,
+            name: name.to_owned(),
+            directory: false,
+        });
+        self.prior = Some(prior);
+        Ok(true)
     }
 
     /// Takes away what this run laid, by the handles that it holds and never by what a manifest
@@ -3748,10 +3767,12 @@ impl Run {
             journal,
             run,
             replacement,
+            prior_creating,
             prior,
             manifest,
         } = std::mem::take(&mut *ffi::locked(&self.laid));
         let records_written = usize::from(replacement.is_some())
+            + usize::from(prior_creating.is_some())
             + usize::from(prior.is_some())
             + usize::from(manifest.is_some());
         let mut records_marked = 0;
@@ -3796,9 +3817,18 @@ impl Run {
                 true,
             );
         }
+        // The earlier-state record, while the run still holds the handle that made it, goes through
+        // that handle.
+        if gone && let Some(file) = prior_creating {
+            let path = file.path.clone();
+            gone = take(
+                Some((false, file.take_away(directory.as_ref()))),
+                &path,
+                true,
+            );
+        }
         if gone {
-            let prior = prior.map(|file| (false, file.take_away(directory.as_ref())));
-            gone = take(prior, &self.paths.prior, true);
+            gone = take(object(prior), &self.paths.prior, true);
         }
         if gone {
             gone = take(object(staging), &self.paths.staging, false);
@@ -5753,6 +5783,20 @@ mod tests {
         assert!(std::fs::metadata(above.join("aside")).unwrap().is_dir());
     }
 
+    /// An object that stands in the data directory, as the run holds one of its own: its identity is
+    /// an open of its name for its attributes alone, with full sharing, and the handle of the
+    /// directory that holds it goes with it.
+    fn identity_of_name(directory: &ffi::Handle, name: &str) -> MadeObject {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let holder = directory.duplicate(LIST).unwrap();
+        MadeObject {
+            identity: DirHandle::open_beneath(&holder, &units, 0, true, FILE_OPEN).unwrap(),
+            holder,
+            name: name.into(),
+            directory: false,
+        }
+    }
+
     /// A run that has laid the folder above, the data directory, its three directories, the
     /// earlier-state record and the manifest, each held with its own directory's handle.
     fn laid_run(top: &Path) -> Run {
@@ -5765,30 +5809,11 @@ mod tests {
         let private = made_in(held(&data_path), "run");
         std::fs::write(data_path.join("manifest.json"), b"{}").unwrap();
         let directory = held(&data_path);
-        // The earlier-state record is the run's through the handle of the call that made it, and
-        // the manifest through the identity of an open of its name.
-        let prior_name: Vec<u16> = "prior.json".encode_utf16().collect();
-        let prior = MadeFile {
-            handle: Arc::new(
-                fresh::create_beneath(
-                    &directory,
-                    &prior_name,
-                    SdKind::AdminFile,
-                    GENERIC_READ | GENERIC_WRITE | DELETE,
-                    FILE_SHARE_READ,
-                )
-                .unwrap(),
-            ),
-            path: data_path.join("prior.json"),
-        };
-        let manifest_name: Vec<u16> = "manifest.json".encode_utf16().collect();
-        let holder = directory.duplicate(LIST).unwrap();
-        let manifest = MadeObject {
-            identity: DirHandle::open_beneath(&holder, &manifest_name, 0, true, FILE_OPEN).unwrap(),
-            holder,
-            name: "manifest.json".into(),
-            directory: false,
-        };
+        // The earlier-state record and the manifest are the run's through the identity of an open
+        // of their names.
+        std::fs::write(data_path.join("prior.json"), b"{}").unwrap();
+        let prior = identity_of_name(&directory, "prior.json");
+        let manifest = identity_of_name(&directory, "manifest.json");
         Run {
             paths: Paths {
                 program: top.join("program"),
@@ -5812,6 +5837,7 @@ mod tests {
                 journal: Some(journal),
                 run: Some(private),
                 replacement: None,
+                prior_creating: None,
                 prior: Some(prior),
                 manifest: Some(manifest),
             })),
