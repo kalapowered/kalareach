@@ -777,3 +777,19 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     expect(isLit(wrapper.querySelector('.md-link') as HTMLElement)).toBe(true)
   })
 })
+
+describe('a link in a line wider than its message', () => {
+  it('has an area where the pane has been scrolled sideways by more than the reach: the message’s box is tested on the vertical axis only', () => {
+    // The message's box is as wide as the stream and the pane has scrolled 200 px to the right: the
+    // message now lies at x -200 to 190, and an unbroken run still shows a link at x 300 to 330.
+    const { pane, text, links } = between({ left: 300, top: 100, right: 330, bottom: 117 })
+    boxes.set(text.parentElement as HTMLElement, { left: -200, top: 0, right: 190, bottom: 844 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(text, { clientX: 336, clientY: 108 }))
+    expect(isLit(links[0]), 'the look for a tap 6 px after the words').toBe(true)
+    fire('pointerup', pointer(text, { clientX: 336, clientY: 108, timeStamp: 120 }))
+    fire('click', click(text, { clientX: 336, clientY: 108 }))
+    expect(opened).toEqual([links[0]])
+  })
+})

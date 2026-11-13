@@ -250,6 +250,10 @@ const OPEN: Rect = { left: -Infinity, top: -Infinity, right: Infinity, bottom: I
  * near the point, so a message of some thousand links reads every one of its link boxes at each press
  * and each click. Besides those boxes, each press and each click finds the message of every link of
  * the pane with `closest`: a walk of the tree, not a layout read.
+ *
+ * A message is near when the point lies within the radius of the message's box on the vertical axis
+ * only. All messages share one horizontal extent, the stream's, and a link in a line wider than it
+ * (an unbroken run, a wide table) lies outside that box once the pane has scrolled sideways.
  */
 function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement> {
   const all = pane.querySelectorAll<HTMLElement>('.m-node .md-link')
@@ -266,7 +270,8 @@ function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement
     if (message === null) return false
     let answer = messages.get(message)
     if (answer === undefined) {
-      answer = near(message.getBoundingClientRect())
+      const box = message.getBoundingClientRect()
+      answer = y >= box.top - radius && y <= box.bottom + radius
       messages.set(message, answer)
     }
     return answer
