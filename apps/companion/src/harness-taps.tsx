@@ -44,13 +44,16 @@ const TAP_MESSAGES: readonly string[] = [
   'The last words of the conversation end with [a link](https://example.org/last-line)'
 ]
 
-/** Puts the messages of the taps on the first session. */
-export function fillForTaps(controls: FakeHostControls): void {
+/** A conversation shorter than the pane: one message, with its link at the end of the only line. */
+const SHORT_MESSAGES: readonly string[] = ['The only words of a short conversation end with [a short link](https://example.org/short-last)']
+
+/** Puts the messages of the taps on the first session, or the short conversation's one message. */
+export function fillForTaps(controls: FakeHostControls, short = false): void {
   // The link at the end of a line has its words end at the pane's right edge, as a full line's last word does.
   const style = document.createElement('style')
   style.textContent = ".m-node p:has(.md-link[title$='at-end']) { text-align: justify; text-align-last: justify; }"
   document.head.append(style)
-  for (const message of TAP_MESSAGES) controls.records.appendEntry(SESSION, 'message', message)
+  for (const message of short ? SHORT_MESSAGES : TAP_MESSAGES) controls.records.appendEntry(SESSION, 'message', message)
   document.dispatchEvent(new Event('visibilitychange'))
 }
 
@@ -110,18 +113,23 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
       order += 1
       const pointer = event as PointerEvent
       // The event's class, and the pointer's number and type where the event has them: `-` where it has not.
+      // At a pointer down, the link that the page's press handling lit by then (`-` for none): this runs in
+      // the bubble phase, after the handler's own listener on the document has run.
+      const lit = event.type === 'pointerdown' ? nameOf(document.querySelector<HTMLElement>('.md-link[data-pressed]')?.title ?? '') || '-' : '-'
       seen.push(
-        `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)} ${event.constructor.name} ${typeof pointer.pointerId === 'number' ? String(pointer.pointerId) : '-'} ${pointer.pointerType || '-'}`
+        `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)} ${event.constructor.name} ${typeof pointer.pointerId === 'number' ? String(pointer.pointerId) : '-'} ${pointer.pointerType || '-'} lit=${lit}`
       )
       if (seen.length > KEPT) seen.shift()
       show()
     }
-    const types = ['pointerdown', 'pointerup', 'pointercancel', 'click', 'focusin'] as const
+    const types = ['pointerup', 'pointercancel', 'click', 'focusin'] as const
     for (const type of types) document.addEventListener(type, note, true)
+    document.addEventListener('pointerdown', note)
     const timer = window.setInterval(show, 400)
     show()
     return () => {
       for (const type of types) document.removeEventListener(type, note, true)
+      document.removeEventListener('pointerdown', note)
       window.clearInterval(timer)
     }
   }, [controls])

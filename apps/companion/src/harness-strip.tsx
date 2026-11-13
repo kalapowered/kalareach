@@ -142,6 +142,16 @@ export function HarnessStrip({
           >
             Link taps
           </button>
+          <button
+            type="button"
+            id="kr-strip-short-taps"
+            onClick={choose(() => {
+              fillForTaps(controls, true)
+              setTaps(true)
+            })}
+          >
+            Short link taps
+          </button>
           <span id="kr-strip-submissions" data-testid="strip-submissions" aria-label={`Sends received: ${submissions}`}>
             {submissions}
           </span>
