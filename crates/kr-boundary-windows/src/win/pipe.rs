@@ -1032,9 +1032,11 @@ pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
                 )]
                 let woken = unsafe { WaitNamedPipeW(name.as_ptr(), left.as_millis() as u32) };
                 // A call that failed at once would turn the loop with no pause until its bound: it
-                // waits out a short pause instead. The answer decides nothing but this pace.
-                if woken == 0 && turn.elapsed() < RETRY_PAUSE {
-                    std::thread::sleep(RETRY_PAUSE);
+                // waits out a short pause instead, no longer than the time that is left. The answer
+                // decides nothing but this pace.
+                let pause = RETRY_PAUSE.min(left);
+                if woken == 0 && turn.elapsed() < pause {
+                    std::thread::sleep(pause.saturating_sub(turn.elapsed()));
                 }
             }
             Err(failure) => return Err(failure),
