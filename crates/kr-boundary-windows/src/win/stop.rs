@@ -70,6 +70,15 @@ impl Stop {
         }
     }
 
+    /// Makes the set of the event fail for a case, as `set` keeps a set that failed: the failure is
+    /// kept and the event is not signalled, so that only a wait that comes back to read the kept
+    /// failure sees the stop. For the test build only.
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn fail_the_set_for_a_case(&self) {
+        self.unread
+            .get_or_init(|| Failure::Set("a case made the set fail".to_owned()));
+    }
+
     /// Whether the event is set, or could not be waited on (see [`Stop::unread`]).
     #[must_use]
     pub fn is_set(&self) -> bool {
