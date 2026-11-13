@@ -30,6 +30,8 @@ const capturing = new Map<string, boolean>()
 let opened: HTMLElement[] = []
 /** The overflow that the made page's elements have, by axis; an element not named here does not clip. */
 let overflows = new WeakMap<Element, { x: string; y: string }>()
+/** The other computed properties that the made page's elements have, by CSS name (`transform`, `contain`, ...). */
+let styles = new WeakMap<Element, Record<string, string>>()
 
 const rectOf = (box: Box | undefined): DOMRect => {
   const { left, top, right, bottom } = box ?? { left: 0, top: 0, right: 0, bottom: 0 }
@@ -39,6 +41,7 @@ const rectOf = (box: Box | undefined): DOMRect => {
 beforeEach(() => {
   boxes = new WeakMap()
   overflows = new WeakMap()
+  styles = new WeakMap()
   reads = []
   opened = []
   listening.clear()
@@ -79,7 +82,7 @@ beforeEach(() => {
   vi.spyOn(globalThis, 'getComputedStyle').mockImplementation(
     (element: Element) =>
       ({
-        getPropertyValue: () => '44px',
+        getPropertyValue: (name: string) => (name === '--target' ? '44px' : (styles.get(element)?.[name] ?? '')),
         overflowX: overflows.get(element)?.x ?? 'visible',
         overflowY: overflows.get(element)?.y ?? 'visible'
       }) as unknown as CSSStyleDeclaration
@@ -1016,6 +1019,113 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     expect(reads.filter((read) => read === text).length, 'reads of the clipping ancestor for two links').toBe(1)
     expect(reads.filter((read) => read === wrapper).length, 'reads of an ancestor that does not clip').toBe(0)
     expect(isLit(wrapper.querySelector('.md-link') as HTMLElement)).toBe(true)
+  })
+})
+
+describe('a link under a box whose view cannot be measured', () => {
+  // The words (22,120) to (30,137) in a box of the pane's size; the tap at (45,145) is in their area.
+  const words = { left: 22, top: 120, right: 30, bottom: 137 }
+  const tap = { clientX: 45, clientY: 145 }
+
+  /** Every kind of box that the view cannot be measured through, by the computed properties it has. */
+  const blocking: Record<string, Record<string, string>> = {
+    'a scale': { transform: 'matrix(0.5, 0, 0, 0.5, 0, 0)' },
+    'a rotation': { transform: 'matrix(0.8, 0.6, -0.6, 0.8, 0, 0)' },
+    'a skew': { transform: 'matrix(1, 0, 0.5, 1, 0, 0)' },
+    'a 3D scale': { transform: 'matrix3d(0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)' },
+    'a 3D rotation': { transform: 'matrix3d(1, 0, 0, 0, 0, 0.8, 0.6, 0, 0, -0.6, 0.8, 0, 0, 0, 0, 1)' },
+    'the separate scale property': { scale: '0.5' },
+    'the separate rotate property': { rotate: '10deg' },
+    'contain: paint': { contain: 'paint' },
+    'contain: strict': { contain: 'strict' },
+    'contain: content': { contain: 'content' },
+    'contain: layout paint': { contain: 'layout paint' },
+    'content-visibility: auto': { 'content-visibility': 'auto' },
+    'content-visibility: hidden': { 'content-visibility': 'hidden' }
+  }
+
+  it('gives a hidden link no area, as the scaled box of the review shows: a box of 200 by 100 at half size hides words that its client box would show', () => {
+    // The box lies at (40,100) to (140,150) on the screen and has a client box of 200 by 100, so a handler
+    // that laid the client size over the screen origin would see (40,100) to (240,200). The hidden words
+    // are at (146,120) to (154,129) and the tap at (138,140), in the area that those words would have.
+    const { pane, text, links } = between({ left: 146, top: 120, right: 154, bottom: 129 })
+    boxes.set(text, { left: 40, top: 100, right: 140, bottom: 150 })
+    clientBox(text, 200, 100)
+    overflows.set(text, { x: 'hidden', y: 'hidden' })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(text, { clientX: 138, clientY: 140 }))
+    expect(isLit(links[0]), 'the look with a box that has no transform').toBe(true)
+    fire('pointerup', pointer(text, { clientX: 138, clientY: 140, timeStamp: 120 }))
+    fire('click', click(text, { clientX: 138, clientY: 140 }))
+    expect(opened, 'opens with a box that has no transform').toEqual([links[0]])
+    opened = []
+    styles.set(text, { transform: 'matrix(0.5, 0, 0, 0.5, 0, 0)' })
+    fire('pointerdown', pointer(text, { clientX: 138, clientY: 140 }))
+    expect(isLit(links[0]), 'the look under the scaled box').toBe(false)
+    fire('pointerup', pointer(text, { clientX: 138, clientY: 140, timeStamp: 120 }))
+    fire('click', click(text, { clientX: 138, clientY: 140 }))
+    expect(opened, 'opens under the scaled box').toEqual([])
+  })
+
+  for (const [kind, style] of Object.entries(blocking)) {
+    it(`gives a link no area under a box with ${kind}: it never lights by the rule and is never opened`, () => {
+      const { pane, text, links } = between(words)
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, tap))
+      expect(isLit(links[0]), `the look with no ${kind}`).toBe(true)
+      fire('pointerup', pointer(text, { ...tap, timeStamp: 120 }))
+      styles.set(text.parentElement as HTMLElement, style)
+      fire('pointerdown', pointer(text, tap))
+      expect(isLit(links[0]), `the look under ${kind}`).toBe(false)
+      fire('pointerup', pointer(text, { ...tap, timeStamp: 120 }))
+      fire('click', click(text, tap))
+      expect(opened, `opens under ${kind}`).toEqual([])
+    })
+  }
+
+  it('finds such a box wherever it lies between the link and the root: the pane and the page’s root', () => {
+    for (const where of ['the pane', 'the root']) {
+      const { pane, text, links } = between(words)
+      start(pane)
+      clock(100)
+      styles.set(where === 'the pane' ? pane : document.documentElement, { contain: 'paint' })
+      fire('pointerdown', pointer(text, tap))
+      expect(isLit(links[0]), `the look under ${where} with contained paint`).toBe(false)
+      styles.delete(document.documentElement)
+      document.body.replaceChildren()
+      listening.clear()
+    }
+  })
+
+  it('measures a box that only moves its content: a translation, in 2D and in 3D, lights and opens as a box with no transform', () => {
+    for (const transform of ['matrix(1, 0, 0, 1, 12, 8)', 'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 12, 8, 4, 1)', 'none']) {
+      const { pane, text, links } = between(words)
+      start(pane)
+      clock(100)
+      styles.set(text.parentElement as HTMLElement, { transform, 'content-visibility': 'visible', contain: 'layout style', scale: 'none', rotate: 'none' })
+      fire('pointerdown', pointer(text, tap))
+      expect(isLit(links[0]), `the look under ${transform}`).toBe(true)
+      fire('pointerup', pointer(text, { ...tap, timeStamp: 120 }))
+      fire('click', click(text, tap))
+      expect(opened, `opens under ${transform}`).toEqual([links[0]])
+      opened = []
+      document.body.replaceChildren()
+      listening.clear()
+    }
+  })
+
+  it('leaves a press on the link’s own element as on a page with no handler under such a box: no look, and the click is the browser’s alone', () => {
+    const { pane, text, links } = between(words)
+    start(pane)
+    clock(100)
+    styles.set(text.parentElement as HTMLElement, { transform: 'matrix(0.5, 0, 0, 0.5, 0, 0)' })
+    fire('pointerdown', pointer(links[0], { clientX: 26, clientY: 128 }))
+    expect(isLit(links[0]), 'the look of a press on the link’s own element').toBe(false)
+    fire('pointerup', pointer(links[0], { clientX: 26, clientY: 128, timeStamp: 120 }))
+    fire('click', click(links[0], { clientX: 26, clientY: 128 }))
+    expect(opened, 'the handler’s own opens').toEqual([])
   })
 })
 
