@@ -1092,6 +1092,50 @@ describe('a scroll under a held press', () => {
       expect(isLit(links[0]), 'the look where the button lies under the first point and not under the finger').toBe(false)
     })
 
+    it('keeps the look and the press where the lit link’s own element comes under the point, and the engine’s click on the element opens it once', () => {
+      const { pane, text, links } = between(words)
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, press))
+      expect(isLit(links[0]), 'the look of the press on plain text').toBe(true)
+      // The content slides under the finger: the element's box now holds the point, as the page's hit test names it.
+      scrolled(8)
+      scrolledSideways(11)
+      fire('scroll', {} as Event)
+      expect(document.elementFromPoint(press.clientX, press.clientY), 'the element under the point').toBe(links[0])
+      expect(isLit(links[0]), 'the look after the scroll that put the lit link’s own element under the point').toBe(true)
+      fire('pointerup', pointer(links[0], { ...press, timeStamp: 120 }))
+      fire('click', click(links[0], press))
+      expect(opened, 'the handler adds no click to a click that names the link').toEqual([])
+      links[0].click()
+      expect(opened, 'the engine’s own click on the element').toEqual([links[0]])
+    })
+
+    it('ends the look where the lit link’s own element comes under the point but opens another destination now', () => {
+      const { pane, text, links } = between(words)
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, press))
+      links[0].title = 'https://example.org/changed'
+      scrolled(8)
+      scrolledSideways(11)
+      fire('scroll', {} as Event)
+      expect(isLit(links[0]), 'the look where the link now opens another destination').toBe(false)
+    })
+
+    it('ends the look where another link of a message, not the lit one, comes under the point', () => {
+      const { pane, text, links } = between(words, { left: 20, top: 100, right: 60, bottom: 117 })
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, press))
+      expect(isLit(links[0]), 'the look of the press: the first link’s words are the nearer').toBe(true)
+      scrolled(8)
+      scrolledSideways(-40)
+      fire('scroll', {} as Event)
+      expect(document.elementFromPoint(press.clientX, press.clientY), 'the element under the point').toBe(links[1])
+      expect(isLit(links[0]), 'the look where the other link lies under the point').toBe(false)
+    })
+
     it('ends the look where another link comes under the point', () => {
       const { pane, text, links } = between(words)
       // A link that no message holds, so the rule does not weigh it.
