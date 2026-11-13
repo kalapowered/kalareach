@@ -7,9 +7,10 @@ use std::path::Path;
 use kr_boundary_windows::manifest::Outcome;
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CASE_SENSITIVE_WHY, EntryKind, Grounds, IntentAct, IntentRead, NotProved, Origin, ParentCure,
-    Presence, Purpose, RecordLeft, Standing, Taken, choose, data_ending, data_made_ending, ending,
-    intent_words, left_alone, parent_advice, program_keeping, program_open_advice, rollback_ending,
+    CASE_SENSITIVE_WHY, EntryKind, FolderAct, FolderRead, FolderRecord, Grounds, IntentAct,
+    IntentRead, NotProved, Origin, ParentCure, Presence, Purpose, RecordLeft, Standing, Taken,
+    choose, data_ending, data_made_ending, ending, folder_act, folder_words, intent_words,
+    left_alone, parent_advice, program_keeping, program_open_advice, rollback_ending,
     rollback_entry, rollback_failed, rollback_laid_stays, rollback_not_changed, service_program_is,
     unnamed_root_why,
 };
@@ -834,4 +835,91 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
         none.contains("this run held no object that it had made"),
         "{none}"
     );
+}
+
+#[test]
+fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_installation_made_it() {
+    // The record: a result of found is never read, with or without an identity; no identity means no
+    // read; a made folder and an intent that holds an identity are read.
+    assert_eq!(
+        FolderRecord::of(Some(Outcome::Found), true),
+        FolderRecord::Found
+    );
+    assert_eq!(
+        FolderRecord::of(Some(Outcome::Found), false),
+        FolderRecord::Found
+    );
+    assert_eq!(
+        FolderRecord::of(Some(Outcome::Made), false),
+        FolderRecord::NoIdentity
+    );
+    assert_eq!(FolderRecord::of(None, false), FolderRecord::NoIdentity);
+    assert_eq!(
+        FolderRecord::of(Some(Outcome::Made), true),
+        FolderRecord::Made
+    );
+    assert_eq!(FolderRecord::of(None, true), FolderRecord::Intent);
+    for (record, read) in [
+        (FolderRecord::Made, true),
+        (FolderRecord::Intent, true),
+        (FolderRecord::NoIdentity, false),
+        (FolderRecord::Found, false),
+    ] {
+        assert_eq!(record.is_read(), read, "{record:?}");
+    }
+    // The choice: removed only where the record names the folder, the read found that folder and
+    // it holds nothing; every other record or read leaves it, and a failed read fails the removal.
+    let reads = [
+        FolderRead::NotThere,
+        FolderRead::Other,
+        FolderRead::Holds(1),
+        FolderRead::Holds(3),
+        FolderRead::Empty,
+        FolderRead::Failed("x".to_owned()),
+    ];
+    for record in [
+        FolderRecord::Made,
+        FolderRecord::Intent,
+        FolderRecord::NoIdentity,
+        FolderRecord::Found,
+    ] {
+        for read in std::iter::once(None).chain(reads.iter().map(Some)) {
+            let act = folder_act(record, read);
+            let expected = match (record, read) {
+                (FolderRecord::Made | FolderRecord::Intent, Some(FolderRead::Empty)) => {
+                    FolderAct::Remove
+                }
+                (_, Some(FolderRead::Failed(_))) => FolderAct::LeaveAndFail,
+                _ => FolderAct::Leave,
+            };
+            assert_eq!(act, expected, "{record:?} {read:?}");
+        }
+    }
+    // The words say what the manifest holds and what was read, and give no step and no claim of a
+    // removal that no read showed.
+    let folder = "C:\\Program Files\\KalaReach";
+    for record in [
+        FolderRecord::Made,
+        FolderRecord::Intent,
+        FolderRecord::NoIdentity,
+        FolderRecord::Found,
+    ] {
+        for read in std::iter::once(None).chain(reads.iter().map(Some)) {
+            let text = folder_words(folder, record, read);
+            assert!(text.starts_with(folder), "{text}");
+            for forbidden in ["deleted", "is gone", "move it", "remove it", "by hand"] {
+                assert!(!text.contains(forbidden), "{forbidden} in {text}");
+            }
+        }
+    }
+    let found = folder_words(folder, FolderRecord::Found, None);
+    assert!(
+        found.contains("stood there before the installation")
+            && found.contains("also where it is empty"),
+        "{found}"
+    );
+    let holds = folder_words(folder, FolderRecord::Made, Some(&FolderRead::Holds(1)));
+    assert!(holds.contains("found 1 entry in it"), "{holds}");
+    let other = folder_words(folder, FolderRecord::Made, Some(&FolderRead::Other));
+    assert!(other.contains("another identity"), "{other}");
 }

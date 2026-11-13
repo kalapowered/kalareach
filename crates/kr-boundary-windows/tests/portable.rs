@@ -1218,3 +1218,32 @@ fn a_clients_rights_on_the_brokers_pipe_are_the_grant_and_hold_no_right_to_make_
         "(A;;0x100083;;;S-1-5-21-111-222-333-1001)"
     );
 }
+
+#[test]
+fn the_folder_above_the_program_directory_is_held_with_its_identity_and_its_result() {
+    let folder = "C:\\Program Files\\KalaReach";
+    let identity = "0000000000000001:00000000000000000000000000000002";
+    let mut manifest = Manifest::begin();
+    // The intent comes first, with no identity and no result.
+    manifest.record(ObjectKind::ProgramFolder, folder, None);
+    let object = manifest.find(ObjectKind::ProgramFolder, folder).unwrap();
+    assert_eq!((object.outcome, object.detail.as_deref()), (None, None));
+    // The call that made the folder gives its identity, and then the result.
+    manifest.record(ObjectKind::ProgramFolder, folder, Some(identity));
+    manifest.conclude(ObjectKind::ProgramFolder, folder, Outcome::Made);
+    // A repair finds the folder and records the intent again with the identity that it holds; the
+    // result `found` never replaces `made`.
+    manifest.record(ObjectKind::ProgramFolder, folder, Some(identity));
+    manifest.conclude(ObjectKind::ProgramFolder, folder, Outcome::Found);
+    let reread = Manifest::parse(&manifest.to_bytes().unwrap()).unwrap();
+    let object = reread.find(ObjectKind::ProgramFolder, folder).unwrap();
+    assert_eq!(object.outcome, Some(Outcome::Made));
+    assert_eq!(object.detail.as_deref(), Some(identity));
+    // A folder that stood there before the run has the result `found`, and a rollback does not act
+    // on it; the removal's own rule for this kind is the folder's record, not `acted_on_by`.
+    let mut manifest = Manifest::begin();
+    manifest.record(ObjectKind::ProgramFolder, folder, None);
+    manifest.conclude(ObjectKind::ProgramFolder, folder, Outcome::Found);
+    let object = manifest.find(ObjectKind::ProgramFolder, folder).unwrap();
+    assert!(!object.acted_on_by(true));
+}
