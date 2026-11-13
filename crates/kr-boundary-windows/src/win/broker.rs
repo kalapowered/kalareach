@@ -309,8 +309,16 @@ fn run_both(
         )]
         let persons = persons
             .join()
-            .unwrap_or_else(|_| Err("the persons' pipe's loop failed".to_owned()));
-        administrators.and(persons)
+            .unwrap_or_else(|_| Err("the persons' pipe's loop ended in a panic".to_owned()));
+        // Both loops' errors are kept: an error of the second loop is not dropped because the
+        // first failed too.
+        match (administrators, persons) {
+            (Ok(()), persons) => persons,
+            (Err(administrators), Ok(())) => Err(administrators),
+            (Err(administrators), Err(persons)) => Err(format!(
+                "the administrators' pipe's loop: {administrators}; the persons' pipe's loop: {persons}"
+            )),
+        }
     })
 }
 
