@@ -323,6 +323,53 @@ impl Document {
                 .as_ref()
                 .is_none_or(|terminals| terminals.iter().all(|t| t.outcome == Outcome::Passed))
     }
+
+    /// One GitHub warning annotation for each step that was run again and then passed, naming the
+    /// step and the files that could not be started. A step run again whose cause is not shown to
+    /// be the runner's disk carries an error and is among the failed steps, so it has none: it
+    /// ends the run red.
+    #[must_use]
+    pub fn rerun_annotations(&self) -> Vec<String> {
+        self.summary
+            .rerun_steps
+            .iter()
+            .filter(|number| !self.summary.failed_steps.contains(number))
+            .filter_map(|number| {
+                let record = &self.steps[number - 1];
+                let rerun = record.rerun.as_ref()?;
+                Some(format!(
+                    "::warning title={}::{}",
+                    escaped_property(&format!("Step {number} was run again")),
+                    escaped_data(&format!(
+                        "step {number}, {}, was run again after a file that could not be started: {}; {}",
+                        record.what,
+                        rerun.files.join(", "),
+                        rerun.reason
+                    ))
+                ))
+            })
+            .collect()
+    }
+
+    /// The count of steps that were run again, as the last line of a run that had any.
+    #[must_use]
+    pub fn rerun_count_line(&self) -> Option<String> {
+        let count = self.summary.rerun_steps.len();
+        (count > 0)
+            .then(|| format!("{count} steps were run again after a file that could not be started"))
+    }
+}
+
+/// The text of a workflow command, with the characters that end or split a line escaped.
+fn escaped_data(text: &str) -> String {
+    text.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// A property of a workflow command, which also may not hold the characters that end it.
+fn escaped_property(text: &str) -> String {
+    escaped_data(text).replace(':', "%3A").replace(',', "%2C")
 }
 
 /// What a run is asked to do.
