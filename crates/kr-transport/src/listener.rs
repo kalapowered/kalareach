@@ -1304,12 +1304,17 @@ async fn serve_authorised<H: HostHandler>(
     // first ends the session: a control stream that failed, or whose peer closed its send
     // direction, has the consequence section 23 gives it straight away rather than waiting for a
     // handler that may be blocked on a worker.
-    let served = Arc::clone(&state.handler).serve(session);
+    let mut served = Arc::clone(&state.handler).serve(session);
     tokio::select! {
-        () = served => {}
+        () = &mut served => {}
         () = lost.happened() => {}
         _ = connection.closed() => {}
     }
+    // The streams are revoked before the handler is dropped: dropping it ends the streams it holds
+    // and takes them out of the registry, and the loss has to be declared to them first, whichever
+    // of the three ended the session.
+    streams.revoke_streams();
+    drop(served);
     drop(cleanup);
     Ok(())
 }
