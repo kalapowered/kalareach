@@ -98,8 +98,7 @@ export function startLinkPress(element: HTMLElement): () => void {
     stop()
     light(null)
     if (!here(event.target)) return
-    // A press that starts on a control is the control's.
-    const found = namedBy(event.target) === 'control' ? null : linkNear(element, event.clientX, event.clientY)
+    const found = pressedLink(element, event)
     press = {
       pointer: event.pointerId,
       pointerType: event.pointerType,
@@ -115,7 +114,6 @@ export function startLinkPress(element: HTMLElement): () => void {
     document.addEventListener('pointercancel', cancel)
   }
   const click = (event: MouseEvent): void => {
-    if (!here(event.target)) return
     const { clientX: x, clientY: y } = event
     const decision = decide(
       press,
@@ -129,13 +127,29 @@ export function startLinkPress(element: HTMLElement): () => void {
   }
 
   document.addEventListener('pointerdown', down, true)
-  document.addEventListener('click', click, true)
+  element.addEventListener('click', click, true)
   return () => {
     document.removeEventListener('pointerdown', down, true)
-    document.removeEventListener('click', click, true)
+    element.removeEventListener('click', click, true)
     stop()
     light(null)
   }
+}
+
+/**
+ * The link that a press lights and a tap on it opens. A press on a link's own element is that link's,
+ * whatever the words' rectangles say: the browser sends its click to that element. A press on another
+ * control is the control's. Elsewhere it is the link whose words are nearest, where a target holds the point.
+ */
+function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement; destination: string } | null {
+  const target = event.target instanceof Element ? event.target : null
+  const named = namedBy(target)
+  if (named === 'control') return null
+  if (named === 'link') {
+    const own = target?.closest<HTMLElement>('.md-link') ?? null
+    return own === null ? null : { id: own, destination: own.title }
+  }
+  return linkNear(pane, event.clientX, event.clientY)
 }
 
 /** What a click's target is: a link, another control of the message, or neither (plain text). */
@@ -190,7 +204,11 @@ function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement
   const all = pane.querySelectorAll<HTMLElement>('.m-node .md-link')
   if (all.length === 0) return NO_LINKS
   const least = parseFloat(getComputedStyle(pane).getPropertyValue('--target'))
-  const bounds = pane.getBoundingClientRect()
+  // What holds content and can be tapped: the pane's client box, with no border and no scroll bar's strip.
+  const box = pane.getBoundingClientRect()
+  const left = box.left + pane.clientLeft
+  const top = box.top + pane.clientTop
+  const bounds = { left, top, right: left + pane.clientWidth, bottom: top + pane.clientHeight }
   if (!Number.isFinite(least) || least <= 0) return { links: [], reach: { least: 0, beside: 0 }, bounds }
   const reach = { least, beside: least / 2 }
   const radius = contestRadius(reach)
