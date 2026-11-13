@@ -1266,20 +1266,75 @@ Screenshots from the end-to-end run go to `/tmp`, named for what they show.
 ## Building the application
 
 ```sh
-pnpm -C apps/companion tauri build
+pnpm -C apps/companion desktop build
 ```
 
-macOS is the first target. Windows and Linux compile from the same source; their packaging is not
-covered by the checks above.
+This wraps `tauri build` to build for the current machine and bundle for the bundles listed in
+`tauri.conf.json`. The macOS bundles are the app bundle and the `.dmg` disk image. On Linux it
+bundles the `.deb`, `.rpm` and AppImage bundles. On Windows it bundles the MSI and NSIS installers.
+All options are forwarded to `tauri build` as given, except that the command refuses `--runner`,
+`--no-bundle` and a first word other than `build`. It also errors if `--target` is set to a Windows
+target triple on a non-Windows machine.
 
-On Windows the Tauri command line asks for the static Visual C++ runtime unless the environment says
-`STATIC_VCRUNTIME=false`, and the application links the dynamic one, so the build script refuses to
-go on and names the variable. Set it first, in PowerShell:
+What each platform needs:
 
-```powershell
-$env:STATIC_VCRUNTIME = 'false'
-pnpm -C apps/companion tauri build
-```
+- macOS: Install Xcode command line tools. No signing identity is needed with `--no-sign`. The disk
+  image script drives Finder unless the `CI` environment variable is set to `true`. Use `--bundles
+  app` to only build the application bundle.
+- Linux: Install the same dependencies as the Linux CI job. See the `libwebkit2gtk-4.1-dev`,
+  `libgtk-3-dev`, `libayatana-appindicator3-dev` and `librsvg2-dev` packages and their transitive
+  dependencies. The AppImage bundler downloads its tools.
+- Windows: Install the Visual C++ build tools. The bundler downloads the WiX and NSIS tools from
+  GitHub when the executables don't exist yet. The installer downloads the WebView2 bootstrapper if
+  WebView2 is not installed on the machine.
+
+The `companion-bundle` workflow builds and reads the Windows bundle. No job builds a macOS or a
+Linux bundle.
+
+The application itself links against the dynamic Visual C++ runtime. The workspace's
+`.cargo/config.toml` excludes the static runtime from the linker options for all MSVC builds because
+the C library the workspace vendors asks for the static runtime. This causes problems with the
+static and dynamic runtime both being linked because then there are two heaps and two copies of the
+runtime state. The Tauri command line sets `STATIC_VCRUNTIME=true` in the environment for the
+desktop build unless it's already `false`. The build script refuses a build that asks for the static
+runtime. To avoid this error this command sets it to `false` on Windows, whatever the environment
+holds. If it was already set to something else it prints the previous value and that it's replacing
+it.
+
+On Windows the build takes its rustflags from the repository's `.cargo/config.toml` file alone. If
+any of `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` or `CARGO_TARGET_*_RUSTFLAGS`
+are set in the environment then it errors and explains why. The first two replace the link options
+in the file, and the other two are a second source of flags that the command does not take. Running
+`tauri build` without using this command on Windows causes the build to error in a build script with
+a message naming this command.
+
+The `companion-bundle` workflow runs when manually dispatched and when pushed to main and a file in
+the package's native code, this command or this workflow file is modified. It builds the application
+and installers with `STATIC_VCRUNTIME=true` set in the environment like Tauri sets it to verify that
+this command overrides it. It verifies that the build log does not contain the LNK4098 warning about
+multiple C runtimes being selected. It then uses `dumpbin /dependents` to list the libraries the
+built executable imports and verifies that the dynamic runtime's libraries are there and no other
+runtime's are. Then it installs the NSIS installer in a temporary directory with the `/S` flag to
+make it silent. After installing it lists all the files and uses `dumpbin` on the installed
+executable again. Then it uninstalls it. Then it extracts the MSI installer using the administrative
+install option which doesn't actually install or register anything. Then it lists the files and
+again runs `dumpbin` on the executable. In the last two `dumpbin` runs it also lists where each
+import resolves. The Visual C++ runtime comes from the runner, because neither installer carries it.
+It never runs the application. It doesn't upload anything.
+
+The installers bring the program alone, so the Visual C++ runtime must already be on the machine. No
+Windows bundle is released until that is settled.
+
+Building the macOS bundle currently doesn't work with Xcode 27.2 (`ld-27106.1`) and macOS 27.2.1.
+Tauri sets the `MACOSX_DEPLOYMENT_TARGET` environment variable to the value of the
+`bundle.macOS.minimumSystemVersion` key in the tauri configuration file which is currently set to
+14.0. When that's set the linker produces a procedural macro library that can't be loaded by the
+system loader when the compiler tries to load it. Running `tauri build` fails with an error like
+`dlopen(.../libserde_derive-<hash>.dylib, 0x0005): tried: '...' (mis-aligned LINKEDIT string pool,
+fileOffset=0x002CE88C)`. A local build passes with `RUSTFLAGS='-Clink-arg=-Wl,-no_fixup_chains'` in
+the environment, but that leaves chained fixups out of all executables the build links and is not a
+good idea for a release bundle. A macOS bundle for release needs a workflow job with a pinned
+toolchain, and there is none.
 
 On Windows, with Microsoft's linker, the build links the application manifest into every binary it
 makes, the test binaries included. The native dialogs need version 6 of the common controls, and a
