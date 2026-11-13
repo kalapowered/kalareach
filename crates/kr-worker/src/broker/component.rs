@@ -273,6 +273,10 @@ fn cut(text: &str) -> (String, bool) {
     (text[..end].to_owned(), true)
 }
 
+/// What a binding is reported as doing until the link to the plugin runtime has reported anything of
+/// it: the link reaches each binding in its turn, after the call it is making for another.
+const WAITING_FOR_THE_LINK: &str = "waiting for the link to the plugin runtime";
+
 /// What the report of a binding's component says, from what the broker holds of it.
 pub(super) fn report_of(
     binding: &Binding,
@@ -298,7 +302,10 @@ pub(super) fn report_of(
                     .reduce(|first, second| format!("{first}; {second}")),
             ),
             Some((state, reason)) => (*state, reason.clone()),
-            None => (ComponentState::Pending, None),
+            None => (
+                ComponentState::Pending,
+                Some(WAITING_FOR_THE_LINK.to_owned()),
+            ),
         }
     };
     let (reason, reason_cut) = match reason.as_deref().map(cut) {

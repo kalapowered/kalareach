@@ -314,6 +314,40 @@ fn kr_req_11_13_an_instance_has_one_binding() {
     );
 }
 
+/// A binding whose component the link to the plugin runtime has not reached yet is reported
+/// pending with the reason that it waits for the link, so that a person who sees it can tell it is
+/// being waited on and not lost, whatever the link is doing for another binding meanwhile.
+#[test]
+fn a_binding_the_link_has_not_reached_is_pending_and_says_it_waits_for_the_link() {
+    let worker = Worker::open();
+    let source = worker.package(&fixture::Shape {
+        component: true,
+        ..fixture::Shape::claude_code()
+    });
+    let frame = worker.admit(1, vec![testing::admitted(&source)]);
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, frame)
+        .expect("the package binds");
+
+    let live = worker
+        .broker
+        .live_bindings()
+        .into_iter()
+        .next()
+        .expect("the binding is live");
+    let report = live
+        .component
+        .0
+        .expect("a binding whose package ships a component is reported");
+    assert_eq!(
+        report.state,
+        kr_protocol::admission::ComponentState::Pending
+    );
+    let reason = report.reason.0.expect("a pending report says why");
+    assert!(reason.contains("link"), "{reason}");
+}
+
 /// KR-REQ-11.13: a binding is made only from the admissions this worker holds, at the frame they
 /// are at, for a package they admit; nothing a caller describes is bound. The binding and its row
 /// carry the release it holds and where that came from, the frame, the program it was made for
