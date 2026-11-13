@@ -38,7 +38,7 @@ impl Data {
     }
 
     fn finish(&self, seen: Seen) -> Vec<String> {
-        finish_journal_and_run(&self.journal, &self.run, seen)
+        finish_journal_and_run(&self.journal, &self.run, seen, true)
     }
 }
 
@@ -47,8 +47,10 @@ const BOTH: Seen = Seen {
     run: true,
 };
 
+/// A journal file as the broker names it: 32 lowercase hexadecimal digits (`name` repeated to that
+/// length) and the extension.
 fn journal_file(directory: &Path, name: &str) -> PathBuf {
-    let path = directory.join(format!("{name}.journal"));
+    let path = directory.join(format!("{}.journal", name.repeat(32 / name.len())));
     fs::write(&path, b"{}").unwrap();
     path
 }
@@ -182,8 +184,12 @@ fn a_directory_that_the_inspection_did_not_see_and_cannot_be_looked_at_is_named_
     let folder = tempfile::tempdir().unwrap();
     let file = folder.path().join("file");
     fs::write(&file, b"x").unwrap();
-    let failures =
-        finish_journal_and_run(&file.join("journal"), &file.join("run"), Seen::default());
+    let failures = finish_journal_and_run(
+        &file.join("journal"),
+        &file.join("run"),
+        Seen::default(),
+        true,
+    );
     assert_eq!(failures.len(), 2, "{failures:?}");
     for text in &failures {
         assert!(
@@ -204,4 +210,65 @@ fn a_link_that_points_nowhere_is_something_that_is_there() {
     // The look that follows a link finds nothing, and the removal then treated the name as free.
     assert!(!link.exists());
     assert!(matches!(look(&link), Look::There));
+}
+
+#[test]
+fn only_the_names_that_the_broker_gives_its_journal_files_are_deleted() {
+    let case = Data::new().with(true, false);
+    let mine = journal_file(&case.journal, "0123");
+    let others: Vec<PathBuf> = [
+        "a.journal".to_owned(),
+        format!("{}.journal", "AB".repeat(16)),
+        format!("{}.journal", "ab".repeat(15)),
+        format!("{}.journal.old", "ab".repeat(16)),
+        format!("{}.txt", "ab".repeat(16)),
+    ]
+    .iter()
+    .map(|name| {
+        let path = case.journal.join(name);
+        fs::write(&path, b"x").unwrap();
+        path
+    })
+    .collect();
+    let failures = case.finish(BOTH);
+    assert!(!mine.exists());
+    for other in &others {
+        assert!(other.exists(), "{}", other.display());
+    }
+    // The directory holds the other names, so it stays and is named.
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains(&case.journal.display().to_string()));
+}
+
+#[test]
+fn the_journal_files_stay_where_the_caller_says_the_broker_may_still_write_them() {
+    let case = Data::new().with(true, true);
+    let file = journal_file(&case.journal, "0123");
+    let failures = finish_journal_and_run(&case.journal, &case.run, BOTH, false);
+    assert!(file.exists());
+    // The empty `run` directory goes; the journal directory holds the file and stays, named.
+    assert!(!case.run.exists());
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains(&case.journal.display().to_string()));
+}
+
+#[test]
+fn a_journal_file_name_is_32_lowercase_hexadecimal_digits_and_the_extension() {
+    use kr_boundary_windows::records::is_journal_file_name;
+    assert!(is_journal_file_name(&format!(
+        "{}.journal",
+        "0f".repeat(16)
+    )));
+    for not in [
+        "",
+        ".journal",
+        "a.journal",
+        "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F.journal",
+        "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0.journal",
+        "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f.journal.old",
+        "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "zf0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f.journal",
+    ] {
+        assert!(!is_journal_file_name(not), "{not}");
+    }
 }

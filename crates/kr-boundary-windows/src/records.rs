@@ -344,9 +344,23 @@ pub struct Seen {
     pub run: bool,
 }
 
+/// Whether a file name is one that the broker gives an invocation's journal: 32 lowercase
+/// hexadecimal digits (the invocation's 16 bytes) and the extension `.journal`. Nothing else in the
+/// journal's directory is the broker's file.
+#[must_use]
+pub fn is_journal_file_name(name: &str) -> bool {
+    name.strip_suffix(".journal").is_some_and(|stem| {
+        stem.len() == 32
+            && stem
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 /// Deletes the journal's files in the journal's directory where the directory was approved
-/// (`approved`), and in no other. They are the broker's own files, not objects of the run that made
-/// the directory; an entry that stays is found by the removal of the directory.
+/// (`approved`), and in no other. They are the broker's own files (the names of the form that
+/// [`is_journal_file_name`] gives), not objects of the run that made the directory; an entry that
+/// stays, and an entry of another name, is found by the removal of the directory.
 pub fn delete_journal_files(journal: &Path, approved: bool) {
     if approved && let Ok(entries) = fs::read_dir(journal) {
         #[expect(
@@ -354,7 +368,7 @@ pub fn delete_journal_files(journal: &Path, approved: bool) {
             reason = "an entry that cannot be read is not deleted here: where it is still in the directory the removal of the directory below fails for it and the result names what stayed, and where it is gone by then that removal can succeed; the removal's own result decides"
         )]
         for entry in entries.flatten() {
-            if entry.path().extension().and_then(|text| text.to_str()) == Some("journal") {
+            if is_journal_file_name(&entry.file_name().to_string_lossy()) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -366,9 +380,16 @@ pub fn delete_journal_files(journal: &Path, approved: bool) {
 /// now is left whole and named in the result: nothing opened it, so nothing in it was read.
 /// Returns each thing that stayed, with the reason; nothing when all is done.
 // text: finish_journal_and_run
-pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<String> {
+pub fn finish_journal_and_run(
+    journal: &Path,
+    run: &Path,
+    seen: Seen,
+    journal_files_may_go: bool,
+) -> Vec<String> {
     let mut stayed = Vec::new();
-    delete_journal_files(journal, seen.journal);
+    if journal_files_may_go {
+        delete_journal_files(journal, seen.journal);
+    }
     for (directory, approved) in [(run, seen.run), (journal, seen.journal)] {
         if !approved {
             stayed.extend(looked_at_again(directory));

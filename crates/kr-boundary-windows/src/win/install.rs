@@ -1517,7 +1517,7 @@ fn kind_of(paths: &Paths, dir: &Path, name: &OsStr, named_root: bool) -> EntryKi
         } else {
             EntryKind::Other
         }
-    } else if dir == paths.journal && is_journal_file_name(&text) {
+    } else if dir == paths.journal && records::is_journal_file_name(&text) {
         EntryKind::JournalFile
     } else if dir == paths.run && is_hex32(&text) {
         if named_root {
@@ -1992,17 +1992,6 @@ fn data_child_names(paths: &Paths) -> Vec<(OsString, Kind)> {
     ]
 }
 
-/// Whether a journal's file name is one an invocation's journal has: 32 lowercase hexadecimal
-/// digits and the extension.
-fn is_journal_file_name(name: &str) -> bool {
-    name.strip_suffix(".journal").is_some_and(|stem| {
-        stem.len() == 32
-            && stem
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    })
-}
-
 /// Reads what the data directory holds, on handles opened relative to the held directory, and
 /// refuses unless every entry in it is one the installation made. An empty directory is accepted
 /// (nothing records it, and nothing is in it). One that holds anything must hold the manifest, and
@@ -2273,7 +2262,7 @@ fn layout_kind(layout: Layout, name: &str) -> Option<Kind> {
             .is_some_and(is_hex32)
     };
     match layout {
-        Layout::Journal => is_journal_file_name(name).then_some(Kind::File),
+        Layout::Journal => records::is_journal_file_name(name).then_some(Kind::File),
         Layout::Staging => {
             if between("policy-", ".xml") || between("payload-", ".exe") {
                 Some(Kind::File)
@@ -4832,8 +4821,12 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
 
     // The broker, and the proof through it: the start-up cycle's proofs, asked inside the cycle that
     // the broker opens when it starts.
+    // The start is recorded as an intent before the request and as a result after the manager
+    // accepted it: a run that dies between the two leaves the trace that the broker may have run.
+    run.record(ObjectKind::ServiceStarted, SERVICE, None)?;
     let cycle = ProofCycle::begin(PROOF_BOUND, PROOF_ASK_MARGIN, || {
         broker_service.start()?;
+        run.conclude(ObjectKind::ServiceStarted, SERVICE, Outcome::Made)?;
         Ok(broker_service.wait_for(false, Duration::from_secs(60))?)
     })?;
     // text: lay_down-19
@@ -5823,17 +5816,23 @@ fn undo_recorded(
         // text: remove_at-29-service
         say(&remedy::left_alone("the service", SERVICE, object.outcome));
     }
+    // Whether a read showed that the broker's service ended: the manager found none of its name, or
+    // the service was asked to stop where it ran and then read as stopped. The journal's files go
+    // only after that, where the broker may have run.
+    let mut service_ended = false;
     keep(
         (|| -> Result<(), Error> {
             fail_undo("service")?;
-            if service_is_ours
-                && let Some(manager) = &manager
-                && let Some(service) = manager.open(SERVICE)?
-            {
+            if service_is_ours && let Some(manager) = &manager {
+                let Some(service) = manager.open(SERVICE)? else {
+                    service_ended = true;
+                    return Ok(());
+                };
                 if service.status()?.running() {
                     service.stop()?;
-                    service.wait_for(true, Duration::from_secs(60))?;
                 }
+                service.wait_for(true, Duration::from_secs(60))?;
+                service_ended = true;
                 // The marker is a volatile key under the service's own key: it goes first.
                 boot::remove()?;
                 if service.marked_for_deletion()? {
@@ -5969,9 +5968,32 @@ fn undo_recorded(
     // The journal's files and the empty `run` and `journal` directories go where the inspection
     // opened and approved them, and nowhere else. Unfinished work was refused before the removal
     // began; what a journal file still holds now is finished or made nothing.
+    // The journal's files are the broker's, and the broker may still write them while it runs: they
+    // go only where this installation never started the service and the removal did not start it
+    // (the manifest holds no start of it and the removal found no service of its own), or a read
+    // showed that the service ended. Otherwise they stay, and the ending says so.
+    let broker_may_have_run =
+        broker_is_there || manifest.find(ObjectKind::ServiceStarted, SERVICE).is_some();
+    let journal_files_may_go = service_ended || !broker_may_have_run;
+    if seen.journal && !journal_files_may_go {
+        // text: remove_at-41
+        say(&format!(
+            "{}: the journal's files stay: the broker's service may have run, and no read showed that it ended, so no file of the journal is removed while the broker may still write it",
+            paths.journal.display()
+        ));
+        failures.push(
+            "removing the journal's files: the broker's service may have run and its end is not proved"
+                .to_owned(),
+        );
+    }
     match &tree {
         DataTree::ByName => {
-            for stayed in records::finish_journal_and_run(&paths.journal, &paths.run, seen) {
+            for stayed in records::finish_journal_and_run(
+                &paths.journal,
+                &paths.run,
+                seen,
+                journal_files_may_go,
+            ) {
                 // text: remove_at-21
                 say(&format!("the journal or the private roots stay: {stayed}"));
                 failures.push(format!(
@@ -5982,8 +6004,10 @@ fn undo_recorded(
         // The broker's own files in the journal's directory go by name; the directories that this
         // run made go through their identities with the rest of what it laid.
         DataTree::Laid(run) => {
-            for stayed in run.sweep(Layout::Journal) {
-                failures.push(format!("removing the journal's files: {stayed}"));
+            if journal_files_may_go {
+                for stayed in run.sweep(Layout::Journal) {
+                    failures.push(format!("removing the journal's files: {stayed}"));
+                }
             }
         }
     }
@@ -7127,5 +7151,32 @@ mod tests {
         assert!(sweep_layout(&directory, Layout::Journal).is_empty());
         assert!(!mine.try_exists().unwrap());
         assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 4);
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_rollback_keeps_the_journal_files_where_the_broker_was_started_and_its_end_is_not_proved() {
+        let _one = ffi::locked(&FORCED);
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        run.manifest
+            .conclude(ObjectKind::Service, SERVICE, Outcome::Made);
+        // The start is on record, and the service manager cannot be opened, so no read shows that
+        // the service ended.
+        run.manifest
+            .conclude(ObjectKind::ServiceStarted, SERVICE, Outcome::Made);
+        let broker_name = format!("{}.journal", "ab".repeat(16));
+        let journal = run.paths.journal.join(&broker_name);
+        std::fs::write(&journal, b"x").unwrap();
+        crate::manifest::forced::fail_the_next("manager");
+        let error = roll_back(&mut run).unwrap_err().to_string();
+        assert!(
+            error.contains("the journal's files stay: the broker's service may have run"),
+            "{error}"
+        );
+        assert!(
+            journal.try_exists().unwrap(),
+            "a journal file stays while the broker may still write it"
+        );
     }
 }
