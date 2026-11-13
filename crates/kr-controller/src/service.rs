@@ -87,20 +87,24 @@ mod voice_actions;
 mod voice_close;
 mod workers;
 mod workflow_sessions;
+mod writes;
 
 #[cfg(feature = "testing")]
 pub use backup_production::PassPause;
 pub use backup_production::{Held as ProductionHeld, ProducerBounds, StopBackupProduction};
 
+pub(crate) use admission::{EnvelopeRefused, Unauthorised};
 pub use barrier::DEBT_PASS_INTERVAL;
 pub use capabilities::{CAPABILITY_REVISION_FILE, DESKTOP_REREAD_INTERVAL};
 pub use close::{CLOSE_EXCHANGE, CLOSURE_WATCH_TIMEOUT};
 pub use create::{CREATE_WAIT, RENDEZVOUS_TIMEOUT};
+pub(crate) use identifiers::SpendFailed;
 pub use inhibition::{DEMAND_BUDGET, DEMAND_PATIENCE, POWER_REVIEW_INTERVAL};
 pub(crate) use local::serve_each;
 pub use local::{
     LOCAL_KEEPALIVE, RETAINED_AUTHORITY_ANSWERS, RETAINED_MACHINE_ANSWERS, WINDOW_RENEWAL,
 };
+pub(crate) use local_access::LeaseNotLive;
 pub(crate) use reads::withheld_page;
 pub use rendezvous::LAUNCH_IDENTITY_TIMEOUT;
 pub use revocation::Audience;

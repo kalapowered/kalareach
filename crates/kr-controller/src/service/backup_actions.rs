@@ -175,7 +175,7 @@ impl Controller {
             std::sync::Arc::new(Unchecked(std::sync::Arc::clone(self))),
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
     }
 
     /// Stops the next `backup.status` between its two reads, for a suite that holds a call before

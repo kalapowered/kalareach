@@ -24,6 +24,21 @@ use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::LocalOwnerBound;
 
+/// The refusal of a method the local owner's membership lease holds, when no lease is live.
+///
+/// Only [`Controller::local_hold`] makes one: it names no record and no effect, and a held method
+/// is refused before anything is looked for. There is no conversion into it from an error.
+#[derive(Debug)]
+pub(crate) struct LeaseNotLive {
+    error: ControllerError,
+}
+
+impl From<LeaseNotLive> for ControllerError {
+    fn from(refusal: LeaseNotLive) -> Self {
+        refusal.error
+    }
+}
+
 /// How long the publisher waits before it looks at the workers again when nothing woke it and a
 /// worker has not yet acknowledged the statement in force.
 const REPEAT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -255,7 +270,7 @@ impl Controller {
     pub(crate) fn local_hold(
         &self,
         method: kr_protocol::method::Method,
-    ) -> Result<Option<kr_transport::clock::ContinuousInstant>> {
+    ) -> std::result::Result<Option<kr_transport::clock::ContinuousInstant>, LeaseNotLive> {
         if kr_protocol::method::local_hold(method) == kr_protocol::method::LocalHold::Free {
             return Ok(None);
         }
@@ -270,10 +285,13 @@ impl Controller {
             .local_owner_bound(self.local_owner_device(), now, now_ms);
         match bound {
             LocalOwnerBound::Open => Ok(None),
-            LocalOwnerBound::Closed => Err(ControllerError::PermissionDenied {
-                detail: "this host is exclusively organisation-managed and its local owner's \
-                         membership lease is not live; present one with `kr organisation present`"
-                    .to_owned(),
+            LocalOwnerBound::Closed => Err(LeaseNotLive {
+                error: ControllerError::PermissionDenied {
+                    detail: "this host is exclusively organisation-managed and its local owner's \
+                             membership lease is not live; present one with `kr organisation \
+                             present`"
+                        .to_owned(),
+                },
             }),
             LocalOwnerBound::Until { continuous, utc_ms } => {
                 let remaining = std::time::Duration::from_millis(utc_ms.saturating_sub(now_ms));
@@ -290,7 +308,7 @@ impl Controller {
         request: &kr_protocol::envelope::Request,
     ) -> Option<kr_protocol::envelope::ControlFrame> {
         let method = request.method.method()?;
-        let error = self.local_hold(method).err()?;
+        let error = ControllerError::from(self.local_hold(method).err()?);
         Some(super::error_reply(
             request.request_id,
             error.code(),

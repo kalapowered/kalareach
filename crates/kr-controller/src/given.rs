@@ -12,6 +12,11 @@
 //! the answer of a copy out and give the value again as an answer made now.
 
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+use kr_protocol::error::{ProtocolError, RetryCategory};
+use kr_protocol::receipt::ReceiptState;
+
+pub(crate) mod local_door;
+pub(crate) mod network_door;
 
 /// A service's answer to one action.
 ///
@@ -137,19 +142,8 @@ impl<T> Given<T> {
         self.answer
     }
 
-    /// The answer, without where it came from, for a caller that is told every answer whole except
-    /// a copy the service withheld: `unknown` is then what the caller is told, in place of the
-    /// service's refusal of the authority, which says what the caller may not be told, that the
-    /// action did not happen.
-    pub(crate) fn into_answer_or(self, unknown: impl FnOnce() -> T) -> T {
-        match self.origin {
-            Origin::Withheld => unknown(),
-            Origin::Fresh | Origin::Copied => self.answer,
-        }
-    }
-
-    /// The answer, without where it came from. For a caller that is told every answer whole.
-    pub fn into_answer(self) -> T {
+    /// The answer, without where it came from. For a boundary that tells every answer whole.
+    fn into_answer(self) -> T {
         self.answer
     }
 
@@ -188,6 +182,94 @@ impl<T, E> Given<Result<T, E>> {
         }
         Self::of(answer, copied)
     }
+}
+
+/// What a local write came to: the service's answer, with where it came from.
+///
+/// The local door tells this and nothing else ([`local_door::told`]).
+#[derive(Debug)]
+#[must_use = "the local door tells a write only through `told`"]
+pub(crate) struct Settled<T> {
+    given: Given<T>,
+}
+
+impl<T> Settled<T> {
+    /// A write that came to `given`.
+    pub(crate) const fn of(given: Given<T>) -> Self {
+        Self { given }
+    }
+
+    /// The answer, without where it came from, for a case that asks what a write came to.
+    #[cfg(test)]
+    pub(crate) fn into_answer_for_test(self) -> T {
+        self.given.into_answer_for_test()
+    }
+}
+
+/// What a client is told when this host will not show it what became of an action that was, or may
+/// have been, carried out.
+///
+/// The refusal to show it is about what the client may be shown, not about the action. A client
+/// takes a definite refusal for the host's word that nothing was done and drops the action, so the
+/// person would be told the action did not happen when it did.
+pub(crate) fn outcome_not_shown() -> ProtocolError {
+    crate::error::ControllerError::outcome_not_shown().to_protocol_error()
+}
+
+/// Whether `refusal` is a definite word that the action it answers did not happen.
+///
+/// A client keeps an action it sent when the answer is `OUTCOME_UNKNOWN` or a transient failure,
+/// and takes any other refusal as the host's word that nothing was done.
+pub(crate) fn is_definite(refusal: &ProtocolError) -> bool {
+    !matches!(
+        refusal.code.retry_category(),
+        RetryCategory::Transient | RetryCategory::OutcomeUnknown
+    )
+}
+
+/// Whether `answer`, the host's answer to an action, leaves it possible that the action took
+/// effect: its result, or a word that does not say it did not happen.
+pub(crate) fn may_have_taken_effect(answer: &ControlFrame) -> bool {
+    match answer {
+        ControlFrame::Response(Response {
+            outcome: Outcome::Ok(_),
+            ..
+        }) => true,
+        ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) => !is_definite(error),
+        // A receipt says what became of the action, and only a refusal or a rejection says that
+        // nothing did.
+        ControlFrame::Receipt(response) => !matches!(
+            response.receipt.state,
+            ReceiptState::Refused | ReceiptState::Rejected
+        ),
+        _ => false,
+    }
+}
+
+/// What a client is told when this host refuses, after it holds `answer` to an action, to show it
+/// that answer: [`outcome_not_shown`] when the answer leaves it possible that the action took
+/// effect, and `refusal` when the answer says it did not.
+pub(crate) fn after_the_outcome(answer: &ControlFrame, refusal: ProtocolError) -> ProtocolError {
+    if may_have_taken_effect(answer) {
+        outcome_not_shown()
+    } else {
+        refusal
+    }
+}
+
+/// Whether `answer` says another request spent the identifier of this one. That is this host's
+/// word about the identifier and names no result.
+pub(crate) const fn names_a_reused_identifier(answer: &ControlFrame) -> bool {
+    matches!(
+        answer,
+        ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) if matches!(error.code, kr_protocol::error::ErrorCode::IdConflict)
+    )
 }
 
 /// What a lookup read from a record an earlier request, event or attempt left.
@@ -268,33 +350,10 @@ impl Recorded<Result<kr_protocol::envelope::ParamsValue, crate::error::Controlle
 }
 
 impl Recorded<ControlFrame> {
-    /// The frame, given back as a copy unless the authority `check` stops it: then the check's
-    /// refusal, as a frame for `id` that replaces the record's, as a copy the service withheld.
-    pub(crate) fn checked_frame(
-        self,
-        id: kr_protocol::ids::RequestId,
-        check: impl FnOnce() -> Result<(), crate::error::ControllerError>,
-    ) -> Given<ControlFrame> {
-        match check() {
-            Ok(()) => Given::copied(self.0),
-            Err(refusal) => self.refused_by(crate::service::error_reply(
-                id,
-                refusal.code(),
-                refusal.to_string(),
-            )),
-        }
-    }
-
     /// Whether the record says another request spent the identifier of this one. That is this
     /// host's word about the identifier and names no result.
     pub(crate) const fn names_a_reused_identifier(&self) -> bool {
-        matches!(
-            &self.0,
-            ControlFrame::Response(Response {
-                outcome: Outcome::Error(error),
-                ..
-            }) if matches!(error.code, kr_protocol::error::ErrorCode::IdConflict)
-        )
+        names_a_reused_identifier(&self.0)
     }
 }
 
@@ -355,26 +414,16 @@ mod tests {
         assert!(failed.checked(|| Ok(())).into_answer_for_test().is_err());
     }
 
-    /// A frame the check stops is replaced by a refusal frame for the request, and a record that
-    /// names a reused identifier says so.
+    /// A record that names a reused identifier says so, and one that names any other refusal does
+    /// not.
     #[test]
-    fn a_frame_the_check_stops_is_replaced_by_the_refusal() {
+    fn a_record_that_names_a_reused_identifier_says_so() {
         let id = RequestId::new(3);
         let conflict = Recorded::read(ControlFrame::Response(Response {
             request_id: id,
             outcome: Outcome::Error(refusal_of(ErrorCode::IdConflict)),
         }));
         assert!(conflict.names_a_reused_identifier());
-        let given = conflict.checked_frame(id, || Err(refusal()));
-        assert!(given.is_withheld());
-        let ControlFrame::Response(Response {
-            outcome: Outcome::Error(told),
-            ..
-        }) = given.into_answer_for_test()
-        else {
-            panic!("the refusal is an error frame");
-        };
-        assert_eq!(told.code, ErrorCode::PermissionDenied);
         assert!(
             !Recorded::read(ControlFrame::Response(Response {
                 request_id: id,

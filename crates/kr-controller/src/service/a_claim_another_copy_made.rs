@@ -24,7 +24,7 @@ use super::a_recorded_answer_another_copy_wrote::{
     answered_after_a_fence_lands_at_the_check, refused_for_a_fence_landing_at_the_check,
 };
 use super::the_fence_at_every_effect::{
-    accepted, admitted, carried, daemon, mutation_of, refusal, refused_for_a_fence,
+    accepted, admitted, carried, daemon, mutation_of, refusal, refused_for_a_fence, told_now,
 };
 use crate::service::Controller;
 
@@ -68,14 +68,19 @@ async fn a_machine_group_steps_conflict_is_not_told_after_a_fence_lands() {
     );
     a_claim_for_another_request(&controller, &actor_id, mutation.action_id);
     let attempt = || {
-        controller.write_method(
-            &actor_id,
-            &mutation,
-            Method::MachineSplit,
+        told_now(
+            &controller,
             connection_id,
-            None,
-            Some(accepted(&controller)),
-            controller.admitted_revision(connection_id).ok(),
+            &mutation,
+            controller.write_method(
+                &actor_id,
+                &mutation,
+                Method::MachineSplit,
+                connection_id,
+                None,
+                Some(accepted(&controller)),
+                controller.admitted_revision(connection_id).ok(),
+            ),
         )
     };
     let control = attempt().await;
@@ -168,14 +173,19 @@ async fn a_privacy_changes_conflict_is_not_told_while_a_fence_is_owed() {
     );
     a_claim_for_another_request(&controller, &actor_id, mutation.action_id);
     let attempt = || {
-        controller.write_method(
-            &actor_id,
-            &mutation,
-            Method::PrivacySet,
+        told_now(
+            &controller,
             connection_id,
-            None,
-            Some(accepted(&controller)),
-            controller.admitted_revision(connection_id).ok(),
+            &mutation,
+            controller.write_method(
+                &actor_id,
+                &mutation,
+                Method::PrivacySet,
+                connection_id,
+                None,
+                Some(accepted(&controller)),
+                controller.admitted_revision(connection_id).ok(),
+            ),
         )
     };
     let control = attempt().await;

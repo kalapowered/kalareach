@@ -1615,7 +1615,7 @@ impl Controller {
     /// # Errors
     ///
     /// Returns [`ControllerError::PermissionDenied`] while the fence is owed.
-    pub(super) fn check_fence(&self) -> Result<()> {
+    pub(crate) fn check_fence(&self) -> Result<()> {
         // A restriction whose barrier has not retired it stops everything that barrier would have
         // fenced. The revision did not advance, so the registry still reports every connection as
         // admitted; refusing here is what keeps work admitted under withdrawn authority from being

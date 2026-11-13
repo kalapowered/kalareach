@@ -1447,7 +1447,9 @@ impl CatalogueModule {
         Ok(Some(action_read_result(actor_id, action_id, &record)?))
     }
 
-    /// Serves one catalogue or plugin mutation and returns the frame it answers with.
+    /// Serves one catalogue or plugin mutation and returns the frame it answers with, for a case
+    /// that asks what the catalogue answered.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub async fn write_frame(
         &self,
@@ -1469,12 +1471,13 @@ impl CatalogueModule {
                 removal,
             )
             .await
-            .into_answer(),
+            .into_answer_for_test(),
         )
     }
 
     /// Serves one catalogue or plugin mutation as the owner acting directly, with no admission
-    /// window to lapse.
+    /// window to lapse, for a case that asks what the catalogue answered.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub async fn write_frame_admitted(
         &self,
