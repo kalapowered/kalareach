@@ -3516,6 +3516,13 @@ async fn kr_req_19_08_the_watch_after_a_full_budget_says_what_its_last_try_came_
         standing["reason"].as_str().unwrap_or_default()
     ));
 
+    // The watch's own try is refused at admission too, and says the host's words.
+    told_after(companion, "budget", 0, |standing| {
+        standing["state"] == "reconnecting"
+            && is_the_hosts(standing["reason"].as_str().unwrap_or_default())
+    })
+    .await;
+
     // Every place the other kinds may take is held: the watch waits for one, and says that.
     let places = companion_tauri::places::budget();
     let mut held = Vec::new();
