@@ -601,6 +601,10 @@ impl Link {
             match registered {
                 Ok(registration) => {
                     heard = true;
+                    // The runtime refuses a registration of an identifier it holds, so one that it
+                    // accepted means it held nothing of a call given up for the same binding, and
+                    // there is nothing of that call to remove: removing it would remove this one.
+                    self.abandoned.remove(&want.binding_id);
                     self.registered.insert(want.binding_id, want.generation);
                     self.told_facts
                         .insert(want.binding_id, want.execution.clone());
@@ -669,21 +673,15 @@ impl Link {
     }
 
     /// Removes from the runtime the registrations given up while it held them, which it may have
-    /// made all the same. It is done once the runtime has answered something since, and not before:
+    /// made all the same, and which it then holds against any later registration of the same
+    /// binding: a binding the broker wants again is refused until it is removed, and is registered
+    /// at the end of that refusal's wait. It is done once the runtime has answered something since,
+    /// and not before:
     /// a runtime that answers nothing would hold every call for its limit and be lost for it, and
     /// the registrations the broker wants now would wait behind them. Returns false where the
     /// runtime was lost on the way.
     async fn unbind_abandoned(&mut self, broker: &Weak<Broker>) -> bool {
         while let Some(binding_id) = self.abandoned.pop_first() {
-            // A binding the broker wants again is registered again by the pass, which replaces
-            // what the runtime holds of the call that was given up. Removing it here would remove
-            // that registration, after the link has taken it as made.
-            if broker
-                .upgrade()
-                .is_some_and(|broker| broker.component_wanted(binding_id))
-            {
-                continue;
-            }
             let Some(client) = self.client.as_ref() else {
                 self.abandoned.clear();
                 break;
