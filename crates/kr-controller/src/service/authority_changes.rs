@@ -21,8 +21,9 @@ use kr_protocol::sharing::{
 };
 
 use crate::error::{ControllerError, Result};
-use crate::given::{Given, Recorded};
+use crate::given::{Given, Recorded, Settled};
 
+use super::barrier::HostWithdrawal;
 use super::organisation::OrganisationIntent;
 use super::revocation::Audience;
 use super::{Controller, encode, net, parse};
@@ -1188,6 +1189,10 @@ impl Controller {
     /// twice and fence the host twice for one withdrawal. Only the attempt that writes the claim
     /// performs the change; any other is answered from the record
     /// ([`Self::recorded_authority_change`]), and that answer is given as a copy.
+    ///
+    /// A change that raised the barrier that withdrew the whole host, its own connection with it,
+    /// settles with the proof of it ([`HostWithdrawal`]): its result is then told while that
+    /// revision is still the one in force.
     pub(crate) async fn authority_change(
         &self,
         actor_id: &ActorId,
@@ -1195,6 +1200,23 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
+    ) -> Settled<Result<ParamsValue>> {
+        let mut withdrew = None;
+        let given = self
+            .change_authority(actor_id, caller, mutation, method, carried, &mut withdrew)
+            .await;
+        Settled::withdrawing(given, withdrew)
+    }
+
+    /// The change itself; `withdrew` is set by an effect whose own barrier withdrew the host.
+    async fn change_authority(
+        &self,
+        actor_id: &ActorId,
+        caller: AuthorityCaller,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+        withdrew: &mut Option<HostWithdrawal>,
     ) -> Given<Result<ParamsValue>> {
         // A device makes three of these: a share, its revocation and a redemption. The others are
         // the owner's at this machine, and their answers are written for the owner: a device is
@@ -1253,7 +1275,8 @@ impl Controller {
                 self.organisation_enrol(carried, &hold, *intent).await
             }
             (Method::OrganisationExclusiveSet, Some(OrganisationIntent::Exclusive(intent))) => {
-                self.organisation_exclusive(carried, &hold, intent).await
+                self.organisation_exclusive(carried, &hold, intent, withdrew)
+                    .await
             }
             (method, _) => match method {
                 Method::GrantCreate => {
@@ -1269,9 +1292,13 @@ impl Controller {
                     self.grant_transfer(actor_id, mutation, carried, &hold)
                         .await
                 }
-                Method::DeviceRevoke => self.device_revoke(mutation, carried, &hold).await,
+                Method::DeviceRevoke => {
+                    self.device_revoke(mutation, carried, &hold, withdrew)
+                        .await
+                }
                 Method::OrganisationWithdraw => {
-                    self.organisation_withdraw(mutation, carried, &hold).await
+                    self.organisation_withdraw(mutation, carried, &hold, withdrew)
+                        .await
                 }
                 Method::DevicePreviewKeyUpdate => {
                     self.device_preview_key_update(actor_id, mutation, carried)
@@ -1997,13 +2024,14 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
         hold: &crate::grants::ClaimHold,
+        withdrew: &mut Option<HostWithdrawal>,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
-        encode(
-            &self
-                .revoke_device_authority(params.device_id, Some(&carried), Some(hold))
-                .await?,
-        )
+        let (revoked, proof) = self
+            .revoke_device_authority_proving(params.device_id, Some(&carried), Some(hold))
+            .await?;
+        *withdrew = proof;
+        encode(&revoked)
     }
 
     /// Registers or rotates a paired device's notification-preview key under the action it

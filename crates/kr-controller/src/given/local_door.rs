@@ -17,7 +17,8 @@ use kr_protocol::method::Method;
 use super::{Origin, Settled, may_have_taken_effect, names_a_reused_identifier};
 use crate::error::ControllerError;
 use crate::service::{
-    Controller, EnvelopeRefused, LeaseNotLive, SpendFailed, Unauthorised, error_reply, respond,
+    Controller, EnvelopeRefused, HostWithdrawal, LeaseNotLive, SpendFailed, Unauthorised,
+    error_reply, respond,
 };
 
 /// What the local door answers a mutation with, and so how the answer is written.
@@ -134,11 +135,15 @@ impl<'a> Standing<'a> {
 /// - Any other answer carries only this request's own effect. It is given while the connection's
 ///   registration stands and no fence is owed; otherwise it is not shown when it may have taken
 ///   effect, and the check's refusal when it says nothing was done.
+/// - The same, when the request's own effect raised the barrier that withdrew every connection of
+///   the host, its own included ([`HostWithdrawal`]): the registration is then gone by the
+///   request's own doing, so the answer is given while no fence is owed and no later barrier has
+///   moved the revision that withdrawal set.
 ///
 /// "Not shown" is `OUTCOME_UNKNOWN`. Every reply made here may be a result, so it is written under
 /// the local owner's lease.
 pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>) -> DoorReply {
-    let Settled { given } = settled;
+    let Settled { given, withdrew } = settled;
     let origin = given.origin();
     let answer = given.into_answer();
     let Standing {
@@ -160,10 +165,7 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
                 Err(refusal) => refused_with(request_id, &refusal),
             }
         }
-        Origin::Fresh => match controller
-            .authorised(connection_id)
-            .map_err(ControllerError::from)
-            .and_then(|_| controller.check_fence())
+        Origin::Fresh => match own_withdrawal_or_standing(controller, connection_id, withdrew).await
         {
             Ok(()) => answer,
             // The check's refusal says nothing was done, which is true of a refusal and false of a
@@ -176,6 +178,34 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
         frame,
         request_id,
         carries_a_result: true,
+    }
+}
+
+/// What a fresh answer that is not a conflict stands on: the connection's registration and no
+/// fence owed, or, for a request whose own barrier withdrew the host, no fence owed and the
+/// revision that barrier set still in force.
+async fn own_withdrawal_or_standing(
+    controller: &Controller,
+    connection_id: ConnectionId,
+    withdrew: Option<HostWithdrawal>,
+) -> Result<(), ControllerError> {
+    match withdrew {
+        Some(withdrew) => {
+            controller.check_fence()?;
+            if controller.withdrawal_stands(&withdrew).await {
+                Ok(())
+            } else {
+                Err(ControllerError::PermissionDenied {
+                    detail: "the authority this connection was admitted under has been \
+                             withdrawn; open a new connection"
+                        .to_owned(),
+                })
+            }
+        }
+        None => controller
+            .authorised(connection_id)
+            .map_err(ControllerError::from)
+            .and_then(|_| controller.check_fence()),
     }
 }
 
