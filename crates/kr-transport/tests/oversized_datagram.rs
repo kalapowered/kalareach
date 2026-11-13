@@ -24,29 +24,33 @@
 //! 3. releases the thread, and waits for a number of beats that came after that, failing when one
 //!    does not come: it decides by the beats that came, and the wait only bounds how long a stopped
 //!    runtime is given before the case says so;
-//! 4. looks at the queue once more and fails if the datagram is still in it: nothing else reads
-//!    that socket, so a queue that held the datagram and is empty now is one the endpoint's driver
-//!    read.
+//! 4. looks at the queue, and while the datagram is still in it waits for the same number of beats
+//!    again and looks again, up to a bound: a queue that held the datagram and is empty is one the
+//!    endpoint's driver read, since nothing else reads that socket, and a queue that still holds
+//!    it at the bound is one the endpoint did not read;
+//! 5. waits for the same number of beats once more, which shows that the runtime goes on after the
+//!    read: a receive call that read the datagram and then did not return would stop them.
 //!
 //! The queue is read through a duplicate of the endpoint's own descriptor, which Apple systems give
 //! when a process opens `/dev/fd/<n>`, found by the address it is bound to. Reading it with
-//! `peek_from` takes nothing out of the queue and changes no flag of the socket. The case looks at
-//! the queue while the thread is held, and once after the beats, and never between the release and
-//! the beats: on this system a loop of looks at the queue while the endpoint reads it left the
-//! datagram unread in a third or more of the runs, with the endpoint's runtime running and with no
+//! `peek_from` leaves the queue as it was and changes no flag of the socket. The case looks at the
+//! queue while the thread is held, and afterwards once for each run of beats, never in a tight
+//! loop: on this system a loop of looks at the queue while the endpoint reads it left the datagram
+//! unread in about a third of the runs or more, with the endpoint's runtime running and with no
 //! wake-up to come for it, and the same loop of looks over a plain tokio socket did the same. The
-//! datagrams are 2,000 and 9,000 bytes, the second to show that the case does not depend on how far
-//! above the buffer a datagram is, and a sender can repeat one, so each is sent in turn. After them
-//! a second endpoint dials the first and the connection opens, which shows that the endpoint still
-//! takes a peer. When the beats stop, the case sends one small datagram to let the endpoint go
-//! before it fails, so that the thread does not keep running while the rest of the run goes on.
+//! datagrams are 2,000 and 9,000 bytes, each above the buffer; the second keeps the case able to
+//! see the fault if a later release of the library reads into a buffer larger than 2,000 bytes, and
+//! a sender can repeat one, so each is sent in turn. After them a second endpoint dials the first
+//! and the connection opens, which shows that the endpoint still takes a peer. When the beats stop,
+//! the case sends one small datagram to let the endpoint go before it fails, so that the thread
+//! does not keep running while the rest of the run goes on.
 //!
 //! Elsewhere. On Linux and Android the endpoint reads datagrams with a batch call that has no such
-//! loop, so the fault does not exist there; and `/dev/fd/<n>` does not give a duplicate of a
-//! socket, so the case reads no queue. It sends the datagrams and counts the beats, which shows that
-//! the runtime went on after each send and says nothing of whether the endpoint read it. The case
-//! is built on Unix targets only: Windows has a socket layer of its own, with no such loop, and the
-//! file is empty there.
+//! loop, so the fault does not exist there; and `/dev/fd/<n>` is not a duplicate of a socket there.
+//! The case looks for the duplicate on Apple systems only. Elsewhere it reads no queue: it sends
+//! the datagrams and waits for the beats, which shows that the runtime went on after each send and
+//! says nothing of whether the endpoint read it. The case is built on Unix targets only: Windows has
+//! a socket layer of its own, with no such loop, and the file is empty there.
 
 #![cfg(unix)]
 
@@ -70,8 +74,13 @@ use tokio::sync::oneshot;
 /// buffer.
 const OVERSIZED: [usize; 2] = [2_000, 9_000];
 
-/// How many beats must come after the read of a datagram before the endpoint counts as running.
+/// How many beats must come after a step before the endpoint counts as running at that step.
 const BEATS: usize = 25;
+
+/// How many times the case looks at the queue for a datagram it has seen there, each look after
+/// `BEATS` more beats, before it says that the endpoint did not read the datagram: as long, at
+/// the beat's pace, as `STALL`.
+const LOOKS: usize = 200;
 
 /// How often the endpoint's runtime sends a beat when nothing holds it.
 const BEAT: Duration = Duration::from_millis(2);
@@ -84,8 +93,9 @@ const STALL: Duration = Duration::from_secs(10);
 /// How long the connection of the last step is given to open.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// The descriptors of this process that are looked at when the endpoint's socket is sought: Apple
-/// systems' limit on open files.
+/// The descriptors of this process that are looked at when the endpoint's socket is sought: the
+/// figure Apple's headers call `OPEN_MAX`. A process that holds a descriptor above it gets no look
+/// at that one, and the case then fails saying that no descriptor is the endpoint's socket.
 #[cfg(target_vendor = "apple")]
 const OPEN_MAX: u32 = 10_240;
 
@@ -204,6 +214,28 @@ impl Host {
         release_tx
     }
 
+    /// Fails the case, saying what the endpoint's runtime did not do, unless it runs. When it does
+    /// not, one small datagram is sent first, to let go a receive call that does not return.
+    fn expect_runs(&self, sender: &UdpSocket, round: usize, size: usize) {
+        if self.runs() {
+            return;
+        }
+        // A datagram that fits ends a receive call that does not return.
+        sender
+            .send_to(&[0_u8; 16], self.socket)
+            .expect("the releasing datagram sent");
+        let released = self.runs();
+        panic!(
+            "after oversized datagram {round}, {size} bytes, the endpoint's runtime sent no beat \
+             for {STALL:?}, so its receive call held the thread; a datagram that fits {} it",
+            if released {
+                "released"
+            } else {
+                "did not release"
+            }
+        );
+    }
+
     /// Whether the endpoint's runtime is running: `BEATS` beats, all of them sent after this call
     /// began, and none of them more than `STALL` after the one before.
     fn runs(&self) -> bool {
@@ -234,7 +266,8 @@ fn duplicate_of_socket_bound_to(address: SocketAddr) -> Option<UdpSocket> {
     })
 }
 
-/// Elsewhere `/dev/fd/<n>` is not a duplicate of a socket, and the queue is not read.
+/// Elsewhere the descriptors are not looked at and the queue is not read: on Linux and Android
+/// `/dev/fd/<n>` is not a duplicate of a socket, and opening it for a pipe can block.
 #[cfg(not(target_vendor = "apple"))]
 fn duplicate_of_socket_bound_to(_address: SocketAddr) -> Option<UdpSocket> {
     None
@@ -287,28 +320,24 @@ fn an_endpoint_goes_on_after_a_datagram_above_its_receive_buffer() {
             );
             drop(held);
         }
-        if !host.runs() {
-            // A datagram that fits ends a receive call that does not return.
-            sender
-                .send_to(&[0_u8; 16], host.socket)
-                .expect("the releasing datagram sent");
-            let released = host.runs();
-            panic!(
-                "after oversized datagram {round}, {size} bytes, the endpoint's runtime sent no beat \
-                 for {STALL:?}, so its receive call held the thread; a datagram that fits {} it",
-                if released {
-                    "released"
-                } else {
-                    "did not release"
-                }
-            );
-        }
+        host.expect_runs(&sender, round, size);
         if let Some(view) = &view {
+            let mut read = false;
+            for _ in 0..LOOKS {
+                if !queued(view) {
+                    read = true;
+                    break;
+                }
+                host.expect_runs(&sender, round, size);
+            }
             assert!(
-                !queued(view),
+                read,
                 "the endpoint's runtime went on after oversized datagram {round}, {size} bytes, \
                  but the datagram is still in the endpoint's socket: the endpoint did not read it"
             );
+            // The runtime goes on after the read as well: a receive call that read the datagram
+            // and then did not return would stop the beats from here on.
+            host.expect_runs(&sender, round, size);
         }
     }
 
