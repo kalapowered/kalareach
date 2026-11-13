@@ -319,7 +319,10 @@ const OPEN: Rect = { left: -Infinity, top: -Infinity, right: Infinity, bottom: I
  * them. The reads grow with the number of messages that hold links and with the links of the messages
  * near the point, so a message of some thousand links reads every one of its link boxes at each press
  * and each click. Besides those boxes, each press and each click finds the message of every link of
- * the pane with `closest`: a walk of the tree, not a layout read.
+ * the pane with `closest`: a walk of the tree, not a layout read. While a press that lit a link lives, each
+ * scroll event of any box in the page and each scroll or resize of the visual viewport reads the same again
+ * at the press's point, and a press on a link's own element also reads that element's view; moves,
+ * the release and a cancel read nothing.
  *
  * A message is near when the point lies within the radius of the message's box on the vertical axis
  * only. All messages share one horizontal extent, the stream's, and a link in a line wider than it

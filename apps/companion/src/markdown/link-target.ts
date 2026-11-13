@@ -236,20 +236,26 @@ export const SLOP = 10
 
 /**
  * The most that an engine moves the click of a tap away from its press when it adjusts the touch toward
- * a nearby control, in CSS pixels at a page scale of 1 (the page's viewport sets it; on a zoomed page the
- * same distance is fewer CSS pixels).
+ * a nearby control, in CSS pixels, at a page scale of 1 and the density of a phone's screen.
  *
+ * What each engine's source gives:
  * - Blink: `third_party/blink/renderer/core/page/touch_adjustment.cc`, `GetHitTestRectForAdjustment`,
  *   holds the touch's area between `kMinAdjustmentSizeDip` (20) and `kMaxAdjustmentSizeDip` (32) wide,
- *   and `SnapTo` puts the adjusted point inside that square: at most 16 px on an axis, `16 * sqrt(2)`
- *   at its corner. A finger-sized contact has the largest area; a synthetic touch has the smallest (10 px
- *   on an axis, which is what the browser cases log).
- * - WebKit: `Source/WebCore/page/LocalFrame.cpp`, `LocalFrame::qualifyingNodeAtViewportLocation`, tests
- *   points up to `unscaledSearchRadius` (15) times the screen's pixel density over 163 (about 1 on a
- *   phone) from the touch, on each axis: at most 15 px, less on a diagonal.
+ *   and `SnapTo` puts the adjusted point inside that square: at most 16 px on an axis at scale 1, and
+ *   `16 * sqrt(2)` at its corner. A finger-sized contact has the largest area; a synthetic touch has the
+ *   smallest (10 px on an axis, which is what the browser cases log).
+ * - WebKit: `Source/WebCore/page/LocalFrame.cpp`, `LocalFrame::qualifyingNodeAtViewportLocation`, searches a
+ *   square: points up to `unscaledSearchRadius` (15) times the screen's pixel density over 163 from the
+ *   touch, on each axis, divided by the page scale. Its adjusted point can lie at the square's corner, so a
+ *   diagonal reaches the side times `sqrt(2)`: `15 * sqrt(2)`, about 21.2 px, at a density factor of 1 (the
+ *   simulator's phone has logged an adjustment of 17.0 points, 11.7 across and 12.3 down).
  *
- * The larger of the two is Blink's corner. The cases log the press-to-click distance of every tap on both
- * engines and on the emulated phones, and hold it to `CLICK_AWAY`.
+ * The number is Blink's corner, which is above WebKit's at a factor of 1. What it does not cover goes to the
+ * device round: a page zoomed out below a scale of 1 (the same screen distance is more CSS pixels), and a
+ * screen whose density factor takes WebKit's corner above this number (above about 1.07). The cases log
+ * the press-to-click distance of every tap, on a click that names plain text apart from one that names a
+ * link's own element or another control, since only the first is decided here (a click that names an
+ * element stands, and the browser's adjustment chose it), and hold both to `CLICK_AWAY`.
  */
 export const TOUCH_ADJUSTMENT = 16 * Math.SQRT2
 
