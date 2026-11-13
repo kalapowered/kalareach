@@ -243,7 +243,7 @@ fn xchacha20_poly1305_agrees_with_every_wycheproof_case() {
         let opened = aead_decrypt(&sealed, &aad, &nonce, &key);
         match result {
             "valid" => {
-                assert_eq!(opened.expect("opens"), message, "case {tc}");
+                assert_eq!(opened.ok().as_ref(), Some(&message), "case {tc}");
                 assert_eq!(
                     aead_encrypt(&message, &aad, &nonce, &key).expect("seals"),
                     sealed,
