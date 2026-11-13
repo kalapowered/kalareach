@@ -673,22 +673,105 @@ impl Recorded {
     }
 }
 
-/// How the removal writes an executable collection that is left with no rule of anyone else's,
-/// from what the record gave, the mode that the present collection has, and whether a rule that
-/// the installation did not make shares the collection. A record that was not read selects no
-/// write: the collection is left as it is found, without the installation's rules.
+/// What the removal does with an executable collection that is left with no rule of anyone else's,
+/// from what the record gave and the mode that the present collection has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restore {
+    /// The collection has the mode that the installation sets and the record holds an empty
+    /// collection with this mode: it is written as the record holds it.
+    Record(Mode),
+    /// The collection already has the mode that the record holds: nothing is written back, and the
+    /// collection is left as it is found, without the installation's rules.
+    Same(Mode),
+    /// The collection has another mode than the installation sets and than the record's: that mode
+    /// stays, and the collection is left as it is found, without the installation's rules.
+    Stays {
+        /// The mode that the collection has and keeps.
+        present: Mode,
+        /// The mode that the record holds.
+        recorded: Mode,
+    },
+    /// The record gives no empty collection with a mode, or a rule that the installation did not
+    /// make shares the collection: the collection returns to not configured.
+    NotConfigured,
+    /// The record was not read: no mode is written, and the collection is left as it is found,
+    /// without the installation's rules. The text is the reason.
+    Unread(String),
+}
+
+impl Restore {
+    /// What [`strip`] writes for the collection.
+    #[must_use]
+    pub fn emptied(&self) -> Emptied {
+        match self {
+            Restore::Record(mode) => Emptied::Mode(*mode),
+            Restore::Same(_) | Restore::Stays { .. } | Restore::Unread(_) => Emptied::AsFound,
+            Restore::NotConfigured => Emptied::NotConfigured,
+        }
+    }
+}
+
+/// How the removal leaves an executable collection that is left with no rule of anyone else's,
+/// from what the record gave, the mode that the present collection has (not configured where the
+/// policy holds no executable collection), and whether a rule that the installation did not make
+/// shares the collection. The present mode is compared with the record's: a mode that is already
+/// the record's is left, and a mode that is neither the installation's nor the record's stays.
 #[must_use]
-pub fn emptied_for(recorded: &Recorded, present: Option<Mode>, shared: bool) -> Emptied {
+pub fn restore_for(recorded: &Recorded, present: Mode, shared: bool) -> Restore {
     match recorded {
-        Recorded::Unread(_) => Emptied::AsFound,
+        Recorded::Unread(why) => Restore::Unread(why.clone()),
         Recorded::Read(Some(mode)) if !shared => {
-            if present == Some(Mode::Enabled) {
-                Emptied::Mode(*mode)
+            if present == Mode::Enabled {
+                Restore::Record(*mode)
+            } else if present == *mode {
+                Restore::Same(*mode)
             } else {
-                Emptied::AsFound
+                Restore::Stays {
+                    present,
+                    recorded: *mode,
+                }
             }
         }
-        Recorded::Read(_) => Emptied::NotConfigured,
+        Recorded::Read(_) => Restore::NotConfigured,
+    }
+}
+
+/// A mode that stays after a removal because it is neither the installation's nor the record's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stays {
+    /// The mode that the collection has and keeps.
+    pub present: Mode,
+    /// The mode that the record holds.
+    pub recorded: Mode,
+}
+
+/// What the policy after a removal is compared with: the record's policy, or, where the record
+/// holds an empty executable collection with a mode and the present collection holds no rule and
+/// has another mode than the installation's and the record's, the record's policy with that mode,
+/// since the removal leaves a mode that is not its own. The second part is that mode and the
+/// record's, where the comparison made that allowance.
+#[must_use]
+pub fn expected_after(baseline: &Policy, present: &Policy) -> (Policy, Option<Stays>) {
+    let here = present.exe_mode().unwrap_or(Mode::NotConfigured);
+    let empty_here = present
+        .collections
+        .get(EXE)
+        .is_none_or(|collection| collection.rules.is_empty());
+    match baseline.recorded_empty_mode() {
+        Some(recorded) if empty_here && here != Mode::Enabled && here != recorded => {
+            let mut expected = baseline.clone();
+            if let Some(collection) = expected.collections.get_mut(EXE) {
+                collection.mode = here;
+            }
+            (
+                expected,
+                Some(Stays {
+                    present: here,
+                    recorded,
+                }),
+            )
+        }
+        _ => (baseline.clone(), None),
     }
 }
 

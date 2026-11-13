@@ -8,7 +8,7 @@ use kr_boundary_windows::frame::{self, FrameError, Request, Response};
 use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior, STORE_VERSION};
 use kr_boundary_windows::policy::{
     self, Action, Emptied, Kind, Mode, Policy, RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT,
-    Recorded,
+    Recorded, Restore, Stays,
 };
 use kr_boundary_windows::state::{Status, Verdict};
 
@@ -774,15 +774,10 @@ fn a_record_whose_policy_does_not_parse_selects_no_write() {
         matches!(invalid_entry, Recorded::Unread(_)),
         "{invalid_entry:?}"
     );
-    for present in [
-        None,
-        Some(Mode::Enabled),
-        Some(Mode::AuditOnly),
-        Some(Mode::NotConfigured),
-    ] {
+    for present in [Mode::Enabled, Mode::AuditOnly, Mode::NotConfigured] {
         for shared in [false, true] {
             assert_eq!(
-                policy::emptied_for(&unread, present, shared),
+                policy::restore_for(&unread, present, shared).emptied(),
                 Emptied::AsFound,
                 "{present:?} {shared}"
             );
@@ -809,17 +804,99 @@ fn a_record_whose_policy_does_not_parse_selects_no_write() {
     assert_eq!(record("AuditOnly"), Recorded::Read(Some(Mode::AuditOnly)));
     assert_eq!(record("NotConfigured"), Recorded::Read(None));
     assert_eq!(
-        policy::emptied_for(&record("AuditOnly"), Some(Mode::Enabled), false),
-        Emptied::Mode(Mode::AuditOnly)
+        policy::restore_for(&record("AuditOnly"), Mode::Enabled, false),
+        Restore::Record(Mode::AuditOnly)
     );
     assert_eq!(
-        policy::emptied_for(&record("NotConfigured"), Some(Mode::Enabled), false),
-        Emptied::NotConfigured
+        policy::restore_for(&record("NotConfigured"), Mode::Enabled, false),
+        Restore::NotConfigured
     );
     assert_eq!(
-        policy::emptied_for(&record("AuditOnly"), Some(Mode::Enabled), true),
-        Emptied::NotConfigured
+        policy::restore_for(&record("AuditOnly"), Mode::Enabled, true),
+        Restore::NotConfigured
     );
+}
+
+/// The present mode of an executable collection is compared with the mode that the record holds
+/// for it, in the three sequences that a computer with an empty audit-only collection can reach.
+/// (1) An administrator set the mode back to the record's after the installation: the mode is the
+/// record's already, nothing is written back, and the comparison finds no difference, so no line
+/// of the removal contradicts another. (2) A removal wrote the record's mode and a later step
+/// failed: the retry finds the record's mode there, the same case. (3) An administrator chose
+/// another mode after the installation: that mode stays, the comparison allows for it and names
+/// it and the record's mode, and the removal can finish. A collection that still has the mode the
+/// installation set is a difference in every sequence.
+#[test]
+fn the_removal_compares_the_present_mode_with_the_records_and_lets_another_mode_stay() {
+    let record_xml = r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="AuditOnly"></RuleCollection></AppLockerPolicy>"#;
+    let baseline = Policy::parse(record_xml).unwrap();
+    let recorded = Recorded::of(Ok(baseline.clone()));
+    let ours = [RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT];
+    let installed_xml = installed().render();
+    let with_mode = |mode: &str| {
+        installed_xml.replace(
+            r#"EnforcementMode="Enabled""#,
+            &format!(r#"EnforcementMode="{mode}""#),
+        )
+    };
+    // What a removal writes for a present policy, and what its check then finds.
+    let run = |xml: &str| {
+        let present = Policy::parse(xml).unwrap();
+        let mode = present.exe_mode().unwrap_or(Mode::NotConfigured);
+        let restore = policy::restore_for(&recorded, mode, false);
+        let written = policy::strip(xml, &ours, restore.emptied()).unwrap();
+        let after = Policy::parse(&written).unwrap();
+        let (expected, stays) = policy::expected_after(&baseline, &after);
+        (restore, after.differences(&expected), stays)
+    };
+
+    // The mode that the installation set: the record's mode is written, and no difference is left.
+    let (restore, left, stays) = run(&with_mode("Enabled"));
+    assert_eq!(restore, Restore::Record(Mode::AuditOnly));
+    assert!(left.is_empty() && stays.is_none(), "{left:?}");
+
+    // (1) The record's mode is there already, with the installation's rules still in the
+    // collection: it is written as found, and nothing is said to differ.
+    let (restore, left, stays) = run(&with_mode("AuditOnly"));
+    assert_eq!(restore, Restore::Same(Mode::AuditOnly));
+    assert!(left.is_empty() && stays.is_none(), "{left:?}");
+
+    // (2) The retry after a removal that wrote the record's mode and stopped later: no rule is
+    // left, the mode is the record's.
+    let (restore, left, stays) = run(record_xml);
+    assert_eq!(restore, Restore::Same(Mode::AuditOnly));
+    assert!(left.is_empty() && stays.is_none(), "{left:?}");
+
+    // (3) Another mode than the installation's and the record's stays, and the check finishes with
+    // the two modes named.
+    let (restore, left, stays) = run(&with_mode("NotConfigured"));
+    assert_eq!(
+        restore,
+        Restore::Stays {
+            present: Mode::NotConfigured,
+            recorded: Mode::AuditOnly
+        }
+    );
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(
+        stays,
+        Some(Stays {
+            present: Mode::NotConfigured,
+            recorded: Mode::AuditOnly
+        })
+    );
+    // The repeated removal of (3) finds the same, and finishes the same way.
+    let (_, left, stays) = run(
+        r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="NotConfigured"></RuleCollection></AppLockerPolicy>"#,
+    );
+    assert!(left.is_empty() && stays.is_some(), "{left:?}");
+
+    // The mode that the installation set, left in place after the removal, is a difference that
+    // keeps the removal from finishing: no allowance is made for it.
+    let still_enforced = Policy::parse(&with_mode("Enabled")).unwrap();
+    let (expected, stays) = policy::expected_after(&baseline, &still_enforced);
+    assert!(stays.is_none());
+    assert!(!still_enforced.differences(&expected).is_empty());
 }
 
 /// A client asks the platform for what the pipe's list grants and for nothing beyond it. The
