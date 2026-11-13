@@ -311,12 +311,14 @@ fn run(
             println!("not run: {}: {}", terminal.terminal, terminal.reason);
         }
     }
+    if std::env::var_os("GITHUB_ACTIONS").is_some_and(|value| value == "true") {
+        for annotation in document.rerun_annotations() {
+            println!("{annotation}");
+        }
+    }
     println!("result: {}", path.display());
-    if !summary.rerun_steps.is_empty() {
-        println!(
-            "{} steps were run again after a file that could not be started",
-            summary.rerun_steps.len()
-        );
+    if let Some(line) = document.rerun_count_line() {
+        println!("{line}");
     }
     if document.passed() {
         ExitCode::SUCCESS

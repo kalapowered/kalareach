@@ -117,12 +117,16 @@ with every other program the step wrote that is empty or cut short. The result's
 `conformance/faults/` that keeps each file's size, first bytes, Mach-O header and the system's
 check of its signature, and the kernel's lines about failed writes to storage for the minutes
 before. `summary.rerun_steps` lists the steps, and the run's last line says how many were run again.
-A step run again is never a plain pass.
 
 The `cause` is `runner_disk` where the evidence shows it: a file is empty, cut short or its
 signature does not check, or the kernel logged a storage error. It is `unexplained` where the file
 is whole and validly signed and the kernel logged no storage error, and then the step has an error
 and the run fails, because the cause may be this repository's.
+
+A run in which every step run again passed the second time and has the runner's disk as its cause
+exits 0, and says so where a reader of the workflow's runs sees it: under GitHub Actions the
+program prints one `::warning` annotation for each such step, naming the step and the files that
+could not be started, and the last line counts the steps run again.
 
 ### The classes of test in the landing workflow
 
