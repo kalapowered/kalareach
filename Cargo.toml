@@ -308,6 +308,16 @@ zeroize = { version = "=1.9.0", features = ["derive"] }
 # release archives use is built; the library's other methods and its encryption are not.
 zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate2"] }
 
+# On Apple systems `noq-udp` 1.4.0, the UDP layer under every endpoint, calls the receive system
+# call without end after one datagram larger than the receive buffer when the socket's queue is
+# then empty: the endpoint's driver handles no packet until a datagram that fits arrives. Upstream
+# fixed it on its main branch after that release, in the commit named here, whose `noq-udp` states
+# version 1.5.0 and differs from the 1.4.0 release in that one receive function and its two cases.
+# Remove this entry, and the git source it gives `noq-udp` in the lock, when the lock can take a
+# released `noq-udp` that holds the fix.
+[patch.crates-io]
+noq-udp = { git = "https://github.com/n0-computer/noq", rev = "04807b674cff617cbac323256416dc4779ccf7c2" }
+
 [workspace.lints.rust]
 missing_docs = "warn"
 unsafe_code = "forbid"
