@@ -468,6 +468,15 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     expect(press(93, 128, [words50], IOS, INNER), 'past it').toBeNull()
   })
 
+  it('weighs no distance to words that an empty view shows nothing of, so that they keep no other link’s area from growing', () => {
+    // A is at the pane's corner and holds (35,40) only by the room that the corner gives back; the words of B span the gap of an empty view.
+    const a = { words: [words(0, 0, 8)], view: PANE }
+    const across = { words: [{ left: 30, top: 30, right: 40, bottom: 60 }], view: { left: 36, top: 30, right: 34, bottom: 60 } }
+    const down = { words: [{ left: 30, top: 30, right: 60, bottom: 50 }], view: { left: 0, top: 38, right: 390, bottom: 36 } }
+    expect(linkAt({ x: 35, y: 40 }, [a, across], IOS), 'an empty view across').toBe(0)
+    expect(linkAt({ x: 35, y: 40 }, [a, down], IOS), 'an empty view down').toBe(0)
+  })
+
   it('has no area at all in a view that is empty, though the words span the gap between two boxes', () => {
     const empty: Rect = { left: 50, top: 100, right: 40, bottom: 160 }
     expect(press(45, 128, [[words(30, 120, 30)]], IOS, empty)).toBeNull()
