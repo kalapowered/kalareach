@@ -761,15 +761,15 @@ test.describe('a tap on the pane as it ships', () => {
 const FINGER = { ios: 44, android: 48 } as const
 
 const PLAIN = 'Plain words that hold no link, there to give the page room above and below.'
+/** A short link at the start of a line and one at the end of a line, each beside the pane's edge, and a link on a conversation's last line. */
+const EDGES = [
+  ['at the start of a line', 'https://example.org/at-start', ['[1](https://example.org/at-start) then plain words after the link at the start of the line.']],
+  ['at the end of a line', 'https://example.org/at-end', ['Plain words before the link at the end of the line, [2](https://example.org/at-end)']]
+] as const
+const LAST = 'https://example.org/last-line'
+const LAST_LINE = 'The last words of the conversation end with [a link](https://example.org/last-line)'
 const CLOSE = ['[the first close link](https://example.org/close-1)  \n[the second close link](https://example.org/close-2)']
 
-/** Taps one point, and says which link it opened, if any: the link that the page's own opened-links list gained. */
-async function tapAt(page: Page, x: number, y: number): Promise<string | null> {
-  const made = await tapAndRead(page, x, y)
-  return made.opened[made.opened.length - 1] ?? null
-}
-
-// KR-REQ-13.19: the area in which a tap opens a link is at least the size the platform asks for around
 /** The pane's box as the page lays it out now. */
 async function paneBox(page: Page): Promise<{ left: number; top: number; right: number; bottom: number }> {
   return page.evaluate(() => {
@@ -867,6 +867,13 @@ async function missedInRing(page: Page, words: Words, size: number): Promise<str
   return missed
 }
 
+/** Taps one point, and says which link it opened, if any: the link that the page's own opened-links list gained. */
+async function tapAt(page: Page, x: number, y: number): Promise<string | null> {
+  const made = await tapAndRead(page, x, y)
+  return made.opened[made.opened.length - 1] ?? null
+}
+
+// KR-REQ-13.19: the area in which a tap opens a link is at least the size the platform asks for around
 // the link's words (44 points on iOS and 48 dp on Android, in every direction), and where two links
 // stand closer than that, the nearer words have the area between them. The case taps a ring of points
 // around the words of a link in the middle of a line, and every point of the axis between two links
@@ -899,6 +906,48 @@ test.describe('the area in which a tap opens a link', () => {
               }
             }, href)
           }
+          const words = await wordsOf(page, href)
+          const pane = await paneBox(page)
+          const size = FINGER[surface]
+          const room = where === 'at the end of a line' ? pane.right - words.right : words.left - pane.left
+          expect(room, `the room the pane gives beside the words ${where}`).toBeLessThan(2)
+          const missed = await missedInRing(page, words, size)
+          expect(missed, 'points of the least size, held inside the pane, that opened no link').toEqual([])
+          const area = await areaOf(page, href, words)
+          test.info().annotations.push({ type: 'area', description: `${where} ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)})` })
+          expect(Math.min(area.width, area.height), 'the area’s least side, measured by the pressed look').toBeGreaterThanOrEqual(size)
+          // What lights at a press is what opens: the pressed look at the far point of the area, none past it.
+          const inside = ringPoints(words, pane, size)
+          const far = where === 'at the end of a line' ? inside[0] : inside[inside.length - 1]
+          const past = where === 'at the end of a line' ? words.left - size - 12 : words.right + size + 12
+          await page.mouse.move(far?.x ?? 0, far?.y ?? 0)
+          await page.mouse.down()
+          expect(await pressedLooks(page), 'the pressed look at the far point of the area').toBe(1)
+          await page.mouse.up()
+          await page.mouse.move(past, words.y)
+          await page.mouse.down()
+          expect(await pressedLooks(page), 'the pressed look past the area').toBe(0)
+          await page.mouse.up()
+          expect(await tapAt(page, past, words.y), 'a link opened by a tap past the area').toBeNull()
+        })
+      }
+
+      test(`is the least size for a link on the conversation's last line, where the pane's bottom cuts the area below the words, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio, only: [...Array.from({ length: 14 }, () => PLAIN), LAST_LINE] })
+        const words = await wordsOf(page, LAST)
+        await page.evaluate(() => {
+          const pane = document.querySelector<HTMLElement>('.m-pane')
+          if (pane) pane.scrollTop = pane.scrollHeight
+        })
+        const settled = await wordsOf(page, LAST)
+        const pane = await paneBox(page)
+        const size = FINGER[surface]
+        expect(settled.top, 'the last line has not moved when the pane is scrolled to its end').toBeGreaterThanOrEqual(words.top - 1)
+        // Where the area reaches below the words (the words are shorter than the least size) the pane's bottom cuts it.
+        if (settled.bottom - settled.top < size) {
+          expect(pane.bottom - settled.bottom, 'the room under the words of the conversation’s last line').toBeLessThan((size - (settled.bottom - settled.top)) / 2)
         }
         const missed = await missedInRing(page, settled, size)
         expect(missed, 'points of the least size, held inside the pane, that opened no link').toEqual([])
@@ -951,52 +1000,3 @@ test.describe('the area in which a tap opens a link', () => {
     }
   }
 })
-/** A short link at the start of a line and one at the end of a line, each beside the pane's edge, and a link on a conversation's last line. */
-const EDGES = [
-  ['at the start of a line', 'https://example.org/at-start', ['[1](https://example.org/at-start) then plain words after the link at the start of the line.']],
-  ['at the end of a line', 'https://example.org/at-end', ['Plain words before the link at the end of the line, [2](https://example.org/at-end)']]
-] as const
-const LAST = 'https://example.org/last-line'
-const LAST_LINE = 'The last words of the conversation end with [a link](https://example.org/last-line)'
-          const words = await wordsOf(page, href)
-          const pane = await paneBox(page)
-          const size = FINGER[surface]
-          const room = where === 'at the end of a line' ? pane.right - words.right : words.left - pane.left
-          expect(room, `the room the pane gives beside the words ${where}`).toBeLessThan(2)
-          const missed = await missedInRing(page, words, size)
-          expect(missed, 'points of the least size, held inside the pane, that opened no link').toEqual([])
-          const area = await areaOf(page, href, words)
-          test.info().annotations.push({ type: 'area', description: `${where} ${surface} ${ratio === 1 ? 'default' : 'largest'}: ${String(area.width)} x ${String(area.height)} px (least ${String(size)})` })
-          expect(Math.min(area.width, area.height), 'the area’s least side, measured by the pressed look').toBeGreaterThanOrEqual(size)
-          // What lights at a press is what opens: the pressed look at the far point of the area, none past it.
-          const inside = ringPoints(words, pane, size)
-          const far = where === 'at the end of a line' ? inside[0] : inside[inside.length - 1]
-          const past = where === 'at the end of a line' ? words.left - size - 12 : words.right + size + 12
-          await page.mouse.move(far?.x ?? 0, far?.y ?? 0)
-          await page.mouse.down()
-          expect(await pressedLooks(page), 'the pressed look at the far point of the area').toBe(1)
-          await page.mouse.up()
-          await page.mouse.move(past, words.y)
-          await page.mouse.down()
-          expect(await pressedLooks(page), 'the pressed look past the area').toBe(0)
-          await page.mouse.up()
-          expect(await tapAt(page, past, words.y), 'a link opened by a tap past the area').toBeNull()
-        })
-      }
-
-      test(`is the least size for a link on the conversation's last line, where the pane's bottom cuts the area below the words, on ${surface} at ${size} text size`, async ({
-        page
-      }) => {
-        await pressPage(page, surface, { scale: ratio, only: [...Array.from({ length: 14 }, () => PLAIN), LAST_LINE] })
-        const words = await wordsOf(page, LAST)
-        await page.evaluate(() => {
-          const pane = document.querySelector<HTMLElement>('.m-pane')
-          if (pane) pane.scrollTop = pane.scrollHeight
-        })
-        const settled = await wordsOf(page, LAST)
-        const pane = await paneBox(page)
-        const size = FINGER[surface]
-        expect(settled.top, 'the last line has not moved when the pane is scrolled to its end').toBeGreaterThanOrEqual(words.top - 1)
-        // Where the area reaches below the words (the words are shorter than the least size) the pane's bottom cuts it.
-        if (settled.bottom - settled.top < size) {
-          expect(pane.bottom - settled.bottom, 'the room under the words of the conversation’s last line').toBeLessThan((size - (settled.bottom - settled.top)) / 2)
