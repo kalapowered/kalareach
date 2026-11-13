@@ -44,7 +44,11 @@
  * A link's view is what every box that clips it leaves of the page (see `viewOf`): the pane's client
  * box (what holds content and can be tapped, with no border and no scroll bar's strip), the scrollers
  * inside and outside the pane, and the visual viewport. A press or a click where no link has a view
- * lights and opens nothing.
+ * lights and opens nothing. Where a box between a link and the page's root makes a view that cannot be
+ * measured (`blocksView`: a transform that is more than a move, a box that contains its paint, a box
+ * that skips its content's rendering) the link takes no part: it gets no added area, the rule never
+ * lights it and the handler never opens it, and a press on its own element lights nothing, as on a page
+ * with no handler. The browser's click on its own element stands.
  */
 
 import { useEffect, type RefObject } from 'react'
@@ -213,7 +217,7 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
   if (named === 'control') return null
   if (named === 'link') {
     const own = target?.closest<HTMLElement>('.md-link') ?? null
-    return own === null ? null : { id: own, destination: own.title, own: true }
+    return own === null || unmeasured(own) ? null : { id: own, destination: own.title, own: true }
   }
   if (!opensByRule(event.pointerType)) return null
   const near = linkNear(pane, event.clientX, event.clientY)
@@ -242,7 +246,8 @@ function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
 
 /** Whether `point` lies in the part of `link`'s own element that every box clipping it leaves in view. */
 function liesInView(pane: HTMLElement, link: HTMLElement, point: { x: number; y: number }): boolean {
-  const view = viewOf(link, clipsOf(pane), screenOf())
+  const view = viewOf(link, ancestorsOf(pane), screenOf())
+  if (view === null) return false
   const box = link.getBoundingClientRect()
   const left = Math.max(box.left, view.left)
   const right = Math.min(box.right, view.right)
@@ -286,11 +291,16 @@ function linkNear(pane: HTMLElement, x: number, y: number): PaneLink<HTMLElement
 /** What a layout is where the pane holds no link in a message: nothing to press. */
 const NO_LINKS: Layout<HTMLElement> = { links: [], reach: { least: 0, beside: 0 } }
 
-/** The part of a box that clips a link, by axis: where `x` or `y` is false the box leaves that axis alone. */
-interface Clip {
+/**
+ * What a read knows of one ancestor of a link: whether it keeps the view from being measured, and how it
+ * clips, by axis (where `x` or `y` is false the box leaves that axis alone), with its client box, which
+ * is read when a link first needs it.
+ */
+interface Ancestor {
+  readonly blocks: boolean
   readonly x: boolean
   readonly y: boolean
-  readonly box: Rect
+  box: Rect | null
 }
 
 /** The room that nothing clips. */
@@ -336,21 +346,25 @@ function layoutNear(pane: HTMLElement, x: number, y: number): Layout<HTMLElement
     }
     return answer
   }
-  const clips = clipsOf(pane)
+  const known = ancestorsOf(pane)
   const screen = screenOf()
+  // A link whose view cannot be measured takes no part: it is not in the layout at all.
   const links = Array.from(all)
     .filter((link) => nearMessage(link) && near(link.getBoundingClientRect()))
-    .map((link) => ({ id: link, destination: link.title, words: wordsOf(link), view: viewOf(link, clips, screen) }))
+    .flatMap((link) => {
+      const view = viewOf(link, known, screen)
+      return view === null ? [] : [{ id: link, destination: link.title, words: wordsOf(link), view }]
+    })
   return { links, reach }
 }
 
 /**
- * What is known of the boxes that clip the links of `pane` in one read, so that each is read once. The
+ * What is known of the ancestors of the links of `pane` in one read, so that each is read once. The
  * pane clips every link in it, whatever its computed overflow says: what holds content and can be
  * tapped is its client box, with no border and no scroll bar's strip.
  */
-function clipsOf(pane: HTMLElement): Map<Element, Clip | null> {
-  return new Map<Element, Clip | null>([[pane, { x: true, y: true, box: clientBoxOf(pane) }]])
+function ancestorsOf(pane: HTMLElement): Map<Element, Ancestor> {
+  return new Map<Element, Ancestor>([[pane, { blocks: blocksView(getComputedStyle(pane)), x: true, y: true, box: clientBoxOf(pane) }]])
 }
 
 /** What the visual viewport shows of the page, in the layout viewport's coordinates. */
@@ -365,35 +379,82 @@ function screenOf(): Rect {
  * What every box that clips `link` leaves of the page, by axis: the visual viewport `screen`, narrowed by
  * the client box of each ancestor from the link up to the document's root whose computed overflow on that
  * axis is not `visible`. The intersection is taken whole, so a later fit never gives back what an earlier
- * box cut. `clips` holds what is known of each ancestor in this read, so that each is read once.
+ * box cut. `known` holds what is read of each ancestor in this read, so that each is read once.
+ *
+ * It is null where the view cannot be measured: an ancestor whose box keeps the client boxes from being
+ * laid over the words' rectangles (`blocksView`). A named limit, not geometry that this models.
  *
  * The walk follows the element tree. It does not model a link taken out of the flow: an absolutely
  * positioned link is clipped by the boxes between it and its containing block, a fixed one by none, and
- * the walk clips both by every ancestor; a transformed box clips by its bounding box; a clip-path or a
- * mask is not read. In this page's messages links are inline, so none of these holds.
+ * the walk clips both by every ancestor; a clip-path or a mask is not read. In this page's messages
+ * links are inline, so none of these holds.
  */
-function viewOf(link: HTMLElement, clips: Map<Element, Clip | null>, screen: Rect): Rect {
+function viewOf(link: HTMLElement, known: Map<Element, Ancestor>, screen: Rect): Rect | null {
   let view = screen
   for (let ancestor = link.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
-    let clip = clips.get(ancestor)
-    if (clip === undefined) {
+    let box = known.get(ancestor)
+    if (box === undefined) {
       const style = getComputedStyle(ancestor)
-      const x = style.overflowX !== 'visible'
-      const y = style.overflowY !== 'visible'
-      clip = x || y ? { x, y, box: clientBoxOf(ancestor) } : null
-      clips.set(ancestor, clip)
+      box = { blocks: blocksView(style), x: style.overflowX !== 'visible', y: style.overflowY !== 'visible', box: null }
+      known.set(ancestor, box)
     }
-    if (clip === null) continue
+    if (box.blocks) return null
+    if (!box.x && !box.y) continue
+    box.box ??= clientBoxOf(ancestor)
     view = {
-      left: clip.x ? Math.max(view.left, clip.box.left) : view.left,
-      right: clip.x ? Math.min(view.right, clip.box.right) : view.right,
-      top: clip.y ? Math.max(view.top, clip.box.top) : view.top,
-      bottom: clip.y ? Math.min(view.bottom, clip.box.bottom) : view.bottom
+      left: box.x ? Math.max(view.left, box.box.left) : view.left,
+      right: box.x ? Math.min(view.right, box.box.right) : view.right,
+      top: box.y ? Math.max(view.top, box.box.top) : view.top,
+      bottom: box.y ? Math.min(view.bottom, box.box.bottom) : view.bottom
     }
     // Nothing of the link is in view of an empty view, whatever the boxes further up leave.
     if (view.left >= view.right || view.top >= view.bottom) break
   }
   return view
+}
+
+/** Whether a box between `link` and the page's root keeps its view from being measured (see `blocksView`). */
+function unmeasured(link: HTMLElement): boolean {
+  for (let ancestor = link.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
+    if (blocksView(getComputedStyle(ancestor))) return true
+  }
+  return false
+}
+
+/**
+ * Whether a box keeps the view of the links under it from being measured: the client boxes of the
+ * ancestors are read in the box's own units and its words' rectangles in the page's, and they are laid
+ * over each other as they are. That holds where a box only moves its content (a translation: its
+ * bounding rectangle moves with it). It does not hold where the box
+ *
+ * - has a transform that is more than a move (its matrix is not a pure translation) or the separate
+ *   `scale` or `rotate` property: the bounding rectangle of the box is not the box;
+ * - contains its paint (`contain` with `paint`, `strict` or `content`) or skips its content's rendering
+ *   (`content-visibility` other than `visible`): words are hidden with no overflow value that says so.
+ *
+ * A link under such a box takes no part, so that no hidden link is lit or opened. The product has no
+ * such box around a message. Not modelled: what a perspective, a filter, a clip-path or a mask hides.
+ */
+function blocksView(style: CSSStyleDeclaration): boolean {
+  const value = (name: string): string => style.getPropertyValue(name).trim()
+  const set = (name: string): boolean => value(name) !== '' && value(name) !== 'none'
+  if (!isMove(value('transform')) || set('scale') || set('rotate')) return true
+  if (value('contain').split(/\s+/).some((kind) => kind === 'paint' || kind === 'strict' || kind === 'content')) return true
+  return value('content-visibility') !== '' && value('content-visibility') !== 'visible'
+}
+
+/** The entries of a 2D matrix that a pure translation holds (`NaN`: any value), and those of a 3D one. */
+const MOVE_2D = [1, 0, 0, 1, NaN, NaN]
+const MOVE_3D = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, NaN, NaN, NaN, 1]
+
+/** Whether a computed `transform` is none or a pure translation. Any other form is not a move. */
+function isMove(transform: string): boolean {
+  if (transform === '' || transform === 'none') return true
+  const parsed = /^matrix(3d)?\(([^)]*)\)$/.exec(transform)
+  if (parsed === null) return false
+  const wanted = parsed[1] === undefined ? MOVE_2D : MOVE_3D
+  const values = (parsed[2] ?? '').split(',').map(Number)
+  return values.length === wanted.length && wanted.every((entry, index) => Number.isNaN(entry) || Math.abs((values[index] ?? NaN) - entry) < 1e-9)
 }
 
 /** What a box holds of content that can be tapped: its client box, with no border and no scroll bar's strip. */
