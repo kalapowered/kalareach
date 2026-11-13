@@ -280,7 +280,14 @@ fn cancel(pipe: HANDLE, transfer: &mut Transfer) -> ffi::Result<bool> {
     Ok(matches!(ended, ffi::Waited::Signalled(_)))
 }
 
-/// Waits for a transfer, up to the deadline and until the stop event is set. When it does not
+/// How long a wait with no deadline of its own waits before it looks at the stop again. It exists
+/// because a stop event that could not be set wakes nobody: the failure is kept in the stop, and
+/// only a wait that comes back to read it sees it, so a failed set ends every listener within one
+/// slice. The cost is one idle wake-up a second for each listener.
+const STOP_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Waits for a transfer, up to the deadline and until the stop event is set. A wait with no
+/// deadline waits in slices of [`STOP_SLICE`], and each slice reads the stop again. When it does not
 /// finish in time it is cancelled and waited for for at most [`CANCEL_GRACE_MS`]; a transfer that
 /// still has not ended is left to end by itself, its record and buffer kept for the life of the
 /// process, and `stuck` is set so that the caller takes no more transfers on that pipe.
@@ -291,18 +298,25 @@ fn wait(
     deadline: Option<Instant>,
     stuck: &mut bool,
 ) -> io::Result<(u32, Transfer)> {
-    let milliseconds = deadline.map_or(INFINITE, |deadline| {
-        let left = deadline.saturating_duration_since(Instant::now());
-        // One less than the longest wait, which means "forever".
-        super::ffi::milliseconds(left, INFINITE - 1)
-    });
     // The stop is waited on first: when both are signalled the call reports the stop, so a transfer
     // that finished at once never wins over it, and a wait that fails is kept as the unread stop.
-    let waited = stop.wait_for(
-        &[transfer.event.raw()],
-        milliseconds,
-        "waiting for the other end",
-    );
+    let waited = loop {
+        let left = deadline.map_or(STOP_SLICE, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        // One less than the longest wait, which means "forever".
+        let waited = stop.wait_for(
+            &[transfer.event.raw()],
+            super::ffi::milliseconds(left, INFINITE - 1),
+            "waiting for the other end",
+        );
+        // A slice of a wait with no deadline that ended with nothing signalled is waited on again:
+        // the next call reads the stop's kept failure first.
+        if deadline.is_none() && matches!(waited, Ok(ffi::Waited::TimedOut)) {
+            continue;
+        }
+        break waited;
+    };
     if !matches!(waited, Ok(ffi::Waited::Signalled(1))) {
         // A transfer that is not seen to end after the cancel stays with the process, and the
         // cancel's own failed wait is told beside the reason.
@@ -1047,4 +1061,68 @@ pub fn connect_held(kind: Kind, process: &ServerProcess) -> Result<Connection> {
         deadline: None,
         stuck: false,
     })
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use super::*;
+
+    /// A wait with no deadline on a pipe that no client comes to ends within two slices of a stop
+    /// that could not be set: the event is never signalled, the failure is only kept, and the wait
+    /// that comes back every slice reads it and ends the transfer with the stop's reason.
+    #[test]
+    fn a_wait_with_no_deadline_ends_within_two_slices_of_a_stop_that_could_not_be_set() {
+        let name = wide(&format!(
+            r"\\.\pipe\kr-slice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: the name is NUL-terminated and outlives the call; no security attributes.
+        let pipe = Handle::new(
+            unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,
+                    512,
+                    512,
+                    0,
+                    null(),
+                )
+            },
+            "making the case's pipe",
+        )
+        .unwrap();
+        let stop = Stop::new().unwrap();
+        let mut transfer = Transfer::new(Vec::new()).unwrap();
+        // SAFETY: the pipe is open for overlapped use and `transfer` keeps the record.
+        let connected = unsafe { ffi::connect_named_pipe(pipe.raw(), &mut transfer.overlapped) };
+        assert!(matches!(connected, ffi::Connect::Pending));
+        let late = Arc::clone(&stop);
+        let failer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            late.fail_the_set_for_a_case();
+        });
+        let started = Instant::now();
+        let mut stuck = false;
+        let Err(error) = wait(pipe.raw(), transfer, &stop, None, &mut stuck) else {
+            panic!("the wait ended with a transfer, not with the stop");
+        };
+        let took = started.elapsed();
+        failer.join().unwrap();
+        assert!(took < 2 * STOP_SLICE, "{took:?}");
+        assert!(
+            error.get_ref().is_some_and(|inner| inner.is::<Stopped>()),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("the stop could not be set"),
+            "{error}"
+        );
+        assert!(!stuck);
+    }
 }
