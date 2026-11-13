@@ -336,12 +336,18 @@ fn the_folder_above_the_program_directory_is_made_and_removed_only_as_the_run_th
     let result = at("run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Made)");
     assert!(intent < made && made < held && held < identity && identity < result);
     assert!(folder.contains("run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Found)"));
+    // A repair that finds the folder writes no result, so that an earlier run's intent with its
+    // identity is not turned into a folder that stood there before the installation; only a new
+    // installation's own read concludes `found`.
+    let repair = at("None if existing => Ok(()),");
+    let new_run = at("None => run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Found)");
+    assert!(result < repair && repair < new_run);
     // lay_down makes the folder after the check of the program directory's parents and before the
     // program directory.
     let lay = code_of(body_of(&source, "fn lay_down("));
     let check = lay.find("check_program_parents(&paths, after)?;").unwrap();
     let folder_at = lay
-        .find("make_program_folder(run, &paths, &readable)?;")
+        .find("make_program_folder(run, &paths, &readable, existing)?;")
         .unwrap();
     let program = lay
         .find("fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)")
