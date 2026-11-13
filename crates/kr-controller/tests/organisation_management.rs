@@ -1134,6 +1134,98 @@ async fn a_lease_presented_across_another_devices_revocation_is_not_shown_and_it
     fixture.host.stop().await;
 }
 
+/// KR-REQ-09.09, KR-REQ-17.54: the answer to a presentation of the lease for the host's own local
+/// owner derives from an older event, so the door does not show it when the authority it was
+/// admitted under has gone by the time it is told: a fence this host comes to owe after the route
+/// answered, or a withdrawal of the whole host that the request did not raise (the one the debt pass
+/// makes for a debt it publishes). Each leaves the lease installed; the same lease presented again,
+/// on a connection under the authority now in force, is answered as the first presentation was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_presented_while_a_fence_is_owed_or_the_host_withdraws_is_not_shown_and_is_answered_again()
+ {
+    let fixture = Fixture::start().await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+    let lease = fixture.organisation.lease(
+        2,
+        &organisation_support::member("owner"),
+        fixture.listed().await.host_device.authorisation_key,
+        fixture.now(),
+        &[ActionRight::SessionView],
+    );
+    let params = MembershipPresentParams {
+        lease,
+        authority: Nullable::null(),
+    };
+    let environment = fixture.host.environment_id;
+    let mut client = fixture.host.client().await;
+    let first: kr_protocol::organisation::MembershipPresentResult = calls::mutate_as(
+        environment,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        Method::MembershipPresent,
+        &params,
+    )
+    .await
+    .expect("the host takes the lease for its local owner");
+
+    let controller = fixture.host.controller();
+    for host_withdraws in [false, true] {
+        let (arrived, release) = controller.pause_after_a_route_answers();
+        let telling = tokio::spawn({
+            let params = params.clone();
+            async move {
+                let told: Result<kr_protocol::organisation::MembershipPresentResult, _> =
+                    calls::mutate_as(
+                        environment,
+                        &mut client,
+                        ActionId::new(kr_ipc::new_uuid()),
+                        Method::MembershipPresent,
+                        &params,
+                    )
+                    .await;
+                told
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the route answers")
+            .expect("the pause is armed");
+        if host_withdraws {
+            controller
+                .revoke_authority()
+                .await
+                .expect("the host withdraws its authority");
+        } else {
+            controller.hold_fence(true);
+        }
+        release.send(()).expect("the door goes on");
+        let refused = telling
+            .await
+            .expect("the door tells it")
+            .expect_err("an answer under authority that has gone is not shown");
+        assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
+        controller.hold_fence(false);
+
+        client = fixture.host.client().await;
+        let again: kr_protocol::organisation::MembershipPresentResult = calls::mutate_as(
+            environment,
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::MembershipPresent,
+            &params,
+        )
+        .await
+        .expect("the same lease on a connection under the authority in force is answered");
+        assert_eq!(again, first, "it is answered as the first presentation was");
+    }
+    fixture.host.stop().await;
+}
+
 /// KR-REQ-17.54: what recovers the host is for the device that can recover it. An owner's device
 /// whose grant ends is refused on a lapsed exclusive host, a leased owner device keeps every
 /// confirmation, and the confirmation of ending exclusive management is not carried by a device
