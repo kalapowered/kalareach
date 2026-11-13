@@ -12,7 +12,7 @@
 //! the answer of a copy out and give the value again as an answer made now.
 
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
-use kr_protocol::error::{ProtocolError, RetryCategory};
+use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
 use kr_protocol::receipt::ReceiptState;
 
 use crate::service::HostWithdrawal;
@@ -183,6 +183,26 @@ impl<T, E> Given<Result<T, E>> {
             };
         }
         Self::of(answer, copied)
+    }
+}
+
+impl<T> Given<Result<T, ProtocolError>> {
+    /// Whether the strict check is owed to this answer once it is in hand: it is a copy, or it
+    /// says another request spent the action's identifier.
+    pub(crate) fn is_held_to_the_strict_check(&self) -> bool {
+        self.is_copied()
+            || (self.origin == Origin::Fresh
+                && matches!(&self.answer, Err(refusal) if refusal.code == ErrorCode::IdConflict))
+    }
+
+    /// This answer replaced by `refusal`, which the strict check refused it with: a copy is
+    /// withheld, and any other answer is the host's own refusal.
+    pub(crate) fn refused_by(self, refusal: ProtocolError) -> Self {
+        if self.is_copied() {
+            Self::withheld(Err(refusal))
+        } else {
+            Self::fresh(Err(refusal))
+        }
     }
 }
 
@@ -392,7 +412,7 @@ pub(crate) mod host_context {
     /// The answer of the host's own workflow, which goes to no caller outside the daemon: it acts
     /// for its node under the node's own admission, so what it is given is the answer whatever
     /// its origin.
-    pub(crate) fn whole<T>(given: Given<T>) -> T {
+    pub(crate) fn whole<T>(_at: crate::service::AtTheHostsOwnWorkflow, given: Given<T>) -> T {
         given.into_answer()
     }
 }
