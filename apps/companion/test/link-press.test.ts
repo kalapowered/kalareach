@@ -284,16 +284,12 @@ describe('a tap between two links, through the handler', () => {
 })
 
 describe('where the handler’s listeners stand', () => {
-  it('puts the click listener on the pane and the pointer listeners on the document', () => {
+  it('puts every listener on the document: the click, the pointer down, and the move, up and cancel from a press to its end', () => {
     const { pane } = between({ left: 0, top: 0, right: 8, bottom: 17 })
     const stop = start(pane)
-    // The click is on the pane itself: WebKit sends a click for a tap on the pane's bare area only to an
-    // element that has a click listener of its own, or lies under one other than the document's.
-    expect([...listening.keys()].filter((type) => type.startsWith('pane ')).sort()).toEqual(['pane click'])
-    // A press outside the pane ends the record, and a release or a cancel can come outside it.
-    expect([...listening.keys()].filter((type) => !type.startsWith('pane ')).sort()).toEqual(['pointerdown'])
+    expect([...listening.keys()].sort()).toEqual(['click', 'pointerdown'])
     fire('pointerdown', pointer(pane, { clientX: 51, clientY: 43 }))
-    expect([...listening.keys()].filter((type) => !type.startsWith('pane ')).sort()).toEqual(['pointercancel', 'pointerdown', 'pointermove', 'pointerup'])
+    expect([...listening.keys()].sort()).toEqual(['click', 'pointercancel', 'pointerdown', 'pointermove', 'pointerup'])
     stop()
     expect([...listening.keys()]).toEqual([])
   })
@@ -306,6 +302,17 @@ describe('where the handler’s listeners stand', () => {
     fire('pointerup', pointer(pane, { clientX: 40, clientY: 30, timeStamp: 120 }))
     fire('click', click(pane, { clientX: 40, clientY: 30 }))
     expect(opened).toEqual([links[0]])
+  })
+
+  it('leaves a click outside the pane alone', () => {
+    const { pane, links } = between({ left: 0, top: 0, right: 8, bottom: 17 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(pane, { clientX: 40, clientY: 30 }))
+    fire('pointerup', pointer(pane, { clientX: 40, clientY: 30, timeStamp: 120 }))
+    fire('click', click(document.body, { clientX: 40, clientY: 30 }))
+    expect(opened).toEqual([])
+    expect(links.length).toBe(1)
   })
 })
 
