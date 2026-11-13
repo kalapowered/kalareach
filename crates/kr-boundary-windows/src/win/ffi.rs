@@ -130,6 +130,7 @@ pub struct KnownFolderError {
 /// A platform error in the system's own form: its code in hexadecimal and, where the system has a
 /// message for it, the message. An `HRESULT` that wraps a Windows error is looked up by that error.
 #[must_use]
+// text: system_form
 pub fn system_form(code: u32) -> String {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,

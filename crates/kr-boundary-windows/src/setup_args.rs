@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 /// What the setup program prints for a command line that is not one.
+// text: USAGE
 pub const USAGE: &str = "usage: kr-boundary-setup install|repair --payload DIRECTORY [--person SID]\n       kr-boundary-setup remove\n       kr-boundary-setup status";
 
 /// The exit code of a command line that is refused.
