@@ -1409,6 +1409,32 @@ fn a_new_method_does_not_pass_where_the_root_uses_method_without_widening() {
     assert!(lines.is_empty(), "{lines:?}");
 }
 
+/// A change of a keyword of the root beside a new method is a difference of its own: the old
+/// schema accepts the texts of `Method` as a whole (its root is a string) and refuses a number; the
+/// new one, whose root is a number, does the reverse. Nothing under `$defs` differs but the method,
+/// so the new method passes and the root's line is the only one.
+#[test]
+fn a_change_of_the_roots_type_beside_a_new_method_is_reported() {
+    let with_root = |root_type: &str, names: &[&str]| {
+        let mut schema = with_methods(&json!({}), names);
+        schema["$ref"] = json!("#/$defs/Method");
+        schema["type"] = json!(root_type);
+        schema
+    };
+    let (old, new) = (
+        with_root("string", &["a"]),
+        with_root("number", &["a", "b"]),
+    );
+    assert_eq!(
+        level_lines(&old, &new),
+        vec!["$root changed: type".to_owned()]
+    );
+    assert_eq!(
+        crate::public_contract::compare(&old, &new),
+        Ok(vec!["$root changed: type".to_owned(), added("b")])
+    );
+}
+
 /// Where every use of `Method` widens with it, the new name passes: a use as a property (also one
 /// whose name is a keyword), an item, an additional property, a pattern property, in an `anyOf`,
 /// an `allOf`, a nullable pair, beside an annotation, as a whole definition, through another

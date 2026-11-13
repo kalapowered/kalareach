@@ -40,11 +40,25 @@ pub enum SurfaceError {
     NotASurface(String),
 }
 
-/// The definitions reachable from some roots in a generated schema.
+/// The place of the schema's own root in a [`Difference`]: no definition has a name that begins
+/// with `$`.
+const ROOT_PLACE: &str = "$root";
+
+/// The definitions reachable from some roots in a generated schema, and the keywords of the
+/// schema's own root.
+///
+/// A validator applies the keywords of a schema's root (`type`, `$schema`, `not`, a `$ref`) to every
+/// document, so a surface that is cut from a schema holds them beside the definitions, and
+/// [`differences`] compares them: a change of the root's `type` alone is a difference. Two things
+/// of the root are left out: its annotations, as everywhere, and its `properties`, which name the
+/// bundle's definitions that the cut reads by name. A surface that is read from a recorded document
+/// holds no root keywords (the document records none), and compares none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
     roots: Vec<String>,
     definitions: BTreeMap<String, Value>,
+    /// The root's keywords that decide something, as an object; `None` for a recorded document.
+    root: Option<Value>,
 }
 
 impl Surface {
@@ -67,6 +81,10 @@ impl Surface {
             }
             todo.push((*root).to_owned());
         }
+        let own = own_keywords(schema);
+        for reference in references(&own) {
+            todo.push(reference_name(&reference)?);
+        }
         while let Some(name) = todo.pop() {
             if definitions.contains_key(&name) {
                 continue;
@@ -82,7 +100,11 @@ impl Surface {
         let mut roots: Vec<String> = roots.iter().map(|root| (*root).to_owned()).collect();
         roots.sort();
         roots.dedup();
-        Ok(Self { roots, definitions })
+        Ok(Self {
+            roots,
+            definitions,
+            root: Some(own),
+        })
     }
 
     /// Reads a surface document, as [`Surface::render`] writes it.
@@ -106,7 +128,8 @@ impl Surface {
             })
             .collect::<Result<_, _>>()?;
         let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
-        let surface = Self::cut(&document, &roots)?;
+        let mut surface = Self::cut(&document, &roots)?;
+        surface.root = None;
         let declared = document
             .get("$defs")
             .and_then(Value::as_object)
@@ -234,6 +257,18 @@ fn strip(node: &Value, names: bool) -> Value {
     }
 }
 
+/// The keywords of a schema's own root that decide something: all of them but `$defs`, `properties`
+/// and the annotations.
+fn own_keywords(schema: &Value) -> Value {
+    let mut own = serde_json::Map::new();
+    for (keyword, member) in schema.as_object().into_iter().flatten() {
+        if !matches!(keyword.as_str(), "$defs" | "properties") {
+            own.insert(keyword.clone(), member.clone());
+        }
+    }
+    without_annotations(&Value::Object(own))
+}
+
 fn references(node: &Value) -> Vec<String> {
     let mut found = Vec::new();
     collect_references(node, &mut found);
@@ -274,7 +309,8 @@ fn reference_name(reference: &str) -> Result<String, SurfaceError> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Difference {
     /// Where, by the old surface's names: `Definition`, `Definition.member`, `Definition#variant`,
-    /// and these nested (`Definition#variant.member[]`).
+    /// and these nested (`Definition#variant.member[]`); `$root` for a keyword of the schema's own
+    /// root, and the same nested for a keyword of the root that has parts.
     pub at: String,
     /// What kind of difference.
     pub kind: DifferenceKind,
@@ -319,7 +355,8 @@ impl fmt::Display for Difference {
 ///
 /// Both are walked from the roots they share through the references between definitions, so the
 /// name a definition has on either side does not matter; only where it is used. Every keyword of
-/// a schema is compared but its description and its title.
+/// a schema is compared but its description and its title. So are the keywords of the schema's own
+/// root, where both surfaces hold them.
 #[must_use]
 pub fn differences(old: &Surface, new: &Surface) -> Vec<Difference> {
     let mut comparer = Comparer {
@@ -347,6 +384,9 @@ pub fn differences(old: &Surface, new: &Surface) -> Vec<Difference> {
             }
             (false, false) => {}
         }
+    }
+    if let (Some(old_root), Some(new_root)) = (&old.root, &new.root) {
+        comparer.node(old_root, new_root, ROOT_PLACE);
     }
     comparer.found.sort();
     comparer.found.dedup();

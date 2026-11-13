@@ -23,7 +23,7 @@ use kr_protocol::retained::{
 };
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::update::CompatibilityLevel;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const SURFACE_073: &str = include_str!("retained/0.73/surface.schema.json");
 const SURFACE_075: &str = include_str!("retained/0.75/surface.schema.json");
@@ -796,5 +796,108 @@ fn the_recordings_beside_the_tests_are_of_the_release_before() {
             .find_map(|line| line.strip_prefix("release=")),
         before.record("release"),
         "the recorded registration names the release level {level} was cut from"
+    );
+}
+
+/// A surface cut from a schema holds the keywords of the schema's own root, beside its
+/// definitions, and a difference in one is a difference of the surface: a validator applies them to
+/// every document, so a root whose `type` changes accepts what it refused. Its annotations and
+/// its `properties` (which name the bundle's definitions, that the cut reads by name) decide
+/// nothing, and a root's reference is followed like any other. A surface read from a recorded
+/// document holds none, and compares none.
+#[test]
+fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
+    let dialect = "https://json-schema.org/draft/2020-12/schema";
+    let root = || {
+        json!({
+            "$schema": dialect,
+            "type": "object",
+            "title": "Bundle",
+            "description": "What the bundle holds",
+            "properties": { "a": { "$ref": "#/$defs/A" } },
+        })
+    };
+    let cut = |root: &Value, defined: Value| {
+        let mut schema = root.clone();
+        schema["$defs"] = defined;
+        Surface::cut(&schema, &["A"]).expect("a surface")
+    };
+    let definitions = || json!({ "A": { "type": "string" }, "B": { "type": "string" } });
+    let found = |old: &Surface, new: &Surface| {
+        differences(old, new)
+            .iter()
+            .map(|found| (found.at.clone(), found.kind, found.detail.clone()))
+            .collect::<Vec<_>>()
+    };
+    let base = cut(&root(), definitions());
+    assert_eq!(found(&base, &cut(&root(), definitions())), vec![]);
+    let changed = |keyword: &str, value: Value| {
+        let mut other = root();
+        other[keyword] = value;
+        other
+    };
+    for (new_root, keyword) in [
+        // A root that is a string accepts only texts; one that is an object, only objects.
+        (changed("type", json!("string")), "type"),
+        // The dialect decides what the keywords of the schema mean.
+        (
+            changed("$schema", json!("http://json-schema.org/draft-07/schema#")),
+            "$schema",
+        ),
+        // A keyword that the earlier root did not have.
+        (changed("not", json!({ "type": "null" })), "not"),
+    ] {
+        assert_eq!(
+            found(&base, &cut(&new_root, definitions())),
+            vec![(
+                "$root".to_owned(),
+                DifferenceKind::Changed,
+                keyword.to_owned()
+            )],
+            "{keyword}"
+        );
+    }
+    let mut without = root();
+    without
+        .as_object_mut()
+        .expect("an object")
+        .remove("$schema");
+    assert_eq!(
+        found(&base, &cut(&without, definitions())),
+        vec![(
+            "$root".to_owned(),
+            DifferenceKind::Changed,
+            "$schema".to_owned()
+        )],
+        "a root that names no dialect"
+    );
+    // Annotations and the bundle's own `properties` decide nothing.
+    let mut quiet = root();
+    quiet["title"] = json!("Another title");
+    quiet["description"] = json!("Another description");
+    quiet["properties"] = json!({ "b": { "$ref": "#/$defs/B" } });
+    assert_eq!(found(&base, &cut(&quiet, definitions())), vec![]);
+    // A reference of the root reaches a definition that no root of the cut names, so a change
+    // there is a difference of the surface too.
+    let mut composed = root();
+    composed["additionalProperties"] = json!({ "$ref": "#/$defs/B" });
+    let mut other_definitions = definitions();
+    other_definitions["B"] = json!({ "type": "number" });
+    assert_eq!(
+        found(
+            &cut(&composed, definitions()),
+            &cut(&composed, other_definitions)
+        ),
+        vec![("B".to_owned(), DifferenceKind::Changed, "type".to_owned())],
+        "a definition that only the root refers to"
+    );
+    // A recorded document holds no root keywords, so the surface read from one compares none.
+    let recorded = Surface::parse(&base.render()).expect("the recorded surface");
+    assert_eq!(
+        found(
+            &recorded,
+            &cut(&changed("type", json!("string")), definitions())
+        ),
+        vec![]
     );
 }
