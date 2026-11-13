@@ -519,6 +519,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
         None => steps,
     };
     let mut executed = Vec::new();
+    let mut rerun_budget = fault::RERUN_BUDGET;
     for (index, step) in steps.iter().enumerate() {
         progress(&format!(
             "step {} of {}: {} ({})",
@@ -537,6 +538,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                 lister: &options.lister,
             },
             &map.packages,
+            &mut rerun_budget,
             &mut *progress,
         );
         progress(&format!(

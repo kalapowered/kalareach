@@ -110,18 +110,29 @@ cut short with no error from the linker, and Cargo then takes it for built. Star
 exit status 126 and the shell's words `cannot execute binary file`, and so does every later step
 that needs it.
 
-A step that ends so, naming a file under the target directory that the step itself wrote, is run
+A step that ends so, naming a program of Cargo's making under the target directory that the step
+itself wrote (in a profile directory, its `deps` or a unit's directory under its `build`), is run
 once more, after the file, its build directory and Cargo's record of building it are removed, along
-with every other program the step wrote that is empty or cut short. The result's step then holds a
-`rerun` object with the first run's log and exit status, the files, the cause and the file under
-`conformance/faults/` that keeps each file's size, first bytes, Mach-O header and the system's
-check of its signature, and the kernel's lines about failed writes to storage for the minutes
-before. `summary.rerun_steps` lists the steps, and the run's last line says how many were run again.
+with every other program the step wrote in those places that is empty or cut short. A removal
+never follows a link out of the target directory. A step in which a test failed is not run again,
+and neither is one whose first run took longer than the time left of the thirty minutes that the
+report spends in all on second runs, which the report's own limit could not hold: the step keeps
+its failure, with that reason added.
 
-The `cause` is `runner_disk` where the evidence shows it: a file is empty, cut short or its
-signature does not check, or the kernel logged a storage error. It is `unexplained` where the file
-is whole and validly signed and the kernel logged no storage error, and then the step has an error
-and the run fails, because the cause may be this repository's.
+The result's step holds a `rerun` object with the first run's log and exit status, the files, the
+cause, and the file under `conformance/faults/` that keeps each file's size, first bytes, Mach-O
+header and the system's check of its signature, and the count of the kernel's lines about failed
+writes to storage; the lines themselves are in the file beside it that ends in `.kernel.txt`. The
+kernel's log is read from a few minutes before the earliest of the files was written. If the first
+run's evidence could not be kept, the step has an error and the run fails. `summary.rerun_steps`
+lists the steps, and the run's last line says how many were run again.
+
+The `cause` is `runner_disk` where the evidence shows it: a file is empty, its first bytes are
+zeros, it is cut short, or a Mach-O program's signature does not check, or the kernel logged a
+storage error. It is `unexplained` where nothing shows damage in the file, which may be a script
+or a program of another system that the check of signatures does not read, and the kernel logged
+no storage error, and then the step has an error and the run fails, because the cause may be this
+repository's.
 
 A run in which every step run again passed the second time and has the runner's disk as its cause
 exits 0, and says so where a reader of the workflow's runs sees it: under GitHub Actions the
