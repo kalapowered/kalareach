@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use kr_boundary_windows::manifest::{Manifest, ObjectKind};
+use kr_boundary_windows::remedy;
 use kr_boundary_windows::win::install::{self, DataChild, Entry, Options, Paths};
 use kr_boundary_windows::win::{acl, sd};
 
@@ -48,12 +49,12 @@ impl Cleanup {
         });
     }
 
-    /// A right that the case gives the users group on a folder that it made, taken away again.
     /// Drops the function that the case sets for the removal's seam if the removal did not run it.
     fn hook(&mut self) {
         self.undo(install::testing::no_hook_after_the_removal_inspects_the_data_directory);
     }
 
+    /// A right that the case gives the users group on a folder that it made, taken away again.
     fn grant(&mut self, folder: &Path, right: &str) {
         icacls(folder, &["/grant", &format!("{USERS}:{right}")]);
         let folder = folder.to_owned();
@@ -302,9 +303,11 @@ fn a_folder_above_the_program_top_that_an_ordinary_account_may_delete_in_is_refu
     names_the_folder_and_the_right(&text, &above, "program directory");
 }
 
-/// A link at the top of the program tree (a moved `Program Files`) is the administrator's own: the
-/// walk from the top down refuses it with the words of any link above the trees, reads the real
-/// sentence, and never tells to remove the link.
+/// A link at the known folder itself (a moved `Program Files`) is another program's: the walk from
+/// the top down refuses it with the words of any link above the trees, which say what a supported
+/// layout is and never that the setup program makes the folder or that the link is to be removed. A
+/// link strictly below the known folder is the product's own: its words say that the setup program
+/// makes that folder itself. Both links are made and each text is required.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
@@ -315,14 +318,16 @@ fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
     let target = inherited_folder(&mut clean);
     parent_of(&target);
     let container = inherited_folder(&mut clean);
+    let data_parent = inherited_folder(&mut clean);
+    parent_of(&data_parent);
+
+    // The link is at the known folder itself.
     let link = container.join("Program Files");
     junction(&link, &target);
     clean.junction(&link);
-    let data_parent = inherited_folder(&mut clean);
-    parent_of(&data_parent);
     let paths = paths_with(&data_parent, &link.join("Boundary"), &link);
     let text = install::remove(&paths, true)
-        .expect_err("a link at the top of the program tree")
+        .expect_err("a link at the known folder")
         .to_string();
     assert!(
         text.contains(&format!(
@@ -338,16 +343,55 @@ fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
     );
     assert!(text.contains("Nothing was changed"), "{text}");
     assert!(
+        text.contains(&remedy::supported_layout(remedy::Tree::Program)),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "The setup program directs no change to a folder that other programs share."
+        ),
+        "{text}"
+    );
+    assert!(
         !text.to_lowercase().contains("remove the link"),
         "an administrator is never told to remove it: {text}"
     );
-    // The folder is the boundary's own, so nothing sends the administrator to another computer's
-    // known folders.
+    // The known folder is not the setup program's to make.
+    assert!(!text.contains("makes this folder itself"), "{text}");
+
+    // The link is strictly below the known folder, in the folder that the installation makes.
+    let top = container.join("Top");
+    owned_dir(&top);
+    parent_of(&top);
+    let own = top.join("KalaReach");
+    junction(&own, &target);
+    clean.junction(&own);
+    let paths = paths_with(&data_parent, &own.join("Boundary"), &top);
+    let text = install::remove(&paths, true)
+        .expect_err("a link below the known folder")
+        .to_string();
+    assert!(
+        text.contains(&format!(
+            "{} is a folder above the boundary's program directory",
+            own.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("it is a link or a mounted folder"), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
     assert!(
         text.contains("The setup program makes this folder itself"),
         "{text}"
     );
+    assert!(
+        text.contains("Do not remove the program directory"),
+        "{text}"
+    );
     assert!(!text.contains("plain folders"), "{text}");
+    assert!(
+        !text.to_lowercase().contains("remove the link"),
+        "an administrator is never told to remove it: {text}"
+    );
 }
 
 /// A fresh installation reads the folders above the program tree before it makes, writes or stops
@@ -451,8 +495,8 @@ fn a_link_above_the_data_parent_is_refused() {
 }
 
 /// A substituted drive letter is no volume's root: the folders above its target are not read, so a
-/// tree reached through it is refused before anything is changed, with the letter named and the
-/// real path to install on.
+/// tree reached through it is refused before anything is changed, with the letter and the real path
+/// named and what a supported layout is. The words tell no one to end the substitution.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
@@ -492,19 +536,23 @@ fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
         "the real path is named: {text}"
     );
     assert!(
-        text.contains("end the substitution or redirection of that letter"),
+        text.contains(&remedy::supported_layout(remedy::Tree::Data)),
         "{text}"
     );
+    assert!(!text.contains("substitution"), "{text}");
+    assert!(!text.contains("redirection"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
 }
 
-/// A root that is not there is a volume that does not answer, and it is refused before anything is
-/// changed, in both walks: a folder that is not there ends a walk, but the root is the first folder
-/// of it, and a tree on a drive that is gone must not let the installation make records on another
-/// volume first.
+/// A root that is not there is a volume that is gone. An installation, a repair and the data walk
+/// refuse it before anything is changed, in words that say that the root is not there and never that
+/// the installation asked the volume what it is: a folder that is not there ends a walk, but the root
+/// is the first folder of it, and a tree on a drive that is gone must not let the installation make
+/// records on another volume first. A removal goes on past the program tree's root: it does not
+/// refuse, and it names the program directory that it could not reach.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
-fn a_root_that_is_not_there_is_refused_for_its_volume_before_anything_is_changed() {
+fn a_root_that_is_not_there_is_refused_before_a_change_and_a_removal_goes_on() {
     if needs_the_system() {
         return;
     }
@@ -523,12 +571,14 @@ fn a_root_that_is_not_there_is_refused_for_its_volume_before_anything_is_changed
         .to_string();
     for needle in [
         format!("{letter}\\ is a folder above the boundary's data directory"),
-        "its volume did not answer".to_owned(),
+        "the root of its volume is not there".to_owned(),
         "Nothing was changed".to_owned(),
     ] {
         assert!(text.contains(&needle), "{needle}: {text}");
     }
-    assert!(!text.contains("holds it open"), "{text}");
+    for word in ["holds it open", "did not answer", "asks a volume", "asked"] {
+        assert!(!text.contains(word), "{word}: {text}");
+    }
     // The program walk: the data parent is a folder of the guest's own volume, the program
     // directory's top is on the drive that is not there, and nothing is made on the way.
     let (local, mut paths) = data_parent_with_paths(&mut clean);
@@ -539,24 +589,45 @@ fn a_root_that_is_not_there_is_refused_for_its_volume_before_anything_is_changed
         .err()
         .expect("a program directory on a drive that is not there")
         .to_string();
-    let removal = install::remove(&paths, true)
-        .expect_err("a program directory on a drive that is not there")
-        .to_string();
-    for text in [entry, removal] {
-        assert!(
-            text.contains(&format!(
-                "{letter}\\ is a folder above the boundary's program directory"
-            )),
-            "{text}"
-        );
-        assert!(text.contains("its volume did not answer"), "{text}");
-        assert!(!text.contains("holds it open"), "{text}");
-    }
+    assert!(
+        entry.contains(&format!(
+            "{letter}\\ is a folder above the boundary's program directory"
+        )),
+        "{entry}"
+    );
+    assert!(
+        entry.contains("the root of its volume is not there"),
+        "{entry}"
+    );
+    assert!(entry.contains("Nothing was changed"), "{entry}");
+    assert!(!entry.contains("holds it open"), "{entry}");
     assert!(
         !paths.data.exists(),
         "no data directory was made under {}",
         local.display()
     );
+    // An installed data directory: a repair refuses in the same words, before any change, and the
+    // removal does not refuse. It goes on, and its last words name the program directory that it
+    // could not reach, whether it finishes or stops at a step of its own.
+    installed_data_directory(&paths);
+    let repair = install::entry(&paths);
+    let repair = repair.err().expect("a repair refuses").to_string();
+    assert!(
+        repair.contains("the root of its volume is not there"),
+        "{repair}"
+    );
+    let unreached = remedy::program_unreached(&paths.program.display().to_string());
+    match install::remove(&paths, false) {
+        Ok(()) => assert!(!paths.data.exists(), "the removal finished its data"),
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                !text.contains("is a folder above the boundary's"),
+                "the removal went on: {text}"
+            );
+            assert!(text.contains(&unreached), "{text}");
+        }
+    }
 }
 
 /// A link that points nowhere at the program directory's name is a link, and gets the link's own
