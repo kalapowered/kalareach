@@ -256,7 +256,8 @@ export const SLOP = 10
  * the press-to-click distance of every tap, on a click that names plain text apart from one that names a
  * link's own element or another control, since only the first is decided here (a click that names an
  * element stands, and the browser's adjustment chose it). The browser cases assert both distances against
- * `CLICK_AWAY`; the iOS session and the Android probe only log them.
+ * `CLICK_AWAY`, the Android probe checks the distance of every tap against it and logs it, and the iOS
+ * session only logs them.
  */
 export const TOUCH_ADJUSTMENT = 16 * Math.SQRT2
 
