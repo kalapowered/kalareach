@@ -7,7 +7,14 @@
 # of the first two, so a failed read becomes a statement about the machine or a decision. Read with
 # `records::look`, or with a call that returns the error, and carry the error to the text. A place
 # where nothing rests on the fold (a clean-up whose text claims nothing, a display that names the
-# identifier instead) carries `#[expect(clippy::disallowed_methods, reason = "...")]` with the reason.
+# identifier instead) carries `#[expect(clippy::disallowed_methods, reason = "...")]` with the reason,
+# on the statement that makes the fold and never on a whole function, so that a later fold in the
+# same function is a place of its own that needs its own reason.
+#
+# Iterating over a result is covered in three ways. `Result::iter` and `Result::iter_mut` are
+# listed, and so are the iterator methods that skip what fails (`flatten`, `flat_map`, `filter_map`).
+# A `for` loop over a `Result` is refused by the compiler's own lint, which `-D warnings` makes an
+# error, and `Result::into_iter` has no path that this list can name.
 
 disallowed-methods = [
     { path = "std::path::Path::exists", reason = "it answers false when the look failed; look with records::look, or with std::fs::metadata and keep the error" },
@@ -18,6 +25,13 @@ disallowed-methods = [
     { path = "std::result::Result::unwrap_or", reason = "it turns a failed read into a value; match on the Result and carry the error" },
     { path = "std::result::Result::unwrap_or_default", reason = "it turns a failed read into a value; match on the Result and carry the error" },
     { path = "std::result::Result::unwrap_or_else", reason = "it turns a failed read into a value; match on the Result and carry the error" },
+    { path = "std::result::Result::or", reason = "it replaces a failed read with another result; match on the Result and carry the error" },
+    { path = "std::result::Result::or_else", reason = "it replaces a failed read with another result; match on the Result and carry the error" },
+    { path = "std::result::Result::iter", reason = "it iterates over nothing for a failed read, so the error disappears; match on the Result and carry the error" },
+    { path = "std::result::Result::iter_mut", reason = "it iterates over nothing for a failed read, so the error disappears; match on the Result and carry the error" },
+    { path = "std::iter::Iterator::flatten", reason = "over results it skips the failed ones; match on each result and carry the error" },
+    { path = "std::iter::Iterator::flat_map", reason = "over results it skips the failed ones; match on each result and carry the error" },
+    { path = "std::iter::Iterator::filter_map", reason = "over results it skips the failed ones; match on each result and carry the error" },
     { path = "std::result::Result::is_ok", reason = "it turns a failed read into false; match on the Result and carry the error" },
     { path = "std::result::Result::is_err", reason = "it turns a failed read into a statement; match on the Result and carry the error" },
     { path = "std::result::Result::is_ok_and", reason = "it turns a failed read into false; match on the Result and carry the error" },

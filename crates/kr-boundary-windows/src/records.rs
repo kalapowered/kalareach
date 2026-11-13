@@ -83,6 +83,10 @@ impl Approved {
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn all_that_are_there(data: &Path) -> Approved {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a helper of the tests alone: a listing that fails approves no replacement, and what is not approved stays and is named by the removal"
+        )]
         let replacements = fs::read_dir(data)
             .into_iter()
             .flatten()
@@ -363,6 +367,10 @@ pub fn finish_journal_and_run(journal: &Path, run: &Path, seen: Seen) -> Vec<Str
     if seen.journal
         && let Ok(entries) = fs::read_dir(journal)
     {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an entry that cannot be read is not deleted here: the removal of the directory below fails for it and the result names what stayed"
+        )]
         for entry in entries.flatten() {
             if entry.path().extension().and_then(|text| text.to_str()) == Some("journal") {
                 let _ = fs::remove_file(entry.path());

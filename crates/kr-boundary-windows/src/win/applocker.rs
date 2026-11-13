@@ -308,10 +308,6 @@ impl Channel {
     ///
     /// Returns an error when the file cannot be written, PowerShell refuses the policy or the log,
     /// or its answer does not name a record.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a record number that is not a number ends in Error::Unreadable at once; no default stands in for it"
-    )]
     pub fn set(&self, xml: &str) -> Result<u64, Error> {
         // PowerShell reads the policy by its path, so the file is one that did not exist: a random
         // name, made in the directory the installation checked, owned by the administrators in the
@@ -347,10 +343,15 @@ impl Channel {
         // The file served its read: it is removed whatever PowerShell said.
         let _ = std::fs::remove_file(&file);
         let text = text?;
-        text.lines()
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a record number that is not a number ends in Error::Unreadable at once; no default stands in for it"
+        )]
+        let record = text
+            .lines()
             .find_map(|line| line.trim().strip_prefix(RECORD_BEFORE_WRITE))
-            .and_then(|number| number.trim().parse().ok())
-            .ok_or_else(|| {
+            .and_then(|number| number.trim().parse().ok());
+        record.ok_or_else(|| {
                 Error::Unreadable(format!(
                     "PowerShell did not say which record the log ended at before the policy was written: {}",
                     text.trim()

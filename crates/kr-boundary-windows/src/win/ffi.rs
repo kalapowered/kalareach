@@ -252,13 +252,14 @@ pub fn last(what: impl Into<String>) -> Error {
     error(unsafe { GetLastError() }, what)
 }
 
-/// A lock taken even when a thread that held it panicked. What these locks guard is a hook or a list
-/// that this crate keeps for itself, and nothing in it is read from the machine, so a poisoned lock
-/// holds data as good as any.
+/// A lock taken even when a thread that held it panicked. What these locks guard is a hook, a list of
+/// lines, a set of handles or a list of names that threads of this crate put there; each holder only
+/// adds to it, takes it or clears it. Taking a poisoned lock is not a read of the machine, and it
+/// folds no failed read into an answer: what a thread put there stays as that thread left it.
 pub fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     #[expect(
         clippy::disallowed_methods,
-        reason = "a lock that a panicking thread poisoned still holds its data, and nothing in it was read from the machine"
+        reason = "taking a poisoned lock is not a read of the machine: what it guards was put there by threads of this crate, whatever they read, and the lock folds no failed read into an answer"
     )]
     let guard = mutex
         .lock()

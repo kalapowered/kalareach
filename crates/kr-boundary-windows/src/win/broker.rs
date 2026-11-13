@@ -295,10 +295,6 @@ fn serve() -> Result<(), String> {
 /// Runs the loops of the two pipes, each on a thread of its own, under the one stop: a loop that ends
 /// for any reason sets the stop, so the other ends with it, and the service reports that it stopped
 /// only after both have.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a loop that panicked is told as its failure"
-)]
 fn run_both(
     persons: &mut Listener,
     administrators: &mut Listener,
@@ -307,6 +303,10 @@ fn run_both(
     std::thread::scope(|scope| {
         let persons = scope.spawn(|| run(persons, state));
         let administrators = run(administrators, state);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a loop that panicked is told as its failure"
+        )]
         let persons = persons
             .join()
             .unwrap_or_else(|_| Err("the persons' pipe's loop failed".to_owned()));
@@ -431,10 +431,6 @@ fn send(connection: &mut Connection, response: &Response) -> Result<(), FrameErr
 
 /// Serves one connection until it ends. Every read and every write has a deadline, so a client
 /// that sends nothing or reads nothing gives its slot back.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a send that failed ends this connection, which is all there is to do; no text is said of it"
-)]
 fn answer(mut connection: Connection, state: &State, kind: Kind) {
     // The platform lets a server take on a client's identity only after it has read from the pipe,
     // so the first message is read before the caller is identified. Nothing is done with it until
@@ -457,6 +453,10 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
     };
     match first {
         Ok(Request::Hello { version }) if version == frame::VERSION => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a send that failed ends this connection, which is all there is to do; no text is said of it"
+            )]
             if send(
                 &mut connection,
                 &Response::Hello {
@@ -563,6 +563,10 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
                 }
             }
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a send that failed ends this connection, which is all there is to do; no text is said of it"
+        )]
         if send(&mut connection, &response).is_err() {
             return;
         }

@@ -425,18 +425,18 @@ impl Tracker {
 
     /// The granted or made object that a leftover's `object` names, by its key as text or by the
     /// path of its grant.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-    )]
     fn owner_of(&self, object: &str) -> Option<FileKey> {
         // The key's text is taken only in the form the key prints, which is the form the room for
         // the leftover was kept for.
-        object
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a text in hand is parsed as a key: one that is not valid is no key, and the owner is then looked up by its path; nothing was read from the machine"
+        )]
+        let by_key = object
             .parse::<FileKey>()
             .ok()
-            .filter(|key| self.keys.contains_key(key) && key.to_string() == object)
-            .or_else(|| self.by_path.get(&name_of(object)).copied())
+            .filter(|key| self.keys.contains_key(key) && key.to_string() == object);
+        by_key.or_else(|| self.by_path.get(&name_of(object)).copied())
     }
 
     /// Puts an object's account in place and keeps the total of what is kept right.

@@ -223,12 +223,13 @@ pub fn short(text: &str) -> String {
 
 /// The bytes of `text` once written as a JSON string, without the quotes.
 #[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a text that cannot be written as JSON counts as too large and is refused; nothing was read from the machine"
-)]
 pub fn json_bytes(text: &str) -> usize {
-    serde_json::to_string(text).map_or(usize::MAX, |encoded| encoded.len() - 2)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a text that cannot be written as JSON counts as too large and is refused; nothing was read from the machine"
+    )]
+    let bytes = serde_json::to_string(text).map_or(usize::MAX, |encoded| encoded.len() - 2);
+    bytes
 }
 
 /// Whether a path fits a row, and the words for the person when it does not.

@@ -461,13 +461,13 @@ enum Value {
 
 impl Value {
     /// Whether `value` is one of the type's, or the rule to refuse it by.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
-    )]
     fn admit(self, value: Option<&[u8]>, rule: &'static str) -> Result<(), &'static str> {
         let text = value.map(std::str::from_utf8);
         let line = |text: &str| !text.chars().any(char::is_control);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+        )]
         let ok = match (self, text) {
             (Self::Words(words), Some(Ok(text))) => {
                 words.iter().any(|word| text.eq_ignore_ascii_case(word))

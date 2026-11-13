@@ -3074,6 +3074,10 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // What an earlier run left in staging was checked as the layout names it; it is removed.
     let sweep = |staging: &Path| {
         if let Ok(entries) = fs::read_dir(staging) {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a clean-up of what an earlier run left: an entry that cannot be read stays, nothing here says that staging is empty, and this run stages its files under fresh names"
+            )]
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 match layout_kind(Layout::Staging, &name) {
