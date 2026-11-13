@@ -268,6 +268,18 @@ impl Policy {
         self.collections.get(EXE).map(|collection| collection.mode)
     }
 
+    /// Whether the executable collection holds a rule that is this installation's own.
+    #[must_use]
+    pub fn holds_our_rules(&self) -> bool {
+        let ours = [RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT];
+        self.collections.get(EXE).is_some_and(|collection| {
+            collection
+                .rules
+                .keys()
+                .any(|id| ours.contains(&id.as_str()))
+        })
+    }
+
     /// The rules of the executable collection that are not this installation's own.
     #[must_use]
     pub fn foreign_exe_rules(&self) -> Vec<&Rule> {

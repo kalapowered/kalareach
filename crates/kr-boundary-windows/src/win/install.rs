@@ -365,12 +365,29 @@ fn say(line: &str) {
 ///
 /// Returns [`Error::Refused`] naming the foreign object, or the failure of the call that looked.
 pub fn entry(paths: &Paths) -> Result<Entry, Error> {
+    entered(paths, Purpose::Install)
+}
+
+/// What the setup program does when it reads the data directory: an installation, a repair or a
+/// removal. A refusal of the data directory tells the administrator to move it aside only at an
+/// installation, and only after reads that succeeded found nothing of the installation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    Install,
+    Repair,
+    Remove,
+}
+
+/// [`entry`] for a run with this purpose.
+fn entered(paths: &Paths, purpose: Purpose) -> Result<Entry, Error> {
     check_shape(paths, remedy::Stage::Before)?;
     // What the data directory holds is read on handles before any of it is used: the manifest
     // decides what a repair or a removal touches, so it is read only after the directory it is in
     // and everything beside it passed their checks.
     let inspected = match check_data_parent(paths)? {
-        Some(parent) => inspect_existing_data(paths, &parent)?.map(|(_, inspected)| inspected),
+        Some(parent) => {
+            inspect_existing_data(paths, &parent, purpose)?.map(|(_, inspected)| inspected)
+        }
         None => None,
     };
     // A data directory that passed its inspection is the installation's own: with no manifest it is
@@ -754,13 +771,51 @@ fn data_descriptor() -> Result<sd::OwnedSd, Error> {
 /// The refusal of a data directory that is there and is not the installation's own. The ending
 /// comes from what the directory's own handle showed, and one refusal gives one ending: a step only
 /// where a read that succeeded shows what it is, and no step where a read failed.
-fn data_refusal(paths: &Paths, why: &str, origin: &Origin) -> Error {
-    let ending = remedy::data_ending(origin, why == remedy::CASE_SENSITIVE_WHY);
+fn data_refusal(paths: &Paths, why: &str, origin: &Origin, purpose: Purpose) -> Error {
+    let standing = standing_of(paths, purpose, origin);
+    let ending = remedy::data_ending(origin, why == remedy::CASE_SENSITIVE_WHY, standing);
     // text: data_refusal-1
     Error::Refused(format!(
         "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. {ending}",
         paths.data.display()
     ))
+}
+
+/// What the reads of this run show of the rest of the installation, for the refusal of a data
+/// directory that the installation did not set. Only the words that move the directory aside rest
+/// on it: they stand at an installation, where the handle showed a link, another kind of object or
+/// an owner outside the system's class, and where the service, both accounts and the policy were
+/// read and showed nothing of the installation. A removal and a repair never ask, and a read that
+/// fails or finds something leaves the answer at "may be installed".
+fn standing_of(paths: &Paths, purpose: Purpose, origin: &Origin) -> remedy::Standing {
+    if purpose == Purpose::Install
+        && matches!(origin, Origin::Foreign | Origin::Owned(_))
+        && nothing_of_the_installation_found(paths)
+    {
+        remedy::Standing::NothingFound
+    } else {
+        remedy::Standing::MayBeInstalled
+    }
+}
+
+/// Whether the service, both accounts and the policy were each read, and none shows a part of the
+/// installation. A read that fails is not "nothing found".
+fn nothing_of_the_installation_found(paths: &Paths) -> bool {
+    let service = service::manager().and_then(|manager| manager.open(SERVICE));
+    if !matches!(service, Ok(None)) {
+        return false;
+    }
+    for name in [CHECKOUT, CONNECT] {
+        if !matches!(account::find(name), Ok(None)) {
+            return false;
+        }
+    }
+    // The folder above the data directory was checked and held by the caller, and is where the
+    // channel makes its own temporary directory.
+    match Channel::new(paths.data_parent()).effective() {
+        Ok((_, policy)) => !policy.holds_our_rules(),
+        Err(_) => false,
+    }
 }
 
 /// The refusal of a data directory when a call on it failed, the open of it or a read of its open
@@ -890,7 +945,7 @@ fn kind_of(paths: &Paths, dir: &Path, name: &OsStr, named_root: bool) -> EntryKi
 fn origin_of(handle: &ffi::Handle) -> Origin {
     match sd::summary_of_handle(handle) {
         Ok(summary) if [SYSTEM, ADMINISTRATORS].contains(&summary.owner.as_str()) => Origin::System,
-        Ok(_) => Origin::Foreign,
+        Ok(summary) => Origin::Owned(summary.owner),
         Err(error) => Origin::Unknown(error.to_string()),
     }
 }
@@ -2443,6 +2498,7 @@ fn inspect_within(
 fn inspect_existing_data(
     paths: &Paths,
     parent: &ffi::Handle,
+    purpose: Purpose,
 ) -> Result<Option<(DirHandle, Inspected)>, Error> {
     let name = paths
         .data
@@ -2457,7 +2513,7 @@ fn inspect_existing_data(
     };
     match data_directory_reason(paths, &handle) {
         Ok(None) => {}
-        Ok(Some((why, origin))) => return Err(data_refusal(paths, &why, &origin)),
+        Ok(Some((why, origin))) => return Err(data_refusal(paths, &why, &origin, purpose)),
         Err(error) => return Err(data_unread(paths, "a read of it", error)),
     }
     let data = held_directory(handle)?;
@@ -2481,6 +2537,11 @@ fn inspect_existing_data(
 /// Returns [`Error::Refused`] naming the reason when the folder, the directory or anything in it is
 /// not the installation's own, and the platform's error when a call fails.
 pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
+    make_data_directory_for(paths, Purpose::Install)
+}
+
+/// [`make_data_directory`] for a run with this purpose.
+fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds, Error> {
     let (held, parent_made) = match check_data_parent(paths)? {
         Some(held) => (held, false),
         None => {
@@ -2549,7 +2610,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
     } else {
         match verdict {
             Ok(None) => {}
-            Ok(Some((why, origin))) => return Err(data_refusal(paths, &why, &origin)),
+            Ok(Some((why, origin))) => return Err(data_refusal(paths, &why, &origin, purpose)),
             Err(error) => return Err(data_unread(paths, "a read of it", error)),
         }
     }
@@ -2980,7 +3041,14 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
         ));
     }
     let person = person_of(options)?;
-    let state = entry(paths)?;
+    let state = entered(
+        paths,
+        if repair {
+            Purpose::Repair
+        } else {
+            Purpose::Install
+        },
+    )?;
     let (manifest, existing) = match (state, repair) {
         (Entry::Fresh, false) => (Manifest::begin(), false),
         (Entry::Fresh, true) => {
@@ -3043,7 +3111,14 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // The folder, the directory and the directories in it are held, and each list goes on its own
     // handle, until everything beneath them is made and protected. A directory that is there was
     // checked on its handle, with every entry of the data directory, before this.
-    let mut holds = make_data_directory(&paths)?;
+    let mut holds = make_data_directory_for(
+        &paths,
+        if existing {
+            Purpose::Repair
+        } else {
+            Purpose::Install
+        },
+    )?;
     holds.protect()?;
     run.record(
         ObjectKind::Directory,
@@ -3682,7 +3757,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     let mut seen = records::Seen::default();
     let mut approved = records::Approved::default();
     let found = match check_data_parent_at(paths, stage)? {
-        Some(parent) => match inspect_existing_data(paths, &parent)? {
+        Some(parent) => match inspect_existing_data(paths, &parent, Purpose::Remove)? {
             Some((_, inspected)) => {
                 seen.journal = inspected.journal.is_some();
                 seen.run = inspected.run.is_some();

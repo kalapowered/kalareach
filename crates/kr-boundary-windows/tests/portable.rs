@@ -90,6 +90,22 @@ fn a_change_to_an_installed_policy_is_named() {
             },
         );
     assert_eq!(foreign.foreign_exe_rules().len(), 1);
+    // The installation's rules are found in a policy that holds them, with or without another
+    // rule beside them, and not in one that holds only another rule.
+    assert!(installed().holds_our_rules());
+    assert!(foreign.holds_our_rules());
+    let (alone, _) = installed().without_ours();
+    assert!(!alone.holds_our_rules());
+    let (shared, kept) = foreign.without_ours();
+    assert!(kept && shared.holds_our_rules(), "the allow-all rule stays");
+    let mut only_theirs = foreign.clone();
+    let exe = only_theirs.collections.get_mut(policy::EXE).unwrap();
+    for id in [RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT] {
+        exe.rules.remove(id);
+    }
+    assert_eq!(only_theirs.foreign_exe_rules().len(), 1);
+    assert!(!only_theirs.holds_our_rules());
+    assert!(!Policy::default().holds_our_rules());
     let extra = foreign.differences(&installed());
     assert_eq!(extra.len(), 1, "{extra:?}");
     // A rule that the expected policy lacks is named by its identifier. Nothing in the comparison
