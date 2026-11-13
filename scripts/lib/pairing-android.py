@@ -39,6 +39,35 @@ APP = "to.kala.reach"
 DEPLOYED_HOST = "reach.kala.to"
 
 
+def spoken_address(host: str) -> str:
+    """An address in the form the page exposes it in: as words.
+
+    The page draws a service's address as it is written and hides that from the accessibility tree,
+    which holds the address as words in its place (`ServiceAddress` in the companion's page). So
+    `uiautomator` names "127 dot 0 dot 0 dot 1" where the screen shows 127.0.0.1, and a wait for the
+    written form never ends. This is the page's own rule, `spokenAddress`: each dot is the word
+    "dot", each colon of an IPv6 literal is "colon", and a port is "port" and its number. A literal
+    comes bracketed with its port after the bracket, or bare; a name or an IPv4 address has one
+    colon at the most, before its port, and an IPv6 literal has two or more.
+    `pairing-android-check.py` holds this to the page's own cases.
+    """
+    bracketed = re.fullmatch(r"\[([^\]]+)\](?::(\d+))?", host)
+    if bracketed is not None:
+        return _with_port(_say_colons(bracketed[1]), bracketed[2])
+    if len(host.split(":")) > 2:
+        return _say_colons(host)
+    named = re.fullmatch(r"(.*?)(?::(\d+))?", host)
+    return _with_port(named[1].replace(".", " dot "), named[2])
+
+
+def _say_colons(groups: str) -> str:
+    return re.sub(r"\s+", " ", " colon ".join(groups.split(":"))).strip()
+
+
+def _with_port(words: str, port: str | None) -> str:
+    return words if port is None else f"{words} port {port}"
+
+
 # ---- The emulator's camera ---------------------------------------------------------------------
 
 
@@ -1161,7 +1190,8 @@ def type_into_field(phone: Phone, text: str, replacing: int = 0, holding: str = 
 
 
 def point_codes_at(phone: Phone, origin: str, host: str) -> None:
-    """Changes the service codes go through, and goes on only once the screen names `host` as it.
+    """Changes the service codes go through, and goes on only once the screen names `host` as it,
+    in the words the page exposes it in (`spoken_address`).
 
     The keyboard covers the button, so the form is sent with the keyboard's own key: a tap at the
     button's place would land on a key of the keyboard. A code is never sent to another service by
@@ -1173,7 +1203,7 @@ def point_codes_at(phone: Phone, origin: str, host: str) -> None:
     phone.wait(lambda each: each == "Use this service", "the field for the pairing service", 30)
     type_into_field(phone, origin, replacing=40, holding="https://")
     phone.run("shell", "input", "keyevent", "KEYCODE_ENTER")
-    phone.wait(lambda each: each == host, f"{host} as the service codes go through", 30)
+    phone.wait(lambda each: each == spoken_address(host), f"{host} as the service codes go through", 30)
 
 
 def one_attempt(phone: Phone, shot: str) -> str:
@@ -1221,7 +1251,9 @@ def release(adb: str, serial: str, directory: Path, shots: Path, port: str, atte
         start_pairing_screen(phone)
         # A code is sent only to the service the screen names: a package whose default were another
         # origin would otherwise be tried against it, and still pass.
-        phone.wait(lambda each: each == DEPLOYED_HOST, f"{DEPLOYED_HOST} as the service codes go through", 30)
+        phone.wait(
+            lambda each: each == spoken_address(DEPLOYED_HOST), f"{DEPLOYED_HOST} as the service codes go through", 30
+        )
         phone.wait(lambda each: each == "Pair", "the button that starts an attempt", 30)
         attempts.parent.mkdir(parents=True, exist_ok=True)
         with attempts.open("a", encoding="utf-8") as record:
