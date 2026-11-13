@@ -424,6 +424,16 @@ const SURFACES = ['ios', 'android'] as const
 // control, and a press near one of them is that one's click. Each case counts the clicks the browser
 // made and the clicks that a handler of the page added: a press on a link's words or on a control gives
 // the one click of the browser and no other.
+/** Opens the Terminal view of a session whose terminal has ended: the page offers "Attach again". */
+async function endedTerminal(page: Page, surface: 'ios' | 'android'): Promise<void> {
+  await openSession(page, surface)
+  await page.getByRole('tab', { name: 'Terminal' }).click()
+  await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+  await page.evaluate(() => {
+    window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
+  })
+}
+
 test.describe('the links and the controls of a message in the pane', () => {
   test.use({ hasTouch: true })
   for (const surface of SURFACES) {
@@ -475,12 +485,7 @@ test.describe('the links and the controls of a message in the pane', () => {
     }
 
     test(`"Attach again", pressed 2 px inside a side and held 200 ms, attaches on ${surface}`, async ({ page }) => {
-      await openSession(page, surface)
-      await page.getByRole('tab', { name: 'Terminal' }).click()
-      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
-      await page.evaluate(() => {
-        window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
-      })
+      await endedTerminal(page, surface)
       const again = page.getByRole('button', { name: 'Attach again' })
       const box = await again.boundingBox()
       if (!box) throw new Error('Attach again has no box')
@@ -492,18 +497,33 @@ test.describe('the links and the controls of a message in the pane', () => {
       await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
     })
 
-    test(`"Attach again", tapped 2 px inside a side, attaches on ${surface}`, async ({ page }) => {
-      await openSession(page, surface)
-      await page.getByRole('tab', { name: 'Terminal' }).click()
-      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
-      await page.evaluate(() => {
-        window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
+    for (const [size, ratio] of SIZES) {
+      test(`"Attach again", tapped 2 px inside a side with a touch, attaches on ${surface} at ${size} text size`, async ({ page }) => {
+        await withTextScale(page, ratio)
+        await endedTerminal(page, surface)
+        const box = await page.getByRole('button', { name: 'Attach again' }).boundingBox()
+        if (!box) throw new Error('Attach again has no box')
+        await tap(page, box.x + box.width - 2, box.y + box.height / 2)
+        await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
       })
-      const box = await page.getByRole('button', { name: 'Attach again' }).boundingBox()
-      if (!box) throw new Error('Attach again has no box')
-      await page.touchscreen.tap(box.x + box.width - 2, box.y + box.height / 2)
-      await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
-    })
+
+      test(`"Attach again", pressed 8 px inside a side with a touch and held 0.4 s, attaches on ${surface} at ${size} text size`, async ({
+        page,
+        browserName
+      }) => {
+        test.skip(browserName !== 'chromium', 'a touch is held through the Chromium protocol: WebKit has no tool for a touch that is held')
+        await withTextScale(page, ratio)
+        await endedTerminal(page, surface)
+        const box = await page.getByRole('button', { name: 'Attach again' }).boundingBox()
+        if (!box) throw new Error('Attach again has no box')
+        const { session } = await touchSession(page)
+        const point = { x: box.x + 8, y: box.y + box.height / 2 }
+        await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] })
+        await page.waitForTimeout(400)
+        await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+        await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
+      })
+    }
   }
 })
 
@@ -558,19 +578,34 @@ test.describe('a tap on the plain text near a link of a message', () => {
         expect(handlers(far.clicks), 'clicks that the page added 34 px after the words').toEqual([])
       })
 
-      test(`adds no link click for the second tap of a double tap on ${surface} at ${size} text size`, async ({ page }) => {
+      test(`adds no link click for the second tap of a double tap on ${surface} at ${size} text size`, async ({ page, browserName }) => {
         await pressPage(page, surface, { scale: ratio, extra: TEXT_AFTER_LINK })
         const after = await pointOnTextAfter(page, DOCS)
-        // Two quick taps: the engine that counts a double tap gives the second click a detail of 2.
-        await page.touchscreen.tap(after.x, after.y)
-        await page.touchscreen.tap(after.x, after.y)
-        await expect.poll(async () => browsers(await clicksSeen(page)).length, 'clicks of two taps').toBe(2)
-        const clicks = browsers(await clicksSeen(page))
-        test.info().annotations.push({ type: 'details of the two clicks', description: clicks.map((click) => `${click.named.split(' ')[0] ?? ''} ${String(click.detail)}`).join(', ') })
-        // A click that names a link opens it, as the browser's own does; a click on text adds a link's click when its detail is 1 and none for another.
-        const expected = clicks.filter((click) => click.named.startsWith('link') || click.detail === 1).length
-        expect(clicks[0]?.detail, 'the first tap’s click').toBe(1)
-        expect((await openedLinks(page)).length, 'links opened by the two taps').toBe(expected)
+        // Two quick taps: the engine that counts a double tap gives the second click a detail of 2, one that does not gives each a detail of 1.
+        const taps: { named: string; detail: number; added: number; opened: number }[] = []
+        for (let each = 0; each < 2; each += 1) {
+          const clicksBefore = (await clicksSeen(page)).length
+          const openedBefore = (await openedLinks(page)).length
+          await page.touchscreen.tap(after.x, after.y)
+          await expect.poll(async () => browsers((await clicksSeen(page)).slice(clicksBefore)).length, 'a click for the tap').toBe(1)
+          const made = (await clicksSeen(page)).slice(clicksBefore)
+          const click = browsers(made)[0]
+          taps.push({
+            named: click?.named.split(' ')[0] ?? '',
+            detail: click?.detail ?? -1,
+            added: handlers(made).length,
+            opened: (await openedLinks(page)).length - openedBefore
+          })
+        }
+        test.info().annotations.push({ type: 'the two taps', description: JSON.stringify(taps) })
+        expect(taps[0], 'the first tap: a click on the text, and the link opened once through the page’s click').toEqual({ named: 'text', detail: 1, added: 1, opened: 1 })
+        if (browserName === 'chromium') {
+          // Chromium counts the double tap: the second click has a detail of 2, and the page adds nothing to it.
+          expect(taps[1], 'the second tap of the double tap').toEqual({ named: 'text', detail: 2, added: 0, opened: 0 })
+        } else {
+          // WebKit counts none for these: the second tap is a tap of its own, and opens the link as the first did.
+          expect(taps[1], 'the second tap, which the engine does not count as a double tap').toEqual({ named: 'text', detail: 1, added: 1, opened: 1 })
+        }
       })
 
       test(`opens nothing for a mouse's click on the text, and nothing for a mouse drag that ends there, and stops neither, on ${surface} at ${size} text size`, async ({
@@ -642,17 +677,29 @@ test.describe('a tap on the plain text near a link of a message', () => {
       expect(handlers(made.clicks), 'clicks that the page added to a press on a link whose destination changed').toEqual([])
     })
 
-    test(`opens nothing for a touch that moves beyond the slop on ${surface}`, async ({ page, browserName }) => {
+    test(`takes the pressed look off a touch that the engine cancels as it starts to scroll, and opens nothing, on ${surface}`, async ({
+      page,
+      browserName
+    }) => {
       test.skip(browserName !== 'chromium', 'the touch is moved through the Chromium protocol: WebKit has no tool for a touch that moves')
       await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
       const after = await pointOnTextAfter(page, DOCS)
-      const session = await page.context().newCDPSession(page)
+      await page.evaluate(() => {
+        const seen: string[] = []
+        ;(window as unknown as { pointerEnds: string[] }).pointerEnds = seen
+        for (const type of ['pointerup', 'pointercancel']) document.addEventListener(type, () => seen.push(type), true)
+      })
+      const { session } = await touchSession(page)
       const touch = (type: 'touchStart' | 'touchMove' | 'touchEnd', y: number): Promise<unknown> =>
         session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x: after.x, y }] })
       await touch('touchStart', after.y)
+      expect(await pressedLooks(page), 'the pressed look at the touch’s start').toBe(1)
       await touch('touchMove', after.y - 14)
       await touch('touchMove', after.y - 30)
+      // The engine takes the moving touch for a scroll and cancels the pointer: the handler's own cancel takes the look off, before any release.
+      await expect.poll(() => pressedLooks(page), 'the pressed look once the engine cancelled the touch').toBe(0)
       await touch('touchEnd', after.y - 30)
+      expect(await page.evaluate(() => (window as unknown as { pointerEnds: string[] }).pointerEnds), 'how the pointer ended').toEqual(['pointercancel'])
       await page.waitForTimeout(400)
       expect(await openedLinks(page), 'links opened by a touch that moved').toEqual([])
     })
@@ -723,6 +770,103 @@ async function tapAt(page: Page, x: number, y: number): Promise<string | null> {
 }
 
 // KR-REQ-13.19: the area in which a tap opens a link is at least the size the platform asks for around
+/** The pane's box as the page lays it out now. */
+async function paneBox(page: Page): Promise<{ left: number; top: number; right: number; bottom: number }> {
+  return page.evaluate(() => {
+    const box = (document.querySelector('.m-pane') as HTMLElement).getBoundingClientRect()
+    return { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+  })
+}
+
+/**
+ * The corners and the middles of the sides of the square of the least size about a link's words, one
+ * pixel inside it. Where the pane cuts the square on a side, the square slides back inside the pane
+ * by what was cut: the area that a tap opens the link in keeps its size there.
+ */
+function ringPoints(words: Words, pane: { left: number; top: number; right: number; bottom: number }, size: number): { x: number; y: number }[] {
+  const slide = (low: number, high: number, min: number, max: number): [number, number] => {
+    let from = low
+    let to = high
+    if (from < min) {
+      to += min - from
+      from = min
+    }
+    if (to > max) {
+      from -= to - max
+      to = max
+    }
+    return [Math.max(from, min), to]
+  }
+  const [left, right] = slide(words.x - size / 2, words.x + size / 2, pane.left, pane.right)
+  const [top, bottom] = slide(words.y - size / 2, words.y + size / 2, pane.top, pane.bottom)
+  const points: { x: number; y: number }[] = []
+  for (const y of [top + 1, (top + bottom) / 2, bottom - 1]) {
+    for (const x of [left + 1, (left + right) / 2, right - 1]) points.push({ x, y })
+  }
+  return points
+}
+
+/**
+ * The area the page's handler gives a link, measured by the pressed look: the extent, along the line
+ * through the words' middle and along the column through it, of the points at which a press lights
+ * the link. What lights at a press is what opens at a tap.
+ */
+async function areaOf(page: Page, href: string, words: Words): Promise<{ left: number; right: number; top: number; bottom: number; width: number; height: number }> {
+  return page.evaluate(
+    ({ target, x, y }) => {
+      const pane = (document.querySelector('.m-pane') as HTMLElement).getBoundingClientRect()
+      const lit = (px: number, py: number): boolean => {
+        const element = document.elementFromPoint(px, py)
+        if (!element) return false
+        const init = { bubbles: true, cancelable: true, clientX: px, clientY: py, pointerId: 77, pointerType: 'touch', isPrimary: true, button: 0 }
+        element.dispatchEvent(new PointerEvent('pointerdown', init))
+        const answer = document.querySelector('.md-link[data-pressed]')?.getAttribute('title') === target
+        document.dispatchEvent(new PointerEvent('pointercancel', init))
+        return answer
+      }
+      const extent = (from: number, to: number, at: (n: number) => boolean): [number, number] => {
+        let low = Number.POSITIVE_INFINITY
+        let high = Number.NEGATIVE_INFINITY
+        for (let n = Math.floor(from); n < Math.ceil(to); n += 1) {
+          if (at(n + 0.5)) {
+            low = Math.min(low, n)
+            high = Math.max(high, n + 1)
+          }
+        }
+        return [low, high]
+      }
+      const [left, right] = extent(pane.left, pane.right, (n) => lit(n, y))
+      const [top, bottom] = extent(pane.top, pane.bottom, (n) => lit(x, n))
+      return { left, right, top, bottom, width: right - left, height: bottom - top }
+    },
+    { target: href, x: words.x, y: words.y }
+  )
+}
+
+/**
+ * The points of `ringPoints` at which a tap opened no link, as text. A tap on the pane's own bare
+ * area (no message there) gets no click from WebKit, so no handler of the page can act on it: those
+ * points are left out in WebKit and counted in the case's annotations. Chromium gives a click there.
+ */
+async function missedInRing(page: Page, words: Words, size: number): Promise<string[]> {
+  const pane = await paneBox(page)
+  const webkit = page.context().browser()?.browserType().name() === 'webkit'
+  const missed: string[] = []
+  const bare: string[] = []
+  for (const point of ringPoints(words, pane, size)) {
+    const onThePane = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.classList.contains('m-pane') ?? false, [point.x, point.y])
+    const label = `${String(Math.round(point.x - words.x))}, ${String(Math.round(point.y - words.y))}`
+    if (webkit && onThePane) {
+      bare.push(label)
+      continue
+    }
+    const opened = await tapAt(page, point.x, point.y)
+    if (opened === null) missed.push(label)
+  }
+  if (bare.length > 0) test.info().annotations.push({ type: 'points on the pane’s bare area, which WebKit gives no click', description: bare.join(' | ') })
+  return missed
+}
+
 // the link's words (44 points on iOS and 48 dp on Android, in every direction), and where two links
 // stand closer than that, the nearer words have the area between them. The case taps a ring of points
 // around the words of a link in the middle of a line, and every point of the axis between two links
