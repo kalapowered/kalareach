@@ -394,7 +394,7 @@ install_volume_searches_by_case-1 | reading the flags of the volume that holds t
 install_protect_handle-1 | setting the permissions of {what} | setting the permissions of {what}: Windows error N | read: the step that the words name, in `protect_handle`, returned an error
 install_attributes_of-1 | reading {what} | reading {what}: Windows error N | read: the step that the words name, in `attributes_of`, returned an error
 install_file_key-1 | reading an object's identity | reading an object's identity: Windows error N | read: the step that the words name, in `file_key`, returned an error
-install_open_directory_relative-1 | opening a directory beneath a held directory | opening a directory beneath a held directory: Windows error N | read: the step that the words name, in `open_directory_relative`, returned an error
+install_open_directory_relative-1 | opening a directory beneath a held directory | opening a directory beneath a held directory (or by its full path where it has no parent): Windows error N | read: the step that the words name, in `open_directory_relative`, returned an error
 install_opened_final_path-1 | opening a known folder | opening a known folder: Windows error N | read: the step that the words name, in `opened_final_path`, returned an error
 install_check_ancestors-1 | opening a folder above the installation | opening a folder above the installation: Windows error N | read: the step that the words name, in `check_ancestors`, returned an error
 install_check_program_parents-1 | opening a folder above the program directory | opening a folder above the program directory: Windows error N | read: the step that the words name, in `check_program_parents`, returned an error
