@@ -667,7 +667,7 @@ async fn a_worker_told_more_notices_than_a_result_reads_is_told_the_host() {
 }
 
 /// A paired device's record, for the device `device_id` names.
-fn a_paired_device(
+pub(super) fn a_paired_device(
     controller: &Controller,
     device_id: kr_protocol::ids::DeviceId,
     grant: kr_protocol::grant::Grant,
@@ -694,7 +694,7 @@ fn a_paired_device(
 
 /// The tree a device holds below one root: `grants` grants that each carry input and the size, the
 /// first of them the root. Returns the root and the grant the device's record is paired under.
-fn a_device_holding(
+pub(super) fn a_device_holding(
     controller: &Controller,
     grants: u32,
 ) -> (kr_protocol::ids::GrantId, kr_protocol::grant::Grant) {
