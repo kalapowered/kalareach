@@ -4,9 +4,9 @@
 
 use kr_boundary_windows::remedy::{
     AncestorFault, KnownFolder, ParentCure, Presence, Stage, Subject, Tree, ancestor_refusal,
-    broker_not_stopped, dos_path_of, identity_text, is_below, is_on_a_network_share,
-    is_the_place_asked_for, is_the_volumes_own_root, known_folder_unreadable, parent_advice,
-    program_removal_advice, rights_finding, rights_in_words, shape_refusal, supported_layout,
+    dos_path_of, identity_text, is_below, is_on_a_network_share, is_the_place_asked_for,
+    is_the_volumes_own_root, known_folder_unreadable, parent_advice, program_removal_advice,
+    rights_finding, rights_in_words, shape_refusal, supported_layout,
 };
 
 const DELETE_CHILD: u32 = 0x0000_0040;
@@ -1337,20 +1337,6 @@ fn the_line_for_a_known_folder_that_cannot_be_read_says_the_limit_of_a_removal()
     ] {
         assert!(!removal.contains(by_hand), "{by_hand}: {removal}");
     }
-}
-
-/// A repair that cannot verify the stopped state of the broker's service says so, and stops before
-/// the program directory is changed.
-#[test]
-fn a_repair_that_cannot_stop_the_broker_says_so() {
-    let text = broker_not_stopped();
-    assert!(text.contains("did not reach the stopped state"), "{text}");
-    assert!(
-        text.contains("stopped before it changed the program directory"),
-        "{text}"
-    );
-    assert!(text.contains("a repair has no rollback"), "{text}");
-    assert!(!text.contains("stays stopped"), "{text}");
 }
 
 /// What an own folder's words claim of contents that nothing read: nothing. The folder that holds

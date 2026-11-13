@@ -2822,24 +2822,28 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // The program directory and its files.
     let manager = service::manager()?;
     let broker_service = manager.open(SERVICE)?;
-    // A repair has no rollback: the broker stays stopped only where its service was verified to be
-    // stopped. A service that is running, or on the way to either state, is asked to stop and waited
-    // for; where it does not reach the stopped state, the run stops before it changes the program
-    // directory.
+    // A repair has no rollback: the broker is said to stay stopped only where a read of its service
+    // said stopped. A service that is running is asked to stop and waited for; one that is on its way
+    // to either state is waited for (a stop request is refused there); where it does not reach the
+    // stopped state within the bound, the run stops before it changes the program directory.
     let mut broker_stopped = false;
     if let Some(service) = &broker_service {
-        if !service.status()?.stopped() {
-            let stop = service
-                .stop()
-                .and_then(|()| service.wait_for(true, Duration::from_secs(60)));
-            if stop.is_err() && !service.status()?.stopped() {
-                return Err(Error::Failed(remedy::broker_not_stopped()));
-            }
+        let end = Instant::now() + Duration::from_secs(60);
+        let stopped = remedy::stop_broker(
+            || service.status().map(|status| status.broker_state()),
+            || service.stop(),
+            || {
+                if Instant::now() >= end {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                true
+            },
+        )?;
+        if !stopped {
+            return Err(Error::Failed(remedy::broker_not_stopped(existing)));
         }
-        broker_stopped = service.status()?.stopped();
-        if !broker_stopped {
-            return Err(Error::Failed(remedy::broker_not_stopped()));
-        }
+        broker_stopped = true;
     }
     run.record(
         ObjectKind::Directory,
