@@ -580,7 +580,7 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
     assert!(two.contains("C:\\Data (another object stands at its name, so nothing was marked); C:\\Above (the data directory in it stays)."));
     assert!(
         two.ends_with(
-            " It marked for removal, each through the identity that this run kept of it: C:\\Data\\run; C:\\Data\\journal."
+            " It marked for removal, each through the identity that this run kept of it, and a read of its name afterwards found it gone: C:\\Data\\run; C:\\Data\\journal."
         ),
         "{two}"
     );
@@ -624,7 +624,7 @@ fn the_ending_of_a_rollback_says_records_are_deleted_only_where_the_run_wrote_an
     for text in [&with_records, &without_records] {
         assert!(
             text.ends_with(&format!(
-                "each through the identity that this run kept of it: {DATA}\\run; {DATA}; {ABOVE}"
+                "each through the identity that this run kept of it, and a read of its name afterwards found it gone: {DATA}\\run; {DATA}; {ABOVE}"
             )),
             "{text}"
         );

@@ -812,6 +812,25 @@ fn names_held_by(identity: &ffi::Handle) -> String {
     }
 }
 
+/// What a read of a name answers after the object that stood there was marked for removal, in the
+/// directory that `holder` holds: [`Taken::Marked`] where the name is not found (the object is
+/// gone), and the words that say what was read otherwise: an object at the name, or a read that
+/// failed. The mark alone does not show that an object is gone, so no text says so before this read.
+fn read_back(holder: &ffi::Handle, units: &[u16]) -> Result<Taken, String> {
+    match DirHandle::open_beneath(holder, units, 0, true, FILE_OPEN) {
+        Err(failure)
+            if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+        {
+            Ok(Taken::Marked)
+        }
+        Ok(_) => Err("it was marked for removal and is still at its name".to_owned()),
+        Err(failure) => Err(format!(
+            "it was marked for removal, but {}, so whether it is gone is not known",
+            remedy::platform_error("a read of its name afterwards failed", failure.code)
+        )),
+    }
+}
+
 impl MadeObject {
     /// Marks the object for removal and closes every handle of it that the run holds: the object is
     /// opened by its bare name, relative to the handle of the directory that holds it and never
@@ -820,7 +839,8 @@ impl MadeObject {
     /// that this run made; where it is the same, the mark is set on that same handle. Another object
     /// at the name is marked by nothing. The handle of the open is closed before the object's own
     /// handle and the directory's, so that the caller turns to the directory that holds this one
-    /// with none of this object's handles open. Returns [`Taken::Marked`] where the mark was set,
+    /// with none of this object's handles open. Returns [`Taken::Marked`] where the mark was set
+    /// and a read of the name afterwards answered not found,
     /// [`Taken::NotFound`] where the open answered that the name is not found (nothing was read of
     /// the object and nothing was done with it), and [`Taken::Stays`] with the platform's refusal,
     /// or what was found at the name.
@@ -861,21 +881,23 @@ impl MadeObject {
             if found != made {
                 return Err("another object stands at its name, so nothing was marked".to_owned());
             }
-            super::root::delete(&at_name)
-                .map(|()| Taken::Marked)
-                .map_err(|failure| {
-                    let words = remedy::platform_error(
-                        "the platform refused to mark it for removal",
-                        failure.code,
-                    );
-                    // A directory that holds an entry stays: the entries are named, read through the
-                    // object's own handle.
-                    if directory {
-                        format!("{words}; {}", names_held_by(&identity))
-                    } else {
-                        words
-                    }
-                })
+            super::root::delete(&at_name).map_err(|failure| {
+                let words = remedy::platform_error(
+                    "the platform refused to mark it for removal",
+                    failure.code,
+                );
+                // A directory that holds an entry stays: the entries are named, read through the
+                // object's own handle.
+                if directory {
+                    format!("{words}; {}", names_held_by(&identity))
+                } else {
+                    words
+                }
+            })?;
+            // The handle that set the mark is closed, and then the name is read: the object is
+            // said to be gone only where that read answers not found.
+            drop(at_name);
+            read_back(&holder, &units)
         })();
         // The handle of the open is closed, then the object's own, then the directory's.
         drop((identity, holder));
@@ -990,16 +1012,31 @@ struct MadeFile {
 }
 
 impl MadeFile {
-    /// Marks the file for removal through the handle of the call that made it, and closes the
-    /// handle. Returns [`Taken::Marked`] where the mark was set and [`Taken::Stays`] with the
-    /// platform's refusal.
-    fn take_away(self) -> Taken {
-        match super::root::delete(&self.handle) {
-            Ok(()) => Taken::Marked,
-            Err(failure) => Taken::Stays(remedy::platform_error(
+    /// Marks the file for removal through the handle of the call that made it, closes the handle,
+    /// and reads the file's name in the directory that `holder` holds. Returns [`Taken::Marked`]
+    /// where the mark was set and the read answered not found, and [`Taken::Stays`] with the
+    /// platform's refusal of the mark, or with what the read answered.
+    fn take_away(self, holder: Option<&ffi::Handle>) -> Taken {
+        let MadeFile { handle, path } = self;
+        if let Err(failure) = super::root::delete(&handle) {
+            return Taken::Stays(remedy::platform_error(
                 "the platform refused to mark it for removal",
                 failure.code,
-            )),
+            ));
+        }
+        drop(handle);
+        let units: Vec<u16> = path
+            .file_name()
+            .map(|name| name.encode_wide().collect())
+            .unwrap_or_default();
+        let Some(holder) = holder else {
+            return Taken::Stays(
+                "it was marked for removal, and no read of its name was made".to_owned(),
+            );
+        };
+        match read_back(holder, &units) {
+            Ok(taken) => taken,
+            Err(words) => Taken::Stays(words),
         }
     }
 }
@@ -3688,8 +3725,8 @@ impl Run {
     }
 
     /// Takes away what this run laid, by the handles that it holds and never by what a manifest
-    /// says: the run's own handle of the data directory is closed, then the objects go through
-    /// their own identities, children before parents. The directories of the journal and of the
+    /// says: the objects go through their own identities, children before parents, and the run's
+    /// own handle of the data directory is closed before the data directory is taken. The directories of the journal and of the
     /// private roots go first (the broker's own files in them were deleted before this), then the
     /// earlier-state record, then the staging directory (the files that this run staged in it were
     /// deleted before this), and the manifest, each only once what it follows is gone, so that a
@@ -3702,7 +3739,9 @@ impl Run {
     /// records are deleted only where the run wrote records (the earlier-state record, the
     /// manifest) and the rollback marked each of them.
     fn take_away(&mut self) -> Rolled {
-        self.directory = None;
+        // The run's own handle of the data directory stays until the files of the run are read
+        // back, and is closed before the directories are taken.
+        let directory = self.directory.take();
         let Laid {
             made,
             staging,
@@ -3751,10 +3790,14 @@ impl Run {
         // made it, wherever the object is by now: at the replacement's name, or at the manifest's.
         if gone && let Some(file) = replacement {
             let path = file.path.clone();
-            gone = take(Some((false, file.take_away())), &path, true);
+            gone = take(
+                Some((false, file.take_away(directory.as_ref()))),
+                &path,
+                true,
+            );
         }
         if gone {
-            let prior = prior.map(|file| (false, file.take_away()));
+            let prior = prior.map(|file| (false, file.take_away(directory.as_ref())));
             gone = take(prior, &self.paths.prior, true);
         }
         if gone {
@@ -3763,6 +3806,7 @@ impl Run {
         if gone {
             take(object(manifest), &self.paths.manifest, true);
         }
+        drop(directory);
         let (directory, folder) = made.take_away();
         for (taken, path) in [
             (directory, &self.paths.data),
