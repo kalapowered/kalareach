@@ -6,9 +6,9 @@
 use std::path::Path;
 
 use kr_boundary_windows::remedy::{
-    AncestorFault, EntryKind, Origin, ParentCure, Presence, Record, Remedy, Shape, Stage, Subject,
-    Tree, ancestor_refusal, choose, ending, origin_of_open_error, origin_of_shape, parent_advice,
-    program_removal_advice,
+    AncestorFault, Clearance, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Record,
+    Remedy, Shape, Stage, Standing, Subject, Tree, ancestor_refusal, choose, ending,
+    origin_of_open_error, origin_of_shape, parent_advice, program_removal_advice,
 };
 
 const RECORDS: [EntryKind; 9] = [
@@ -22,6 +22,17 @@ const RECORDS: [EntryKind; 9] = [
     EntryKind::NamedRoot,
     EntryKind::UnnamedRoot,
 ];
+
+/// An installation whose reads found nothing of the installation: the one run that has a clearance.
+fn at_install() -> Grounds<'static> {
+    Grounds::new(Purpose::Install, &|| Standing::NothingFound)
+}
+
+fn clearance() -> Clearance {
+    at_install()
+        .clearance()
+        .expect("an installation that found nothing has a clearance")
+}
 
 fn unknown() -> Origin {
     Origin::Unknown("Windows error 1117".to_owned())
@@ -43,13 +54,11 @@ fn lookups() -> [Presence; 3] {
 fn a_record_that_another_account_made_is_moved_out_whatever_the_manifest_says() {
     for kind in RECORDS {
         for manifest in lookups() {
-            for origin in [
-                Origin::Foreign,
-                Origin::Refused("Windows error 5".to_owned()),
-            ] {
+            let owned = Origin::Owned("S-1-5-21-1-2-3-1001".to_owned());
+            for origin in [Origin::Foreign, owned] {
                 assert_eq!(
-                    choose(kind, &origin, &manifest, None),
-                    Remedy::MoveAside,
+                    choose(&at_install(), kind, &origin, &manifest, None),
+                    Remedy::MoveAside(clearance()),
                     "{kind:?} {origin:?} {manifest:?}"
                 );
             }
@@ -57,20 +66,26 @@ fn a_record_that_another_account_made_is_moved_out_whatever_the_manifest_says() 
     }
 }
 
+/// A step that rests on a read that failed does not exist, for any purpose: the entry's own list
+/// refused the open, the open failed, or the object changed while it was read.
 #[test]
 fn a_record_that_could_not_be_read_is_never_corrected_or_removed_whatever_the_manifest_says() {
+    let refused = Origin::Refused("Windows error 5".to_owned());
+    let changed = Origin::Changed("the identifier names another object".to_owned());
     for kind in RECORDS {
         for manifest in lookups() {
             assert_eq!(
-                choose(kind, &held(), &manifest, None),
+                choose(&at_install(), kind, &held(), &manifest, None),
                 Remedy::Unreadable,
                 "{kind:?} {manifest:?}"
             );
-            assert_eq!(
-                choose(kind, &unknown(), &manifest, None),
-                Remedy::MoveAside,
-                "{kind:?} {manifest:?}"
-            );
+            for origin in [unknown(), refused.clone(), changed.clone()] {
+                assert_eq!(
+                    choose(&at_install(), kind, &origin, &manifest, None),
+                    Remedy::NoStep,
+                    "{kind:?} {origin:?} {manifest:?}"
+                );
+            }
         }
     }
 }
@@ -85,19 +100,25 @@ fn a_record_of_the_systems_class_is_corrected_while_a_manifest_may_be_there_and_
             Presence::Unknown("Windows error 5".to_owned()),
         ] {
             let expected = if kind == EntryKind::UnnamedRoot {
-                Remedy::Remove
+                Remedy::Remove(clearance())
             } else {
                 Remedy::Correct
             };
             assert_eq!(
-                choose(kind, &Origin::System, &manifest, None),
+                choose(&at_install(), kind, &Origin::System, &manifest, None),
                 expected,
                 "{kind:?} {manifest:?}"
             );
         }
         assert_eq!(
-            choose(kind, &Origin::System, &Presence::Absent, None),
-            Remedy::Remove,
+            choose(
+                &at_install(),
+                kind,
+                &Origin::System,
+                &Presence::Absent,
+                None
+            ),
+            Remedy::Remove(clearance()),
             "{kind:?}"
         );
     }
@@ -110,23 +131,36 @@ fn a_record_of_the_systems_class_is_corrected_while_a_manifest_may_be_there_and_
 fn a_name_that_the_layout_does_not_give_takes_the_four_states_of_its_own_handle() {
     for manifest in lookups() {
         assert_eq!(
-            choose(EntryKind::Other, &Origin::System, &manifest, None),
-            Remedy::Remove,
+            choose(
+                &at_install(),
+                EntryKind::Other,
+                &Origin::System,
+                &manifest,
+                None
+            ),
+            Remedy::Remove(clearance()),
             "{manifest:?}"
         );
-        for origin in [
-            Origin::Foreign,
-            unknown(),
-            Origin::Refused("Windows error 5".to_owned()),
-        ] {
+        assert_eq!(
+            choose(
+                &at_install(),
+                EntryKind::Other,
+                &Origin::Foreign,
+                &manifest,
+                None
+            ),
+            Remedy::MoveAside(clearance()),
+            "{manifest:?}"
+        );
+        for origin in [unknown(), Origin::Refused("Windows error 5".to_owned())] {
             assert_eq!(
-                choose(EntryKind::Other, &origin, &manifest, None),
-                Remedy::MoveAside,
+                choose(&at_install(), EntryKind::Other, &origin, &manifest, None),
+                Remedy::NoStep,
                 "{origin:?} {manifest:?}"
             );
         }
         assert_eq!(
-            choose(EntryKind::Other, &held(), &manifest, None),
+            choose(&at_install(), EntryKind::Other, &held(), &manifest, None),
             Remedy::Unreadable,
             "{manifest:?}"
         );
@@ -139,19 +173,43 @@ fn a_name_that_the_layout_does_not_give_takes_the_four_states_of_its_own_handle(
 fn a_private_root_that_no_journal_names_takes_its_remedy_from_its_handle() {
     for manifest in lookups() {
         assert_eq!(
-            choose(EntryKind::UnnamedRoot, &Origin::System, &manifest, None),
-            Remedy::Remove
+            choose(
+                &at_install(),
+                EntryKind::UnnamedRoot,
+                &Origin::System,
+                &manifest,
+                None
+            ),
+            Remedy::Remove(clearance())
         );
         assert_eq!(
-            choose(EntryKind::UnnamedRoot, &Origin::Foreign, &manifest, None),
-            Remedy::MoveAside
+            choose(
+                &at_install(),
+                EntryKind::UnnamedRoot,
+                &Origin::Foreign,
+                &manifest,
+                None
+            ),
+            Remedy::MoveAside(clearance())
         );
         assert_eq!(
-            choose(EntryKind::UnnamedRoot, &unknown(), &manifest, None),
-            Remedy::MoveAside
+            choose(
+                &at_install(),
+                EntryKind::UnnamedRoot,
+                &unknown(),
+                &manifest,
+                None
+            ),
+            Remedy::NoStep
         );
         assert_eq!(
-            choose(EntryKind::UnnamedRoot, &held(), &manifest, None),
+            choose(
+                &at_install(),
+                EntryKind::UnnamedRoot,
+                &held(),
+                &manifest,
+                None
+            ),
             Remedy::Unreadable
         );
     }
@@ -166,7 +224,7 @@ fn a_private_root_that_no_journal_names_takes_its_remedy_from_its_handle() {
 #[test]
 fn the_words_of_a_refused_entry_say_what_the_handle_showed_and_nothing_of_who_made_it() {
     let (remedy, foreign) = said(EntryKind::Staging, &Origin::Foreign, &Presence::Present);
-    assert_eq!(remedy, Remedy::MoveAside);
+    assert_eq!(remedy, Remedy::MoveAside(clearance()));
     assert!(
         foreign.contains("shows what the installation does not leave there: an owner that is not the system or the Administrators group, a reparse point, a second name for a file, or another kind of object than its layout gives at that name"),
         "{foreign}"
@@ -185,7 +243,7 @@ fn the_words_of_a_refused_entry_say_what_the_handle_showed_and_nothing_of_who_ma
         &Origin::Changed("the identifier names another object".to_owned()),
         &Presence::Present,
     );
-    assert_eq!(remedy, Remedy::MoveAside);
+    assert_eq!(remedy, Remedy::NoStep);
     assert!(
         changed.contains(
             "it changed or moved while it was read (the identifier names another object)"
@@ -194,16 +252,24 @@ fn the_words_of_a_refused_entry_say_what_the_handle_showed_and_nothing_of_who_ma
     );
     assert!(!changed.contains("could not be read"), "{changed}");
     assert!(!changed.contains("did not make it"), "{changed}");
+    assert!(
+        changed.ends_with("The setup program names no step for it."),
+        "{changed}"
+    );
 
     let (_, refused) = said(
         EntryKind::JournalFile,
         &Origin::Refused("Windows error 5".to_owned()),
         &Presence::Present,
     );
+    // A failed open names its error and gives no step.
     assert!(
-        refused.contains(
-            "if its delete is pending, close the program that holds it, and the entry goes"
-        ),
+        refused.contains("an entry with a delete pending gives it too."),
+        "{refused}"
+    );
+    assert!(!refused.contains("rename"), "{refused}");
+    assert!(
+        refused.ends_with("The setup program names no step for it."),
         "{refused}"
     );
 }
@@ -223,8 +289,18 @@ fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_o
             EntryKind::Journal,
             EntryKind::Run,
         ] {
-            let remedy = choose(kind, &origin, &Presence::Present, Some(Record::NotRecorded));
-            assert_eq!(remedy, Remedy::MoveAside, "{kind:?} {origin:?}");
+            let remedy = choose(
+                &at_install(),
+                kind,
+                &origin,
+                &Presence::Present,
+                Some(Record::NotRecorded),
+            );
+            assert_eq!(
+                remedy,
+                Remedy::MoveAside(clearance()),
+                "{kind:?} {origin:?}"
+            );
         }
     }
     // What the handle chooses is chosen again where the manifest records the entry or the record was
@@ -232,15 +308,17 @@ fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_o
     for record in [None, Some(Record::Recorded)] {
         assert_eq!(
             choose(
+                &at_install(),
                 EntryKind::Staging,
                 &Origin::System,
                 &Presence::Absent,
                 record
             ),
-            Remedy::Remove
+            Remedy::Remove(clearance())
         );
         assert_eq!(
             choose(
+                &at_install(),
                 EntryKind::Manifest,
                 &Origin::System,
                 &Presence::Present,
@@ -255,7 +333,7 @@ fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_o
     let manifest = format!("{data}/manifest.json");
     let text = ending(
         Path::new(&manifest),
-        Remedy::MoveAside,
+        &Remedy::MoveAside(clearance()),
         &Origin::System,
         EntryKind::Manifest,
         &Presence::Present,
@@ -298,7 +376,7 @@ fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_o
         let entry = format!("{data}/child");
         let text = ending(
             Path::new(&entry),
-            Remedy::MoveAside,
+            &Remedy::MoveAside(clearance()),
             &Origin::System,
             kind,
             &Presence::Present,
@@ -338,10 +416,10 @@ fn an_open_error_is_told_apart_by_what_it_shows() {
 }
 
 fn said(kind: EntryKind, origin: &Origin, manifest: &Presence) -> (Remedy, String) {
-    let remedy = choose(kind, origin, manifest, None);
+    let remedy = choose(&at_install(), kind, origin, manifest, None);
     let text = ending(
         Path::new("D:\\data\\entry"),
-        remedy,
+        &remedy,
         origin,
         kind,
         manifest,
@@ -359,12 +437,12 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
     // A removal with the manifest there says that it stays, whichever entry is removed.
     for kind in [EntryKind::Other, EntryKind::UnnamedRoot] {
         let (remedy, text) = said(kind, &Origin::System, &Presence::Present);
-        assert_eq!(remedy, Remedy::Remove, "{kind:?}");
+        assert_eq!(remedy, Remedy::Remove(clearance()), "{kind:?}");
         assert!(text.contains(STAYS), "{kind:?}: {text}");
     }
     let text = ending(
         Path::new("D:\\data\\journal"),
-        Remedy::Remove,
+        &Remedy::Remove(clearance()),
         &Origin::System,
         EntryKind::Journal,
         &Presence::Present,
@@ -379,7 +457,7 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
         (EntryKind::Journal, Presence::Absent),
     ] {
         let (remedy, text) = said(kind, &Origin::System, &manifest);
-        assert_eq!(remedy, Remedy::Remove, "{kind:?}");
+        assert_eq!(remedy, Remedy::Remove(clearance()), "{kind:?}");
         assert!(!text.contains(STAYS), "{kind:?}: {text}");
     }
     // Moved out: the next run makes new only what the installation makes.
@@ -394,7 +472,7 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
         (EntryKind::Replacement, false),
     ] {
         let (remedy, text) = said(kind, &Origin::Foreign, &Presence::Present);
-        assert_eq!(remedy, Remedy::MoveAside, "{kind:?}");
+        assert_eq!(remedy, Remedy::MoveAside(clearance()), "{kind:?}");
         assert_eq!(text.contains("makes it new"), makes_it, "{kind:?}: {text}");
         assert!(
             text.contains("out of the data directory"),
@@ -440,16 +518,16 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
 }
 
 /// The one remedy each state of a refused folder above the data directory is told: a held folder is
-/// cured by closing the program, another account's by moving it aside, the system's own by
-/// correcting its list, and one that holds no data directory by removing it. A text never offers a
-/// second remedy beside its own.
+/// cured by closing the program, another account's by giving the ownership back (which rests on what
+/// the administrator knows), the system's own by correcting its list, and a folder that could not be
+/// opened or is no folder is given no step. A text never offers a second remedy beside its own.
 #[test]
 fn each_state_of_the_parent_folder_is_told_one_remedy() {
     const REMEDIES: [&str; 4] = [
         "Close the program",
-        "Move the folder aside",
-        "Correct its list instead",
-        "remove or rename the folder",
+        "give the ownership back to the Administrators group",
+        "Correct its list",
+        "The setup program names no step for it.",
     ];
     let said = |text: &str| -> Vec<&str> {
         REMEDIES
@@ -458,31 +536,23 @@ fn each_state_of_the_parent_folder_is_told_one_remedy() {
             .filter(|remedy| text.contains(remedy))
             .collect()
     };
+    let owner = || "S-1-5-21-1-2-3-1001".to_owned();
     let cases = [
-        (ParentCure::Close, "Close the program"),
-        (ParentCure::MoveAside, "Move the folder aside"),
-        (ParentCure::Unreadable, "Move the folder aside"),
-        (
-            ParentCure::Correct(Presence::Present),
-            "Correct its list instead",
-        ),
+        (ParentCure::Close, REMEDIES[0]),
+        (ParentCure::Owned(owner()), REMEDIES[1]),
+        (ParentCure::Unreadable, REMEDIES[3]),
+        (ParentCure::NotAFolder, REMEDIES[3]),
+        (ParentCure::Correct(Presence::Present), REMEDIES[2]),
         (
             ParentCure::Correct(Presence::Unknown("Windows error 5".to_owned())),
-            "Correct its list instead",
+            REMEDIES[2],
         ),
-        (
-            ParentCure::Correct(Presence::Absent),
-            "remove or rename the folder",
-        ),
+        (ParentCure::Correct(Presence::Absent), REMEDIES[2]),
     ];
     for (cure, remedy) in cases {
         let text = parent_advice(&cure);
         assert_eq!(said(&text), vec![remedy], "{cure:?}: {text}");
     }
-    // A folder that holds nothing is removed, and the text does not add that its list could be
-    // corrected instead.
-    let text = parent_advice(&ParentCure::Correct(Presence::Absent));
-    assert!(!text.contains("give it to"), "{text}");
 }
 
 /// A reparse point at the folder that holds the data directory is told in the words of an own
@@ -537,35 +607,15 @@ fn a_link_at_the_folder_above_the_data_directory_is_told_as_one_at_an_own_folder
     }
 }
 
-/// The folder above the data directory is said to be made new only on a condition that the run
-/// that follows can meet: the boundary is not installed (an installation then makes it; a removal
-/// makes nothing, and an installed boundary stops the run before). The folder that the handle shows
-/// with another owner is told by its owner; what is at a folder's name and is no folder is a thing
-/// that is moved aside, with nothing said of what it holds.
+/// The folder above the data directory is told by what its handle showed: another owner is named
+/// (the identifier that the handle gave), and what is at a folder's name and is no folder is said to
+/// be that, with nothing said of what it holds and no forecast of what a later run makes.
 #[test]
-fn the_folder_above_the_data_directory_is_said_to_be_made_new_only_where_the_boundary_is_not_installed()
- {
-    for cure in [
-        ParentCure::Unreadable,
-        ParentCure::MoveAside,
-        ParentCure::NotAFolder,
-    ] {
-        let text = parent_advice(&cure);
-        assert!(
-            text.contains(
-                "Where the boundary is not installed, the installation then makes the folder new."
-            ),
-            "{cure:?}: {text}"
-        );
-        assert!(
-            !text.contains("again: the installation makes the folder new"),
-            "{cure:?}: {text}"
-        );
-    }
-    let owner = parent_advice(&ParentCure::MoveAside);
+fn the_folder_above_the_data_directory_is_told_by_what_its_handle_showed() {
+    let owner = parent_advice(&ParentCure::Owned("S-1-5-21-1-2-3-1001".to_owned()));
     assert!(
         owner.contains(
-            "The handle of this folder shows an owner that is not the system or the Administrators group"
+            "The handle of this folder shows an owner that is not the system or the Administrators group: S-1-5-21-1-2-3-1001."
         ),
         "{owner}"
     );
@@ -578,13 +628,21 @@ fn the_folder_above_the_data_directory_is_said_to_be_made_new_only_where_the_bou
     for held in ["can hold", "keeps everything in it", "files that"] {
         assert!(!file.contains(held), "{held}: {file}");
     }
+    for cure in [
+        ParentCure::Unreadable,
+        ParentCure::Owned("S-1-5-21-1-2-3-1001".to_owned()),
+        ParentCure::NotAFolder,
+    ] {
+        let text = parent_advice(&cure);
+        assert!(!text.contains("makes the folder new"), "{cure:?}: {text}");
+    }
 }
 
 #[test]
 fn a_folder_that_holds_the_data_directory_or_may_is_never_told_to_be_removed() {
     for cure in [
         ParentCure::Close,
-        ParentCure::MoveAside,
+        ParentCure::Owned("S-1-5-21-1-2-3-1001".to_owned()),
         ParentCure::NotAFolder,
         ParentCure::Link(Stage::Before),
         ParentCure::Unreadable,
@@ -671,39 +729,21 @@ fn an_entry_of_another_kind_than_the_layout_gives_is_not_the_installations() {
 }
 
 /// What a foreign manifest's refusal says the next run does is what the next run does with no
-/// manifest: it reads each remaining entry on its own handle, and says remove, move aside or close
-/// the program, never "names each to remove".
+/// manifest: it reads each remaining entry on its own handle and says what that handle shows. The
+/// forecast names no step of the next run, which depends on what that run's reads find.
 #[test]
 fn the_forecast_after_a_foreign_manifest_is_moved_aside_is_the_next_runs_own_reading() {
     let (remedy, text) = said(EntryKind::Manifest, &Origin::Foreign, &Presence::Present);
-    assert_eq!(remedy, Remedy::MoveAside);
+    assert_eq!(remedy, Remedy::MoveAside(clearance()));
     assert!(text.contains("on their own handles"), "{text}");
-    assert!(text.contains("move it aside"), "{text}");
     assert!(
-        text.contains("close the program that holds it open"),
+        text.contains("says what the handle of the first it finds shows"),
         "{text}"
     );
+    for step in ["move it aside", "close the program", "to remove it"] {
+        assert!(!text.contains(step), "{step}: {text}");
+    }
     assert!(!text.contains("names each to remove"), "{text}");
-}
-
-/// The forecast says what the next run does for the state that run finds. After a manifest that
-/// nothing shows the origin of (a handle that could not be read, or that changed while it was read)
-/// is moved aside, the next run reads the first entry it finds and may move that aside too, because
-/// its handle shows nothing either.
-#[test]
-fn the_forecast_after_a_manifest_covers_the_state_that_shows_nothing_of_who_made_an_entry() {
-    let (remedy, text) = said(
-        EntryKind::Manifest,
-        &Origin::Unknown("access".to_owned()),
-        &Presence::Present,
-    );
-    assert_eq!(remedy, Remedy::MoveAside);
-    assert!(text.contains("shows nothing of who made it"), "{text}");
-    assert!(text.contains("could not be read"), "{text}");
-    assert!(
-        text.contains("changed or moved while it was read"),
-        "{text}"
-    );
 }
 
 /// A name beside a moved-aside entry is a name that the layout does not give. The next run reads
@@ -722,13 +762,13 @@ fn the_parenthesis_about_a_new_name_beside_an_entry_does_not_promise_its_removal
         EntryKind::UnnamedRoot,
         EntryKind::Other,
     ] {
-        for origin in [
-            Origin::Foreign,
-            Origin::Refused("5".to_owned()),
-            Origin::Unknown("x".to_owned()),
-        ] {
+        for origin in [Origin::Foreign, Origin::Owned("S-1-5-21-1".to_owned())] {
             let (remedy, text) = said(kind, &origin, &Presence::Present);
-            assert_eq!(remedy, Remedy::MoveAside, "{kind:?} {origin:?}");
+            assert_eq!(
+                remedy,
+                Remedy::MoveAside(clearance()),
+                "{kind:?} {origin:?}"
+            );
             assert!(!text.contains("asks you to remove that"), "{text}");
             assert!(
                 text.contains("the next run reads it on its own handle"),

@@ -6,10 +6,27 @@ use std::path::Path;
 
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CASE_SENSITIVE_WHY, EntryKind, Origin, ParentCure, Presence, Standing, choose, data_ending,
-    data_made_ending, ending, parent_advice, program_keeping, program_open_advice,
-    unnamed_root_why,
+    CASE_SENSITIVE_WHY, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Standing,
+    choose, data_ending, data_made_ending, ending, parent_advice, program_keeping,
+    program_open_advice, unnamed_root_why,
 };
+
+/// An installation whose reads found nothing of the installation: the one run that may name a move.
+fn at_install() -> Grounds<'static> {
+    Grounds::new(Purpose::Install, &|| Standing::NothingFound)
+}
+
+/// Every purpose with each answer that its reads could give.
+const PURPOSES_AND_STANDINGS: [(Purpose, Standing); 8] = [
+    (Purpose::Install, Standing::NothingFound),
+    (Purpose::Install, Standing::MayBeInstalled),
+    (Purpose::Repair, Standing::NothingFound),
+    (Purpose::Repair, Standing::MayBeInstalled),
+    (Purpose::Remove, Standing::NothingFound),
+    (Purpose::Remove, Standing::MayBeInstalled),
+    (Purpose::Status, Standing::NothingFound),
+    (Purpose::Status, Standing::MayBeInstalled),
+];
 
 /// Every state that an entry's refusal can be told in.
 fn every_state() -> Vec<(EntryKind, Origin, Presence)> {
@@ -28,9 +45,11 @@ fn every_state() -> Vec<(EntryKind, Origin, Presence)> {
     let origins = [
         Origin::System,
         Origin::Foreign,
+        Origin::Owned("S-1-5-21-1-2-3-1001".to_owned()),
         Origin::Held("Windows error 32".to_owned()),
         Origin::Refused("Windows error 5".to_owned()),
         Origin::Unknown("Windows error 1".to_owned()),
+        Origin::Changed("it was another object".to_owned()),
     ];
     let manifests = [
         Presence::Present,
@@ -53,10 +72,10 @@ fn every_state() -> Vec<(EntryKind, Origin, Presence)> {
 #[test]
 fn no_ending_of_an_entry_claims_the_journal_or_what_the_entry_holds() {
     for (kind, origin, manifest) in every_state() {
-        let remedy = choose(kind, &origin, &manifest, None);
+        let remedy = choose(&at_install(), kind, &origin, &manifest, None);
         let text = ending(
             Path::new(r"D:\data\entry"),
-            remedy,
+            &remedy,
             &origin,
             kind,
             &manifest,
@@ -131,9 +150,19 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
     ] {
         let not_set = matches!(origin, Origin::Foreign | Origin::Owned(_));
         for case_sensitive in [false, true] {
-            for standing in [Standing::NothingFound, Standing::MayBeInstalled] {
-                let text = data_ending(&origin, case_sensitive, standing);
-                let what = format!("{origin:?} {case_sensitive} {standing:?}: {text}");
+            // Every purpose with every answer of the reads: only an installation whose reads found
+            // nothing has a clearance, and the answer of the reads is not even asked for any other
+            // purpose.
+            for (purpose, standing) in PURPOSES_AND_STANDINGS {
+                let reads = || standing;
+                let grounds = Grounds::new(purpose, &reads);
+                let text = data_ending(&grounds, &origin, case_sensitive);
+                let standing = if purpose == Purpose::Install {
+                    standing
+                } else {
+                    Standing::MayBeInstalled
+                };
+                let what = format!("{origin:?} {case_sensitive} {purpose:?} {standing:?}: {text}");
                 assert!(!text.contains("stay where they are"), "{what}");
                 assert!(!text.contains("The manifest and the journal"), "{what}");
                 assert_eq!(
@@ -201,9 +230,9 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
             }
         }
     }
-    let flag = data_ending(&Origin::System, true, Standing::MayBeInstalled);
+    let flag = data_ending(&at_install(), &Origin::System, true);
     assert!(flag.contains("setCaseSensitiveInfo"), "{flag}");
-    let owner = data_ending(&Origin::System, false, Standing::MayBeInstalled);
+    let owner = data_ending(&at_install(), &Origin::System, false);
     assert!(
         owner.contains(
             "Leave the system and the Administrators group as the only entries of its list"
