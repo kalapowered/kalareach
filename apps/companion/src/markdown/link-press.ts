@@ -16,18 +16,20 @@
  *   of the click: the engines differ, and a click that no pointer made (a keyboard's, a screen reader's)
  *   has a detail of 0 and adds nothing.
  * - A press is live or dead. The pressed look shows on the lit link only while the press lives, and a
- *   dead press opens nothing. For a mouse or a trackpad press on a link's own element, whose click comes
- *   from where the button is released, the look also follows the pointer: it goes out while the pointer
- *   is outside the element (within the slop) and is lit again where the pointer is back in it. It lives from the pointer down to the pointer up, and dies at the first of:
+ *   dead press opens nothing. It lives from the pointer down to the pointer up, and dies at the first of:
  *   a move past the slop, a pointer cancel, the loss of the pointer's capture, the window's loss of
- *   focus, the page's hiding, the next primary pointer down (in the pane or outside it),
- *   and a scroll of any box or of the visual viewport, or a resize of the viewport, after which a release
- *   at the press's point would no longer open the lit link (`releaseOpens`). At its death the look ends at once. The open at
- *   the click runs the same rule at the press's own point, so for a touch or a pen what lights at the
- *   press is what opens at the release. A layout that moves under a held finger with no scroll (an image
- *   that loads above the link, text that grows above it) ends nothing: the click's own check refuses the
- *   open, and the look stays until the release. Watching the content's size would end presses whenever
- *   an answer streams below the link, which is the usual state.
+ *   focus, the page's hiding, the next primary pointer down (in the pane or outside it) and, for a touch
+ *   or a pen only, a scroll of any box or of the visual viewport, or a resize of the viewport, after
+ *   which a release at the press's point would open nothing (`releaseOpens`). At its death the look ends
+ *   at once. A mouse's or a trackpad's record never gives an open (`decide` stands for it), so no scroll
+ *   ends its press. Its click comes from where the button is released and goes to the engine's target, so
+ *   its look follows the pointer, at each move and at each scroll: lit while the pointer lies in the
+ *   link's own element, out where it has left it (within the slop), lit again where it is back.
+ * - The open at the click runs the same rule at the press's own point, so for a touch or a pen what
+ *   lights at the press is what opens at the release. A layout that moves under a held finger with no
+ *   scroll (an image that loads above the link, text that grows above it) ends nothing: the click's own
+ *   check refuses the open, and the look stays until the release. Watching the content's size would end
+ *   presses whenever an answer streams below the link, which is the usual state.
  *
  * Where the listeners stand: all on the document (the window's blur excepted), in the capture phase for
  * the pointer down and the click. A press outside the pane must end the pane's record and its look, so
@@ -125,8 +127,9 @@ export function startLinkPress(element: HTMLElement): () => void {
     if (!opensByRule(press.pointerType)) light(releaseOpens(element, press) ? press.start.link : null)
   }
   // The scroll of any box (scroll events do not bubble, so the capture phase on the document hears them
-  // all) and the visual viewport's scroll and resize move the page under a held finger: the look is kept
-  // only where a release at the press's point would still open the lit link (`releaseOpens`).
+  // all) and the visual viewport's scroll and resize move the page under a held pointer. A touch's or a pen's
+  // press is kept, with its look, only where a release would still open the lit link (`releaseOpens`), and
+  // ends otherwise. A mouse's or a trackpad's look is lit or put out by the same answer, as at a move.
   const recheck = (): void => {
     if (press === null) return
     const opens = releaseOpens(element, press)
@@ -258,9 +261,11 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
  *   one for a touch or a pen, whose click comes from where it went down, and the pointer's current one
  *   for a mouse or a trackpad, whose click comes from where the button is released;
  * - the nearest-words rule at the press's first point, for a pointer that `opensByRule` (a touch or a
- *   pen) only, and only where the page's hit test names plain text of the pane there, since a control, a
- *   link or an element outside the pane that lies under the point takes the click: a mouse's click on
- *   plain text opens nothing.
+ *   pen) only: a mouse's click on plain text opens nothing. The page's hit test at that point says what
+ *   the click names. Where it names the lit link's own element and the link still opens what it opened at
+ *   the press, a release opens it (the engine's click) and the press is kept. Where it names plain text of
+ *   the pane, the rule decides. Where it names another control, another link or an element outside the
+ *   pane, that element takes the click and the press is not kept.
  *
  * Two paths call it: `move`, for a mouse or a trackpad on a link's own element, to light and take off
  * the look as the pointer crosses the element's edge, and `recheck`, at each scroll or resize while a lit
@@ -362,12 +367,13 @@ const OPEN: Rect = { left: -Infinity, top: -Infinity, right: Infinity, bottom: I
  * near the point, so a message of some thousand links reads every one of its link boxes at each press
  * and each click. Besides those boxes, each press and each click finds the message of every link of
  * the pane with `closest`: a walk of the tree, not a layout read. While a press that lit a link lives, each
- * scroll event of any box in the page and each scroll or resize of the visual viewport asks `releaseOpens`.
- * A press on a link's own element that still lies under the point (`liesInView`) reads that element's view
- * and its box and returns, with no layout read; any other press, a press on plain text or an own-element
- * press that no longer lies under the point, also asks the page's hit test at the press's point and, for a
- * touch or a pen, reads this layout again there. A mouse's or a trackpad's move on a link's own element
- * reads the element's view as well; a touch's or a pen's move, the release and a cancel read nothing.
+ * scroll event of any box in the page and each scroll or resize of the visual viewport asks `releaseOpens`,
+ * and so does each move of a mouse or a trackpad. A press on a link's own element reads that element's view
+ * and its box (`liesInView`), and returns with no further read where the point lies in it. For a mouse or
+ * a trackpad that is all: the rest of the answer is no, with no hit test. For a touch or a pen the answer
+ * goes on to the page's hit test at the press's point (no layout read) and returns where the hit lies in
+ * the lit link's own element; otherwise a hit on plain text of the pane reads this layout again there. A
+ * touch's or a pen's move, the release and a cancel read nothing.
  *
  * A message is near when the point lies within the radius of the message's box on the vertical axis
  * only. All messages share one horizontal extent, the stream's, and a link in a line wider than it
