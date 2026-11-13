@@ -604,18 +604,16 @@ impl Child {
     /// Waits for the child to end, up to a bound and until the stop is set.
     ///
     /// Returns the exit code, or `None` when the bound ran out first or the stop came first; the
-    /// caller looks at the stop to tell the two apart. The stop's event is the first handle, so a
-    /// child that ended at the same moment does not win over a stop that is set.
+    /// caller looks at the stop to tell the two apart. The stop is waited on first, so a child
+    /// that ended at the same moment does not win over a stop that is set.
     ///
     /// # Errors
     ///
     /// Returns the platform's error when the wait or the exit code fails.
     pub fn wait_or_stop(&self, bound: Duration, stop: &Stop) -> Result<Option<u32>, ffi::Error> {
         let milliseconds = ffi::milliseconds(bound, u32::MAX);
-        let handles = [stop.event(), self.process.raw()];
-        // text: launch_wait_or_stop-1
-        match ffi::wait_any(
-            &handles,
+        match stop.wait_for(
+            &[self.process.raw()],
             milliseconds,
             "waiting for the child to end or the stop",
         )? {

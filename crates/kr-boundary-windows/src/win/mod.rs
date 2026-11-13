@@ -24,6 +24,7 @@
 //! | `broker` | The broker service |
 //! | `install` | The installation, its repair and its removal |
 //! | `setup` | The setup program's command line |
+//! | `stop` | The broker's stop event, and every wait that includes it |
 
 pub mod account;
 pub mod acl;
@@ -44,6 +45,7 @@ pub mod root;
 pub mod sd;
 pub mod service;
 pub mod setup;
+mod stop;
 pub mod token;
 pub mod verify;
 pub mod walk;
