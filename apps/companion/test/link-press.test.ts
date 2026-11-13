@@ -870,8 +870,14 @@ describe('the look of a mouse press on a link’s own element as the pointer mov
       start(pane)
       clock(100)
       fire('pointerdown', pointer(links[0], mouse(138, { pointerType })))
+      reads = []
       fire('pointermove', pointer(text, mouse(143, { pointerType })))
       expect(isLit(links[0]), `the look of a ${pointerType} 5 px to the right`).toBe(true)
+      expect(reads, `the boxes read at the move of a ${pointerType}`).toEqual([])
+      // A release comes from the press's first point: a scroll of 1 px leaves the element under it, though the pointer is past it.
+      scrolledSideways(1)
+      fire('scroll', {} as Event)
+      expect(isLit(links[0]), `the look of a ${pointerType} after a scroll that leaves the element under the first point`).toBe(true)
     })
   }
 })
