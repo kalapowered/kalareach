@@ -201,19 +201,38 @@ mod tests {
         Arc::new(Handle::new(event, "making a case's event").unwrap())
     }
 
+    /// What `wait` answered and how long it took, or an error where it had not answered when `limit`
+    /// ran out: a wait that does not end fails the case by that answer and does not hang it. The
+    /// wait that did not end is left to the end of the process.
+    fn answered_within<T: Send + 'static>(
+        limit: Duration,
+        wait: impl FnOnce() -> T + Send + 'static,
+    ) -> std::result::Result<(Duration, T), std::sync::mpsc::RecvTimeoutError> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let answer = wait();
+            let _ = sender.send((started.elapsed(), answer));
+        });
+        receiver.recv_timeout(limit)
+    }
+
     /// Runs `wait` while the stop's set fails 300 ms in (the failure is kept and the event is never
-    /// signalled), and says how long the wait took and what it answered.
-    fn while_the_set_fails<T>(stop: &Arc<Stop>, wait: impl FnOnce() -> T) -> (Duration, T) {
+    /// signalled), and gives its answer and how long it took, or an error where it did not end
+    /// within three slices.
+    fn while_the_set_fails<T: Send + 'static>(
+        stop: &Arc<Stop>,
+        wait: impl FnOnce(Arc<Stop>) -> T + Send + 'static,
+    ) -> std::result::Result<(Duration, T), std::sync::mpsc::RecvTimeoutError> {
         let late = Arc::clone(stop);
         let failer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             late.fail_the_set_for_a_case();
         });
-        let started = Instant::now();
-        let answer = wait();
-        let took = started.elapsed();
+        let waiting = Arc::clone(stop);
+        let answer = answered_within(3 * STOP_SLICE, move || wait(waiting));
         failer.join().unwrap();
-        (took, answer)
+        answer
     }
 
     fn the_stop_is_read_as_not_set(stop: &Stop) {
@@ -225,8 +244,8 @@ mod tests {
         assert!(stop.unread().is_some());
     }
 
-    /// A pause that the stop must end, with a bound of fifteen minutes or none, ends within two
-    /// slices of a stop that could not be set.
+    /// A pause that the stop must end, with a bound of fifteen minutes or a bound of weeks, ends
+    /// within two slices of a stop that could not be set.
     #[test]
     fn a_wait_on_the_stop_ends_within_two_slices_of_a_stop_that_could_not_be_set() {
         for pause in [
@@ -234,7 +253,9 @@ mod tests {
             Duration::from_secs(u64::from(u32::MAX)),
         ] {
             let stop = Stop::new().unwrap();
-            let (took, set) = while_the_set_fails(&stop, || stop.wait(pause));
+            let Ok((took, set)) = while_the_set_fails(&stop, move |stop| stop.wait(pause)) else {
+                panic!("{pause:?}: the wait did not end within three slices");
+            };
             assert!(set, "a failed set reads as the stop");
             assert!(took < 2 * STOP_SLICE, "{pause:?}: {took:?}");
             the_stop_is_read_as_not_set(&stop);
@@ -249,12 +270,15 @@ mod tests {
         for bound in [900_000, INFINITE] {
             let stop = Stop::new().unwrap();
             let other = another_event();
-            let (took, waited) = while_the_set_fails(&stop, || {
+            let Ok((took, waited)) = while_the_set_fails(&stop, move |stop| {
                 stop.wait_for(&[other.raw()], bound, "waiting in a case")
-            });
-            assert!(
-                matches!(waited, Ok(ffi::Waited::Signalled(0))),
-                "{bound}: {waited:?}"
+            }) else {
+                panic!("{bound}: the wait did not end within three slices");
+            };
+            assert_eq!(
+                waited.unwrap(),
+                ffi::Waited::Signalled(0),
+                "{bound}: the stop is the answer"
             );
             assert!(took < 2 * STOP_SLICE, "{bound}: {took:?}");
             the_stop_is_read_as_not_set(&stop);

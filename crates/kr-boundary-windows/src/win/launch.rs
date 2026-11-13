@@ -1115,8 +1115,9 @@ mod tests {
         }
     }
 
-    /// A wait for a child that does not end, with a bound of fifteen minutes or none, ends within
-    /// two slices of a stop that could not be set, and says nothing of the child's end.
+    /// A wait for a child that does not end, with a bound of fifteen minutes or a bound of weeks,
+    /// ends within two slices of a stop that could not be set, and says nothing of the child's end.
+    /// A wait that does not end fails the case by the answer of its thread and does not hang it.
     #[test]
     fn a_wait_for_a_child_or_the_stop_ends_within_two_slices_of_a_stop_that_could_not_be_set() {
         for bound in [
@@ -1130,10 +1131,18 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(300));
                 late.fail_the_set_for_a_case();
             });
+            let waiting = Arc::clone(&stop);
+            let (sender, receiver) = std::sync::mpsc::channel();
             let started = Instant::now();
-            let waited = child.wait_or_stop(bound, &stop);
-            let took = started.elapsed();
+            std::thread::spawn(move || {
+                let waited = child.wait_or_stop(bound, &waiting);
+                let _ = sender.send((started.elapsed(), waited));
+            });
+            let answer = receiver.recv_timeout(3 * super::super::stop::STOP_SLICE);
             failer.join().unwrap();
+            let Ok((took, waited)) = answer else {
+                panic!("{bound:?}: the wait did not end within three slices");
+            };
             assert!(matches!(waited, Ok(None)), "{bound:?}: {waited:?}");
             assert!(
                 took < 2 * super::super::stop::STOP_SLICE,
