@@ -46,8 +46,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, NtSetSecurityObject,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
-    GetLastError, HANDLE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND,
+    ERROR_SHARING_VIOLATION, GetLastError, HANDLE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
@@ -57,9 +57,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TAG_INFO, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128,
     FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FileAttributeTagInfo, FileCaseSensitiveInfo, FileIdInfo,
-    GetFileInformationByHandleEx, GetFileSizeEx, OPEN_EXISTING,
+    GetFileInformationByHandleEx, GetFileSizeEx, GetVolumeInformationByHandleW, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::SystemServices::FILE_CASE_SENSITIVE_SEARCH;
 
 use super::acl;
 use super::applocker::{self, Channel};
@@ -775,6 +776,57 @@ fn data_failure(paths: &Paths, error: Error) -> Error {
     }
 }
 
+/// The refusal of a data directory whose check on its open handle could not finish, because a read
+/// of it failed: the words name the read and its error, and nothing more. The failed read showed
+/// nothing of who made the directory or of what it holds, so the words give no step and no forecast.
+/// Any other kind of failure is returned as it is.
+fn data_unread(paths: &Paths, error: Error) -> Error {
+    match error {
+        Error::Win(failure) => {
+            // text: data_unread-1
+            Error::Refused(format!(
+                "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). The setup program goes no further with it, because a read of it failed ({failure}) and showed nothing of what it is.",
+                paths.data.display()
+            ))
+        }
+        other => other,
+    }
+}
+
+/// What the data directory must be, read on its open handle: a plain directory, and what
+/// [`check_data_object`] requires. Returns the reason that it is not, with what its handle shows of
+/// who made it.
+fn data_directory_reason(
+    paths: &Paths,
+    handle: &ffi::Handle,
+) -> Result<Option<(String, Origin)>, Error> {
+    if let Some(why) = not_a_plain_directory(handle, &paths.data.display().to_string())? {
+        return Ok(Some((why.to_owned(), Origin::Foreign)));
+    }
+    Ok(check_data_object(handle)?.map(|why| (why, origin_of(handle))))
+}
+
+/// The refusal of a data directory that this run made and then refused: the handles are closed, what
+/// the run made (the directory, and the folder above it where the run made that too) is removed
+/// while it holds nothing else, and the words say what was done and what could not be.
+fn refuse_made_data_directory(
+    paths: &Paths,
+    parent: ffi::Handle,
+    made: ffi::Handle,
+    why: &str,
+    parent_made: bool,
+) -> Error {
+    drop(made);
+    drop(parent);
+    let stayed = records::remove_made(&paths.data, parent_made.then(|| paths.data_parent()));
+    // text: data_made_refusal-1
+    Error::Refused(format!(
+        "{} is the boundary's data directory. This run made it, and it is refused because {why}. {}",
+        paths.data.display(),
+        remedy::data_made_ending(&stayed)
+    ))
+}
+
 /// The refusal of what is inside the data directory: a child that is not the installation's own, or
 /// is not what the manifest says.
 fn child_refusal(paths: &Paths, name: &OsStr, why: &str, origin: &Origin) -> Error {
@@ -950,8 +1002,11 @@ const ADMINISTRATORS: &str = "S-1-5-32-544";
 
 /// The reason the installation cannot compare a directory's names as it does: the directory takes
 /// two names that differ only by case for two entries, and the listing and the checks here take
-/// them for one. A platform that does not answer the read has not shown that the directory has no
-/// such flag: the read's error is the answer.
+/// them for one. The read has three answers: the flag is set, the flag is clear, and the read
+/// failed. A failed read is the error, whatever its code, with one exception: where the system
+/// answers `ERROR_INVALID_PARAMETER` (it does not know the class for this volume), a second read of
+/// the volume's own flags can show that the volume has no case sensitive search, so that no
+/// directory on it separates names by case; only then does the answer count as clear.
 fn case_sensitive_reason(handle: &ffi::Handle) -> Result<Option<String>, Error> {
     let mut info = FILE_CASE_SENSITIVE_INFO { Flags: 0 };
     // SAFETY: the handle is open and the record is the size the class takes.
@@ -967,15 +1022,55 @@ fn case_sensitive_reason(handle: &ffi::Handle) -> Result<Option<String>, Error> 
         // SAFETY: reads the calling thread's last error.
         let code = unsafe { GetLastError() };
         // text: install_case_sensitive_reason-1
-        return Err(ffi::error(
+        let unread = ffi::error(
             code,
             "reading whether the data directory separates names by case",
-        )
-        .into());
+        );
+        if code != ERROR_INVALID_PARAMETER {
+            return Err(unread.into());
+        }
+        return match volume_searches_by_case(handle) {
+            Ok(false) => Ok(None),
+            Ok(true) => Err(unread.into()),
+            Err(volume) => {
+                // text: install_case_sensitive_reason-2
+                Err(ffi::error(volume.code, format!("{unread}, and then {}", volume.what)).into())
+            }
+        };
     }
     // The flag that says the directory separates names that differ only by case.
     const CASE_SENSITIVE_DIRECTORY: u32 = 1;
     Ok((info.Flags & CASE_SENSITIVE_DIRECTORY != 0).then(|| remedy::CASE_SENSITIVE_WHY.to_owned()))
+}
+
+/// Whether the volume that holds the object on `handle` supports case sensitive search, which is
+/// the flag `FILE_CASE_SENSITIVE_SEARCH` of `GetVolumeInformationByHandleW`. A volume without it
+/// cannot hold two names that differ only by case. NTFS sets it, so a system that does not know
+/// the per-directory class and holds the directory on NTFS gets `true` here, and its read stays an
+/// error.
+fn volume_searches_by_case(handle: &ffi::Handle) -> ffi::Result<bool> {
+    let mut flags = 0_u32;
+    // SAFETY: the handle is open, the call writes the flags and nothing else, and every other
+    // output is not asked for.
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            handle.raw(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0
+    {
+        // text: install_volume_searches_by_case-1
+        return Err(ffi::last(
+            "reading the flags of the volume that holds the data directory",
+        ));
+    }
+    Ok(flags & FILE_CASE_SENSITIVE_SEARCH != 0)
 }
 
 /// What the data directory itself must be on its handle: a directory that compares names without
@@ -2371,11 +2466,10 @@ fn inspect_existing_data(
     else {
         return Ok(None);
     };
-    if let Some(why) = not_a_plain_directory(&handle, &paths.data.display().to_string())? {
-        return Err(data_refusal(paths, why, &Origin::Foreign));
-    }
-    if let Some(why) = check_data_object(&handle).map_err(|error| data_failure(paths, error))? {
-        return Err(data_refusal(paths, &why, &origin_of(&handle)));
+    match data_directory_reason(paths, &handle) {
+        Ok(None) => {}
+        Ok(Some((why, origin))) => return Err(data_refusal(paths, &why, &origin)),
+        Err(error) => return Err(data_unread(paths, error)),
     }
     let data = held_directory(handle)?;
     let inspected = inspect_data_directory(paths, &data)?;
@@ -2398,8 +2492,8 @@ fn inspect_existing_data(
 /// Returns [`Error::Refused`] naming the reason when the folder, the directory or anything in it is
 /// not the installation's own, and the platform's error when a call fails.
 pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
-    let held = match check_data_parent(paths)? {
-        Some(held) => held,
+    let (held, parent_made) = match check_data_parent(paths)? {
+        Some(held) => (held, false),
         None => {
             // The words say that this run made the folder only where its own call did: a folder
             // that appeared between the look and the call is another program's, and the run has
@@ -2410,7 +2504,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
             } else {
                 remedy::Stage::Before
             };
-            check_data_parent_at(paths, stage)?.ok_or_else(|| {
+            let held = check_data_parent_at(paths, stage)?.ok_or_else(|| {
                 // text: make_data_directory-1
                 Error::Failed(if made {
                     format!(
@@ -2423,7 +2517,8 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
                         paths.data_parent().display()
                     )
                 })
-            })?
+            })?;
+            (held, made)
         }
     };
     let name = paths
@@ -2443,11 +2538,31 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
     )?
     // text: make_data_directory-3
     .ok_or_else(|| Error::Failed("the data directory was made and is gone again".to_owned()))?;
-    if let Some(why) = not_a_plain_directory(&made, &paths.data.display().to_string())? {
-        return Err(data_refusal(paths, why, &Origin::Foreign));
-    }
-    if let Some(why) = check_data_object(&made).map_err(|error| data_failure(paths, error))? {
-        return Err(data_refusal(paths, &why, &origin_of(&made)));
+    let verdict = data_directory_reason(paths, &made);
+    if created {
+        // A directory that this run made and then refuses is taken away again, with the folder
+        // above it where the run made that too, so the refusal leaves nothing of the run behind
+        // and the removal that undoes the installation finds nothing to meet it with.
+        let why = match verdict {
+            Ok(None) => None,
+            Ok(Some((why, _))) => Some(why),
+            Err(error) => Some(format!("a read of it failed ({error})")),
+        };
+        if let Some(why) = why {
+            return Err(refuse_made_data_directory(
+                paths,
+                held,
+                made,
+                &why,
+                parent_made,
+            ));
+        }
+    } else {
+        match verdict {
+            Ok(None) => {}
+            Ok(Some((why, origin))) => return Err(data_refusal(paths, &why, &origin)),
+            Err(error) => return Err(data_unread(paths, error)),
+        }
     }
     let data = held_directory(made)?;
     let inspected = if created {

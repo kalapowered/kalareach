@@ -330,6 +330,19 @@ pub fn remove_empty(data: &Path) -> Vec<String> {
     }
 }
 
+/// Removes what a run made and then refused: the data directory, and after it the folder above it,
+/// where the run made that folder too. Each goes only while it is empty, so what another program put
+/// in either stays, and is named. Returns what could not be removed, with the reason; nothing when
+/// everything the run made is gone.
+// text: remove_made
+pub fn remove_made(data: &Path, parent: Option<&Path>) -> Vec<String> {
+    let mut stayed = remove_empty(data);
+    if let Some(parent) = parent.filter(|_| stayed.is_empty()) {
+        stayed = remove_empty(parent);
+    }
+    stayed
+}
+
 /// Which of the data directory's `journal` and `run` directories the removal's inspection opened
 /// and approved. A directory that is not marked was not there when it looked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

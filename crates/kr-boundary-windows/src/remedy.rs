@@ -946,6 +946,23 @@ pub fn data_ending(origin: &Origin, case_sensitive: bool) -> &'static str {
     }
 }
 
+/// The words that end the refusal of a data directory that this run made itself: what the run did
+/// with what it made. They name no step, since a refusal after the run made the directory leaves
+/// nothing of the run for the person to move or to correct; `stayed` is what the run could not
+/// remove, each with its reason.
+#[must_use]
+// text: data_made_ending
+pub fn data_made_ending(stayed: &[String]) -> String {
+    if stayed.is_empty() {
+        "This run removed what it made, so nothing of it is left.".to_owned()
+    } else {
+        format!(
+            "This run could not remove what it made: {}.",
+            stayed.join("; ")
+        )
+    }
+}
+
 /// Why a private root is refused when no journal names it: what the journals say, and nothing of
 /// what the broker is doing. `damaged` holds the invocations whose journal is damaged, each with
 /// its identifier and what is wrong with it: those journals were read only up to the damage.
