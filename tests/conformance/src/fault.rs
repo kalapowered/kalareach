@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 
+use crate::libtest::Outcome;
 use crate::plan::Step;
 use crate::run::{self, Executed, Place};
 use crate::workspace::Package;
@@ -43,12 +44,15 @@ const CODE_SIGNATURE: u32 = 0x1d;
 /// load commands of any program the build makes.
 const HEAD_BYTES: usize = 65_536;
 
-/// How deep below the target directory a file is looked for: the target triple, the profile, the
-/// build scripts' directory and the directory of one script.
-const DEPTH: usize = 4;
+/// How much time, in all, the report spends on the second runs of steps. A step whose first run
+/// took longer than what is left is not run again: the report's own limit would end the run
+/// before it wrote its result, and a run that ends red with its result is better than one that
+/// ends with none.
+pub const RERUN_BUDGET: Duration = Duration::from_secs(30 * 60);
 
-/// Directories of the target directory that hold no program the linker wrote.
-const SKIPPED: [&str; 3] = ["incremental", "out", "native"];
+/// How long a program that was asked to end is given before it is killed.
+#[cfg(target_os = "macos")]
+const GRACE: Duration = Duration::from_secs(5);
 
 /// The words of the kernel's lines that say the storage under a volume failed to take a write.
 const STORAGE_WORDS: [&str; 4] = [
@@ -117,8 +121,12 @@ pub struct FileFacts {
     pub head: String,
     /// What is wrong with its Mach-O header, when something is.
     pub shape: Option<String>,
-    /// The result of the system's check of its signature, when the check ran.
+    /// The result of the system's check of its signature, when the check ran: it runs on a
+    /// Mach-O program whose header is whole, and on nothing else.
     pub signature: Option<Result<(), String>>,
+    /// Why the file could not be read, when it could not. A file that could not be read is not
+    /// shown to be damaged.
+    pub unread: Option<String>,
 }
 
 impl FileFacts {
@@ -186,8 +194,9 @@ fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
 }
 
 /// What is wrong with a Mach-O program from its first bytes and its length, when something is: it
-/// is empty, its header is zeros or something else, or a segment, the signature or its load
-/// commands lie beyond the end of the file. A script, or a program of another system, is not read.
+/// is empty, its first bytes are zeros, or a segment, the signature or its load commands lie
+/// beyond the end of the file. A script, a program of another system and any other file are not
+/// read.
 #[must_use]
 pub fn macho_problem(head: &[u8], length: u64) -> Option<String> {
     if length == 0 {
@@ -200,20 +209,20 @@ pub fn macho_problem(head: &[u8], length: u64) -> Option<String> {
     {
         return None;
     }
-    let (Some(magic), Some(commands), Some(size)) =
-        (u32_at(head, 0), u32_at(head, 16), u32_at(head, 20))
-    else {
+    if u32_at(head, 0) != Some(MACH_O_64) {
+        // A page the disk lost reads as zeros. Any other file is not one the linker wrote here,
+        // and is not shown to be damaged.
+        return head
+            .iter()
+            .take(32)
+            .all(|byte| *byte == 0)
+            .then(|| "the first 32 bytes are all zero".to_owned());
+    }
+    let (Some(commands), Some(size)) = (u32_at(head, 16), u32_at(head, 20)) else {
         return Some(format!(
             "the file is {length} bytes, too short for a Mach-O header"
         ));
     };
-    if magic != MACH_O_64 {
-        return Some(if head.iter().take(32).all(|byte| *byte == 0) {
-            "the first 32 bytes are all zero".to_owned()
-        } else {
-            format!("the first four bytes, {magic:08x}, are not a Mach-O header")
-        });
-    }
     let commands_end = 32 + u64::from(size);
     if commands_end > length {
         return Some(format!(
@@ -297,7 +306,7 @@ pub fn facts_of(path: &Path, now: SystemTime) -> FileFacts {
     match head_of(path) {
         Ok((head, length)) => {
             let shape = macho_problem(&head, length);
-            let signature = if shape.is_none() {
+            let signature = if shape.is_none() && u32_at(&head, 0) == Some(MACH_O_64) {
                 signature_check(path)
             } else {
                 None
@@ -314,6 +323,7 @@ pub fn facts_of(path: &Path, now: SystemTime) -> FileFacts {
                     .join(" "),
                 shape,
                 signature,
+                unread: None,
             }
         }
         Err(error) => FileFacts {
@@ -321,8 +331,9 @@ pub fn facts_of(path: &Path, now: SystemTime) -> FileFacts {
             size: None,
             age,
             head: String::new(),
-            shape: Some(format!("the file could not be read: {error}")),
+            shape: None,
             signature: None,
+            unread: Some(format!("the file could not be read: {error}")),
         },
     }
 }
@@ -334,6 +345,38 @@ pub fn count_storage_errors(text: &str) -> usize {
         .filter(|line| line.contains("kernel["))
         .filter(|line| STORAGE_WORDS.iter().any(|word| line.contains(word)))
         .count()
+}
+
+/// How many minutes of the kernel's log are read: from a little before the earliest of the files
+/// that could not be started was written, up to now, and no more than `LOG_MINUTES`. The length of
+/// the step is not part of it: a storage error from before the file was written says nothing of it.
+fn window_minutes(files: &[FileFacts]) -> u64 {
+    let earliest = files
+        .iter()
+        .filter_map(|file| file.age)
+        .max()
+        .unwrap_or_default();
+    (earliest.as_secs() / 60 + 3).min(LOG_MINUTES)
+}
+
+/// Asks a process to end, and kills it when it has not ended after `GRACE`. `sudo` passes the
+/// request on to the program it runs; it cannot pass on a kill, which would leave that program
+/// running.
+#[cfg(target_os = "macos")]
+fn end_process(child: &mut std::process::Child) {
+    let asked = Command::new("/bin/kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .is_ok_and(|status| status.success());
+    let asked_at = std::time::Instant::now();
+    while asked && asked_at.elapsed() < GRACE {
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Writes the kernel's storage lines of the last `minutes` to `out`.
@@ -369,8 +412,7 @@ fn storage_log(minutes: u64, out: &Path) -> Result<(), String> {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if started.elapsed() > LOG_LIMIT => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    end_process(&mut child);
                     return Err("the kernel's log was not read in time".to_owned());
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(200)),
@@ -418,6 +460,8 @@ fn reason_for(
     for file in files {
         if let Some(shape) = &file.shape {
             parts.push(format!("{}: {shape}", named(file)));
+        } else if let Some(why) = &file.unread {
+            parts.push(format!("{}: {why}", named(file)));
         } else if let Some(Err(why)) = &file.signature {
             parts.push(format!(
                 "{}: its signature does not check ({why})",
@@ -435,7 +479,7 @@ fn reason_for(
     match cause {
         Cause::RunnerDisk => format!("the runner's disk: {}", parts.join("; ")),
         Cause::Unexplained => format!(
-            "not shown to be the runner's disk: the file is whole and its signature is {}; {}",
+            "not shown to be the runner's disk: the file shows no damage and its signature is {}; {}",
             if files
                 .iter()
                 .all(|file| matches!(file.signature, Some(Ok(()))))
@@ -467,42 +511,96 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-fn walk(dir: &Path, depth: usize, began: SystemTime, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// The profile directories of a target directory, which are the directories one level down, or two
+/// where the build names a target triple, that hold Cargo's records of what it built.
+fn profiles_of(target: &Path) -> Vec<PathBuf> {
+    let is_directory =
+        |entry: &std::fs::DirEntry| entry.file_type().is_ok_and(|kind| kind.is_dir());
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(target) else {
+        return found;
+    };
+    for entry in entries.flatten().filter(is_directory) {
+        let path = entry.path();
+        if path.join(".fingerprint").is_dir() {
+            found.push(path);
+        } else if let Ok(inner) = std::fs::read_dir(&path) {
+            found.extend(
+                inner
+                    .flatten()
+                    .filter(is_directory)
+                    .map(|deeper| deeper.path())
+                    .filter(|deeper| deeper.join(".fingerprint").is_dir()),
+            );
+        }
+    }
+    found
+}
+
+/// The profile directory that holds `file` as a program of Cargo's making: the file is in the
+/// profile directory itself (a linked program), in its `deps` (a unit's output), or in a unit's
+/// directory under its `build` (a build script). A file anywhere else under the target directory
+/// is not one that a build wrote.
+fn profile_of_output(target: &Path, file: &Path) -> Option<PathBuf> {
+    let is_profile = |directory: &Path| {
+        directory.starts_with(target)
+            && directory != target
+            && directory.join(".fingerprint").is_dir()
+    };
+    let parent = file.parent()?;
+    if is_profile(parent) {
+        return Some(parent.to_path_buf());
+    }
+    let above = parent.parent()?;
+    if parent.file_name().is_some_and(|name| name == "deps") && is_profile(above) {
+        return Some(above.to_path_buf());
+    }
+    let profile = above.parent()?;
+    (above.file_name().is_some_and(|name| name == "build") && is_profile(profile))
+        .then(|| profile.to_path_buf())
+}
+
+/// Adds the programs of `directory`, written at or after `began`, whose Mach-O header shows them
+/// empty or cut short.
+fn scan(directory: &Path, began: SystemTime, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) || path.extension().is_some() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        if kind.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if depth < DEPTH && !name.starts_with('.') && !SKIPPED.contains(&name.as_ref()) {
-                walk(&path, depth + 1, began, found);
-            }
-        } else if kind.is_file() && path.extension().is_none() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            let recent = metadata.modified().is_ok_and(|written| written >= began);
-            if recent
-                && is_executable(&metadata)
-                && head_of(&path).is_ok_and(|(head, length)| macho_problem(&head, length).is_some())
-            {
-                found.push(path);
-            }
+        let recent = metadata.modified().is_ok_and(|written| written >= began);
+        if recent
+            && is_executable(&metadata)
+            && head_of(&path).is_ok_and(|(head, length)| macho_problem(&head, length).is_some())
+        {
+            found.push(path);
         }
     }
 }
 
-/// The programs under `target` written since `began` whose Mach-O header shows them empty or cut
-/// short: the files of the same burst that no log named yet.
+/// The programs written since `began` whose Mach-O header shows them empty or cut short, in the
+/// places a build puts programs: each profile directory, its `deps` and each unit's directory
+/// under its `build`. They are the files of the same burst that no log named yet.
 #[must_use]
 pub fn damaged_since(target: &Path, began: SystemTime) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    walk(target, 0, began, &mut found);
+    for profile in profiles_of(target) {
+        scan(&profile, began, &mut found);
+        scan(&profile.join("deps"), began, &mut found);
+        if let Ok(units) = std::fs::read_dir(profile.join("build")) {
+            for unit in units.flatten() {
+                if unit.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    scan(&unit.path(), began, &mut found);
+                }
+            }
+        }
+    }
     found.sort();
     found
 }
@@ -514,34 +612,47 @@ fn hash_of(name: &str) -> Option<&str> {
     (hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hash)
 }
 
-fn remove_tree(path: &Path, removed: &mut Vec<PathBuf>) {
-    if std::fs::remove_dir_all(path).is_ok() {
+/// Whether `path` is in a directory that lies inside `target`, with every link on the way to it
+/// followed: a removal of something in a directory that a link leads out of would remove what the
+/// link points at.
+fn within(target: &Path, path: &Path) -> bool {
+    let (Ok(real), Some(parent)) = (target.canonicalize(), path.parent()) else {
+        return false;
+    };
+    parent
+        .canonicalize()
+        .is_ok_and(|parent| parent.starts_with(real))
+}
+
+/// Removes the directory and what is in it. A link is removed, never what it leads to.
+fn remove_tree(target: &Path, path: &Path, removed: &mut Vec<PathBuf>) {
+    if within(target, path) && std::fs::remove_dir_all(path).is_ok() {
         removed.push(path.to_path_buf());
     }
 }
 
-fn remove_one(path: &Path, removed: &mut Vec<PathBuf>) {
-    if std::fs::remove_file(path).is_ok() {
+fn remove_one(target: &Path, path: &Path, removed: &mut Vec<PathBuf>) {
+    if within(target, path) && std::fs::remove_file(path).is_ok() {
         removed.push(path.to_path_buf());
     }
 }
 
 /// Removes every file of the unit with `hash` in the profile directory's `deps`, and the unit's
 /// records of having been built.
-fn remove_unit(profile: &Path, hash: &str, removed: &mut Vec<PathBuf>) {
+fn remove_unit(target: &Path, profile: &Path, hash: &str, removed: &mut Vec<PathBuf>) {
     let suffix = format!("-{hash}");
     if let Ok(entries) = std::fs::read_dir(profile.join("deps")) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             if name.to_string_lossy().contains(&suffix) {
-                remove_one(&entry.path(), removed);
+                remove_one(target, &entry.path(), removed);
             }
         }
     }
     if let Ok(entries) = std::fs::read_dir(profile.join(".fingerprint")) {
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().ends_with(&suffix) {
-                remove_tree(&entry.path(), removed);
+                remove_tree(target, &entry.path(), removed);
             }
         }
     }
@@ -561,16 +672,11 @@ fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
 /// Removes a damaged program and what makes Cargo take it for built, so that the next build makes
 /// it again: for a build script, its directory and the unit's records; for a program or test
 /// binary with a hash in its name, every file of that unit and its records; for a program linked
-/// into the profile directory, the file in `deps` it is a link to, and that unit.
+/// into the profile directory, the file in `deps` it is a link to, and that unit. A file that is
+/// not a program of Cargo's making, or that a link leads out of `target` to, is not removed.
 pub fn remove_damage(target: &Path, file: &Path) -> Vec<PathBuf> {
     let mut removed = Vec::new();
-    let profile = file
-        .ancestors()
-        .skip(1)
-        .take_while(|ancestor| ancestor.starts_with(target))
-        .find(|ancestor| ancestor.join(".fingerprint").is_dir());
-    let Some(profile) = profile else {
-        remove_one(file, &mut removed);
+    let Some(profile) = profile_of_output(target, file) else {
         return removed;
     };
     let unit_directory = file.parent().filter(|parent| {
@@ -580,9 +686,13 @@ pub fn remove_damage(target: &Path, file: &Path) -> Vec<PathBuf> {
     });
     if let Some(unit) = unit_directory {
         if let Some(name) = unit.file_name() {
-            remove_tree(&profile.join(".fingerprint").join(name), &mut removed);
+            remove_tree(
+                target,
+                &profile.join(".fingerprint").join(name),
+                &mut removed,
+            );
         }
-        remove_tree(unit, &mut removed);
+        remove_tree(target, unit, &mut removed);
         return removed;
     }
     let name = file
@@ -590,7 +700,7 @@ pub fn remove_damage(target: &Path, file: &Path) -> Vec<PathBuf> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     if let Some(hash) = hash_of(&name) {
-        remove_unit(profile, hash, &mut removed);
+        remove_unit(target, &profile, hash, &mut removed);
     } else if let Ok(own) = std::fs::metadata(file)
         && let Ok(entries) = std::fs::read_dir(profile.join("deps"))
     {
@@ -604,10 +714,10 @@ pub fn remove_damage(target: &Path, file: &Path) -> Vec<PathBuf> {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         for hash in linked.iter().filter_map(|name| hash_of(name)) {
-            remove_unit(profile, hash, &mut removed);
+            remove_unit(target, &profile, hash, &mut removed);
         }
     }
-    remove_one(file, &mut removed);
+    remove_one(target, file, &mut removed);
     removed
 }
 
@@ -662,7 +772,10 @@ fn facts_text(account: &Account<'_>) -> String {
             } else {
                 &file.head
             },
-            file.shape.as_deref().unwrap_or("whole"),
+            file.shape
+                .as_deref()
+                .or(file.unread.as_deref())
+                .unwrap_or("no damage found"),
             match &file.signature {
                 None => "not checked".to_owned(),
                 Some(Ok(())) => "valid".to_owned(),
@@ -694,22 +807,37 @@ fn facts_text(account: &Account<'_>) -> String {
     text
 }
 
+/// Whether a test of the step's run failed: a step in which one did has a failure of its own, which
+/// a second run could hide.
+fn has_failed_test(done: &Executed) -> bool {
+    done.binaries.iter().any(|(_, binary)| {
+        binary
+            .tests
+            .values()
+            .any(|outcome| matches!(outcome, Outcome::Failed))
+    })
+}
+
 /// Runs `step`, and once more when its first run ended in a file the linker wrote that the system
 /// would not start.
 ///
 /// The second run is the step's result, with the first run's log kept beside its own and the
 /// facts in [`Rerun`]. Where the evidence does not show the runner's disk, the step has an error
-/// and the report fails.
+/// and the report fails, and so it does where the first run's evidence could not be kept. The file
+/// has to be a program of Cargo's making that the step wrote. A step in which a test failed is not
+/// run again, and neither is one whose first run took longer than what `budget`, the time the
+/// report leaves for second runs, still holds; `budget` is what the second run takes from it.
 #[must_use]
 pub fn execute(
     step: &Step,
     number: usize,
     place: &Place<'_>,
     packages: &[Package],
+    budget: &mut Duration,
     progress: &mut dyn FnMut(&str),
 ) -> Executed {
     let began = SystemTime::now();
-    let first = run::execute(step, number, place, packages);
+    let mut first = run::execute(step, number, place, packages);
     if first.error.is_none() && first.exit == Some(0) {
         return first;
     }
@@ -719,11 +847,26 @@ pub fn execute(
     };
     let named: Vec<PathBuf> = named_files(&String::from_utf8_lossy(&bytes), &target)
         .into_iter()
-        .filter(|path| written_since(path, began))
+        .filter(|path| written_since(path, began) && profile_of_output(&target, path).is_some())
         .collect();
-    if named.is_empty() {
+    if named.is_empty() || has_failed_test(&first) {
         return first;
     }
+    let took = Duration::from_secs(first.seconds);
+    if took > *budget {
+        let said = format!(
+            "a file the step linked could not be started, and the step is not run again: its first run took {} s and {} s are left for second runs",
+            took.as_secs(),
+            budget.as_secs()
+        );
+        progress(&format!("  {said}"));
+        first.error = Some(match first.error.take() {
+            Some(error) => format!("{error}; {said}"),
+            None => said,
+        });
+        return first;
+    }
+    *budget -= took;
     let now = SystemTime::now();
     let files: Vec<FileFacts> = named.iter().map(|path| facts_of(path, now)).collect();
     let swept: Vec<PathBuf> = damaged_since(&target, began)
@@ -734,19 +877,13 @@ pub fn execute(
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let mut unkept: Vec<String> = Vec::new();
     let faults = place.evidence.join("conformance").join("faults");
-    let _ = std::fs::create_dir_all(&faults);
+    if let Err(error) = std::fs::create_dir_all(&faults) {
+        unkept.push(format!("{} was not made: {error}", faults.display()));
+    }
     let kernel = faults.join(format!("{stem}.kernel.txt"));
-    let earliest = files
-        .iter()
-        .filter_map(|file| file.age)
-        .chain(std::iter::once(
-            now.duration_since(began).unwrap_or_default(),
-        ))
-        .max()
-        .unwrap_or_default();
-    let minutes = (earliest.as_secs() / 60 + 3).min(LOG_MINUTES);
-    let storage = storage_log(minutes, &kernel).and_then(|()| {
+    let storage = storage_log(window_minutes(&files), &kernel).and_then(|()| {
         std::fs::read_to_string(&kernel)
             .map(|text| count_storage_errors(&text))
             .map_err(|error| error.to_string())
@@ -758,7 +895,7 @@ pub fn execute(
         removed.extend(remove_damage(&target, path));
     }
     let facts = format!("conformance/faults/{stem}.txt");
-    let _ = std::fs::write(
+    if let Err(error) = std::fs::write(
         place.evidence.join(&facts),
         facts_text(&Account {
             step,
@@ -771,21 +908,28 @@ pub fn execute(
             reason: &reason,
             removed: &removed,
         }),
-    );
+    ) {
+        unkept.push(format!("{facts} was not written: {error}"));
+    }
     let logs = place.evidence.join("conformance").join("logs");
     let first_log = format!("conformance/logs/{stem}.first-run.log");
     let moved = std::fs::rename(
         place.evidence.join(&first.log),
         place.evidence.join(&first_log),
     );
-    let _ = std::fs::rename(
+    if let Err(error) = std::fs::rename(
         logs.join(format!("{stem}.records")),
         logs.join(format!("{stem}.first-run.records")),
-    );
-    let first_log = if moved.is_ok() {
-        first_log
-    } else {
-        first.log.clone()
+    ) && error.kind() != std::io::ErrorKind::NotFound
+    {
+        unkept.push(format!("the first run's records were not kept: {error}"));
+    }
+    let first_log = match moved {
+        Ok(()) => first_log,
+        Err(error) => {
+            unkept.push(format!("the first run's log was not kept: {error}"));
+            first.log.clone()
+        }
     };
     let relative: Vec<String> = named
         .iter()
@@ -804,6 +948,16 @@ pub fn execute(
     if cause == Cause::Unexplained {
         let said = format!(
             "a file the step linked could not be started, and it was {reason}: the cause may be this repository's"
+        );
+        second.error = Some(match second.error.take() {
+            Some(error) => format!("{error}; {said}"),
+            None => said,
+        });
+    }
+    if !unkept.is_empty() {
+        let said = format!(
+            "the first run's evidence was not kept: {}",
+            unkept.join("; ")
         );
         second.error = Some(match second.error.take() {
             Some(error) => format!("{error}; {said}"),
@@ -873,10 +1027,13 @@ mod tests {
     fn a_header_is_empty_zero_cut_short_or_whole() {
         assert!(macho_problem(&[], 0).unwrap().contains("empty"));
         assert!(macho_problem(&[0; 64], 4096).unwrap().contains("all zero"));
-        assert!(
-            macho_problem(b"not a program", 13)
-                .unwrap()
-                .contains("too short")
+        let mut cut = MACH_O_64.to_le_bytes().to_vec();
+        cut.extend_from_slice(&[7; 6]);
+        assert!(macho_problem(&cut, 10).unwrap().contains("too short"));
+        assert_eq!(
+            macho_problem(b"not a program", 13),
+            None,
+            "a file that is not a Mach-O program is not shown to be damaged"
         );
         let whole = header(4096);
         assert_eq!(macho_problem(&whole, 4096), None);
@@ -886,6 +1043,18 @@ mod tests {
                 .contains("segment __TEXT ends at byte 4096")
         );
         assert_eq!(macho_problem(b"#!/bin/sh\nexit 0\n", 17), None);
+    }
+
+    #[test]
+    fn the_kernels_log_is_read_from_a_little_before_the_earliest_file_was_written() {
+        let aged = |seconds: u64| FileFacts {
+            age: Some(Duration::from_secs(seconds)),
+            ..facts(None, None)
+        };
+        assert_eq!(window_minutes(&[aged(30)]), 3);
+        assert_eq!(window_minutes(&[aged(30), aged(600)]), 13);
+        assert_eq!(window_minutes(&[aged(3 * 3600)]), LOG_MINUTES);
+        assert_eq!(window_minutes(&[]), 3);
     }
 
     #[test]
@@ -909,6 +1078,7 @@ mod tests {
             head: String::new(),
             shape: shape.map(str::to_owned),
             signature,
+            unread: None,
         }
     }
 
@@ -938,6 +1108,16 @@ mod tests {
         assert_eq!(
             cause_of(&[whole, facts(Some("cut"), None)], None),
             Cause::RunnerDisk
+        );
+        let unread = FileFacts {
+            size: None,
+            unread: Some("the file could not be read: denied".to_owned()),
+            ..facts(None, None)
+        };
+        assert_eq!(
+            cause_of(&[unread], Some(0)),
+            Cause::Unexplained,
+            "a file that could not be read is not shown to be damaged"
         );
     }
 
@@ -1055,6 +1235,11 @@ mod tests {
             write(path, bytes);
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
+        std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        // A program that a test of the repository leaves under the target directory is not a
+        // program a build wrote, whether or not it looks cut short.
+        program(&target.join("fixtures/helper"), b"");
+        program(&profile.join("examples/helper"), b"");
         program(
             &profile.join("build/a-1111111111111111/build-script-build"),
             b"",
@@ -1075,5 +1260,134 @@ mod tests {
             ]
         );
         assert!(damaged_since(&target, SystemTime::now() + Duration::from_secs(60)).is_empty());
+    }
+
+    #[test]
+    fn only_a_program_of_cargos_making_is_taken_for_one_a_build_wrote() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let profile = target.join("debug");
+        std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        assert_eq!(
+            profile_of_output(&target, &profile.join("kr-conformance")),
+            Some(profile.clone())
+        );
+        assert_eq!(
+            profile_of_output(&target, &profile.join("deps/a-1111111111111111")),
+            Some(profile.clone())
+        );
+        assert_eq!(
+            profile_of_output(
+                &target,
+                &profile.join("build/a-1111111111111111/build-script-build")
+            ),
+            Some(profile.clone())
+        );
+        for elsewhere in [
+            target.join("fixtures/helper"),
+            profile.join("examples/helper"),
+            profile.join("build/helper"),
+            directory.path().join("src/lib"),
+        ] {
+            assert_eq!(
+                profile_of_output(&target, &elsewhere),
+                None,
+                "{}",
+                elsewhere.display()
+            );
+        }
+        let triple = target.join("aarch64-apple-darwin/release");
+        std::fs::create_dir_all(triple.join(".fingerprint")).unwrap();
+        assert_eq!(
+            profile_of_output(&target, &triple.join("deps/b-2222222222222222")),
+            Some(triple)
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_cargos_output_is_not_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let profile = target.join("debug");
+        std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        let helper = profile.join("examples/helper");
+        write(&helper, b"");
+        assert!(remove_damage(&target, &helper).is_empty());
+        assert!(helper.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_leads_out_of_the_target_directory_is_not_followed_by_a_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let profile = target.join("debug");
+        std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        let outside = directory.path().join("outside");
+        write(&outside.join("victim-1111111111111111"), b"kept");
+        write(&outside.join("unit-1111111111111111/records"), b"kept");
+        write(&profile.join("deps/own-2222222222222222"), b"");
+        // The profile's `deps` is a link to a directory outside the target directory, and so is
+        // the directory of a unit under `build`.
+        std::fs::remove_dir_all(profile.join("deps")).unwrap();
+        std::os::unix::fs::symlink(&outside, profile.join("deps")).unwrap();
+        std::fs::create_dir_all(profile.join("build")).unwrap();
+        std::os::unix::fs::symlink(&outside, profile.join("build/linked-1111111111111111"))
+            .unwrap();
+        let removed = remove_damage(&target, &profile.join("deps/victim-1111111111111111"));
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(outside.join("victim-1111111111111111").exists());
+        // The unit's directory is the link: the link goes, and what it leads to stays.
+        let linked = profile.join("build/linked-1111111111111111");
+        let removed = remove_damage(&target, &linked.join("script"));
+        assert_eq!(removed, vec![linked.clone()]);
+        assert!(!linked.exists());
+        assert!(outside.join("unit-1111111111111111/records").exists());
+        assert!(outside.join("victim-1111111111111111").exists());
+        // The unit's records are in a directory that a link leads out to: the program is removed,
+        // the records are left.
+        let release = target.join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        write(&release.join("deps/own-3333333333333333"), b"");
+        write(&outside.join("own-3333333333333333/records"), b"kept");
+        std::os::unix::fs::symlink(&outside, release.join(".fingerprint")).unwrap();
+        let removed = remove_damage(&target, &release.join("deps/own-3333333333333333"));
+        assert_eq!(removed, vec![release.join("deps/own-3333333333333333")]);
+        assert!(outside.join("own-3333333333333333/records").exists());
+        assert!(outside.join("victim-1111111111111111").exists());
+    }
+
+    #[test]
+    fn a_step_in_which_a_test_failed_is_not_one_that_a_second_run_may_settle() {
+        use crate::libtest::Binary;
+        use crate::plan::Group;
+        let done = |outcome: Option<Outcome>| Executed {
+            step: Step::cargo(Group::Rust, "tests", &["test"]),
+            exit: Some(101),
+            seconds: 0,
+            log: "conformance/logs/01-tests.log".to_owned(),
+            binaries: outcome
+                .map(|outcome| {
+                    (
+                        None,
+                        Binary {
+                            tests: [("a_test".to_owned(), outcome)].into(),
+                            ..Binary::default()
+                        },
+                    )
+                })
+                .into_iter()
+                .collect(),
+            built: Vec::new(),
+            listed: std::collections::BTreeMap::new(),
+            vitest: None,
+            lane: None,
+            tools: Vec::new(),
+            error: None,
+            rerun: None,
+        };
+        assert!(!has_failed_test(&done(None)));
+        assert!(!has_failed_test(&done(Some(Outcome::Passed))));
+        assert!(has_failed_test(&done(Some(Outcome::Failed))));
     }
 }
