@@ -2950,6 +2950,7 @@ mod tests {
                 lock_sha256: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
                 pinned: Vec::new(),
                 vectors: Vec::new(),
+                prebuilt_archive: None,
             }),
             stores: vec![ReleaseStore {
                 store: "registry".to_owned(),

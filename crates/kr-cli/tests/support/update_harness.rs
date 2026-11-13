@@ -700,6 +700,7 @@ impl Assembled {
                     lock_sha256: Digest256::from_bytes([0; 32]),
                     pinned: Vec::new(),
                     vectors: Vec::new(),
+                    prebuilt_archive: None,
                 }),
                 stores: release_stores(),
                 files,

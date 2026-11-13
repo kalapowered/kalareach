@@ -3,15 +3,20 @@
 //! The release manifest pins eight libraries by exact version, with the graph each resolved to and
 //! the vectors the pairing profile is held to. They are read from the workspace's own `Cargo.toml`
 //! and `Cargo.lock`, never typed in a second place, and the documents that name them must say the
-//! same versions: a pin that moves without its documents is refused.
+//! same versions: a pin that moves without its documents is refused. A Windows MSVC release also
+//! names the prebuilt archive its libsodium links, read from the script that places it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
-use kr_protocol::update::{PinnedCrate, ReleaseDependencies, ReleaseSource, ResolvedCrate};
+use kr_protocol::update::{
+    PinnedCrate, PrebuiltArchive, ReleaseDependencies, ReleaseSource, ResolvedCrate,
+};
 use toml_edit::{DocumentMut, Item};
 
-use crate::refusal::{Refusal, Result, digest, digest_file, read, read_text, refuse, scalar};
+use crate::refusal::{
+    Refusal, Result, digest, digest_file, digest_from_hex, read, read_text, refuse, scalar,
+};
 
 /// The libraries a release pins: the crates that carry a key, a secret or a proof.
 pub const PINNED: [&str; 8] = [
@@ -33,13 +38,15 @@ struct Package {
     dependencies: Vec<String>,
 }
 
-/// The pins, their resolved graphs and the vectors, held to the documents that name them.
+/// The pins, their resolved graphs and the vectors, held to the documents that name them, and for a
+/// Windows MSVC `target` the prebuilt archive its libsodium links.
 ///
 /// # Errors
 ///
 /// Returns a refusal for a library that is not pinned to one exact version, that the lock resolves
-/// to another version or without a checksum, or that a document names at another version.
-pub fn dependencies(checkout: &Path) -> Result<ReleaseDependencies> {
+/// to another version or without a checksum, or that a document names at another version, and for
+/// an archive that the documents do not name as the script that places it fixes it.
+pub fn dependencies(checkout: &Path, target: &str) -> Result<ReleaseDependencies> {
     let manifest = read_text(&checkout.join("Cargo.toml"))?
         .parse::<DocumentMut>()
         .map_err(|error| Refusal(format!("Cargo.toml is not TOML: {error}")))?;
@@ -101,7 +108,40 @@ pub fn dependencies(checkout: &Path) -> Result<ReleaseDependencies> {
         lock_sha256: scalar(digest(&lock_bytes)),
         pinned,
         vectors,
+        prebuilt_archive: prebuilt_archive(checkout, target)?,
     })
+}
+
+/// The archive a Windows MSVC build links in place of compiling libsodium: the one the placing
+/// script holds by name and digest, which the cryptography reference must name the same. No other
+/// target links one.
+fn prebuilt_archive(checkout: &Path, target: &str) -> Result<Option<PrebuiltArchive>> {
+    if !target.ends_with("-pc-windows-msvc") {
+        return Ok(None);
+    }
+    let script = read_text(&checkout.join("scripts/place-libsodium-archive.sh"))?;
+    let held = |name: &str| -> Result<String> {
+        let prefix = format!("{name}=");
+        script
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(str::to_owned)
+            .ok_or_else(|| Refusal(format!("the placing script holds no {name}")))
+    };
+    let name = held("archive")?;
+    let sha256 = held("archive_sha256")?;
+    let reference = read_text(&checkout.join("docs/crypto/README.md"))?;
+    for stated in [&name, &sha256] {
+        if !reference.contains(stated.as_str()) {
+            refuse!(
+                "the cryptography reference does not name {stated}, which the placing script holds"
+            );
+        }
+    }
+    Ok(Some(PrebuiltArchive {
+        name,
+        sha256: scalar(digest_from_hex(&sha256)?),
+    }))
 }
 
 /// The exact version the workspace pins `name` to.
