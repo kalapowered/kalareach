@@ -338,6 +338,7 @@ fn the_ending_of_what_a_run_made_claims_each_object_only_where_the_cleanup_came_
             Taken::Marked,
             Taken::NotFound,
             Taken::Stays(why.to_owned()),
+            Taken::Unconfirmed(why.to_owned()),
         ]
     };
     for directory in each("d") {
@@ -348,16 +349,36 @@ fn the_ending_of_what_a_run_made_claims_each_object_only_where_the_cleanup_came_
             let folder_stays = matches!(folder, Taken::Stays(_));
             let directory_lost = directory == Taken::NotFound;
             let folder_lost = folder == Taken::NotFound;
+            let directory_unconfirmed = matches!(directory, Taken::Unconfirmed(_));
+            let folder_unconfirmed = matches!(folder, Taken::Unconfirmed(_));
+            let unconfirmed = directory_unconfirmed || folder_unconfirmed;
             assert_eq!(
                 text.contains("removed the data directory"),
-                directory == Taken::Marked && (folder_stays || folder_lost),
+                directory == Taken::Marked && (folder_stays || folder_lost || folder_unconfirmed),
                 "{label}"
             );
             assert_eq!(
                 text.contains("nothing of it is left"),
-                !directory_stays && !folder_stays && !directory_lost && !folder_lost,
+                !directory_stays
+                    && !folder_stays
+                    && !directory_lost
+                    && !folder_lost
+                    && !unconfirmed,
                 "{label}"
             );
+            // An object that was marked and whose name could not be read afterwards is said to
+            // have been marked and read back with a failure, and the words say that it is not
+            // known whether it is gone: they do not say that it stays.
+            assert_eq!(
+                text.contains(
+                    "a read of its name afterwards failed, so it is not known whether it is gone"
+                ),
+                unconfirmed,
+                "{label}"
+            );
+            if unconfirmed && !directory_stays && !folder_stays {
+                assert!(!text.contains("stays"), "{label}");
+            }
             assert_eq!(
                 text.contains(&format!("{DATA}, was not found at its name")),
                 directory_lost,
@@ -382,18 +403,19 @@ fn the_ending_of_what_a_run_made_claims_each_object_only_where_the_cleanup_came_
             );
             assert_eq!(
                 text.contains(&format!("{DATA} (d)")),
-                directory_stays,
+                directory_stays || directory_unconfirmed,
                 "{label}"
             );
             assert_eq!(
                 text.contains(&format!("{ABOVE} (f)")),
-                folder_stays,
+                folder_stays || folder_unconfirmed,
                 "{label}"
             );
             assert_eq!(
                 text.contains("could not remove what it made"),
                 !directory_lost
                     && !folder_lost
+                    && !unconfirmed
                     && (directory_stays || (directory != Taken::Marked && folder_stays)),
                 "{label}"
             );
@@ -464,6 +486,12 @@ fn the_rollbacks_entry_for_an_object_says_what_the_cleanup_came_to_and_no_more()
     for wrong in ["stays", "is gone", "nothing was marked"] {
         assert!(!lost.contains(wrong), "{wrong}: {lost}");
     }
+    // An object that was marked and whose name could not be read afterwards gets the words of that
+    // read, which say that it is not known whether it is gone.
+    assert_eq!(
+        rollback_entry(&Taken::Unconfirmed("u".to_owned()), DATA),
+        Some(format!("{DATA} (u)"))
+    );
     let ending = rollback_laid_stays(&[lost], &[]);
     assert!(ending.ends_with("did nothing with it)."), "{ending}");
 }

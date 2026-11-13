@@ -1187,8 +1187,8 @@ pub enum Taken {
     NotMade,
     /// The object that this run made was marked for removal through the handle of the call that
     /// made it, and a read of its name afterwards answered not found: it is gone. An object that
-    /// was marked and is still at its name, or whose name could not be read afterwards, is
-    /// [`Taken::Stays`] with the words of what was read.
+    /// was marked and is still at its name is [`Taken::Stays`] with the words of what was read, and
+    /// one whose name could not be read afterwards is [`Taken::Unconfirmed`].
     Marked,
     /// The cleanup opened the object by its name in the directory that holds it, and the platform
     /// answered that the name was not found: nothing was read of the object, so nothing says that it
@@ -1198,6 +1198,10 @@ pub enum Taken {
     /// stands at its name, or the reason that the cleanup did not try (the directory in the folder
     /// stays, or was not found).
     Stays(String),
+    /// The object that this run made was marked for removal, and the read of its name afterwards
+    /// failed (or none was made): the words say that the mark was set and that the read failed, and
+    /// nothing says that the object is gone or that it stays.
+    Unconfirmed(String),
 }
 
 /// The words that end the failure of a step after this run made the data directory, or the folder
@@ -1212,15 +1216,18 @@ pub enum Taken {
 // text: data_made_ending
 pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &str) -> String {
     let mut stayed = Vec::new();
-    if let Taken::Stays(why) = directory {
-        stayed.push(format!("{data} ({why})"));
+    let mut unconfirmed = Vec::new();
+    for (taken, path) in [(directory, data), (folder, above)] {
+        match taken {
+            Taken::Stays(why) => stayed.push(format!("{path} ({why})")),
+            Taken::Unconfirmed(why) => unconfirmed.push(format!("{path} ({why})")),
+            Taken::NotMade | Taken::Marked | Taken::NotFound => {}
+        }
     }
-    if let Taken::Stays(why) = folder {
-        stayed.push(format!("{above} ({why})"));
-    }
-    if *directory == Taken::NotFound || *folder == Taken::NotFound {
+    if *directory == Taken::NotFound || *folder == Taken::NotFound || !unconfirmed.is_empty() {
         // An object whose name was not found is said to be neither removed nor kept: nothing was
-        // read of it, and the rollback did nothing with it.
+        // read of it, and the rollback did nothing with it. An object that was marked and whose
+        // name could not be read afterwards is said to be neither gone nor kept either.
         let mut sentences = Vec::new();
         if *directory == Taken::Marked {
             sentences.push("This run removed the data directory that it made.".to_owned());
@@ -1233,6 +1240,12 @@ pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &s
         if *folder == Taken::NotFound {
             sentences.push(format!(
                 "The folder that this run made above the data directory, {above}, was not found at its name, and the rollback did nothing with it."
+            ));
+        }
+        if !unconfirmed.is_empty() {
+            sentences.push(format!(
+                "This run marked for removal what it made, and a read of its name afterwards failed, so it is not known whether it is gone: {}.",
+                unconfirmed.join("; ")
             ));
         }
         if !stayed.is_empty() {
@@ -1658,8 +1671,10 @@ pub fn rollback_failed(failures: &[String], record: &RecordLeft, unread_prior: &
 
 /// The entry of the rollback's list for one object that this run made, or none where the cleanup
 /// took the object away or did not make it: the object's path with the platform's words where it
-/// stays, and with the words of a name that was not found, which say that the rollback did nothing
-/// with the object and nothing of whether it stays. `path` is the object's path.
+/// stays or where the read of its name after the mark failed (the words say that the mark was set
+/// and that the read failed), and with the words of a name that was not found, which say that the
+/// rollback did nothing with the object and nothing of whether it stays. `path` is the object's
+/// path.
 #[must_use]
 // text: rollback_entry
 pub fn rollback_entry(taken: &Taken, path: &str) -> Option<String> {
@@ -1668,7 +1683,7 @@ pub fn rollback_entry(taken: &Taken, path: &str) -> Option<String> {
         Taken::NotFound => Some(format!(
             "{path} (its name was not found in the directory that holds it, and the rollback did nothing with it)"
         )),
-        Taken::Stays(why) => Some(format!("{path} ({why})")),
+        Taken::Stays(why) | Taken::Unconfirmed(why) => Some(format!("{path} ({why})")),
     }
 }
 
