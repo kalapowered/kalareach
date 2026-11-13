@@ -384,6 +384,48 @@ fn the_manifests_replacement_is_a_new_file_under_a_name_nothing_could_have_made(
 }
 
 #[test]
+fn a_failure_of_the_earlier_state_record_names_that_record_and_not_the_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prior.json");
+    // A record that is not there cannot be read; one that is not a record is not read.
+    let missing = Prior::load(&path).unwrap_err().to_string();
+    assert!(
+        missing.starts_with("the earlier-state record could not be read:"),
+        "{missing}"
+    );
+    std::fs::write(&path, b"not a record").unwrap();
+    let garbage = Prior::load(&path).unwrap_err().to_string();
+    assert!(
+        garbage.starts_with("the earlier-state record is not one this program reads:"),
+        "{garbage}"
+    );
+    // A record that cannot be written: the folder is not there.
+    let record = Prior {
+        store: STORE_VERSION,
+        appid_start_type: 3,
+        appid_running: false,
+        policy_xml: String::new(),
+    };
+    let nowhere = dir.path().join("none").join("prior.json");
+    let unwritten = record.write_once(&nowhere).unwrap_err().to_string();
+    assert!(
+        unwritten.starts_with("the earlier-state record could not be written:"),
+        "{unwritten}"
+    );
+    for text in [&missing, &garbage, &unwritten] {
+        assert!(!text.contains("installation record"), "{text}");
+    }
+    // The manifest keeps its own noun.
+    let manifest = Manifest::load(&dir.path().join("manifest.json"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        manifest.starts_with("the installation record could not be read:"),
+        "{manifest}"
+    );
+}
+
+#[test]
 fn a_step_records_its_intent_before_it_and_its_result_after_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manifest.json");
