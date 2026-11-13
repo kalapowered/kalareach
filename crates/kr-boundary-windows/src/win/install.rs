@@ -994,28 +994,6 @@ impl std::fmt::Debug for DataHolds {
 }
 
 impl DataHolds {
-    /// The failure of a step after this run made the data directory or the folder above it, and the
-    /// cleanup of what it made: every handle of the run to those objects is closed first (the folders
-    /// and directories held here, which are copies of the handles of the creating calls), and then
-    /// what the run made is marked for removal through the handles of the calls that made it.
-    fn undo(self, error: Error) -> Error {
-        let DataHolds {
-            paths,
-            purpose: _,
-            _parent,
-            laid,
-            data,
-            staging,
-            journal,
-            run,
-        } = self;
-        drop((_parent, data, staging, journal, run));
-        // Only what the data directory's place holds is taken away here: nothing else is laid
-        // before the first record.
-        let made = std::mem::take(&mut ffi::locked(&laid).made);
-        made.after(&paths, error)
-    }
-
     /// Gives the data directory the installation's protected list, on the handle held since the
     /// directory was made or checked. The call propagates to nothing: what the directory holds is
     /// given its list by the steps that make it.
@@ -1271,9 +1249,10 @@ fn data_directory_reason(
     Ok(check_data_object(handle)?.map(|why| (why, origin_of(handle))))
 }
 
-/// The refusal of a data directory that this run made and then refused. The words that say what was
-/// done about what the run made, and what could not be, are added by [`Made::after`], which takes the
-/// objects away through the handles of the calls that made them.
+/// The refusal of a data directory that this run made and then refused. In an installation's run
+/// the rollback takes what the run made away, through the handles of the calls that made it, and
+/// says what it did. A caller that is no run has the words that say what was done about what the
+/// call made, and what could not be, added by [`Made::after`].
 fn refuse_made_data_directory(paths: &Paths, why: &str) -> Error {
     // text: data_made_refusal-1
     Error::Refused(format!(
@@ -3068,28 +3047,45 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
     make_data_directory_for(paths, Purpose::Install)
 }
 
-/// [`make_data_directory`] for a run with this purpose. What the run makes of the data directory's
-/// place is held through the handle of the call that made it. A failure after the first of those
-/// calls marks what the run made for removal through those handles, and the failure's words say what
-/// that did.
+/// [`make_data_directory`] for a caller that is not an installation's run, so that nothing rolls
+/// back after it. What the call makes of the data directory's place is held through the handle of
+/// the call that made it. A failure after the first of those calls marks what the call made for
+/// removal through those handles, and the failure's words say what that did.
 fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds, Error> {
-    let mut made = Made::default();
-    match open_data_directory(paths, purpose, &mut made) {
-        Ok((held, data, inspected)) => Ok(DataHolds {
-            paths: paths.clone(),
-            purpose,
-            _parent: held,
-            laid: Arc::new(Mutex::new(Laid {
-                made,
-                ..Laid::default()
-            })),
-            data,
-            staging: inspected.staging,
-            journal: inspected.journal,
-            run: inspected.run,
-        }),
-        Err(error) => Err(made.after(paths, error)),
+    let laid = Arc::new(Mutex::new(Laid::default()));
+    match make_data_directory_in(paths, purpose, &laid) {
+        Ok(holds) => Ok(holds),
+        Err(error) => {
+            let made = std::mem::take(&mut ffi::locked(&laid).made);
+            Err(made.after(paths, error))
+        }
     }
+}
+
+/// [`make_data_directory`] for an installation's run, which keeps `laid` to the end of its work.
+/// What the call makes of the data directory's place is put in `laid` as soon as the call that made
+/// it returns, and stays there where the call fails: the failure is returned as it is, and the run's
+/// one rollback takes away what it made, so that no second cleanup of the same objects takes place
+/// and no step's failure is lost between two of them.
+fn make_data_directory_in(
+    paths: &Paths,
+    purpose: Purpose,
+    laid: &Arc<Mutex<Laid>>,
+) -> Result<DataHolds, Error> {
+    let mut made = Made::default();
+    let opened = open_data_directory(paths, purpose, &mut made);
+    ffi::locked(laid).made = made;
+    let (held, data, inspected) = opened?;
+    Ok(DataHolds {
+        paths: paths.clone(),
+        purpose,
+        _parent: held,
+        laid: Arc::clone(laid),
+        data,
+        staging: inspected.staging,
+        journal: inspected.journal,
+        run: inspected.run,
+    })
 }
 
 /// The folder above the data directory and the data directory, each held and checked, and what the
@@ -3652,10 +3648,13 @@ impl Run {
     /// deleted before this), and the manifest, each only once what it follows is gone, so that a
     /// run that is made again from the records that stay finds them. The data directory goes last,
     /// and the folder above it where this run made that too, whatever happened before, so that what
-    /// keeps them is named. Returns each object that the rollback did not take away, with the
-    /// reason: a directory whose name was not found is named with the words of a name that was not
-    /// found, and a file of the run that is not at its name counts as gone.
-    fn take_away(&mut self) -> Vec<String> {
+    /// keeps them is named. Returns what the rollback came to for each object, by its path: those
+    /// that it marked for removal, in the order that it took them, and those that it did not take
+    /// away, with the reason (a directory whose name was not found is named with the words of a name
+    /// that was not found, and a file of the run that is not at its name counts as gone). The
+    /// records are deleted only where the run wrote records (the earlier-state record, the
+    /// manifest) and the rollback marked each of them.
+    fn take_away(&mut self) -> Rolled {
         self.directory = None;
         let Laid {
             made,
@@ -3665,42 +3664,71 @@ impl Run {
             prior,
             manifest,
         } = std::mem::take(&mut *ffi::locked(&self.laid));
-        let mut stayed = Vec::new();
-        let mut take = |object: Option<MadeObject>, path: &Path| -> bool {
+        let records_written = usize::from(prior.is_some()) + usize::from(manifest.is_some());
+        let mut records_marked = 0;
+        let mut rolled = Rolled::default();
+        let mut take = |object: Option<MadeObject>, path: &Path, record: bool| -> bool {
             let Some(object) = object else {
                 return true;
             };
             let directory = object.directory;
             match object.take_away() {
-                Taken::NotMade | Taken::Marked => true,
-                // A file of this run that is not at its name has nothing that stays.
+                Taken::NotMade => true,
+                Taken::Marked => {
+                    rolled.marked.push(path.display().to_string());
+                    records_marked += usize::from(record);
+                    true
+                }
+                // A file of this run that is not at its name has nothing that stays, and the
+                // rollback marked nothing: it is not a record that was marked.
                 Taken::NotFound if !directory => true,
                 taken => {
-                    stayed.extend(remedy::rollback_entry(&taken, &path.display().to_string()));
+                    rolled
+                        .stayed
+                        .extend(remedy::rollback_entry(&taken, &path.display().to_string()));
                     false
                 }
             }
         };
-        let mut gone = take(run, &self.paths.run);
-        gone &= take(journal, &self.paths.journal);
+        let mut gone = take(run, &self.paths.run, false);
+        gone &= take(journal, &self.paths.journal, false);
         if gone {
-            gone = take(prior, &self.paths.prior);
+            gone = take(prior, &self.paths.prior, true);
         }
         if gone {
-            gone = take(staging, &self.paths.staging);
+            gone = take(staging, &self.paths.staging, false);
         }
         if gone {
-            take(manifest, &self.paths.manifest);
+            take(manifest, &self.paths.manifest, true);
         }
         let (directory, folder) = made.take_away();
         for (taken, path) in [
             (directory, &self.paths.data),
             (folder, &self.paths.data_parent().to_path_buf()),
         ] {
-            stayed.extend(remedy::rollback_entry(&taken, &path.display().to_string()));
+            let path = path.display().to_string();
+            if taken == Taken::Marked {
+                rolled.marked.push(path);
+            } else {
+                rolled.stayed.extend(remedy::rollback_entry(&taken, &path));
+            }
         }
-        stayed
+        rolled.records_deleted = records_written > 0 && records_marked == records_written;
+        rolled
     }
+}
+
+/// What a rollback came to for what the run laid in the data directory's place, by the objects'
+/// paths.
+#[derive(Debug, Default)]
+struct Rolled {
+    /// Each object that was marked for removal through the identity that the run kept of it, in the
+    /// order that the rollback took them.
+    marked: Vec<String>,
+    /// Each object that stays or whose name was not found, with the words of the call that failed.
+    stayed: Vec<String>,
+    /// Whether the run wrote records and the rollback marked each of them.
+    records_deleted: bool,
 }
 
 /// The permission list of the service: the system and administrators in full, and each enrolled
@@ -3888,43 +3916,31 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // The folder, the directory and the directories in it are held, and each list goes on its own
     // handle, until everything beneath them is made and protected. A directory that is there was
     // checked on its handle, with every entry of the data directory, before this.
-    let mut holds = make_data_directory_for(
+    // What this run makes is held in the one value that the holds and the run share, to the end of
+    // the run: a failure at any step, before the first record or after it, is rolled back from it
+    // by the one rollback of `install`, which takes the data directory's place away with the rest.
+    let mut holds = make_data_directory_in(
         &paths,
         if existing {
             Purpose::Repair
         } else {
             Purpose::Install
         },
+        &run.laid,
     )?;
-    // What this run makes is held in the one value that the holds and the run share, to the end of
-    // the run: a failure after the first record is rolled back from it, not from a manifest.
-    run.laid = Arc::clone(&holds.laid);
     // The manifest's replacements are named relative to this handle, a copy of the held directory's
     // that stays to the end of the run, so that no path names the directory.
-    run.directory = match holds.data.handle().duplicate(LIST) {
-        Ok(copy) => Some(copy),
-        Err(error) => return Err(holds.undo(error.into())),
-    };
-    // Until the first manifest is written a removal finds nothing of what this run made, so a failure
-    // of the next two steps takes it away through the handles that made it.
+    run.directory = Some(holds.data.handle().duplicate(LIST)?);
     #[cfg(feature = "testing")]
-    if let Err(error) = crate::manifest::forced::failure_at("protect").map_err(Error::Failed) {
-        return Err(holds.undo(error));
-    }
-    if let Err(error) = holds.protect() {
-        return Err(holds.undo(error));
-    }
+    crate::manifest::forced::failure_at("protect").map_err(Error::Failed)?;
+    holds.protect()?;
     #[cfg(feature = "testing")]
-    if let Err(error) = crate::manifest::forced::failure_at("record").map_err(Error::Failed) {
-        return Err(holds.undo(error));
-    }
-    if let Err(error) = run.record(
+    crate::manifest::forced::failure_at("record").map_err(Error::Failed)?;
+    run.record(
         ObjectKind::Directory,
         &paths.data.display().to_string(),
         None,
-    ) {
-        return Err(holds.undo(error));
-    }
+    )?;
     // The manifest records the directory now. What this run made stays held in `run.laid`: the
     // rollback of a failure takes it away by its identity, and a removal after a finished
     // installation finds it by the manifest.
@@ -5162,38 +5178,49 @@ fn undo_recorded(
     );
     if failures.is_empty() {
         // The records go last: a failed removal can be run again from them.
-        let stayed = match &mut tree {
-            DataTree::ByName => remove_approved_records(paths, &approved),
+        match &mut tree {
+            DataTree::ByName => {
+                let stayed = remove_approved_records(paths, &approved);
+                if stayed.is_empty() {
+                    // text: remove_at-24
+                    say(&format!(
+                        "the removal ended without a failure and its records are deleted{unread_prior}"
+                    ));
+                    Ok(())
+                } else {
+                    // While the manifest stays, the removal runs again whole and reads it. Without
+                    // it, an empty directory is finished by the next removal, and anything else in
+                    // it is for the person to remove.
+                    let next = records::next_step(
+                        &records::look(&paths.manifest),
+                        &records::held_in(&paths.data),
+                    );
+                    // text: remove_at-25
+                    Err(Error::Failed(format!(
+                        "the removal's steps ended without a failure, but the removal of its records left: {}. {next}{unread_prior}",
+                        stayed.join("; ")
+                    )))
+                }
+            }
             DataTree::Laid(run) => {
                 // What this run staged and what the policy channel made stand in staging under the
                 // layout's names; they go before the directory that holds them.
                 sweep_staging(&paths.staging);
-                run.take_away()
-            }
-        };
-        if stayed.is_empty() {
-            // text: remove_at-24
-            say(&format!(
-                "the removal ended without a failure and its records are deleted{unread_prior}"
-            ));
-            Ok(())
-        } else {
-            if matches!(tree, DataTree::Laid(_)) {
-                // text: remove_at-27
-                Err(Error::Failed(remedy::rollback_laid_stays(&stayed)))
-            } else {
-                // While the manifest stays, the removal runs again whole and reads it. Without
-                // it, an empty directory is finished by the next removal, and anything else in
-                // it is for the person to remove.
-                let next = records::next_step(
-                    &records::look(&paths.manifest),
-                    &records::held_in(&paths.data),
-                );
-                // text: remove_at-25
-                Err(Error::Failed(format!(
-                    "the removal's steps ended without a failure, but the removal of its records left: {}. {next}{unread_prior}",
-                    stayed.join("; ")
-                )))
+                let rolled = run.take_away();
+                if rolled.stayed.is_empty() {
+                    // text: remove_at-28
+                    say(&format!(
+                        "{}{unread_prior}",
+                        remedy::rollback_ending(&rolled.marked, rolled.records_deleted)
+                    ));
+                    Ok(())
+                } else {
+                    // text: remove_at-27
+                    Err(Error::Failed(remedy::rollback_laid_stays(
+                        &rolled.stayed,
+                        &rolled.marked,
+                    )))
+                }
             }
         }
     } else {
@@ -5666,9 +5693,67 @@ mod tests {
     fn a_run_takes_away_what_it_laid_by_its_identities_children_before_parents() {
         let top = tempfile::tempdir().unwrap();
         let mut run = laid_run(top.path());
-        let stayed = run.take_away();
-        assert!(stayed.is_empty(), "{stayed:?}");
+        let rolled = run.take_away();
+        assert!(rolled.stayed.is_empty(), "{rolled:?}");
+        let marked: Vec<&str> = rolled
+            .marked
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&top.path().display().to_string())
+                    .unwrap()
+            })
+            .collect();
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            marked,
+            [
+                format!("{sep}above{sep}data{sep}run"),
+                format!("{sep}above{sep}data{sep}journal"),
+                format!("{sep}above{sep}data{sep}prior.json"),
+                format!("{sep}above{sep}data{sep}staging"),
+                format!("{sep}above{sep}data{sep}manifest.json"),
+                format!("{sep}above{sep}data"),
+                format!("{sep}above"),
+            ],
+            "{rolled:?}"
+        );
+        assert!(rolled.records_deleted, "{rolled:?}");
         assert!(!top.path().join("above").try_exists().unwrap());
+    }
+
+    /// A run that wrote no record has none that the rollback could have marked: the objects it
+    /// marked are named, and nothing says that records are deleted.
+    #[test]
+    fn a_run_that_wrote_no_record_has_no_records_deleted_and_names_what_was_marked() {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        {
+            let mut laid = ffi::locked(&run.laid);
+            laid.prior = None;
+            laid.manifest = None;
+        }
+        std::fs::remove_file(&run.paths.prior).unwrap();
+        std::fs::remove_file(&run.paths.manifest).unwrap();
+        let rolled = run.take_away();
+        assert!(rolled.stayed.is_empty(), "{rolled:?}");
+        assert_eq!(rolled.marked.len(), 5, "{rolled:?}");
+        assert!(!rolled.records_deleted, "{rolled:?}");
+        let ending = remedy::rollback_ending(&rolled.marked, rolled.records_deleted);
+        assert!(!ending.contains("record"), "{ending}");
+        assert!(!top.path().join("above").try_exists().unwrap());
+    }
+
+    /// A record of the run whose name was not found was not marked by the rollback: the records are
+    /// not said to be deleted, and the record is not among the objects that were marked.
+    #[test]
+    fn a_record_that_is_not_at_its_name_is_not_a_record_that_was_marked() {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        std::fs::rename(&run.paths.manifest, top.path().join("aside.json")).unwrap();
+        let rolled = run.take_away();
+        assert!(!rolled.records_deleted, "{rolled:?}");
+        let manifest = run.paths.manifest.display().to_string();
+        assert!(!rolled.marked.contains(&manifest), "{rolled:?}");
     }
 
     #[test]
@@ -5678,7 +5763,8 @@ mod tests {
         let mut run = laid_run(top.path());
         let foreign = top.path().join("above").join("data").join("foreign.txt");
         std::fs::write(&foreign, b"x").unwrap();
-        let stayed = run.take_away();
+        let rolled = run.take_away();
+        let stayed = &rolled.stayed;
         assert_eq!(stayed.len(), 2, "{stayed:?}");
         assert!(
             stayed[0].starts_with(&run.paths.data.display().to_string()),
@@ -5688,6 +5774,9 @@ mod tests {
             stayed[1].contains("the data directory in it stays"),
             "{stayed:?}"
         );
+        // What the rollback marked is named, the records among it, and what stays is not.
+        assert_eq!(rolled.marked.len(), 5, "{rolled:?}");
+        assert!(rolled.records_deleted, "{rolled:?}");
         assert!(std::fs::metadata(&foreign).unwrap().is_file());
         // What the run laid in the directory is gone; the entry that it did not lay is not touched.
         assert!(!run.paths.manifest.try_exists().unwrap());
