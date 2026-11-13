@@ -293,7 +293,7 @@ pub fn run_captured_until(
         // Open is said only of a pipe that a look showed open; a deadline that came before any read
         // of a pipe shows nothing of it.
         (Ok(out), Ok(err)) if out.open || err.open => Err(format!(
-            "a pipe of the program was still open after the end of its job (standard output: {}; standard error: {})",
+            "a pipe of the program was still open at its last look (standard output: {}; standard error: {})",
             pipe_state(&out),
             pipe_state(&err)
         )),
@@ -308,7 +308,7 @@ pub fn run_captured_until(
         // The end is not proved; a read of a pipe that failed is told with it.
         (Err(LaunchError::EndUncertain(reason)), Err(read)) => {
             return Err(LaunchError::EndUncertain(format!(
-                "{reason}; the reads of the program's pipes: {read}"
+                "{reason}; the reads of the program's pipes, which ended after the job was told to end, gave: {read}"
             )));
         }
         (Err(error @ LaunchError::EndUncertain(_)), Ok(_)) => return Err(error),

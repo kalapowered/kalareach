@@ -4243,11 +4243,9 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 // written as it is found, without the installation's rules. A record that was not
                 // read gives no mode, so the collection is written as it is found.
                 let recorded = recorded_of(prior.as_ref(), prior_error.as_deref());
-                let restore = policy::restore_for(
-                    &recorded,
-                    effective.exe_mode().unwrap_or(policy::Mode::NotConfigured),
-                    shared_rules(&effective).is_some(),
-                );
+                let present = effective.exe_mode().unwrap_or(policy::Mode::NotConfigured);
+                let restore =
+                    policy::restore_for(&recorded, present, shared_rules(&effective).is_some());
                 let emptied = restore.emptied();
                 let stripped = policy::strip(&xml, drop, emptied);
                 // text: remove_at-9
@@ -4255,9 +4253,22 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 channel.set(&stripped)?;
                 match &restore {
                     policy::Restore::Unread(why) => {
+                        // Only the rules that this step takes out are named, and the mode that the
+                        // collection keeps. A record that was loaded still gives the fields that
+                        // were read from it; one that was not loaded gives none.
+                        let taken = if kept {
+                            "the installation's two deny rules"
+                        } else {
+                            "the installation's rules"
+                        };
+                        let fields = if prior.is_some() {
+                            "The record itself was read, so the Application Identity service's start value and whether it was running are used from it below, where the removal's steps for them apply."
+                        } else {
+                            "No field of the record was read, so none is used from it."
+                        };
                         // text: remove_at-10-unread
                         say(&format!(
-                            "the earlier state could not be read ({why}), so nothing is written back from it: the policy is written without the installation's rules, and the executable collection is left as it is found"
+                            "the earlier state's policy could not be read ({why}), so no mode is written back from it: the policy is written without {taken}, and the executable collection is left as it is found, with the mode {present:?}. A rule that is added to it later takes effect in that mode. {fields}"
                         ));
                     }
                     policy::Restore::Record(mode) => {
@@ -4278,7 +4289,19 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                             "the executable collection has the mode {present:?}, which is neither the mode that the installation sets nor the earlier-state record's {recorded:?}, so it is written as it is found, without the installation's rules, and the mode {present:?} stays"
                         ));
                     }
-                    policy::Restore::NotConfigured => {}
+                    // The record holds no empty executable collection with a mode, and no rule of
+                    // anyone else's keeps the collection: it is written as not configured. A mode
+                    // that is neither the installation's nor not configured (audit only) was set
+                    // after the installation, and the write replaces it.
+                    policy::Restore::NotConfigured => {
+                        if shared_rules(&effective).is_none() && present == policy::Mode::AuditOnly
+                        {
+                            // text: remove_at-10-not-configured
+                            say(&format!(
+                                "the executable collection has the mode {present:?}, which the installation did not set, and the earlier-state record holds no empty executable collection with a mode, so it is written as not configured: the mode {present:?} does not stay"
+                            ));
+                        }
+                    }
                 }
                 if kept {
                     // text: remove_at-10-kept
