@@ -44,6 +44,7 @@ parent_advice | It holds no data directory of the boundary | read: symlink_metad
 parent_advice | If nothing else needs what is in it, remove or rename the folder | conditional correction of the installation's own folder
 rights_in_words | the rights of an identity, in words | read: the access mask of the entry in the list of the handle
 identity_text | the name and the identifier of an identity | read: the entry's identifier and the account lookup of it
+foreign_rules_refusal | a rule that the installation did not make is in the executable collection (identifier I), so a repair would change what that rule means | read: foreign_exe_rules listed rules whose identifiers are none of the installation's three; the policy read shows the identifiers and nothing of an author or a time
 git_permissions_refusal | X can be changed (or replaced) by others: finding | read: Finding::Granted: the owner read outside the system's class, no permission list, or an allow entry for an account outside it with a right that counts
 git_permissions_refusal | The setup program cannot tell whether X can be changed (or replaced) by others: finding | read: Finding::Unevaluated: an entry of a type that the check does not interpret, an entry too small for its identifier, or no owner; no right is known to be given
 rights_finding | X is allowed the right to ... (rights 0x...) | read: the list of the handle (acl::replaceable_by_others_on, changeable_by_others_on)
@@ -164,7 +165,7 @@ install-6 | the earlier state is back | read: the removal returned Ok
 install-7 | the removal after the failure also failed: error | read: the removal's error, printed
 lay_down-1 | making the directory: error | read: the directory creation's error, printed
 lay_down-2 | reading what is on this computer | flow: progress before the policy is read
-lay_down-3 | an administrator has added a rule to the executable collection since the installation, so a repair would change what that rule means | read: the effective policy's foreign_exe_rules is not empty
+lay_down-3 | the words of remedy::foreign_rules_refusal | read: see foreign_rules_refusal; the effective policy's foreign_exe_rules is not empty
 lay_down-4 | Git: version at directory | read: qualify_git's result (the version Git reported, the directory)
 lay_down-5 | X verified: signed by S, sha256 H | read: the signature check's subject and the digest computed
 lay_down-6 | the Application Identity service does not exist on this computer | read: the service manager's open of the service returned none

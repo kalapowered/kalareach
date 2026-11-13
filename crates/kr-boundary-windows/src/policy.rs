@@ -272,7 +272,7 @@ impl Policy {
                 match (have.rules.get(id), want.rules.get(id)) {
                     (Some(_), None) => {
                         lines.push(format!(
-                            "the {name} collection has a rule that is not ours: {id}"
+                            "the {name} collection has the rule {id}, which the expected policy does not have"
                         ));
                     }
                     (None, Some(_)) => lines.push(format!("the {name} rule {id} is missing")),

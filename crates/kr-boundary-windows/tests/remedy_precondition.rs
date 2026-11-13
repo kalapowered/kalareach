@@ -8,7 +8,7 @@ use std::io::{Error, ErrorKind};
 use kr_boundary_windows::records::next_step;
 use kr_boundary_windows::remedy::{
     CONFIG_NOT_EMPTY_WHY, Finding, appid_start_type_left, application_control_set,
-    empty_config_advice, git_permissions_refusal, git_program_not_reached,
+    empty_config_advice, foreign_rules_refusal, git_permissions_refusal, git_program_not_reached,
     payload_file_not_reached,
 };
 
@@ -202,5 +202,40 @@ fn a_permission_list_that_the_check_cannot_evaluate_is_not_said_to_let_others_ch
         );
         assert!(!cannot.starts_with(path), "{cannot}");
         assert!(cannot.contains("an entry of type 9"), "{cannot}");
+    }
+}
+
+/// The repair's refusal for rules in the executable collection that the installation did not make
+/// names each identifier and says that the rules are there. It says nothing of who added a rule or
+/// when: the read shows an identifier, not an author or a time.
+#[test]
+fn the_refusal_for_a_rule_that_the_installation_did_not_make_names_no_author_and_no_time() {
+    let one = foreign_rules_refusal(&["11111111-1111-1111-1111-111111111111"]);
+    let many = foreign_rules_refusal(&[
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+    ]);
+    assert!(
+        one.contains("11111111-1111-1111-1111-111111111111"),
+        "{one}"
+    );
+    assert!(one.contains("is in the executable collection"), "{one}");
+    assert!(
+        many.contains("11111111-1111-1111-1111-111111111111, 22222222-2222-2222-2222-222222222222"),
+        "{many}"
+    );
+    assert!(many.contains("are in the executable collection"), "{many}");
+    for text in [&one, &many] {
+        for author_or_time in [
+            "administrator",
+            "added",
+            "since",
+            "after",
+            "later",
+            "someone",
+        ] {
+            assert!(!text.contains(author_or_time), "{author_or_time}: {text}");
+        }
+        assert!(text.contains("did not make"), "{text}");
     }
 }

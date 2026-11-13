@@ -90,7 +90,16 @@ fn a_change_to_an_installed_policy_is_named() {
             },
         );
     assert_eq!(foreign.foreign_exe_rules().len(), 1);
-    assert!(!foreign.differences(&installed()).is_empty());
+    let extra = foreign.differences(&installed());
+    assert_eq!(extra.len(), 1, "{extra:?}");
+    // A rule that the expected policy lacks is named by its identifier. Nothing in the comparison
+    // shows who made it, so the line does not say whose it is.
+    assert!(
+        extra[0].contains("11111111-1111-1111-1111-111111111111")
+            && extra[0].contains("which the expected policy does not have"),
+        "{extra:?}"
+    );
+    assert!(!extra[0].contains("ours"), "{extra:?}");
 
     let mut audit = installed();
     audit.collections.get_mut(policy::EXE).unwrap().mode = Mode::AuditOnly;
