@@ -3040,10 +3040,10 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .staging
         .join(format!("policy-{}.xml", "ef".repeat(16)));
     owned_file(&named, b"x");
-    refused_with("the manifest holds no record of this directory");
+    refused_with("no manifest records this directory");
     std::fs::remove_file(&named).unwrap();
     std::fs::remove_file(&paths.manifest).unwrap();
-    refused_with("the manifest holds no record of this directory");
+    refused_with("no manifest records this directory");
     std::fs::remove_file(&journal_file).unwrap();
     for which in [&paths.staging, &paths.journal, &paths.run] {
         std::fs::remove_dir(which).unwrap();
@@ -4424,7 +4424,7 @@ fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_e
     stop.set();
     server.join().unwrap();
     assert!(
-        refused.contains("left before the proof for Connect"),
+        refused.contains("seconds left, so the proof for Connect was not asked"),
         "{refused}"
     );
     assert_eq!(asked.load(Ordering::SeqCst), 1, "only the first was asked");
