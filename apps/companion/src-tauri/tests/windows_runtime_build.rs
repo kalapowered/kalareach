@@ -11,7 +11,11 @@ use std::ffi::OsStr;
 mod build_windows_runtime;
 
 fn refused(target_os: &str, target_env: &str, input: Option<&str>) -> Option<&'static str> {
-    build_windows_runtime::refusal(target_os, target_env, input.map(OsStr::new))
+    build_windows_runtime::refusal(target_os, target_env, "x86_64", input.map(OsStr::new))
+}
+
+fn refused_for(target_arch: &str, input: Option<&str>) -> Option<&'static str> {
+    build_windows_runtime::refusal("windows", "msvc", target_arch, input.map(OsStr::new))
 }
 
 #[test]
@@ -43,5 +47,23 @@ fn a_build_for_another_target_is_not_refused_whatever_the_variable_says() {
         ("android", ""),
     ] {
         assert_eq!(refused(os, env, Some("true")), None, "{os} {env}");
+    }
+}
+
+#[test]
+fn an_msvc_build_for_an_architecture_without_the_linker_settings_is_refused() {
+    // The settings in `.cargo/config.toml` name x86-64 and ARM64; whichever way another target was
+    // chosen, its link would hold both runtimes, and that is refused with or without the variable.
+    for arch in ["x86", "arm", "arm64ec"] {
+        for input in [None, Some("false"), Some("true")] {
+            assert!(
+                refused_for(arch, input).is_some(),
+                "{arch} {input:?} was not refused"
+            );
+        }
+    }
+    for arch in ["x86_64", "aarch64"] {
+        assert_eq!(refused_for(arch, None), None, "{arch}");
+        assert_eq!(refused_for(arch, Some("false")), None, "{arch}");
     }
 }
