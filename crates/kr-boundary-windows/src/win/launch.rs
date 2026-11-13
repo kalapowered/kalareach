@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, FILETIME, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
-    HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
+    HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, SECURITY_ATTRIBUTES, SecurityImpersonation, TOKEN_ASSIGN_PRIMARY,
@@ -420,24 +420,18 @@ pub mod testing {
     /// held until [`release_held_pipe_writers`], as a process that is not in the job would hold it.
     /// The pipe then does not reach its end when the job's processes have gone.
     pub fn hold_next_pipe_writer() {
-        *HOLD_PIPE_AFTER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(0);
+        *crate::win::ffi::locked(&HOLD_PIPE_AFTER) = Some(0);
     }
 
     /// As [`hold_next_pipe_writer`], for the pipe made after the next one: a capture makes its
     /// standard output pipe first and its standard error pipe second, so this holds the writer of
     /// the error pipe alone.
     pub fn hold_second_pipe_writer() {
-        *HOLD_PIPE_AFTER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(1);
+        *crate::win::ffi::locked(&HOLD_PIPE_AFTER) = Some(1);
     }
 
     pub(super) fn take_hold() -> bool {
-        let mut after = HOLD_PIPE_AFTER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut after = crate::win::ffi::locked(&HOLD_PIPE_AFTER);
         match *after {
             Some(0) => {
                 *after = None;
@@ -452,18 +446,12 @@ pub mod testing {
     }
 
     pub(super) fn keep(writer: Handle) {
-        HELD_WRITERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(writer);
+        crate::win::ffi::locked(&HELD_WRITERS).push(writer);
     }
 
     /// Lets go of every writer that [`hold_next_pipe_writer`] kept.
     pub fn release_held_pipe_writers() {
-        HELD_WRITERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        crate::win::ffi::locked(&HELD_WRITERS).clear();
     }
 
     /// Makes the next read of a child's exit code fail, after the child has ended.
@@ -505,12 +493,10 @@ fn end_unresumed(process: &Handle, pid: u32, reports: &Reports, deadline: Option
     // text: launch_end_unresumed-1
     let terminate_error = (!terminated).then(|| last("ending a suspended child"));
     let wait_ms = deadline.map_or(END_WAIT_MS, |deadline| {
-        u32::try_from(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis(),
+        ffi::milliseconds(
+            deadline.saturating_duration_since(Instant::now()),
+            END_WAIT_MS,
         )
-        .unwrap_or(END_WAIT_MS)
         .clamp(END_FLOOR_MS, END_WAIT_MS)
     });
     // SAFETY: as above.
@@ -520,8 +506,18 @@ fn end_unresumed(process: &Handle, pid: u32, reports: &Reports, deadline: Option
             || "the call succeeded".to_owned(),
             |error| error.to_string(),
         );
+        // A wait that failed did not wait the bound: the words say which of the two happened.
+        let wait = if waited == WAIT_TIMEOUT {
+            format!("was not seen to end within {wait_ms} ms")
+        } else if waited == WAIT_FAILED {
+            // text: launch_end_unresumed-2
+            let why = last("the wait for its end");
+            format!("was not seen to end: {why}")
+        } else {
+            format!("was not seen to end: the wait for its end gave the answer {waited:#x}")
+        };
         reports.add(format!(
-            "the suspended child (process {pid}) was not seen to end within {wait_ms} ms ({call})"
+            "the suspended child (process {pid}) {wait} ({call})"
         ));
     }
 }
@@ -599,13 +595,19 @@ impl Child {
     ///
     /// Returns the platform's error when the wait or the exit code fails.
     pub fn wait(&self, bound: Duration) -> Result<Option<u32>, ffi::Error> {
-        let milliseconds = u32::try_from(bound.as_millis()).unwrap_or(u32::MAX);
+        let milliseconds = ffi::milliseconds(bound, u32::MAX);
         // SAFETY: the process handle is open.
-        let waited = unsafe { WaitForSingleObject(self.process.raw(), milliseconds) };
-        if waited != WAIT_OBJECT_0 {
-            return Ok(None);
+        match unsafe { WaitForSingleObject(self.process.raw(), milliseconds) } {
+            WAIT_OBJECT_0 => self.exit_code(),
+            WAIT_TIMEOUT => Ok(None),
+            // text: launch_wait-1
+            WAIT_FAILED => Err(last("waiting for the child to end")),
+            // text: launch_wait-2
+            other => Err(ffi::error(
+                0,
+                format!("waiting for the child to end gave the answer {other:#x}"),
+            )),
         }
-        self.exit_code()
     }
 
     /// Waits for the child to end, up to a bound and until the stop is set.
@@ -618,14 +620,21 @@ impl Child {
     ///
     /// Returns the platform's error when the wait or the exit code fails.
     pub fn wait_or_stop(&self, bound: Duration, stop: &Stop) -> Result<Option<u32>, ffi::Error> {
-        let milliseconds = u32::try_from(bound.as_millis()).unwrap_or(u32::MAX);
+        let milliseconds = ffi::milliseconds(bound, u32::MAX);
         let handles = [stop.event(), self.process.raw()];
         // SAFETY: both handles are open for the length of the wait.
-        let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
-        if waited != WAIT_OBJECT_0 + 1 {
-            return Ok(None);
+        match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) } {
+            answer if answer == WAIT_OBJECT_0 + 1 => self.exit_code(),
+            // The stop came first, or the bound ran out.
+            WAIT_OBJECT_0 | WAIT_TIMEOUT => Ok(None),
+            // text: launch_wait_or_stop-1
+            WAIT_FAILED => Err(last("waiting for the child to end or the stop")),
+            // text: launch_wait_or_stop-2
+            other => Err(ffi::error(
+                0,
+                format!("waiting for the child to end or the stop gave the answer {other:#x}"),
+            )),
         }
-        self.exit_code()
     }
 
     fn exit_code(&self) -> Result<Option<u32>, ffi::Error> {

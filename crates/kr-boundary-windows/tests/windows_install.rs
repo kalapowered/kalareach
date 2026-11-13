@@ -261,7 +261,7 @@ impl Case {
                 "--payload",
                 payload.to_str().unwrap(),
                 "--person",
-                &self.person.to_text(),
+                &self.person.to_text().unwrap(),
             ],
             "yes\n",
             environment,
@@ -378,7 +378,7 @@ fn installation_lays_down_and_removal_restores() {
     // Every object is there, as the manifest says.
     let manifest = Manifest::load(&paths.manifest).unwrap();
     assert_eq!(manifest.state, InstallState::Installed);
-    assert_eq!(manifest.persons, [case.person.to_text()]);
+    assert_eq!(manifest.persons, [case.person.to_text().unwrap()]);
     let mut sids = Vec::new();
     for name in [CHECKOUT, CONNECT] {
         let sid = Sid::of_account(name).expect("the account exists");
@@ -388,7 +388,7 @@ fn installation_lays_down_and_removal_restores() {
                 .unwrap()
                 .detail
                 .as_deref(),
-            Some(sid.to_text().as_str())
+            Some(sid.to_text().unwrap().as_str())
         );
         let rights = account::rights_of(&sid).unwrap();
         for right in account::DENY_RIGHTS {
@@ -434,7 +434,10 @@ fn installation_lays_down_and_removal_restores() {
     let security = sc(&["sdshow", SERVICE]);
     let access = security.split("S:").next().unwrap_or_default();
     assert!(
-        access.contains(&format!("(A;;CCLCLORC;;;{})", case.person.to_text())),
+        access.contains(&format!(
+            "(A;;CCLCLORC;;;{})",
+            case.person.to_text().unwrap()
+        )),
         "the person may only look at the service: {security}"
     );
     assert!(
@@ -534,7 +537,7 @@ fn installation_lays_down_and_removal_restores() {
     let loaded = String::from_utf8_lossy(&loaded.stdout).into_owned();
     for (name, sid) in [CHECKOUT, CONNECT].iter().zip(&sids) {
         assert!(
-            !loaded.contains(&sid.to_text()),
+            !loaded.contains(&sid.to_text().unwrap()),
             "no hive of {name} is loaded: {loaded}"
         );
         assert!(
@@ -553,7 +556,7 @@ fn installation_lays_down_and_removal_restores() {
 
     // The policy is what was written, and the Application Identity service is on.
     let (_, effective) = channel().effective().unwrap();
-    let wanted = Policy::installed(&sids[0].to_text(), &sids[1].to_text());
+    let wanted = Policy::installed(&sids[0].to_text().unwrap(), &sids[1].to_text().unwrap());
     assert!(
         effective.differences(&wanted).is_empty(),
         "{:?}",
@@ -863,7 +866,7 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
             "--payload",
             payload.to_str().unwrap(),
             "--person",
-            &other.to_text(),
+            &other.to_text().unwrap(),
         ],
         "yes\n",
         &[],
@@ -875,8 +878,13 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
             .manifest,
     )
     .unwrap();
-    assert_eq!(manifest.persons, [case.person.to_text(), other.to_text()]);
-    assert!(sc(&["sdshow", SERVICE]).contains(&format!("(A;;CCLCLORC;;;{})", other.to_text())));
+    assert_eq!(
+        manifest.persons,
+        [case.person.to_text().unwrap(), other.to_text().unwrap()]
+    );
+    assert!(
+        sc(&["sdshow", SERVICE]).contains(&format!("(A;;CCLCLORC;;;{})", other.to_text().unwrap()))
+    );
 
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     let _ = account::delete(&other_name);
@@ -993,7 +1001,10 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
         .unwrap();
     assert!(status.status.success(), "{status:?}");
     let refused = install::check_data_parent(&paths_under(&inherited)).unwrap_err();
-    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    assert!(
+        refused.to_string().contains(&owner.to_text().unwrap()),
+        "{refused}"
+    );
     let _ = account::delete(&name);
     let _ = std::fs::remove_dir_all(&inherited);
 
@@ -1385,7 +1396,10 @@ fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_
         .unwrap();
     assert!(status.status.success(), "{status:?}");
     let refused = install::make_data_directory(&paths).unwrap_err();
-    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    assert!(
+        refused.to_string().contains(&owner.to_text().unwrap()),
+        "{refused}"
+    );
     let _ = account::delete(&name);
     let _ = std::fs::remove_dir_all(&paths.data);
 
@@ -1682,7 +1696,7 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
     give_to(&paths.program, &name);
     for text in both("an account-owned program directory") {
         assert!(
-            text.contains(&owner.to_text()),
+            text.contains(&owner.to_text().unwrap()),
             "the refusal is for the owner: {text}"
         );
         assert!(text.contains("Make the Administrators group"), "{text}");
@@ -1848,7 +1862,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
         let text = install::check_data_parent(&paths_under(&foreign))
             .unwrap_err()
             .to_string();
-        assert!(text.contains(&owner.to_text()), "{text}");
+        assert!(text.contains(&owner.to_text().unwrap()), "{text}");
         assert!(
             text.contains("The installation did not make this folder"),
             "{text}"
@@ -2578,7 +2592,7 @@ fn every_object_the_installation_makes_names_the_administrators_as_owner_under_a
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{Principals, SdKind};
     const ADMINISTRATORS: &str = "S-1-5-32-544";
-    let user = token::current_user().unwrap().to_text();
+    let user = token::current_user().unwrap().to_text().unwrap();
     assert_ne!(user, ADMINISTRATORS, "the user is not the group");
     let folder = inherited_folder();
     acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
@@ -2865,7 +2879,10 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     assert!(status.status.success(), "{status:?}");
     let before = summary_of(&paths.journal);
     let refused = install::make_data_directory(&paths).expect_err("a child that is owned");
-    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    assert!(
+        refused.to_string().contains(&owner.to_text().unwrap()),
+        "{refused}"
+    );
     assert_eq!(summary_of(&paths.journal).entries, before.entries);
     let _ = Command::new("icacls")
         .arg(&paths.journal)
@@ -2969,7 +2986,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         unrecorded.record(ObjectKind::Directory, &path.display().to_string(), None);
     }
     unrecorded.save(&paths.manifest).unwrap();
-    refused_with("no manifest records");
+    refused_with("its manifest does not record this directory");
     let mut no_staging = Manifest::begin();
     for path in [&paths.data, &paths.journal, &paths.run] {
         no_staging.record(ObjectKind::Directory, &path.display().to_string(), None);
@@ -2983,10 +3000,10 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .staging
         .join(format!("policy-{}.xml", "ef".repeat(16)));
     owned_file(&named, b"x");
-    refused_with("no manifest records");
+    refused_with("the manifest holds no record of this directory");
     std::fs::remove_file(&named).unwrap();
     std::fs::remove_file(&paths.manifest).unwrap();
-    refused_with("no manifest records");
+    refused_with("the manifest holds no record of this directory");
     std::fs::remove_file(&journal_file).unwrap();
     for which in [&paths.staging, &paths.journal, &paths.run] {
         std::fs::remove_dir(which).unwrap();
@@ -3190,7 +3207,10 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     let shown = policy.file_name().unwrap().to_string_lossy().into_owned();
     moved_aside_with(&shown);
     let refused = install::make_data_directory(&paths).expect_err("a file that is owned");
-    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    assert!(
+        refused.to_string().contains(&owner.to_text().unwrap()),
+        "{refused}"
+    );
     assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
     assert_eq!(summary_of(&policy), before);
     give_to(&policy, "*S-1-5-32-544");
@@ -3208,7 +3228,10 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     assert_ne!(listed, clean, "the list now names the account");
     refused_with(&shown);
     let refused = install::make_data_directory(&paths).expect_err("a list that names an account");
-    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    assert!(
+        refused.to_string().contains(&owner.to_text().unwrap()),
+        "{refused}"
+    );
     assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
     assert_eq!(summary_of(&policy), listed, "the file is as it was");
     let removed = Command::new("icacls")
@@ -3249,7 +3272,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .expect_err("a root that another account owns")
         .to_string();
     assert!(text.contains(&"ab".repeat(16)), "{text}");
-    assert!(text.contains(&owner.to_text()), "{text}");
+    assert!(text.contains(&owner.to_text().unwrap()), "{text}");
     assert!(text.contains("did not make"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
@@ -3293,7 +3316,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     assert!(!text.contains("Remove "), "{text}");
     // The text names the account that owns it, says what the handle shows that the installation
     // does not leave there, says not to correct it into place, and says not to remove it.
-    assert!(text.contains(&owner.to_text()), "{text}");
+    assert!(text.contains(&owner.to_text().unwrap()), "{text}");
     assert!(text.contains("does not leave there"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
     assert!(text.contains("do not remove it"), "{text}");
@@ -3570,7 +3593,7 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
             boot_marker: "boot".to_owned(),
             session_luid: 1,
             group_sid: "S-1-9-1-2-3-4".to_owned(),
-            client_sid: case.person.to_text(),
+            client_sid: case.person.to_text().unwrap(),
             client_pid: 1,
             client_creation_time: 1,
             chain: Vec::new(),
@@ -3958,7 +3981,7 @@ fn runs_as_the_system() -> bool {
     assert_ne!(read, 0, "the token's user is read");
     // SAFETY: the buffer holds a TOKEN_USER whose identifier points into the same buffer.
     let user = unsafe { Sid::from_ptr((*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid) };
-    user.to_text() == "S-1-5-18"
+    user.to_text().unwrap() == "S-1-5-18"
 }
 
 /// Opens the broker's pipe asking for exactly `access`, the way the installer's client does, and

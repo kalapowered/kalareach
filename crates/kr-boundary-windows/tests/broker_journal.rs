@@ -2932,7 +2932,7 @@ mod guest {
     #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest"]
     fn the_private_roots_rows_go_through_the_journal_around_its_creation_and_its_removal() {
         if !kr_boundary_windows::win::token::current_user()
-            .is_ok_and(|user| user.to_text() == "S-1-5-18")
+            .is_ok_and(|user| user.to_text().unwrap() == "S-1-5-18")
         {
             eprintln!(
                 "SKIPPED: not run under this token: the case makes objects owned by another account, which only the system's token may set"

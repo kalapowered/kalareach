@@ -46,8 +46,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, NtSetSecurityObject,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND,
-    ERROR_SHARING_VIOLATION, GetLastError, HANDLE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    GetLastError, HANDLE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
@@ -193,7 +193,7 @@ fn note_call(_call: &str) {}
 /// would act, so that the case shows what the installation does then. A build that ships has none.
 #[cfg(feature = "testing")]
 pub mod testing {
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::Mutex;
 
     type Hook = Box<dyn FnOnce() + Send>;
 
@@ -207,14 +207,14 @@ pub mod testing {
     /// installation does, the function runs after the listing; read the other way round, it runs
     /// after the journal's read, and [`listing_the_function_ran_after`] tells which.
     pub fn after_the_first_of_the_two_reads(hook: impl FnOnce() + Send + 'static) {
-        *RAN_AFTER.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        *AFTER_A_READ.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+        *crate::win::ffi::locked(&RAN_AFTER) = None;
+        *crate::win::ffi::locked(&AFTER_A_READ) = Some(Box::new(hook));
     }
 
     /// The read the function ran after (`run` for the listing of the roots, `journal` for the read
     /// of the journal), or none while it has not run.
     pub fn listing_the_function_ran_after() -> Option<&'static str> {
-        *RAN_AFTER.lock().unwrap_or_else(PoisonError::into_inner)
+        *crate::win::ffi::locked(&RAN_AFTER)
     }
 
     static AFTER_THE_INSPECTION: Mutex<Option<Hook>> = Mutex::new(None);
@@ -223,36 +223,26 @@ pub mod testing {
     /// it decides what to do: a directory that something made after the inspection found none
     /// there is then there, as it is on a machine where an ordinary account made it in between.
     pub fn after_the_removal_inspects_the_data_directory(hook: impl FnOnce() + Send + 'static) {
-        *AFTER_THE_INSPECTION
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+        *crate::win::ffi::locked(&AFTER_THE_INSPECTION) = Some(Box::new(hook));
     }
 
     /// Drops a function that was set and did not run, so that it does not run in another case.
     pub fn no_hook_after_the_removal_inspects_the_data_directory() {
-        *AFTER_THE_INSPECTION
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+        *crate::win::ffi::locked(&AFTER_THE_INSPECTION) = None;
     }
 
     pub(super) fn after_the_removal_inspection() {
-        let hook = AFTER_THE_INSPECTION
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let hook = crate::win::ffi::locked(&AFTER_THE_INSPECTION).take();
         if let Some(hook) = hook {
             hook();
         }
     }
 
     pub(super) fn after_a_read(read: &'static str) {
-        let hook = AFTER_A_READ
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let hook = crate::win::ffi::locked(&AFTER_A_READ).take();
         if let Some(hook) = hook {
             hook();
-            *RAN_AFTER.lock().unwrap_or_else(PoisonError::into_inner) = Some(read);
+            *crate::win::ffi::locked(&RAN_AFTER) = Some(read);
         }
     }
 }
@@ -446,7 +436,11 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
 /// Makes a directory with its descriptor unless one is there: what is there was checked on its
 /// handle when the installation was entered.
 fn made_if_missing(path: &Path, readable: &Principals, what: &str) -> Result<(), Error> {
-    if path.exists() {
+    if path
+        .try_exists()
+        // text: made_if_missing-1
+        .map_err(io_error(format!("looking at {}", path.display())))?
+    {
         return Ok(());
     }
     fresh::directory_at(path, SdKind::AdminDir, readable).map_err(io_error(what))
@@ -457,7 +451,13 @@ fn made_if_missing(path: &Path, readable: &Principals, what: &str) -> Result<(),
 /// installation was entered, and is overwritten as it is, keeping the descriptor that was checked.
 fn install_program_file(source: &Path, target: &Path) -> io::Result<()> {
     let mut from = fs::File::open(source)?;
-    if target.exists() {
+    let there = target.try_exists().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("a look at {} failed ({error})", target.display()),
+        )
+    })?;
+    if there {
         let mut to = OpenOptions::new().write(true).truncate(true).open(target)?;
         io::copy(&mut from, &mut to)?;
         return to.sync_all();
@@ -792,7 +792,7 @@ fn removal_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, origin: &
 
 /// The refusal of the manifest, or of a directory of the data directory, that the manifest's own
 /// record does not show: the entry's own handle passed its checks, so the remedy comes from the
-/// manifest's record of it, which says that nothing records what is in the entry.
+/// manifest's record of it, which says that the manifest does not record the entry.
 fn unrecorded_refusal(paths: &Paths, name: &OsStr, why: &str) -> Error {
     refusal_with(
         paths,
@@ -950,7 +950,8 @@ const ADMINISTRATORS: &str = "S-1-5-32-544";
 
 /// The reason the installation cannot compare a directory's names as it does: the directory takes
 /// two names that differ only by case for two entries, and the listing and the checks here take
-/// them for one. A platform that has no such flag has no such directory.
+/// them for one. A platform that does not answer the read has not shown that the directory has no
+/// such flag: the read's error is the answer.
 fn case_sensitive_reason(handle: &ffi::Handle) -> Result<Option<String>, Error> {
     let mut info = FILE_CASE_SENSITIVE_INFO { Flags: 0 };
     // SAFETY: the handle is open and the record is the size the class takes.
@@ -965,9 +966,6 @@ fn case_sensitive_reason(handle: &ffi::Handle) -> Result<Option<String>, Error> 
     {
         // SAFETY: reads the calling thread's last error.
         let code = unsafe { GetLastError() };
-        if code == ERROR_INVALID_PARAMETER {
-            return Ok(None);
-        }
         // text: install_case_sensitive_reason-1
         return Err(ffi::error(
             code,
@@ -2257,7 +2255,13 @@ fn file_size(handle: &ffi::Handle) -> Result<u64, Error> {
             io::Error::last_os_error()
         )));
     }
-    Ok(u64::try_from(size).unwrap_or(0))
+    match u64::try_from(size) {
+        Ok(size) => Ok(size),
+        // text: file_size-2
+        Err(_) => Err(Error::Failed(format!(
+            "reading the size of a file: the platform gave {size}, which is not a size"
+        ))),
+    }
 }
 
 /// Reads every entry below a directory of the staging layout, whatever its name, on its own
@@ -2630,8 +2634,8 @@ fn refuse_code_integrity() -> Result<(), Error> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Refused`] when Git is not where the policy expects it, can be changed by
-/// others, or cannot be run.
+/// Returns [`Error::Refused`] when Git is not where the policy expects it, has an owner or an
+/// entry that allows an account outside the system's class to change it, or cannot be run.
 pub fn qualify_git() -> Result<GitSet, Error> {
     let dir = git_dir()?;
     let mut images = Vec::new();
@@ -2853,8 +2857,8 @@ pub fn confirm(person: Option<&str>, action: &str) -> Result<(), Error> {
 
 fn person_of(options: &Options) -> Result<String, Error> {
     match &options.person {
-        Some(text) => Ok(Sid::parse(text)?.to_text()),
-        None => Ok(token::current_user()?.to_text()),
+        Some(text) => Ok(Sid::parse(text)?.to_text()?),
+        None => Ok(token::current_user()?.to_text()?),
     }
 }
 
@@ -3125,7 +3129,11 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         &empty_config.display().to_string(),
         Some(&hex::encode(Sha256::digest(b""))),
     )?;
-    if !empty_config.exists() {
+    if !empty_config
+        .try_exists()
+        // text: install_lay_down-4
+        .map_err(io_error(format!("looking at {}", empty_config.display())))?
+    {
         fresh::file_at(&empty_config, SdKind::ProgramFile, true)
             // text: install_lay_down-2
             .map_err(io_error("making the empty global configuration"))?;
@@ -3162,7 +3170,8 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
                 account::create(name)?
             }
         };
-        run.record(ObjectKind::Account, name, Some(&sid.to_text()))?;
+        let sid_text = sid.to_text()?;
+        run.record(ObjectKind::Account, name, Some(&sid_text))?;
         run.record(ObjectKind::Right, &format!("{name}:deny-sign-in"), None)?;
         account::grant_rights(&sid, &account::DENY_RIGHTS)?;
         run.record(
@@ -3174,7 +3183,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         // text: lay_down-11
         say(&format!(
             "account {name} ({}) refused sign-in at the screen, by Remote Desktop, as a batch job and as a service, and hidden from the sign-in screen",
-            sid.to_text()
+            sid_text
         ));
         sids.push(sid);
     }
@@ -3251,7 +3260,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     }
 
     // The policy, and the platform's next event that says it applied it.
-    let wanted = Policy::installed(&sids[0].to_text(), &sids[1].to_text());
+    let wanted = Policy::installed(&sids[0].to_text()?, &sids[1].to_text()?);
     for id in [
         policy::RULE_ALLOW_ALL,
         policy::RULE_CHECKOUT,
@@ -3641,7 +3650,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     if !approved.staging {
         match fresh::directory_at(&paths.staging, SdKind::AdminDir, &Principals::default()) {
             Ok(()) => approved.staging = true,
-            Err(error) if error.raw_os_error() == i32::try_from(ERROR_ALREADY_EXISTS).ok() => {
+            Err(error) if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) => {
                 // text: remove_at-5
                 return Err(Error::Refused(format!(
                     "{}. Nothing was removed. Run the removal again: it checks the directory first, and says what to do about it if it is not the installation's own.",
@@ -3665,21 +3674,30 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             let _ = service.wait_for(false, Duration::from_secs(60));
         }
         match open_session().and_then(|mut connection| {
-            match ask(&mut connection, &Request::Maintenance { on: true })? {
-                Response::Done {} => Ok(connection),
-                // text: remove_at-7-refused
-                Response::Refused { reason, detail } => Err(Error::Failed(format!(
-                    "the broker refused it ({reason:?}: {detail})"
-                ))),
-                // text: remove_at-7-answer
-                other => Err(Error::Failed(format!(
-                    "the broker answered with {other:?}, not that the request was carried out"
-                ))),
-            }
+            let answer = ask(&mut connection, &Request::Maintenance { on: true })?;
+            Ok((connection, answer))
         }) {
-            Ok(connection) => {
-                // text: remove_at-6
-                say("the broker is in its maintenance state");
+            Ok((connection, answer)) => {
+                match answer {
+                    Response::Done {} => {
+                        // text: remove_at-6
+                        say("the broker is in its maintenance state");
+                    }
+                    Response::Refused { reason, detail } => {
+                        // text: remove_at-7-refused
+                        say(&format!(
+                            "the broker refused the request for its maintenance state ({reason:?}: {detail})"
+                        ));
+                    }
+                    other => {
+                        // text: remove_at-7-answer
+                        say(&format!(
+                            "the broker answered the request for its maintenance state with {other:?}, not that it was carried out"
+                        ));
+                    }
+                }
+                // Whatever the broker answered, the connection stays the session: the release is asked
+                // of the broker below, and what it answers there is a failure of the removal.
                 session = Some(connection);
             }
             // text: remove_at-7
@@ -3715,8 +3733,15 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                     // text: remove_at-9
                     &policy::strip(&xml, drop).map_err(|error| Error::Failed(error.to_string()))?,
                 )?;
-                // text: remove_at-10
-                say("the policy is put back");
+                if kept {
+                    // text: remove_at-10-kept
+                    say(
+                        "the policy is written without the installation's two deny rules, and its allow-all rule and the collection's mode stay",
+                    );
+                } else {
+                    // text: remove_at-10
+                    say("the policy is written without the installation's rules");
+                }
                 Ok(())
             })(),
             "putting the policy back",
@@ -3898,17 +3923,26 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     }
     if let Some(prior) = &prior {
         match residue(prior, paths) {
-            // text: remove_at-22
-            Ok(left) if left.is_empty() => say(
-                "the policy, the two accounts and their hiding, the broker's service and the program directory show no difference from the earlier-state record",
-            ),
-            Ok(left) => {
+            Ok((left, present_policy)) if left.is_empty() => {
+                if present_policy {
+                    // text: remove_at-22-present
+                    say(
+                        "the policy shows no difference from the present policy without the installation's two deny rules (an administrator's rule is in the executable collection, so the allow-all rule stays and the earlier-state record is not the comparison); the two accounts and the sign-in list's values for them are not there, the broker's service is not there or is marked for deletion, and the program directory is not there",
+                    );
+                } else {
+                    // text: remove_at-22
+                    say(
+                        "the policy shows no difference from the earlier-state record; the two accounts and the sign-in list's values for them are not there, the broker's service is not there or is marked for deletion, and the program directory is not there",
+                    );
+                }
+            }
+            Ok((left, _)) => {
                 for line in &left {
                     // text: remove_at-23
-                    say(&format!("not put back: {line}"));
+                    say(&format!("the check after the removal found: {line}"));
                 }
                 failures.push(format!(
-                    "the earlier state is not back: {}",
+                    "the check after the removal found: {}",
                     left.join("; ")
                 ));
             }
@@ -3930,7 +3964,9 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         let stayed = remove_approved_records(paths, &approved);
         if stayed.is_empty() {
             // text: remove_at-24
-            say(&format!("the installation is removed{unread_prior}"));
+            say(&format!(
+                "the removal ended without a failure and its records are deleted{unread_prior}"
+            ));
             Ok(())
         } else {
             // While the manifest stays, the removal runs again whole and reads it. Without it,
@@ -3942,7 +3978,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             );
             // text: remove_at-25
             Err(Error::Failed(format!(
-                "the service, the accounts and the installation's policy rules are removed, but the data directory stays: {}. {next}{unread_prior}",
+                "the removal ended without a failure, but the data directory stays: {}. {next}{unread_prior}",
                 stayed.join("; ")
             )))
         }
@@ -4014,23 +4050,30 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
             ));
         }
     }
-    if paths.journal.exists() {
-        let unfinished = super::journal::replay(&paths.journal, "")
-            // text: refuse_while_unfinished-1
-            .map_err(|error| Error::Failed(format!("reading the journal: {error}")))?;
-        for invocation in unfinished {
-            let project = invocation
-                .rows
-                .iter()
-                .find_map(|row| match row {
-                    Row::Begin { tree_path, .. } => Some(tree_path.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "a project that is not named".to_owned());
-            found.push(format!(
-                "the invocation {} on {project} ({:?})",
-                invocation.id, invocation.standing
-            ));
+    match records::look(&paths.journal) {
+        records::Look::NotThere => {}
+        records::Look::Unread(error) => {
+            // text: refuse_while_unfinished-3
+            return Err(Error::Failed(format!("reading the journal: {error}")));
+        }
+        records::Look::There => {
+            let unfinished = super::journal::replay(&paths.journal, "")
+                // text: refuse_while_unfinished-1
+                .map_err(|error| Error::Failed(format!("reading the journal: {error}")))?;
+            for invocation in unfinished {
+                let project = invocation
+                    .rows
+                    .iter()
+                    .find_map(|row| match row {
+                        Row::Begin { tree_path, .. } => Some(tree_path.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "a project that is not named".to_owned());
+                found.push(format!(
+                    "the invocation {} on {project} ({:?})",
+                    invocation.id, invocation.standing
+                ));
+            }
         }
     }
     if found.is_empty() {
@@ -4044,14 +4087,18 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
     }
 }
 
-/// What the installation changed that has not been put back, read from the machine against the
-/// earlier-state record. An empty list means the baseline holds. The data directory is not
-/// counted: it holds the records this check reads, and goes last.
+/// What the machine shows of the installation after a removal, and what the policy was compared
+/// with. The policy is compared with the earlier-state record, or, where an administrator's rule has
+/// joined the executable collection, with the present policy without the installation's two deny
+/// rules (the second part is true then). The accounts, the sign-in list, the broker's service and the
+/// program directory are compared with their not being there. An empty list means that each
+/// comparison holds. The data directory is not counted: it holds the records this check reads, and
+/// goes last.
 ///
 /// # Errors
 ///
 /// Returns the failure of a call that could not look.
-pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
+pub fn residue(prior: &Prior, paths: &Paths) -> Result<(Vec<String>, bool), Error> {
     let mut left = Vec::new();
     let (_, effective) = Channel::new(&paths.staging).effective()?;
     let baseline = Policy::parse(&prior.policy_xml).map_err(|error| {
@@ -4062,10 +4109,11 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
     })?;
     // Where an administrator's rule has since joined the executable collection, the removal keeps the
     // allow-all rule and the collection's mode beside it on purpose; everything else of ours is gone.
-    let expected = if effective.foreign_exe_rules().is_empty() {
-        baseline
-    } else {
+    let present_policy = !effective.foreign_exe_rules().is_empty();
+    let expected = if present_policy {
         effective.without_ours().0
+    } else {
+        baseline
     };
     left.extend(effective.differences(&expected));
     for name in [CHECKOUT, CONNECT] {
@@ -4093,5 +4141,5 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
             paths.program.display()
         )),
     }
-    Ok(left)
+    Ok((left, present_policy))
 }

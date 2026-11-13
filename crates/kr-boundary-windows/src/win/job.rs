@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
@@ -80,8 +80,11 @@ pub enum State {
 pub struct Ended {
     /// Every retained process object is signalled: each process has exited.
     pub all_exited: bool,
-    /// The job's own count of active processes is zero.
+    /// The job's own count of active processes was read at the last look and is zero.
     pub active_zero: bool,
+    /// The job's own count of active processes could be read at the last look. Where it could not,
+    /// `active_zero` is false and says nothing about the count.
+    pub count_read: bool,
 }
 
 impl Ended {
@@ -92,6 +95,17 @@ impl Ended {
     #[must_use]
     pub fn proved(self) -> bool {
         self.all_exited && self.active_zero
+    }
+
+    /// What the last look at the job's count showed, in words for a person.
+    #[must_use]
+    // text: count_words
+    pub fn count_words(self) -> &'static str {
+        match (self.count_read, self.active_zero) {
+            (false, _) => "the job's count of processes could not be read",
+            (true, true) => "the job counts no process",
+            (true, false) => "the job counts a process",
+        }
     }
 }
 
@@ -105,17 +119,11 @@ pub struct Reports(Arc<Mutex<Vec<String>>>);
 impl Reports {
     /// Adds a report.
     pub(super) fn add(&self, text: String) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(text);
+        crate::win::ffi::locked(&self.0).push(text);
     }
 
     fn all(&self) -> Vec<String> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        crate::win::ffi::locked(&self.0).clone()
     }
 }
 
@@ -389,7 +397,11 @@ impl Job {
                 // SAFETY: the retained process handle is open.
                 unsafe { WaitForSingleObject(child.process.raw(), 0) == WAIT_OBJECT_0 }
             });
-            let active_zero = self.active_processes().is_ok_and(|count| count == 0);
+            let counted = self.active_processes();
+            let (active_zero, count_read) = match &counted {
+                Ok(count) => (*count == 0, true),
+                Err(_) => (false, false),
+            };
             let remaining = deadline.saturating_duration_since(Instant::now());
             if (all_exited && active_zero) || remaining.is_zero() {
                 if !(all_exited && active_zero) {
@@ -397,14 +409,19 @@ impl Job {
                         || "the call to end the job succeeded".to_owned(),
                         |error| error.to_string(),
                     );
+                    let count = match &counted {
+                        Ok(count) => format!("{count}"),
+                        Err(error) => format!("not read ({error})"),
+                    };
                     self.reports.add(format!(
                         "the job was not seen empty within the bound (exited {all_exited}, \
-                         active count zero {active_zero}; {call})"
+                         active count {count}; {call})"
                     ));
                 }
                 return Ended {
                     all_exited,
                     active_zero,
+                    count_read,
                 };
             }
             self.wait_for_message(remaining.min(Duration::from_millis(100)));
@@ -422,7 +439,7 @@ impl Job {
                 &raw mut bytes,
                 &raw mut key,
                 &raw mut overlapped,
-                u32::try_from(up_to.as_millis()).unwrap_or(u32::MAX),
+                super::ffi::milliseconds(up_to, u32::MAX),
             );
         }
     }

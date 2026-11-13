@@ -165,6 +165,10 @@ fn failed(form: &ReaderForm, rule: &'static str, what: &str) -> Refusal {
 ///
 /// Returns a refusal when the argument is missing, is given to a reader that takes none, or is
 /// outside the grammar of its type.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+)]
 pub fn reader_line(reader: Reader, argument: Option<&str>) -> Result<OperationLine, Refusal> {
     let form = form(reader);
     let bad = || {
@@ -227,6 +231,10 @@ fn result_code(form: &ReaderForm, output: &Output<'_>) -> Result<u32, Refusal> {
 /// # Errors
 ///
 /// Returns a refusal for an unresolved revision, a deadline, or output that is not one line.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+)]
 pub fn parse_r1(output: &Output<'_>, name: &str) -> Result<String, Refusal> {
     let form = form(Reader::R1);
     match output.exit {
@@ -327,6 +335,10 @@ fn listing<'a>(form: &ReaderForm, stdout: &'a [u8]) -> Result<Vec<&'a [u8]>, Ref
     Ok(records)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+)]
 fn mode_of(text: &[u8]) -> Option<u32> {
     let text = std::str::from_utf8(text).ok()?;
     MODES
@@ -335,6 +347,10 @@ fn mode_of(text: &[u8]) -> Option<u32> {
         .flatten()
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+)]
 fn oid_of(text: &[u8]) -> Option<String> {
     std::str::from_utf8(text)
         .ok()
@@ -489,6 +505,10 @@ pub fn blob_request(oids: &[String]) -> Result<Vec<u8>, Refusal> {
 /// different number of answers, an answer out of order or of another type, a size over
 /// [`MAX_BLOB_BYTES`], a total over [`MAX_BLOB_TOTAL_BYTES`], or bytes that do not frame to the
 /// sizes.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+)]
 pub fn parse_r5<'a>(requested: &[String], output: &Output<'a>) -> Result<Vec<&'a [u8]>, Refusal> {
     let form = form(Reader::R5);
     result_code(form, output)?;

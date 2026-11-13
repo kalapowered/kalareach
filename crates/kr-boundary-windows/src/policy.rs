@@ -445,10 +445,17 @@ fn attribute(element: &BytesStart<'_>, name: &str) -> Result<Option<String>, Pol
     Ok(None)
 }
 
-/// A field that the entry must carry: its value, or the refusal that names the entry and the field.
+/// A field that the entry must carry and must give a value to: its value, or the refusal that names
+/// the entry and the field.
 fn required(element: &BytesStart<'_>, field: &str, entry: &str) -> Result<String, PolicyError> {
-    attribute(element, field)?
-        .ok_or_else(|| PolicyError::Unknown(format!("{entry} has no {field}")))
+    let value = attribute(element, field)?
+        .ok_or_else(|| PolicyError::Unknown(format!("{entry} has no {field}")))?;
+    if value.trim().is_empty() {
+        return Err(PolicyError::Unknown(format!(
+            "{entry} has an empty {field}"
+        )));
+    }
+    Ok(value)
 }
 
 /// A value that no known form matches: the refusal names the entry, the field and the value.
@@ -515,8 +522,8 @@ fn open(
         }
         "Exceptions" => *in_exceptions = true,
         "FilePathCondition" => {
-            if let (Some(rule), Some(path)) = (rule.as_mut(), attribute(element, "Path")?) {
-                let path = normal_path(&path);
+            if let Some(rule) = rule.as_mut() {
+                let path = normal_path(&required(element, "Path", "a FilePathCondition")?);
                 if *in_exceptions {
                     rule.exceptions.insert(path);
                 } else {

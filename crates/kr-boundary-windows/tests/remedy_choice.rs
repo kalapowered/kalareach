@@ -251,7 +251,7 @@ fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_o
     }
 
     // The manifest that holds no record of its own data directory: the text names the manifest and
-    // the directory, says to keep the manifest, and ends with the standing words of a manifest.
+    // the directory.
     let manifest = format!("{data}/manifest.json");
     let text = ending(
         Path::new(&manifest),
@@ -261,26 +261,24 @@ fn an_entry_that_the_manifest_holds_no_record_of_is_moved_aside_with_the_basis_o
         &Presence::Present,
         Some(Record::NotRecorded),
     );
-    assert!(
-        text.starts_with(&format!(
-            "The manifest in {data} holds no record of {data} itself, so nothing records what {data} holds."
-        )),
-        "{text}"
+    // The reason and the one fact that the read shows about the setup program: it names no step. No
+    // remedy, no forecast of what a run after a change of the manifest says, and nothing of what the
+    // directory holds.
+    assert_eq!(
+        text,
+        format!(
+            "The manifest in {data} holds no record of {data} itself. The setup program names no step for this state."
+        )
     );
-    assert!(
-        text.contains("and do not remove it. Move it aside: out of the data directory"),
-        "{text}"
-    );
-    assert!(
-        text.contains("Keep it: it may be the record of an installation."),
-        "{text}"
-    );
-    assert!(
-        text.ends_with("or to close the program that holds it open."),
-        "{text}"
-    );
-    assert!(!text.contains("Correct what the reason names"), "{text}");
-    assert!(!text.contains("Remove "), "{text}");
+    for words in [
+        "Move it aside",
+        "Keep it",
+        "Remove ",
+        "nothing records",
+        "next run",
+    ] {
+        assert!(!text.contains(words), "{words}: {text}");
+    }
 
     // A directory that the manifest holds no record of and that holds entries.
     for (kind, next) in [

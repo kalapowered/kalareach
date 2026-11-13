@@ -77,7 +77,16 @@ pub fn directory_at(path: &Path, kind: SdKind, principals: &Principals) -> io::R
 pub fn directory_all(path: &Path, kind: SdKind, principals: &Principals) -> io::Result<bool> {
     let mut missing = Vec::new();
     for ancestor in path.ancestors() {
-        if ancestor.as_os_str().is_empty() || ancestor.exists() {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        let there = ancestor.try_exists().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("a look at {} failed ({error})", ancestor.display()),
+            )
+        })?;
+        if there {
             break;
         }
         missing.push(ancestor);

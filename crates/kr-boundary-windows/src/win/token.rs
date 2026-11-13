@@ -186,7 +186,7 @@ fn s4u_with(
     // The request is the structure followed by the two names it points at, in one allocation that
     // is aligned for the structure.
     let user: Vec<u16> = account.encode_utf16().collect();
-    let domain: Vec<u16> = computer_name().encode_utf16().collect();
+    let domain: Vec<u16> = computer_name()?.encode_utf16().collect();
     let header = size_of::<MSV1_0_S4U_LOGON>();
     let total = header + (user.len() + domain.len()) * 2;
     let mut request = vec![0_u64; total.div_ceil(8)];
@@ -297,17 +297,18 @@ fn s4u_with(
     Handle::new(primary, "the primary token")
 }
 
-fn computer_name() -> String {
+pub(super) fn computer_name() -> Result<String> {
     use windows_sys::Win32::System::WindowsProgramming::GetComputerNameW;
     let mut buffer = [0_u16; 64];
     let mut length = buffer.len() as u32;
     // SAFETY: the buffer is the length passed.
     unsafe {
         if GetComputerNameW(buffer.as_mut_ptr(), &raw mut length) == 0 {
-            return String::new();
+            // text: token_computer_name-1
+            return Err(last("reading this computer's name"));
         }
     }
-    String::from_utf16_lossy(&buffer[..length as usize])
+    Ok(String::from_utf16_lossy(&buffer[..length as usize]))
 }
 
 /// The identifier of the account a token belongs to.
@@ -390,7 +391,7 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
             return Err(last("making the invocation's group the token's owner"));
         }
     }
-    let list = format!("D:(A;;GA;;;{})(A;;GA;;;SY)", group.to_text());
+    let list = format!("D:(A;;GA;;;{})(A;;GA;;;SY)", group.to_text()?);
     let text = wide(&list);
     let mut descriptor: *mut c_void = null_mut();
     // SAFETY: the text is NUL-terminated; the descriptor is freed below, after the token has

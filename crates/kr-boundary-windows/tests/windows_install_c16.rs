@@ -121,7 +121,7 @@ fn require_clean_guest() {
 /// delete in, and the check of the folders above the trees refuses them, as it should.
 fn needs_the_system() -> bool {
     if kr_boundary_windows::win::token::current_user()
-        .is_ok_and(|user| user.to_text() == "S-1-5-18")
+        .is_ok_and(|user| user.to_text().unwrap() == "S-1-5-18")
     {
         return false;
     }
@@ -981,7 +981,7 @@ fn a_staging_directory_made_after_the_inspection_is_left_and_named() {
 /// what would change the outcome if the removal acted on it: another start value, which the removal
 /// would put back, the service not running before the installation (the removal would stop it on
 /// this word where it runs), and an earlier policy with a rule that the machine does not have (the
-/// residue check would then report that the earlier state is not back). The case reads the
+/// residue check would then report a difference). The case reads the
 /// service's start value and whether it runs before and after the removal, and the last words say
 /// that neither was put back. The removal reaches the service, the boot marker and the policy
 /// steps: the case first checks that the guest holds no installation.
@@ -1067,7 +1067,10 @@ fn a_prior_record_made_after_the_inspection_is_left_and_named() {
         "{text}"
     );
     // Neither the baseline nor the start value was used: the residue check did not run on it.
-    assert!(!text.contains("the earlier state is not back"), "{text}");
+    assert!(
+        !text.contains("the check after the removal found"),
+        "{text}"
+    );
     assert!(!text.contains("checking the earlier state"), "{text}");
     assert!(paths.prior.exists(), "what appeared stays");
     assert!(paths.manifest.exists(), "the manifest stays with it");

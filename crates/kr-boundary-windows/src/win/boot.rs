@@ -138,7 +138,14 @@ fn read_id(key: &OpenKey) -> Result<Option<String>> {
                 .position(|unit| *unit == 0)
                 .unwrap_or(units);
             let text = String::from_utf16_lossy(&buffer[..end]);
-            Ok(uuid::Uuid::parse_str(&text).ok().map(|_| text))
+            // The value was read: one that is not an identifier is no marker, and a new marker
+            // replaces it.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the value was read; one that is not an identifier is no marker, and the caller makes a new one"
+            )]
+            let marker = uuid::Uuid::parse_str(&text).ok().map(|_| text);
+            Ok(marker)
         }
         ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(None),
         other => Err(error(other, "reading the boot marker")),

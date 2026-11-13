@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use std::process::ExitCode;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::ERROR_FAILED_SERVICE_CONTROLLER_CONNECT;
@@ -185,7 +185,7 @@ impl State {
     /// both classes asked within it share it. When the open cycle has ended, this request begins
     /// the next one, [`PROOF_BOUND`] long, and the deadline of the earlier one is not touched.
     fn proof_deadline(&self) -> Instant {
-        let mut open = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut open = crate::win::ffi::locked(&self.cycle);
         let now = Instant::now();
         if now >= *open {
             *open = now + PROOF_BOUND;
@@ -267,11 +267,14 @@ fn serve() -> Result<(), String> {
     ] {
         enable_privilege(privilege).map_err(|error| error.to_string())?;
     }
-    let people: Vec<Sid> = manifest
-        .persons
-        .iter()
-        .filter_map(|text| Sid::parse(text).ok())
-        .collect();
+    let mut people: Vec<Sid> = Vec::new();
+    for text in &manifest.persons {
+        people.push(Sid::parse(text).map_err(|error| {
+            format!(
+                "the enrolled identity {text} is not an identifier that the platform reads: {error}"
+            )
+        })?);
+    }
     let mut persons = Listener::bind(Kind::Persons, &people, Arc::clone(&stop))
         .map_err(|error| error.to_string())?;
     let mut administrators = Listener::bind(Kind::Administrators, &[], Arc::clone(&stop))
@@ -280,12 +283,22 @@ fn serve() -> Result<(), String> {
     // begins its own count no earlier than the broker's.
     let state = Arc::new(State::begun(manifest, paths, Arc::clone(&stop)));
     report(SERVICE_RUNNING, 0, 0);
-    run_both(&mut persons, &mut administrators, &state)
+    let ran = run_both(&mut persons, &mut administrators, &state);
+    // A wait on the stop event that failed ended the work as a stop does, and says why.
+    match (stop.unread(), ran) {
+        (Some(unread), Ok(())) => Err(unread.to_owned()),
+        (Some(unread), Err(error)) => Err(format!("{unread}; {error}")),
+        (None, ran) => ran,
+    }
 }
 
 /// Runs the loops of the two pipes, each on a thread of its own, under the one stop: a loop that ends
 /// for any reason sets the stop, so the other ends with it, and the service reports that it stopped
 /// only after both have.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a loop that panicked is told as its failure"
+)]
 fn run_both(
     persons: &mut Listener,
     administrators: &mut Listener,
@@ -418,6 +431,10 @@ fn send(connection: &mut Connection, response: &Response) -> Result<(), FrameErr
 
 /// Serves one connection until it ends. Every read and every write has a deadline, so a client
 /// that sends nothing or reads nothing gives its slot back.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a send that failed ends this connection, which is all there is to do; no text is said of it"
+)]
 fn answer(mut connection: Connection, state: &State, kind: Kind) {
     // The platform lets a server take on a client's identity only after it has read from the pipe,
     // so the first message is read before the caller is identified. Nothing is done with it until

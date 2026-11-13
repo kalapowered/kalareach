@@ -139,7 +139,12 @@ impl Key {
             )
         };
         match status {
-            ERROR_SUCCESS if kind == REG_DWORD => Ok(Some(u32::from_le_bytes(data))),
+            ERROR_SUCCESS if kind == REG_DWORD && size == 4 => Ok(Some(u32::from_le_bytes(data))),
+            // text: registry-3
+            ERROR_SUCCESS if kind == REG_DWORD => Err(error(
+                0,
+                format!("the value {name} is a DWORD of {size} bytes, not 4"),
+            )),
             // text: registry-2
             ERROR_SUCCESS => Err(error(
                 0,

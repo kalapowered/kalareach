@@ -226,14 +226,14 @@ const CHANGES_CONTENT: u32 = 0x0000_0002 // write data, add file
 const REPLACES: u32 =
     0x0000_0040 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000 | 0x0200_0000;
 
-fn system_class(sid: &Sid) -> bool {
+fn system_class(sid: &Sid) -> Result<bool> {
     const SYSTEM: &str = "S-1-5-18";
     const ADMINISTRATORS: &str = "S-1-5-32-544";
     const CREATOR_OWNER: &str = "S-1-3-0";
     const TRUSTED_INSTALLER: &str =
         "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
-    let text = sid.to_text();
-    [SYSTEM, ADMINISTRATORS, CREATOR_OWNER, TRUSTED_INSTALLER].contains(&text.as_str())
+    let text = sid.to_text()?;
+    Ok([SYSTEM, ADMINISTRATORS, CREATOR_OWNER, TRUSTED_INSTALLER].contains(&text.as_str()))
 }
 
 /// Says which account other than the system's own can change a path, or `None` when none can.
@@ -399,10 +399,13 @@ unsafe fn finding_in(
     }
     // SAFETY: the owner points at an identifier inside the descriptor.
     let owner_sid = unsafe { Sid::from_ptr(owner) };
-    if !system_class(&owner_sid) {
+    if !system_class(&owner_sid)? {
         return Ok(Some(Finding::Granted(format!(
             "it is owned by {}",
-            crate::remedy::identity_text(owner_sid.account_name().as_deref(), &owner_sid.to_text())
+            crate::remedy::identity_text(
+                owner_sid.account_name().as_deref(),
+                &owner_sid.to_text()?
+            )
         ))));
     }
     if dacl.is_null() {
@@ -476,15 +479,15 @@ unsafe fn finding_in(
                 (*allowed).Mask,
             )
         };
-        if mask & mask_of_interest != 0 && !system_class(&sid) {
+        if mask & mask_of_interest != 0 && !system_class(&sid)? {
             if counts == Counts::Above {
                 return Ok(Some(Finding::Granted(crate::remedy::rights_finding(
-                    &crate::remedy::identity_text(sid.account_name().as_deref(), &sid.to_text()),
+                    &crate::remedy::identity_text(sid.account_name().as_deref(), &sid.to_text()?),
                     mask & mask_of_interest,
                 ))));
             }
             return Ok(Some(Finding::Granted(crate::remedy::entry_rights_finding(
-                &sid.to_text(),
+                &sid.to_text()?,
                 mask & mask_of_interest,
             ))));
         }
@@ -683,7 +686,7 @@ mod tests {
                 fixture.set_size(2, size);
                 let finding = fixture.finding(false).unwrap_or_default();
                 assert!(
-                    finding.contains("does not hold its identifier"),
+                    finding.contains("is not a valid one or does not fit in the entry's size"),
                     "{text} cut to {size}: {finding:?}"
                 );
                 assert!(
@@ -700,7 +703,7 @@ mod tests {
             fixture
                 .finding(false)
                 .unwrap_or_default()
-                .contains("does not hold its identifier")
+                .contains("is not a valid one or does not fit in the entry's size")
         );
     }
 
@@ -769,7 +772,7 @@ mod tests {
             fixture
                 .above()
                 .unwrap_or_default()
-                .contains("does not hold its identifier")
+                .contains("is not a valid one or does not fit in the entry's size")
         );
     }
 }

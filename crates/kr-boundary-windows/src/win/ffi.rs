@@ -51,6 +51,30 @@ pub fn last(what: impl Into<String>) -> Error {
     error(unsafe { GetLastError() }, what)
 }
 
+/// A lock taken even when a thread that held it panicked. What these locks guard is a hook or a list
+/// that this crate keeps for itself, and nothing in it is read from the machine, so a poisoned lock
+/// holds data as good as any.
+pub fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a lock that a panicking thread poisoned still holds its data, and nothing in it was read from the machine"
+    )]
+    let guard = mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+}
+
+/// A duration as the whole milliseconds that a wait takes, and never more than `longest`: a longer
+/// duration, or one that does not fit the platform's count, waits for `longest`.
+#[must_use]
+pub fn milliseconds(duration: std::time::Duration, longest: u32) -> u32 {
+    match u32::try_from(duration.as_millis()) {
+        Ok(milliseconds) => milliseconds.min(longest),
+        Err(_) => longest,
+    }
+}
+
 /// Text as a NUL-terminated wide string.
 #[must_use]
 pub fn wide(text: &str) -> Vec<u16> {
@@ -426,17 +450,22 @@ impl Sid {
     }
 
     /// The identifier as text.
-    #[must_use]
-    pub fn to_text(&self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the identifier cannot be converted: no text is then given,
+    /// and in particular no empty one.
+    pub fn to_text(&self) -> Result<String> {
         let mut text: *mut u16 = null_mut();
         // SAFETY: the identifier is valid; the text is an out-parameter freed below.
         unsafe {
             if ConvertSidToStringSidW(self.as_ptr(), &raw mut text) == 0 {
-                return String::new();
+                // text: sid_to_text-1
+                return Err(last("converting an identifier to text"));
             }
             let value = from_wide(text);
             LocalFree(text.cast());
-            value
+            Ok(value)
         }
     }
 }
@@ -456,13 +485,13 @@ pub fn window_station_names() -> Result<Vec<String>> {
     unsafe extern "system" fn collect(name: *const u16, _: isize) -> i32 {
         // SAFETY: the platform passes a NUL-terminated name that lives through the call.
         let name = unsafe { from_wide(name) };
-        NAMES.lock().unwrap_or_else(|e| e.into_inner()).push(name);
+        locked(&NAMES).push(name);
         1
     }
-    NAMES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    locked(&NAMES).clear();
     // SAFETY: the callback has the signature the call wants and touches only the static list.
     if unsafe { EnumWindowStationsW(Some(collect), 0) } == 0 {
         return Err(last("listing the window stations"));
     }
-    Ok(NAMES.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    Ok(locked(&NAMES).clone())
 }

@@ -118,7 +118,7 @@ pub fn group() -> Sid {
 /// A descriptor that refuses the system and names only its owner, which is what a taken-over Git's
 /// own object can look like to the broker.
 pub fn hostile_descriptor(owner: &Sid) -> OwnedSd {
-    let owner = owner.to_text();
+    let owner = owner.to_text().unwrap();
     descriptor_from_text(&format!("O:{owner}D:P(D;;FA;;;SY)(A;;FA;;;{owner})")).unwrap()
 }
 

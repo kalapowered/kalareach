@@ -556,7 +556,8 @@ const _: () = {
 /// Whether this process runs as the system. A case that makes objects owned by another account
 /// has nothing to show under any other token, which cannot set that owner.
 fn runs_as_the_system() -> bool {
-    kr_boundary_windows::win::token::current_user().is_ok_and(|user| user.to_text() == "S-1-5-18")
+    kr_boundary_windows::win::token::current_user()
+        .is_ok_and(|user| user.to_text().unwrap() == "S-1-5-18")
 }
 
 /// Every subset of the three privileges, as a name and a list.
