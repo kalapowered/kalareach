@@ -271,6 +271,18 @@ describe('a tap between two links, through the handler', () => {
     expect(opened, 'links opened by the click').toEqual([])
   })
 
+  it('reads the links near the press’s point at the click, though the engine reported the click 20 px from it', () => {
+    // The press is at the edge of the corner link's area (50.25 px from its words); the click is reported 20 px farther, where
+    // the link's box lies just beyond the radius of 62.2 px: the layout read at the click's point would leave the link out.
+    const { pane, text, links } = between({ left: 0, top: 0, right: 8, bottom: 17 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(text, { clientX: 51, clientY: 43 }))
+    fire('pointerup', pointer(text, { clientX: 51, clientY: 43, timeStamp: 120 }))
+    fire('click', click(text, { clientX: 71, clientY: 43 }))
+    expect(opened).toEqual([links[0]])
+  })
+
   it('still gives the point to the link at the corner when no other link’s words are nearer', () => {
     const { pane, text, links } = between({ left: 0, top: 0, right: 8, bottom: 17 })
     start(pane)
