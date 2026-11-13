@@ -99,6 +99,7 @@ struct Worker {
     sequence: u64,
     _view: kr_worker::output::OutputStream,
     _service: Arc<WorkerService>,
+    _serving: kr_ipc::testing::Serving,
 }
 
 impl Worker {
@@ -204,7 +205,7 @@ impl Worker {
             )
             .expect("a worker service"),
         );
-        tokio::spawn(Arc::clone(&service).serve(listener));
+        let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
         let mut registry =
             Registry::open(environment.registry_database(), environment_id).expect("the registry");
         registry
@@ -247,6 +248,7 @@ impl Worker {
             sequence: 0,
             _view: view,
             _service: service,
+            _serving: serving,
         }
     }
 
