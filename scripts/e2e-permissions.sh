@@ -470,17 +470,17 @@ if [ -n "$node_binary" ] && [ -d "$pnpm_store" ]; then
   if [ -d "$run_root/node_modules/playwright" ]; then
     driver="$run_root/node_modules"
     cat >"$run_root/bin/browser-check.mjs" <<'BROWSER'
-// Opens a page in a real browser engine and writes one screenshot. The page is this script's own
-// bytes rather than anything on the network, and the driver and the browser are both on the
-// internal disk.
+// Opens a page in a real browser engine and writes one screenshot, to the path it is given. The
+// page is this script's own bytes rather than anything on the network, and the driver and the
+// browser are both on the internal disk.
 import { chromium } from 'playwright'
 
 const browser = await chromium.launch()
 try {
   const page = await browser.newPage()
   await page.setContent('<title>KalaReach desktop capability check</title><h1>ok</h1>')
-  await page.screenshot({ path: '/tmp/kr-permissions-browser-27.07.png' })
-  console.log(`ok: ${await page.title()}, screenshot at /tmp`)
+  await page.screenshot({ path: process.argv[2] })
+  console.log(`ok: ${await page.title()}, screenshot at ${process.argv[2]}`)
 } finally {
   await browser.close()
 }
@@ -526,7 +526,7 @@ evidence="$run_root/evidence"
   fi
   if [ -n "$driver" ] && [ -n "$node_binary" ]; then
     cd "$run_root"
-    if NODE_PATH="$driver" "$node_binary" "$run_root/bin/browser-check.mjs" \
+    if NODE_PATH="$driver" "$node_binary" "$run_root/bin/browser-check.mjs" "\$evidence/browser.png" \
       > "\$evidence/browser.txt" 2>&1; then
       echo "browser: \$(tail -1 "\$evidence/browser.txt")"
     else
@@ -552,7 +552,7 @@ if [ ! -s "$run_root/evidence/tools.status" ]; then
   fail "the tools step answered"
 else
   cp "$run_root/evidence/tools.txt" "$artefacts/tools.txt" 2>/dev/null || true
-  for file in peekaboo-apps.txt simulators.txt parallels.txt browser.txt; do
+  for file in peekaboo-apps.txt simulators.txt parallels.txt browser.txt browser.png; do
     [ -s "$run_root/evidence/$file" ] && cp "$run_root/evidence/$file" "$artefacts/$file"
   done
   sed 's/^/  /' "$run_root/evidence/tools.txt"
