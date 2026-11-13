@@ -1222,9 +1222,9 @@ impl AutomationService {
                     },
                     started: continued,
                 },
-                // The chain already stands past the generation this rearm leaves: another copy of
-                // it rearmed first, so this answer is what that copy left, and the host is told
-                // it is a copy.
+                // The chain already stands past the generation this rearm leaves, so the answer
+                // is where the chain stands now, not a rearm this request made, and the host is
+                // told it is answered from what an earlier submission left.
                 Rearm::Already { generation } => {
                     if let Some(answered) = submitted.answered {
                         answered.store(true, std::sync::atomic::Ordering::Release);

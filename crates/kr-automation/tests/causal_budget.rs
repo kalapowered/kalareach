@@ -1875,11 +1875,11 @@ async fn a_chain_spends_no_more_managed_allowance_than_it_inherited() {
     assert_eq!(budget(wider).max_managed_spend, 50);
 }
 
-/// KR-REQ-09.09: a rearm that finds the chain already past the generation it leaves, because
-/// another copy of it rearmed first, is answered from where the chain stands and says it was
-/// answered from what an earlier submission left, so that the host holds it to the authority check
-/// as it holds any recorded answer. A rearm that makes the chain's next generation answers for
-/// itself.
+/// KR-REQ-09.09: a rearm that finds the chain already past the generation it leaves, as the second
+/// submission of one action identifier does, is answered from where the chain stands and says it
+/// was answered from what an earlier submission left, so that the host holds it to the authority
+/// check as it holds any recorded answer. A rearm that makes the chain's next generation answers
+/// for itself.
 #[tokio::test]
 async fn a_rearm_that_finds_the_chain_already_rearmed_says_it_was_answered_from_a_record() {
     let table = common::every_right(&[test_grant_id(1)]);
@@ -1895,12 +1895,13 @@ async fn a_rearm_that_finds_the_chain_already_rearmed_says_it_was_answered_from_
         grant_reference: test_grant_id(1),
         generation: kr_protocol::scalars::U64::new(0),
     };
+    let key = common::fresh_action(Method::WorkflowRearm);
     let rearm = |answered: &std::sync::atomic::AtomicBool, now_ms: u64| {
         service.rearm(
             &params,
             &Submitted {
                 answered: Some(answered),
-                key: &common::fresh_action(Method::WorkflowRearm),
+                key: &key,
                 admission: &common::admitted,
                 caller_grant: None,
             },

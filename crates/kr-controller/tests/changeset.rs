@@ -1533,9 +1533,12 @@ async fn an_apply_that_loses_its_claim_to_another_copy_is_told_so_only_under_its
         refused.message, told.message,
         "the caller is not told what the claim said: {refused:?}"
     );
-    assert!(
-        !refused.message.contains("fence"),
-        "the caller is not told the authority is gone, a definite word: {refused:?}"
+    assert_eq!(
+        refused.message,
+        kr_controller::error::ControllerError::outcome_not_shown()
+            .to_protocol_error()
+            .message,
+        "the caller is told that what became of the action is not shown: {refused:?}"
     );
     assert_eq!(
         git_output(&path, &["rev-parse", "refs/heads/main"]),

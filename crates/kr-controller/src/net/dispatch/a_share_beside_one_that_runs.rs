@@ -906,6 +906,10 @@ async fn a_share_refused_beside_one_that_runs_is_not_told_after_a_fence_lands() 
     release.send(()).expect("the refused share goes on");
     let answered = racing.await;
     world.controller.hold_fence(false);
+    assert!(
+        !answered.is_copied() && !answered.is_withheld(),
+        "the fence's refusal answers for this share alone, as a fresh answer"
+    );
     let told = refused(&answered).to_protocol_error();
     assert_eq!(told.code, ErrorCode::PermissionDenied, "{told:?}");
     assert!(
