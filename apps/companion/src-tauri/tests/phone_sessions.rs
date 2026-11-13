@@ -4327,3 +4327,134 @@ async fn kr_req_19_08_a_reload_or_a_change_of_host_stops_the_dials_under_way() {
     control.release_all();
     adopted.stop().await;
 }
+
+/// KR-REQ-19.08, KR-REQ-23.21: an upload's chunks go out on a data stream of the connection that
+/// holds a place of this computer's budget, and the stream takes no place of its own: the budget
+/// holds as many places on the host after the upload as before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_an_upload_goes_out_on_a_data_stream_of_the_connection_that_holds_the_place() {
+    use kr_client::chunks::ChunkRoute;
+    use kr_client::uploads::{self, Held, Progress, Stage, Subject, Upload};
+    use kr_protocol::limits::UPLOAD_CHUNK_LEN;
+    use kr_protocol::scalars::DurationMs;
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let rights = [ActionRight::SessionView, ActionRight::FilesUpload];
+    let (phone, _control) = phone_governed(&adopted, pairing(&rights)).await;
+    let companion = &phone.companion;
+    let host = host_of(companion);
+    let places = companion_tauri::places::budget();
+    let held_before = places.held_on(host);
+    let session = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .session()
+        .expect("the main connection");
+
+    let route = ChunkRoute::network(&session, adopted.host.environment_id)
+        .await
+        .expect("the host takes an attachment stream from a connection that holds a place");
+    let bytes: Vec<u8> = (0..2 * UPLOAD_CHUNK_LEN + 1_000)
+        .map(|index| u8::try_from(index % 251).unwrap_or(0))
+        .collect();
+    let mut upload = Upload::new(
+        Subject {
+            environment_id: adopted.host.environment_id,
+            session_id: None,
+            device_id: None,
+            declared_media_type: "application/octet-stream".to_owned(),
+            original_file_name: "three.bin".to_owned(),
+        },
+        Box::new(Held::new(bytes.clone())),
+    );
+    let (progress, watching) = tokio::sync::watch::channel(Progress::default());
+    let handle = tokio::time::timeout(
+        WATCHDOG,
+        uploads::send(
+            &session,
+            &route,
+            &net_support::on_the_host(&adopted.host),
+            &mut upload,
+            DurationMs::new(60_000),
+            &progress,
+        ),
+    )
+    .await
+    .expect("the upload ends")
+    .expect("the upload is published");
+
+    assert_eq!(handle.byte_len.get(), bytes.len() as u64);
+    assert_eq!(watching.borrow().stage, Stage::Published);
+    assert_eq!(
+        places.held_on(host),
+        held_before,
+        "the upload's streams took no place"
+    );
+    drop(route);
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08, KR-REQ-23.21: a data stream that is open takes no place, and it ends with the
+/// connection that holds the place: after the connection is closed the stream is revoked, and no
+/// stream opens through an opener that was taken before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_data_stream_ends_with_the_connection_that_holds_the_place() {
+    use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
+    use kr_protocol::ids::TransferId;
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let rights = [ActionRight::SessionView, ActionRight::FilesUpload];
+    let (phone, _control) = phone_governed(&adopted, pairing(&rights)).await;
+    let companion = &phone.companion;
+    let host = host_of(companion);
+    let places = companion_tauri::places::budget();
+    let held_before = places.held_on(host);
+    let session = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .session()
+        .expect("the main connection");
+    let transport = Arc::clone(session.transport());
+    let opener = transport
+        .stream_opener()
+        .expect("a connection to a paired host has data streams");
+    let header = StreamHeader {
+        kind: StreamKind::AttachmentChunks,
+        connection_id: transport.connection_id(),
+        stream_id: Nullable::null(),
+        resource: StreamResource {
+            environment_id: adopted.host.environment_id,
+            session_id: Nullable::null(),
+            attachment_id: Nullable::null(),
+            transfer_id: Nullable::some(TransferId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [9; 16],
+            ))),
+        },
+    };
+
+    let stream = opener
+        .open(header.clone())
+        .await
+        .expect("a data stream opens on the connection that holds the place");
+    assert!(!stream.is_revoked());
+    assert_eq!(
+        places.held_on(host),
+        held_before,
+        "an open stream takes no place"
+    );
+
+    transport.close();
+
+    assert!(stream.is_revoked(), "the stream ended with its connection");
+    tokio::time::timeout(WATCHDOG, opener.revoked())
+        .await
+        .expect("the streams of a closed connection are revoked");
+    assert!(
+        opener.open(header).await.is_err(),
+        "no stream opens through an opener taken before the close"
+    );
+    drop(stream);
+    adopted.stop().await;
+}
