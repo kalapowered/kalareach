@@ -195,6 +195,32 @@ fn a_policy_entry_with_a_missing_or_unknown_field_is_refused_as_not_understood()
         rule(r#"Action="Allow" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}""#),
         &["FilePathRule", "no UserOrGroupSid"],
     );
+    // A field that is there and holds nothing is as unread as one that is missing.
+    refused(
+        rule(r#"Action="Allow" UserOrGroupSid="S-1-1-0" Id="  ""#),
+        &["FilePathRule", "empty Id"],
+    );
+    refused(
+        rule(r#"Action="Allow" UserOrGroupSid="" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}""#),
+        &["FilePathRule", "empty UserOrGroupSid"],
+    );
+    refused(
+        r#"<AppLockerPolicy Version="1"><RuleCollection Type="" EnforcementMode="Enabled" /></AppLockerPolicy>"#.to_owned(),
+        &["RuleCollection", "empty Type"],
+    );
+    let condition = |condition: &str| {
+        format!(
+            r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="Enabled"><FilePathRule {whole} Name="n" Description="d"><Conditions>{condition}</Conditions></FilePathRule></RuleCollection></AppLockerPolicy>"#
+        )
+    };
+    refused(
+        condition("<FilePathCondition/>"),
+        &["FilePathCondition", "no Path"],
+    );
+    refused(
+        condition(r#"<FilePathCondition Path=" "/>"#),
+        &["FilePathCondition", "empty Path"],
+    );
 }
 
 #[test]
@@ -487,6 +513,27 @@ fn the_platforms_own_reports_are_read() {
     assert_eq!(applied[0].id, 8001);
     assert!(applied[0].rule_id.is_empty());
     assert!(events::parse("<Event>").is_err());
+}
+
+#[test]
+fn an_event_number_or_reference_that_is_not_read_is_an_error_and_not_a_default() {
+    let event = |inner: &str| format!("<Event><System>{inner}</System></Event>");
+    for unread in [
+        "<EventID>80x4</EventID>",
+        "<EventID></EventID>",
+        "<EventRecordID>-1</EventRecordID>",
+        "<EventRecordID>12</EventRecordID><EventRecordID>1 2</EventRecordID>",
+        "<Data>a&bogus;b</Data>",
+        "<Data>a&#xD800;b</Data>",
+    ] {
+        assert!(events::parse(&event(unread)).is_err(), "{unread}");
+    }
+    // A reference that splits a number leaves the number whole.
+    let read = events::parse(&event(
+        "<EventID>&#56;004</EventID><EventRecordID>77</EventRecordID>",
+    ))
+    .unwrap();
+    assert_eq!((read[0].id, read[0].record), (BLOCKED, 77));
 }
 
 #[test]

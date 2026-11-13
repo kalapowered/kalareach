@@ -198,20 +198,20 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
             let group = needed(principals.group.as_ref(), "the invocation's group")?;
             Ok(format!(
                 "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;{MODIFY};;;{})",
-                group.to_text()
+                group.to_text()?
             ))
         }
         SdKind::DataPipe => {
             let client = needed(principals.client.as_ref(), "the client")?;
             Ok(format!(
                 "O:SYD:P(A;;GA;;;SY)(A;;{PIPE_READ};;;{})",
-                client.to_text()
+                client.to_text()?
             ))
         }
         SdKind::ProcessThread => Ok(match principals.group.as_ref() {
             Some(group) => format!(
                 "O:BAD:P(A;;{ALL_BUT_CHANGING_THE_DESCRIPTOR};;;{})(A;;{ALL_ACCESS};;;SY)",
-                group.to_text()
+                group.to_text()?
             ),
             None => format!("O:BAD:P(A;;{ALL_ACCESS};;;SY)"),
         }),
@@ -231,7 +231,7 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
             let group = needed(principals.group.as_ref(), "the invocation's group")?;
             Ok(format!(
                 "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{READ_AND_EXECUTE};;;{})",
-                group.to_text()
+                group.to_text()?
             ))
         }
     }
@@ -306,7 +306,7 @@ unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
         return Err(error(0, "the descriptor has no owner"));
     }
     // SAFETY: the owner pointer is inside the valid descriptor.
-    let owner = unsafe { Sid::from_ptr(owner) }.to_text();
+    let owner = unsafe { Sid::from_ptr(owner) }.to_text()?;
     let mut control = 0_u16;
     let mut revision = 0_u32;
     // SAFETY: as above.
@@ -358,7 +358,7 @@ unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
                 kind,
                 flags,
                 mask,
-                sid: sid.to_text(),
+                sid: sid.to_text()?,
             });
         }
         Some(entries)

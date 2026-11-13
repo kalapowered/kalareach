@@ -51,6 +51,10 @@
 //! again, or that writes a dump of itself, is outside the claim, and so is a computer on which an
 //! administrator has configured error reporting for the broker's own program.
 
+// The methods that clippy.toml lists fold a failed read into an answer: none of them is used here
+// without an expectation that says why nothing rests on the fold.
+#![deny(clippy::disallowed_methods)]
+
 pub mod env;
 pub mod events;
 pub mod filekey;

@@ -79,3 +79,7 @@ unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+# The methods that clippy.toml lists fold a failed read into an answer. The library and the programs
+# of the product deny them in their roots; the cases, the build script and the guest's stand-in
+# program, which no person runs, look at their own files and may use them.
+disallowed_methods = "allow"

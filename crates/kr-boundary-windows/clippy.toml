@@ -1,0 +1,27 @@
+# Clippy reads the nearest clippy.toml, so this file stands in for the repository's for this package
+# alone. It sets no minimum Rust version of its own: the package's `rust-version`, which is the
+# repository's, is the one Clippy then uses.
+#
+# This crate tells a person what the machine showed, and it decides on what it read. A read has three
+# answers: there, not there, and could not be read. The methods below fold the third answer into one
+# of the first two, so a failed read becomes a statement about the machine or a decision. Read with
+# `records::look`, or with a call that returns the error, and carry the error to the text. A place
+# where nothing rests on the fold (a clean-up whose text claims nothing, a display that names the
+# identifier instead) carries `#[expect(clippy::disallowed_methods, reason = "...")]` with the reason.
+
+disallowed-methods = [
+    { path = "std::path::Path::exists", reason = "it answers false when the look failed; look with records::look, or with std::fs::metadata and keep the error" },
+    { path = "std::path::Path::is_file", reason = "it answers false when the look failed; look with records::look, or with std::fs::metadata and keep the error" },
+    { path = "std::path::Path::is_dir", reason = "it answers false when the look failed; look with records::look, or with std::fs::metadata and keep the error" },
+    { path = "std::path::Path::is_symlink", reason = "it answers false when the look failed; look with std::fs::symlink_metadata and keep the error" },
+    { path = "std::result::Result::ok", reason = "it drops the error of a failed read; match on the Result and carry the error" },
+    { path = "std::result::Result::unwrap_or", reason = "it turns a failed read into a value; match on the Result and carry the error" },
+    { path = "std::result::Result::unwrap_or_default", reason = "it turns a failed read into a value; match on the Result and carry the error" },
+    { path = "std::result::Result::unwrap_or_else", reason = "it turns a failed read into a value; match on the Result and carry the error" },
+    { path = "std::result::Result::is_ok", reason = "it turns a failed read into false; match on the Result and carry the error" },
+    { path = "std::result::Result::is_err", reason = "it turns a failed read into a statement; match on the Result and carry the error" },
+    { path = "std::result::Result::is_ok_and", reason = "it turns a failed read into false; match on the Result and carry the error" },
+    { path = "std::result::Result::is_err_and", reason = "it turns an answer into a statement about the error; match on the Result" },
+    { path = "std::result::Result::map_or", reason = "it turns a failed read into a value; match on the Result and carry the error" },
+    { path = "std::result::Result::map_or_else", reason = "it turns a failed read into a value; match on the Result and carry the error" },
+]

@@ -308,6 +308,10 @@ impl Channel {
     ///
     /// Returns an error when the file cannot be written, PowerShell refuses the policy or the log,
     /// or its answer does not name a record.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a record number that is not a number ends in Error::Unreadable at once; no default stands in for it"
+    )]
     pub fn set(&self, xml: &str) -> Result<u64, Error> {
         // PowerShell reads the policy by its path, so the file is one that did not exist: a random
         // name, made in the directory the installation checked, owned by the administrators in the

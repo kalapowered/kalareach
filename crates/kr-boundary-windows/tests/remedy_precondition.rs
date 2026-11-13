@@ -197,8 +197,9 @@ fn the_removals_next_step_says_what_the_lookup_found_at_the_manifests_name() {
     }
 }
 
-/// The refusal for Git's permissions says that others can change or replace a file or a folder only
-/// for a state that the check read and found to grant a right. A list that the check cannot evaluate
+/// The refusal for Git's permissions says that an owner or an entry of the list allows others to
+/// change or replace a file or a folder only for a state that the check read, and claims no effective
+/// access: it says that entries that deny are not read. A list that the check cannot evaluate
 /// (an entry of a type that it does not interpret) is refused in words of its own, which say that
 /// the setup program cannot tell, and never say that others can change or replace it.
 #[test]
@@ -212,7 +213,9 @@ fn a_permission_list_that_the_check_cannot_evaluate_is_not_said_to_let_others_ch
         let confirmed = git_permissions_refusal(path, &granted, replacement);
         assert_eq!(
             confirmed,
-            format!("{path} can be {said} by others: S-1-5-32-545 is allowed rights 0x2")
+            format!(
+                "A look at {path} found an owner or an entry of its list that allows it to be {said} by an account outside the system's class: S-1-5-32-545 is allowed rights 0x2. The check does not read an entry that denies."
+            )
         );
         let cannot = git_permissions_refusal(path, &unread, replacement);
         assert!(

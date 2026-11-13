@@ -53,7 +53,7 @@ pub fn main() -> ExitCode {
             let options = Options { payload, person };
             let person = match &options.person {
                 Some(person) => Ok(person.clone()),
-                None => super::token::current_user().map(|user| user.to_text()),
+                None => super::token::current_user().and_then(|user| user.to_text()),
             };
             person.map_err(install::Error::from).and_then(|person| {
                 install::confirm(

@@ -2,6 +2,8 @@
 //! elevated, started by `kr host boundary`, and takes the person's typed yes before it changes
 //! anything.
 
+#![deny(clippy::disallowed_methods)]
+
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
     kr_boundary_windows::win::setup::main()

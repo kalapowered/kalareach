@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, LocalFree, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, LocalFree, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
@@ -95,7 +95,14 @@ impl Kind {
 }
 
 /// An event that, once set, ends every wait of every connection that holds it.
-pub struct Stop(Handle);
+///
+/// A wait on the event has three answers: set, not set, and failed. A failed wait says nothing about
+/// the event, so it does not count as "not set": the stop counts as set, which ends the work, and
+/// the failure is kept for [`Stop::unread`], which the service reports.
+pub struct Stop {
+    event: Handle,
+    unread: std::sync::OnceLock<String>,
+}
 
 impl Stop {
     /// A new stop event, not set.
@@ -106,38 +113,70 @@ impl Stop {
     pub fn new() -> Result<Arc<Stop>> {
         // SAFETY: a manual-reset event with no name and no security attributes.
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
-        // text: pipe_new-1
-        Ok(Arc::new(Stop(Handle::new(event, "making the stop event")?)))
+        Ok(Arc::new(Stop {
+            // text: pipe_new-1
+            event: Handle::new(event, "making the stop event")?,
+            unread: std::sync::OnceLock::new(),
+        }))
     }
 
     /// Ends every wait.
     pub fn set(&self) {
         // SAFETY: the event handle is open.
         unsafe {
-            SetEvent(self.0.raw());
+            SetEvent(self.event.raw());
         }
     }
 
-    /// Whether the event is set.
+    /// Whether the event is set, or could not be waited on (see [`Stop::unread`]).
     #[must_use]
     pub fn is_set(&self) -> bool {
-        // SAFETY: the event handle is open; a zero wait only reads its state.
-        unsafe { WaitForSingleObject(self.0.raw(), 0) == WAIT_OBJECT_0 }
+        self.waited(0)
     }
 
-    /// Waits for as long as `duration` or until the event is set, and says whether it is set. A
-    /// pause of a request's own work that the stop must be able to end takes this and not a sleep.
+    /// The error of a wait on the event that failed, if one did.
+    #[must_use]
+    // text: unread
+    pub fn unread(&self) -> Option<&str> {
+        self.unread.get().map(String::as_str)
+    }
+
+    /// Waits on the event for up to the milliseconds. Returns whether it is set, or whether the wait
+    /// failed, which is kept in `unread`.
+    fn waited(&self, milliseconds: u32) -> bool {
+        // SAFETY: the event handle is open for the length of the wait.
+        let waited = unsafe { WaitForSingleObject(self.event.raw(), milliseconds) };
+        match waited {
+            WAIT_OBJECT_0 => true,
+            WAIT_TIMEOUT => false,
+            other => {
+                let failure = if other == WAIT_FAILED {
+                    // text: pipe_stop_waited-1
+                    last("waiting on the stop event")
+                } else {
+                    // text: pipe_stop_waited-2
+                    error(
+                        0,
+                        format!("waiting on the stop event gave the answer {other:#x}"),
+                    )
+                };
+                let _ = self.unread.set(failure.to_string());
+                true
+            }
+        }
+    }
+
+    /// Waits for as long as `duration` or until the event is set, and says whether it is set (or
+    /// could not be waited on, as [`Stop::is_set`]). A pause of a request's own work that the stop
+    /// must be able to end takes this and not a sleep.
     #[must_use]
     pub fn wait(&self, duration: std::time::Duration) -> bool {
-        let milliseconds =
-            u32::try_from(duration.as_millis()).map_or(INFINITE - 1, |left| left.min(INFINITE - 1));
-        // SAFETY: the event handle is open for the length of the wait.
-        unsafe { WaitForSingleObject(self.0.raw(), milliseconds) == WAIT_OBJECT_0 }
+        self.waited(super::ffi::milliseconds(duration, INFINITE - 1))
     }
 
     /// The event's handle, for a wait of another module that the stop must be able to end.
     pub(super) fn event(&self) -> HANDLE {
-        self.0.raw()
+        self.event.raw()
     }
 }
 
@@ -239,6 +278,10 @@ pub mod testing {
         REFILLS_TO_FAIL.store(count, Ordering::SeqCst);
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an atomic counter of the testing seams, not a read"
+    )]
     pub(super) fn take_refill_failure() -> bool {
         REFILLS_TO_FAIL
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -257,16 +300,11 @@ pub mod testing {
     /// broker's own client end is opened on it, so that a case can pause the bind in that window. The
     /// hook is a flag of the whole process.
     pub fn before_the_keepers_open(hook: Option<Hook>) {
-        *BEFORE_THE_KEEPERS_OPEN
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+        *crate::win::ffi::locked(&BEFORE_THE_KEEPERS_OPEN) = hook;
     }
 
     pub(super) fn keepers_open_is_next() {
-        let hook = BEFORE_THE_KEEPERS_OPEN
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let hook = crate::win::ffi::locked(&BEFORE_THE_KEEPERS_OPEN).clone();
         if let Some(hook) = hook {
             hook();
         }
@@ -335,26 +373,37 @@ fn wait(
 ) -> io::Result<(u32, Transfer)> {
     // The stop's event is the first handle: when both are signalled the call reports the lower index,
     // so a transfer that finished at once never wins over the stop.
-    let handles = [stop.0.raw(), transfer.event.raw()];
+    let handles = [stop.event.raw(), transfer.event.raw()];
     let milliseconds = deadline.map_or(INFINITE, |deadline| {
         let left = deadline.saturating_duration_since(Instant::now());
         // One less than the longest wait, which means "forever".
-        u32::try_from(left.as_millis()).map_or(INFINITE - 1, |left| left.min(INFINITE - 1))
+        super::ffi::milliseconds(left, INFINITE - 1)
     });
     // SAFETY: both handles are open for the length of the wait.
     let signalled = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
+    // The error of a failed wait is read before another call can replace it.
+    let failed = (signalled == WAIT_FAILED).then(io::Error::last_os_error);
     if signalled != WAIT_OBJECT_0 + 1 {
         if !cancel(pipe, &mut transfer) {
             *stuck = true;
             std::mem::forget(transfer);
         }
-        return Err(if signalled == WAIT_TIMEOUT {
+        return Err(if let Some(error) = failed {
+            io::Error::new(
+                error.kind(),
+                format!("waiting for the other end failed ({error})"),
+            )
+        } else if signalled == WAIT_TIMEOUT {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the other end did not answer before the deadline",
             )
-        } else {
+        } else if signalled == WAIT_OBJECT_0 {
             stopping()
+        } else {
+            io::Error::other(format!(
+                "waiting for the other end gave the answer {signalled:#x}"
+            ))
         });
     }
     let mut transferred = 0_u32;
@@ -660,7 +709,7 @@ impl Listener {
         let mut list = format!("D:P(A;;GA;;;SY){}", pipe_access::entry("BA"));
         if kind == Kind::Persons {
             for person in people {
-                list.push_str(&pipe_access::entry(&person.to_text()));
+                list.push_str(&pipe_access::entry(&person.to_text()?));
             }
         }
         let descriptor = Descriptor::from_text(&list)?;

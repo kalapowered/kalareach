@@ -93,7 +93,11 @@ fn the_root_is_made_by_one_call_with_the_descriptor_it_was_sent_and_its_rows_com
     );
     assert_eq!(
         (entries[1].sid.clone(), entries[1].mask, entries[1].flags),
-        (owner.to_text(), MODIFY, INHERIT_OBJECT_AND_CONTAINER)
+        (
+            owner.to_text().unwrap(),
+            MODIFY,
+            INHERIT_OBJECT_AND_CONTAINER
+        )
     );
     for part in [root.tmp(), root.home()] {
         let inner = look_at(&part);

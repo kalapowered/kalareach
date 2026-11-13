@@ -159,7 +159,7 @@ impl Fixture {
         .unwrap();
         let full_descriptor = descriptor_from_text(&format!(
             "O:SYD:P(A;;0x1fffff;;;{})(A;;0x1fffff;;;SY)",
-            group.to_text()
+            group.to_text().unwrap()
         ))
         .unwrap();
         Fixture {
@@ -492,11 +492,11 @@ fn security_of(object: HANDLE) -> Security {
             let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
             assert_eq!((*ace).Header.AceType, 0, "every entry allows");
             let sid = Sid::from_ptr((&raw mut (*ace).SidStart).cast());
-            allowed.push((sid.to_text(), (*ace).Mask));
+            allowed.push((sid.to_text().unwrap(), (*ace).Mask));
             flags.push((*ace).Header.AceFlags);
         }
         let found = Security {
-            owner: Sid::from_ptr(owner).to_text(),
+            owner: Sid::from_ptr(owner).to_text().unwrap(),
             protected: control & 0x1000 != 0,
             allowed,
             flags,
@@ -703,7 +703,7 @@ fn the_process_and_thread_name_the_group_and_the_system_and_the_group_cannot_cha
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let (suspended, output) = fixture.start(&job, &["spawn-hold"]);
-    let group = fixture.group.to_text();
+    let group = fixture.group.to_text().unwrap();
     let expected = [
         (group.clone(), 0x0013_ffff_u32),
         (SYSTEM_SID.to_owned(), 0x001f_ffff_u32),
@@ -1060,8 +1060,8 @@ fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocat
         invocation: hex::encode(INVOCATION.0),
         boot_marker: "boot".to_owned(),
         session_luid: 1,
-        group_sid: fixture.group.to_text(),
-        client_sid: fixture.sid.to_text(),
+        group_sid: fixture.group.to_text().unwrap(),
+        client_sid: fixture.sid.to_text().unwrap(),
         client_pid: 1,
         client_creation_time: 1,
         chain: Vec::new(),
@@ -1908,7 +1908,7 @@ fn runs_as_the_system() -> bool {
     assert_ne!(read, 0, "the token's user is read");
     // SAFETY: the buffer holds a TOKEN_USER whose identifier points into the same buffer.
     let user = unsafe { Sid::from_ptr((*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid) };
-    user.to_text() == SYSTEM_SID
+    user.to_text().unwrap() == SYSTEM_SID
 }
 
 /// The entry that names the Administrators group is for a token that holds the group enabled,

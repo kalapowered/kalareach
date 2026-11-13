@@ -425,6 +425,10 @@ impl Tracker {
 
     /// The granted or made object that a leftover's `object` names, by its key as text or by the
     /// path of its grant.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a text or bytes in hand are parsed here: that they are not valid is the whole answer, and nothing was read from the machine"
+    )]
     fn owner_of(&self, object: &str) -> Option<FileKey> {
         // The key's text is taken only in the form the key prints, which is the form the room for
         // the leftover was kept for.

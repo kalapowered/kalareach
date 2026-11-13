@@ -47,14 +47,19 @@ fn random_password() -> String {
 }
 
 /// The identifier of a local account: `Some` where the lookup found it, `None` where the lookup
-/// answered that no account has that name (the platform's "no mapping" answer).
+/// answered that no local account has that name (the platform's "no mapping" answer). The lookup is
+/// local: it names this computer.
 ///
 /// # Errors
 ///
 /// Returns the platform's error when the lookup failed for any other reason: nothing is then
 /// known about the account.
 pub fn find(name: &str) -> Result<Option<Sid>> {
-    match Sid::of_account(name) {
+    // The name is qualified with this computer's name, so that the platform looks it up among this
+    // computer's own accounts and asks no domain. A plain name that no local account has is passed
+    // on to a domain's controller, and an error of that lookup would be taken for the account's.
+    let qualified = format!("{}\\{name}", super::token::computer_name()?);
+    match Sid::of_account(&qualified) {
         Ok(sid) => Ok(Some(sid)),
         Err(failure) if failure.code == ERROR_NONE_MAPPED => Ok(None),
         Err(failure) => Err(failure),
@@ -274,7 +279,7 @@ pub fn hidden_from_sign_in(name: &str) -> Result<bool> {
 ///
 /// Returns the platform's error for any failure but a missing profile.
 pub fn delete_profile(sid: &Sid) -> Result<()> {
-    let text = wide(&sid.to_text());
+    let text = wide(&sid.to_text()?);
     // SAFETY: the identifier text is NUL-terminated; the two optional names are null.
     let removed = unsafe { DeleteProfileW(text.as_ptr(), null(), null()) };
     if removed != 0 {

@@ -223,7 +223,7 @@ fn an_empty_data_directory_that_an_earlier_removal_left_is_finished_by_the_next_
 /// delete in, and the check of the folders above the trees refuses them, as it should.
 fn needs_the_system() -> bool {
     if kr_boundary_windows::win::token::current_user()
-        .is_ok_and(|user| user.to_text() == "S-1-5-18")
+        .is_ok_and(|user| user.to_text().unwrap() == "S-1-5-18")
     {
         return false;
     }

@@ -226,13 +226,17 @@ pub fn ending(
         }
         Remedy::MoveAside => {
             let not_recorded = record == Some(Record::NotRecorded);
+            if not_recorded && kind == EntryKind::Manifest {
+                // The reason is all that the read shows: the manifest was read and holds no record
+                // of its own data directory. No step is named, since the setup program has none
+                // for it, and no forecast is made of what a run after any change of the manifest
+                // says.
+                let data = data.unwrap_or_default();
+                return format!(
+                    "The manifest in {data} holds no record of {data} itself. The setup program names no step for this state."
+                );
+            }
             let basis = match origin {
-                _ if not_recorded && kind == EntryKind::Manifest => {
-                    let data = data.unwrap_or_default();
-                    format!(
-                        "The manifest in {data} holds no record of {data} itself, so nothing records what {data} holds."
-                    )
-                }
                 _ if not_recorded => format!(
                     "The manifest holds no record of {entry}, and {entry} holds entries: nothing shows what wrote them."
                 ),
@@ -264,13 +268,8 @@ pub fn ending(
                 }
                 EntryKind::Other => "The next run finds the entry absent.",
             };
-            let kept = if not_recorded && kind == EntryKind::Manifest {
-                " Keep it: it may be the record of an installation."
-            } else {
-                ""
-            };
             format!(
-                "{basis} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again.{kept} {next}"
+                "{basis} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again. {next}"
             )
         }
         Remedy::Unreadable => format!(
@@ -403,14 +402,16 @@ impl std::fmt::Display for Finding {
 
 /// What the setup program says of one of Git's files, or of a folder above them, whose permissions
 /// the check found a state in: `replacement` is true for a folder above the files, where the check
-/// asks only whether the folder or what it holds can be replaced. A confirmed grant is said to be
-/// one; a list that the check cannot evaluate is said to be one that the setup program cannot read.
+/// asks only whether the folder or what it holds can be replaced. An owner or an entry that allows the change is said to be
+/// that, and not as a result; a list that the check cannot evaluate is said to be one that the setup program cannot read.
 #[must_use]
 // text: git_permissions_refusal
 pub fn git_permissions_refusal(path: &str, finding: &Finding, replacement: bool) -> String {
     let what = if replacement { "replaced" } else { "changed" };
     match finding {
-        Finding::Granted(words) => format!("{path} can be {what} by others: {words}"),
+        Finding::Granted(words) => format!(
+            "A look at {path} found an owner or an entry of its list that allows it to be {what} by an account outside the system's class: {words}. The check does not read an entry that denies."
+        ),
         Finding::Unevaluated(words) => {
             format!("The setup program cannot tell whether {path} can be {what} by others: {words}")
         }

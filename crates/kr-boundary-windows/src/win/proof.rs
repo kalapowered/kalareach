@@ -330,8 +330,9 @@ fn settled(job: &Job, ended: Ended) -> Result<(), LaunchError> {
 fn uncertain_end(job: &Job, ended: Ended) -> LaunchError {
     let reasons = job.unproved_reasons().join("; ");
     LaunchError::EndUncertain(format!(
-        "the program was not shown to have ended (exited {}, job empty {}): {reasons}",
-        ended.all_exited, ended.active_zero
+        "the program was not shown to have ended (exited {}, {}): {reasons}",
+        ended.all_exited,
+        ended.count_words()
     ))
 }
 
@@ -520,17 +521,11 @@ pub mod testing {
     /// process is made and held suspended, or the launch failed), before the run looks at the stop
     /// again and resumes it. The hook is a flag of the whole process.
     pub fn after_the_launch(hook: Option<Hook>) {
-        *AFTER_THE_LAUNCH
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+        *crate::win::ffi::locked(&AFTER_THE_LAUNCH) = hook;
     }
 
     pub(super) fn launch_ended() {
-        if let Some(hook) = AFTER_THE_LAUNCH
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(hook) = crate::win::ffi::locked(&AFTER_THE_LAUNCH).as_ref() {
             hook();
         }
     }
@@ -538,17 +533,11 @@ pub mod testing {
     /// Sets, or with none clears, what a proof does when its search for a refusal has found one, before
     /// it starts any program that follows. The hook is a flag of the whole process.
     pub fn after_the_search(hook: Option<Hook>) {
-        *AFTER_THE_SEARCH
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+        *crate::win::ffi::locked(&AFTER_THE_SEARCH) = hook;
     }
 
     pub(super) fn search_ended() {
-        if let Some(hook) = AFTER_THE_SEARCH
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(hook) = crate::win::ffi::locked(&AFTER_THE_SEARCH).as_ref() {
             hook();
         }
     }
@@ -574,6 +563,10 @@ pub mod testing {
 /// Proves that the policy refuses an unlisted program to a class's token and runs a listed one,
 /// all before the deadline.
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the words keep the error of the read"
+)]
 pub fn prove(
     manifest: &Manifest,
     class: Class,
