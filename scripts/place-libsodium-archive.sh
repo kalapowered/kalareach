@@ -39,7 +39,7 @@ crate_version=1.24.0
 # The archive and its signature as upstream publishes them, and the name the build script reads.
 archive=libsodium-1.0.22-msvc.zip
 archive_bytes=17690194
-archive_sha256=3e03a726fac4bc09cb61d8f29d658ef7a5eca0811de59082130414f7ca2e4279
+archive_sha256=3e03a726fac4bc09cb61d8f29d658ef7a5eca0811de59082130414f7ca2e4278
 signature=libsodium-1.0.22-msvc.zip.minisig
 signature_bytes=320
 signature_sha256=3210cf4d985f7b192bb8d5eb2ec7f481e0f47420f144cf1069921f714bfad1d1
