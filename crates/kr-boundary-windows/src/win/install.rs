@@ -36,7 +36,7 @@ use crate::manifest::{
 };
 use crate::messages;
 use crate::notice::NOTICE;
-use crate::policy::{self, Policy};
+use crate::policy::{self, Emptied, Mode, Policy};
 use crate::records::{self, Records, is_hex32, is_manifest_replacement};
 use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Shape};
 
@@ -3853,10 +3853,40 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                         policy::RULE_CONNECT,
                     ]
                 };
-                channel.set(
-                    // text: remove_at-9
-                    &policy::strip(&xml, drop).map_err(|error| Error::Failed(error.to_string()))?,
-                )?;
+                // Where the earlier-state record holds an executable collection with no rule and a
+                // mode, a collection that holds only what the installation set (its mode, and no
+                // rule but its own) is written back as the record holds it; one that holds more is
+                // written as it is found, without the installation's rules.
+                let recorded = recorded_empty_mode(prior.as_ref());
+                let emptied = match recorded {
+                    Some(mode) if shared_rules(&effective).is_none() => {
+                        if effective.exe_mode() == Some(Mode::Enabled) {
+                            Emptied::Mode(mode)
+                        } else {
+                            Emptied::AsFound
+                        }
+                    }
+                    _ => Emptied::NotConfigured,
+                };
+                let stripped = policy::strip(&xml, drop, emptied);
+                // text: remove_at-9
+                let stripped = stripped.map_err(|error| Error::Failed(error.to_string()))?;
+                channel.set(&stripped)?;
+                match (emptied, recorded) {
+                    (Emptied::Mode(mode), _) => {
+                        // text: remove_at-10-record
+                        say(&format!(
+                            "the policy is written without the installation's rules, and the executable collection is written as the earlier-state record holds it: no rule, and the mode {mode:?}"
+                        ));
+                    }
+                    (Emptied::AsFound, Some(mode)) => {
+                        // text: remove_at-10-differs
+                        say(&format!(
+                            "the executable collection differs from the earlier-state record in more than the installation's rules, so it is written as it is found, without them, and the record's mode {mode:?} is not written back"
+                        ));
+                    }
+                    _ => {}
+                }
                 if kept {
                     // text: remove_at-10-kept
                     say(
@@ -4268,6 +4298,16 @@ impl Shared {
                 ids.join(", ")
             ),
         }
+    }
+}
+
+/// The mode of the earlier-state record's executable collection, where the record holds one with
+/// no rule and a mode other than not configured; none where the record holds no such collection or
+/// is not there or cannot be read (the check after the removal says that it could not).
+fn recorded_empty_mode(prior: Option<&Prior>) -> Option<Mode> {
+    match Policy::parse(&prior?.policy_xml) {
+        Ok(record) => record.recorded_empty_mode(),
+        Err(_) => None,
     }
 }
 

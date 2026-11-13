@@ -7,7 +7,7 @@ use kr_boundary_windows::events::{self, BLOCKED};
 use kr_boundary_windows::frame::{self, FrameError, Request, Response};
 use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior, STORE_VERSION};
 use kr_boundary_windows::policy::{
-    self, Action, Kind, Mode, Policy, RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT,
+    self, Action, Emptied, Kind, Mode, Policy, RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT,
 };
 use kr_boundary_windows::state::{Status, Verdict};
 
@@ -540,7 +540,12 @@ fn an_event_number_or_reference_that_is_not_read_is_an_error_and_not_a_default()
 fn removal_takes_out_only_our_rules_and_leaves_the_rest_as_written() {
     let reported = include_str!("fixtures/effective-policy.xml").trim();
     // Ours only: the collection goes back to not configured.
-    let none = policy::strip(reported, &[RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT]).unwrap();
+    let none = policy::strip(
+        reported,
+        &[RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT],
+        Emptied::NotConfigured,
+    )
+    .unwrap();
     let after = Policy::parse(&none).unwrap();
     assert!(after.is_unconfigured());
     assert!(
@@ -553,7 +558,12 @@ fn removal_takes_out_only_our_rules_and_leaves_the_rest_as_written() {
     // and the publisher rule survives with its own name and text.
     let theirs = r#"<FilePublisherRule Id="33333333-3333-3333-3333-333333333333" Name="Contoso &amp; sons" Description="d" UserOrGroupSid="S-1-1-0" Action="Allow"><Conditions><FilePublisherCondition PublisherName="O=CONTOSO" ProductName="*" BinaryName="*"><BinaryVersionRange LowSection="*" HighSection="*" /></FilePublisherCondition></Conditions></FilePublisherRule>"#;
     let shared = reported.replace("</RuleCollection>", &format!("{theirs}</RuleCollection>"));
-    let kept = policy::strip(&shared, &[RULE_CHECKOUT, RULE_CONNECT]).unwrap();
+    let kept = policy::strip(
+        &shared,
+        &[RULE_CHECKOUT, RULE_CONNECT],
+        Emptied::NotConfigured,
+    )
+    .unwrap();
     assert!(kept.contains(theirs));
     let parsed = Policy::parse(&kept).unwrap();
     let exe = &parsed.collections["Exe"];
@@ -567,7 +577,54 @@ fn removal_takes_out_only_our_rules_and_leaves_the_rest_as_written() {
         exe.rules["33333333-3333-3333-3333-333333333333"].kind,
         Kind::Publisher
     );
-    assert!(policy::strip("not a policy", &[]).is_err());
+    assert!(policy::strip("not a policy", &[], Emptied::NotConfigured).is_err());
+}
+
+/// An executable collection that the earlier-state record holds with no rule and a mode (audit
+/// only, the state of a computer that audits before it enforces) is written back by the removal as
+/// the record holds it, so that the comparison with the record finds no difference. Where the
+/// collection is not in the mode the installation set, it is written as it is found, without the
+/// installation's rules, and the record's mode is not forced onto it.
+#[test]
+fn the_removal_writes_an_empty_audit_only_collection_back_as_the_record_holds_it() {
+    let record_of = |mode: &str| {
+        Policy::parse(&format!(
+            r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="{mode}"></RuleCollection></AppLockerPolicy>"#
+        ))
+        .unwrap()
+    };
+    let record = record_of("AuditOnly");
+    assert_eq!(record.recorded_empty_mode(), Some(Mode::AuditOnly));
+    assert_eq!(record_of("NotConfigured").recorded_empty_mode(), None);
+    let installed = Policy::installed("S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1002");
+    assert_eq!(installed.exe_mode(), Some(Mode::Enabled));
+    assert_eq!(installed.recorded_empty_mode(), None, "it holds rules");
+    let xml = installed.render();
+    let ours = [RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT];
+
+    // Written as the record holds it: no difference. The old write, not configured, is one.
+    let back = policy::strip(&xml, &ours, Emptied::Mode(Mode::AuditOnly)).unwrap();
+    assert!(back.contains(r#"EnforcementMode="AuditOnly""#), "{back}");
+    let after = Policy::parse(&back).unwrap();
+    assert!(after.differences(&record).is_empty(), "{back}");
+    let flat = policy::strip(&xml, &ours, Emptied::NotConfigured).unwrap();
+    assert!(
+        !Policy::parse(&flat)
+            .unwrap()
+            .differences(&record)
+            .is_empty()
+    );
+
+    // A collection whose mode the installation did not set keeps the mode it has; the rules go.
+    let changed = xml.replace(
+        r#"EnforcementMode="Enabled""#,
+        r#"EnforcementMode="AuditOnly""#,
+    );
+    let found = policy::strip(&changed, &ours, Emptied::AsFound).unwrap();
+    let left = Policy::parse(&found).unwrap();
+    assert_eq!(left.exe_mode(), Some(Mode::AuditOnly));
+    assert!(left.collections[policy::EXE].rules.is_empty(), "{found}");
+    assert!(!found.contains("NotConfigured"), "{found}");
 }
 
 /// A client asks the platform for what the pipe's list grants and for nothing beyond it. The
