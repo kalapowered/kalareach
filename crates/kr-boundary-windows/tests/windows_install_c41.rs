@@ -417,3 +417,95 @@ fn a_rollback_of_a_run_that_set_no_start_type_says_that_it_left_the_start_type_a
         "after the rollback the computer is as it was: {text}"
     );
 }
+
+/// A new installation that fails after the broker step, whose rollback also fails at its account
+/// step, with the manifest damaged as `how` says (none: left as it is). The ending is printed in
+/// full; then the administrator's removal, with none of the test variables, runs to its end.
+fn a_rollback_with_a_failed_step(how: Option<&str>) -> String {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let person = Person::make();
+    let mut environment = vec![
+        ("KR_BOUNDARY_FAIL_AFTER", "broker"),
+        ("KR_BOUNDARY_FAIL_UNDO", "account"),
+    ];
+    if let Some(how) = how {
+        environment.push(("KR_BOUNDARY_DAMAGE_MANIFEST", how));
+    }
+    let label = how.unwrap_or("intact");
+    let (code, text) = install_with(&person, &environment);
+    let ending = text
+        .find("undoing what was done")
+        .map_or("(no rollback)", |at| &text[at..]);
+    observed(&format!(
+        "manifest {label}: the ending from \"undoing what was done\" to its end follows\n{ending}\nOBSERVED manifest {label}: the ending ends"
+    ));
+    assert_ne!(code, Some(0), "{label}: {text}");
+    assert!(
+        !text.contains("could not be damaged"),
+        "{label}: the seam did not damage the manifest: {text}"
+    );
+    assert!(
+        text.contains("the removal after the failure also failed")
+            && text.contains("a failure was injected into the account step of the undoing"),
+        "{label}: the rollback did not fail at its account step: {text}"
+    );
+    assert!(
+        text.contains("the administrator's removal takes the rest"),
+        "{label}: the ending does not say that the administrator's removal takes the rest: {text}"
+    );
+    assert!(
+        !text.contains("records are kept") && !text.contains("stays where it is"),
+        "{label}: the ending says that records are kept or that the manifest stays: {text}"
+    );
+    match how {
+        Some("garbage") | Some("absent") => assert!(
+            text.contains("wrote its record again at"),
+            "{label}: the ending does not say that the run wrote its record again: {text}"
+        ),
+        _ => assert!(
+            text.contains("found the manifest that this run holds"),
+            "{label}: the ending does not say that the run's manifest was found: {text}"
+        ),
+    }
+    // The record stands for the administrator's removal.
+    let paths = Paths::system().unwrap();
+    assert!(
+        Manifest::load(&paths.manifest).is_ok(),
+        "{label}: no manifest that the removal can read stands at {}: {text}",
+        paths.manifest.display()
+    );
+
+    let (removal_code, removal) = ordinary_removal();
+    assert_eq!(removal_code, Some(0), "{label}: {removal}");
+    assert!(
+        removal.contains("without a failure") && removal.contains("its records are deleted"),
+        "{label}: the removal did not end without a failure with its records deleted: {removal}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "{label}: after the removal the computer is as it was: {removal}"
+    );
+    text
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_rollback_with_a_failed_step_and_an_unreadable_manifest_leaves_a_record_for_the_removal() {
+    a_rollback_with_a_failed_step(Some("garbage"));
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_rollback_with_a_failed_step_and_an_absent_manifest_leaves_a_record_for_the_removal() {
+    a_rollback_with_a_failed_step(Some("absent"));
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_rollback_with_a_failed_step_and_an_intact_manifest_leaves_a_record_for_the_removal() {
+    a_rollback_with_a_failed_step(None);
+}
