@@ -312,7 +312,7 @@ impl Host {
             )
             .expect("a worker service"),
         );
-        tokio::spawn(Arc::clone(&service).serve(listener));
+        let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
         kr_ipc::descriptor::publish(
             &environment,
             &WorkerDescriptor {
@@ -334,6 +334,7 @@ impl Host {
             session_id,
             runtime,
             _service: service,
+            _serving: serving,
         }
     }
 
@@ -361,6 +362,7 @@ struct Hosted {
     session_id: SessionId,
     runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
+    _serving: kr_ipc::testing::Serving,
 }
 
 impl Hosted {
