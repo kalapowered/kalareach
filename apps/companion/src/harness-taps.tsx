@@ -6,7 +6,7 @@
  * what detail, and from which pointer.
  * A test that drives the application on a device taps by coordinates and cannot see the page's
  * events, so this puts them on the page as text, which the device's accessibility tree carries: the
- * events the page saw, the rectangles of the links' words, the links the host opened and where the
+ * events the page saw, the rectangles of the links' words and of what clips them, the links the host opened and where the
  * focus is. It is started by the strip, which also fills the first session with the messages the taps
  * need. The harness bundle is built only for tests, so none of this ships.
  *
@@ -73,6 +73,35 @@ const describe = (target: EventTarget | null): string => {
 
 const round = (value: number): string => (Math.round(value * 10) / 10).toString()
 
+/**
+ * What every box that clips a link leaves of the page, as the record reads it for itself: the visual
+ * viewport narrowed, on each axis, by the client box of every ancestor whose computed overflow on that
+ * axis is not `visible`.
+ */
+const viewOf = (link: HTMLElement): readonly number[] => {
+  const screen = window.visualViewport
+  let [left, top, right, bottom] = screen
+    ? [screen.offsetLeft, screen.offsetTop, screen.offsetLeft + screen.width, screen.offsetTop + screen.height]
+    : [0, 0, window.innerWidth, window.innerHeight]
+  for (let ancestor = link.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    const style = getComputedStyle(ancestor)
+    const x = style.overflowX !== 'visible'
+    const y = style.overflowY !== 'visible'
+    if (!x && !y) continue
+    const box = ancestor.getBoundingClientRect()
+    const own = ancestor === document.documentElement ? { left: 0, top: 0 } : { left: box.left + ancestor.clientLeft, top: box.top + ancestor.clientTop }
+    if (x) {
+      left = Math.max(left, own.left)
+      right = Math.min(right, own.left + ancestor.clientWidth)
+    }
+    if (y) {
+      top = Math.max(top, own.top)
+      bottom = Math.min(bottom, own.top + ancestor.clientHeight)
+    }
+  }
+  return [left, top, right, bottom]
+}
+
 /** The record, as lines of text on the page: the events, the links' rectangles, the links opened and the focus. */
 export function TapRecord({ controls }: { readonly controls: FakeHostControls }): ReactNode {
   useEffect(() => {
@@ -93,7 +122,7 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
           .map((rect) => [rect.left, rect.top, rect.right, rect.bottom].map(round).join(' '))
           .join(' ')
         const line = parseFloat(getComputedStyle(link).lineHeight)
-        return `L ${nameOf(link.title)} box ${[box.left, box.top, box.right, box.bottom].map(round).join(' ')} words ${words} line ${round(Number.isFinite(line) ? line : 0)}`
+        return `L ${nameOf(link.title)} box ${[box.left, box.top, box.right, box.bottom].map(round).join(' ')} words ${words} line ${round(Number.isFinite(line) ? line : 0)} view ${viewOf(link).map(round).join(' ')}`
       })
       const scroller = document.querySelector('.m-pane')
       const room = scroller?.getBoundingClientRect()
