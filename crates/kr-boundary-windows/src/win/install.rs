@@ -488,10 +488,24 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
     };
     let handle = match ffi::Handle::new(raw, "opening the data directory's parent folder") {
         Ok(handle) => handle,
-        Err(failure)
-            if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
-        {
+        // The data parent is not there: the installation makes it.
+        Err(failure) if failure.code == ERROR_FILE_NOT_FOUND => {
             return Ok(None);
+        }
+        // Every folder above the data parent was read before this open, so a path that is not
+        // found is a known folder, or one above it, that is gone since: a refusal as a known folder
+        // that is gone, never an absent data parent.
+        Err(failure) if failure.code == ERROR_PATH_NOT_FOUND => {
+            let known = parent.parent().unwrap_or(parent).display().to_string();
+            // text: check_data_parent_at-1
+            return Err(Error::Refused(remedy::ancestor_refusal(
+                &remedy::Subject::shared(
+                    &known,
+                    remedy::AncestorFault::Unreadable(&failure.to_string()),
+                ),
+                remedy::Tree::Data,
+                stage,
+            )));
         }
         Err(failure) if failure.code == ERROR_SHARING_VIOLATION => {
             return Err(parent_refusal(
@@ -1820,7 +1834,11 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
 /// The first folder of the walk is `program_top`, the system's known folder `Program Files`, which
 /// other programs share; every folder strictly below it is the installation's own. The words of a
 /// refusal are chosen by that ([`remedy::Subject::at`]).
-fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Error> {
+///
+/// # Errors
+///
+/// Returns [`Error::Refused`] naming the reason, or the failure of the call that looked.
+pub fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Error> {
     use remedy::AncestorFault as Fault;
     check_ancestors(&paths.program_top, remedy::Tree::Program, stage)?;
     let Some(parent) = paths.program.parent() else {

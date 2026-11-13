@@ -755,6 +755,9 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
         AncestorFault::NotAFolder => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} Remove or rename what is in its place if nothing else needs it, then run the setup program again. {kept}"
         ),
+        AncestorFault::Leads(found) => format!(
+            "{folder} is a folder above the boundary's {below}. It is refused because the folder that it opens is at {found}, not at {folder}. {changes} The setup program makes this folder itself, as a plain folder, at its own path in the system's own known folder, and it directs no change to a folder that other programs share. {kept}"
+        ),
         AncestorFault::Unreadable(error) => format!(
             "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} If a program holds it open, close that program, then run the setup program again. {kept}"
         ),
@@ -767,7 +770,6 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
         | AncestorFault::RootMissing(_)
         | AncestorFault::VolumeRoot
         | AncestorFault::Overlap(_)
-        | AncestorFault::Leads(_)
         | AncestorFault::List(_) => shared_refusal(folder, tree, fault, stage),
     }
 }
@@ -979,7 +981,7 @@ pub fn shape_refusal(
 pub fn known_folder_unreadable(folder: &str, status: &str, removal: bool) -> String {
     let limit = if removal {
         format!(
-            " A removal reads what to remove from the manifest in the data directory and checks the program directory before it deletes anything, so it cannot go on while that folder cannot be read. If the boundary is installed, the broker's service, its two accounts and its rules in the policy stay. If the volume of the {folder} folder is gone for good, the setup program cannot remove them."
+            " A removal reads what to remove from the manifest in the data directory and checks the program directory before it deletes anything, so it cannot go on while the {folder} folder cannot be read. If the boundary is installed, the broker's service, its two accounts and its rules in the policy stay. If the volume of the {folder} folder is gone for good, the setup program cannot remove them."
         )
     } else {
         String::new()

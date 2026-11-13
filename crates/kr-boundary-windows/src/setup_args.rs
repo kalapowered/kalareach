@@ -39,8 +39,8 @@ pub struct Rejected {
 ///
 /// # Errors
 ///
-/// Returns [`Rejected`] for no command, a command that is not one, and an option of an installation
-/// or a repair that is not one or has no value, or a missing payload.
+/// Returns [`Rejected`] for no command, a command that is not one, words after a removal or a status,
+/// and an option of an installation or a repair that is not one or has no value, or a missing payload.
 pub fn parse(arguments: &[String]) -> Result<Command, Rejected> {
     let refuse = |message: Option<&str>| Rejected {
         message: message.map(str::to_owned),
@@ -49,6 +49,10 @@ pub fn parse(arguments: &[String]) -> Result<Command, Rejected> {
         return Err(refuse(None));
     };
     match command.as_str() {
+        // A command with words after it is a wrong command line, whatever the words are.
+        "remove" | "status" if arguments.len() > 1 => {
+            Err(refuse(Some(&format!("unknown argument {}", arguments[1]))))
+        }
         "remove" => Ok(Command::Remove),
         "status" => Ok(Command::Status),
         "install" | "repair" => {

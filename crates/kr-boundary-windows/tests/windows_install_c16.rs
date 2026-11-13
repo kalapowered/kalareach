@@ -609,11 +609,11 @@ fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
     assert!(text.contains("Nothing was changed"), "{text}");
 }
 
-/// A root that is not there is a volume that is gone, and every run refuses it before anything is
-/// changed, in both walks: an installation, a repair and a removal. A folder that is not there ends a
-/// walk, but the root is the first folder of it, and a tree on a drive that is gone must not let the
-/// installation make records on another volume first. The words say that the root is not there, with
-/// the error, and name no cause.
+/// A known folder on a drive that is not there is refused before anything is changed by every run:
+/// an installation, a repair and a removal. The shape check opens the known folder first and says
+/// what it is: its full path and an open that failed. The data walk, read on its own, says that the
+/// root of the volume is not there, with the error, and names no cause. (The program walk's own words
+/// are the next case's: the shape check refuses first in a run.)
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_root_that_is_not_there_is_refused_before_a_change_by_every_run() {
@@ -653,17 +653,35 @@ fn a_root_that_is_not_there_is_refused_before_a_change_by_every_run() {
         .expect_err("a data parent on a drive that is not there")
         .to_string();
     words(&text, "data directory");
-    // The program walk: the data parent is a folder of the guest's own volume, the program
-    // directory's top is on the drive that is not there, and nothing is made on the way.
+    // The program tree: the data parent is a folder of the guest's own volume, the program
+    // directory's top is on the drive that is not there, and nothing is made on the way. The shape
+    // check refuses it as the known folder that it is.
     let (local, mut paths) = data_parent_with_paths(&mut clean);
     paths.program_top = PathBuf::from(format!("{letter}\\Program Files\\KalaReach"));
     paths.program = paths.program_top.join("Program");
     paths.git = paths.program.join("git");
+    let shape = |text: &str| {
+        for needle in [
+            format!(
+                "{} is a folder above the boundary's program directory",
+                paths.program_top.display()
+            ),
+            "It is refused because it could not be opened or read to be checked".to_owned(),
+            "Nothing was changed".to_owned(),
+            "Run the setup program again when it can be read.".to_owned(),
+        ] {
+            assert!(text.contains(&needle), "{needle}: {text}");
+        }
+        assert!(
+            !text.contains("the root of its volume is not there"),
+            "the shape check refuses before the walk reads a root: {text}"
+        );
+    };
     let entry = install::entry(&paths)
         .err()
         .expect("a program directory on a drive that is not there")
         .to_string();
-    words(&entry, "program directory");
+    shape(&entry);
     assert!(
         !paths.data.exists(),
         "no data directory was made under {}",
@@ -681,9 +699,48 @@ fn a_root_that_is_not_there_is_refused_before_a_change_by_every_run() {
             .expect_err("a removal refuses")
             .to_string(),
     ] {
-        words(&text, "program directory");
+        shape(&text);
     }
     assert!(paths.manifest.exists(), "the removal changed nothing");
+}
+
+/// A known folder that goes after the shape check is refused by the walk that reads it next: the
+/// program walk, read on its own, with the program tree's known folder on a drive that is not there,
+/// says that the root of the volume is not there, with the error, names no cause, and changes
+/// nothing. A run reaches the walk this way only when a volume goes between the two reads, so the
+/// case calls the walk after the folder is already gone.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_known_folder_taken_away_after_the_shape_check_is_refused_by_the_program_walk() {
+    if needs_the_system() {
+        return;
+    }
+    require_clean_guest();
+    let mut clean = Cleanup::default();
+    let letter = ('D'..='Z')
+        .rev()
+        .map(|letter| format!("{letter}:"))
+        .find(|letter| !Path::new(&format!("{letter}\\")).exists())
+        .expect("a free drive letter");
+    let (_local, mut paths) = data_parent_with_paths(&mut clean);
+    paths.program_top = PathBuf::from(format!("{letter}\\Program Files"));
+    paths.program = paths.program_top.join("KalaReach").join("Program");
+    paths.git = paths.program.join("git");
+    let text = install::check_program_parents(&paths, remedy::Stage::Before)
+        .expect_err("a program tree on a drive that is not there")
+        .to_string();
+    for needle in [
+        format!("{letter}\\ is a folder above the boundary's program directory"),
+        "the root of its volume is not there".to_owned(),
+        "Nothing was changed".to_owned(),
+        "Run the setup program again when it can be read.".to_owned(),
+    ] {
+        assert!(text.contains(&needle), "{needle}: {text}");
+    }
+    for word in ["holds it open", "did not answer", "removed"] {
+        assert!(!text.contains(word), "{word}: {text}");
+    }
+    assert!(!paths.program_top.exists(), "nothing was made");
 }
 
 /// A link that points nowhere at the program directory's name is a link, and gets the link's own
