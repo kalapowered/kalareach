@@ -8,7 +8,7 @@ use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
     CASE_SENSITIVE_WHY, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Standing, Taken,
     choose, data_ending, data_made_ending, ending, parent_advice, program_keeping,
-    program_open_advice, rollback_entry, rollback_laid_stays, unnamed_root_why,
+    program_open_advice, rollback_ending, rollback_entry, rollback_laid_stays, unnamed_root_why,
 };
 
 /// An installation whose reads found nothing of the installation: the one run that may name a move.
@@ -460,7 +460,7 @@ fn the_rollbacks_entry_for_an_object_says_what_the_cleanup_came_to_and_no_more()
     for wrong in ["stays", "is gone", "nothing was marked"] {
         assert!(!lost.contains(wrong), "{wrong}: {lost}");
     }
-    let ending = rollback_laid_stays(&[lost]);
+    let ending = rollback_laid_stays(&[lost], &[]);
     assert!(ending.ends_with("did nothing with it)."), "{ending}");
 }
 
@@ -559,19 +559,33 @@ fn an_empty_data_directory_that_stayed_is_not_said_to_be_held() {
 /// step: no instruction to move, remove, correct or delete anything stands in it.
 #[test]
 fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_gives_no_step() {
-    let one = rollback_laid_stays(&[
-        "C:\\Data (the platform refused to mark it for removal: Windows error 145; it holds a.txt)"
-            .to_owned(),
-    ]);
+    let one = rollback_laid_stays(
+        &[
+            "C:\\Data (the platform refused to mark it for removal: Windows error 145; it holds a.txt)"
+                .to_owned(),
+        ],
+        &[],
+    );
     assert_eq!(
         one,
         "The steps of the rollback ended without a failure, but this run could not take away all that it made: C:\\Data (the platform refused to mark it for removal: Windows error 145; it holds a.txt)."
     );
-    let two = rollback_laid_stays(&[
-        "C:\\Data (another object stands at its name, so nothing was marked)".to_owned(),
-        "C:\\Above (the data directory in it stays)".to_owned(),
-    ]);
+    let two = rollback_laid_stays(
+        &[
+            "C:\\Data (another object stands at its name, so nothing was marked)".to_owned(),
+            "C:\\Above (the data directory in it stays)".to_owned(),
+        ],
+        &["C:\\Data\\run".to_owned(), "C:\\Data\\journal".to_owned()],
+    );
     assert!(two.contains("C:\\Data (another object stands at its name, so nothing was marked); C:\\Above (the data directory in it stays)."));
+    assert!(
+        two.ends_with(
+            " It marked for removal, each through the identity that this run kept of it: C:\\Data\\run; C:\\Data\\journal."
+        ),
+        "{two}"
+    );
+    // An ending that names a failure does not say that records are deleted.
+    assert!(!two.contains("deleted"), "{two}");
     for text in [&one, &two] {
         for step in [
             "Remove",
@@ -583,6 +597,55 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
             "Correct",
             "run the",
             "Run the",
+            "by hand",
+        ] {
+            assert!(!text.contains(step), "{step}: {text}");
+        }
+    }
+}
+
+/// The rollback's last words say that the records are deleted only where the run wrote records and
+/// marked each of them, and say nothing of records where it wrote none. They name each object that
+/// was marked, in order, and say that nothing was marked where the run held nothing that it made.
+#[test]
+fn the_ending_of_a_rollback_says_records_are_deleted_only_where_the_run_wrote_and_marked_them() {
+    let marked = [format!("{DATA}\\run"), DATA.to_owned(), ABOVE.to_owned()];
+    let with_records = rollback_ending(&marked, true);
+    assert!(
+        with_records
+            .starts_with("the removal ended without a failure and its records are deleted. "),
+        "{with_records}"
+    );
+    let without_records = rollback_ending(&marked, false);
+    assert!(
+        without_records.starts_with("the removal ended without a failure. "),
+        "{without_records}"
+    );
+    for text in [&with_records, &without_records] {
+        assert!(
+            text.ends_with(&format!(
+                "each through the identity that this run kept of it: {DATA}\\run; {DATA}; {ABOVE}"
+            )),
+            "{text}"
+        );
+    }
+    assert!(!without_records.contains("record"), "{without_records}");
+    // Nothing was marked: there are no records to say anything of, whatever the flag says.
+    for records in [false, true] {
+        let nothing = rollback_ending(&[], records);
+        assert_eq!(
+            nothing,
+            "the removal ended without a failure; this run held no object that it had made, so the rollback marked nothing for removal"
+        );
+        assert!(!nothing.contains("record"), "{nothing}");
+    }
+    for text in [&with_records, &without_records] {
+        for step in [
+            "Remove",
+            "remove it",
+            "Move",
+            "move it",
+            "Delete",
             "by hand",
         ] {
             assert!(!text.contains(step), "{step}: {text}");
