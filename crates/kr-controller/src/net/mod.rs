@@ -1945,7 +1945,6 @@ fn unreadable_close_answer() -> ControllerError {
     }
 }
 
-/// The frame that turns a connection away, saying why as a device is told it.
 /// The longest the host spends telling a device why its connection is refused, the write and the
 /// wait for the device to take it together. A device that does not read leaves the write waiting
 /// for stream credit, and by then the connection is no longer counted among the transport's
@@ -1969,6 +1968,7 @@ async fn refuse(session: &AuthorisedSession, error: &ControllerError) {
     let _ = tokio::time::timeout(REFUSAL_WRITE, tell).await;
 }
 
+/// The frame that turns a connection away, saying why as a device is told it.
 fn refusal(error: &kr_protocol::error::ProtocolError) -> kr_protocol::envelope::ControlFrame {
     kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
         request_id: kr_protocol::ids::RequestId::new(0),

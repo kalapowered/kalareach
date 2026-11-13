@@ -62,8 +62,10 @@
 //!   under one type whose signatures begin with the same line, a signature that spans lines whose
 //!   first line is the same in both, and a nested `fn` that holds the hit, are not told apart.
 //!
-//! None of these forms is used by product code. A reading of these forms is found by review of the change that adds it, and by the compiler where
-//! the cause's types forbid it.
+//! Product code uses one of these forms: `plain_words` in `voice/owner.rs` puts `.message` at the
+//! start of a line, to strip the code's name from the words a host sent. A reading of these forms
+//! is found by review of the change that adds it, and by the compiler where the cause's types
+//! forbid it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
