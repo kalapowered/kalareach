@@ -129,8 +129,13 @@ export function startLinkPress(element: HTMLElement): () => void {
   // only where a release at the press's point would still open the lit link (`releaseOpens`).
   const recheck = (): void => {
     if (press === null) return
-    if (!releaseOpens(element, press)) die()
-    else light(press.start.link)
+    const opens = releaseOpens(element, press)
+    // A touch's or a pen's press ends where a release would open nothing. A mouse's or a trackpad's record never
+    // gives an open (`decide` stands for a pointer that `opensByRule` refuses), so it has nothing to end: its press
+    // lives on, and its look follows the pointer as at a move, out where a release would open nothing, lit again
+    // where the pointer is back.
+    if (!opens && opensByRule(press.pointerType)) die()
+    else light(opens ? press.start.link : null)
   }
   // The pointer's capture was taken from the pointer, the window is no longer in front or the page is
   // no longer shown: no release will come to this press.
