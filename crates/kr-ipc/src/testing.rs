@@ -223,10 +223,12 @@ impl PrivateTempDir {
 
 /// How long the removal of a [`PrivateTempDir`] is tried again while it is refused.
 ///
-/// It is longer than the thirty seconds the slowest holder a test host has keeps a file after the
-/// daemon is let go of: the sweep that lets go of the challenges nobody answered holds the host
-/// owner's files until its next tick.
-const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(45);
+/// It covers a holder that is ending: a task that was aborted and is cancelled at the runtime's
+/// next turn, a thread that is joining. A holder that keeps a file longer than this is a fixture
+/// that did not end it, which the line the drop prints names by its case, and the directory is
+/// left to the cleanup of the temporary folder. A case that needs the tree gone, as one that starts
+/// a daemon whose own sweep holds a file for up to thirty seconds does, waits for it itself.
+const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Removes `root` and what is in it. A removal that is refused is tried again for no longer than
 /// `patience`, which is no time at all when it is zero; the refusal that is left at the end is
@@ -262,7 +264,7 @@ impl Drop for PrivateTempDir {
     /// removal of the folder it is in, and the holder is usually something that is ending and lets
     /// go in a moment: a task that was aborted and has not been cancelled yet, a thread that is
     /// joining. So the removal is tried again for as long as it is refused, and for no longer than
-    /// `REMOVAL_PATIENCE` (45 seconds), and what is not removed at the end is said on the error
+    /// `REMOVAL_PATIENCE` (two seconds), and what is not removed at the end is said on the error
     /// output, outside what a test's capture keeps. It does not fail the case: this directory is made
     /// by the suites of every platform, and a case that has a holder to wait for, as a host that
     /// waits for its daemon's lock does, fails on a tree that is left, and one that has a guard of
@@ -729,6 +731,41 @@ mod tests {
             "the removal was refused once, and then tried again"
         );
         assert!(!root.exists(), "{} is left", root.display());
+    }
+
+    /// A removal that stays refused ends at its bound and leaves the directory: the drop does not
+    /// wait for a holder that is not ending. The holder here lets go when the drop has returned, or
+    /// after twenty seconds, which the drop would only reach by waiting for it, and then the
+    /// directory would be gone.
+    #[cfg(windows)]
+    #[test]
+    fn a_removal_that_stays_refused_gives_up_and_leaves_the_directory() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = PrivateTempDir::create();
+        let root = directory.path().to_path_buf();
+        let held = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .share_mode(0)
+            .open(root.join("store.db"))
+            .expect("a file held open without sharing");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(20));
+            drop(held);
+        });
+
+        drop(directory);
+
+        let left = root.exists();
+        release.send(()).expect("the holder is waiting");
+        holder.join().expect("the holder ended");
+        std::fs::remove_dir_all(&root).expect("the directory goes once the file is let go of");
+        assert!(
+            left,
+            "the drop waited for the holder and removed the directory"
+        );
     }
 
     /// The address the tests name as unanswered refuses a connection. A machine that answers there
