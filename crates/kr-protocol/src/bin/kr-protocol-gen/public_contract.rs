@@ -69,6 +69,35 @@ pub struct Report {
     pub differences: Vec<(String, Vec<String>)>,
 }
 
+/// The keys of the object that the read-only marker is written for: the shape (`type`,
+/// `properties`, `required`), the marker itself and the annotations the comparison ignores.
+const METADATA_OBJECT_KEYS: [&str; 6] = [
+    "type",
+    "properties",
+    "required",
+    "description",
+    "title",
+    READ_ONLY_METADATA,
+];
+
+/// Whether the definition is an open object of its own `properties` and nothing else that composes
+/// or closes it: `type` is `object`, there is no `additionalProperties`, and every key is from
+/// [`METADATA_OBJECT_KEYS`]. Its reader drops a member it does not know, and an open object says
+/// nothing of a value's member that it does not list, so a member added to its `properties`
+/// changes no verdict of the earlier schema on a value that a newer host sends, wherever the
+/// definition is used. A `$ref`, a nullable pair or a list of branches gives a label of the same
+/// form from another list, and a closed object refuses the member.
+fn is_a_metadata_object(schema: &Value, definition: &str) -> bool {
+    let node = &schema["$defs"][definition];
+    node.get("type").and_then(Value::as_str) == Some("object")
+        && node.get("additionalProperties").is_none()
+        && node.as_object().is_some_and(|members| {
+            members
+                .keys()
+                .all(|key| METADATA_OBJECT_KEYS.contains(&key.as_str()))
+        })
+}
+
 /// Whether `difference` is one an earlier reader accepts: a definition that is new, or an optional
 /// member that a read-only metadata object of the earlier release did not have.
 fn accepted(old: &Value, new: &Value, difference: &Difference) -> bool {
@@ -81,7 +110,10 @@ fn accepted(old: &Value, new: &Value, difference: &Difference) -> bool {
     let Some((definition, member)) = difference.at.split_once('.') else {
         return false;
     };
-    if member.contains(['.', '#', '[', '{']) {
+    if difference.detail != "a member"
+        || definition.contains(['#', '[', '{'])
+        || member.contains(['.', '#', '[', '{'])
+    {
         return false;
     }
     let marked = old["$defs"][definition]
@@ -92,7 +124,10 @@ fn accepted(old: &Value, new: &Value, difference: &Difference) -> bool {
         .get("required")
         .and_then(Value::as_array)
         .is_some_and(|required| required.iter().any(|name| name.as_str() == Some(member)));
-    marked && !required
+    marked
+        && !required
+        && is_a_metadata_object(old, definition)
+        && is_a_metadata_object(new, definition)
 }
 
 /// Every difference between one release's schema and the head's, with every definition a root.
@@ -217,7 +252,8 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
 const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// Whether every member of `named`, a map from names to schemas, is a schema that stands where it
-/// may (see [`widens_at`]). A member must be an object, a boolean or a list: a name is a keyword
+/// may (see [`widens_at`]). A member must be an object, a boolean or a list (under `dependencies`,
+/// a list of names): any other member is no schema, and a text under a name is a keyword
 /// to a resolver that reads every object for the keywords `$id`, `id`, `$anchor` and
 /// `$dynamicAnchor`, and it takes any text under one of them for an address or a name, so a text
 /// under a name is refused.
@@ -293,8 +329,8 @@ fn reference_widens(member: &Value, reaching: &BTreeSet<&str>, widening: bool) -
 /// against the base address of the resource that holds it, and it reaches the member of the one
 /// `$defs` that its name says (a generated file holds a key once; a name that `$defs` lacks
 /// reaches nothing, which is an error and never another place). Only a [`SCOPE_KEYWORDS`] keyword
-/// can change that, and the walk refuses each of them wherever it stands (`$schema` only at the
-/// root, and only with the one dialect that the walk is written for). It reads a key as a name
+/// can change that, and the walk refuses each of them wherever it stands (`$schema` may stand
+/// only at the root, and there only with [`DIALECT`]). It reads a key as a name
 /// only in a map from names to schemas (`properties`, `patternProperties`, `$defs`,
 /// `definitions`, `dependentSchemas`, `dependencies`), and only where the member under the name
 /// is an object, a boolean or a list ([`schemas_widen`]); every key of a value that it does not
@@ -423,6 +459,11 @@ fn is_referred_to(schema: &Value, name: &str) -> bool {
 /// * `sections` lists it: the build's table of sections lists it at a level above the level the
 ///   earlier release's stored-format lock records for the document;
 /// * it is not required;
+/// * the document is a plain closed object in both schemas ([`plain_closed_object`]), so its own
+///   `properties` are the only list that gives the label `ConfigurationDocument.member`, and the
+///   added member is a key that the earlier schema refused (an open document, a nullable pair or
+///   a `$ref` with `properties` beside it gives the same label from a list where the member
+///   restricts a value that the earlier schema accepted);
 /// * no definition of either schema refers to `ConfigurationDocument`, so no answer a host gives
 ///   carries the document, and a reference that moved to a copy of it cannot hide the add: only
 ///   the file and the registry's copy of it are read by a release that lacks the section.
@@ -447,6 +488,8 @@ fn is_a_new_section(
         .is_some_and(|required| required.iter().any(|name| name.as_str() == Some(section)));
     sections.contains(section)
         && !required
+        && plain_closed_object(CONFIGURATION_DOCUMENT, old, "the earlier release's").is_ok()
+        && plain_closed_object(CONFIGURATION_DOCUMENT, new, "this commit's").is_ok()
         && !is_referred_to(old, CONFIGURATION_DOCUMENT)
         && !is_referred_to(new, CONFIGURATION_DOCUMENT)
 }
@@ -642,6 +685,8 @@ pub struct PassedMember {
 ///   rule holds what a client of the protocol reads;
 /// * the head's table lists the member at an SDK version above the earlier release's;
 /// * the head's SDK version is above the earlier release's;
+/// * every use of the definition, in both schemas, is one where a wider definition only widens
+///   the place ([`is_used_only_where_it_widens`]);
 /// * its definition is reached from the connector table's root and not from the package manifest's,
 ///   in both SDK schemas: a host reads `connector.json` after it has tested the package's
 ///   `sdk_range`, and parses all of `plugin.json` before it can, so a new member there would stop
@@ -720,6 +765,15 @@ fn is_a_listed_arrival(
             ));
         }
         plain_closed_object(definition, schema, name)?;
+    }
+    // A closed object that gains a member accepts more, so a place that uses it must gain values
+    // when it does: in a `oneOf` beside a branch that accepts the member, or a `not`, the earlier
+    // schema accepts a value that the new one refuses, and the difference is not an arrival.
+    if ![old, new]
+        .iter()
+        .all(|schema| is_used_only_where_it_widens(schema, definition))
+    {
+        return Ok(None);
     }
     Ok(Some(PassedMember {
         member: format!("{definition}.{member}"),
