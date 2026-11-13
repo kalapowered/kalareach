@@ -1,7 +1,7 @@
 //! What the build says to a request for the static Visual C++ runtime.
 //!
 //! This program links the dynamic runtime: the workspace's linker settings leave `LIBCMT` out of
-//! every MSVC link (see `.cargo/config.toml`), and the static runtime asks for it. The Tauri build
+//! the x86-64 and ARM64 MSVC links (see `.cargo/config.toml`), and the static runtime asks for it. The Tauri build
 //! step reads `STATIC_VCRUNTIME` before the attribute this package gives it, and the Tauri command
 //! line sets the variable to `true` for a desktop build unless it is already `false`. A build
 //! started that way asks for the runtime the linker's settings contradict, and it fails at the
