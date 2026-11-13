@@ -260,11 +260,11 @@ impl AppState {
     /// refuses a request on it as not permitted or answers one with an outcome it does not know,
     /// whichever path of the application made the request, except a read sent with
     /// `read_unsignalled`: that one asks whether the connection was withdrawn, and its refusal is
-    /// its answer. The host is asked for its devices,
-    /// which it lists to any connection of this computer's that it admits and to no other: a
-    /// refusal of that over this connection, and an answer over another, say it was withdrawn,
-    /// where one request's refusal for its own reasons does not. The other takes its place, and the
-    /// withdrawn one is ended, which the supervision takes up in turn.
+    /// its answer. The host is asked for its devices, which it lists to any connection of this
+    /// computer's that it admits and to no other: a refusal of that over this connection, and an
+    /// answer over another, say it was withdrawn, where one request's refusal for its own reasons
+    /// does not. The other takes its place, and the withdrawn one is ended, which the supervision
+    /// takes up in turn.
     pub async fn replace_if_withdrawn(&self, session: &Arc<Session>) {
         let held = self
             .connection

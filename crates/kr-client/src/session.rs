@@ -836,11 +836,11 @@ impl Session {
     /// refused too, the refusal is the grant's and is returned as it is, and that second call,
     /// which signals, is what raises [`Self::standing_in_doubt`]; where it is answered, the first
     /// read is asked once more, in case the host refused it for a reason that has passed, and a
-    /// second refusal means the host does not serve the read. The first reads do not signal, since a host too old for
-    /// the method is not one that withdrew the connection. A host that lists the method and whose
-    /// session's worker is of a release that does not serve it refuses it as an unsupported
-    /// capability, which is the same answer: the read is not served. Any other failure is returned
-    /// as it is.
+    /// second refusal means the host does not serve the read. The first reads do not signal, since
+    /// a host too old for the method is not one that withdrew the connection. A host that lists
+    /// the method and whose session's worker is of a release that does not serve it refuses it as
+    /// an unsupported capability, which is the same answer: the read is not served. Any other
+    /// failure is returned as it is.
     ///
     /// # Errors
     ///

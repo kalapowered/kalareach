@@ -989,7 +989,11 @@ pub async fn forward_events<R: Runtime>(
             }
             () = question_ended(&mut asking), if asking.is_some() => {
                 asking = None;
-                let _ = tokio::time::timeout(std::time::Duration::ZERO, session.standing_in_doubt()).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::ZERO,
+                    session.standing_in_doubt(),
+                )
+                .await;
                 continue;
             }
             () = session.closed() => {

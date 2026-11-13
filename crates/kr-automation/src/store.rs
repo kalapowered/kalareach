@@ -1390,9 +1390,10 @@ impl<'c> Journal<'c> {
     /// chain already on the generation after `leaves` is answered as having been rearmed and is
     /// not touched, and a chain on any other generation is refused. A chain whose budget has not
     /// run out is refused too, because nothing about it is stopped. The repeat is answered before
-    /// the journal's admission is asked, since it has nothing left to admit; every refusal waits
-    /// for the admission, so a request whose admission has lapsed is told of nothing the chain
-    /// holds.
+    /// the journal's admission is asked, since it has nothing left to admit; each of the three
+    /// refusals waits for the admission, so a request whose admission has lapsed is refused for
+    /// that and is told none of them. A budget this journal cannot read is a storage error and is
+    /// reported before the admission is asked.
     ///
     /// The budget moves to the next generation with fresh counters. Every descendant the budget of
     /// the generation it leaves refused is handed to `continue_with` once, with the new
