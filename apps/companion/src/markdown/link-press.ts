@@ -16,7 +16,9 @@
  *   of the click: the engines differ, and a click that no pointer made (a keyboard's, a screen reader's)
  *   has a detail of 0 and adds nothing.
  * - A press is live or dead. The pressed look shows on the lit link only while the press lives, and a
- *   dead press opens nothing. It lives from the pointer down to the pointer up, and dies at the first of:
+ *   dead press opens nothing. For a mouse or a trackpad press on a link's own element, whose click comes
+ *   from where the button is released, the look also follows the pointer: it goes out while the pointer
+ *   is outside the element (within the slop) and is lit again where the pointer is back in it. It lives from the pointer down to the pointer up, and dies at the first of:
  *   a move past the slop, a pointer cancel, the loss of the pointer's capture, the window's loss of
  *   focus, the page's hiding, the next primary pointer down (in the pane or outside it),
  *   and a scroll of any box or of the visual viewport, or a resize of the viewport, after which a release
@@ -243,18 +245,23 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
 }
 
 /**
- * Whether a release at the press's point would open the link that the press lit. This is the one
- * predicate of every path that lights or keeps a look, and each of them asks it of the same two things:
+ * Whether a release now would open the link that the press lit. It asks two things:
  *
  * - the press's own element: the browser sends its click to the link's element, for every pointer type,
- *   while the press's point lies in the part of that element that its view leaves (`liesInView`: the
- *   element's rectangle held to every box that clips it, not the raw rectangle);
- * - the nearest-words rule at the press's point, for a pointer that `opensByRule` (a touch or a pen)
- *   only: a mouse's click on plain text opens nothing.
+ *   while the point lies in the part of that element that its view leaves (`liesInView`: the element's
+ *   rectangle held to every box that clips it, not the raw rectangle). The point is the press's first
+ *   one for a touch or a pen, whose click comes from where it went down, and the pointer's current one
+ *   for a mouse or a trackpad, whose click comes from where the button is released;
+ * - the nearest-words rule at the press's first point, for a pointer that `opensByRule` (a touch or a
+ *   pen) only, and only where the page's hit test names plain text of the pane there, since a control, a
+ *   link or an element outside the pane that lies under the point takes the click: a mouse's click on
+ *   plain text opens nothing.
  *
- * The paths: `pressedLink` at the pointer down (the element under the press, or the rule for a touch or
- * a pen), `recheck` at each scroll or resize while a lit press lives (this function), and `decide` at the
- * click (the rule, with the same pointer test, and the element's own click by the browser).
+ * Two paths call it: `move`, for a mouse or a trackpad on a link's own element, to light and take off
+ * the look as the pointer crosses the element's edge, and `recheck`, at each scroll or resize while a lit
+ * press lives, which also ends the press where the answer is no. The other two make the same decision
+ * from the event's own target, with no hit test of their own: `pressedLink` at the pointer down and
+ * `decide` at the click.
  */
 function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
   const by = opensByRule(press.pointerType)
@@ -345,9 +352,12 @@ const OPEN: Rect = { left: -Infinity, top: -Infinity, right: Infinity, bottom: I
  * near the point, so a message of some thousand links reads every one of its link boxes at each press
  * and each click. Besides those boxes, each press and each click finds the message of every link of
  * the pane with `closest`: a walk of the tree, not a layout read. While a press that lit a link lives, each
- * scroll event of any box in the page and each scroll or resize of the visual viewport reads the same again
- * at the press's point, and a press on a link's own element also reads that element's view; moves,
- * the release and a cancel read nothing.
+ * scroll event of any box in the page and each scroll or resize of the visual viewport asks `releaseOpens`.
+ * A press on a link's own element that still lies under the point (`liesInView`) reads that element's view
+ * and its box and returns, with no layout read; any other press, a press on plain text or an own-element
+ * press that no longer lies under the point, also asks the page's hit test at the press's point and, for a
+ * touch or a pen, reads this layout again there. A mouse's or a trackpad's move on a link's own element
+ * reads the element's view as well; a touch's or a pen's move, the release and a cancel read nothing.
  *
  * A message is near when the point lies within the radius of the message's box on the vertical axis
  * only. All messages share one horizontal extent, the stream's, and a link in a line wider than it
@@ -414,8 +424,8 @@ function screenOf(): Rect {
  *
  * The walk follows the element tree. It does not model a link taken out of the flow: an absolutely
  * positioned link is clipped by the boxes between it and its containing block, a fixed one by none, and
- * the walk clips both by every ancestor; a clip-path or a mask is not read. In this page's messages
- * links are inline, so none of these holds.
+ * the walk clips both by every ancestor; a clip-path, a mask, `zoom`, `offset-path` and `offset-rotate`
+ * are not read. In this page's messages links are inline, so none of these holds.
  */
 function viewOf(link: HTMLElement, known: Map<Element, Ancestor>, screen: Rect): Rect | null {
   let view = screen
@@ -461,7 +471,9 @@ function unmeasured(link: HTMLElement): boolean {
  *   (`content-visibility` other than `visible`): words are hidden with no overflow value that says so.
  *
  * A link under such a box takes no part, so that no hidden link is lit or opened. The product has no
- * such box around a message. Not modelled: what a perspective, a filter, a clip-path or a mask hides.
+ * such box around a message. Not read, and so not modelled: what a perspective, a filter, a clip-path, a
+ * mask, `zoom` (a box's own scale of its client box) or `offset-path` and `offset-rotate` (a box moved
+ * or turned along a path) hide or move. The product uses none of them on a message.
  */
 function blocksView(style: CSSStyleDeclaration): boolean {
   const value = (name: string): string => style.getPropertyValue(name).trim()
