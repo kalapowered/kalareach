@@ -523,6 +523,7 @@ events-3 | which is not a character: | the application-control log holds the ref
 events-4 | which is not a number | the application-control log gave the EventID (or EventRecordID) "text", which is not a number | read: the text of the event's number element, taken whole, did not parse as the number's type (an element with no content is the text "")
 events-5 | with the {name} twice | the application-control log gave an event with the EventID (or EventRecordID) twice | read: the event holds a second element of that name
 events-6 | with no {name} | the application-control log gave an event with no EventID (or EventRecordID) | read: the event ended with no element of that name (an event with no content has neither)
+events-7 | with something beside its text | the application-control log gave the EventID (or EventRecordID) with something beside its text (a comment, a CDATA section, an element or another item), so which text is its number is not known | read: the reader returned an item other than text, a reference or the element's end between the start and the end of the number's element
 frame-1 | the connection ended | the connection ended | read: the peer closed the connection between two frames
 frame-2 | a frame of {0} bytes is longer than the limit | a frame of N bytes is longer than the limit | read: the frame's length is over the limit
 frame-3 | the message is not one this protocol carries: | the message is not one this protocol carries: why | read: the frame's body did not decode as a message of the protocol
