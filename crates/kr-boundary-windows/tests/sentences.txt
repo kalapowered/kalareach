@@ -250,7 +250,11 @@ remove_at-25 | the service, the accounts and the installation's policy rules are
 remove_at-26 | the removal did not finish and its records are kept | the removal did not finish and its records are kept | read: failures is not empty
 refuse_while_unfinished-1 | reading the journal: | reading the journal: error | read: the journal's read error, printed
 refuse_while_unfinished-2 | work that is not proved done is recorded, so this removal changed nothing | work that is not proved done is recorded, so this removal changed nothing: the invocations | read: the journals hold work that needs recovery (unfinished, uncertain, unreadable, or finished with a leftover; refuse_while_unfinished), read before this removal changed anything
-residue-1 | Policy::parse( | the error of reading the earlier-state record's policy | read: Policy::parse of the recorded policy failed, its error printed
+residue-1 | the policy in the earlier-state record could not be read: | the policy in the earlier-state record could not be read: error | read: Policy::parse of the recorded policy (the earlier-state record's copy) failed, its error printed
+manifest-1 | the installation record is not one this program reads: | the installation record is not one this program reads: why | read: the record's bytes are not a manifest or a record of this version (serde or the version check)
+manifest-2 | the installation record could not be read: | the installation record could not be read: error | read: fs::read of the record's file failed, its error printed (Manifest::load, Prior::load)
+manifest-3 | the installation record could not be written: | the installation record could not be written: error | read: the write or the rename of the record failed, its error printed
+policy-1 | the text of the policy is not one that this program reads: | the text of the policy is not one that this program reads: why | read: Policy::parse of the policy's text failed (the effective policy, or the earlier-state record's copy), its error printed
 
 platform_error | Windows error {code} | what: Windows error N | read: the platform's error number of the failed call (GetLastError, or the status that the call returned)
 platform_error | what.to_owned() | what, with no number | read: the failure is one that no call returned (code 0): a check that the setup program made itself
@@ -270,8 +274,6 @@ listed | #[error] | frame.rs | 9 | to be read into rows: the audit (parts E and 
 listed | #[error] | journal/framing.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | journal/replay.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | journal/rows.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | manifest.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | policy.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | win/applocker.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | win/ffi.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | win/install.rs | 7 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row

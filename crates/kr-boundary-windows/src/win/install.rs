@@ -3971,9 +3971,12 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
 pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
     let mut left = Vec::new();
     let (_, effective) = Channel::new(&paths.staging).effective()?;
-    let baseline =
+    let baseline = Policy::parse(&prior.policy_xml).map_err(|error| {
         // text: residue-1
-        Policy::parse(&prior.policy_xml).map_err(|error| Error::Failed(error.to_string()))?;
+        Error::Failed(format!(
+            "the policy in the earlier-state record could not be read: {error}"
+        ))
+    })?;
     // Where an administrator's rule has since joined the executable collection, the removal keeps the
     // allow-all rule and the collection's mode beside it on purpose; everything else of ours is gone.
     let expected = if effective.foreign_exe_rules().is_empty() {

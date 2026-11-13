@@ -25,9 +25,15 @@ pub const STORE_VERSION: u32 = 1;
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The record is not what this program reads.
+    // text: manifest-1
     #[error("the installation record is not one this program reads: {0}")]
     Unreadable(String),
+    /// The record's file could not be read.
+    // text: manifest-2
+    #[error("the installation record could not be read: {0}")]
+    Read(io::Error),
     /// The record could not be written.
+    // text: manifest-3
     #[error("the installation record could not be written: {0}")]
     Io(#[from] io::Error),
 }
@@ -213,7 +219,7 @@ impl Manifest {
     ///
     /// Returns [`StoreError`] when the file cannot be read or is not a manifest.
     pub fn load(path: &Path) -> Result<Manifest, StoreError> {
-        Manifest::parse(&fs::read(path)?)
+        Manifest::parse(&fs::read(path).map_err(StoreError::Read)?)
     }
 }
 
@@ -258,7 +264,7 @@ impl Prior {
     ///
     /// Returns [`StoreError`] when the file cannot be read or is not a record of this version.
     pub fn load(path: &Path) -> Result<Prior, StoreError> {
-        let prior: Prior = serde_json::from_slice(&fs::read(path)?)
+        let prior: Prior = serde_json::from_slice(&fs::read(path).map_err(StoreError::Read)?)
             .map_err(|error| StoreError::Unreadable(error.to_string()))?;
         if prior.store != STORE_VERSION {
             return Err(StoreError::Unreadable(format!(
@@ -341,6 +347,33 @@ mod tests {
                     .bytes()
                     .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
             "{name}"
+        );
+    }
+
+    /// A file that cannot be read is said to be unreadable, and one that cannot be written is said to
+    /// be unwritable: the two errors have their own words.
+    #[test]
+    fn a_record_that_cannot_be_read_is_not_said_to_be_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("manifest.json");
+        for read in [
+            Manifest::load(&missing).unwrap_err().to_string(),
+            Prior::load(&missing).unwrap_err().to_string(),
+        ] {
+            assert!(
+                read.starts_with("the installation record could not be read: "),
+                "{read}"
+            );
+            assert!(!read.contains("written"), "{read}");
+        }
+        let into_a_directory_that_is_not_there = dir.path().join("none").join("manifest.json");
+        let write = Manifest::begin()
+            .save(&into_a_directory_that_is_not_there)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            write.starts_with("the installation record could not be written: "),
+            "{write}"
         );
     }
 
