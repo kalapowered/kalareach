@@ -317,8 +317,9 @@ impl Prior {
 /// A failure that a case forces at a named step, once, in the test build only. The steps are
 /// `"protect"` and `"record"` (the installation's first two steps after it made the data directory),
 /// `"replacement"` (inside the write of a record, after its replacement file was made), `"proof"`
-/// (the first read of the proof, after the replacement was renamed over the record), and `"prior"`
-/// and `"prior-flush"` (the write and the flush of the earlier-state record, after it was made).
+/// (the first read of the proof, after the replacement was renamed over the record), `"prior"`,
+/// `"prior-flush"` and `"prior-identity"` (the write, the flush and the taking of the identity of
+/// the earlier-state record, after it was made).
 #[cfg(feature = "testing")]
 pub mod forced {
     use std::sync::{Mutex, PoisonError};
