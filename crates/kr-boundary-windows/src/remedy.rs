@@ -1184,7 +1184,9 @@ pub enum Taken {
     /// This run did not make the object, so the cleanup did nothing to it.
     NotMade,
     /// The object that this run made was marked for removal through the handle of the call that
-    /// made it.
+    /// made it, and a read of its name afterwards answered not found: it is gone. An object that
+    /// was marked and is still at its name, or whose name could not be read afterwards, is
+    /// [`Taken::Stays`] with the words of what was read.
     Marked,
     /// The cleanup opened the object by its name in the directory that holds it, and the platform
     /// answered that the name was not found: nothing was read of the object, so nothing says that it
@@ -1267,7 +1269,7 @@ pub fn rollback_laid_stays(stayed: &[String], marked: &[String]) -> String {
         String::new()
     } else {
         format!(
-            " It marked for removal, each through the identity that this run kept of it: {}.",
+            " It marked for removal, each through the identity that this run kept of it, and a read of its name afterwards found it gone: {}.",
             marked.join("; ")
         )
     };
@@ -1279,9 +1281,10 @@ pub fn rollback_laid_stays(stayed: &[String], marked: &[String]) -> String {
 
 /// The words that end a rollback whose steps ended without a failure and that took away all that
 /// the run laid in the data directory's place: each object that was marked for removal through
-/// the identity that the run kept of it, by its path, in the order that the rollback took them.
-/// They say that the records are deleted only where the run wrote records and marked each of them
-/// (`records_deleted`), and say nothing of records otherwise. Where the run held no object that it
+/// the identity that the run kept of it and found gone by a read of its name afterwards, by its
+/// path, in the order that the rollback took them. They say that the records are deleted only where
+/// the run wrote records and each of them was marked and found gone (`records_deleted`), and say
+/// nothing of records otherwise. Where the run held no object that it
 /// made, they say that nothing was marked. They give no step.
 #[must_use]
 // text: rollback_ending
@@ -1295,7 +1298,7 @@ pub fn rollback_ending(marked: &[String], records_deleted: bool) -> String {
         "the removal ended without a failure"
     };
     format!(
-        "{opening}. The rollback marked for removal, each through the identity that this run kept of it: {}",
+        "{opening}. The rollback marked for removal, each through the identity that this run kept of it, and a read of its name afterwards found it gone: {}",
         marked.join("; ")
     )
 }
