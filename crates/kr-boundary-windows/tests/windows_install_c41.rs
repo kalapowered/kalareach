@@ -292,7 +292,8 @@ fn a_run_that_died_after_it_made_the_service_is_removed_by_a_read_of_the_service
 
 /// An account of the given name made by hand: no comment, so without the installation's mark.
 fn make_an_account_by_hand(name: &str) {
-    let password = format!("Zq9!{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
+    // At most 14 characters: a longer password makes `net user` ask a question that nobody answers.
+    let password = format!("Zq9!{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
     let made = Command::new("net.exe")
         .args(["user", name, &password, "/add"])
         .output()
