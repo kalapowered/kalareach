@@ -971,10 +971,37 @@ struct Laid {
     staging: Option<MadeObject>,
     journal: Option<MadeObject>,
     run: Option<MadeObject>,
+    /// The replacement of the manifest that a write is making, from the call that made it until it
+    /// is proved to be the manifest or is marked for removal.
+    replacement: Option<MadeFile>,
     /// The earlier-state record, as this run wrote it.
     prior: Option<MadeObject>,
-    /// The manifest, as the last write put it at its name.
+    /// The manifest, as the last write proved it to be at its name.
     manifest: Option<MadeObject>,
+}
+
+/// A file that a run made and holds through the handle of the call that made it. The handle has the
+/// right to delete the file and marks it wherever it is, so that no name has to be read again. The
+/// path is for the words that say what became of it.
+#[derive(Debug)]
+struct MadeFile {
+    handle: Arc<ffi::Handle>,
+    path: PathBuf,
+}
+
+impl MadeFile {
+    /// Marks the file for removal through the handle of the call that made it, and closes the
+    /// handle. Returns [`Taken::Marked`] where the mark was set and [`Taken::Stays`] with the
+    /// platform's refusal.
+    fn take_away(self) -> Taken {
+        match super::root::delete(&self.handle) {
+            Ok(()) => Taken::Marked,
+            Err(failure) => Taken::Stays(remedy::platform_error(
+                "the platform refused to mark it for removal",
+                failure.code,
+            )),
+        }
+    }
 }
 
 impl Laid {
@@ -3607,7 +3634,7 @@ impl Run {
     }
 
     /// Writes the manifest, replacing the file whole, beside the held handle of the data directory,
-    /// and holds the identity of what the manifest's name opens afterwards.
+    /// and holds the identity of the object that the write proved to be at the manifest's name.
     fn save(&self) -> Result<(), Error> {
         let Some(directory) = &self.directory else {
             // text: run_save-1
@@ -3616,12 +3643,32 @@ impl Run {
                     .to_owned(),
             ));
         };
-        self.manifest.save_beside(&self.paths.manifest, directory)?;
+        let bytes = self.manifest.to_bytes()?;
         let name = self.paths.manifest.file_name().unwrap_or_default();
-        let mut laid = ffi::locked(&self.laid);
-        // The object that was there before is the one that the write replaced.
-        laid.manifest = None;
-        laid.manifest = Some(identity_in(directory, name)?);
+        // The directory's handle that goes with the manifest's identity is copied before anything is
+        // made, so that no call that can fail stands between the proof and the identity's record.
+        let holder = directory.duplicate(LIST)?;
+        let staging = crate::manifest::replacement_name(&self.paths.manifest);
+        // The replacement is the run's from the call that made it: the write tells the run its
+        // handle at once (no call that can fail stands between the create and this record, since
+        // the only steps are the move of the handle into a shared pointer and the call itself), and
+        // the run's rollback marks the file through it wherever the file is.
+        let hold = |made: Option<(&Arc<ffi::Handle>, &Path)>| {
+            ffi::locked(&self.laid).replacement = made.map(|(handle, path)| MadeFile {
+                handle: Arc::clone(handle),
+                path: path.to_path_buf(),
+            });
+        };
+        let found = fresh::replace_whole(directory, &self.paths.manifest, &staging, &bytes, &hold)
+            .map_err(StoreError::from)?;
+        // The manifest's identity is the proof's own handle, never an open of the name made later.
+        // The earlier identity stays where it is until this assignment replaces it.
+        ffi::locked(&self.laid).manifest = Some(MadeObject {
+            identity: found,
+            holder,
+            name: name.to_owned(),
+            directory: false,
+        });
         Ok(())
     }
 
@@ -3661,18 +3708,26 @@ impl Run {
             staging,
             journal,
             run,
+            replacement,
             prior,
             manifest,
         } = std::mem::take(&mut *ffi::locked(&self.laid));
-        let records_written = usize::from(prior.is_some()) + usize::from(manifest.is_some());
+        let records_written = usize::from(replacement.is_some())
+            + usize::from(prior.is_some())
+            + usize::from(manifest.is_some());
         let mut records_marked = 0;
         let mut rolled = Rolled::default();
-        let mut take = |object: Option<MadeObject>, path: &Path, record: bool| -> bool {
-            let Some(object) = object else {
+        let object = |object: Option<MadeObject>| {
+            object.map(|object| {
+                let directory = object.directory;
+                (directory, object.take_away())
+            })
+        };
+        let mut take = |taken: Option<(bool, Taken)>, path: &Path, record: bool| -> bool {
+            let Some((directory, taken)) = taken else {
                 return true;
             };
-            let directory = object.directory;
-            match object.take_away() {
+            match taken {
                 Taken::NotMade => true,
                 Taken::Marked => {
                     rolled.marked.push(path.display().to_string());
@@ -3690,16 +3745,22 @@ impl Run {
                 }
             }
         };
-        let mut gone = take(run, &self.paths.run, false);
-        gone &= take(journal, &self.paths.journal, false);
-        if gone {
-            gone = take(prior, &self.paths.prior, true);
+        let mut gone = take(object(run), &self.paths.run, false);
+        gone &= take(object(journal), &self.paths.journal, false);
+        // A replacement of the manifest that the run still holds is marked through the handle that
+        // made it, wherever the object is by now: at the replacement's name, or at the manifest's.
+        if gone && let Some(file) = replacement {
+            let path = file.path.clone();
+            gone = take(Some((false, file.take_away())), &path, true);
         }
         if gone {
-            gone = take(staging, &self.paths.staging, false);
+            gone = take(object(prior), &self.paths.prior, true);
         }
         if gone {
-            take(manifest, &self.paths.manifest, true);
+            gone = take(object(staging), &self.paths.staging, false);
+        }
+        if gone {
+            take(object(manifest), &self.paths.manifest, true);
         }
         let (directory, folder) = made.take_away();
         for (taken, path) in [
@@ -5682,6 +5743,7 @@ mod tests {
                 staging: Some(staging),
                 journal: Some(journal),
                 run: Some(private),
+                replacement: None,
                 prior: Some(prior),
                 manifest: Some(manifest),
             })),
@@ -5781,5 +5843,63 @@ mod tests {
         // What the run laid in the directory is gone; the entry that it did not lay is not touched.
         assert!(!run.paths.manifest.try_exists().unwrap());
         assert!(!run.paths.staging.try_exists().unwrap());
+    }
+
+    /// A manifest that another process put at the name after the run's last save is not the run's:
+    /// the identity that the save held is the proof's own, so the object at the name differs, it is
+    /// not marked, and the words say that another object stands there.
+    #[test]
+    fn a_manifest_that_another_process_put_at_the_name_after_the_save_is_not_marked() {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        run.save().unwrap();
+        std::fs::rename(&run.paths.manifest, top.path().join("aside.json")).unwrap();
+        std::fs::write(&run.paths.manifest, b"another process's file").unwrap();
+        let rolled = run.take_away();
+        assert!(!rolled.records_deleted, "{rolled:?}");
+        assert!(
+            rolled
+                .stayed
+                .iter()
+                .any(|entry| entry.contains("another object stands at its name")),
+            "{rolled:?}"
+        );
+        assert_eq!(
+            std::fs::read(&run.paths.manifest).unwrap(),
+            b"another process's file"
+        );
+    }
+
+    /// A replacement of the manifest that the run still holds, from the call that made it, is
+    /// marked through the handle that made it, at whatever name it has, and counts as a record.
+    #[test]
+    fn a_replacement_that_the_run_holds_is_marked_through_the_handle_that_made_it() {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        let name: Vec<u16> = "manifest-x.new".encode_utf16().collect();
+        let handle = fresh::create_beneath(
+            run.directory.as_ref().unwrap(),
+            &name,
+            SdKind::AdminFile,
+            GENERIC_READ | GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ,
+        )
+        .unwrap();
+        let path = run.paths.data.join("manifest-x.new");
+        ffi::locked(&run.laid).replacement = Some(MadeFile {
+            handle: Arc::new(handle),
+            path: path.clone(),
+        });
+        assert!(path.try_exists().unwrap());
+        let rolled = run.take_away();
+        assert!(rolled.stayed.is_empty(), "{rolled:?}");
+        assert!(
+            rolled.marked.contains(&path.display().to_string()),
+            "{rolled:?}"
+        );
+        assert!(rolled.records_deleted, "{rolled:?}");
+        assert!(!path.try_exists().unwrap());
     }
 }
