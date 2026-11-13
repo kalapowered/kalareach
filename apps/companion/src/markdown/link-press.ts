@@ -17,7 +17,8 @@
  *   has a detail of 0 and adds nothing.
  * - A press is live or dead. The pressed look shows on the lit link only while the press lives, and a
  *   dead press opens nothing. It lives from the pointer down to the pointer up, and dies at the first of:
- *   a move past the slop, a pointer cancel, the next primary pointer down (in the pane or outside it),
+ *   a move past the slop, a pointer cancel, the loss of the pointer's capture, the window's loss of
+ *   focus, the page's hiding, the next primary pointer down (in the pane or outside it),
  *   and a scroll of any box or of the visual viewport, or a resize of the viewport, after which a release
  *   at the press's point would no longer open the lit link (`releaseOpens`). At its death the look ends at once. The open at
  *   the click runs the same rule at the press's own point, so for a touch or a pen what lights at the
@@ -26,12 +27,14 @@
  *   open, and the look stays until the release. Watching the content's size would end presses whenever
  *   an answer streams below the link, which is the usual state.
  *
- * Where the listeners stand: all on the document, in the capture phase for the pointer down and the
- * click. A press outside the pane must end the pane's record and its look, so the pointer down is not on
- * the pane; the pointer move, up and cancel, the scroll of any box (a scroll does not bubble, so only
- * the capture phase on the document hears every box) and the visual viewport's scroll and resize stand
- * from a press to its end, because a release or a cancel can come outside the pane when the finger
- * slides out; and the click acts only on a click whose target lies in the pane. A click listener on the
+ * Where the listeners stand: all on the document (the window's blur excepted), in the capture phase for
+ * the pointer down and the click. A press outside the pane must end the pane's record and its look, so
+ * the pointer down is not on the pane; the pointer move, up and cancel, the scroll of any box (a scroll
+ * does not bubble, so only the capture phase on the document hears every box) and the visual viewport's
+ * scroll and resize stand from a press to its end, because a release or a cancel can come outside the pane
+ * when the finger slides out; for a press that lit a link the loss of the pointer's capture, the page's
+ * visibility change and the window's blur stand too, and each removes them with the rest at every end;
+ * and the click acts only on a click whose target lies in the pane. A click listener on the
  * pane itself gave no click at any point where the document's gives none: the points that get none in a
  * desktop WebKit are its scroll bar's strip at the pane's right edge, which no listener changes and
  * which the phones do not have. iOS sends a click on plain text because the page's own listeners sit on
@@ -86,9 +89,12 @@ export function startLinkPress(element: HTMLElement): () => void {
     press !== null && Math.hypot(event.clientX - press.at.x, event.clientY - press.at.y) > SLOP
 
   // A press is live or dead. It lives from a primary pointer down to the pointer's up, and it dies at the
-  // first of: a move past the slop, a pointer cancel, the next primary pointer down, and a scroll or a
-  // resize after which the link it lit no longer wins its point. At its death the look ends at once and
-  // the record goes, so a dead press opens nothing. The listeners below stand only while a press lives.
+  // first of: a move past the slop, a pointer cancel, the loss of the pointer's capture, the window's loss
+  // of focus, the page's hiding, the next primary pointer down, and a scroll or a resize after which a
+  // release would no longer open the link it lit. At its death the look ends at once and the record goes,
+  // so a dead press opens nothing. The listeners below stand only while a press lives. A release can
+  // then never arrive (a lost capture, a window that is no longer in front, a page that is no longer
+  // shown), and the look would stay on the link until some later press.
   const die = (): void => {
     press = null
     light(null)
@@ -105,10 +111,24 @@ export function startLinkPress(element: HTMLElement): () => void {
     if (releaseOpens(element, press)) return
     die()
   }
+  // The pointer's capture was taken from the pointer, the window is no longer in front or the page is
+  // no longer shown: no release will come to this press.
+  const lost = (event: PointerEvent): void => {
+    if (press !== null && event.pointerId === press.pointer) die()
+  }
+  const blur = (): void => {
+    die()
+  }
+  const hide = (): void => {
+    if (document.hidden) die()
+  }
   const stop = (): void => {
     document.removeEventListener('pointermove', move)
     document.removeEventListener('pointerup', up)
     document.removeEventListener('pointercancel', cancel)
+    document.removeEventListener('lostpointercapture', lost)
+    document.removeEventListener('visibilitychange', hide)
+    window.removeEventListener('blur', blur)
     document.removeEventListener('scroll', recheck, true)
     window.visualViewport?.removeEventListener('scroll', recheck)
     window.visualViewport?.removeEventListener('resize', recheck)
@@ -148,6 +168,9 @@ export function startLinkPress(element: HTMLElement): () => void {
     document.addEventListener('pointerup', up)
     document.addEventListener('pointercancel', cancel)
     if (found !== null) {
+      document.addEventListener('lostpointercapture', lost)
+      document.addEventListener('visibilitychange', hide)
+      window.addEventListener('blur', blur)
       document.addEventListener('scroll', recheck, true)
       window.visualViewport?.addEventListener('scroll', recheck)
       window.visualViewport?.addEventListener('resize', recheck)
