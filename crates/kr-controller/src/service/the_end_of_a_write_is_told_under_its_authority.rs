@@ -480,13 +480,21 @@ async fn a_debt_published_while_the_proof_waits_for_the_registry_stops_the_resul
         .expect("the barrier");
     assert!(proof.is_some(), "its own debt, alone, is the proof");
     let registry = controller.registry.lock().await;
-    let telling = tokio::spawn({
-        let controller = Arc::clone(&controller);
-        async move { told_as(&controller, connection_id, a_result_carrying(proof)).await }
-    });
+    let mut telling = std::pin::pin!(told_as(
+        &controller,
+        connection_id,
+        a_result_carrying(proof)
+    ));
+    // One poll takes the telling to the first thing it cannot get past, the registry's lock, so
+    // whatever it checked before that was checked before the fence below is owed.
+    let first = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(telling.as_mut(), cx))
+    })
+    .await;
+    assert!(first.is_pending(), "the telling waits for the registry");
     // Another request's restriction publishes its debt while the registry is held, as one does.
     controller.hold_fence(true);
     drop(registry);
-    not_shown(&telling.await.expect("the door tells it"));
+    not_shown(&telling.await);
     controller.hold_fence(false);
 }
