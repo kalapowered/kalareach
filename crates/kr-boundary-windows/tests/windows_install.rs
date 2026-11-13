@@ -275,12 +275,14 @@ impl Drop for Case {
     fn drop(&mut self) {
         let (removal_code, removal_output) = setup(&["remove"], "yes\n", &[]);
         // A case whose body removed the installation itself leaves nothing for this removal, which
-        // then says so and refuses: that is the right end, and the check below reads the machine.
-        let removal_code = if removal_output.contains("nothing is installed") {
-            0
-        } else {
-            removal_code
-        };
+        // then says that the data directory is not there and refuses: that is the right end, and
+        // the check below reads the machine.
+        let removal_code =
+            if removal_output.contains("is not there, so no manifest says what to remove") {
+                0
+            } else {
+                removal_code
+            };
         // What the removal left, read before the policy is cleared here: a case that ends with
         // something of the installation still on the machine fails itself, and the next case's
         // "not clean" is not the only sign of it.

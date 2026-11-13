@@ -1,7 +1,7 @@
 //! A check of the crate's source against the table of its sentences (`tests/sentences.txt`).
 //!
 //! Every place in `src/` that makes a text for a person carries an identifier, as the comment
-//! `// text: <identifier>` on the line before it: each `Error::Refused(`, `Error::Failed(` and `say(`
+//! `// text: <identifier>` on the line before it: each `Error::Refused(`, `Error::Failed(`, `Begin::Refuse(` and `say(`
 //! (a place that makes two texts on one line lists two identifiers), and, in `remedy.rs` and
 //! `records.rs`, each `pub fn` that returns words (a `String` or a `&str`) and each `pub const` of
 //! words. The table names, for each identifier, the sentences that state a fact about the machine
@@ -31,7 +31,11 @@ fn occurrences(line: &str, needle: &str) -> usize {
             let continues = before.is_some_and(|c| {
                 c.is_alphanumeric() || c == '_' || (needle == "say(" && (c == '.' || c == ':'))
             });
-            let pattern = needle.starts_with("Error::") && after.starts_with("_)");
+            let pattern = (needle.starts_with("Error::") && after.starts_with("_)"))
+                || (needle == "Begin::Refuse("
+                    && after.split_once(')').is_some_and(|(binding, rest)| {
+                        is_identifier(binding) && rest.trim_start().starts_with("=>")
+                    }));
             !continues && !pattern
         })
         .count()
@@ -77,10 +81,15 @@ fn places(file: &str, lines: &[&str]) -> Vec<(usize, usize)> {
         if line.contains("fn say(") {
             continue;
         }
-        let needed = ["Error::Refused(", "Error::Failed(", "say("]
-            .iter()
-            .map(|needle| occurrences(line, needle))
-            .sum();
+        let needed = [
+            "Error::Refused(",
+            "Error::Failed(",
+            "Begin::Refuse(",
+            "say(",
+        ]
+        .iter()
+        .map(|needle| occurrences(line, needle))
+        .sum();
         if needed > 0 {
             found.push((at, needed));
         }
@@ -284,4 +293,11 @@ fn the_check_fails_for_a_place_without_a_row_a_row_without_a_place_and_a_name_us
     // A constant of words.
     let constant = "pub const WHY: &str = \"x\";\n";
     assert_eq!(check(&[("remedy.rs", constant)], "").len(), 1);
+    // A refusal that a result carries is a place; a pattern that passes it on is not.
+    let returned = "Look::There => Begin::Refuse(format!(\"x\")),\n";
+    assert_eq!(check(&[("records.rs", returned)], "").len(), 1);
+    let passed_on = "records::Begin::Refuse(text) => return Err(Error::Refused(text)),\n";
+    assert_eq!(check(&[("install.rs", passed_on)], "").len(), 1);
+    let only_passed_on = "records::Begin::Refuse(text) => return Ok(text),\n";
+    assert!(check(&[("install.rs", only_passed_on)], "").is_empty());
 }

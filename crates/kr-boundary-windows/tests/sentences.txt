@@ -6,14 +6,16 @@
 # read is really behind its sentence.
 
 # ---- records.rs
-not_there_at_the_inspection | X was not there when the removal looked for it, and something is there now, so it was not removed | read: the inspection found the name absent, and entry_exists (symlink_metadata) found something at it now
+not_there_at_the_inspection | X was not there when the removal looked for it, and something is there now, so it was not removed | read: the inspection did not approve the name, and a look found something at it now (records::look answered There, or the creating call answered ERROR_ALREADY_EXISTS)
+looked_at_again | X was not there when the removal looked for it, and a look at it now failed (error), so it was not removed | read: records::look answered Unread with the error of symlink_metadata; the answer There gives the words of not_there_at_the_inspection
 remove | removing X failed (error): the call fails for an entry still in the directory and for a program that holds it open | read: the removal call's error; the causes are said as possibilities
 remove | its listing failed, so a replacement of the manifest cannot be ruled out | read: list_names returned an error
 remove_with | removing X failed (error) | read: the removal call's error for that entry
 remove_with | its listing failed, so a replacement of the manifest cannot be ruled out | read: list_names returned an error
 remove_empty | the directory's removal failed (error) | read: remove_dir's error
 finish_journal_and_run | removing X failed (error) | read: the removal call's error for the journal file or the empty directory
-unread_prior | The earlier-state record was not read, so the Application Identity service's start value and running state were not put back | read: entry_exists found the record's entry and the inspection did not approve it for reading
+unread_prior | The earlier-state record was not read, so the Application Identity service's start value and running state were not put back | read: records::look answered There for the record's name and the inspection did not approve it for reading
+unread_prior | The look at the earlier-state record's name failed (error), so no record was read: if one is there, the service's start value and running state were not put back | read: records::look answered Unread with the error of symlink_metadata; no record is known to be there
 next_step | Something is at the manifest's name, and it stays with them | read: paths.manifest.exists() (follows a link) returned true
 next_step | If a program holds one of them open, close it | condition: a failed removal call can mean a holder
 next_step | The directory is empty, and a new installation accepts an empty data directory | read: data_is_empty (a listing with no entry); rule of entry
@@ -98,11 +100,16 @@ appid_start_type_left | the start type is N, not the M that the installation rec
 appid_start_type_left | the installation recorded no start type for it | read: the manifest's entry has no start= value
 dos_path_of | a final path as a person can use it | no sentence: the final path with its prefix removed
 
+begin-1 | X was not there when the removal looked for it, and something is there now, so nothing was removed | read: the inspection found the directory or the folder above it absent; records::look answered There
+begin-2 | X was not there when the removal looked for it, and a look at it now failed (error), so nothing was removed | read: the inspection found the directory or the folder above it absent; records::look answered Unread with its error
+begin-3 | X is not there, so no manifest says what to remove | read: the inspection found the directory or the folder above it absent, and records::look answered NotThere; no call read the service, the accounts or the policy
+
 # ---- win/install.rs
 inject-1 | a failure was injected after the step | rule: the testing feature's injected failure; no fact about the machine
 entry-1 | an account named N exists and this installation did not make it | read: account::find found the account and no manifest records it
 entry-2 | a service named N exists and this installation did not make it | read: the service manager opened the service and no manifest records it
-entry-3 | X exists and this installation did not make it | read: entry_exists found it and no manifest records it
+entry-3 | X exists and this installation did not make it | read: records::look answered There and no manifest records it
+entry-4 | a look at X failed (error), so the setup program cannot tell whether something that this installation did not make is there | read: records::look answered Unread with the error of symlink_metadata
 parent_refusal-1 | X is the folder that holds the boundary's data: whoever owns it, or can write or delete in it, could put data of their own in its place | rule of the layout; the reason is a read of the handle: ERROR_SHARING_VIOLATION, an open error, a reparse point or not a directory
 directory-1 | X was made and is gone again | read: the create call returned success and the open after it answered not found
 data_refusal-1 | X is the boundary's data directory; it is refused because (reason) | rule of the layout; the reason is a read: the owner, the list, a reparse point, the case flag, an entry that no manifest records
@@ -186,7 +193,7 @@ open_session-4 | the words of remedy::hello_failure | read: see hello_failure
 open_session-5 | the broker answered hello with an unexpected response | read: the response's variant
 ask-1 | the error of the request to the broker | read: the frame error of the request, printed
 remove_at-1 | run the setup program as an administrator | read: token::current_is_administrator returned false
-remove_at-2 | the words of records::begin | read: see records
+remove_at-2 | the words of records::begin | read: see begin-1 to begin-3
 remove_at-3 | the empty data directory is removed | read: Inspection::Empty and records::remove_empty left nothing
 remove_at-4 | the data directory stays because X could not be removed | read: records::remove_empty's lines of what stayed
 remove_at-5 | X was not there when the removal looked for it, and something is there now: nothing was removed | read: see not_there_at_the_inspection
