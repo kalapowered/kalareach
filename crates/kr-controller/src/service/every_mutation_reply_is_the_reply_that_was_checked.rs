@@ -204,9 +204,112 @@ fn params_for_a_route(
     use kr_protocol::privacy::PrivacyRetainedDeleteParams;
     use kr_protocol::sharing::{DeviceRevokeParams, GrantRevokeParams};
 
-    use super::a_recorded_answer_another_copy_wrote::{a_workflow_install, capability_request};
+    use super::a_recorded_answer_another_copy_wrote::{
+        a_workflow_install, cancellation, capability_request, materialisation, setting_quiet_hours,
+    };
 
     match method {
+        Method::AgentToolsInstall => {
+            let project = temp.root().join("a-project-the-walk-installs-in");
+            std::fs::create_dir_all(&project).expect("a project directory");
+            Some(super::the_fence_at_every_effect::installation_in(temp, &project).params)
+        }
+        Method::ProjectOperationCancel => Some(cancellation(temp).params),
+        Method::ChangesetMaterialize => Some(materialisation(temp).params),
+        Method::AttentionQuietHours => Some(setting_quiet_hours(temp).params),
+        Method::CataloguePin => Some(
+            ParamsValue::from_typed(&kr_protocol::catalogue::CataloguePinParams {
+                environment_id: temp.environment_id(),
+                catalogue_id: "nobody-enrolled-this".to_owned(),
+                generation: kr_protocol::scalars::Nullable(Some(
+                    kr_protocol::ids::RepositoryGeneration::new(1),
+                )),
+            })
+            .expect("encodes"),
+        ),
+        Method::SessionClose => Some(
+            ParamsValue::from_typed(&kr_protocol::session::SessionCloseParams {
+                session_id: kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()),
+            })
+            .expect("encodes"),
+        ),
+        Method::DraftCreate => Some(
+            ParamsValue::from_typed(&kr_protocol::transfer::DraftCreateParams {
+                environment_id: temp.environment_id(),
+                device_id: kr_protocol::scalars::Nullable::null(),
+                session_id: kr_protocol::scalars::Nullable::null(),
+                application_instance_id: kr_protocol::scalars::Nullable::null(),
+                text: "a draft that belongs to no session".to_owned(),
+            })
+            .expect("encodes"),
+        ),
+        Method::MachineSplit => {
+            let group = controller
+                .machine_report()
+                .expect("this daemon serves a machine group record");
+            Some(
+                ParamsValue::from_typed(&kr_protocol::machine::MachineSplitParams {
+                    expected: kr_protocol::machine::MachineExpected {
+                        machine_id: group.machine_id,
+                        revision: group.revision,
+                    },
+                })
+                .expect("encodes"),
+            )
+        }
+        Method::AccountSignOut => Some(
+            ParamsValue::from_typed(&kr_protocol::host_account::AccountSignOutParams {})
+                .expect("encodes"),
+        ),
+        Method::WorkflowEnable => Some(
+            ParamsValue::from_typed(&kr_protocol::automation::WorkflowEnableParams {
+                workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
+                revision: kr_protocol::scalars::U64::new(1),
+            })
+            .expect("encodes"),
+        ),
+        Method::WorkflowPause => Some(
+            ParamsValue::from_typed(&kr_protocol::automation::WorkflowPauseParams {
+                workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
+                revision: kr_protocol::scalars::U64::new(1),
+                reason: kr_protocol::scalars::Nullable::null(),
+            })
+            .expect("encodes"),
+        ),
+        Method::UploadCancel => Some(
+            ParamsValue::from_typed(&kr_protocol::transfer::UploadCancelParams {
+                transfer_id: kr_protocol::ids::TransferId::new(kr_ipc::new_uuid()),
+            })
+            .expect("encodes"),
+        ),
+        Method::DraftDiscard => Some(
+            ParamsValue::from_typed(&kr_protocol::transfer::DraftDiscardParams {
+                draft_id: kr_protocol::ids::DraftId::new(kr_ipc::new_uuid()),
+            })
+            .expect("encodes"),
+        ),
+        Method::EnvironmentForget => Some(
+            ParamsValue::from_typed(&kr_protocol::identity::EnvironmentForgetParams {
+                environment_id: temp.environment_id(),
+            })
+            .expect("encodes"),
+        ),
+        Method::VoiceGrant => Some(
+            ParamsValue::from_typed(&kr_protocol::voice::VoiceGrantParams {
+                device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+                session_ids: CanonicalSet::new(),
+                actions: kr_protocol::scalars::Nullable::null(),
+            })
+            .expect("encodes"),
+        ),
+        Method::OwnerConfirmationRequest => Some(
+            ParamsValue::from_typed(&kr_protocol::confirmation::OwnerConfirmationRequestParams {
+                subject: kr_protocol::confirmation::ConfirmationSubject::SetExclusiveManagement {
+                    exclusive: false,
+                },
+            })
+            .expect("encodes"),
+        ),
         Method::PrivacySet => {
             Some(ParamsValue::from_typed(&PrivacySetParams { enabled: false }).expect("encodes"))
         }
@@ -241,6 +344,75 @@ fn params_for_a_route(
     }
 }
 
+/// The local writes the walk sends with parameters that do not reach their route: each needs a
+/// fixture of its own that a walk of the whole table cannot build alone, so the envelope declines
+/// it for its empty parameters and its reply is the declined one, which `declined` made and the
+/// sink consumed. They are listed so that no write passes unnamed; one that gains parameters here
+/// leaves the list.
+const WITHOUT_A_FIXTURE: &[Method] = &[
+    Method::EnvironmentEnrol,
+    Method::EnvironmentRefresh,
+    Method::DeliveryDestinationConfigure,
+    Method::DeliveryDestinationRemove,
+    Method::DeliveryDestinationSecretSet,
+    Method::AccountSignIn,
+    Method::AccountStorageSignIn,
+    Method::AccountStorageSignOut,
+    Method::BackupEnable,
+    Method::BackupBundleWrite,
+    Method::HostUpdateHandover,
+    Method::DescriptionConfigure,
+    Method::DescriptionDownload,
+    Method::MachineJoin,
+    Method::MachineMerge,
+    Method::OrganisationEnrol,
+    Method::OrganisationPolicyApply,
+    Method::OrganisationWithdraw,
+    Method::MembershipPresent,
+    Method::PairInvite,
+    Method::PairConfirm,
+    Method::PairCancel,
+    Method::CatalogueAdd,
+    Method::CatalogueSync,
+    Method::CatalogueRemove,
+    Method::PluginInstall,
+    Method::PluginRemove,
+    Method::PluginPin,
+    Method::PluginEnable,
+    Method::PluginDisable,
+    Method::PluginGrant,
+    Method::AgentToolsRemove,
+    Method::SessionCreate,
+    Method::SessionRename,
+    Method::AgentPromptSubmit,
+    Method::AgentPromptQueue,
+    Method::DraftUpdate,
+    Method::AgentDraftAddAttachment,
+    Method::UploadBegin,
+    Method::UploadChunk,
+    Method::UploadFinish,
+    Method::ProjectInit,
+    Method::ProjectClone,
+    Method::ProjectAdopt,
+    Method::ProjectLocationAuthorise,
+    Method::ProjectLocationWithdraw,
+    Method::ProjectLocationAttach,
+    Method::WorkspaceCreate,
+    Method::WorkspaceRemove,
+    Method::DiffApply,
+    Method::DiffRevert,
+    Method::ChangesetCapture,
+    Method::ReviewAcknowledge,
+    Method::AttentionAcknowledge,
+    Method::VisitAcknowledge,
+    Method::OwnerConfirmationComplete,
+    Method::HostClockEstablish,
+    Method::GrantCreate,
+    Method::GrantTransfer,
+    Method::WorkflowRun,
+    Method::WorkflowRearm,
+];
+
 fn code_of(frame: &ControlFrame) -> Option<ErrorCode> {
     match frame {
         ControlFrame::Response(Response {
@@ -269,7 +441,16 @@ async fn every_mutation_reply_is_the_reply_that_was_checked() {
         if params.is_some() {
             reaching.push(method);
         }
-        let mutation = caller.mutation(&temp, method, params.unwrap_or_else(ParamsValue::empty));
+        let mut mutation =
+            caller.mutation(&temp, method, params.unwrap_or_else(ParamsValue::empty));
+        if method == Method::SessionClose && reaching.last() == Some(&method) {
+            // A close names its session in its target as well as in its parameters.
+            let params: kr_protocol::session::SessionCloseParams =
+                mutation.params.to_typed().expect("decodes");
+            mutation.target.session_id = kr_protocol::scalars::Nullable::some(params.session_id);
+            mutation.target.session_epoch =
+                kr_protocol::scalars::Nullable::some(kr_protocol::ids::SessionEpoch::V1);
+        }
         let request_id = mutation.request_id;
         let read = caller.ask(mutation).await;
         let (was_told, made) = made(&controller, request_id);
@@ -284,16 +465,51 @@ async fn every_mutation_reply_is_the_reply_that_was_checked() {
     }
     assert!(asked > 50, "a mutation for each local write: {asked}");
     // The replies of the requests that reach a route are told, and not declined by the envelope.
-    for method in &reaching {
-        assert!(
-            told.contains(method),
-            "{method:?} carries parameters that reach its route, so its reply is told"
-        );
-    }
+    let declined: Vec<Method> = reaching
+        .iter()
+        .copied()
+        .filter(|method| !told.contains(method))
+        .collect();
     assert!(
-        reaching.len() >= 8,
-        "the walk reaches the routes of several kinds: {reaching:?}"
+        declined.is_empty(),
+        "these carry parameters that reach their route, so their replies are told: {declined:?}"
     );
+    let without: Vec<Method> = Method::ALL
+        .iter()
+        .copied()
+        .filter(|method| {
+            LocalWrite::of(*method).is_some_and(|kind| kind != LocalWrite::NotServed)
+                && !reaching.contains(method)
+        })
+        .collect();
+    assert_eq!(
+        without, WITHOUT_A_FIXTURE,
+        "the writes the walk sends with no parameters that reach their route are the ones listed"
+    );
+    // Each kind of route is reached by at least one method, so that the arm of `write_method` that
+    // serves it has told a reply.
+    for method in Method::ALL.iter().copied() {
+        let Some(kind) = LocalWrite::of(method) else {
+            continue;
+        };
+        if kind == LocalWrite::NotServed {
+            assert!(
+                !told.contains(&method),
+                "{method:?} is served by nobody here, so the envelope declines it"
+            );
+            continue;
+        }
+        if !matches!(kind, LocalWrite::Setup | LocalWrite::SessionCreate) {
+            assert!(
+                reaching.iter().any(|reached| {
+                    LocalWrite::of(*reached).is_some_and(|reached| {
+                        std::mem::discriminant(&reached) == std::mem::discriminant(&kind)
+                    })
+                }),
+                "{kind:?}: no method of this kind of route is walked with parameters that reach it"
+            );
+        }
+    }
 
     // A mutation on a stream that does not carry it is declined, and the caller reads that.
     let mutation = caller.mutation(&temp, Method::UploadChunk, ParamsValue::empty());
