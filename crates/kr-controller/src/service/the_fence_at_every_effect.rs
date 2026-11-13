@@ -3273,3 +3273,318 @@ async fn a_file_of_the_agents_this_host_cannot_read_is_the_requests_own_refusal(
         Err(crate::error::ControllerError::Storage { .. })
     ));
 }
+
+use super::the_end_of_a_write_is_told_under_its_authority::not_shown;
+
+/// What the door tells of `mutation`'s first admission once its route has answered. With `fence`,
+/// this host comes to owe a fence after the route has answered and before the answer is told, which
+/// is where the door's strict check meets it.
+async fn performed_with_a_fence_landing_before_the_telling(
+    controller: &Arc<Controller>,
+    connection_id: ConnectionId,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+    fence: bool,
+) -> ControlFrame {
+    let pause = fence.then(|| controller.pause_before_a_reply_is_told());
+    let performing = tokio::spawn({
+        let (controller, actor_id, mutation) =
+            (Arc::clone(controller), actor_id.clone(), mutation.clone());
+        async move {
+            let method = mutation.method.method().expect("a method");
+            told_now(
+                &controller,
+                connection_id,
+                &mutation,
+                controller.write_method(
+                    &actor_id,
+                    &mutation,
+                    method,
+                    connection_id,
+                    None,
+                    Some(accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                ),
+            )
+            .await
+        }
+    });
+    if let Some((arrived, release)) = pause {
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the route answers")
+            .expect("the pause is armed");
+        controller.hold_fence(true);
+        release.send(()).expect("the door goes on");
+    }
+    let told = performing.await.expect("the door tells it");
+    controller.hold_fence(false);
+    told
+}
+
+/// KR-REQ-09.09: what `organisation.policy.apply` answers is made from the policies the host holds,
+/// so the door tells it only while no fence is owed: with none, a request that names no policy is
+/// given its refusal as it is; with a fence owed once the route has answered, it is not shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_organisation_policy_apply_answers_is_not_shown_when_a_fence_lands_after_the_read() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = mutation_of(&temp, Method::OrganisationPolicyApply, ParamsValue::empty());
+
+    let told = performed_with_a_fence_landing_before_the_telling(
+        &controller,
+        connection_id,
+        &actor_id,
+        &mutation,
+        false,
+    )
+    .await;
+    let given = refusal(&told).unwrap_or_else(|| panic!("a request naming no policy: {told:?}"));
+    assert_ne!(given.code, ErrorCode::OutcomeUnknown, "{given:?}");
+
+    let told = performed_with_a_fence_landing_before_the_telling(
+        &controller,
+        connection_id,
+        &actor_id,
+        &mutation,
+        true,
+    )
+    .await;
+    not_shown(&told);
+}
+
+/// KR-REQ-09.09: the row a refresh answers for an environment that no process bridge reaches is the
+/// enrolment record's, so the door tells it only while no fence is owed: with none, the refresh is
+/// answered; with a fence owed once the route has answered, it is not shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_row_a_refresh_answers_from_a_record_is_not_shown_when_a_fence_lands_after_the_read() {
+    use kr_protocol::identity::{
+        EnvironmentAccess, EnvironmentEnrolParams, EnvironmentRefreshParams,
+    };
+    let rig = Refreshing::start().await;
+    let mut enrolment = enrolment_of(9);
+    enrolment.access = EnvironmentAccess::PairedHost;
+    let environment_id = enrolment.environment_id;
+    let enrol = mutation_of(
+        &rig.temp,
+        Method::EnvironmentEnrol,
+        ParamsValue::from_typed(&EnvironmentEnrolParams { enrolment }).expect("encodes"),
+    );
+    let enrolled = performed_with_a_fence_landing_before_the_telling(
+        &rig.controller,
+        rig.connection_id,
+        &rig.actor_id,
+        &enrol,
+        false,
+    )
+    .await;
+    assert!(refusal(&enrolled).is_none(), "enrolled: {enrolled:?}");
+
+    let refresh = || {
+        mutation_of(
+            &rig.temp,
+            Method::EnvironmentRefresh,
+            ParamsValue::from_typed(&EnvironmentRefreshParams {
+                environment_id,
+                start: false,
+            })
+            .expect("encodes"),
+        )
+    };
+    let told = performed_with_a_fence_landing_before_the_telling(
+        &rig.controller,
+        rig.connection_id,
+        &rig.actor_id,
+        &refresh(),
+        false,
+    )
+    .await;
+    assert!(
+        refusal(&told).is_none(),
+        "the refresh is answered: {told:?}"
+    );
+    let told = performed_with_a_fence_landing_before_the_telling(
+        &rig.controller,
+        rig.connection_id,
+        &rig.actor_id,
+        &refresh(),
+        true,
+    )
+    .await;
+    not_shown(&told);
+}
+
+/// KR-REQ-09.09: an installation record this host cannot read says that a record exists, so the
+/// refusal is the record's and the door tells it only while no fence is owed: with none, the
+/// refusal is given as it is; with a fence owed once the route has answered, it is not shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_record_this_host_cannot_read_is_not_shown_when_a_fence_lands_after_the_read()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let project = tempfile::TempDir::new().expect("a project directory of this test's own");
+    let installed = performed_with_a_fence_landing_before_the_telling(
+        &controller,
+        connection_id,
+        &actor_id,
+        &installation_in(&temp, project.path()),
+        false,
+    )
+    .await;
+    assert!(refusal(&installed).is_none(), "installed: {installed:?}");
+    let record = installation_record(controller.paths.state_dir())
+        .expect("the installation left its record");
+    std::fs::write(&record, b"this is not a record").expect("the record is spoiled");
+
+    let told = performed_with_a_fence_landing_before_the_telling(
+        &controller,
+        connection_id,
+        &actor_id,
+        &installation_in(&temp, project.path()),
+        false,
+    )
+    .await;
+    let given =
+        refusal(&told).unwrap_or_else(|| panic!("an unreadable record is no answer: {told:?}"));
+    assert_ne!(given.code, ErrorCode::OutcomeUnknown, "{given:?}");
+    let told = performed_with_a_fence_landing_before_the_telling(
+        &controller,
+        connection_id,
+        &actor_id,
+        &installation_in(&temp, project.path()),
+        true,
+    )
+    .await;
+    not_shown(&told);
+}
+
+/// KR-REQ-09.09: the refusal that a request and a stored object name different sessions is what the
+/// transfer journal stores, so the door tells it only while no fence is owed: with none, the refusal
+/// is given as it is; with a fence owed once the route has answered, it is not shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refusal_from_a_stored_subject_is_not_shown_when_a_fence_lands_after_the_read() {
+    use kr_protocol::transfer::{DraftCreateParams, DraftCreateResult, DraftUpdateParams};
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let create = mutation_of(
+        &temp,
+        Method::DraftCreate,
+        ParamsValue::from_typed(&DraftCreateParams {
+            environment_id: temp.environment_id(),
+            device_id: Nullable::null(),
+            session_id: Nullable::null(),
+            application_instance_id: Nullable::null(),
+            text: "a draft that belongs to no session".to_owned(),
+        })
+        .expect("encodes"),
+    );
+    let created = performed_with_a_fence_landing_before_the_telling(
+        &controller,
+        connection_id,
+        &actor_id,
+        &create,
+        false,
+    )
+    .await;
+    let ControlFrame::Response(response) = created else {
+        panic!("a create is answered with a response");
+    };
+    let Outcome::Ok(created) = response.outcome else {
+        panic!("the draft is created: {response:?}");
+    };
+    let created: DraftCreateResult = created.to_typed().expect("decodes");
+
+    let update = || MutationRequest {
+        target: ActionTarget {
+            environment_id: temp.environment_id(),
+            session_id: Nullable::some(kr_protocol::ids::SessionId::new(kr_ipc::new_uuid())),
+            session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        },
+        ..mutation_of(
+            &temp,
+            Method::DraftUpdate,
+            ParamsValue::from_typed(&DraftUpdateParams {
+                draft_id: created.draft.draft_id,
+                expected_revision: created.draft.revision,
+                text: "changed".to_owned(),
+            })
+            .expect("encodes"),
+        )
+    };
+    let told = performed_with_a_fence_landing_before_the_telling(
+        &controller,
+        connection_id,
+        &actor_id,
+        &update(),
+        false,
+    )
+    .await;
+    let given = refusal(&told).unwrap_or_else(|| panic!("the subjects differ: {told:?}"));
+    assert_eq!(given.code, ErrorCode::InvalidArgument, "{given:?}");
+    let told = performed_with_a_fence_landing_before_the_telling(
+        &controller,
+        connection_id,
+        &actor_id,
+        &update(),
+        true,
+    )
+    .await;
+    not_shown(&told);
+}
+
+/// KR-REQ-09.09: a repeat of `account.sign_out` is answered from the claim the first attempt left.
+/// The method takes no admission into the service, so the door's entry check is all that stands
+/// before the lookup, and a fence this host comes to owe at the lookup, after that check, is what
+/// the door's strict check meets: the repeat is not shown. The control: with no fence the repeat is
+/// given the first attempt's answer, and is again once the fence is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_answered_from_its_claim_is_not_shown_when_a_fence_lands_at_the_lookup() {
+    use super::a_recorded_answer_another_copy_wrote::answered_after_a_fence_lands_at_the_check;
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = mutation_of(
+        &temp,
+        Method::AccountSignOut,
+        ParamsValue::from_typed(&kr_protocol::host_account::AccountSignOutParams {})
+            .expect("encodes"),
+    );
+    // Each attempt runs on a task of its own, so that the door's future is not held on the case's
+    // stack beside the pause that stops it.
+    let attempt = || {
+        let (controller, actor_id, mutation) =
+            (Arc::clone(&controller), actor_id.clone(), mutation.clone());
+        async move {
+            tokio::spawn(async move {
+                told_now(
+                    &controller,
+                    connection_id,
+                    &mutation,
+                    controller.write_method(
+                        &actor_id,
+                        &mutation,
+                        Method::AccountSignOut,
+                        connection_id,
+                        None,
+                        Some(accepted(&controller)),
+                        controller.admitted_revision(connection_id).ok(),
+                    ),
+                )
+                .await
+            })
+            .await
+            .expect("the door tells it")
+        }
+    };
+    let first = attempt().await;
+    assert!(refusal(&first).is_none(), "the first attempt: {first:?}");
+    let again = attempt().await;
+    assert_eq!(again, first, "with no fence the repeat is given the record");
+
+    let told = answered_after_a_fence_lands_at_the_check(&controller, attempt()).await;
+    not_shown(&told);
+
+    let after = attempt().await;
+    assert_eq!(after, first, "once the fence is gone it is answered again");
+}
