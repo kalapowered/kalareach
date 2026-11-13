@@ -210,17 +210,14 @@ fn assert_clean(before: &Snapshot) {
     );
 }
 
-/// Runs the setup program with the payload of the guest's runner and "yes" on its input, from the
-/// given working directory, with the given variables. Returns its exit code and its output.
-fn run_setup(
+/// Starts the setup program with the payload of the guest's runner and "yes" on its input, from
+/// the given working directory, with the given variables.
+fn start_setup(
     arguments: &[&str],
     environment: &[(&str, &str)],
     working_directory: Option<&Path>,
-) -> (Option<i32>, String) {
-    let bin = PathBuf::from(
-        std::env::var_os("KR_BOUNDARY_BIN")
-            .expect("KR_BOUNDARY_BIN names the directory with the setup program and its payloads"),
-    );
+) -> std::process::Child {
+    let bin = bin_directory();
     let mut command = Command::new(bin.join("kr-boundary-setup.exe"));
     if let Some(("install", rest)) = arguments.split_first().map(|(first, rest)| (*first, rest)) {
         command
@@ -243,13 +240,29 @@ fn run_setup(
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("the setup program starts");
     child.stdin.take().unwrap().write_all(b"yes\n").unwrap();
-    let output = child.wait_with_output().unwrap();
+    child
+}
+
+/// The exit code and the output of a setup program that ended.
+fn ended(output: &std::process::Output) -> (Option<i32>, String) {
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     (output.status.code(), text)
+}
+
+/// Runs the setup program (see [`start_setup`]) to its end. Returns its exit code and its output.
+fn run_setup(
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    working_directory: Option<&Path>,
+) -> (Option<i32>, String) {
+    let output = start_setup(arguments, environment, working_directory)
+        .wait_with_output()
+        .unwrap();
+    ended(&output)
 }
 
 /// A new installation of the setup program that fails after the named step with the manifest
@@ -601,5 +614,118 @@ fn a_repair_whose_proof_read_fails_after_the_rename_keeps_the_new_record_and_the
         snapshot(),
         before,
         "after the removal the computer is as it was: {text}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_new_installation_that_fails_after_the_broker_step_is_rolled_back_and_prints_its_one_ending() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        token::current_is_administrator().unwrap(),
+        "the case must run elevated"
+    );
+    let before = snapshot();
+    assert_clean(&before);
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..6];
+    let person_name = format!("krperson{id}");
+    let person = account::create(&person_name).expect("the person's account is made");
+    let (code, text) = run_setup(
+        &["install", "--person", &person.to_text().unwrap()],
+        &[("KR_BOUNDARY_FAIL_AFTER", "broker")],
+        None,
+    );
+    println!("--- kr-boundary-setup install, failure after the broker step -> {code:?}\n{text}");
+    let _ = account::delete(&person_name);
+    assert_ne!(code, Some(0), "{text}");
+    assert!(
+        text.contains("undoing what was done")
+            && text.contains("the removal after the failure finished")
+            && !text.contains("also failed"),
+        "the rollback did not end without a failure: {text}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the rollback the computer is as it was: {text}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_rollback_that_cannot_mark_the_data_directory_names_what_stays_and_does_not_say_it_finished() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        token::current_is_administrator().unwrap(),
+        "the case must run elevated"
+    );
+    let before = snapshot();
+    assert_clean(&before);
+    let paths = Paths::system().unwrap();
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..6];
+    let person_name = format!("krperson{id}");
+    let person = account::create(&person_name).expect("the person's account is made");
+    let child = start_setup(
+        &["install", "--person", &person.to_text().unwrap()],
+        &[("KR_BOUNDARY_FAIL_AFTER", "broker")],
+        None,
+    );
+    let reader = std::thread::spawn(move || child.wait_with_output().unwrap());
+    // Once the run has made its directories and the manifest, a file of this case's own is made in
+    // the data directory and held open with no sharing of delete across the whole rollback.
+    let stray = paths.data.join("stray-of-the-case.txt");
+    let mut held = None;
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while !reader.is_finished() && std::time::Instant::now() < give_up {
+        if held.is_none() && paths.data.join("run").exists() && paths.manifest.exists() {
+            held = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(1)
+                .open(&stray)
+                .ok();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let output = reader.join().unwrap();
+    let (code, text) = ended(&output);
+    println!(
+        "--- kr-boundary-setup install, failure after the broker step, a file held in the data directory -> {code:?}\n{text}"
+    );
+    let made_the_stray = held.is_some();
+    drop(held);
+    observed(&format!(
+        "after the rollback: {}",
+        disk_of_the_data_tree(&paths)
+    ));
+    // Back to the earlier state: the file goes, and the administrator's removal runs to its end.
+    let _ = std::fs::remove_file(&stray);
+    let (removal_code, removal) = run_setup(&["remove"], &[], None);
+    println!("--- kr-boundary-setup remove -> {removal_code:?}\n{removal}");
+    let _ = account::delete(&person_name);
+    assert!(
+        made_the_stray,
+        "the case made no file in the data directory: {text}"
+    );
+    assert_ne!(code, Some(0), "{text}");
+    assert!(
+        text.contains("the removal after the failure also failed"),
+        "the rollback did not say that it failed: {text}"
+    );
+    assert!(
+        !text.contains("the removal after the failure finished")
+            && !text.contains("records are deleted"),
+        "the rollback says it finished or deleted records: {text}"
+    );
+    assert_eq!(
+        removal_code,
+        Some(0),
+        "the removal after it succeeds: {removal}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the removal the computer is as it was: {removal}"
     );
 }
