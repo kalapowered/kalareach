@@ -538,6 +538,45 @@ fn a_program_parent_made_by_hand_stands_after_a_good_installation_and_its_remova
     the_program_parent_after(false);
 }
 
+/// Fails if a file that a write of a record made and did not rename stands in the data directory:
+/// the names are the record's stem, 32 hexadecimal digits and `.new`.
+fn no_replacement_file_stands(paths: &Paths, when: &str) {
+    let names = names_in(&paths.data);
+    observed(&format!("the data directory {when} holds {names:?}"));
+    let left: Vec<&String> = names.iter().filter(|name| name.ends_with(".new")).collect();
+    assert!(
+        left.is_empty(),
+        "{when}: a replacement file stands: {left:?}"
+    );
+}
+
+/// Fails unless another program can open the manifest and the earlier-state record for reading,
+/// writing and deleting, sharing everything: the run keeps no restrictive handle of either.
+fn both_records_open_for_read_write_and_delete(paths: &Paths, when: &str) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_GENERIC_READ_WRITE: u32 = 0x0012_0089 | 0x0012_0116;
+    for path in [&paths.manifest, &paths.prior] {
+        let opened = std::fs::OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ_WRITE | DELETE)
+            .share_mode(7)
+            .open(path);
+        observed(&format!(
+            "{when}: opening {} for read, write and delete: {}",
+            path.display(),
+            opened.as_ref().map_or_else(
+                |error| format!("{error} ({:?})", error.raw_os_error()),
+                |_| "ok".to_owned()
+            )
+        ));
+        assert!(
+            opened.is_ok(),
+            "{when}: {} cannot be opened for read, write and delete: {opened:?}",
+            path.display()
+        );
+    }
+}
+
 /// The directory that holds the setup program and its signed payloads.
 fn bin_directory() -> PathBuf {
     PathBuf::from(
@@ -572,6 +611,8 @@ fn a_repair_whose_proof_read_fails_after_the_rename_keeps_the_new_record_and_the
     let installed = Manifest::load(&paths.manifest).unwrap();
     assert!(installed.persons.contains(&first_text));
     assert!(!installed.persons.contains(&second_text));
+    no_replacement_file_stands(&paths, "after a good installation");
+    both_records_open_for_read_write_and_delete(&paths, "after a good installation");
 
     // A repair that enrols the second person, whose first write of the manifest renames for real
     // and then cannot read what stands at the record's name.
@@ -604,11 +645,26 @@ fn a_repair_whose_proof_read_fails_after_the_rename_keeps_the_new_record_and_the
         "the new manifest lost the first person: {kept:?}"
     );
 
+    no_replacement_file_stands(&paths, "after the repair whose read failed");
+
+    // A repair by the same person with nothing forced, with the broker running, runs to its end.
+    let repaired = install::install(&paths, &options, true);
+    observed(&format!(
+        "repair with nothing forced: install returned: {}",
+        repaired
+            .as_ref()
+            .err()
+            .map_or_else(|| "Ok".to_owned(), ToString::to_string)
+    ));
+    no_replacement_file_stands(&paths, "after the repair with nothing forced");
+    both_records_open_for_read_write_and_delete(&paths, "after the repair with nothing forced");
+
     // The administrator's removal runs to its end and the computer is as it was.
     let (code, text) = run_setup(&["remove"], &[], None);
     println!("--- kr-boundary-setup remove -> {code:?}\n{text}");
     let _ = account::delete(&first_name);
     let _ = account::delete(&second_name);
+    assert!(repaired.is_ok(), "the repair with nothing forced failed");
     assert_eq!(code, Some(0), "the removal succeeds: {text}");
     assert_eq!(
         snapshot(),
@@ -728,4 +784,50 @@ fn a_rollback_that_cannot_mark_the_data_directory_names_what_stays_and_does_not_
         before,
         "after the removal the computer is as it was: {removal}"
     );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_failure_of_the_earlier_state_record_in_a_new_installation_is_rolled_back_clean() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        token::current_is_administrator().unwrap(),
+        "the case must run elevated"
+    );
+    let options = Options {
+        payload: bin_directory().join("payload"),
+        person: None,
+    };
+    let paths = Paths::system().unwrap();
+    // The write of the record, its flush and the taking of its identity each fail once.
+    for point in ["prior", "prior-flush", "prior-identity"] {
+        let before = snapshot();
+        assert_clean(&before);
+        println!("OBSERVED prior {point}: the setup program's own lines follow");
+        forced::fail_the_next(point);
+        let result = install::install(&paths, &options, false);
+        forced::fail_the_next("none");
+        println!("OBSERVED prior {point}: the setup program's own lines end");
+        let failure = result
+            .expect_err("the forced failure stops the installation")
+            .to_string();
+        observed(&format!("prior {point}: install returned: {failure}"));
+        observed(&format!(
+            "prior {point}: after the run: {}",
+            disk_of_the_data_tree(&paths)
+        ));
+        assert!(
+            failure.contains(&format!("a failure forced for a case at the step {point}")),
+            "{point}: {failure}"
+        );
+        assert!(
+            !paths.data_parent().exists() && !paths.data.exists(),
+            "{point}: the data directory or the folder above it stands: {failure}"
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "{point}: after the rollback the computer is as it was: {failure}"
+        );
+    }
 }
