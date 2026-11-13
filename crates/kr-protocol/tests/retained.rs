@@ -926,11 +926,12 @@ fn a_difference_in_the_keywords_of_the_schemas_own_root_is_a_difference() {
 }
 
 /// A reference of the schema's own root is followed only where its name is ASCII letters, digits
-/// and `_`. A validator reads the fragment as a JSON pointer (`~1` is `/`, `%2F` is `/`) and takes a
-/// trailing text or an empty name as no name, so a reference whose text is another definition's
-/// literal name points elsewhere for it: a cut that took the text for the name would compare the
-/// wrong target (a root whose reference goes from `#/$defs/A~1B`, which is `A/B`, to `C` would be no
-/// difference where the definition `A~1B` and `C` are alike).
+/// and `_`. A validator reads the fragment as a JSON pointer (`~1` is `/`, `%2F` is `/`, a trailing
+/// `/` starts another segment), so a reference whose text is another definition's literal name may
+/// point elsewhere for it: a cut that took the text for the name would compare the wrong target (a
+/// root whose reference goes from `#/$defs/A~1B`, which is `A/B`, to `C` would be no difference
+/// where the definition `A~1B` and `C` are alike). The names of every committed schema are plain, so
+/// the strict form refuses none of them; it also refuses an empty name, which is a valid pointer.
 #[test]
 fn a_root_reference_whose_name_is_not_plain_is_refused_by_the_cut() {
     for (reference, literal) in [

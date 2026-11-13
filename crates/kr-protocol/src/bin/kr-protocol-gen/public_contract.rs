@@ -891,7 +891,8 @@ fn is_a_listed_arrival(
 /// Whether the keys of a definition that a rule reads have the form that it reads: `required` is a
 /// list of texts (a rule that finds it no list takes the member for one that is not required, and a
 /// reader that iterates a text reads it as a list of letters), and `description` and `title` are
-/// texts, as the comparer leaves out only a text.
+/// texts (the comparer skips them whatever their value, so a change of one that is no text would be
+/// no line).
 fn has_plain_forms(node: &Value) -> bool {
     node.get("required").is_none_or(|required| {
         required

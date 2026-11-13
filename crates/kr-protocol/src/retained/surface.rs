@@ -81,8 +81,9 @@ impl Surface {
     /// # Errors
     ///
     /// Returns [`SurfaceError::UnknownRoot`] for a root the bundle lacks,
-    /// [`SurfaceError::BadReference`] for a reference that is not to one of its definitions by
-    /// its plain name, [`SurfaceError::ReservedName`] for a definition it reaches with a name that
+    /// [`SurfaceError::BadReference`] for a reference that is not `#/$defs/NAME` (and, for a
+    /// reference of its own root, with a NAME of ASCII letters, digits and `_`),
+    /// [`SurfaceError::ReservedName`] for a definition it reaches with a name that
     /// begins with `$`, and [`SurfaceError::RootReference`] for a reference of its own root to a
     /// definition that the roots do not reach.
     pub fn cut(schema: &Value, roots: &[&str]) -> Result<Self, SurfaceError> {

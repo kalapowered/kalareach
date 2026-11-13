@@ -2314,6 +2314,27 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
         (vec![], vec!["push".to_owned()]),
         "the root's properties"
     );
+    // The bundle's entries for other definitions stand beside the document's own: only the entries
+    // that point at the document are counted.
+    let with_another_entry = |schema: &Value| {
+        let mut schema = with_root(
+            schema,
+            "properties",
+            json!({ "configuration_document": document,
+                "another": { "$ref": "#/$defs/Another" } }),
+        );
+        schema["$defs"]["Another"] = json!({ "type": "object" });
+        schema
+    };
+    let (lines, passed) = section_lines(
+        &with_another_entry(&closed(false)),
+        &with_another_entry(&closed(true)),
+    );
+    assert_eq!(
+        (lines, passed),
+        (vec![], vec!["push".to_owned()]),
+        "another bundle entry"
+    );
 }
 
 /// A new section is excused only where every keyword of both schemas, at the place and on the path
@@ -2323,9 +2344,10 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
 /// use that the walk reads. A schema that names no dialect is refused as it is for the other
 /// rules. The keyword stands in both schemas, in the earlier one only and in the new one only, so
 /// that the section is the only difference that can be excused. (A `$ref` of another form in a
-/// definition or in a keyword of the root other than `properties` is refused when the schema is
-/// cut, before this rule reads it; among the root's `properties`, which the cut does not read, the
-/// walk refuses it.)
+/// keyword of the root other than `properties`, and in a definition where no definition has its
+/// text as a literal name, is refused when the schema is cut, before this rule reads it; among the
+/// root's `properties`, which the cut does not read, and in a definition whose literal name the
+/// text is, the walk refuses it.)
 #[test]
 fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
     let schema = |with_push: bool| {
@@ -2452,8 +2474,9 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
 /// The keys of a place that a rule reads have the form that it reads: a `required` that is a text
 /// or holds a non-text, and a `description` or a `title` that is not a text, leave the member as a
 /// line for each of the three rules that read a definition's keys. The comparer reads `required`
-/// only as a list of texts and leaves out an annotation whatever its value, so no other line shows
-/// the change. The form stands in both schemas, in the earlier one only and in the new one only.
+/// only as a list of texts (it drops an entry that is no text and reads a text as no list) and skips
+/// `description` and `title` whatever their value, so the form itself is no line of its own. The
+/// form stands in both schemas, in the earlier one only and in the new one only.
 #[test]
 fn a_place_whose_required_or_annotation_has_another_form_excuses_nothing() {
     type Edit = fn(&mut Value);
