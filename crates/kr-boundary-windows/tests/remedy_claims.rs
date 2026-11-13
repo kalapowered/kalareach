@@ -6,8 +6,8 @@ use std::path::Path;
 
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CASE_SENSITIVE_WHY, EntryKind, Origin, ParentCure, Presence, UNNAMED_ROOT_WHY, choose,
-    data_ending, ending, parent_advice, program_keeping, program_open_advice,
+    CASE_SENSITIVE_WHY, EntryKind, Origin, ParentCure, Presence, choose, data_ending, ending,
+    parent_advice, program_keeping, program_open_advice, unnamed_root_why,
 };
 
 /// Every state that an entry's refusal can be told in.
@@ -193,8 +193,33 @@ fn an_entry_that_could_not_be_opened_is_not_said_to_be_held_by_a_program() {
 #[test]
 fn a_root_that_no_journal_names_is_not_said_to_be_idle() {
     assert_eq!(
-        UNNAMED_ROOT_WHY,
+        unnamed_root_why(&[]),
         "no journal that could be read names it as unfinished work"
+    );
+}
+
+/// A damaged journal is named, with what is wrong with it, and is said to be read only up to the
+/// damage: a root that no journal names in the rows that were read is not said to be named by no
+/// journal that could be read.
+#[test]
+fn a_damaged_journal_is_named_where_a_root_is_said_to_be_named_by_none() {
+    let text = unnamed_root_why(&[("run-7", "record 3 is not a row: bad tag")]);
+    assert!(
+        text.contains(
+            "the journal of the invocation run-7 is damaged (record 3 is not a row: bad tag)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("its rows after the damage were not read"),
+        "{text}"
+    );
+    assert!(text.starts_with("no journal names it as unfinished work in the rows that were read"));
+    assert!(!text.contains("could be read names"), "{text}");
+    let two = unnamed_root_why(&[("a", "x"), ("b", "y")]);
+    assert!(
+        two.contains("the invocation a is damaged (x)")
+            && two.contains("the invocation b is damaged (y)")
     );
 }
 

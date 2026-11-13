@@ -9,7 +9,7 @@
 
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NONE_MAPPED};
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     NERR_Success, NERR_UserNotFound, NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD,
     UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
@@ -46,10 +46,19 @@ fn random_password() -> String {
     )
 }
 
-/// The identifier of a local account, or `None` when there is no such account.
-#[must_use]
-pub fn find(name: &str) -> Option<Sid> {
-    Sid::of_account(name).ok()
+/// The identifier of a local account: `Some` where the lookup found it, `None` where the lookup
+/// answered that no account has that name (the platform's "no mapping" answer).
+///
+/// # Errors
+///
+/// Returns the platform's error when the lookup failed for any other reason: nothing is then
+/// known about the account.
+pub fn find(name: &str) -> Result<Option<Sid>> {
+    match Sid::of_account(name) {
+        Ok(sid) => Ok(Some(sid)),
+        Err(failure) if failure.code == ERROR_NONE_MAPPED => Ok(None),
+        Err(failure) => Err(failure),
+    }
 }
 
 /// Makes a local account: no group, a password nobody keeps that never expires and cannot be

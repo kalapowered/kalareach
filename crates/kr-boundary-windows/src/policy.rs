@@ -146,6 +146,10 @@ pub enum PolicyError {
     // text: policy-1
     #[error("the text of the policy is not one that this program reads: {0}")]
     Unreadable(String),
+    /// An entry of the policy lacks a field, or holds a value that this program does not know.
+    // text: policy-2
+    #[error("the policy holds an entry that this program does not understand: {0}")]
+    Unknown(String),
 }
 
 fn normal_path(path: &str) -> String {
@@ -441,6 +445,24 @@ fn attribute(element: &BytesStart<'_>, name: &str) -> Result<Option<String>, Pol
     Ok(None)
 }
 
+/// A field that the entry must carry: its value, or the refusal that names the entry and the field.
+fn required(element: &BytesStart<'_>, field: &str, entry: &str) -> Result<String, PolicyError> {
+    attribute(element, field)?
+        .ok_or_else(|| PolicyError::Unknown(format!("{entry} has no {field}")))
+}
+
+/// A value that no known form matches: the refusal names the entry, the field and the value.
+fn not_known(entry: &str, field: &str, value: &str) -> PolicyError {
+    let shown = if value.chars().count() > 60 {
+        format!("{}...", value.chars().take(60).collect::<String>())
+    } else {
+        value.to_owned()
+    };
+    PolicyError::Unknown(format!(
+        "{entry} has the {field} \"{shown}\", which this program does not know"
+    ))
+}
+
 fn open(
     element: &BytesStart<'_>,
     seen_root: &mut bool,
@@ -452,11 +474,13 @@ fn open(
     match name.as_str() {
         "AppLockerPolicy" => *seen_root = true,
         "RuleCollection" => {
-            let kind = attribute(element, "Type")?.unwrap_or_default();
-            let mode = match attribute(element, "EnforcementMode")?.as_deref() {
-                Some("Enabled") => Mode::Enabled,
-                Some("AuditOnly") => Mode::AuditOnly,
-                _ => Mode::NotConfigured,
+            let kind = required(element, "Type", "a RuleCollection")?;
+            let entry = format!("the {kind} RuleCollection");
+            let mode = match required(element, "EnforcementMode", &entry)?.as_str() {
+                "Enabled" => Mode::Enabled,
+                "AuditOnly" => Mode::AuditOnly,
+                "NotConfigured" => Mode::NotConfigured,
+                other => return Err(not_known(&entry, "EnforcementMode", other)),
             };
             *collection = Some((
                 kind,
@@ -472,15 +496,16 @@ fn open(
                 "FilePublisherRule" => Kind::Publisher,
                 _ => Kind::Hash,
             };
-            let action = match attribute(element, "Action")?.as_deref() {
-                Some("Deny") => Action::Deny,
-                _ => Action::Allow,
+            let entry = format!("a {name}");
+            let action = match required(element, "Action", &entry)?.as_str() {
+                "Allow" => Action::Allow,
+                "Deny" => Action::Deny,
+                other => return Err(not_known(&entry, "Action", other)),
             };
             *rule = Some(Rule {
-                id: normal_id(&attribute(element, "Id")?.unwrap_or_default()),
+                id: normal_id(&required(element, "Id", &entry)?),
                 kind,
-                sid: attribute(element, "UserOrGroupSid")?
-                    .unwrap_or_default()
+                sid: required(element, "UserOrGroupSid", &entry)?
                     .trim()
                     .to_uppercase(),
                 action,

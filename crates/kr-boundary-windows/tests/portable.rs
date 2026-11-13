@@ -139,6 +139,64 @@ fn an_effective_policy_is_read_whatever_its_layout() {
     assert!(Policy::parse("<AppLockerPolicy><RuleCollection").is_err());
 }
 
+/// A collection or a rule that lacks a field, or holds a value that the program does not know, is
+/// refused as one that the program does not understand, with the field and the value: no default
+/// stands in for what the policy did not say.
+#[test]
+fn a_policy_entry_with_a_missing_or_unknown_field_is_refused_as_not_understood() {
+    let rule = |attributes: &str| {
+        format!(
+            r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="Enabled"><FilePathRule {attributes} Name="n" Description="d"><Conditions><FilePathCondition Path="*"/></Conditions></FilePathRule></RuleCollection></AppLockerPolicy>"#
+        )
+    };
+    let whole =
+        r#"Action="Allow" UserOrGroupSid="S-1-1-0" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}""#;
+    Policy::parse(&rule(whole)).expect("a rule with every field is read");
+    let refused = |xml: String, words: &[&str]| {
+        let error = Policy::parse(&xml).expect_err("an entry the program does not understand");
+        let said = error.to_string();
+        assert!(
+            said.starts_with("the policy holds an entry that this program does not understand: "),
+            "{said}"
+        );
+        for word in words {
+            assert!(said.contains(word), "{said:?} lacks {word:?}");
+        }
+        assert!(!said.contains("not one that this program reads"), "{said}");
+    };
+    refused(
+        r#"<AppLockerPolicy Version="1"><RuleCollection EnforcementMode="Enabled" /></AppLockerPolicy>"#.to_owned(),
+        &["RuleCollection", "no Type"],
+    );
+    refused(
+        r#"<AppLockerPolicy Version="1"><RuleCollection Type="Dll" /></AppLockerPolicy>"#
+            .to_owned(),
+        &["Dll", "no EnforcementMode"],
+    );
+    refused(
+        r#"<AppLockerPolicy Version="1"><RuleCollection Type="Dll" EnforcementMode="Sometimes" /></AppLockerPolicy>"#.to_owned(),
+        &["Dll", "EnforcementMode", "\"Sometimes\"", "does not know"],
+    );
+    refused(
+        rule(r#"UserOrGroupSid="S-1-1-0" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}""#),
+        &["FilePathRule", "no Action"],
+    );
+    refused(
+        rule(
+            r#"Action="Maybe" UserOrGroupSid="S-1-1-0" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}""#,
+        ),
+        &["FilePathRule", "Action", "\"Maybe\"", "does not know"],
+    );
+    refused(
+        rule(r#"Action="Allow" UserOrGroupSid="S-1-1-0""#),
+        &["FilePathRule", "no Id"],
+    );
+    refused(
+        rule(r#"Action="Allow" Id="{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}""#),
+        &["FilePathRule", "no UserOrGroupSid"],
+    );
+}
+
 #[test]
 fn removal_keeps_the_allow_all_rule_beside_an_administrators_rule() {
     // Alone, the installation's rules all go and the collection is not configured again.
