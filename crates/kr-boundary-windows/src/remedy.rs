@@ -1215,6 +1215,19 @@ pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &s
     }
 }
 
+/// The words that end a rollback whose steps ended without a failure but that could not take away
+/// all that the run laid in the data directory's place: each object that stays, with the platform's
+/// words and, for a directory, the entries that it holds. They say what was read and no more, and
+/// give no step: nothing in them tells a person to move, remove or correct anything.
+#[must_use]
+// text: rollback_laid_stays
+pub fn rollback_laid_stays(stayed: &[String]) -> String {
+    format!(
+        "The steps of the rollback ended without a failure, but this run could not take away all that it made: {}.",
+        stayed.join("; ")
+    )
+}
+
 /// Why a private root is refused when no journal names it: what the journals say, and nothing of
 /// what the broker is doing. `damaged` holds the invocations whose journal is damaged, each with
 /// its identifier and what is wrong with it: those journals were read only up to the damage.
