@@ -466,6 +466,20 @@ describe('the boxes the handler reads', () => {
     expect(reads.length, 'boxes read by the click').toBeLessThanOrEqual(bound)
   })
 
+  it('are the pane, the message and each of its links where one message holds 1200 links: the bound is the message’s, not the near links’', () => {
+    const { pane, texts } = conversation(1, 1200)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[0], { clientX: 4, clientY: 28 }))
+    // The pane's box, the message's box, the box of each of its 1200 links (all of them lie in the message that is near the
+    // press), and the words of the 4 links within the radius of 62.2 px of the press: 1206 reads for a press and for a click.
+    expect(reads.length, 'boxes read by the press').toBe(1 + 1 + 1200 + 4)
+    fire('pointerup', pointer(texts[0], { clientX: 4, clientY: 28, timeStamp: 120 }))
+    reads = []
+    fire('click', click(texts[0], { clientX: 4, clientY: 28 }))
+    expect(reads.length, 'boxes read by the click').toBe(1 + 1 + 1200 + 4)
+  })
+
   it('are none where the conversation holds messages and no link', () => {
     const pane = document.createElement('div')
     for (let m = 0; m < 30; m += 1) {
