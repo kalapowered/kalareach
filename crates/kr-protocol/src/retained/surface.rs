@@ -29,7 +29,8 @@ const IGNORED: [&str; 2] = ["description", "title"];
 /// Why a surface could not be made.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SurfaceError {
-    /// A root names no definition.
+    /// A root, or a reference inside a member of the schema's own root, names no definition of the
+    /// schema.
     #[error("the schema has no definition named {0}")]
     UnknownRoot(String),
     /// A reference does not name a definition of the schema; one of the schema's own root, or inside
@@ -69,10 +70,12 @@ const ROOT_PLACE: &str = "$root";
 /// inline). The cut does not follow an entry's reference: the definitions it holds are the ones
 /// the roots reach, so an entry that is a reference is compared by its own text, and an inline
 /// entry is compared as any schema is, where a reference inside it is followed to a definition that
-/// the surface holds and passed over otherwise. So that none can point where the comparison does
-/// not look, every reference inside a member is `#/$defs/NAME` with a plain NAME of a definition
-/// of the schema, though not necessarily one that the surface holds. A surface that is read from a
-/// recorded document holds no root (the document records none), and compares none.
+/// the surface holds and passed over otherwise. Every reference inside a member is therefore
+/// `#/$defs/NAME` with a plain NAME of a definition of the schema, though not necessarily one that
+/// the surface holds: a comparison of two surfaces that hold every definition reads each one, and
+/// a pointer into a definition or a name that the schema lacks would be passed over by any. A
+/// surface that is read from a recorded document holds no root (the document records none), and
+/// compares none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
     roots: Vec<String>,

@@ -2506,7 +2506,7 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         .is_err()
     );
     type Edit = fn(&mut Value);
-    let rows: [(&str, Edit); 11] = [
+    let rows: [(&str, Edit); 12] = [
         ("an unmodelled keyword at the root", |schema| {
             schema["x-unmodelled"] = json!(true);
         }),
@@ -2551,6 +2551,10 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         ("a second bundle entry for the document", |schema| {
             schema["properties"] = json!({ "a": { "$ref": "#/$defs/ConfigurationDocument" },
                 "b": { "$ref": "#/$defs/ConfigurationDocument" } });
+        }),
+        // The cut reads a `$ref` only where it is a text, so the walk is the one guard here.
+        ("a bundle entry whose reference is not a text", |schema| {
+            schema["properties"] = json!({ "c": { "$ref": 5 } });
         }),
         ("a dynamic reference with an address", |schema| {
             schema["$defs"]["Holder"] = json!({ "type": "object", "properties": {

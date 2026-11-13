@@ -266,7 +266,8 @@ that is a reference is compared by its text and is not followed, so a definition
 with its member following it is a difference at the member although the definition itself is the
 same. An inline member (`identifiers` in the protocol schema, `vocabulary` in the SDK schema) is
 compared as any other schema is: a change to its own keywords or members is a difference at the
-member, and a reference inside it follows its definition. Every reference inside a member has to be
+member, and a reference inside it is followed to its definition, where a change is a line at the
+definition and not at the member. Every reference inside a member has to be
 `#/$defs/NAME` with a NAME of letters, digits and underscores that the schema defines, and a schema
 with another one is refused. A member that only the commit has is not a difference. A recorded
 surface of a retained level holds no root, so this comparison does not reach it.
@@ -347,8 +348,9 @@ a narrower object only narrows the place (a property, an item, an additional or 
 new member can widen it. The report reads both schemas whole for this, as the check of a level does
 (see [A level is one surface](#a-level-is-one-surface)): the dialect, the form of every `$ref` and
 the keywords that the check knows have to be as stated there, and the object's `required` is a list
-of distinct texts. Every other difference is reported: a member or a
-variant added to a closed object, a member, a variant or a definition removed, and any change.
+of distinct texts, and its `description` and `title` are texts. Every other difference is reported:
+a member or a variant added to a closed object, a member, a variant or a definition removed, and
+any change.
 `SessionSummary.root` is one: an earlier strict reader cannot read the summary of a command session.
 No client was released, so no shim carries it. A new section of the configuration document is one
 too, though the check of a level passes it ([A level is one surface](#a-level-is-one-surface)):
