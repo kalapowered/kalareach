@@ -16,7 +16,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
@@ -145,7 +145,8 @@ pub fn target_directory(root: &Path, environment: &[(String, String)]) -> PathBu
 }
 
 /// The files under `target` that a log says could not be started: a line that gives a file's path
-/// twice and then the shell's words, in a log that also holds exit status 126.
+/// twice and then the shell's words, in a log that also holds exit status 126. A path that steps
+/// up with `..` is not under `target` whatever it starts with, and is not named.
 #[must_use]
 pub fn named_files(log: &str, target: &Path) -> Vec<PathBuf> {
     if !log.contains("exit status: 126") && !log.contains("(exit 126)") {
@@ -163,6 +164,9 @@ pub fn named_files(log: &str, target: &Path) -> Vec<PathBuf> {
         if first == second
             && path.is_absolute()
             && path.starts_with(target)
+            && !path
+                .components()
+                .any(|component| component == Component::ParentDir)
             && !files.iter().any(|file| file == path)
         {
             files.push(path.to_path_buf());
@@ -839,6 +843,14 @@ mod tests {
         assert!(named_files(&log, Path::new("/elsewhere/target")).is_empty());
         let without_the_exit = log.replace("(exit status: 126)", "(exit status: 1)");
         assert!(named_files(&without_the_exit, target).is_empty());
+        let stepping_out = format!(
+            "{log}  /Users/runner/work/kalareach/kalareach/target/../src/lib.rs: /Users/runner/work/kalareach/kalareach/target/../src/lib.rs: cannot execute binary file\n"
+        );
+        assert_eq!(
+            named_files(&stepping_out, target),
+            vec![PathBuf::from(REFUSED.split_once(": ").unwrap().0)],
+            "a path that steps up out of the target directory is not named"
+        );
     }
 
     /// A Mach-O header of one segment of `segment_end` bytes, in a file of `length` bytes.
