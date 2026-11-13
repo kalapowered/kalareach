@@ -24,7 +24,7 @@ use crate::given::local_door::{Standing, told};
 use crate::given::{Given, Settled};
 
 /// The not-shown refusal.
-fn not_shown(frame: &ControlFrame) {
+pub(super) fn not_shown(frame: &ControlFrame) {
     let error = refusal(frame).unwrap_or_else(|| panic!("a refusal was told: {frame:?}"));
     assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
     assert_eq!(
@@ -173,6 +173,84 @@ async fn a_result_is_not_shown_while_a_fence_is_owed_after_the_route_answers() {
     .await;
     refused_for_a_fence(refusal(&owed).expect("a refusal"));
     controller.hold_fence(false);
+}
+
+/// KR-REQ-09.09, 09.12: the four modules' first admissions are told as the end of a write is:
+/// whatever answer a module gives, a result is not shown once the connection is withdrawn or a fence
+/// is owed, and a refusal that says nothing was done is the check's own; a registration restamped
+/// by a withdrawal that did not take this one changes nothing for either. Each leg runs on a daemon
+/// of its own, so that every request is a first attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_four_modules_first_admissions_are_told_under_the_authority_they_end_with() {
+    use super::a_recorded_answer_another_copy_wrote::{
+        a_workflow_install, cancellation, materialisation, setting_quiet_hours,
+    };
+
+    type Route = fn(&kr_ipc::testing::TempHost, &Controller) -> MutationRequest;
+    let routes: [(&str, Route); 4] = [
+        ("automation", |temp, controller| {
+            a_workflow_install(temp, controller)
+        }),
+        ("attention", |temp, _| setting_quiet_hours(temp)),
+        ("change set", |temp, _| materialisation(temp)),
+        ("project", |temp, _| cancellation(temp)),
+    ];
+    let mut results = 0;
+    for (name, route) in routes {
+        let leg = |meanwhile: fn(&Controller, ConnectionId)| async move {
+            let (temp, controller, _clock) = daemon().await;
+            let mutation = route(&temp, &controller);
+            let method = mutation.method.method().expect("a method");
+            let controller_for_the_leg = Arc::clone(&controller);
+            told_after_the_route_answers(&controller, (method, mutation), move |connection_id| {
+                meanwhile(&controller_for_the_leg, connection_id);
+            })
+            .await
+        };
+        let control = leg(|_, _| {}).await;
+        let withdrawn = leg(|controller, connection_id| controller.deregister(connection_id)).await;
+        let fenced = leg(|controller, _| controller.hold_fence(true)).await;
+        let restamped = leg(|controller, _| {
+            controller
+                .admitted_write()
+                .values_mut()
+                .for_each(|connection| {
+                    connection.admitted_revision = kr_protocol::ids::AuthorityRevision::new(
+                        connection.admitted_revision.get() + 1,
+                    );
+                });
+        })
+        .await;
+        // A result, and a word that does not say the action was not done, may be of an effect that
+        // ran: the door does not show it once the authority it ends with has gone.
+        if refusal(&control).is_none_or(|error| !crate::given::is_definite(error)) {
+            results += usize::from(refusal(&control).is_none());
+            not_shown(&withdrawn);
+            not_shown(&fenced);
+            assert_eq!(
+                refusal(&restamped).map(|error| error.code),
+                refusal(&control).map(|error| error.code),
+                "{name}: the answer is told across a restamp: {restamped:?}"
+            );
+        } else {
+            let said = refusal(&control).expect("a refusal").code;
+            assert_eq!(
+                refusal(&withdrawn).expect("a refusal").code,
+                ErrorCode::PermissionDenied,
+                "{name}: a refusal that says nothing was done is the authority's: {withdrawn:?}"
+            );
+            refused_for_a_fence(refusal(&fenced).expect("a refusal"));
+            assert_eq!(
+                refusal(&restamped).expect("a refusal").code,
+                said,
+                "{name}: the refusal is told across a restamp: {restamped:?}"
+            );
+        }
+    }
+    assert!(
+        results >= 2,
+        "two of the four answer with a result: {results}"
+    );
 }
 
 /// What the door tells of `settled` for `connection_id`, admitted under `admitted`.

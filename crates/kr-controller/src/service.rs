@@ -690,6 +690,12 @@ pub struct Controller {
     /// no other. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     replies_written: std::sync::Mutex<Vec<(kr_protocol::ids::RequestId, ControlFrame)>>,
+    /// Each reply `told` or `declined` made, with the request it answers and whether it was told,
+    /// noted where it is made and not where it is written: what a test compares with the replies
+    /// the sink consumed, so that a reply the sink writes is the one that was made. Compiled away
+    /// in every shipped build.
+    #[cfg(feature = "testing")]
+    replies_made: std::sync::Mutex<Vec<(kr_protocol::ids::RequestId, bool, ControlFrame)>>,
     /// Where this host's own tests stop a copy of an action at the local door that its window
     /// refuses, once it has looked for the claim of the action and found none while another arrival
     /// may carry the action out, so that the other arrival can end in between. Compiled away in
@@ -1560,6 +1566,11 @@ mod every_mutation_reply_is_the_reply_that_was_checked;
 /// What the local door tells of a write whose own effect has run, once the route has answered.
 #[cfg(test)]
 mod the_end_of_a_write_is_told_under_its_authority;
+
+/// What the local door tells of a copy when a barrier restamps the registration after the
+/// route's own check.
+#[cfg(test)]
+mod a_copy_meets_a_restamp;
 
 /// A local connection whose peer stops reading.
 #[cfg(test)]

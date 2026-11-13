@@ -107,6 +107,8 @@ pub(super) struct Scripted {
     receipts_unreadable: AtomicBool,
     /// Whether its answer to `action.read` carries a member no level's surface admits.
     answers_in_no_known_form: AtomicBool,
+    /// The code with which it refuses an action it performs none of and holds no receipt for.
+    refusal_code: std::sync::Mutex<ErrorCode>,
 }
 
 /// The actor and the action a scripted worker keeps a prompt's receipt under.
@@ -155,6 +157,7 @@ impl Scripted {
             prompt_receipts: std::sync::Mutex::new(BTreeMap::new()),
             receipts_unreadable: AtomicBool::new(false),
             answers_in_no_known_form: AtomicBool::new(false),
+            refusal_code: std::sync::Mutex::new(ErrorCode::ResourceUnavailable),
         })
     }
 
@@ -213,6 +216,16 @@ impl Scripted {
             .installed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Has this worker refuse the actions it performs none of, and holds no receipt for, with
+    /// `code`: a definite refusal such as `INVALID_ARGUMENT` says the action was not performed,
+    /// which the default `RESOURCE_UNAVAILABLE` does not.
+    pub(super) fn refuses_with(&self, code: ErrorCode) {
+        *self
+            .refusal_code
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = code;
     }
 
     /// Has this worker accept the prompt submissions it is forwarded, or stop accepting them.
@@ -852,7 +865,10 @@ fn serve_scripted(
                                     None => ControlFrame::Response(Response {
                                         request_id,
                                         outcome: Outcome::Error(ProtocolError::new(
-                                            ErrorCode::ResourceUnavailable,
+                                            *script
+                                                .refusal_code
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner),
                                             "this worker performs no action but a close",
                                         )),
                                     }),
