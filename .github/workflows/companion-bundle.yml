@@ -1,0 +1,228 @@
+name: companion-bundle
+
+# Builds the companion's desktop bundle on Windows the way a person builds it (`pnpm desktop build`),
+# and reads what that makes: the link of the application and both installers.
+#
+# The application links the dynamic Visual C++ runtime. The workspace's linker options leave the
+# static one out of every MSVC link, since the C library it vendors asks for it, and the Tauri command
+# line asks for it again unless the environment says otherwise. The build step below starts with
+# `STATIC_VCRUNTIME=true` in its environment, which is what the command line would have set, so a
+# build that passes shows that the entry replaces it. Two reads then say that one C runtime is in the
+# link: the build's log has no `LNK4098` (the linker's report of objects that ask for two runtimes),
+# and the executable imports the dynamic runtime's libraries and no other runtime's. Each installer is
+# then opened: the NSIS installer is run silently into a directory of the runner's own and removed
+# again, and the MSI is extracted with an administrative install, which registers nothing. In both,
+# the files are listed and the installed executable's imports are read again. The application is never
+# started.
+#
+# Nothing is uploaded and no cache is saved. A tool that a read needs and the runner lacks fails the
+# job; no read is skipped.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - apps/companion/src-tauri/**
+      - apps/companion/scripts/desktop.mjs
+      - .github/workflows/companion-bundle.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: companion-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here reads debug information, and the build is one a cache does not hold.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows-bundle:
+    name: windows bundle
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # libsodium's prebuilt archives, placed from the cache or once from its host, so that the build
+      # downloads nothing from there.
+      - name: Place libsodium's archives
+        uses: ./.github/actions/libsodium-archive
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          package-manager-cache: false
+
+      # The tool both reads need, found before the long build so that a runner without it stops the
+      # job at once. It is Microsoft's, from the Visual C++ tools on the runner.
+      - name: Find dumpbin
+        shell: bash
+        run: |
+          vswhere="C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+          install=$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')
+          dumpbin=$(find "$(cygpath -u "$install")/VC/Tools/MSVC" -path '*/bin/Hostx64/x64/dumpbin.exe' | sort -V | tail -1)
+          if [ -z "$dumpbin" ] || [ ! -f "$dumpbin" ]; then
+            echo "::error::dumpbin is not on this runner, so the link cannot be read."
+            exit 1
+          fi
+          echo "dumpbin: $dumpbin"
+          echo "DUMPBIN=$(cygpath -w "$dumpbin")" >> "$GITHUB_ENV"
+
+      - name: Install the packages
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The bundle build, as a person starts it, with the variable that the Tauri command line would
+      # have set. The log is kept for the next step to read.
+      - name: Build the bundle
+        shell: bash
+        env:
+          STATIC_VCRUNTIME: "true"
+        run: |
+          log="$(cygpath -u "$RUNNER_TEMP")/bundle-build.log"
+          pnpm -C apps/companion desktop build 2>&1 | tee "$log"
+
+      - name: Read the link
+        shell: bash
+        run: |
+          log="$(cygpath -u "$RUNNER_TEMP")/bundle-build.log"
+          exe=target/release/kalareach-companion.exe
+          if [ ! -s "$log" ]; then
+            echo "::error::The log of the bundle build is not there, so its link cannot be read."
+            exit 1
+          fi
+          if [ ! -f "$exe" ]; then
+            echo "::error::The build made no $exe."
+            exit 1
+          fi
+
+          # The entry replaced the variable that this step's environment gave the build.
+          if ! grep -F 'STATIC_VCRUNTIME was `true` in the environment' "$log"; then
+            echo "::error::The entry did not say that it replaced STATIC_VCRUNTIME=true."
+            exit 1
+          fi
+
+          # Read one: the linker did not report objects that ask for two C runtimes.
+          found=0
+          grep -n 'LNK4098' "$log" || found=$?
+          if [ "$found" -eq 0 ]; then
+            echo '::error::The link reported LNK4098: objects asking for two different C runtimes.'
+            exit 1
+          fi
+          if [ "$found" -ne 1 ]; then
+            echo '::error::The bundle build log could not be searched for LNK4098.'
+            exit 1
+          fi
+          echo 'No link reported LNK4098.'
+
+          # Read two: the libraries the executable imports. The dynamic runtime is there, and no other
+          # runtime is: not an older one, not a debug one.
+          "$(cygpath -u "$DUMPBIN")" -nologo -dependents "$exe" | tr -d '\r' | tee dependents.txt
+          libraries=$(sed -n 's/^ *\([A-Za-z0-9_.+-]*\.dll\) *$/\1/p' dependents.txt | tr 'A-Z' 'a-z' | sort -u)
+          if [ -z "$libraries" ]; then
+            echo "::error::dumpbin listed no libraries for $exe."
+            exit 1
+          fi
+          echo "$libraries" | grep -q '^vcruntime140\.dll$' || { echo '::error::The executable does not import vcruntime140.dll.'; exit 1; }
+          echo "$libraries" | grep -q '^api-ms-win-crt-' || { echo '::error::The executable imports no library of the universal C runtime.'; exit 1; }
+          other=$(echo "$libraries" | grep -E '^(msvcrt\.dll|msvcr[0-9]+d?\.dll|ucrtbased\.dll|vcruntime[0-9_]+d\.dll|msvcp[0-9_]+d\.dll)$' || true)
+          if [ -n "$other" ]; then
+            echo "::error::The executable imports another C runtime as well: $other"
+            exit 1
+          fi
+          echo 'The executable imports the dynamic C runtime and no other.'
+
+      # The installer run silently into a directory of the runner's own, and then removed. The
+      # installed executable must import what the built one does.
+      - name: Open the NSIS installer
+        shell: pwsh
+        run: |
+          function Get-Imports([string]$path) {
+            $out = & $env:DUMPBIN -nologo -dependents $path
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin could not read $path" }
+            $out | ForEach-Object { $_.Trim().ToLowerInvariant() } |
+              Where-Object { $_ -match '^[a-z0-9_.+-]+\.dll$' } | Sort-Object -Unique
+          }
+          $built = Get-Imports 'target/release/kalareach-companion.exe'
+          $setups = @(Get-ChildItem 'target/release/bundle/nsis' -Filter '*-setup.exe')
+          if ($setups.Count -ne 1) { throw "expected one NSIS installer, found $($setups.Count)" }
+          Write-Host "installer: $($setups[0].Name), $($setups[0].Length) bytes"
+
+          $dir = Join-Path $env:RUNNER_TEMP 'nsis-install'
+          $run = Start-Process -FilePath $setups[0].FullName -ArgumentList '/S', "/D=$dir" -Wait -PassThru
+          if ($run.ExitCode -ne 0) { throw "the installer ended with $($run.ExitCode)" }
+
+          Get-ChildItem $dir -Recurse -File | ForEach-Object { '{0,12} {1}' -f $_.Length, $_.FullName.Substring($dir.Length + 1) }
+          $installed = @(Get-ChildItem $dir -Recurse -Filter 'kalareach-companion.exe')
+          if ($installed.Count -ne 1) { throw "expected one installed executable, found $($installed.Count)" }
+          $after = Get-Imports $installed[0].FullName
+          if (Compare-Object $built $after) { throw "the installed executable imports other libraries than the built one" }
+          foreach ($name in $after) {
+            $where =
+              if (Test-Path (Join-Path $installed[0].DirectoryName $name)) { 'beside the executable' }
+              elseif ($name -match '^(api|ext)-ms-win-') { 'a Windows API set' }
+              elseif ($name -match '^(vcruntime|msvcp|concrt|vcomp)') { 'the Visual C++ runtime, from the runner' }
+              elseif (Test-Path (Join-Path $env:SystemRoot "System32\$name")) { 'a Windows system library' }
+              else { 'NOT FOUND' }
+            '{0,-40} {1}' -f $name, $where
+          }
+
+          $uninstall = Join-Path $dir 'uninstall.exe'
+          if (-not (Test-Path $uninstall)) { throw 'the installation has no uninstaller' }
+          $run = Start-Process -FilePath $uninstall -ArgumentList '/S', "_?=$dir" -Wait -PassThru
+          if ($run.ExitCode -ne 0) { throw "the uninstaller ended with $($run.ExitCode)" }
+          if (Test-Path $installed[0].FullName) { throw 'the uninstaller left the executable' }
+          Remove-Item $dir -Recurse -Force
+
+      # An administrative install extracts the files and registers nothing.
+      - name: Open the MSI
+        shell: pwsh
+        run: |
+          function Get-Imports([string]$path) {
+            $out = & $env:DUMPBIN -nologo -dependents $path
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin could not read $path" }
+            $out | ForEach-Object { $_.Trim().ToLowerInvariant() } |
+              Where-Object { $_ -match '^[a-z0-9_.+-]+\.dll$' } | Sort-Object -Unique
+          }
+          $built = Get-Imports 'target/release/kalareach-companion.exe'
+          $packages = @(Get-ChildItem 'target/release/bundle/msi' -Filter '*.msi')
+          if ($packages.Count -ne 1) { throw "expected one MSI, found $($packages.Count)" }
+          Write-Host "package: $($packages[0].Name), $($packages[0].Length) bytes"
+
+          $dir = Join-Path $env:RUNNER_TEMP 'msi-extract'
+          $run = Start-Process -FilePath 'msiexec.exe' -ArgumentList '/a', "`"$($packages[0].FullName)`"", '/qn', "TARGETDIR=`"$dir`"" -Wait -PassThru
+          if ($run.ExitCode -ne 0) { throw "msiexec ended with $($run.ExitCode)" }
+
+          Get-ChildItem $dir -Recurse -File | ForEach-Object { '{0,12} {1}' -f $_.Length, $_.FullName.Substring($dir.Length + 1) }
+          $extracted = @(Get-ChildItem $dir -Recurse -Filter 'kalareach-companion.exe')
+          if ($extracted.Count -ne 1) { throw "expected one extracted executable, found $($extracted.Count)" }
+          $after = Get-Imports $extracted[0].FullName
+          if (Compare-Object $built $after) { throw "the extracted executable imports other libraries than the built one" }
+          foreach ($name in $after) {
+            $where =
+              if (Test-Path (Join-Path $extracted[0].DirectoryName $name)) { 'beside the executable' }
+              elseif ($name -match '^(api|ext)-ms-win-') { 'a Windows API set' }
+              elseif ($name -match '^(vcruntime|msvcp|concrt|vcomp)') { 'the Visual C++ runtime, from the runner' }
+              elseif (Test-Path (Join-Path $env:SystemRoot "System32\$name")) { 'a Windows system library' }
+              else { 'NOT FOUND' }
+            '{0,-40} {1}' -f $name, $where
+          }
+          Remove-Item $dir -Recurse -Force
