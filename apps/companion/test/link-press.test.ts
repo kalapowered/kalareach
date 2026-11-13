@@ -805,6 +805,22 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     expect(isLit(links[0]), 'the look for a tap under the inner box').toBe(false)
   })
 
+  it('shows no link beyond an inner box’s right edge or above its top edge, where the pane’s own edges lie farther out', () => {
+    for (const [name, words, tap] of [
+      ['right of the box', { left: 360, top: 120, right: 380, bottom: 137 }, { clientX: 346, clientY: 128 }],
+      ['above the box', { left: 100, top: 70, right: 140, bottom: 87 }, { clientX: 120, clientY: 96 }]
+    ] as const) {
+      const { pane, text, links } = between(words)
+      clip(text, { left: 40, top: 100, right: 350, bottom: 160 }, 'hidden')
+      start(pane)
+      clock(100)
+      fire('pointerdown', pointer(text, tap))
+      expect(isLit(links[0]), `the look for a tap beside a link ${name}`).toBe(false)
+      fire('pointerup', pointer(text, { ...tap, timeStamp: 120 }))
+      document.body.replaceChildren()
+    }
+  })
+
   it('shows no link that the visual viewport of a zoomed page has left off the screen', () => {
     // Zoomed 2x: the visual viewport shows x 195 to 390 and y 0 to 422 of the layout; the words end at x 191.
     const { pane, text, links } = between({ left: 183, top: 100, right: 191, bottom: 117 })
