@@ -175,12 +175,12 @@ fn said(kind: EntryKind, origin: &Origin, manifest: &Presence) -> (Remedy, Strin
     (remedy, text)
 }
 
-/// "The manifest stays where it is" is said only where the lookup found a manifest; the journal and
+/// That the entry at the manifest's name stays is said only where the lookup found one; the journal and
 /// what an entry holds are never claimed, and "the next run makes it new" only of what the
 /// installation makes.
 #[test]
 fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
-    const STAYS: &str = "the manifest stays where it is";
+    const STAYS: &str = "the entry at the manifest's name stays where it is";
     // A removal with the manifest there says that it stays, whichever entry is removed.
     for kind in [EntryKind::Other, EntryKind::UnnamedRoot] {
         let (remedy, text) = said(kind, &Origin::System, &Presence::Present);
@@ -232,10 +232,24 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
         &Origin::Refused("Windows error 5".to_owned()),
         &Presence::Present,
     );
+    // An open that failed with error 5 names the error and gives a list that refuses the
+    // Administrators group as one cause, beside a delete that is pending: it does not say that the
+    // installation did not make the entry.
+    assert!(refused.contains("(Windows error 5)"), "{refused}");
     assert!(
-        refused.contains("refuses the Administrators group"),
+        refused
+            .contains("A permission list that refuses the Administrators group gives that error"),
         "{refused}"
     );
+    assert!(
+        refused.contains("an entry with a delete pending gives it too"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("so the installation did not make it"),
+        "{refused}"
+    );
+    assert!(!refused.contains("The permission list of"), "{refused}");
     let (_, read) = said(EntryKind::JournalFile, &unknown(), &Presence::Present);
     assert!(read.contains("Nothing shows who made"), "{read}");
     let (_, held_text) = said(EntryKind::JournalFile, &held(), &Presence::Present);

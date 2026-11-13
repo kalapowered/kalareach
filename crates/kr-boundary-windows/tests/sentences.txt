@@ -1,0 +1,213 @@
+# The sentences of the crate's refusals, failures and lines of progress that state a fact about the machine, and the read behind each.
+# One row per sentence: <identifier> | <sentence, shortened> | <the read behind it (the function and what it returned), or the rule or flow it rests on>.
+# The identifier stands in the source as `// text: <identifier>` on the line before the place that makes the text (tests/sentences.rs
+# reads both). A place whose text states no fact about the machine has one row that says "rule" or "flow". Writing the read of a
+# row is the reviewer's work: the case that reads this file checks that every place has a row and every row a place, not that the
+# read is really behind its sentence.
+
+# ---- records.rs
+not_there_at_the_inspection | X was not there when the removal looked for it, and something is there now, so it was not removed | read: the inspection found the name absent, and entry_exists (symlink_metadata) found something at it now
+remove | removing X failed (error): the call fails for an entry still in the directory and for a program that holds it open | read: the removal call's error; the causes are said as possibilities
+remove | its listing failed, so a replacement of the manifest cannot be ruled out | read: list_names returned an error
+remove_with | removing X failed (error) | read: the removal call's error for that entry
+remove_with | its listing failed, so a replacement of the manifest cannot be ruled out | read: list_names returned an error
+remove_empty | the directory's removal failed (error) | read: remove_dir's error
+finish_journal_and_run | removing X failed (error) | read: the removal call's error for the journal file or the empty directory
+unread_prior | The earlier-state record was not read, so the Application Identity service's start value and running state were not put back | read: entry_exists found the record's entry and the inspection did not approve it for reading
+next_step | Something is at the manifest's name, and it stays with them | read: paths.manifest.exists() (follows a link) returned true
+next_step | If a program holds one of them open, close it | condition: a failed removal call can mean a holder
+next_step | The directory is empty, and a new installation accepts an empty data directory | read: data_is_empty (a listing with no entry); rule of entry
+next_step | A new installation refuses until they are gone, and nothing has checked them | rule of entry; flow: the removal has not opened them
+
+# ---- remedy.rs
+ending | Remove X, and nothing else, then run the setup program again | rule: an entry of the data directory that the installation makes
+ending | the entry at the manifest's name stays where it is | read: presence_of(manifest) is symlink_metadata Ok: something is at the name
+ending | The open of X failed (error); a permission list that refuses the Administrators group is one cause, a delete that is pending is another | read: the open returned access denied (origin_of_open_error, error 5) with the error printed; rule: no list of the installation's refuses the administrator
+ending | Nothing shows who made X, because it could not be read (error) | read: the open or the owner read failed, error printed
+ending | The handle of X shows that the installation did not make it | read: the handle (reparse tag, link count, kind: origin_of_opened; owner: sd::summary_of_handle)
+ending | Do not correct ... move it aside ... run the setup program again | rule: instruction for an entry of the installation's own data directory
+ending | The directory then holds no manifest, and nothing records what else is in it | effect of the instruction; rule of inspect_data_directory
+ending | The next run finds the entry absent and makes it new, or does not make it again | effect of the instruction; rule: the installation makes these entries or does not
+ending | because a program holds it open and it could not be read | read: the open returned a sharing or lock violation (32, 33: origin_of_open_error)
+ending | Correct what the reason names, then run the setup program again | rule: what to correct in the installation's own entry
+ending | Do not remove X: by its name it is one of the installation's own entries, which may hold records of what is installed | rule: the layout's names (kind_of); may
+parent_advice | Nothing shows who made this folder, because it could not be opened to be checked | read: the open failed with an error other than a sharing violation, error in the reason
+parent_advice | Move the folder aside, the installation makes the folder new | instruction; rule
+parent_advice | Close the program that holds it open: a change of its owner or its list does not close a handle | read: the open returned ERROR_SHARING_VIOLATION
+parent_advice | The installation did not make this folder, and it can hold files that another account wrote | read: attributes (reparse, not a directory: GetFileInformationByHandleEx) or check_owner; can hold is a condition
+parent_advice | Whether it holds the data directory could not be read (error), so removal is not offered | read: presence_of returned an error other than not found
+parent_advice | Correct it instead: give it to the Administrators group or the system | rule: what to correct in the installation's own folder
+parent_advice | something is at the data directory's name in it, and that can hold the manifest, the journals and the private roots | read: symlink_metadata(data) Ok, nothing of its kind or contents
+parent_advice | It holds no data directory of the boundary | read: symlink_metadata(data) answered not found
+parent_advice | If nothing else needs what is in it, remove or rename the folder | conditional correction of the installation's own folder
+rights_in_words | the rights of an identity, in words | read: the access mask of the entry in the list of the handle
+identity_text | the name and the identifier of an identity | read: the entry's identifier and the account lookup of it
+rights_finding | X is allowed the right to ... (rights 0x...) | read: the list of the handle (acl::replaceable_by_others_on, changeable_by_others_on)
+REMOTE_VOLUME | the volume is on another computer, and only local volumes are supported | read: the volume's device characteristics say remote (walk::check_volume), or the final path of a known folder is a network path
+hello_failure | the failure of the greeting, and other elevated sessions may hold the administrators' pipe | read: the greeting's frame error; may
+busy_pipe | the broker's pipe stayed busy: no instance of it was listening for N seconds | read: the deadline ended the wait for an instance of the pipe
+supported_layout | This layout is not supported: the setup program installs the tree only in the known folder and only where the path that the system gives is its own final path | rule of the installation
+ancestor_refusal | X is a folder above the boundary's data or program directory | rule: Paths::system places the tree below that folder
+ancestor_refusal | a drive letter that is not the root of its volume: it leads to Y | read: final_path_of of the opened root against is_the_volumes_own_root
+ancestor_refusal | It is on a volume that the installation does not use (reason) | read: walk::check_volume (the volume's information)
+ancestor_refusal | It is refused because it is a link or a mounted folder | read: attributes_of shows a reparse point
+ancestor_refusal | It is refused because it is not a folder | read: attributes_of has no directory bit
+ancestor_refusal | the folder's list gives to others the right to swap a folder below it for a link, or to replace that program | read: the list of the handle; rule that names the risk
+ancestor_refusal | It is refused because it could not be opened or read to be checked (error) | read: the call failed, error printed
+ancestor_refusal | the path that the system gives for it is not the final path of the folder that it opens: that folder's own path is Y | read: SHGetKnownFolderPath and GetFinalPathNameByHandleW of the opened folder
+ancestor_refusal | it is the root of a volume | read: the final path of the opened known folder has nothing after the volume's name
+ancestor_refusal | it overlaps Y, the system's other known folder | read: the two final paths
+ancestor_refusal | its volume could not be asked what it is (error) | read: the volume query failed
+ancestor_refusal | the root of its volume is not there (error) | read: the open of the root answered not found
+ancestor_refusal | The setup program makes this folder itself, as a plain folder; it does not follow or change a link | rule: the folder is strictly below a known folder
+ancestor_refusal | If a program holds it open, close that program | condition
+ancestor_refusal | Nothing was changed, or what this run had already changed | flow: the shape check and the walks run before any change (Stage)
+CASE_SENSITIVE_WHY | it separates names that differ only by case, and the installation compares names without regard to case | read: the directory's case-sensitivity flag is set; rule of the installation
+data_ending | The handle of this directory shows that the installation did not make it, and it can hold files that another account wrote | read: the handle (origin_of)
+data_ending | Nothing shows that the installation made this directory, because its own list refuses the check or it could not be read | read: the open error (access denied or other)
+data_ending | Nothing shows who made this directory, because it could not be read; close the program that holds it open | read: sharing violation
+data_ending | Make the Administrators group its owner; turn the flag off; nothing in it is removed | rule: what to correct in the installation's own directory
+UNNAMED_ROOT_WHY | no journal names it as unfinished work | read: roots_named_by_the_journal does not hold the name
+program_keeping | Do not remove it: the manifest records the installation and stays where it is | read: a manifest was read (recorded)
+program_keeping | Do not remove the program directory | instruction
+program_open_advice | If a program holds X open, close that program; if its list refuses the check, correct who may open it; if it is a link, remove the link itself | conditions; rule
+program_removal_advice | Remove the link X itself: it is not something that the installation makes there | read: opened.kind (reparse), link count, kind or name; rule
+program_removal_advice | A repair makes the program files again | read: a manifest was read (recorded); rule
+shape_refusal | the refusal of a known folder that could not be opened, that leads elsewhere, that is on a share, that is a volume root or that overlaps the other | read: opened_final_path of both known folders, compared by is_the_place_asked_for, is_a_volume_root and is_at_or_below
+shape_refusal | Nothing was changed, or what this run had already changed | flow: the shape check runs first (Stage)
+known_folder_unreadable | The system's folder could not be read: status. Nothing was changed | read: SHGetKnownFolderPath returned the status
+known_folder_unreadable | If the boundary is installed, the broker's service, its two accounts and its rules in the policy stay | read: the removal could not read the known folder, so it removed nothing
+broker_not_stopped | The broker's service did not reach the stopped state | read: stop_broker returned Ok(false): the last read at the bound did not say stopped
+broker_not_stopped | What it had already changed stays, and a repair has no rollback | rule of a repair; flow: the run stopped before the program directory
+broker_stop_refused | The broker's service refused the request to stop it (error), and a read of its state after that showed it neither stopped nor changing state | read: the stop request's error, then service.status() showed a state that accepts a request
+broker_stop_refused | What it had already changed stays, and a repair has no rollback | rule of a repair; flow: the run stopped before the program directory
+git_program_not_reached | Git's program X is not where the policy expects it | read: fs::read failed with the kind not found
+git_program_not_reached | Git's program X could not be read (error) | read: fs::read failed with any other error, printed
+payload_file_not_reached | X is not in the payload directory | read: symlink_metadata failed with the kind not found
+payload_file_not_reached | X could not be read (error) | read: symlink_metadata failed with any other error, printed
+application_control_set | The effective application control policy is not empty: it enforces C and it holds rules in D | read: the effective policy's collections, by mode (Enabled) and by rules
+application_control_set | This run had already made or protected the data directory and the directories in it before it read the policy, and the manifest records them | flow: lay_down makes and records them before the policy check
+CONFIG_NOT_EMPTY_WHY | it is not empty, and the installation's own configuration is empty | read: file_size (GetFileSizeEx) is not 0
+empty_config_advice | Remove X, and nothing else: the installation makes it empty | rule: the manifest records the digest of nothing
+empty_config_advice | a configuration that is not empty may hold settings | condition: only the size was read
+empty_config_advice | A repair makes it again, empty | read: a manifest was read (recorded); rule
+appid_start_type_left | the Application Identity service's start type is N, the same as the installation recorded and the earlier-state record holds | read: the service's configuration now, the manifest's start=N and the earlier-state record's value, all equal
+appid_start_type_left | the start type is N, not the M that the installation recorded, so it is left alone | read: the service's configuration now differs from the manifest's start=M
+appid_start_type_left | the installation recorded no start type for it | read: the manifest's entry has no start= value
+dos_path_of | a final path as a person can use it | no sentence: the final path with its prefix removed
+
+# ---- win/install.rs
+inject-1 | a failure was injected after the step | rule: the testing feature's injected failure; no fact about the machine
+entry-1 | an account named N exists and this installation did not make it | read: account::find found the account and no manifest records it
+entry-2 | a service named N exists and this installation did not make it | read: the service manager opened the service and no manifest records it
+entry-3 | X exists and this installation did not make it | read: entry_exists found it and no manifest records it
+parent_refusal-1 | X is the folder that holds the boundary's data: whoever owns it, or can write or delete in it, could put data of their own in its place | rule of the layout; the reason is a read of the handle: ERROR_SHARING_VIOLATION, an open error, a reparse point or not a directory
+directory-1 | X was made and is gone again | read: the create call returned success and the open after it answered not found
+data_refusal-1 | X is the boundary's data directory; it is refused because (reason) | rule of the layout; the reason is a read: the owner, the list, a reparse point, the case flag, an entry that no manifest records
+refusal_with-1 | X is the boundary's data directory; it is refused because of an entry: reason | read: the handle of the entry (kind, owner, list, link count) or the lookup of its name; no manifest records a directory that must be empty
+program_refusal-1 | X is the program directory; it is refused because of an entry: reason | read: the handle of the entry (owner, list, kind, link count, size) against the layout's names
+program_refusal-1 | it is not empty, and the installation's own configuration is empty; it is a directory, not a file; the installation does not give that name there | read: file_size not 0; opened.kind; program_kind of the name
+check_shape-1 | the words of remedy::shape_refusal | read: see shape_refusal
+check_ancestors-1 | the words of remedy::ancestor_refusal | read: see ancestor_refusal
+check_program_parents-1 | the words of remedy::ancestor_refusal | read: see ancestor_refusal
+roots_named_by_the_journal-1 | reading the journal: error | read: the journal file's read error, printed
+file_size-1 | reading the size of a file: error | read: GetFileSizeEx's error, printed
+inspect_existing_data-1 | the data directory has no name | read: Path::file_name returned None for the data path
+make_data_directory-1 | X was made and is gone again | read: the create call returned success and the check of the parent answered absent
+make_data_directory-2 | the data directory has no name | read: Path::file_name returned None for the data path
+make_data_directory-3 | the data directory was made and is gone again | read: the create call returned success and the open after it answered not found
+create_data_parent-1 | making X: Windows error N | read: the create call's error code
+refuse_when_controlled-1 | application control already holds rule(s) of this installation's names | read: the effective policy's executable collection holds a rule with one of the installation's identifiers
+refuse_when_controlled-2 | the words of remedy::application_control_set | read: see application_control_set
+refuse_software_restriction-1 | a software restriction policy is set on this computer | read: registry key CodeIdentifiers has the DefaultLevel value
+refuse_software_restriction-2 | a software restriction policy holds rules on this computer | read: a Paths, Hashes or UrlZones key of a level has subkeys
+refuse_smart_app_control-1 | Smart App Control is on or evaluating on this computer (state N) | read: the VerifiedAndReputablePolicyState value is not 0 (documented: 1 on, 2 evaluation)
+refuse_smart_app_control-2 | Smart App Control's state could not be found where the system keeps it: the CI policy key, or its VerifiedAndReputablePolicyState value, is not there | read: registry::open of the key answered none, or the value's read answered none
+refuse_code_integrity-1 | the code-integrity policies could not be listed (error) | read: the Windows directory or the trusted CiTool command could not be had, error printed
+refuse_code_integrity-2 | the code-integrity policies could not be listed (error) | read: starting CiTool returned an error, printed
+refuse_code_integrity-3 | the code-integrity policies could not be listed (status) | read: CiTool's exit status was not success
+refuse_code_integrity-4 | the code-integrity policies could not be read (error) | read: the JSON of CiTool's output did not parse
+refuse_code_integrity-5 | the code-integrity policies could not be read | read: the output has no Policies array
+refuse_code_integrity-6 | a code-integrity policy beyond the system's is present: N | read: an entry with IsSystemPolicy false
+refuse_code_integrity-7 | Smart App Control is enforcing | read: an entry that is enforced and named VerifiedAndReputable
+qualify_git-1 | the words of remedy::git_program_not_reached | read: see git_program_not_reached
+qualify_git-2 | X can be changed by others: finding | read: acl::changeable_by_others returned the finding
+qualify_git-3 | X can be replaced by others: finding | read: acl::replaceable_by_others returned the finding
+qualify_git-4 | Git could not be run: error | read: starting git returned an error, printed
+qualify_git-5 | Git did not report its version: it ended with S and wrote T | read: git's exit status and standard output
+stage_payload-1 | the words of remedy::payload_file_not_reached | read: see payload_file_not_reached
+stage_payload-2 | X is a link, not a file | read: symlink_metadata shows a symbolic link or a reparse attribute
+stage_payload-3 | X is signed by A, not by B | read: the Authenticode check's signer subject against the expected subject
+keep-1 | step failed: error | read: the failed step's error, printed
+confirm-1 | The broker will serve the account P; Type yes to do it | rule: the prompt of the setup program; the account is the one named by the options
+confirm-2 | The broker will serve the account P; Type yes to do it | rule: the prompt of the setup program; the account is the one named by the options
+confirm-3 | reading the answer failed | read: the read of standard input returned an error
+confirm-4 | the answer was not yes, so nothing was changed | read: the answer text; flow: the prompt comes before any change
+install-1 | run the setup program as an administrator | read: token::current_is_administrator returned false
+install-2 | nothing is installed, so there is nothing to repair | read: entry(paths) returned Fresh and the command is repair
+install-3 | the boundary is already installed or half installed: use repair or remove | read: entry(paths) returned Installed or Partial and the command is install
+install-4 | the installation stopped: failure | read: the failure that stopped it, printed
+install-5 | undoing what was done | flow: the removal follows a failed installation
+install-6 | the earlier state is back | read: the removal returned Ok
+install-7 | the removal after the failure also failed: error | read: the removal's error, printed
+lay_down-1 | making the directory: error | read: the directory creation's error, printed
+lay_down-2 | reading what is on this computer | flow: progress before the policy is read
+lay_down-3 | an administrator has added a rule to the executable collection since the installation, so a repair would change what that rule means | read: the effective policy's foreign_exe_rules is not empty
+lay_down-4 | Git: version at directory | read: qualify_git's result (the version Git reported, the directory)
+lay_down-5 | X verified: signed by S, sha256 H | read: the signature check's subject and the digest computed
+lay_down-6 | the Application Identity service does not exist on this computer | read: the service manager's open of the service returned none
+lay_down-7 | the earlier state is recorded | flow: the earlier-state record was saved before the change
+lay_down-8 | the words of remedy::broker_stop_refused | read: see broker_stop_refused
+lay_down-9 | the words of remedy::broker_not_stopped | read: see broker_not_stopped
+lay_down-10 | X changed while it was installed | read: the digest of the installed file differs from the digest of the staged file
+lay_down-11 | account N (S) refused sign-in and hidden from the sign-in screen | flow: the account's rights and hiding were set by calls that returned success
+lay_down-12 | no Git installation is recorded | read: the manifest has no Git entry
+lay_down-13 | the Application Identity service is already running, so the policy is written and the platform's report of it is awaited | read: the service's state is running
+lay_down-14 | the notice that application control is starting | rule: the constant of messages.rs
+lay_down-15 | application control has started, N s after the service | read: wait_for_applied returned the time that it waited
+lay_down-16 | the policy is written | flow: the write of the policy returned Ok
+lay_down-17 | the platform has applied the policy | read: the log event of the policy's application was found by wait_for_applied (the record that applied it)
+lay_down-18 | the platform reports a different policy from the one written | read: the effective policy differs from the policy that was written, the differences listed
+lay_down-19 | the broker is running | read: the service was started and its state read running
+lay_down-20 | the boundary is installed and in force | flow: the start-up proof answered ready
+prove-1 | the start-up proof's cycle of N seconds had less than M seconds left before the proof for the class was asked | read: the clock against the cycle's end
+prove-2 | the broker answered the proof for the class after the end of its cycle of N seconds | read: the clock against the cycle's end when the answer came
+prove-3 | the proof failed: detail | read: the broker's answer with ready false and its detail
+prove-4 | the proof failed: detail | read: the broker's answer with ready false and its detail
+prove-5 | the broker answered a proof with an unexpected response | read: the response's variant
+wait_for_applied-1 | Windows did not report the event within N seconds | read: the wait for the event ended at its bound
+open_session-1 | the broker's service does not exist | read: the service manager's open returned none
+open_session-2 | the broker's service is not running | read: the service's state is not running
+open_session-3 | the broker's service changed while the installer connected to it | read: the service's identity differs between two reads
+open_session-4 | the words of remedy::hello_failure | read: see hello_failure
+open_session-5 | the broker answered hello with an unexpected response | read: the response's variant
+ask-1 | the error of the request to the broker | read: the frame error of the request, printed
+remove_at-1 | run the setup program as an administrator | read: token::current_is_administrator returned false
+remove_at-2 | the words of records::begin | read: see records
+remove_at-3 | the empty data directory is removed | read: Inspection::Empty and records::remove_empty left nothing
+remove_at-4 | the data directory stays because X could not be removed | read: records::remove_empty's lines of what stayed
+remove_at-5 | X was not there when the removal looked for it, and something is there now: nothing was removed | read: see not_there_at_the_inspection
+remove_at-6 | the broker is in its maintenance state | read: the Maintenance request returned a response
+remove_at-7 | the broker could not be reached, so the release will be read from the policy alone: error | read: the connection's error, printed
+remove_at-8 | an administrator's rule shares the executable collection, so the allow-all rule and the collection's mode stay in force beside it | read: the effective policy's without_ours reported a kept rule
+remove_at-9 | the policy is put back | flow: the policy write returned Ok
+remove_at-10 | putting the policy back failed | read: the step's error, printed
+remove_at-11 | the Application Identity service is missing | read: the service manager's open returned none
+remove_at-12 | the Application Identity service's start type is back to N | flow: the registry write returned Ok
+remove_at-13 | the words of remedy::appid_start_type_left | read: see appid_start_type_left
+remove_at-14 | the proof's detail | read: the broker's answer with ready true and its detail
+remove_at-15 | the broker's detail of a proof that was not ready | read: the broker's answer to the proof with ready false, and its detail
+remove_at-16 | the broker answered the proof with an unexpected response | read: the answer's variant, printed
+remove_at-17 | the Application Identity service is stopped as it was | flow: the service stop returned Ok where it had been stopped before
+remove_at-18 | the broker's service is already deleted and goes when the last program that holds it lets go | read: the service manager marks the service as pending delete
+remove_at-19 | the broker's service is deleted | flow: the delete call returned Ok
+remove_at-20 | account N is removed with its rights | flow: the removal call returned Ok
+remove_at-21 | removing the journal or the private roots failed: X | read: records::finish_journal_and_run's lines of what stayed
+remove_at-22 | the machine matches the earlier-state record | read: residue returned no line
+remove_at-23 | not put back: line | read: residue returned the lines of what differs from the earlier-state record
+remove_at-24 | the installation is removed | flow: every step returned and the records were removed
+remove_at-25 | the service, the accounts and the policy are removed, but the data directory stays because X could not be removed | read: failures is empty and records::remove_approved_records returned what stayed
+remove_at-26 | the removal did not finish and its records are kept | read: failures is not empty
+refuse_while_unfinished-1 | reading the journal: error | read: the journal's read error, printed
+refuse_while_unfinished-2 | unfinished work is recorded, so nothing was changed | read: the journals hold unfinished work (refuse_while_unfinished)
+residue-1 | the error of reading the earlier-state record's policy | read: Policy::parse of the recorded policy failed, its error printed

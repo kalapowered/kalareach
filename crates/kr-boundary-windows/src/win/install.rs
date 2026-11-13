@@ -153,6 +153,7 @@ pub const STEPS: [&str; 7] = [
 #[cfg(feature = "testing")]
 fn inject(step: &str) -> Result<(), Error> {
     if std::env::var("KR_BOUNDARY_FAIL_AFTER").as_deref() == Ok(step) {
+        // text: inject-1
         return Err(Error::Failed(format!(
             "a failure was injected after the {step} step"
         )));
@@ -394,18 +395,21 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     }
     for name in [CHECKOUT, CONNECT] {
         if account::find(name).is_some() {
+            // text: entry-1
             return Err(Error::Refused(format!(
                 "an account named {name} exists and this installation did not make it"
             )));
         }
     }
     if service::manager()?.open(SERVICE)?.is_some() {
+        // text: entry-2
         return Err(Error::Refused(format!(
             "a service named {SERVICE} exists and this installation did not make it"
         )));
     }
     for (directory, accepted) in [(&paths.program, false), (&paths.data, data_accepted)] {
         if records::entry_exists(directory) && !accepted {
+            // text: entry-3
             return Err(Error::Refused(format!(
                 "{} exists and this installation did not make it",
                 directory.display()
@@ -556,6 +560,7 @@ fn presence_of(path: &Path) -> Presence {
 fn parent_refusal(paths: &Paths, why: &str, cure: ParentCure) -> Error {
     let parent = paths.data_parent();
     let remedy = remedy::parent_advice(&cure);
+    // text: parent_refusal-1
     Error::Refused(format!(
         "{} is the folder that holds the boundary's data (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns that folder, or can write or delete in it, could put data of their own in its place while the broker runs as the system. {remedy}",
         parent.display()
@@ -664,6 +669,7 @@ impl DataHolds {
             LIST | WRITE_DAC,
         )?
         .ok_or_else(|| {
+            // text: directory-1
             Error::Failed(format!(
                 "{} was made and is gone again",
                 which.path(&self.paths).display()
@@ -695,6 +701,7 @@ fn data_descriptor() -> Result<sd::OwnedSd, Error> {
 /// from what the directory's own handle showed, and one refusal gives one remedy.
 fn data_refusal(paths: &Paths, why: &str, origin: &Origin) -> Error {
     let remedy = remedy::data_ending(origin, why == remedy::CASE_SENSITIVE_WHY);
+    // text: data_refusal-1
     Error::Refused(format!(
         "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system. {remedy}",
         paths.data.display()
@@ -850,6 +857,7 @@ fn refusal_with(
     let manifest = presence_of(&paths.manifest);
     let remedy = remedy::choose(kind, origin, &manifest);
     let ending = remedy::ending(&entry, remedy, origin, kind, &manifest);
+    // text: refusal_with-1
     Error::Refused(format!(
         "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because of {}: {why}. Whatever is in it that another account made or can change could be read by the broker, running as the system, as its own. {ending}",
         paths.data.display(),
@@ -1577,7 +1585,7 @@ enum Cure {
     RemoveEntry,
     /// The entry is a link: remove the link itself and not what it points to.
     RemoveLink,
-    /// The configuration file that the installation makes empty holds settings: remove it, and a
+    /// The configuration file that the installation makes empty is not empty: remove it, and a
     /// repair makes it again, empty. It is a name the installation gives there, so the text of
     /// [`Cure::RemoveEntry`] does not fit it.
     EmptyConfig,
@@ -1615,15 +1623,7 @@ fn program_refusal(
         Cure::RemoveLink => {
             remedy::program_removal_advice(&entry.display().to_string(), true, recorded)
         }
-        Cure::EmptyConfig => format!(
-            "Remove {}, and nothing else: the installation makes it empty, and a configuration that holds settings would be read by the Git that the boundary's accounts run, and a change of its owner or its list does not cure that. {}Then run the setup program again.",
-            entry.display(),
-            if recorded {
-                "A repair makes it again, empty. "
-            } else {
-                ""
-            }
-        ),
+        Cure::EmptyConfig => remedy::empty_config_advice(&entry.display().to_string(), recorded),
         Cure::Volume => format!(
             "{} is on a volume that the installation does not use: it keeps its program directory on a fixed, local NTFS volume, and nothing in it can be corrected to make another volume one. {kept_directory} {}",
             entry.display(),
@@ -1631,6 +1631,7 @@ fn program_refusal(
         ),
         Cure::Open => remedy::program_open_advice(&entry.display().to_string(), kept_directory),
     };
+    // text: program_refusal-1
     Error::Refused(format!(
         "{} is the boundary's program directory (the program that the service runs as the system). It is refused because of {}: {why}. Whoever owns it, or can change its list, could replace that program. {remedy}",
         paths.program.display(),
@@ -1709,6 +1710,7 @@ fn check_shape(paths: &Paths, stage: remedy::Stage) -> Result<(), Error> {
         &known_folder(&data_path, &data_opened),
         stage,
     ) {
+        // text: check_shape-1
         Some(text) => Err(Error::Refused(text)),
         None => Ok(()),
     }
@@ -1736,6 +1738,7 @@ fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Resu
     for (index, folder) in chain.into_iter().enumerate() {
         let shown = folder.display().to_string();
         let refuse = |fault: Fault<'_>| {
+            // text: check_ancestors-1
             Error::Refused(remedy::ancestor_refusal(
                 &remedy::Subject::shared(&shown, fault),
                 tree,
@@ -1832,6 +1835,7 @@ fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Erro
     for folder in chain {
         let shown = folder.display().to_string();
         let refuse = |fault: Fault<'_>| {
+            // text: check_program_parents-1
             Error::Refused(remedy::ancestor_refusal(
                 &remedy::Subject::at(&shown, &known, fault),
                 remedy::Tree::Program,
@@ -2060,6 +2064,7 @@ fn roots_named_by_the_journal(paths: &Paths) -> Result<BTreeSet<String>, Error> 
         return Ok(named);
     }
     let unfinished = super::journal::replay(&paths.journal, "")
+        // text: roots_named_by_the_journal-1
         .map_err(|error| Error::Failed(format!("reading the journal: {error}")))?;
     for invocation in unfinished {
         for row in &invocation.rows {
@@ -2114,6 +2119,7 @@ fn file_size(handle: &ffi::Handle) -> Result<u64, Error> {
     // SAFETY: the handle is open with the right to read its attributes and the pointer is to a
     // local that lives through the call.
     if unsafe { GetFileSizeEx(handle.raw(), &raw mut size) } == 0 {
+        // text: file_size-1
         return Err(Error::Failed(format!(
             "reading the size of a file: {}",
             io::Error::last_os_error()
@@ -2182,7 +2188,7 @@ fn inspect_within(
                 // The configuration is recorded with the digest of nothing, so what is there must
                 // be nothing: a repair makes it again once it is removed.
                 Some(_) if is_git_config(paths, dir, &name) && file_size(&opened.handle)? != 0 => {
-                    Some("it holds settings, and the installation's own configuration is empty")
+                    Some(remedy::CONFIG_NOT_EMPTY_WHY)
                 }
                 Some(_) => None,
             };
@@ -2215,6 +2221,7 @@ fn inspect_existing_data(
     let name = paths
         .data
         .file_name()
+        // text: inspect_existing_data-1
         .ok_or_else(|| Error::Failed("the data directory has no name".to_owned()))?;
     let Some((handle, _)) =
         open_directory_relative(parent, name, FILE_OPEN, None, LIST | WRITE_DAC)
@@ -2261,6 +2268,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
                 remedy::Stage::Before
             };
             check_data_parent_at(paths, stage)?.ok_or_else(|| {
+                // text: make_data_directory-1
                 Error::Failed(format!(
                     "{} was made and is gone again",
                     paths.data_parent().display()
@@ -2271,6 +2279,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
     let name = paths
         .data
         .file_name()
+        // text: make_data_directory-2
         .ok_or_else(|| Error::Failed("the data directory has no name".to_owned()))?;
     let descriptor = data_descriptor()?;
     // A directory that is there is opened, one that is not is made with the descriptor, and a link
@@ -2282,6 +2291,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
         Some(&descriptor),
         LIST | WRITE_DAC,
     )?
+    // text: make_data_directory-3
     .ok_or_else(|| Error::Failed("the data directory was made and is gone again".to_owned()))?;
     if let Some(why) = not_a_plain_directory(&made, &paths.data.display().to_string())? {
         return Err(data_refusal(paths, why, &Origin::Foreign));
@@ -2325,6 +2335,7 @@ fn create_data_parent(parent: &Path) -> Result<bool, Error> {
         // SAFETY: reads the calling thread's last error.
         let code = unsafe { GetLastError() };
         if code != ERROR_ALREADY_EXISTS {
+            // text: create_data_parent-1
             return Err(Error::Failed(format!(
                 "making {}: Windows error {code}",
                 parent.display()
@@ -2353,16 +2364,27 @@ fn refuse_when_controlled(channel: &Channel) -> Result<(String, Policy), Error> 
     })
     .collect();
     if !ours.is_empty() {
+        // text: refuse_when_controlled-1
         return Err(Error::Refused(format!(
             "application control already holds rule(s) of this installation's names: {}",
             ours.join(", ")
         )));
     }
     if !effective.is_unconfigured() {
-        return Err(Error::Refused(
-            "this computer already enforces application control, so the installation stops and changes nothing"
-                .to_owned(),
-        ));
+        let named = |keep: &dyn Fn(&policy::Collection) -> bool| -> Vec<&str> {
+            effective
+                .collections
+                .iter()
+                .filter(|(_, collection)| keep(collection))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        };
+        let enforced = named(&|collection| collection.mode == policy::Mode::Enabled);
+        let ruled = named(&|collection| !collection.rules.is_empty());
+        // text: refuse_when_controlled-2
+        return Err(Error::Refused(remedy::application_control_set(
+            &enforced, &ruled,
+        )));
     }
     refuse_software_restriction()?;
     refuse_smart_app_control()?;
@@ -2376,6 +2398,7 @@ fn refuse_software_restriction() -> Result<(), Error> {
         return Ok(());
     };
     if key.dword("DefaultLevel")?.is_some() {
+        // text: refuse_software_restriction-1
         return Err(Error::Refused(
             "a software restriction policy is set on this computer".to_owned(),
         ));
@@ -2389,6 +2412,7 @@ fn refuse_software_restriction() -> Result<(), Error> {
                 r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\{level}\{kind}"
             ))? && !rules.subkey_names()?.is_empty()
             {
+                // text: refuse_software_restriction-2
                 return Err(Error::Refused(
                     "a software restriction policy holds rules on this computer".to_owned(),
                 ));
@@ -2405,17 +2429,20 @@ fn refuse_smart_app_control() -> Result<(), Error> {
         .flatten();
     match state {
         Some(0) => Ok(()),
+        // text: refuse_smart_app_control-1
         Some(other) => Err(Error::Refused(format!(
             "Smart App Control is on or evaluating on this computer (state {other})"
         ))),
+        // text: refuse_smart_app_control-2
         None => Err(Error::Refused(
-            "Smart App Control's state could not be read".to_owned(),
+            "Smart App Control's state could not be found where the system keeps it: the CI policy key, or its VerifiedAndReputablePolicyState value, is not there".to_owned(),
         )),
     }
 }
 
 fn refuse_code_integrity() -> Result<(), Error> {
     let listing = |error: &dyn std::fmt::Display| {
+        // text: refuse_code_integrity-1
         Error::Refused(format!(
             "the code-integrity policies could not be listed: {error}"
         ))
@@ -2428,22 +2455,26 @@ fn refuse_code_integrity() -> Result<(), Error> {
         .stdin(Stdio::null())
         .output()
         .map_err(|error| {
+            // text: refuse_code_integrity-2
             Error::Refused(format!(
                 "the code-integrity policies could not be listed: {error}"
             ))
         })?;
     if !output.status.success() {
+        // text: refuse_code_integrity-3
         return Err(Error::Refused(format!(
             "the code-integrity policies could not be listed: {}",
             output.status
         )));
     }
     let listing: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        // text: refuse_code_integrity-4
         Error::Refused(format!(
             "the code-integrity policies could not be read: {error}"
         ))
     })?;
     let policies = listing["Policies"].as_array().ok_or_else(|| {
+        // text: refuse_code_integrity-5
         Error::Refused("the code-integrity policies could not be read".to_owned())
     })?;
     for entry in policies {
@@ -2451,11 +2482,13 @@ fn refuse_code_integrity() -> Result<(), Error> {
         let enforced = entry["IsEnforced"].as_bool().unwrap_or(true);
         let name = entry["FriendlyName"].as_str().unwrap_or("");
         if !system {
+            // text: refuse_code_integrity-6
             return Err(Error::Refused(format!(
                 "a code-integrity policy beyond the system's is present: {name}"
             )));
         }
         if enforced && name.starts_with("VerifiedAndReputable") {
+            // text: refuse_code_integrity-7
             return Err(Error::Refused("Smart App Control is enforcing".to_owned()));
         }
     }
@@ -2475,13 +2508,15 @@ pub fn qualify_git() -> Result<GitSet, Error> {
     let mut images = Vec::new();
     for relative in policy::git_images() {
         let path = dir.join(relative);
-        let bytes = fs::read(&path).map_err(|_| {
-            Error::Refused(format!(
-                "Git's program {} is not where the policy expects it",
-                path.display()
+        let bytes = fs::read(&path).map_err(|error| {
+            // text: qualify_git-1
+            Error::Refused(remedy::git_program_not_reached(
+                &path.display().to_string(),
+                &error,
             ))
         })?;
         if let Some(finding) = acl::changeable_by_others(&path, false)? {
+            // text: qualify_git-2
             return Err(Error::Refused(format!(
                 "{} can be changed by others: {finding}",
                 path.display()
@@ -2493,6 +2528,7 @@ pub fn qualify_git() -> Result<GitSet, Error> {
                 break;
             }
             if let Some(finding) = acl::changeable_by_others(parent, true)? {
+                // text: qualify_git-3
                 return Err(Error::Refused(format!(
                     "{} can be replaced by others: {finding}",
                     parent.display()
@@ -2507,10 +2543,12 @@ pub fn qualify_git() -> Result<GitSet, Error> {
     }
     let output = applocker::trusted_command(dir.join("mingw64").join("bin").join("git.exe"))
         .and_then(|mut command| command.arg("--version").stdin(Stdio::null()).output())
+        // text: qualify_git-4
         .map_err(|error| Error::Refused(format!("Git could not be run: {error}")))?;
     // What Git reports is the version the policy is written for: a run that failed, or wrote
     // anything but its one line, is not Git.
     let version = git_version(output.status.success(), &output.stdout).ok_or_else(|| {
+        // text: qualify_git-5
         Error::Refused(format!(
             "Git did not report its version: it ended with {} and wrote {:?}",
             output.status,
@@ -2537,15 +2575,17 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
     let mut staged = Vec::new();
     for name in [BROKER, CREDENTIAL] {
         let source = payload.join(name);
-        let metadata = fs::symlink_metadata(&source).map_err(|_| {
-            Error::Refused(format!(
-                "{} is not in the payload directory",
-                source.display()
+        let metadata = fs::symlink_metadata(&source).map_err(|error| {
+            // text: stage_payload-1
+            Error::Refused(remedy::payload_file_not_reached(
+                &source.display().to_string(),
+                &error,
             ))
         })?;
         if metadata.file_type().is_symlink()
             || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
         {
+            // text: stage_payload-2
             return Err(Error::Refused(format!(
                 "{} is a link, not a file",
                 source.display()
@@ -2575,6 +2615,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
             .map_err(io_error(format!("opening {}", path.display())))?;
         let subject = verify::signer(&checked, &path)?;
         if subject != verify::PUBLISHER {
+            // text: stage_payload-3
             return Err(Error::Refused(format!(
                 "{name} is signed by {subject}, not by {}",
                 verify::PUBLISHER
@@ -2625,6 +2666,7 @@ fn service_security(persons: &[String]) -> String {
 /// the removal undone.
 fn keep(result: Result<(), Error>, what: &str, failures: &mut Vec<String>) {
     if let Err(error) = result {
+        // text: keep-1
         say(&format!("{what} failed: {error}"));
         failures.push(format!("{what}: {error}"));
     }
@@ -2644,8 +2686,11 @@ pub struct Options {
 ///
 /// Returns [`Error::Refused`] for any answer but yes.
 pub fn confirm(person: &str, action: &str) -> Result<(), Error> {
+    // text: confirm-1
     say(NOTICE);
+    // text: confirm-2
     say("");
+    // text: confirm-3
     say(&format!("The broker will serve the account {person}."));
     print!("Type yes to {action}: ");
     let _ = io::stdout().flush();
@@ -2657,6 +2702,7 @@ pub fn confirm(person: &str, action: &str) -> Result<(), Error> {
     if answer.trim().eq_ignore_ascii_case("yes") {
         Ok(())
     } else {
+        // text: confirm-4
         Err(Error::Refused(
             "the answer was not yes, so nothing was changed".to_owned(),
         ))
@@ -2678,6 +2724,7 @@ fn person_of(options: &Options) -> Result<String, Error> {
 /// removal sequence has run and the machine has been checked against the earlier-state record.
 pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Error> {
     if !token::current_is_administrator()? {
+        // text: install-1
         return Err(Error::Refused(
             "run the setup program as an administrator".to_owned(),
         ));
@@ -2687,11 +2734,13 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
     let (manifest, existing) = match (state, repair) {
         (Entry::Fresh, false) => (Manifest::begin(), false),
         (Entry::Fresh, true) => {
+            // text: install-2
             return Err(Error::Refused(
                 "nothing is installed, so there is nothing to repair".to_owned(),
             ));
         }
         (Entry::Installed(_) | Entry::Partial(_), false) => {
+            // text: install-3
             return Err(Error::Refused(
                 "the boundary is already installed or half installed: use repair or remove"
                     .to_owned(),
@@ -2708,13 +2757,17 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
     }
     let outcome = lay_down(&mut run, options, existing);
     if let Err(failure) = outcome {
+        // text: install-4
         say(&format!("the installation stopped: {failure}"));
         if existing {
             return Err(failure);
         }
+        // text: install-5
         say("undoing what was done");
         match remove_at(paths, true, remedy::Stage::Rollback) {
+            // text: install-6
             Ok(()) => say("the earlier state is back"),
+            // text: install-7
             Err(error) => say(&format!(
                 "the removal after the failure also failed: {error}"
             )),
@@ -2751,6 +2804,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         )?;
         holds.directory(which).map_err(|error| match error {
             Error::Refused(_) => error,
+            // text: lay_down-1
             other => Error::Failed(format!("making {what}: {other}")),
         })?;
     }
@@ -2775,11 +2829,13 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     };
     sweep(&paths.staging);
 
+    // text: lay_down-2
     say("reading what is on this computer");
     let (baseline_xml, effective) = if existing {
         let (xml, effective) = channel.effective()?;
         let foreign = effective.foreign_exe_rules();
         if !foreign.is_empty() {
+            // text: lay_down-3
             return Err(Error::Refused(
                 "an administrator has added a rule to the executable collection since the installation, so a repair would change what that rule means"
                     .to_owned(),
@@ -2791,9 +2847,11 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     };
     let _ = effective;
     let git = qualify_git()?;
+    // text: lay_down-4
     say(&format!("Git: {} at {}", git.version, git.dir));
     let staged = stage_payload(&options.payload, &paths.staging)?;
     for file in &staged {
+        // text: lay_down-5
         say(&format!(
             "{} verified: signed by {}, sha256 {}",
             file.name,
@@ -2805,6 +2863,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     run.manifest.save(&paths.manifest)?;
 
     let appid = service::manager()?.open(APPID)?.ok_or_else(|| {
+        // text: lay_down-6
         Error::Refused(
             "the Application Identity service does not exist on this computer".to_owned(),
         )
@@ -2818,6 +2877,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         policy_xml: baseline_xml,
     };
     if prior.write_once(&paths.prior)? {
+        // text: lay_down-7
         say("the earlier state is recorded");
     }
     inject("directories")?;
@@ -2847,6 +2907,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             // A repair has no rollback, so its words say what the refusal was and what the run left;
             // an installation's own failure path says what is undone.
             remedy::StopFailure::Refused(error) if existing => {
+                // text: lay_down-8
                 Error::Failed(remedy::broker_stop_refused(&error.to_string()))
             }
             remedy::StopFailure::Refused(error) | remedy::StopFailure::Read(error) => {
@@ -2854,6 +2915,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             }
         })?;
         if !stopped {
+            // text: lay_down-9
             return Err(Error::Failed(remedy::broker_not_stopped(existing)));
         }
         broker_stopped = true;
@@ -2918,6 +2980,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         install_program_file(&file.path, &target)
             .map_err(io_error(format!("installing {}", file.name)))?;
         if sha256_of(&target)? != file.sha256 {
+            // text: lay_down-10
             return Err(Error::Failed(format!(
                 "{} changed while it was installed",
                 file.name
@@ -2947,6 +3010,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             None,
         )?;
         account::hide_from_sign_in(name)?;
+        // text: lay_down-11
         say(&format!(
             "account {name} ({}) refused sign-in and hidden from the sign-in screen",
             sid.to_text()
@@ -2989,6 +3053,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         .manifest
         .git
         .clone()
+        // text: lay_down-12
         .ok_or_else(|| Error::Failed("no Git installation is recorded".to_owned()))?;
     let log_env = proof::proof_environment(&git, &paths.staging).map_err(Error::Failed)?;
     // A service that is already running is never stopped. An event of an earlier life of the service
@@ -2999,6 +3064,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     let was_running = appid.status()?.running();
     if was_running {
         inject("appid")?;
+        // text: lay_down-13
         say(
             "the Application Identity service is already running, so the policy is written and the platform's report of it is awaited",
         );
@@ -3007,6 +3073,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         Identity(&appid).start()?;
         let first_deadline = within(FIRST_APPLIED_BOUND);
         inject("appid")?;
+        // text: lay_down-14
         say(messages::APPLICATION_CONTROL_STARTING);
         let (waited, _) = wait_for_applied(
             before_start,
@@ -3015,6 +3082,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             &paths.staging,
             &log_env,
         )?;
+        // text: lay_down-15
         say(&format!(
             "application control has started, {:.0} s after the service",
             waited.as_secs_f32()
@@ -3034,6 +3102,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // and comes back with the write's answer: an event after that number came after the write began.
     let before_write = channel.set(&wanted.render())?;
     note_call(&format!("policy written after record {before_write}"));
+    // text: lay_down-16
     say("the policy is written");
     inject("policy")?;
     let (_, applied_record) = wait_for_applied(
@@ -3048,11 +3117,13 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         &log_env,
     )?;
     note_call(&format!("policy applied by record {applied_record}"));
+    // text: lay_down-17
     say("the platform has applied the policy");
     let (after_xml, after) = channel.effective()?;
     let _ = after_xml;
     let differences = after.differences(&wanted);
     if !differences.is_empty() {
+        // text: lay_down-18
         return Err(Error::Failed(format!(
             "the platform reports a different policy from the one written: {}",
             differences.join("; ")
@@ -3065,12 +3136,14 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         broker_service.start()?;
         Ok(broker_service.wait_for(false, Duration::from_secs(60))?)
     })?;
+    // text: lay_down-19
     say("the broker is running");
     inject("broker")?;
     let mut session = open_session()?;
     cycle.prove(&mut session)?;
     run.manifest.state = InstallState::Installed;
     run.manifest.save(&paths.manifest)?;
+    // text: lay_down-20
     say("the boundary is installed and in force");
     Ok(())
 }
@@ -3134,6 +3207,7 @@ impl ProofCycle {
         let ask_until = deadline.checked_sub(self.margin).unwrap_or(self.began);
         for class in [Class::Checkout, Class::Connect] {
             if Instant::now() >= ask_until {
+                // text: prove-1
                 return Err(Error::Failed(format!(
                     "the start-up proof's cycle of {} seconds had less than {} seconds left before the proof for {class:?} was asked",
                     self.bound.as_secs(),
@@ -3143,6 +3217,7 @@ impl ProofCycle {
             session.set_deadline(Some(deadline));
             let response = ask(session, &Request::Prove { class })?;
             if Instant::now() > deadline {
+                // text: prove-2
                 return Err(Error::Failed(format!(
                     "the broker answered the proof for {class:?} after the end of its cycle of {} seconds",
                     self.bound.as_secs()
@@ -3152,14 +3227,17 @@ impl ProofCycle {
                 Response::Proof {
                     ready: true,
                     detail,
+                    // text: prove-3
                 } => say(&detail),
                 Response::Proof {
                     ready: false,
                     detail,
                 } => {
+                    // text: prove-4
                     return Err(Error::Failed(format!("the proof failed: {detail}")));
                 }
                 other => {
+                    // text: prove-5
                     return Err(Error::Failed(format!(
                         "the broker answered a proof with {other:?}"
                     )));
@@ -3201,6 +3279,7 @@ fn wait_for_applied(
 ) -> Result<(Duration, u64), Error> {
     let begun = Instant::now();
     let too_late = || {
+        // text: wait_for_applied-1
         Error::Failed(format!(
             "Windows did not report {what} within {} seconds",
             deadline.saturating_duration_since(begun).as_secs()
@@ -3232,9 +3311,11 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
     let manager = service::manager()?;
     let service = manager
         .open(SERVICE)?
+        // text: open_session-1
         .ok_or_else(|| Error::Failed("the broker's service does not exist".to_owned()))?;
     let status = service.status()?;
     if !status.running() {
+        // text: open_session-2
         return Err(Error::Failed(
             "the broker's service is not running".to_owned(),
         ));
@@ -3245,6 +3326,7 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
     let held = pipe::ServerProcess::open(status.pid)?;
     let again = service.status()?;
     if !again.running() || again.pid != status.pid {
+        // text: open_session-3
         return Err(Error::Failed(
             "the broker's service changed while the installer connected to it".to_owned(),
         ));
@@ -3257,6 +3339,7 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
             version: frame::VERSION,
         },
     )
+    // text: open_session-4
     .map_err(|failure| Error::Failed(remedy::hello_failure(&failure)))?;
     match said {
         Response::Hello { .. } => {
@@ -3264,6 +3347,7 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
             connection.set_deadline(None);
             Ok(connection)
         }
+        // text: open_session-5
         other => Err(Error::Failed(format!(
             "the broker answered hello with {other:?}"
         ))),
@@ -3276,6 +3360,7 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
 ///
 /// Returns an error when the connection fails or the deadline passes before the answer.
 pub fn ask(connection: &mut pipe::Connection, request: &Request) -> Result<Response, Error> {
+    // text: ask-1
     ask_frames(connection, request).map_err(|error| Error::Failed(error.to_string()))
 }
 
@@ -3306,6 +3391,7 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
 /// changed nothing itself, and what the installation made is still there.
 fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Result<(), Error> {
     if !token::current_is_administrator()? {
+        // text: remove_at-1
         return Err(Error::Refused(
             "run the setup program as an administrator".to_owned(),
         ));
@@ -3353,6 +3439,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         quiet_when_empty,
         &paths.data,
     ) {
+        // text: remove_at-2
         records::Begin::Refuse(text) => return Err(Error::Refused(text)),
         records::Begin::Nothing => return Ok(()),
         records::Begin::FinishEmpty => {
@@ -3364,9 +3451,11 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 if let Some(parent) = paths.data.parent() {
                     let _ = fs::remove_dir(parent);
                 }
+                // text: remove_at-3
                 say("the empty data directory is removed");
                 return Ok(());
             }
+            // text: remove_at-4
             return Err(Error::Failed(format!(
                 "the data directory stays because {} could not be removed. {}",
                 stayed.join("; "),
@@ -3385,6 +3474,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         match fresh::directory_at(&paths.staging, SdKind::AdminDir, &Principals::default()) {
             Ok(()) => approved.staging = true,
             Err(error) if error.raw_os_error() == i32::try_from(ERROR_ALREADY_EXISTS).ok() => {
+                // text: remove_at-5
                 return Err(Error::Refused(format!(
                     "{}. Nothing was removed. Run the removal again: it checks the directory first, and says what to do about it if it is not the installation's own.",
                     records::not_there_at_the_inspection(&paths.staging)
@@ -3410,9 +3500,11 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             Ok(connection)
         }) {
             Ok(connection) => {
+                // text: remove_at-6
                 say("the broker is in its maintenance state");
                 session = Some(connection);
             }
+            // text: remove_at-7
             Err(error) => say(&format!(
                 "the broker could not be reached, so the release will be read from the policy alone: {error}"
             )),
@@ -3427,6 +3519,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 let (xml, effective) = channel.effective()?;
                 let (_, kept) = effective.without_ours();
                 if kept {
+                    // text: remove_at-8
                     say(
                         "an administrator's rule shares the executable collection, so the allow-all rule and the collection's mode stay in force beside it",
                     );
@@ -3441,8 +3534,10 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                     ]
                 };
                 channel.set(
+                    // text: remove_at-9
                     &policy::strip(&xml, drop).map_err(|error| Error::Failed(error.to_string()))?,
                 )?;
+                // text: remove_at-10
                 say("the policy is put back");
                 Ok(())
             })(),
@@ -3456,6 +3551,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         keep(
             (|| -> Result<(), Error> {
                 let appid = manager.open(APPID)?.ok_or_else(|| {
+                    // text: remove_at-11
                     Error::Failed("the Application Identity service is missing".to_owned())
                 })?;
                 let (current, _) = appid.configuration()?;
@@ -3463,15 +3559,19 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 if set_by_us && current != prior.appid_start_type {
                     if let Some(key) = registry::open(APPID_KEY)? {
                         key.set_dword("Start", prior.appid_start_type)?;
+                        // text: remove_at-12
                         say(&format!(
                             "the Application Identity service's start type is back to {}",
                             prior.appid_start_type
                         ));
                     }
                 } else {
-                    say(
-                        "the Application Identity service's start type was changed by someone else and is left alone",
-                    );
+                    // text: remove_at-13
+                    say(&remedy::appid_start_type_left(
+                        current,
+                        object.detail.as_deref(),
+                        prior.appid_start_type,
+                    ));
                 }
                 Ok(())
             })(),
@@ -3487,18 +3587,21 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 Ok(Response::Proof {
                     ready: true,
                     detail,
+                    // text: remove_at-14
                 }) => say(&detail),
                 Ok(Response::Proof {
                     ready: false,
                     detail,
                 }) => {
                     keep(
+                        // text: remove_at-15
                         Err(Error::Failed(detail)),
                         "proving the release",
                         &mut failures,
                     );
                 }
                 Ok(other) => keep(
+                    // text: remove_at-16
                     Err(Error::Failed(format!("{other:?}"))),
                     "proving the release",
                     &mut failures,
@@ -3525,6 +3628,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                     && appid.status()?.running()
                 {
                     Identity(&appid).stop()?;
+                    // text: remove_at-17
                     say("the Application Identity service is stopped as it was");
                 }
                 Ok(())
@@ -3543,11 +3647,13 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 // The marker is a volatile key under the service's own key: it goes first.
                 boot::remove()?;
                 if service.marked_for_deletion()? {
+                    // text: remove_at-18
                     say(
                         "the broker's service is already deleted and goes when the last program that holds it lets go",
                     );
                 } else {
                     service.delete()?;
+                    // text: remove_at-19
                     say("the broker's service is deleted");
                 }
             }
@@ -3568,6 +3674,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 }
                 account::unhide_from_sign_in(&name)?;
                 account::delete(&name)?;
+                // text: remove_at-20
                 say(&format!("account {name} is removed with its rights"));
                 Ok(())
             })(),
@@ -3595,6 +3702,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     // opened and approved them, and nowhere else. Unfinished work was refused before the removal
     // began; what a journal file still holds now is finished or made nothing.
     for stayed in records::finish_journal_and_run(&paths.journal, &paths.run, seen) {
+        // text: remove_at-21
         say(&format!(
             "removing the journal or the private roots failed: {stayed}"
         ));
@@ -3604,9 +3712,11 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     }
     if let Some(prior) = &prior {
         match residue(prior, paths) {
+            // text: remove_at-22
             Ok(left) if left.is_empty() => say("the machine matches the earlier-state record"),
             Ok(left) => {
                 for line in &left {
+                    // text: remove_at-23
                     say(&format!("not put back: {line}"));
                 }
                 failures.push(format!(
@@ -3624,6 +3734,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         // The records go last: a failed removal can be run again from them.
         let stayed = remove_approved_records(paths, &approved);
         if stayed.is_empty() {
+            // text: remove_at-24
             say("the installation is removed");
             Ok(())
         } else {
@@ -3631,12 +3742,14 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             // an empty directory is finished by the next removal, and anything else in it is for
             // the person to remove.
             let next = records::next_step(paths.manifest.exists(), data_is_empty(paths));
+            // text: remove_at-25
             Err(Error::Failed(format!(
                 "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}{unread_prior}",
                 stayed.join("; ")
             )))
         }
     } else {
+        // text: remove_at-26
         Err(Error::Failed(format!(
             "the removal did not finish and its records are kept: {}{unread_prior}",
             failures.join("; ")
@@ -3708,6 +3821,7 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
     }
     if paths.journal.exists() {
         let unfinished = super::journal::replay(&paths.journal, "")
+            // text: refuse_while_unfinished-1
             .map_err(|error| Error::Failed(format!("reading the journal: {error}")))?;
         for invocation in unfinished {
             let project = invocation
@@ -3727,6 +3841,7 @@ pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
     if found.is_empty() {
         Ok(())
     } else {
+        // text: refuse_while_unfinished-2
         Err(Error::Refused(format!(
             "unfinished work is recorded, so nothing was changed: {}",
             found.join("; ")
@@ -3745,6 +3860,7 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
     let mut left = Vec::new();
     let (_, effective) = Channel::new(&paths.staging).effective()?;
     let baseline =
+        // text: residue-1
         Policy::parse(&prior.policy_xml).map_err(|error| Error::Failed(error.to_string()))?;
     // Where an administrator's rule has since joined the executable collection, the removal keeps the
     // allow-all rule and the collection's mode beside it on purpose; everything else of ours is gone.

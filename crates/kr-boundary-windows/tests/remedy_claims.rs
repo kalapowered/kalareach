@@ -64,7 +64,7 @@ fn no_ending_of_an_entry_claims_the_journal_or_what_the_entry_holds() {
         assert!(!text.contains("stay where they are"), "{what}");
         assert!(!text.contains("record what is installed and"), "{what}");
         assert_eq!(
-            text.contains("the manifest stays where it is"),
+            text.contains("the entry at the manifest's name stays where it is"),
             text.starts_with("Remove ") && manifest == Presence::Present,
             "{what}"
         );

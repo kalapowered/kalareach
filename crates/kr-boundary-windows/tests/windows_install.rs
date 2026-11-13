@@ -758,8 +758,16 @@ fn existing_application_control_stops_the_installation_and_changes_nothing() {
     assert!(!before.policy.is_unconfigured());
     let (code, output) = case.install();
     assert_ne!(code, 0, "{output}");
+    // The words say what the read showed (a collection that is enforced and holds a rule), and
+    // what the run had changed before it read the policy.
     assert!(
-        output.contains("already enforces application control"),
+        output.contains(
+            "The effective application control policy is not empty: it enforces Exe and it holds rules in Exe."
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains("This run had already made or protected the data directory"),
         "{output}"
     );
     assert_eq!(snapshot(), before, "nothing was changed");
@@ -1758,12 +1766,12 @@ fn the_program_directory_holds_only_the_names_the_installation_gives_each_of_its
     drop(fresh::file_at(&config, SdKind::ProgramFile, true).unwrap());
     accepted("the complete layout");
 
-    // A configuration that holds anything is not the empty one the manifest records.
+    // A configuration that is not empty is not the empty one the manifest records.
     std::fs::write(&config, b"[core]\n").unwrap();
-    refused("a configuration that holds settings", "it holds settings");
+    refused("a configuration that is not empty", "it is not empty");
     // The text fits the file: the installation makes it, empty, and a repair makes it again. It
     // does not say that the installation never makes it there.
-    for text in both("a configuration that holds settings") {
+    for text in both("a configuration that is not empty") {
         assert!(text.contains("the installation makes it empty"), "{text}");
         assert!(
             !text.contains("not something that the installation makes there"),
@@ -2730,7 +2738,10 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
             "{text}"
         );
         assert!(!text.contains("Do not remove"), "{text}");
-        assert!(text.contains("the manifest stays where it is"), "{text}");
+        assert!(
+            text.contains("the entry at the manifest's name stays where it is"),
+            "{text}"
+        );
     };
     let correction_text = |text: &str| {
         assert!(text.contains("Correct what the reason names"), "{text}");
@@ -3099,7 +3110,10 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         let text = refused.to_string();
         assert!(text.contains(words), "{text}");
         assert!(text.contains("Remove "), "{text}");
-        assert!(text.contains("the manifest stays where it is"), "{text}");
+        assert!(
+            text.contains("the entry at the manifest's name stays where it is"),
+            "{text}"
+        );
     };
     // An entry whose own handle shows that the installation did not make it is moved aside and
     // never named for removal.
