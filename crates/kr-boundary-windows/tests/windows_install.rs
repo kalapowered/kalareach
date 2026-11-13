@@ -936,7 +936,10 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
         "what the folder is: {text}"
     );
     assert!(text.contains("is refused because"), "why: {text}");
-    assert!(text.contains("Remove the folder"), "what to do: {text}");
+    assert!(
+        text.contains("remove or rename the folder"),
+        "what to do: {text}"
+    );
     assert!(text.contains("holds no data directory"), "{text}");
 
     // The same refusal for a folder that holds the data directory, with its manifest, journals and
@@ -946,7 +949,7 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
         .unwrap_err()
         .to_string();
     assert!(text.contains("is refused because"), "why: {text}");
-    assert!(!text.contains("Remove the folder"), "{text}");
+    assert!(!text.contains("remove or rename the folder"), "{text}");
     assert!(!text.contains("remove the folder"), "{text}");
     assert!(text.contains("Do not remove it"), "{text}");
     assert!(text.contains("Correct it instead"), "{text}");
@@ -1837,7 +1840,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
         never(
             &text,
             &[
-                "Remove the folder",
+                "remove or rename the folder",
                 "remove the folder",
                 "Correct it instead",
                 "loses nothing",
@@ -1866,7 +1869,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
     never(
         &text,
         &[
-            "Remove the folder",
+            "remove or rename the folder",
             "remove the folder",
             "Correct it instead",
         ],
@@ -1887,7 +1890,11 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
     assert!(text.contains("Correct it instead"), "{text}");
     never(
         &text,
-        &["Remove the folder", "remove the folder", "loses nothing"],
+        &[
+            "remove or rename the folder",
+            "remove the folder",
+            "loses nothing",
+        ],
     );
 
     // Another program holds it open and shares nothing: that is cured by closing the program.
@@ -1909,7 +1916,11 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
     assert!(text.contains("Do not remove it"), "{text}");
     never(
         &text,
-        &["Remove the folder", "protected list", "Correct it instead"],
+        &[
+            "remove or rename the folder",
+            "protected list",
+            "Correct it instead",
+        ],
     );
 
     let _ = account::delete(&name);
@@ -1945,7 +1956,7 @@ fn a_parent_folder_that_cannot_be_opened_is_told_to_be_moved_aside_and_not_to_be
     assert!(text.contains("could not be opened to be checked"), "{text}");
     assert!(text.contains("Move the folder aside"), "{text}");
     for other in [
-        "Remove the folder",
+        "remove or rename the folder",
         "remove the folder",
         "Correct it instead",
         "Close the program",
@@ -2218,9 +2229,10 @@ fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of
             "{text}"
         );
         assert!(
-            text.contains("Close the program that holds it open"),
+            text.contains("Run the setup program again when it can be opened."),
             "{text}"
         );
+        assert!(!text.contains("holds it open"), "{text}");
         assert!(text.contains("program directory"), "{text}");
         assert!(text.contains(&above.display().to_string()), "{text}");
         assert!(!text.contains("Make the Administrators group"), "{text}");
@@ -3463,7 +3475,7 @@ fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is
     let _ = std::fs::remove_dir_all(&parent);
     assert_ne!(code, 0, "{output}");
     assert!(output.contains("is refused because"), "{output}");
-    assert!(output.contains("Remove the folder"), "{output}");
+    assert!(output.contains("remove or rename the folder"), "{output}");
     assert_eq!(snapshot(), before, "nothing was changed");
 }
 

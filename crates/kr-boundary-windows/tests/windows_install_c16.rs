@@ -552,15 +552,14 @@ fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
     assert!(text.contains("Nothing was changed"), "{text}");
 }
 
-/// A root that is not there is a volume that is gone. An installation, a repair and the data walk
-/// refuse it before anything is changed, in words that say that the root is not there and never that
-/// the installation asked the volume what it is: a folder that is not there ends a walk, but the root
-/// is the first folder of it, and a tree on a drive that is gone must not let the installation make
-/// records on another volume first. A removal goes on past the program tree's root: it does not
-/// refuse, and it names the program directory that it could not reach.
+/// A root that is not there is a volume that is gone, and every run refuses it before anything is
+/// changed, in both walks: an installation, a repair and a removal. A folder that is not there ends a
+/// walk, but the root is the first folder of it, and a tree on a drive that is gone must not let the
+/// installation make records on another volume first. The words say that the root is not there, with
+/// the error, and name no cause.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
-fn a_root_that_is_not_there_is_refused_before_a_change_and_a_removal_goes_on() {
+fn a_root_that_is_not_there_is_refused_before_a_change_by_every_run() {
     if needs_the_system() {
         return;
     }
@@ -571,22 +570,32 @@ fn a_root_that_is_not_there_is_refused_before_a_change_and_a_removal_goes_on() {
         .map(|letter| format!("{letter}:"))
         .find(|letter| !Path::new(&format!("{letter}\\")).exists())
         .expect("a free drive letter");
+    let words = |text: &str, tree: &str| {
+        for needle in [
+            format!("{letter}\\ is a folder above the boundary's {tree}"),
+            "the root of its volume is not there".to_owned(),
+            "Nothing was changed".to_owned(),
+            "Run the setup program again when it can be opened.".to_owned(),
+        ] {
+            assert!(text.contains(&needle), "{needle}: {text}");
+        }
+        for word in [
+            "holds it open",
+            "did not answer",
+            "asks a volume",
+            "asked",
+            "removed",
+        ] {
+            assert!(!text.contains(word), "{word}: {text}");
+        }
+    };
     // The data walk: the data parent is on the drive that is not there.
     let parent = PathBuf::from(format!("{letter}\\ProgramData\\KalaReach"));
     let paths = paths_with(&parent, &parent.join("Program"), &parent);
     let text = install::check_data_parent(&paths)
         .expect_err("a data parent on a drive that is not there")
         .to_string();
-    for needle in [
-        format!("{letter}\\ is a folder above the boundary's data directory"),
-        "the root of its volume is not there".to_owned(),
-        "Nothing was changed".to_owned(),
-    ] {
-        assert!(text.contains(&needle), "{needle}: {text}");
-    }
-    for word in ["holds it open", "did not answer", "asks a volume", "asked"] {
-        assert!(!text.contains(word), "{word}: {text}");
-    }
+    words(&text, "data directory");
     // The program walk: the data parent is a folder of the guest's own volume, the program
     // directory's top is on the drive that is not there, and nothing is made on the way.
     let (local, mut paths) = data_parent_with_paths(&mut clean);
@@ -597,56 +606,27 @@ fn a_root_that_is_not_there_is_refused_before_a_change_and_a_removal_goes_on() {
         .err()
         .expect("a program directory on a drive that is not there")
         .to_string();
-    assert!(
-        entry.contains(&format!(
-            "{letter}\\ is a folder above the boundary's program directory"
-        )),
-        "{entry}"
-    );
-    assert!(
-        entry.contains("the root of its volume is not there"),
-        "{entry}"
-    );
-    assert!(entry.contains("Nothing was changed"), "{entry}");
-    assert!(!entry.contains("holds it open"), "{entry}");
+    words(&entry, "program directory");
     assert!(
         !paths.data.exists(),
         "no data directory was made under {}",
         local.display()
     );
-    // An installed data directory: a repair refuses in the same words, before any change, and the
-    // removal does not refuse. It goes on, and its last words name the program directory that it
-    // could not reach, whether it finishes or stops at a step of its own.
+    // An installed data directory: a repair and a removal refuse in the same words, before any
+    // change, and the removal keeps the manifest and the data directory.
     installed_data_directory(&paths);
-    let repair = install::entry(&paths);
-    let repair = repair.err().expect("a repair refuses").to_string();
-    assert!(
-        repair.contains("the root of its volume is not there"),
-        "{repair}"
-    );
-    let unreached = remedy::program_unreached(&paths.program.display().to_string());
-    // A journal and a run directory that appear after the removal's inspection stop it at a step of
-    // its own, after the program tree, so the case sees its last words.
-    std::fs::remove_dir(&paths.journal).unwrap();
-    std::fs::remove_dir(&paths.run).unwrap();
-    let (journal, run) = (paths.journal.clone(), paths.run.clone());
-    clean.hook();
-    install::testing::after_the_removal_inspects_the_data_directory(move || {
-        std::fs::create_dir(&journal).unwrap();
-        std::fs::create_dir(&run).unwrap();
-    });
-    let text = install::remove(&paths, false)
-        .expect_err("a step of the removal's own stops it")
-        .to_string();
-    assert!(
-        !text.contains("is a folder above the boundary's"),
-        "the removal went on: {text}"
-    );
-    assert!(
-        text.contains("was not there when the removal looked for it"),
-        "{text}"
-    );
-    assert!(text.ends_with(&unreached), "{text}");
+    for text in [
+        install::entry(&paths)
+            .err()
+            .expect("a repair refuses")
+            .to_string(),
+        install::remove(&paths, false)
+            .expect_err("a removal refuses")
+            .to_string(),
+    ] {
+        words(&text, "program directory");
+    }
+    assert!(paths.manifest.exists(), "the removal changed nothing");
 }
 
 /// A link that points nowhere at the program directory's name is a link, and gets the link's own

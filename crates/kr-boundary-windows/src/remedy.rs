@@ -259,7 +259,7 @@ pub fn parent_advice(cure: &ParentCure) -> String {
         ParentCure::MoveAside => "The installation did not make this folder, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned(),
         ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again."),
         ParentCure::Correct(Presence::Present) => "Do not remove it: it holds the data directory, with the manifest, the journals and the private roots of an installation, and removing it would destroy what they say. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
-        ParentCure::Correct(Presence::Absent) => "It holds no data directory, so removing it loses nothing. Remove the folder, then run the setup program again.".to_owned(),
+        ParentCure::Correct(Presence::Absent) => "It holds no data directory of the boundary. If nothing else needs what is in it, remove or rename the folder, then run the setup program again.".to_owned(),
     }
 }
 
@@ -372,15 +372,21 @@ pub enum AncestorFault<'a> {
     Link,
     /// Not a folder.
     NotAFolder,
+    /// A known folder that is the root of a volume: it has no folder above it, and the setup
+    /// program installs only in a known folder below a root.
+    VolumeRoot,
+    /// A known folder that overlaps the system's other known folder: the same folder, or one that
+    /// lies at or below the other tree's own folder. The other known folder.
+    Overlap(&'a str),
     /// A drive letter that is no volume's root: the final path of its opened root.
     Alias(&'a str),
     /// The folder is on a volume that the installation does not use: why, as the volume check says
     /// it. No change of the folder cures it.
     Volume(&'a str),
-    /// The folder could not be opened or read: the platform's error.
+    /// The folder could not be opened or read: the platform's error. No cause is named: the error
+    /// can be any of many.
     Unreadable(&'a str),
-    /// The folder's volume did not answer: the query for what the volume is failed, or the open of
-    /// the volume's root failed with an error other than "not found". The platform's error.
+    /// The query for what the folder's volume is failed: the platform's error.
     VolumeUnanswered(&'a str),
     /// The root of the folder's volume is not there: the open of the root answered "not found". The
     /// platform's error.
@@ -393,20 +399,6 @@ pub enum AncestorFault<'a> {
     Writable(&'a str),
 }
 
-impl<'a> AncestorFault<'a> {
-    /// What an open that failed with an error other than "not found" found: at the root of a
-    /// volume the volume did not answer, and at any folder above it the folder could not be opened
-    /// or read, which a program that holds it open can cause.
-    #[must_use]
-    pub fn open_failed(root: bool, error: &'a str) -> Self {
-        if root {
-            AncestorFault::VolumeUnanswered(error)
-        } else {
-            AncestorFault::Unreadable(error)
-        }
-    }
-}
-
 /// Whose folder a refusal is about, which decides the form of its words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subject<'a> {
@@ -417,9 +409,15 @@ pub enum Subject<'a> {
     /// folder.
     Shared(AncestorFault<'a>),
     /// A folder that the installation makes: strictly below a known folder. Only its words can tell
-    /// the administrator what to correct.
-    Own(AncestorFault<'a>),
+    /// the administrator what to correct. Only [`Subject::at`] makes one: the token cannot be made
+    /// outside this module.
+    Own(AncestorFault<'a>, OwnToken),
 }
+
+/// The proof that a subject was chosen by [`Subject::at`], which compares the folder with its known
+/// folder. It has no public constructor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnToken(());
 
 impl<'a> Subject<'a> {
     /// The subject of a fault at `folder` where `known` is the known folder that the walk starts
@@ -428,7 +426,7 @@ impl<'a> Subject<'a> {
     #[must_use]
     pub fn at(folder: &str, known: &str, fault: AncestorFault<'a>) -> Self {
         if is_below(folder, known) {
-            Subject::Own(fault)
+            Subject::Own(fault, OwnToken(()))
         } else {
             Subject::Shared(fault)
         }
@@ -534,46 +532,6 @@ impl Stage {
     }
 }
 
-/// What a run that reads the folders of a tree is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Purpose {
-    /// An installation or a repair: it makes things in the tree.
-    Install,
-    /// A removal: it takes things out of the tree.
-    Remove,
-}
-
-/// What a walk does where the root of a tree's volume is not there (the open of the root answers
-/// "not found").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MissingRoot {
-    /// Refuse before any change.
-    Refuse,
-    /// Go on, and say at the end what could not be reached.
-    GoOn,
-}
-
-/// What a run does about a root that is not there. An installation and a repair refuse: nothing can
-/// be made on a disk that is gone. A removal of the program tree goes on, since a removal that
-/// refuses there can never finish: the policy goes back and the accounts, the service and the data
-/// go, and its last words name the program directory that it could not reach. The data tree's root
-/// still refuses a removal, since with it gone the removal reads no manifest.
-#[must_use]
-pub fn missing_root(purpose: Purpose, tree: Tree) -> MissingRoot {
-    match (purpose, tree) {
-        (Purpose::Remove, Tree::Program) => MissingRoot::GoOn,
-        _ => MissingRoot::Refuse,
-    }
-}
-
-/// The last words of a removal that went on past a program tree's root that is not there.
-#[must_use]
-pub fn program_unreached(program: &str) -> String {
-    format!(
-        "{program} could not be reached: the root of its volume is not there, so nothing in it was checked or removed. If that volume comes back, remove the program directory then."
-    )
-}
-
 /// What a supported layout is, in one sentence that says where the boundary installs: the tree's
 /// own known folder, with that folder and every folder above it plain, on a fixed, local NTFS
 /// volume.
@@ -593,29 +551,21 @@ const SHARED_CLOSING: &str =
     "The setup program directs no change to a folder that other programs share.";
 
 /// How the words of a folder that the installation does not make end, before the run's changes.
-/// Every ending is fixed: a fault chooses one and cannot add words of its own.
+/// Every ending is fixed: a fault chooses one and cannot add words of its own, and neither names a
+/// cause.
 #[derive(Clone, Copy)]
 enum Ending {
     /// The layout is not supported.
     Layout,
-    /// The volume did not answer, or its root is not there: it can come back.
-    VolumeAnswers,
-    /// The folder could not be opened or read: a program may hold it, or its volume may not answer.
-    HeldOrAnswers,
+    /// A state that can pass: the call may succeed another time.
+    Retry,
 }
 
 impl Ending {
     fn words(self, tree: Tree) -> String {
         match self {
             Ending::Layout => supported_layout(tree),
-            Ending::VolumeAnswers => {
-                "Check that the volume is there and answers, then run the setup program again."
-                    .to_owned()
-            }
-            Ending::HeldOrAnswers => {
-                "Close the program that holds it open, or check that its volume is there and answers, then run the setup program again."
-                    .to_owned()
-            }
+            Ending::Retry => "Run the setup program again when it can be opened.".to_owned(),
         }
     }
 }
@@ -630,7 +580,7 @@ impl Ending {
 pub fn ancestor_refusal(folder: &str, tree: Tree, subject: &Subject<'_>, stage: Stage) -> String {
     match subject {
         Subject::Shared(fault) => shared_refusal(folder, tree, fault, stage),
-        Subject::Own(fault) => own_refusal(folder, tree, fault, stage),
+        Subject::Own(fault, _) => own_refusal(folder, tree, fault, stage),
     }
 }
 
@@ -673,13 +623,13 @@ fn shared_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: St
         ),
         AncestorFault::List(why) => (
             format!(
-                "{head} It is refused because {why}. An identity that may delete the folder, delete or rename an entry in it, change its list or take its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on a different folder than the one that it checked."
+                "{head} It is refused because {why}. An identity that may change the folder, its entries, its list or its ownership could swap a folder below it for a link after the installation has read that folder, and the installation or the removal would then act on a different folder than the one that it checked."
             ),
             Ending::Layout,
         ),
         AncestorFault::Writable(why) => (
             format!(
-                "{head} It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program."
+                "{head} It is refused because {why}. Whoever owns it, or can add to it, or change its entries or its list, could replace that program."
             ),
             Ending::Layout,
         ),
@@ -687,19 +637,29 @@ fn shared_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: St
             format!(
                 "{head} It is refused because it could not be opened or read to be checked ({error})."
             ),
-            Ending::HeldOrAnswers,
+            Ending::Retry,
+        ),
+        AncestorFault::VolumeRoot => (
+            format!(
+                "{head} It is refused because it is the root of a volume, and the setup program installs only in a known folder below a root."
+            ),
+            Ending::Layout,
+        ),
+        AncestorFault::Overlap(other) => (
+            format!(
+                "{head} It is refused because it overlaps {other}, the system's other known folder: the same folder, or the place of the boundary's own folder in it, so the two trees cannot be kept apart."
+            ),
+            Ending::Layout,
         ),
         AncestorFault::VolumeUnanswered(error) => (
             format!(
-                "{head} It is refused because its volume did not answer ({error}). A drive that is being removed, a disk that has failed or a network share that has gone does not answer."
+                "{head} It is refused because its volume could not be asked what it is ({error})."
             ),
-            Ending::VolumeAnswers,
+            Ending::Retry,
         ),
         AncestorFault::RootMissing(error) => (
-            format!(
-                "{head} It is refused because the root of its volume is not there ({error}). A drive that has been removed or a disk that has failed leaves no root."
-            ),
-            Ending::VolumeAnswers,
+            format!("{head} It is refused because the root of its volume is not there ({error})."),
+            Ending::Retry,
         ),
     };
     let ending = ending.words(tree);
@@ -729,15 +689,17 @@ fn own_refusal(folder: &str, tree: Tree, fault: &AncestorFault<'_>, stage: Stage
             "{folder} is a folder above the boundary's {below}. It is refused because it is not a folder, and the setup program makes this folder itself, as a plain folder. {changes} Remove or rename what is in its place if nothing else needs it, then run the setup program again. {kept}"
         ),
         AncestorFault::Unreadable(error) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} Close the program that holds it open or correct who may open it, then run the setup program again. {kept}"
+            "{folder} is a folder above the boundary's {below}. It is refused because it could not be opened or read to be checked ({error}). {changes} If a program holds it open, close that program, then run the setup program again. {kept}"
         ),
         AncestorFault::Writable(why) => format!(
-            "{folder} is a folder above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program. {changes} Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. {kept} Do not move this folder: it holds other things."
+            "{folder} is a folder above the boundary's {below}. It is refused because {why}. Whoever owns it, or can add to it, or change its entries or its list, could replace that program. {changes} Make the Administrators group, the system or the installer service its owner and leave only them able to change it, then run the setup program again. {kept}"
         ),
         AncestorFault::Alias(_)
         | AncestorFault::Volume(_)
         | AncestorFault::VolumeUnanswered(_)
         | AncestorFault::RootMissing(_)
+        | AncestorFault::VolumeRoot
+        | AncestorFault::Overlap(_)
         | AncestorFault::List(_) => shared_refusal(folder, tree, fault, stage),
     }
 }
@@ -763,6 +725,65 @@ pub fn program_removal_advice(entry: &str, link: bool, repair: bool) -> String {
             "Remove {entry}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. {after}"
         )
     }
+}
+
+/// Whether a path is the root of a volume: a drive letter and nothing after it.
+fn is_a_volume_root(path: &str) -> bool {
+    let plain = plain_path(path);
+    plain.len() == 2 && plain.ends_with(':')
+}
+
+/// Whether `folder` is `base` or lies below it.
+fn is_at_or_below(folder: &str, base: &str) -> bool {
+    plain_path(folder) == plain_path(base) || is_below(folder, base)
+}
+
+/// The refusal of a layout whose known folders cannot hold the two trees, read before any walk by
+/// every installation, repair and removal: a known folder that is the root of a volume (so no folder
+/// is above it), and known folders that overlap (the same folder, or one at or below the other
+/// tree's own folder, `<known>\KalaReach`). Its words are the shared form with the layout ending.
+/// After it, a folder strictly below a known folder is the installation's own and the first folder
+/// of a walk above a known folder is a volume's root.
+#[must_use]
+pub fn shape_refusal(program_files: &str, program_data: &str) -> Option<String> {
+    let own_of = |known: &str| format!(r"{}\KalaReach", known.trim_end_matches('\\'));
+    let (folder, tree, fault) = if is_a_volume_root(program_files) {
+        (program_files, Tree::Program, AncestorFault::VolumeRoot)
+    } else if is_a_volume_root(program_data) {
+        (program_data, Tree::Data, AncestorFault::VolumeRoot)
+    } else if is_at_or_below(program_files, &own_of(program_data))
+        || is_at_or_below(program_data, &own_of(program_files))
+        || plain_path(program_files) == plain_path(program_data)
+    {
+        (
+            program_files,
+            Tree::Program,
+            AncestorFault::Overlap(program_data),
+        )
+    } else {
+        return None;
+    };
+    Some(shared_refusal(folder, tree, &fault, Stage::Before))
+}
+
+/// The setup program's line for a known folder that cannot be read: which folder, the platform's
+/// error and that nothing was changed, and at a removal the limit that it has. No words tell
+/// anyone to remove what stays by hand: the policy's rules are shared with other programs.
+#[must_use]
+pub fn known_folder_unreadable(error: &str, removal: bool) -> String {
+    let limit = if removal {
+        " A removal reads what to remove from the manifest in the data directory and checks the program directory before it deletes anything, so it cannot go on while that folder cannot be read. The broker's service, its two accounts and its rules in the policy stay. If the volume is gone for good, the setup program cannot remove them."
+    } else {
+        ""
+    };
+    format!("{error}. Nothing was changed.{limit} {SHARED_CLOSING}")
+}
+
+/// What a repair says when the broker's service did not reach the stopped state: it stops before it
+/// changes the program directory, and a repair has no rollback.
+#[must_use]
+pub fn broker_not_stopped() -> String {
+    "The broker's service did not reach the stopped state, so this run stopped before it changed the program directory. What it had already changed stays, and a repair has no rollback. Run the setup program again when the service is stopped or running.".to_owned()
 }
 
 /// A folder's final path as a person can use it: without the `\\?\` prefix of the extended form, and
