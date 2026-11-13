@@ -423,6 +423,22 @@ fn a_read_of_a_name_that_failed_after_a_mark_is_said_as_unknown_and_never_as_sta
     assert!(source.contains("Taken::Stays(_) | Taken::Unconfirmed(_)"));
 }
 
+/// An error of the tree removal's own calls is not said to be a listing: the removal opens each
+/// child, reads its identity and attributes and marks it as well as lists, so the words say that
+/// removing the entries failed and carry the platform's own words for the call that failed.
+#[test]
+fn a_failed_tree_removal_names_removing_the_entries_and_not_a_listing() {
+    let source = install_source();
+    assert!(!source.contains("a listing of it failed"));
+    assert_eq!(
+        source
+            .matches("removing its entries failed ({error})")
+            .count(),
+        2
+    );
+    assert!(source.contains("a read of what it holds failed ({error})"));
+}
+
 #[test]
 fn the_journal_files_go_only_where_the_service_never_ran_or_a_read_showed_that_it_ended() {
     let source = install_source();

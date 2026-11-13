@@ -883,7 +883,7 @@ fn names_held_by(identity: &ffi::Handle) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Err(error) => format!("a listing of it failed ({error})"),
+        Err(error) => format!("a read of what it holds failed ({error})"),
     }
 }
 
@@ -992,8 +992,10 @@ impl MadeObject {
                         "its own handle could not be read ({error}), so nothing was removed from it"
                     )
                 })?;
-                let leftovers = super::root::remove_children(&held, &|_| true)
-                    .map_err(|error| format!("a listing of it failed ({error}), so it stays"))?;
+                let leftovers =
+                    super::root::remove_children(&held, &|_| true).map_err(|error| {
+                        format!("removing its entries failed ({error}), so it stays")
+                    })?;
                 if !leftovers.is_empty() {
                     return Err(format!(
                         "what it holds was not all removed: {}",
@@ -4373,7 +4375,7 @@ fn sweep_layout(directory: &DirHandle, layout: Layout) -> Vec<String> {
             .iter()
             .map(|left| format!("{} ({})", left.path, left.reason))
             .collect(),
-        Err(error) => vec![format!("a listing of it failed ({error})")],
+        Err(error) => vec![format!("removing its entries failed ({error})")],
     }
 }
 
