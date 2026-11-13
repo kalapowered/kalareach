@@ -314,7 +314,8 @@ fn query<T: Default>(handle: &Handle, class: FILE_INFO_BY_HANDLE_CLASS, what: &s
     Ok(value)
 }
 
-fn key_of(handle: &Handle) -> Result<FileKey> {
+/// The identity of the object behind an open handle.
+pub(super) fn key_of(handle: &Handle) -> Result<FileKey> {
     let info: FILE_ID_INFO = query(handle, FileIdInfo, "reading an object's identity")?;
     Ok(FileKey {
         volume_serial: info.VolumeSerialNumber,
@@ -754,6 +755,22 @@ impl DirHandle {
         share_delete: bool,
         disposition: u32,
     ) -> Result<Handle> {
+        DirHandle::open_beneath(&self.handle, name, access, share_delete, disposition)
+    }
+
+    /// Opens or makes the name `name` directly beneath the directory that `root` holds, relative to
+    /// that handle and never through a path, without following a reparse point.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the name cannot be opened or made.
+    pub fn open_beneath(
+        root: &Handle,
+        name: &[u16],
+        access: u32,
+        share_delete: bool,
+        disposition: u32,
+    ) -> Result<Handle> {
         let bytes = name.len() * 2;
         if bytes > usize::from(u16::MAX) {
             // text: walk-10
@@ -767,7 +784,7 @@ impl DirHandle {
         };
         let attributes = OBJECT_ATTRIBUTES {
             Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: self.handle.raw(),
+            RootDirectory: root.raw(),
             ObjectName: &raw const text,
             // Names come from a listing and are matched exactly, so a directory that tells names apart
             // by case never opens the wrong one.

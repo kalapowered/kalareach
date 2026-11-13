@@ -21,6 +21,18 @@ use serde::{Deserialize, Serialize};
 /// The version of both records.
 pub const STORE_VERSION: u32 = 1;
 
+/// What a record is written beside. On Windows it is the handle that the caller holds of the
+/// directory that holds the record: the replacement is renamed to the record's name relative to that
+/// handle, and the record is proved to be where it is read by opening its name relative to it. No
+/// path names the directory. On other systems a rename by the record's path is all there is, and
+/// nothing is held.
+#[cfg(windows)]
+pub type Beside = crate::win::ffi::Handle;
+/// What a record is written beside: nothing is held on systems other than Windows.
+#[cfg(not(windows))]
+#[derive(Debug)]
+pub struct Beside;
+
 /// A record that could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -201,16 +213,27 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Writes the manifest, replacing the file whole.
+    /// Writes the manifest, replacing the file whole, beside `beside`: on Windows the held handle
+    /// of the directory that holds the file. The installation writes its manifest this way.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Io`] when the file cannot be written.
-    pub fn save(&self, path: &Path) -> Result<(), StoreError> {
+    pub fn save_beside(&self, path: &Path, beside: &Beside) -> Result<(), StoreError> {
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| StoreError::Unreadable(error.to_string()))?;
-        replace(path, &bytes)?;
+        replace(beside, path, &bytes)?;
         Ok(())
+    }
+
+    /// Writes the manifest, replacing the file whole, for a caller that holds no handle of the
+    /// directory that holds it: the directory is opened by the file's path and held for the write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Io`] when the directory cannot be opened or the file cannot be written.
+    pub fn save(&self, path: &Path) -> Result<(), StoreError> {
+        self.save_beside(path, &beside_parent_of(path)?)
     }
 
     /// Reads the manifest at a path.
@@ -333,12 +356,29 @@ fn create(path: &Path, only_new: bool) -> io::Result<File> {
     }
 }
 
+/// What a record is written beside, where the caller holds no handle: the directory that holds the
+/// record, opened by the record's path.
+fn beside_parent_of(path: &Path) -> io::Result<Beside> {
+    #[cfg(windows)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("the record has no directory"))?;
+        crate::win::fresh::hold_directory(parent)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(Beside)
+    }
+}
+
 /// Writes a file whole: to a sibling first, then over the name, so a reader sees the old record or
 /// the new one and never half of either. The sibling has a name of its own that nothing could
 /// have made before (the file's stem, a random name and `.new`) and is made new, so that the
 /// record the broker reads by path is never one that was there before it was written.
-fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    replace_through(path, &replacement_name(path), bytes)
+fn replace(beside: &Beside, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    replace_through(beside, path, &replacement_name(path), bytes)
 }
 
 /// The name a file's replacement is written under: the file's stem, 32 random hexadecimal digits
@@ -356,16 +396,18 @@ fn replacement_name(path: &Path) -> PathBuf {
 /// removed again, so that a failed write leaves no file of its own; a removal that fails too is named
 /// beside the first error. A replacement that this call did not make (the name was taken) is not
 /// touched.
-fn replace_through(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
-    // On Windows the replacement is written, renamed and, where a step fails, marked for removal
-    // through its one handle. The form below is for the other systems: they have no handle that
-    // renames or marks a file by itself, so the replacement is removed by its name.
+fn replace_through(beside: &Beside, path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
+    // On Windows the replacement is written, renamed relative to the held directory handle, proved
+    // to be at the record's name and, where a step fails, marked for removal through its one handle.
+    // The form below is for the other systems: they have no handle that renames or marks a file by
+    // itself, so the replacement is removed by its name.
     #[cfg(windows)]
     {
-        crate::win::fresh::replace_whole(path, staging, bytes)
+        crate::win::fresh::replace_whole(beside, path, staging, bytes)
     }
     #[cfg(not(windows))]
     {
+        let _ = beside;
         replace_by_name(path, staging, bytes)
     }
 }
@@ -396,6 +438,18 @@ fn replace_by_name(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a record in `dir` is written beside: on Windows the held handle of the directory, opened
+    /// as a directory.
+    #[cfg(windows)]
+    fn beside(dir: &Path) -> Beside {
+        crate::win::fresh::hold_directory(dir).unwrap()
+    }
+
+    #[cfg(not(windows))]
+    fn beside(_dir: &Path) -> Beside {
+        Beside
+    }
 
     #[test]
     fn a_replacement_has_a_random_name_of_its_own_every_time() {
@@ -454,7 +508,8 @@ mod tests {
         let path = dir.path().join("manifest.json");
         fs::create_dir(&path).unwrap();
         let staging = dir.path().join("manifest-made.new");
-        let failed = replace_through(&path, &staging, b"the record").unwrap_err();
+        let failed =
+            replace_through(&beside(dir.path()), &path, &staging, b"the record").unwrap_err();
         let look = fs::metadata(&staging).unwrap_err();
         assert_eq!(
             look.kind(),
@@ -474,7 +529,8 @@ mod tests {
         fs::write(&path, b"the record").unwrap();
         let taken = dir.path().join("manifest-taken.new");
         fs::write(&taken, b"another program's file").unwrap();
-        let refused = replace_through(&path, &taken, b"the new record").unwrap_err();
+        let refused =
+            replace_through(&beside(dir.path()), &path, &taken, b"the new record").unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused}");
         assert_eq!(fs::read(&taken).unwrap(), b"another program's file");
         assert_eq!(
