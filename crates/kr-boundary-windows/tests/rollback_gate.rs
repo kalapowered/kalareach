@@ -11,8 +11,15 @@
 
 use std::fs;
 
+/// The source of the installation's product code: the unit cases at the end of the file are left
+/// out, since they call the steps they test.
 fn install_source() -> String {
-    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/win/install.rs")).unwrap()
+    let source =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/win/install.rs")).unwrap();
+    let end = source
+        .find("\n#[cfg(test)]\nmod tests {")
+        .expect("the file ends with its unit cases");
+    source[..end].to_owned()
 }
 
 /// The text of the function that starts with `signature`, to the closing brace at the start of a
@@ -177,10 +184,8 @@ fn the_steps_act_on_an_account_the_service_and_the_identity_service_only_behind_
     // where its own write is on record.
     assert!(steps.contains(".any(|object| !rollback || object.acted_on_by(true));"));
     assert!(steps.contains("&& (!rollback || object.acted_on_by(true))"));
-    assert_eq!(
-        count(&steps, "if service_is_ours && let Some(service) ="),
-        2
-    );
+    assert!(steps.contains("let broker_is_there = match service_is_ours"));
+    assert!(steps.contains("if service_is_ours\n                && let Some(manager) = &manager"));
     assert_eq!(count(&steps, "manager.open(SERVICE)"), 2);
     // The Application Identity service: the rollback's stop needs this run's own start on record.
     let stop = steps.find("Identity(&appid).stop()?").unwrap();
@@ -232,4 +237,39 @@ fn the_installation_records_each_result_after_the_call_that_made_the_object() {
     assert!(lay.contains(
         ".start(|| run.conclude(ObjectKind::AppIdentityStarted, APPID, Outcome::Made))?;"
     ));
+}
+
+#[test]
+fn a_failed_early_read_ends_the_removal_and_is_kept_by_a_rollback() {
+    let source = install_source();
+    let steps = code_of(body_of(&source, "fn undo_recorded("));
+    // The service manager's open: a rollback keeps the failure and the removal returns it, as it
+    // always did, before it changes anything but its own staging directory.
+    let opened = steps
+        .find("let manager = match opened {")
+        .expect("the service manager's open is matched");
+    let kept = steps[opened..]
+        .find("Err(error) if rollback => {")
+        .expect("a rollback keeps the failure");
+    let returned = steps[opened..]
+        .find("Err(error) => return Err(error),")
+        .expect("the removal returns it");
+    assert!(kept < returned);
+    assert!(steps[opened..opened + returned].contains("failures.push("));
+    // The broker's first open and status read: the same two arms.
+    let broker = steps
+        .find("let broker_is_there = match")
+        .expect("the broker's first open and status read are matched");
+    let kept = steps[broker..]
+        .find("Err(error) if rollback => {")
+        .expect("a rollback keeps the failure");
+    let returned = steps[broker..]
+        .find("Err(error) => return Err(error),")
+        .expect("the removal returns it");
+    assert!(kept < returned);
+    assert!(steps[broker..broker + returned].contains("keep("));
+    // No read of the service manager stands outside those two matches or a step under `keep`.
+    assert_eq!(count(&steps, "service::manager()"), 1);
+    assert_eq!(count(&steps, "manager.open(SERVICE)?"), 2);
+    assert_eq!(count(&steps, "manager.open(APPID)?"), 2);
 }

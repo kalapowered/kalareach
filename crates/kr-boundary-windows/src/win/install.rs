@@ -5036,19 +5036,46 @@ fn undo_recorded(
         }
     }
     let channel = Channel::new(&paths.staging);
-    let manager = service::manager()?;
     let mut failures: Vec<String> = earlier;
     // What the steps may act on is what a result shows: a rollback acts on what this run made, and
     // the removal on what a run made or found. An object that is on record as an intent with no
     // result is not acted on, and a line says so.
     let rollback = tree.is_rollback();
+    // A rollback has failed already and undoes what it can: a read that fails in one of its steps
+    // is kept in the result and the other steps run. The removal stops at the service manager's
+    // open and at the broker's first open and status read, before it has changed anything but the
+    // staging directory that it made itself, as it did before.
+    let opened = service::manager().map_err(Error::from);
+    #[cfg(feature = "testing")]
+    let opened = opened.and_then(|manager| {
+        crate::manifest::forced::failure_at("manager")
+            .map(|()| manager)
+            .map_err(Error::Failed)
+    });
+    let manager = match opened {
+        Ok(manager) => Some(manager),
+        Err(error) if rollback => {
+            // text: remove_at-30
+            say(&format!(
+                "the service manager could not be opened ({error}), so the broker's maintenance state, the Application Identity service's steps and the service's deletion are not tried; the other steps run"
+            ));
+            failures.push(format!(
+                "opening the service manager: {error}; the steps that need it were not tried"
+            ));
+            None
+        }
+        Err(error) => return Err(error),
+    };
     // The removal decides about an intent with no result (a run that died) by a read of the object,
     // and not by the absence of the result; a rollback has the results of its own run and acts on
     // them alone.
     let service_is_ours = match manifest.find(ObjectKind::Service, SERVICE) {
         Some(object) if object.acted_on_by(rollback) => true,
         Some(object) if !rollback && object.outcome.is_none() => {
-            let read = read_service_intent(&manager, paths);
+            let read = manager.as_ref().map_or_else(
+                || remedy::IntentRead::Failed("the service manager was not opened".to_owned()),
+                |manager| read_service_intent(manager, paths),
+            );
             // text: remove_at-33-service
             say(&remedy::intent_words(
                 "the service",
@@ -5067,11 +5094,31 @@ fn undo_recorded(
     };
     // (1) the broker stays up and refuses new invocations.
     let mut session = None;
-    if service_is_ours && let Some(service) = manager.open(SERVICE)? {
-        if !service.status()?.running() {
-            let _ = service.start();
-            let _ = service.wait_for(false, Duration::from_secs(60));
+    let broker_is_there = match service_is_ours
+        .then_some(manager.as_ref())
+        .flatten()
+        .map(|manager| -> Result<bool, Error> {
+            #[cfg(feature = "testing")]
+            crate::manifest::forced::failure_at("broker").map_err(Error::Failed)?;
+            let Some(service) = manager.open(SERVICE)? else {
+                return Ok(false);
+            };
+            if !service.status()?.running() {
+                let _ = service.start();
+                let _ = service.wait_for(false, Duration::from_secs(60));
+            }
+            Ok(true)
+        })
+        .transpose()
+    {
+        Ok(there) => there.unwrap_or(false),
+        Err(error) if rollback => {
+            keep(Err(error), "reading the broker's service", &mut failures);
+            false
         }
+        Err(error) => return Err(error),
+    };
+    if broker_is_there {
         match open_session().and_then(|mut connection| {
             let answer = ask(&mut connection, &Request::Maintenance { on: true })?;
             Ok((connection, answer))
@@ -5237,8 +5284,11 @@ fn undo_recorded(
             "the Application Identity service's start type",
         ));
     }
-    if let (Some(object), Some(prior)) = (manifest.find(ObjectKind::AppIdentity, APPID), &prior)
-        && (!rollback || object.acted_on_by(true))
+    if let (Some(object), Some(prior), Some(manager)) = (
+        manifest.find(ObjectKind::AppIdentity, APPID),
+        &prior,
+        &manager,
+    ) && (!rollback || object.acted_on_by(true))
     {
         keep(
             (|| -> Result<(), Error> {
@@ -5306,7 +5356,7 @@ fn undo_recorded(
 
     // (5) the Application Identity service stops if the installation started it and no rule is left,
     // and the broker's service goes.
-    if let Some(prior) = &prior {
+    if let (Some(prior), Some(manager)) = (&prior, &manager) {
         keep(
             (|| -> Result<(), Error> {
                 let (_, effective) = channel.effective()?;
@@ -5354,7 +5404,10 @@ fn undo_recorded(
     }
     keep(
         (|| -> Result<(), Error> {
-            if service_is_ours && let Some(service) = manager.open(SERVICE)? {
+            if service_is_ours
+                && let Some(manager) = &manager
+                && let Some(service) = manager.open(SERVICE)?
+            {
                 if service.status()?.running() {
                     service.stop()?;
                     service.wait_for(true, Duration::from_secs(60))?;
@@ -6129,6 +6182,39 @@ mod tests {
 
     /// A run that wrote no record has none that the rollback could have marked: the objects it
     /// marked are named, and nothing says that records are deleted.
+    /// A failed read in an early step of a rollback is kept in its result and the later steps still
+    /// run: a journal file of the run is deleted whichever of the service manager's open and the
+    /// broker's first open and status read failed. The forced failure is the process's, so the
+    /// cases that use one share a lock.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_failed_early_read_of_a_rollback_is_kept_and_the_later_steps_still_run() {
+        static ONE: Mutex<()> = Mutex::new(());
+        let _one = ffi::locked(&ONE);
+        for (point, words) in [
+            ("manager", "opening the service manager"),
+            ("broker", "reading the broker's service"),
+        ] {
+            let top = tempfile::tempdir().unwrap();
+            let mut run = laid_run(top.path());
+            run.manifest
+                .conclude(ObjectKind::Service, SERVICE, Outcome::Made);
+            let journal = run.paths.journal.join("a.journal");
+            std::fs::write(&journal, b"x").unwrap();
+            crate::manifest::forced::fail_the_next(point);
+            let error = roll_back(&mut run).unwrap_err().to_string();
+            assert!(error.contains(words), "{point}: {error}");
+            assert!(
+                error.contains("a failure forced for a case"),
+                "{point}: {error}"
+            );
+            assert!(
+                !journal.try_exists().unwrap(),
+                "{point}: the journal step ran after the failed read"
+            );
+        }
+    }
+
     #[test]
     fn a_run_that_wrote_no_record_has_no_records_deleted_and_names_what_was_marked() {
         let top = tempfile::tempdir().unwrap();
