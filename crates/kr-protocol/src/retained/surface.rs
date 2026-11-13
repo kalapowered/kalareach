@@ -594,8 +594,11 @@ type BranchKey = (String, usize);
 /// place: `place#text` for the first branch of a text, and `place#number@text` for a later one.
 /// Every text [`head`] gives begins with a letter, so the number, which begins with a digit, comes
 /// before the text: no text can take the form of a later branch's label, a later branch's label is
-/// never the label of a branch whose text is a constant that looks like it, and two branches have
-/// one label only when they have one key.
+/// never the label of a branch whose text is a constant that looks like it, and two branches of one
+/// list have one label only when they have one key. Branches of lists nested in one another can
+/// share a label, since a text can hold a `#`: a rule that decides by a label reads only the
+/// labels that it can tell by their shape (`is_an_added_method` in `public_contract.rs` takes a
+/// name with no `#` in it, which only a branch of the choice itself has).
 fn branch_label(place: &str, (text, number): &BranchKey) -> String {
     if *number == 0 {
         format!("{place}#{text}")

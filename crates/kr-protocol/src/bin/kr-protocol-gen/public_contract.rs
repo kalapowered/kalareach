@@ -154,7 +154,14 @@ fn is_an_added_method(old: &Value, new: &Value, difference: &Difference) -> bool
     if difference.kind != DifferenceKind::Added || difference.detail != "a variant" {
         return false;
     }
-    let Some(name) = difference.at.strip_prefix("Method#const:") else {
+    // A method comes directly from `Method`'s `oneOf`, so its label has the one `#` that follows
+    // `Method`: a rest that holds `#`, `[` or `{` is a branch nested in a branch, or a label made by
+    // a number, and is no method's name.
+    let Some(name) = difference
+        .at
+        .strip_prefix("Method#const:")
+        .filter(|name| !name.contains(['#', '[', '{']))
+    else {
         return false;
     };
     let plain = new["$defs"]["Method"]["oneOf"]
