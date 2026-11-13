@@ -193,8 +193,10 @@ async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
                  BEGIN SELECT RAISE(ABORT, 'no room'); END;",
         )
         .expect("the fault is in place");
-    // A lapse this host found and could not write down.
-    controller.keep_lapse(kr_ipc::now_ms().get());
+    // A lapse this host found and could not write down. It is kept strictly above the floor: a
+    // write of the floor already in flight when the fault was put in place, by the daemon's own
+    // tick, may cover the floor's own moment. This is no tolerance.
+    controller.keep_lapse(controller.utc_floor().get() + 1);
 
     let now_ms = kr_ipc::now_ms().get();
     let lasting = held(&controller, GrantExpiry::Never);
