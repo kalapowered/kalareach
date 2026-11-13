@@ -8,6 +8,7 @@ use kr_boundary_windows::frame::{self, FrameError, Request, Response};
 use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior, STORE_VERSION};
 use kr_boundary_windows::policy::{
     self, Action, Emptied, Kind, Mode, Policy, RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT,
+    Recorded,
 };
 use kr_boundary_windows::state::{Status, Verdict};
 
@@ -753,6 +754,72 @@ fn the_removal_writes_an_empty_audit_only_collection_back_as_the_record_holds_it
     assert_eq!(left.exe_mode(), Some(Mode::AuditOnly));
     assert!(left.collections[policy::EXE].rules.is_empty(), "{found}");
     assert!(!found.contains("NotConfigured"), "{found}");
+}
+
+/// An earlier-state record that cannot be read selects no write: the removal takes out the
+/// installation's rules and leaves the collection as it finds it, whatever its mode, and gives the
+/// parse error, so that the lines can say that nothing was written back and nothing compared. It
+/// used to write the mode "not configured" for such a record, which the record never gave.
+#[test]
+fn a_record_whose_policy_does_not_parse_selects_no_write() {
+    let unread = Recorded::of(Policy::parse("this is not a policy"));
+    let Recorded::Unread(why) = &unread else {
+        panic!("a text that is not a policy was read: {unread:?}");
+    };
+    assert!(why.contains("not one that this program reads"), "{why}");
+    let invalid_entry = Recorded::of(Policy::parse(
+        r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="AuditOnly"><FilePathRule Id="x" Name="n" Description="" UserOrGroupSid="S-1-1-0" Action="Allow"><Conditions><FilePathCondition Path="*"/></Conditions></FilePathRule></RuleCollection></AppLockerPolicy>"#,
+    ));
+    assert!(
+        matches!(invalid_entry, Recorded::Unread(_)),
+        "{invalid_entry:?}"
+    );
+    for present in [
+        None,
+        Some(Mode::Enabled),
+        Some(Mode::AuditOnly),
+        Some(Mode::NotConfigured),
+    ] {
+        for shared in [false, true] {
+            assert_eq!(
+                policy::emptied_for(&unread, present, shared),
+                Emptied::AsFound,
+                "{present:?} {shared}"
+            );
+        }
+    }
+
+    // The collection that the installation set is written without its rules and keeps its mode as
+    // found; no mode of a record is written.
+    let xml = installed().render();
+    let ours = [RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT];
+    let written = policy::strip(&xml, &ours, Emptied::AsFound).unwrap();
+    let left = Policy::parse(&written).unwrap();
+    assert_eq!(left.exe_mode(), Some(Mode::Enabled), "{written}");
+    assert!(left.collections[policy::EXE].rules.is_empty(), "{written}");
+    assert!(!written.contains("NotConfigured"), "{written}");
+
+    // A record that was read keeps its choices: the mode of an empty collection, and not
+    // configured where the record gives none.
+    let record = |mode: &str| {
+        Recorded::of(Policy::parse(&format!(
+            r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="{mode}"></RuleCollection></AppLockerPolicy>"#
+        )))
+    };
+    assert_eq!(record("AuditOnly"), Recorded::Read(Some(Mode::AuditOnly)));
+    assert_eq!(record("NotConfigured"), Recorded::Read(None));
+    assert_eq!(
+        policy::emptied_for(&record("AuditOnly"), Some(Mode::Enabled), false),
+        Emptied::Mode(Mode::AuditOnly)
+    );
+    assert_eq!(
+        policy::emptied_for(&record("NotConfigured"), Some(Mode::Enabled), false),
+        Emptied::NotConfigured
+    );
+    assert_eq!(
+        policy::emptied_for(&record("AuditOnly"), Some(Mode::Enabled), true),
+        Emptied::NotConfigured
+    );
 }
 
 /// A client asks the platform for what the pipe's list grants and for nothing beyond it. The

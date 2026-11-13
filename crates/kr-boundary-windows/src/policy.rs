@@ -650,6 +650,48 @@ pub enum Emptied {
     AsFound,
 }
 
+/// What the earlier-state record gives for the executable collection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recorded {
+    /// The record's policy was read. The mode of its executable collection where that holds no
+    /// rule and a mode other than not configured; none where the record holds no such collection.
+    Read(Option<Mode>),
+    /// The record's policy was not read: no record was loaded, or its policy does not parse. The
+    /// text is the reason. A record that was not read gives no mode, so no mode is written back
+    /// and nothing is compared with it.
+    Unread(String),
+}
+
+impl Recorded {
+    /// What the record gives, from the parse of its policy.
+    #[must_use]
+    pub fn of(record: Result<Policy, PolicyError>) -> Recorded {
+        match record {
+            Ok(policy) => Recorded::Read(policy.recorded_empty_mode()),
+            Err(error) => Recorded::Unread(error.to_string()),
+        }
+    }
+}
+
+/// How the removal writes an executable collection that is left with no rule of anyone else's,
+/// from what the record gave, the mode that the present collection has, and whether a rule that
+/// the installation did not make shares the collection. A record that was not read selects no
+/// write: the collection is left as it is found, without the installation's rules.
+#[must_use]
+pub fn emptied_for(recorded: &Recorded, present: Option<Mode>, shared: bool) -> Emptied {
+    match recorded {
+        Recorded::Unread(_) => Emptied::AsFound,
+        Recorded::Read(Some(mode)) if !shared => {
+            if present == Some(Mode::Enabled) {
+                Emptied::Mode(*mode)
+            } else {
+                Emptied::AsFound
+            }
+        }
+        Recorded::Read(_) => Emptied::NotConfigured,
+    }
+}
+
 /// Takes the rules with the given identifiers out of a policy's own XML and leaves everything
 /// else exactly as the platform wrote it: another rule's name, its kind and its conditions, and the
 /// collections this crate does not model. An executable collection left with no rule is written as
