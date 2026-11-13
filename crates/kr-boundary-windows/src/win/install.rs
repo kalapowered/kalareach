@@ -825,8 +825,8 @@ fn with_grounds<T>(
 }
 
 /// What the reads of this run show of the rest of the installation: nothing found only where the
-/// service, both accounts and the policy were each read and showed nothing of the installation. A
-/// read that finds something or fails leaves the answer at "may be installed", with the words that
+/// service, both accounts, the accounts that carry the comment and the policy were each read and
+/// showed nothing of the installation. A read that finds something or fails leaves the answer at "may be installed", with the words that
 /// say which read found what, or failed with which error.
 fn standing_of(paths: &Paths) -> remedy::Standing {
     match something_of_the_installation(paths) {
@@ -835,8 +835,8 @@ fn standing_of(paths: &Paths) -> remedy::Standing {
     }
 }
 
-/// The first read of the service, of the two accounts and of the policy that shows a part of the
-/// installation or fails, in words; none where each read succeeded and showed nothing. A read that
+/// The first read of the service, of the two accounts by name, of the accounts that carry the
+/// installation's comment and of the policy that shows a part of the installation or fails, in words; none where each read succeeded and showed nothing. A read that
 /// fails is not "nothing found".
 fn something_of_the_installation(paths: &Paths) -> Option<String> {
     match service::manager().and_then(|manager| manager.open(SERVICE)) {
@@ -853,6 +853,23 @@ fn something_of_the_installation(paths: &Paths) -> Option<String> {
             Err(error) => {
                 return Some(format!("a lookup of the account {name} failed ({error})"));
             }
+        }
+    }
+    // One enumeration of the local accounts, for the comment that the installation gives them: an
+    // account that an administrator renamed is still found by it. Another account with the same
+    // comment is found too, which only withholds the move, the safe direction.
+    match account::carrying_the_installation_comment() {
+        Ok(names) if names.is_empty() => {}
+        Ok(names) => {
+            return Some(format!(
+                "an account carries the comment that the installation gives its accounts: {}",
+                names.join(", ")
+            ));
+        }
+        Err(error) => {
+            return Some(format!(
+                "an enumeration of the local accounts failed ({error})"
+            ));
         }
     }
     // The folder above the data directory was checked and held by the caller, and is where the
