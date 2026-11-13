@@ -126,6 +126,10 @@ impl Reports {
     }
 }
 
+/// The pause that the wait of [`Job::end`] takes when the call on the completion port fails at
+/// once, so that its loop does not turn with no pause until its bound.
+const WAKE_PAUSE: Duration = Duration::from_millis(10);
+
 /// A job object with a completion port.
 #[derive(Debug)]
 pub struct Job {
@@ -457,12 +461,13 @@ impl Job {
         let mut bytes = 0_u32;
         let mut key = 0_usize;
         let mut overlapped = null_mut();
+        let began = Instant::now();
         // SAFETY: the port is open and the out-parameters are this function's own.
         #[expect(
             clippy::disallowed_methods,
             reason = "its answer is only a wake-up: whether a message came or the time ran out, the next read of the job's count and of the retained processes decides"
         )]
-        let _woken = unsafe {
+        let woken = unsafe {
             GetQueuedCompletionStatus(
                 self.port.raw(),
                 &raw mut bytes,
@@ -471,5 +476,11 @@ impl Job {
                 super::ffi::milliseconds(up_to, u32::MAX),
             )
         };
+        // A call that failed at once (it came back with no message long before its time) would turn
+        // the caller's loop with no pause until its bound: it waits out a short pause instead. The
+        // answer decides nothing but this pace.
+        if woken == 0 && began.elapsed() < up_to.min(WAKE_PAUSE) {
+            std::thread::sleep(WAKE_PAUSE);
+        }
     }
 }
