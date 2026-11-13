@@ -216,6 +216,8 @@ fn a_policy_entry_with_a_missing_or_unknown_field_is_refused_as_not_understood()
         "{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a0}",
         "{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a0g}",
         "b7d3c1e05a414e7b9c1d4b0a6c2f7a01",
+        "b7d3c1e0-5a41",
+        "b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01-1",
         "S-1-5-32-544",
         "theirs",
     ] {
@@ -236,6 +238,9 @@ fn a_policy_entry_with_a_missing_or_unknown_field_is_refused_as_not_understood()
         "S-1-5-21-111-x-333-1001",
         "S-1-+5-32-544",
         "S-1-5-4294967296",
+        "S-1-5-021",
+        "S-1-281474976710656-1",
+        "S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16",
         "{b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01}",
     ] {
         refused(
@@ -249,6 +254,9 @@ fn a_policy_entry_with_a_missing_or_unknown_field_is_refused_as_not_understood()
     for attributes in [
         r#"Action="Allow" UserOrGroupSid="S-1-5-21-111-222-333-1001" Id="B7D3C1E0-5A41-4E7B-9C1D-4B0A6C2F7A01""#,
         r#"Action="Deny" UserOrGroupSid=" s-1-5-32-544 " Id=" {b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01} ""#,
+        r#"Action="Deny" UserOrGroupSid="S-1-5-4294967295" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
+        r#"Action="Deny" UserOrGroupSid="S-1-281474976710655-0" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
+        r#"Action="Deny" UserOrGroupSid="S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15" Id="b7d3c1e0-5a41-4e7b-9c1d-4b0a6c2f7a01""#,
     ] {
         Policy::parse(&rule(attributes)).expect("an identifier of its form is read");
     }
