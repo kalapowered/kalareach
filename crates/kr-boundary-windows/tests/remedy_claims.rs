@@ -572,7 +572,7 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
     );
     assert_eq!(
         one,
-        "The steps of the rollback ended without a failure, but this run could not take away all that it made: C:\\Data (the platform refused to mark it for removal: Windows error 145; it holds a.txt)."
+        "The rollback's steps that undo the policy, the service, the accounts and the program directory ended without a failure, but this run could not take away all that it laid in the data directory's place: C:\\Data (the platform refused to mark it for removal: Windows error 145; it holds a.txt)."
     );
     let two = rollback_laid_stays(
         &[
