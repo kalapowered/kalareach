@@ -25,9 +25,10 @@ pub const PATIENCE: Duration = Duration::from_secs(60);
 
 /// A daemon on the network with one adopted worker, and the keys of the environment's owner.
 pub struct Environment {
-    pub host: Host,
     pub owner: DeviceKeys,
     pub worker: Worker,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    pub host: Host,
 }
 
 impl Environment {

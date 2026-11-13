@@ -116,11 +116,12 @@ impl std::ops::Deref for Connected {
 
 /// A daemon, a worker over a real terminal whose time service keeps its clock, and the owner.
 struct Rig {
-    host: Host,
     worker: Worker,
     owner: DeviceKeys,
     output: PathBuf,
     _kept: tempfile::TempDir,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Rig {

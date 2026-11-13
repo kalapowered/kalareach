@@ -457,9 +457,10 @@ impl Worker {
 
 /// A daemon on the network with one adopted worker, and the keys of the environment's owner.
 struct Environment {
-    host: Host,
     owner: DeviceKeys,
     worker: Worker,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Environment {

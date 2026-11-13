@@ -32,10 +32,11 @@ use net_support::{Device, Host, connect, pair_with, proposal};
 /// A host whose daemon started on a tree that holds a record of a restore, with a device paired
 /// before the record was placed.
 struct Restored {
-    host: Host,
     owner: DeviceKeys,
     device: Device,
     record: DeviceRecord,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 /// The file the record is kept in.

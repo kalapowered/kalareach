@@ -841,7 +841,6 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
 /// A daemon that starts real workers, on a tree of its own, and the environment it runs in.
 #[cfg(unix)]
 struct Daemon {
-    tree: teardown::Tree,
     controller: Option<Arc<Controller>>,
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
@@ -849,6 +848,8 @@ struct Daemon {
     worker: std::path::PathBuf,
     /// The environment the daemon runs in, which a daemon started again on the tree runs in too.
     host_environment: Vec<(String, String)>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    tree: teardown::Tree,
 }
 
 /// A session a [`Daemon`] started and left running, and what its shell reports of its environment.

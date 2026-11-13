@@ -62,7 +62,6 @@ fn application(kept: &std::path::Path) -> String {
 /// A daemon with an adopted worker and a paired device attached to its session, holding the input
 /// lease, on a connection that sends its own frames.
 struct Rig {
-    host: Host,
     worker: Worker,
     device: RawDevice,
     paired: (Device, DeviceRecord),
@@ -76,6 +75,8 @@ struct Rig {
     /// serves.
     elsewhere: SessionId,
     _kept: tempfile::TempDir,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 /// A daemon whose one session's worker runs the application, and the keys of its owner.

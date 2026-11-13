@@ -2406,10 +2406,11 @@ fn device_reach(since: u64, device_id: DeviceId) -> RevisionReach {
 /// A worker that has acknowledged revision 2 and a phone that holds its input lease under
 /// [`device`]'s grant, at that revision.
 struct Typing {
-    wired: Wired,
     authority: BoundLink,
     phone: BoundLink,
     attachment: AttachmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    wired: Wired,
 }
 
 const OBSERVE_AND_TYPE: [AttachmentCapability; 2] = [
@@ -2579,12 +2580,13 @@ const OBSERVE_AND_SIZE: [AttachmentCapability; 2] = [
 /// A worker that has acknowledged revision 2, a phone that owns the session's size under
 /// [`device`]'s grant, and the owner's own window, which claimed the size after it.
 struct Resizing {
-    wired: Wired,
     authority: BoundLink,
     phone: BoundLink,
     window: LocalClient,
     phones: AttachmentId,
     windows: AttachmentId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    wired: Wired,
 }
 
 impl Resizing {

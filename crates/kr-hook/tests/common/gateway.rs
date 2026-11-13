@@ -112,7 +112,6 @@ pub fn built_stand_in() -> PathBuf {
 /// and a signed record that names that copy.
 pub struct Gateway {
     pub group: LaunchGroup,
-    pub placed: Placed,
     pub runtime: tokio::runtime::Runtime,
     pub broker: Arc<Broker>,
     /// The worker service the session runs, where the harness was built with one: its maintenance
@@ -123,6 +122,8 @@ pub struct Gateway {
     pub executable: PathBuf,
     pub outputs: PathBuf,
     pub generation: std::sync::atomic::AtomicU64,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    pub placed: Placed,
 }
 
 /// What a session's view was told about a resource.

@@ -22,11 +22,12 @@ const RELAY_DEADLINE: Duration = kr_hook::relay::REGISTRATION_APPEARS_WITHIN;
 
 /// A launch's runtime directory beside a placed forwarder.
 struct Launch {
-    placed: Placed,
     directory: PathBuf,
     /// The runtime the listeners of this launch are bound and accepted on: a named pipe is bound to
     /// the runtime that is current where it is made.
     runtime: tokio::runtime::Runtime,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    placed: Placed,
 }
 
 impl Launch {

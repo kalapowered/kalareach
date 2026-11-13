@@ -82,7 +82,6 @@ impl kr_client::services::ServiceSigner for Installation {
 /// Everything one test holds: a daemon whose configuration selects a feed, the feed, and the remote
 /// owner who publishes to it.
 struct Rig {
-    host: Host,
     served: Served,
     timer: Arc<HeldTimer>,
     owner: DeviceKeys,
@@ -91,6 +90,8 @@ struct Rig {
     host_keys: DeviceKeys,
     /// The owner, as a remote owner's client reaches the feed.
     remote: AuthorityFeedClient,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 fn client_for(origin: &str, key: AuthorisationKeyPair) -> AuthorityFeedClient {
@@ -734,11 +735,12 @@ fn put_the_registry_back(tree: &kr_ipc::testing::TempHost, copy: &std::path::Pat
 /// Two devices paired, a copy of the registry taken, and the first revoked from the remote owner's
 /// feed, carried out and acknowledged as complete: the state a restore of the copy goes back past.
 struct Restorable {
-    rig: Rig,
     revoked: (Device, kr_controller::service::net::devices::DeviceRecord),
     kept: (Device, kr_controller::service::net::devices::DeviceRecord),
     earlier: std::path::PathBuf,
     revision: kr_protocol::ids::AuthorityRevision,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 async fn a_revocation_the_registry_will_lose() -> Restorable {
@@ -1876,7 +1878,6 @@ impl Rig {
 /// A host whose registry was put back to before an owner was paired, with the feed showing that
 /// owner's completed withdrawal of a device the registry holds live.
 struct Unverifiable {
-    rig: Rig,
     /// The device the withdrawal names.
     victim: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// A device it does not name.
@@ -1888,6 +1889,8 @@ struct Unverifiable {
     /// How many changes to the list of keys that may remove the feed had reached the feed when the
     /// registry was put back, when `delegations` named faults.
     delegated: usize,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 /// Pairs the device the withdrawal will name with `victim_rights` and one it will not, which is
@@ -3371,7 +3374,6 @@ impl Rig {
 /// A device's request that the host has not taken, ahead in the feed of a withdrawal of that device
 /// that an earlier run of the host carried out, and a host that stands behind the feed.
 struct PutOff {
-    rig: Rig,
     /// The device that made the first request, an owner.
     issuer: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// The device the first request names.
@@ -3380,6 +3382,8 @@ struct PutOff {
     kept: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// The first request.
     first: RevocationRequest,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 /// Pairs an owner `v`, a device `t` its request will name and a device `k` nothing names, has `v`
@@ -3635,13 +3639,14 @@ async fn a_request_of_a_device_the_owner_revoked_at_the_machine_is_refused() {
 /// A device revoked at the machine, a request it published, and the live owner's request naming it
 /// after that.
 struct RevokedIssuer {
-    rig: Rig,
     /// The device revoked at the machine, whose key the request is signed with.
     issuer: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// The device its request names.
     target: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// The request.
     first: RevocationRequest,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 /// Pairs an owner `v` and a device `t`, has the owner at the machine revoke `v`, and publishes a
@@ -3773,7 +3778,6 @@ impl Rig {
 /// and the clock is not proven, with a withdrawal the feed shows complete behind it, and `fillers`
 /// requests from strangers between them. The host is not behind its feed.
 struct Undecidable {
-    rig: Rig,
     /// The owner whose request cannot be judged.
     issuer: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// The device that request names.
@@ -3787,6 +3791,8 @@ struct Undecidable {
     named: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// A second owner, who holds the right to manage the host and is listed to the feed.
     other_owner: (Device, kr_controller::service::net::devices::DeviceRecord),
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 /// What the feed holds behind a request whose issuer cannot be judged, in the order it is
@@ -5642,7 +5648,6 @@ fn a_restore_was_found(tree: &kr_ipc::testing::TempHost) {
 /// A host whose feed holds a request by a key the host does not know that names `target`, and then
 /// `fillers` requests of other keys that name nothing the host holds. The host has not read them.
 struct Stranger {
-    rig: Rig,
     /// The device the request names.
     target: Paired,
     /// A device nothing names.
@@ -5651,6 +5656,8 @@ struct Stranger {
     key: AuthorisationKeyPair,
     /// The request.
     request: RevocationRequest,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 async fn a_request_by_a_key_the_host_does_not_know(fillers: usize) -> Stranger {
@@ -5904,7 +5911,6 @@ impl Rig {
 /// A host whose registry was put back to before an owner was paired, with a request of that owner
 /// that an earlier run of the host carried out and acknowledged as Pending.
 struct PendingRequest {
-    rig: Rig,
     /// The device the request names.
     target: Paired,
     /// A device nothing names.
@@ -5913,6 +5919,8 @@ struct PendingRequest {
     key: AuthorisationKeyPair,
     /// The request.
     request: RevocationRequest,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 async fn a_pending_request_of_an_owner_the_restored_registry_lacks() -> PendingRequest {
@@ -6285,11 +6293,12 @@ async fn a_device_the_host_revoked_after_a_restore_stays_owed_when_the_registry_
 /// A device the feed revoked and one it revoked after, both paired and live in the copy taken
 /// first, and the registry as it was after the first revocation in a second copy.
 struct TwoRevocations {
-    rig: Rig,
     first_revoked: (Device, kr_controller::service::net::devices::DeviceRecord),
     second_revoked: (Device, kr_controller::service::net::devices::DeviceRecord),
     first_request: RevocationRequest,
     second_request: RevocationRequest,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 /// Two devices paired, the owner's feed revoking the first and then the second, each carried out
@@ -7390,10 +7399,11 @@ async fn a_feed_that_removes_the_host_after_the_first_record_write_failed_leaves
 /// that names all three, and a host that starts with a restore found: every live owner device is
 /// owed. `file` is where the record of the restore is.
 struct EveryOwnerOwed {
-    rig: Rig,
     /// A second owner device, and a device that is no owner's: the others the request names.
     others: [Paired; 2],
     file: std::path::PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    rig: Rig,
 }
 
 async fn a_request_that_names_every_owner_device() -> EveryOwnerOwed {

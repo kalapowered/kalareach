@@ -73,11 +73,12 @@ async fn listed(host: &Host, session_id: SessionId) -> GrantListResult {
 
 /// A share of a session to a device, the invitation to redeem it and the device that redeems it.
 struct Offered {
-    host: Host,
     device: Device,
     record: DeviceRecord,
     session_id: SessionId,
     invitation_id: InvitationId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 async fn offered() -> Offered {

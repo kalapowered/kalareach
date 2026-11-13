@@ -90,13 +90,14 @@ impl QuiescenceAuthority for Probing<'_> {
 /// A repository with a checkout the user owns, a workspace selected on it, a worktree of it the
 /// host made, and a version to apply.
 struct Scene {
-    fixture: Fixture,
     project: ProjectRepositoryId,
     shared: WorkspaceId,
     isolated: WorkspaceId,
     version: VersionRef,
     checkout: std::path::PathBuf,
     tree: std::path::PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    fixture: Fixture,
 }
 
 fn scene() -> Scene {

@@ -2462,13 +2462,14 @@ async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services
 /// A daemon on the loopback network with an owner device, whose confirmations the project service
 /// takes for its location decisions.
 struct Owned {
-    host: Host,
     network: kr_controller::service::net::Network,
     /// This host's owner as the project service reaches it: the daemon's own pairing service, whose
     /// ledger the daemon's sweep keeps.
     owner: Arc<kr_controller::project::HostOwner>,
     /// The owner device, when this daemon paired it rather than finding it on record.
     owner_device: Option<kr_protocol::ids::DeviceId>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Owned {

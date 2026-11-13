@@ -131,7 +131,6 @@ const NOT_CARRIED: Moment = Moment::Refuse {
 /// Everything one test holds: a daemon whose configuration selects a lease service and names the
 /// account that pays, the service, and the clocks.
 struct Rig {
-    host: Host,
     served: Served,
     timer: Arc<HeldTimer>,
     wall: MovedWall,
@@ -139,6 +138,8 @@ struct Rig {
     host_key: AuthorisationKey,
     /// The sign-in the host was started with.
     sign_in: SignIn,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Rig {

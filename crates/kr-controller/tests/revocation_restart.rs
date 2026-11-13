@@ -408,12 +408,13 @@ const NAMES_A_PAGE_CARRIES: usize = 8;
 /// A daemon whose worker has a fence of more names than one acknowledgement carries, and the
 /// revocation of a share the worker is named in, answered once with names still owing.
 struct Owing {
-    host: Host,
     workers: Vec<Worker>,
     /// The revocation, as the local owner sent it: repeating it repeats the action.
     mutation: kr_protocol::envelope::MutationRequest,
     session_id: kr_protocol::ids::SessionId,
     owed: usize,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 /// How long the whole arrangement of [`Owing`] may take, every attempt's start, its request and its

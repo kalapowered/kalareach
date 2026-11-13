@@ -845,9 +845,10 @@ const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 /// A daemon on the network that has adopted workers in this process, and the keys of the
 /// environment's owner.
 pub struct Adopted {
-    pub host: Host,
     pub owner: DeviceKeys,
     pub workers: Vec<Worker>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    pub host: Host,
 }
 
 impl Adopted {

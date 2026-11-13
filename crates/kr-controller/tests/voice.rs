@@ -953,10 +953,11 @@ impl kr_controller::voice::SessionFacts for ReadsThenPrivacyChanges {
 /// A daemon whose voice service reads through [`ReadsThenPrivacyChanges`], with a call started,
 /// and what the test holds of the source.
 struct Described {
-    host: Host,
     voice_session_id: kr_protocol::ids::VoiceSessionId,
     after_the_next_read: Arc<std::sync::Mutex<ThenPrivacy>>,
     reads: Arc<std::sync::atomic::AtomicUsize>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 impl Described {
@@ -2099,7 +2100,6 @@ async fn a_retry_is_not_answered_when_a_fence_is_owed_while_its_record_is_found(
 /// A paired device on a connection that sends its own frames, holding a standing voice grant over
 /// one session and the preparation a start of a call over it is bound to.
 struct RawVoice {
-    host: net_support::Host,
     /// The device's own endpoint, which the connection below was dialled from and lives on.
     device: net_support::Device,
     record: kr_controller::service::net::devices::DeviceRecord,
@@ -2107,6 +2107,8 @@ struct RawVoice {
     device_id: DeviceId,
     target: ActionTarget,
     start: VoiceStartParams,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: net_support::Host,
 }
 
 impl RawVoice {

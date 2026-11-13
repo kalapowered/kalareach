@@ -2496,13 +2496,14 @@ async fn a_terminal_back_from_history_is_told_what_the_screen_it_will_be_drawn_h
 /// Everything stays alive for the length of the test: the owner holds the size, and a dropped
 /// connection detaches its attachment.
 struct Panned {
-    host: Host,
     typist: Typist,
     terminal: Attached,
     reader: LocalClient,
     marker: kr_protocol::recovery::ResyncRequired,
     short: Dimensions,
     _owner: Attached,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
 }
 
 /// Builds the screen the next two tests start from: the application has written `x`, and then

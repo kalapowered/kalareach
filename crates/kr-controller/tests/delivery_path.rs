@@ -1030,10 +1030,11 @@ struct OpenChannel {
 
 /// A daemon on the network with one adopted worker, and the keys of the environment's owner.
 struct Environment {
-    host: Host,
     owner: DeviceKeys,
     _worker: Worker,
     worker_session: SessionId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: Host,
     gateway: Arc<Gateway>,
 }
 
