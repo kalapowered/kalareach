@@ -131,7 +131,10 @@ pub fn known_folder(which: KnownFolder) -> Result<std::path::PathBuf> {
         unsafe { CoTaskMemFree(text.cast()) };
         return Err(error(
             status as u32,
-            "reading one of the system's own folders",
+            match which {
+                KnownFolder::ProgramFiles => "reading the system's Program Files folder",
+                KnownFolder::ProgramData => "reading the system's ProgramData folder",
+            },
         ));
     }
     // SAFETY: the answer is a NUL-terminated string that the call allocated.

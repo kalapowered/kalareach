@@ -53,7 +53,10 @@ pub fn main() -> ExitCode {
     let paths = match Paths::system() {
         Ok(paths) => paths,
         Err(error) => {
-            eprintln!("kr-boundary-setup: {error}");
+            eprintln!(
+                "kr-boundary-setup: {}",
+                crate::remedy::known_folder_unreadable(&error.to_string(), command == "remove")
+            );
             return ExitCode::from(1);
         }
     };

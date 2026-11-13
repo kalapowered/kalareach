@@ -3,10 +3,10 @@
 //! that is no volume's root. They run on every platform.
 
 use kr_boundary_windows::remedy::{
-    AncestorFault, MissingRoot, Purpose, Stage, Subject, Tree, ancestor_refusal, dos_path_of,
-    identity_text, is_below, is_on_a_network_share, is_the_place_asked_for,
-    is_the_volumes_own_root, missing_root, program_removal_advice, program_unreached,
-    rights_finding, rights_in_words, supported_layout,
+    AncestorFault, ParentCure, Presence, Stage, Subject, Tree, ancestor_refusal,
+    broker_not_stopped, dos_path_of, identity_text, is_below, is_on_a_network_share,
+    is_the_place_asked_for, is_the_volumes_own_root, known_folder_unreadable, parent_advice,
+    program_removal_advice, rights_finding, rights_in_words, shape_refusal, supported_layout,
 };
 
 const DELETE_CHILD: u32 = 0x0000_0040;
@@ -20,39 +20,69 @@ const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 /// The sentence that ends the words of every folder that the installation does not make.
 const CLOSING: &str = "The setup program directs no change to a folder that other programs share.";
 
-/// Every fault that a folder which the installation does not make can have. The match lists each
-/// variant, so a new fault does not compile here until it is added to the cases below.
+/// The number of faults and of stages that the cases go through. A new variant needs an arm in
+/// `fault_index` or `stage_index` (a compile error until it has one), an index below the count
+/// (a failed case until the count is raised) and a place in the list (a failed case until the list
+/// holds as many as the count).
+const FAULTS: usize = 11;
+const STAGES: usize = 6;
+
+fn fault_index(fault: &AncestorFault<'_>) -> usize {
+    match fault {
+        AncestorFault::Link => 0,
+        AncestorFault::NotAFolder => 1,
+        AncestorFault::VolumeRoot => 2,
+        AncestorFault::Overlap(_) => 3,
+        AncestorFault::Alias(_) => 4,
+        AncestorFault::Volume(_) => 5,
+        AncestorFault::Unreadable(_) => 6,
+        AncestorFault::VolumeUnanswered(_) => 7,
+        AncestorFault::RootMissing(_) => 8,
+        AncestorFault::List(_) => 9,
+        AncestorFault::Writable(_) => 10,
+    }
+}
+
+fn stage_index(stage: &Stage) -> usize {
+    match stage {
+        Stage::Before => 0,
+        Stage::After => 1,
+        Stage::AfterRepair {
+            broker_stopped: true,
+        } => 2,
+        Stage::AfterRepair {
+            broker_stopped: false,
+        } => 3,
+        Stage::DataParentMade => 4,
+        Stage::Rollback => 5,
+    }
+}
+
+/// Every fault that a folder which the installation does not make can have.
 fn every_fault() -> Vec<AncestorFault<'static>> {
     let faults = vec![
         AncestorFault::Link,
         AncestorFault::NotAFolder,
+        AncestorFault::VolumeRoot,
+        AncestorFault::Overlap(r"C:\Data"),
         AncestorFault::Alias(r"C:\Shared\Backing"),
         AncestorFault::Volume("the volume uses FAT32"),
         AncestorFault::Unreadable("Windows error 32"),
         AncestorFault::VolumeUnanswered("Windows error 21"),
         AncestorFault::RootMissing("Windows error 3"),
-        AncestorFault::List("S-1-5-32-545 is allowed the right to delete it"),
+        AncestorFault::List("S-1-5-32-545 is allowed the right named by its list"),
         AncestorFault::Writable("S-1-5-32-545 is allowed to add"),
     ];
-    for fault in &faults {
-        match fault {
-            AncestorFault::Link
-            | AncestorFault::NotAFolder
-            | AncestorFault::Alias(_)
-            | AncestorFault::Volume(_)
-            | AncestorFault::Unreadable(_)
-            | AncestorFault::VolumeUnanswered(_)
-            | AncestorFault::RootMissing(_)
-            | AncestorFault::List(_)
-            | AncestorFault::Writable(_) => {}
-        }
+    assert_eq!(faults.len(), FAULTS, "every fault is in the list");
+    for (at, fault) in faults.iter().enumerate() {
+        assert_eq!(fault_index(fault), at, "{fault:?}");
     }
     faults
 }
 
 /// Every point of a run at which a folder can be read again.
 fn every_stage() -> Vec<Stage> {
-    vec![
+    let stages = vec![
         Stage::Before,
         Stage::After,
         Stage::AfterRepair {
@@ -63,29 +93,63 @@ fn every_stage() -> Vec<Stage> {
         },
         Stage::DataParentMade,
         Stage::Rollback,
-    ]
+    ];
+    assert_eq!(stages.len(), STAGES, "every stage is in the list");
+    for (at, stage) in stages.iter().enumerate() {
+        assert_eq!(stage_index(stage), at, "{stage:?}");
+    }
+    stages
 }
 
 /// The words that tell an administrator to change a folder: a move, another place, the end of a
-/// substitution or a redirection, an owner, a list, the removal of a link or of what is in the way.
-/// Not one of them may be in the words of a folder that other programs share.
-const INSTRUCTIONS: [&str; 15] = [
-    "Move ",
-    " move ",
-    "Remove ",
+/// substitution or a redirection, an owner, a list, the removal of a link or of what is in the way,
+/// a rename, a delete, a mount, a command that does any of these. A second line behind the type:
+/// compared without regard to case, and a word that starts with a letter only where no letter is
+/// before it.
+const INSTRUCTIONS: [&str; 25] = [
+    "rename",
+    "delete",
+    "take ownership",
+    "change its owner",
+    "set its permissions",
+    "unmount",
+    "dismount",
+    "subst",
+    "icacls",
+    "takeown",
+    "mountvol",
+    "move ",
     "remove or",
     "remove the link",
+    "remove it",
+    "remove that",
     "rmdir",
-    "end the substitution",
+    "end the",
     "redirection of",
     "give the",
-    "Make the",
     "make the",
     "narrow",
-    "Correct",
+    "correct",
     "re-point",
     "other place",
 ];
+
+/// The instruction words that `text` holds.
+fn instructions_in(text: &str) -> Vec<&'static str> {
+    let lower = text.to_lowercase();
+    INSTRUCTIONS
+        .into_iter()
+        .filter(|word| {
+            lower.match_indices(word).any(|(at, _)| {
+                at == 0
+                    || !lower[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_alphabetic)
+            })
+        })
+        .collect()
+}
 
 #[test]
 fn each_right_that_lets_an_account_replace_a_folder_is_said_in_words() {
@@ -155,20 +219,17 @@ fn every_fault_of_a_folder_that_the_installation_does_not_make_has_the_one_form(
                 let kept = text.contains("Do not remove the program directory.");
                 assert_eq!(kept, tree == Tree::Program, "{what}");
                 match fault {
-                    AncestorFault::Unreadable(_) => {
+                    AncestorFault::Unreadable(_)
+                    | AncestorFault::VolumeUnanswered(_)
+                    | AncestorFault::RootMissing(_) => {
                         assert!(!text.contains(&layout), "{what}");
                         assert!(
-                            text.contains("Close the program that holds it open"),
-                            "{what}"
-                        );
-                    }
-                    AncestorFault::VolumeUnanswered(_) | AncestorFault::RootMissing(_) => {
-                        assert!(!text.contains(&layout), "{what}");
-                        assert!(
-                            text.contains("Check that the volume is there and answers"),
+                            text.contains("Run the setup program again when it can be opened."),
                             "{what}"
                         );
                         assert!(!text.contains("Close the program"), "{what}");
+                        assert!(!text.contains("did not answer"), "{what}");
+                        assert!(!text.contains("holds it open"), "{what}");
                     }
                     _ => {
                         assert_eq!(text.matches(&layout).count(), 1, "{what}");
@@ -179,9 +240,7 @@ fn every_fault_of_a_folder_that_the_installation_does_not_make_has_the_one_form(
                     layout.starts_with("This layout is not supported: "),
                     "{layout}"
                 );
-                for word in INSTRUCTIONS {
-                    assert!(!text.contains(word), "{word:?} in {what}");
-                }
+                assert!(instructions_in(&text).is_empty(), "{what}");
             }
         }
     }
@@ -207,9 +266,7 @@ fn the_supported_layout_says_where_each_tree_installs() {
     );
     for text in [&data, &program] {
         assert_eq!(text.matches(". ").count(), 0, "one sentence: {text}");
-        for word in INSTRUCTIONS {
-            assert!(!text.contains(word), "{word:?} in {text}");
-        }
+        assert!(instructions_in(text).is_empty(), "{text}");
     }
 }
 
@@ -457,19 +514,25 @@ fn the_refusal_of_what_is_not_a_folder_or_cannot_be_read_says_what_a_layout_is_o
     );
     assert!(text.contains("program directory"), "{text}");
     assert!(
-        text.contains("Close the program that holds it open, or check that its volume is there and answers, then run the setup program again"),
+        text.contains("Run the setup program again when it can be opened."),
         "{text}"
     );
-    assert!(!text.contains("correct who may open it"), "{text}");
+    // No cause is named: the error can be any of many.
+    for cause in [
+        "Close the program",
+        "holds it open",
+        "correct who may open it",
+    ] {
+        assert!(!text.contains(cause), "{cause}: {text}");
+    }
     assert!(!text.contains("This layout is not supported"), "{text}");
 }
 
-/// A volume that does not answer, or a root that is not there, is refused for its volume and not for
-/// a program that holds a folder open: no program holds a volume that is going away, and closing one
-/// cures nothing. The words say what was found, with the platform's error, and what to try that
-/// changes no folder. They tell no one to move or change a folder that other programs share.
+/// A volume that cannot be asked what it is, or a root that is not there, is refused for its volume
+/// and not for a program that holds a folder open. The words say what the call returned, with the
+/// platform's error, and name no cause that the error can contradict.
 #[test]
-fn a_volume_that_does_not_answer_is_refused_for_its_volume_and_not_for_an_open_program() {
+fn a_volume_that_cannot_be_asked_is_refused_for_its_volume_and_names_no_cause() {
     for (tree, own) in [
         (Tree::Program, "program directory"),
         (Tree::Data, "data directory"),
@@ -485,19 +548,23 @@ fn a_volume_that_does_not_answer_is_refused_for_its_volume_and_not_for_an_open_p
             "{text}"
         );
         assert!(
-            text.contains("its volume did not answer (Windows error 21)"),
+            text.contains("its volume could not be asked what it is (Windows error 21)"),
             "{text}"
         );
         assert!(text.contains("Nothing was changed"), "{text}");
         assert!(
-            text.contains(
-                "Check that the volume is there and answers, then run the setup program again"
-            ),
+            text.contains("Run the setup program again when it can be opened."),
             "{text}"
         );
-        assert!(!text.contains("Close the program"), "{text}");
-        assert!(!text.contains("holds it open"), "{text}");
-        assert!(!text.contains("asks a volume"), "{text}");
+        for cause in [
+            "Close the program",
+            "holds it open",
+            "being removed",
+            "has failed",
+            "did not answer",
+        ] {
+            assert!(!text.contains(cause), "{cause}: {text}");
+        }
         let after = ancestor_refusal(
             r"Z:\",
             tree,
@@ -521,10 +588,9 @@ fn a_volume_that_does_not_answer_is_refused_for_its_volume_and_not_for_an_open_p
 }
 
 /// The root of a volume that is not there did not answer a question: the installation never asked
-/// the volume what it is, and its words do not say so. An open of the root that fails for any other
-/// reason is the volume's refusal too, and a folder above the root that fails to open is not.
+/// the volume what it is, and its words say only that the root is not there, with the error.
 #[test]
-fn a_root_that_is_not_there_is_not_said_to_have_been_asked_what_it_is() {
+fn a_root_that_is_not_there_is_said_to_be_not_there_and_nothing_more() {
     for tree in [Tree::Program, Tree::Data] {
         let text = ancestor_refusal(
             r"Z:\",
@@ -536,27 +602,14 @@ fn a_root_that_is_not_there_is_not_said_to_have_been_asked_what_it_is() {
             text.contains("the root of its volume is not there (Windows error 3)"),
             "{text}"
         );
-        assert!(!text.contains("asks"), "{text}");
-        assert!(!text.contains("asked"), "{text}");
-        assert!(!text.contains("did not answer"), "{text}");
+        for word in ["asks", "asked", "did not answer", "removed", "failed"] {
+            assert!(!text.contains(word), "{word}: {text}");
+        }
+        assert!(
+            text.contains("Run the setup program again when it can be opened."),
+            "{text}"
+        );
     }
-    assert_eq!(
-        AncestorFault::open_failed(true, "Windows error 21"),
-        AncestorFault::VolumeUnanswered("Windows error 21")
-    );
-    assert_eq!(
-        AncestorFault::open_failed(false, "Windows error 32"),
-        AncestorFault::Unreadable("Windows error 32")
-    );
-    let root = ancestor_refusal(
-        r"E:\",
-        Tree::Program,
-        &Subject::Shared(AncestorFault::open_failed(true, "Windows error 21")),
-        Stage::Before,
-    );
-    assert!(root.contains("its volume did not answer"), "{root}");
-    assert!(!root.contains("holds it open"), "{root}");
-    assert!(!root.contains("asks"), "{root}");
 }
 
 #[test]
@@ -721,7 +774,8 @@ fn a_final_path_on_a_network_share_is_never_the_place_that_was_asked_for() {
 /// The walk from the program directory's top down reads the known folder itself and the folders
 /// that the installation makes below it. The known folder is another program's: its words say what a
 /// supported layout is, whatever its fault, and never tell to change its owner or its list or to
-/// remove a link. A folder that the installation makes may be told what to correct.
+/// remove a link. A folder that the installation makes may be told what to correct, and claims
+/// nothing of what is in it.
 #[test]
 fn the_known_folder_gets_the_words_of_a_shared_folder_and_the_products_own_folder_its_own() {
     let known = r"C:\Program Files";
@@ -756,23 +810,18 @@ fn the_known_folder_gets_the_words_of_a_shared_folder_and_the_products_own_folde
             &Subject::at(own, known, fault.clone()),
             Stage::Before,
         );
-        let made = ancestor_refusal(
-            own,
-            Tree::Program,
-            &Subject::Own(fault.clone()),
-            Stage::Before,
-        );
-        assert_eq!(below, made, "{fault:?}");
         let own_words = match fault {
             AncestorFault::Link | AncestorFault::NotAFolder => "makes this folder itself",
             AncestorFault::Writable(_) => "Make the Administrators group",
-            _ => "correct who may open it",
+            _ => "If a program holds it open",
         };
         assert!(below.contains(own_words), "{fault:?}: {below}");
         assert!(!at_known.contains(own_words), "{fault:?}: {at_known}");
+        // Nothing of what is in a folder that nothing read.
+        for claim in ["holds other things", "loses nothing"] {
+            assert!(!below.contains(claim), "{fault:?}: {below}");
+        }
     }
-    // The text of the writable known folder holds no instruction, and the text of the product's own
-    // folder says what to correct.
     let text = ancestor_refusal(
         known,
         Tree::Program,
@@ -795,10 +844,7 @@ fn the_known_folder_gets_the_words_of_a_shared_folder_and_the_products_own_folde
     );
     assert!(!text.contains("the manifest records it"), "{text}");
     assert!(text.contains("Nothing was changed"), "{text}");
-    assert!(!text.to_lowercase().contains("remove the link"), "{text}");
-    for word in INSTRUCTIONS {
-        assert!(!text.contains(word), "{word:?}: {text}");
-    }
+    assert!(instructions_in(&text).is_empty(), "{text}");
     let made = ancestor_refusal(
         own,
         Tree::Program,
@@ -848,7 +894,7 @@ fn only_a_folder_strictly_below_the_known_folder_is_the_installations_own() {
     ));
     assert!(matches!(
         Subject::at(r"C:\Program Files\KalaReach", known, AncestorFault::Link),
-        Subject::Own(AncestorFault::Link)
+        Subject::Own(AncestorFault::Link, _)
     ));
     assert!(matches!(
         Subject::at(r"C:\", known, AncestorFault::Link),
@@ -864,7 +910,11 @@ fn a_link_at_the_boundarys_own_folder_sends_the_administrator_nowhere_else() {
     let text = ancestor_refusal(
         r"C:\Program Files\KalaReach",
         Tree::Program,
-        &Subject::Own(AncestorFault::Link),
+        &Subject::at(
+            r"C:\Program Files\KalaReach",
+            r"C:\Program Files",
+            AncestorFault::Link,
+        ),
         Stage::Before,
     );
     assert!(
@@ -887,49 +937,6 @@ fn a_link_at_the_boundarys_own_folder_sends_the_administrator_nowhere_else() {
     assert!(!text.contains("computer"), "{text}");
     assert!(!text.contains("plain folders"), "{text}");
     assert!(!text.to_lowercase().contains("remove the link"), "{text}");
-}
-
-/// What a run does where the root of the program tree's volume is not there: an installation and a
-/// repair refuse, since nothing can be made on a disk that is gone, and a removal goes on, since a
-/// removal that refuses there can never finish. The data tree's root still refuses a removal.
-#[test]
-fn a_removal_goes_on_where_the_program_volumes_root_is_not_there_and_a_setup_does_not() {
-    assert_eq!(
-        missing_root(Purpose::Remove, Tree::Program),
-        MissingRoot::GoOn
-    );
-    assert_eq!(
-        missing_root(Purpose::Install, Tree::Program),
-        MissingRoot::Refuse
-    );
-    assert_eq!(
-        missing_root(Purpose::Remove, Tree::Data),
-        MissingRoot::Refuse
-    );
-    assert_eq!(
-        missing_root(Purpose::Install, Tree::Data),
-        MissingRoot::Refuse
-    );
-}
-
-/// The last words of a removal that went on past a root that is not there name the program
-/// directory that it could not reach, and say what that leaves.
-#[test]
-fn the_removals_last_words_name_the_program_directory_that_it_could_not_reach() {
-    let text = program_unreached(r"C:\Program Files\KalaReach\Boundary");
-    assert!(
-        text.contains(r"C:\Program Files\KalaReach\Boundary could not be reached"),
-        "{text}"
-    );
-    assert!(
-        text.contains("the root of its volume is not there"),
-        "{text}"
-    );
-    assert!(
-        text.contains("nothing in it was checked or removed"),
-        "{text}"
-    );
-    assert!(!text.contains("Nothing was changed"), "{text}");
 }
 
 /// What the setup program can do after a link at the program directory's name: a repair makes the
@@ -963,4 +970,116 @@ fn a_final_path_is_printed_as_a_person_can_use_it() {
     );
     assert_eq!(dos_path_of(r"C:\Windows"), r"C:\Windows");
     assert_eq!(dos_path_of(r"\\?\C:\"), r"C:\");
+}
+
+/// The shape of the paths is read before any walk: a known folder that is the root of a volume, and
+/// known folders that overlap (the same folder, or one at or below the other tree's own folder), are
+/// layouts that are not supported, in the shared form, whatever the letter case, a trailing
+/// backslash or the extended prefix.
+#[test]
+fn the_shape_of_the_known_folders_is_refused_before_any_walk() {
+    let pf = r"C:\Program Files";
+    let pd = r"C:\ProgramData";
+    assert_eq!(shape_refusal(pf, pd), None);
+    assert_eq!(
+        shape_refusal(r"c:\program files\", r"\\?\C:\ProgramData"),
+        None
+    );
+    assert_eq!(
+        shape_refusal(r"C:\Program Files", r"C:\Program Files (x86)"),
+        None
+    );
+    for (files, data, folder) in [
+        (r"D:\", pd, r"D:\"),
+        (r"\\?\d:\", pd, r"\\?\d:\"),
+        (pf, r"E:", r"E:"),
+        (pf, r"e:\", r"e:\"),
+        (r"D:\Data", r"D:\Data", r"D:\Data"),
+        (r"d:\data\", r"D:\DATA", r"d:\data\"),
+        (r"D:\Data\KalaReach", r"D:\Data", r"D:\Data\KalaReach"),
+        (
+            r"\\?\D:\Data\KalaReach\x",
+            r"D:\Data",
+            r"\\?\D:\Data\KalaReach\x",
+        ),
+        (r"D:\Data", r"D:\Data\KalaReach", r"D:\Data"),
+        (r"D:\Data", r"d:\data\kalareach\sub", r"D:\Data"),
+    ] {
+        let text =
+            shape_refusal(files, data).unwrap_or_else(|| panic!("{files} and {data} are refused"));
+        assert!(text.contains(folder), "{files} {data}: {text}");
+        assert!(text.contains("This layout is not supported"), "{text}");
+        assert!(text.contains("Nothing was changed"), "{text}");
+        assert!(text.ends_with(CLOSING), "{text}");
+        assert!(instructions_in(&text).is_empty(), "{text}");
+    }
+    // A sibling that shares a prefix with the other tree's own folder is no overlap.
+    assert_eq!(shape_refusal(r"D:\Data\KalaReach2", r"D:\Data"), None);
+}
+
+/// The setup program's line for a known folder that cannot be read says the error and that nothing
+/// was changed, and at a removal the limit that it has. It names no removal by hand.
+#[test]
+fn the_line_for_a_known_folder_that_cannot_be_read_says_the_limit_of_a_removal() {
+    let error = "reading the system's Program Files folder: Windows error 3";
+    let setup = known_folder_unreadable(error, false);
+    assert!(setup.contains(error), "{setup}");
+    assert!(setup.contains("Nothing was changed."), "{setup}");
+    assert!(!setup.contains("manifest"), "{setup}");
+    assert!(setup.ends_with(CLOSING), "{setup}");
+    let removal = known_folder_unreadable(error, true);
+    for part in [
+        error,
+        "Nothing was changed.",
+        "reads what to remove from the manifest in the data directory",
+        "checks the program directory before it deletes anything",
+        "cannot go on while that folder cannot be read",
+        "The broker's service, its two accounts and its rules in the policy stay.",
+        "If the volume is gone for good, the setup program cannot remove them.",
+    ] {
+        assert!(removal.contains(part), "{part}: {removal}");
+    }
+    assert!(removal.ends_with(CLOSING), "{removal}");
+    // No removal by hand: the policy's rules are shared with other programs.
+    for by_hand in [
+        "by hand",
+        "remove the rules",
+        "remove the service",
+        "Remove ",
+    ] {
+        assert!(!removal.contains(by_hand), "{by_hand}: {removal}");
+    }
+}
+
+/// A repair that cannot verify the stopped state of the broker's service says so, and stops before
+/// the program directory is changed.
+#[test]
+fn a_repair_that_cannot_stop_the_broker_says_so() {
+    let text = broker_not_stopped();
+    assert!(text.contains("did not reach the stopped state"), "{text}");
+    assert!(
+        text.contains("stopped before it changed the program directory"),
+        "{text}"
+    );
+    assert!(text.contains("a repair has no rollback"), "{text}");
+    assert!(!text.contains("stays stopped"), "{text}");
+}
+
+/// What an own folder's words claim of contents that nothing read: nothing. The folder that holds
+/// the data directory, where no data directory is, may be removed or renamed if nothing else needs
+/// what is in it.
+#[test]
+fn the_words_for_a_parent_with_no_data_directory_claim_nothing_of_its_contents() {
+    let text = parent_advice(&ParentCure::Correct(Presence::Absent));
+    assert!(
+        text.contains("It holds no data directory of the boundary."),
+        "{text}"
+    );
+    assert!(
+        text.contains("If nothing else needs what is in it, remove or rename the folder"),
+        "{text}"
+    );
+    for claim in ["loses nothing", "holds other things"] {
+        assert!(!text.contains(claim), "{claim}: {text}");
+    }
 }

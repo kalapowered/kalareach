@@ -362,6 +362,7 @@ fn say(line: &str) {
 ///
 /// Returns [`Error::Refused`] naming the foreign object, or the failure of the call that looked.
 pub fn entry(paths: &Paths) -> Result<Entry, Error> {
+    check_shape(paths)?;
     // What the data directory holds is read on handles before any of it is used: the manifest
     // decides what a repair or a removal touches, so it is read only after the directory it is in
     // and everything beside it passed their checks.
@@ -373,7 +374,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     // an empty one, which a new installation takes as it is.
     let data_accepted = inspected.is_some();
     if let Some(manifest) = inspected.and_then(|inspected| inspected.manifest) {
-        check_program_directory(paths, true, remedy::Stage::Before, remedy::Purpose::Install)?;
+        check_program_directory(paths, true, remedy::Stage::Before)?;
         return Ok(match manifest.state {
             InstallState::Installed => Entry::Installed(manifest),
             InstallState::InProgress => Entry::Partial(manifest),
@@ -382,7 +383,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     // The folders above the program tree are read here, before anything is made, written or
     // stopped, as the folders above the data tree were by the check above; a link at the program
     // directory's name, one that points nowhere included, gets the link's own remedy.
-    check_program_parents(paths, remedy::Stage::Before, remedy::Purpose::Install)?;
+    check_program_parents(paths, remedy::Stage::Before)?;
     if records::entry_exists(&paths.program)
         && let Err(refusal) = DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)?
     {
@@ -455,20 +456,16 @@ fn install_program_file(source: &Path, target: &Path) -> io::Result<()> {
 ///
 /// Returns [`Error::Refused`] naming the reason, or the failure of the call that looked.
 pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
-    check_data_parent_at(paths, remedy::Stage::Before, remedy::Purpose::Install)
+    check_data_parent_at(paths, remedy::Stage::Before)
 }
 
 /// [`check_data_parent`] with the stage of the run that reads the folder, so that a refusal says
 /// only what is so of the run's changes.
-fn check_data_parent_at(
-    paths: &Paths,
-    stage: remedy::Stage,
-    purpose: remedy::Purpose,
-) -> Result<Option<ffi::Handle>, Error> {
+fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ffi::Handle>, Error> {
     let parent = paths.data_parent();
     // Every folder above the data parent is another program's: the known folder `ProgramData` and
     // the folders above it. The data parent itself is the installation's and is read below.
-    check_ancestors(parent, remedy::Tree::Data, stage, purpose)?;
+    check_ancestors(parent, remedy::Tree::Data, stage)?;
     let wide = ffi::wide_path(parent);
     // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
     let raw = unsafe {
@@ -1696,6 +1693,21 @@ fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, recorded: bool) -> Err
     )
 }
 
+/// Refuses a layout whose known folders cannot hold the two trees (a known folder that is the root
+/// of a volume, known folders that overlap): read first by every installation, repair and removal,
+/// before any walk. After it, a folder strictly below a known folder is the installation's own.
+fn check_shape(paths: &Paths) -> Result<(), Error> {
+    let data_parent = paths.data_parent();
+    let program_data = data_parent.parent().unwrap_or(data_parent);
+    match remedy::shape_refusal(
+        &paths.program_top.display().to_string(),
+        &program_data.display().to_string(),
+    ) {
+        Some(text) => Err(Error::Refused(text)),
+        None => Ok(()),
+    }
+}
+
 /// Reads every existing folder above `top`, from the volume's root down to its parent, part by
 /// part: each opened on its own handle with no link followed, a plain folder, owned by the system,
 /// the Administrators group or the installer service, with no entry that lets another account
@@ -1704,20 +1716,14 @@ fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, recorded: bool) -> Err
 /// an account that could rename a folder above could put a link in the place of the folder below it
 /// after the installation has read that one, and the system's default lists do not give that right
 /// but nothing here rests on a default. A folder that is not there ends the walk: nothing below it
-/// is there either. A root that is not there is a volume that is gone: an installation and a repair
-/// refuse, a removal of the program tree goes on ([`remedy::missing_root`]).
+/// is there either. A root that is not there is a volume that is gone, and every run refuses it.
 ///
 /// Every folder read here lies strictly above `top`, the first folder that the installation makes
 /// (the data directory's parent) or the known folder itself (`Program Files`, which the program walk
 /// reads itself), so every one of them is another program's: the known folder `ProgramData`, the
 /// folders above it, a drive letter. Their refusals take the words of a folder that the installation
 /// does not make.
-fn check_ancestors(
-    top: &Path,
-    tree: remedy::Tree,
-    stage: remedy::Stage,
-    purpose: remedy::Purpose,
-) -> Result<Walk, Error> {
+fn check_ancestors(top: &Path, tree: remedy::Tree, stage: remedy::Stage) -> Result<(), Error> {
     use remedy::AncestorFault as Fault;
     let mut chain: Vec<&Path> = top.ancestors().skip(1).collect();
     chain.reverse();
@@ -1756,18 +1762,13 @@ fn check_ancestors(
                 // A folder that is not there ends the walk, but the root of the volume is the
                 // first folder of it: a root that is not there is a volume that is gone.
                 if index == 0 {
-                    return match remedy::missing_root(purpose, tree) {
-                        remedy::MissingRoot::Refuse => {
-                            Err(refuse(Fault::RootMissing(&failure.to_string())))
-                        }
-                        remedy::MissingRoot::GoOn => Ok(Walk::RootMissing),
-                    };
+                    return Err(refuse(Fault::RootMissing(&failure.to_string())));
                 }
-                return Ok(Walk::Read);
+                return Ok(());
             }
-            Err(failure) => {
-                return Err(refuse(Fault::open_failed(index == 0, &failure.to_string())));
-            }
+            // An open that failed is said to have failed with the platform's error, at the root of
+            // a volume and above it alike.
+            Err(failure) => return Err(unreadable(&failure)),
         };
         // The volume first, as the program directory's own open does: a file system that is not
         // NTFS, or a volume on another computer, does not answer the attribute query that follows.
@@ -1796,27 +1797,7 @@ fn check_ancestors(
             return Err(refuse(Fault::List(&why)));
         }
     }
-    Ok(Walk::Read)
-}
-
-/// How far a walk of the folders above a tree read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Walk {
-    /// Every folder that is there was read, and a folder that is not there ended the walk.
-    Read,
-    /// The root of the volume is not there, and the run goes on without reading it.
-    RootMissing,
-}
-
-/// What a look at the program directory found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Checked {
-    /// It was there and its handle and everything in it were checked.
-    Opened,
-    /// It was not there.
-    Absent,
-    /// The root of its volume is not there, so nothing of it was looked at.
-    Unreached,
+    Ok(())
 }
 
 /// Reads every existing folder from [`Paths::program_top`] down to the program directory's parent,
@@ -1829,19 +1810,11 @@ enum Checked {
 /// The first folder of the walk is `program_top`, the system's known folder `Program Files`, which
 /// other programs share; every folder strictly below it is the installation's own. The words of a
 /// refusal are chosen by that ([`remedy::Subject::at`]).
-fn check_program_parents(
-    paths: &Paths,
-    stage: remedy::Stage,
-    purpose: remedy::Purpose,
-) -> Result<Walk, Error> {
+fn check_program_parents(paths: &Paths, stage: remedy::Stage) -> Result<(), Error> {
     use remedy::AncestorFault as Fault;
-    if check_ancestors(&paths.program_top, remedy::Tree::Program, stage, purpose)?
-        == Walk::RootMissing
-    {
-        return Ok(Walk::RootMissing);
-    }
+    check_ancestors(&paths.program_top, remedy::Tree::Program, stage)?;
     let Some(parent) = paths.program.parent() else {
-        return Ok(Walk::Read);
+        return Ok(());
     };
     let known = paths.program_top.display().to_string();
     let mut chain: Vec<&Path> = parent
@@ -1881,7 +1854,7 @@ fn check_program_parents(
             Err(failure)
                 if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
             {
-                return Ok(Walk::Read);
+                return Ok(());
             }
             // Any other answer is not an absence: the folder could not be checked, and the person
             // is told what can be done about that.
@@ -1912,7 +1885,7 @@ fn check_program_parents(
             return Err(refuse(Fault::Writable(&why)));
         }
     }
-    Ok(Walk::Read)
+    Ok(())
 }
 
 /// Why the volume that an open folder is on is not one that the installation uses (a file system
@@ -1958,22 +1931,17 @@ fn final_path_of(handle: &ffi::Handle) -> Result<String, Error> {
 /// Reads the program directory on a handle that is held, and everything in it on its own handle:
 /// no link, one name for a file, the installation's own owner, and no right for another account to
 /// change it. Nothing is done to the directory before this has passed. Returns whether the
-/// directory was there to be opened and approved (a removal deletes the directory only when it was),
-/// was not there, or could not be reached because the root of its volume is not there (a removal
-/// goes on and says so in its last words).
+/// directory was there to be opened and approved: a removal deletes the directory only when it was.
 fn check_program_directory(
     paths: &Paths,
     recorded: bool,
     stage: remedy::Stage,
-    purpose: remedy::Purpose,
-) -> Result<Checked, Error> {
-    if check_program_parents(paths, stage, purpose)? == Walk::RootMissing {
-        return Ok(Checked::Unreached);
-    }
+) -> Result<bool, Error> {
+    check_program_parents(paths, stage)?;
     // The look follows no link: a link that points nowhere is there, and gets the link's own remedy
     // from the open below.
     if !records::entry_exists(&paths.program) {
-        return Ok(Checked::Absent);
+        return Ok(false);
     }
     let program = paths.program.file_name().unwrap_or_default().to_owned();
     let held = match DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)? {
@@ -1991,7 +1959,7 @@ fn check_program_directory(
         ));
     }
     inspect_within(paths, Scope::Program { recorded }, &paths.program, &held, 1)?;
-    Ok(Checked::Opened)
+    Ok(true)
 }
 
 /// The one name a proof directory holds: the unlisted program. Its bytes are those of the system's
@@ -2280,7 +2248,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
             } else {
                 remedy::Stage::Before
             };
-            check_data_parent_at(paths, stage, remedy::Purpose::Install)?.ok_or_else(|| {
+            check_data_parent_at(paths, stage)?.ok_or_else(|| {
                 Error::Failed(format!(
                     "{} was made and is gone again",
                     paths.data_parent().display()
@@ -2845,15 +2813,25 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // The program directory and its files.
     let manager = service::manager()?;
     let broker_service = manager.open(SERVICE)?;
-    if let Some(service) = &broker_service
-        && service.status()?.running()
-    {
-        service.stop()?;
-        service.wait_for(true, Duration::from_secs(60))?;
+    // A repair has no rollback: the broker stays stopped only where its service was verified to be
+    // stopped. A service that is running, or on the way to either state, is asked to stop and waited
+    // for; where it does not reach the stopped state, the run stops before it changes the program
+    // directory.
+    let mut broker_stopped = false;
+    if let Some(service) = &broker_service {
+        if !service.status()?.stopped() {
+            let stop = service
+                .stop()
+                .and_then(|()| service.wait_for(true, Duration::from_secs(60)));
+            if stop.is_err() && !service.status()?.stopped() {
+                return Err(Error::Failed(remedy::broker_not_stopped()));
+            }
+        }
+        broker_stopped = service.status()?.stopped();
+        if !broker_stopped {
+            return Err(Error::Failed(remedy::broker_not_stopped()));
+        }
     }
-    // A repair has no rollback: the broker stays stopped where this run stopped it or found it
-    // stopped, which is wherever the service is there at all.
-    let broker_stopped = broker_service.is_some();
     run.record(
         ObjectKind::Directory,
         &paths.program.display().to_string(),
@@ -2872,7 +2850,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     } else {
         remedy::Stage::After
     };
-    check_program_parents(&paths, after, remedy::Purpose::Install)?;
+    check_program_parents(&paths, after)?;
     fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)
         .map_err(io_error("making the program directory"))?;
     // What the broker points Git's global file, hooks path and template directory at: empty, and
@@ -3310,9 +3288,10 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
     // acts on it and on what it holds only through what this inspection approved: a path that no
     // check opened is never read for a manifest and never deleted from. The handles are closed
     // before anything is deleted.
+    check_shape(paths)?;
     let mut seen = records::Seen::default();
     let mut approved = records::Approved::default();
-    let found = match check_data_parent_at(paths, stage, remedy::Purpose::Remove)? {
+    let found = match check_data_parent_at(paths, stage)? {
         Some(parent) => match inspect_existing_data(paths, &parent)? {
             Some((_, inspected)) => {
                 seen.journal = inspected.journal.is_some();
@@ -3338,7 +3317,6 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         paths,
         matches!(found, records::Inspection::Recorded(_)),
         stage,
-        remedy::Purpose::Remove,
     )?;
     if matches!(found, records::Inspection::Recorded(_)) {
         refuse_while_unfinished(paths)?;
@@ -3571,36 +3549,22 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             &mut failures,
         );
     }
-    match program_checked {
-        Checked::Opened => {
-            keep(
-                fs::remove_dir_all(&paths.program)
-                    .map_err(io_error("removing the program directory")),
-                "removing the program directory",
-                &mut failures,
-            );
-            if let Some(parent) = paths.program.parent() {
-                let _ = fs::remove_dir(parent);
-            }
+    if program_checked {
+        keep(
+            fs::remove_dir_all(&paths.program).map_err(io_error("removing the program directory")),
+            "removing the program directory",
+            &mut failures,
+        );
+        if let Some(parent) = paths.program.parent() {
+            let _ = fs::remove_dir(parent);
         }
-        Checked::Absent if records::entry_exists(&paths.program) => {
-            // It was not there when the removal checked, so no check opened it: nothing is deleted.
-            failures.push(format!(
-                "{} was not there when the removal looked for it, and something is there now, so it was not removed",
-                paths.program.display()
-            ));
-        }
-        // Nothing of it was looked at, so nothing is deleted; the last words say so.
-        Checked::Absent | Checked::Unreached => {}
+    } else if records::entry_exists(&paths.program) {
+        // It was not there when the removal checked, so no check opened it: nothing is deleted.
+        failures.push(format!(
+            "{} was not there when the removal looked for it, and something is there now, so it was not removed",
+            paths.program.display()
+        ));
     }
-    let unreached = if program_checked == Checked::Unreached {
-        format!(
-            " {}",
-            remedy::program_unreached(&paths.program.display().to_string())
-        )
-    } else {
-        String::new()
-    };
     // The journal's files and the empty `run` and `journal` directories go where the inspection
     // opened and approved them, and nowhere else. Unfinished work was refused before the removal
     // began; what a journal file still holds now is finished or made nothing.
@@ -3634,11 +3598,7 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
         // The records go last: a failed removal can be run again from them.
         let stayed = remove_approved_records(paths, &approved);
         if stayed.is_empty() {
-            say(&if unreached.is_empty() {
-                "the installation is removed".to_owned()
-            } else {
-                format!("the installation is removed.{unreached}")
-            });
+            say("the installation is removed");
             Ok(())
         } else {
             // While the manifest stays, the removal runs again whole and reads it. Without it,
@@ -3646,13 +3606,13 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             // the person to remove.
             let next = records::next_step(paths.manifest.exists(), data_is_empty(paths));
             Err(Error::Failed(format!(
-                "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}{unread_prior}{unreached}",
+                "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. {next}{unread_prior}",
                 stayed.join("; ")
             )))
         }
     } else {
         Err(Error::Failed(format!(
-            "the removal did not finish and its records are kept: {}{unread_prior}{unreached}",
+            "the removal did not finish and its records are kept: {}{unread_prior}",
             failures.join("; ")
         )))
     }
