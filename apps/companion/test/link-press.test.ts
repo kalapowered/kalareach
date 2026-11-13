@@ -184,3 +184,56 @@ describe('the three seconds after the release', () => {
   })
 })
 
+describe('the boxes the handler reads', () => {
+  const y = 328
+
+  it('are none where the pane holds no message at all: the terminal and the output views', () => {
+    const pane = document.createElement('div')
+    const rows = document.createElement('div')
+    for (let row = 0; row < 200; row += 1) rows.append(document.createElement('div'))
+    pane.append(rows)
+    document.body.append(pane)
+    startLinkPress(pane)
+    clock(100)
+    fire('pointerdown', pointer(rows, { clientY: 50 }))
+    fire('pointerup', pointer(rows, { clientY: 50, timeStamp: 120 }))
+    fire('click', click(rows, { clientY: 50 }))
+    expect(reads, 'boxes read for a press and a click on a pane with no message').toEqual([])
+    expect(vi.mocked(globalThis.getComputedStyle)).not.toHaveBeenCalled()
+  })
+
+  it('are the pane, the messages and the near messages’ links for a conversation of 1200 links, not every link', () => {
+    const { pane, messages, links, texts } = conversation(60, 20)
+    startLinkPress(pane)
+    clock(100)
+    // Message 30 is under the press; message 29 ends 38 px above it, inside the reach, and message 31 starts 66 px below.
+    fire('pointerdown', pointer(texts[30], { clientY: y + 2700 }))
+    // The pane's box, a box for each of the 60 messages, the box of each of the 40 links of messages 29 and 30,
+    // and the words of the 3 links of message 30 that lie within the reach beside the press.
+    const bound = 1 + messages.length + 2 * 20 + 3
+    expect(reads.length, 'boxes read by the press').toBeLessThanOrEqual(bound)
+    expect(reads.length, 'boxes read by the press, against every link').toBeLessThan(links.flat().length / 4)
+    const readLinks = new Set(reads.filter((each) => each.classList.contains('md-link')))
+    expect(readLinks.has(links[10]?.[0]), 'a link of a message far from the press').toBe(false)
+    expect(readLinks.has(links[31]?.[0]), 'a link of a message beyond the reach under the press').toBe(false)
+    fire('pointerup', pointer(texts[30], { clientY: y + 2700, timeStamp: 120 }))
+    reads = []
+    fire('click', click(texts[30], { clientY: y + 2700 }))
+    expect(reads.length, 'boxes read by the click').toBeLessThanOrEqual(bound)
+  })
+
+  it('are none where the conversation holds messages and no link', () => {
+    const pane = document.createElement('div')
+    for (let m = 0; m < 30; m += 1) {
+      const message = document.createElement('div')
+      message.className = 'm-node'
+      message.append(document.createElement('p'))
+      pane.append(message)
+    }
+    document.body.append(pane)
+    startLinkPress(pane)
+    clock(100)
+    fire('pointerdown', pointer(pane.querySelector('p') as HTMLElement, { clientY: 50 }))
+    expect(reads, 'boxes read for a press on a conversation with no link').toEqual([])
+  })
+})
