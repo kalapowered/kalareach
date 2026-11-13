@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { decide, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
+import { SLOP, decide, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
 
 /** Links are named by strings here: the decision only compares them. */
 type Id = string
@@ -25,7 +25,7 @@ function link(id: Id, rect: Rect, destination = `https://example.org/${id}`): Pa
   return { id, destination, words: [rect] }
 }
 
-/** Two links, one above the other, 40 px apart: the click's point decides between them. */
+/** Two links, one above the other, 40 px apart: the press's point decides between them. */
 const UPPER = link('upper', words(16, 100, 120))
 const LOWER = link('lower', words(16, 140, 120))
 
@@ -33,9 +33,9 @@ function layoutOf(...links: PaneLink<Id>[]): () => Layout<Id> {
   return () => ({ links, reach: IOS, bounds: PANE })
 }
 
-/** A press of a finger on the upper link that has ended 300 ms before the click. */
+/** A press of a finger 8 px under the upper link's words that has ended 300 ms before the click. */
 function press(over: Partial<Press<Id>> = {}): Press<Id> {
-  return { pointerType: 'touch', moved: false, upAt: 1000, start: { link: 'upper', destination: UPPER.destination }, ...over }
+  return { pointerType: 'touch', at: { x: 60, y: 125 }, moved: false, upAt: 1000, start: { link: 'upper', destination: UPPER.destination }, ...over }
 }
 
 /** A trusted click with a detail of 1 on plain text, 8 px under the upper link's words. */
@@ -52,7 +52,7 @@ describe('a click on plain text near the link a touch pressed', () => {
   })
 
   it('opens the link that the press named, whichever place it has among the links', () => {
-    const second = press({ start: { link: 'lower', destination: LOWER.destination } })
+    const second = press({ at: { x: 60, y: 150 }, start: { link: 'lower', destination: LOWER.destination } })
     expect(decide(second, click({ point: { x: 60, y: 150 } }), layoutOf(UPPER, LOWER))).toEqual({ kind: 'open', link: 'lower' })
   })
 
@@ -118,17 +118,17 @@ describe('a click with no usable press before it', () => {
   })
 })
 
-describe('the nearest-words rule at the click’s point', () => {
-  it('stands when it names no link', () => {
-    expect(decide(press(), click({ point: { x: 60, y: 400 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
+describe('the nearest-words rule at the press’s point, run again at the click', () => {
+  it('stands when it names no link there now', () => {
+    expect(decide(press({ at: { x: 60, y: 400 } }), click({ point: { x: 60, y: 400 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
   })
 
-  it('stands when it names another link than the press’s', () => {
-    expect(decide(press(), click({ point: { x: 60, y: 150 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
+  it('stands when it names another link than the press’s there now', () => {
+    expect(decide(press({ at: { x: 60, y: 150 } }), click({ point: { x: 60, y: 150 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
   })
 
   it('stands when the press’s link is no longer in the pane', () => {
-    expect(decide(press(), click({ point: { x: 60, y: 125 } }), layoutOf(LOWER))).toEqual(STAND)
+    expect(decide(press(), click(), layoutOf(LOWER))).toEqual(STAND)
   })
 
   it('stands when the pane holds another link in the place of the press’s, as another element', () => {
@@ -139,8 +139,29 @@ describe('the nearest-words rule at the click’s point', () => {
     expect(decide(press(), click(), layoutOf(link('upper', words(16, 100, 120), 'https://example.org/elsewhere'), LOWER))).toEqual(STAND)
   })
 
-  it('opens the link that has moved, where its words are still the nearest at the click’s point', () => {
+  it('opens the link that has moved, where its words are still the nearest at the press’s point', () => {
     const moved = link('upper', words(16, 112, 120))
     expect(decide(press(), click(), layoutOf(moved, LOWER))).toEqual(OPEN_UPPER)
+  })
+
+  it('reads the layout at the press’s point', () => {
+    const at: { x: number; y: number }[] = []
+    decide(press(), click({ point: { x: 64, y: 130 } }), (point) => {
+      at.push(point)
+      return { links: [UPPER, LOWER], reach: IOS, bounds: PANE }
+    })
+    expect(at).toEqual([{ x: 60, y: 125 }])
+  })
+})
+
+describe('where the click lies against the press', () => {
+  it('opens the link at the edge of its area, where the engine reports the click a pixel off the point that lit it', () => {
+    // The upper link's area ends 22 px under its words' middle (y 108.5): 130.5. The press was at 130.5, the click is reported at 131.
+    expect(decide(press({ at: { x: 60, y: 130.5 } }), click({ point: { x: 60, y: 131 } }), layoutOf(UPPER))).toEqual(OPEN_UPPER)
+  })
+
+  it('opens it for a click at the slop from the press, and stands for a click farther', () => {
+    expect(decide(press(), click({ point: { x: 60 + SLOP, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
+    expect(decide(press(), click({ point: { x: 60 + SLOP + 0.5, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
   })
 })
