@@ -2988,18 +2988,23 @@ async fn a_mutation_told_not_shown_on_a_connection_the_host_did_not_withdraw_lea
     )
     .await;
     assert_eq!(told.code(), kr_protocol::error::ErrorCode::OutcomeUnknown);
-    // The host is asked one question at a time, and a signal raised while one is out is taken up
-    // after it ends. So a second question is asked only once the first has been answered and what
-    // the answer means has been done with the connection: the mutation is told again until the
-    // host has been asked twice, and what is asserted next is asserted after the first decision.
+    // The host is asked one question at a time, and a signal raised while one is out is dropped
+    // when it ends, so it asks nothing more for it. A second question is therefore asked only for
+    // a signal raised after the first has ended, which is after the first has been answered and
+    // what the answer means has been done with the connection: the mutation is told again until
+    // the host has been asked twice, and what is asserted next is asserted after the first
+    // decision. A decision that replaced the connection ends the wait, and the assertions say so.
     let environment_id = state.connection().expect("connected").environment_id();
     let deadline = tokio::time::Instant::now() + WATCHDOG;
-    while tells.listed.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+    while tells.listed.load(std::sync::atomic::Ordering::SeqCst) < 2
+        && state.session().is_ok_and(|held| Arc::ptr_eq(&held, &first))
+    {
         assert!(
             tokio::time::Instant::now() < deadline,
             "a second question to the host about the connection did not happen"
         );
         a_mutation_the_host_tells_as_not_shown(&first, &tells, environment_id).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
         Arc::ptr_eq(&state.session().expect("connected"), &first),
