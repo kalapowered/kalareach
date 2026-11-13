@@ -1550,6 +1550,10 @@ mod every_local_write_has_one_route;
 #[cfg(test)]
 mod every_mutation_reply_is_the_reply_that_was_checked;
 
+/// What the local door tells of a write whose own effect has run, once the route has answered.
+#[cfg(test)]
+mod the_end_of_a_write_is_told_under_its_authority;
+
 /// A local connection whose peer stops reading.
 #[cfg(test)]
 mod a_peer_that_stops_reading;
