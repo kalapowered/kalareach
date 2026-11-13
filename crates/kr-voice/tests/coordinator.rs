@@ -762,6 +762,10 @@ enum Answer {
     Replayed,
     CreationUnknown,
     Capacity,
+    /// The account's managed allowance is spent, so the service refuses before it asks a provider.
+    AccountAllowance,
+    /// The service does not accept the account the host presented.
+    Unauthorised,
     /// The rate moved on after the person was shown it.
     RateChanged,
 }
@@ -1015,6 +1019,24 @@ impl ManagedVoiceService for ManagedFake {
                         reason: kr_client::services::voice::VoiceRefusalReason::ServiceCapacity,
                         message: "Managed capacity is spent.".to_owned(),
                         alternatives: vec!["Use your own provider credential.".to_owned()],
+                        attempt_id: None,
+                        call_id: None,
+                    }))
+                }
+                Answer::AccountAllowance => {
+                    VoiceStart::Refused(Box::new(kr_client::services::voice::VoiceRefusal {
+                        reason: kr_client::services::voice::VoiceRefusalReason::AccountAllowance,
+                        message: "The account's managed allowance is spent.".to_owned(),
+                        alternatives: vec!["Use your own provider credential.".to_owned()],
+                        attempt_id: None,
+                        call_id: None,
+                    }))
+                }
+                Answer::Unauthorised => {
+                    VoiceStart::Refused(Box::new(kr_client::services::voice::VoiceRefusal {
+                        reason: kr_client::services::voice::VoiceRefusalReason::Unauthorised,
+                        message: "The service does not accept this account.".to_owned(),
+                        alternatives: Vec::new(),
                         attempt_id: None,
                         call_id: None,
                     }))
@@ -2125,6 +2147,74 @@ async fn exhausted_capacity_reports_what_still_works() {
     };
     assert_eq!(reason, "service_capacity");
     assert!(!alternatives.is_empty());
+}
+
+/// KR-REQ-23.51: a start the broker refuses on the account, because its managed allowance is spent
+/// or because the service does not accept it, reaches the device as that refusal with the paths that
+/// still work. The host holds no call, asks the broker once and has nothing to close.
+#[tokio::test]
+async fn a_start_the_broker_refuses_on_the_account_holds_no_call() {
+    for (answer, said, own_alternatives) in [
+        (
+            Answer::AccountAllowance,
+            "account_allowance",
+            Some("Use your own provider credential."),
+        ),
+        (Answer::Unauthorised, "unauthorised", None),
+    ] {
+        let fixture = fixture_with(&[ActionRight::SessionView], answer);
+        fixture
+            .coordinator
+            .grant(
+                &grant_params(None),
+                AuthorityRevision::new(1),
+                10_000,
+                &kr_voice::Unbounded,
+            )
+            .await
+            .expect("a standing voice grant");
+        let result = fixture
+            .coordinator
+            .start(
+                device(PHONE),
+                &start_params_for(&fixture.coordinator).await,
+                AuthorityRevision::new(1),
+                10_000,
+                &kr_voice::Unbounded,
+            )
+            .await
+            .expect("an answer");
+        let VoiceStartOutcome::Unavailable {
+            reason,
+            alternatives,
+            ..
+        } = result.outcome
+        else {
+            panic!("{said}: an account the broker refuses is an answer about the service");
+        };
+        assert_eq!(reason, said);
+        match own_alternatives {
+            Some(own) => assert_eq!(alternatives, [own], "{said}: the broker's own paths"),
+            None => assert!(
+                !alternatives.is_empty(),
+                "{said}: the person is not left with no path"
+            ),
+        }
+        assert_eq!(
+            fixture.coordinator.live_sessions(),
+            0,
+            "{said}: a refused start holds no call"
+        );
+        assert_eq!(
+            fixture.broker.offers().len(),
+            1,
+            "{said}: the broker is asked once"
+        );
+        assert!(
+            fixture.broker.closed().is_empty(),
+            "{said}: no call was created, so none is closed"
+        );
+    }
 }
 
 /// KR-REQ-23.51: every voice method needs the voice grant at the host, and a device with none gets
