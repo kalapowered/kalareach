@@ -1144,10 +1144,17 @@ fn open_directory_relative(
         {
             return Ok(None);
         }
+        // text: open_directory_relative-1
         return Err(ffi::error(
             code,
             format!(
-                "opening {} beneath a held directory",
+                "{} {} beneath a held directory",
+                // With `FILE_OPEN_IF` the same call makes a directory that is not there.
+                if disposition == FILE_OPEN {
+                    "opening"
+                } else {
+                    "opening or making"
+                },
                 name.to_string_lossy()
             ),
         )

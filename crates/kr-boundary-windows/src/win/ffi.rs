@@ -126,12 +126,24 @@ impl KnownFolder {
 
 /// A known folder that the shell could not give: which one, and the platform's answer.
 #[derive(Debug, thiserror::Error)]
-#[error("reading the system's {} folder: {}", .folder.name(), system_form(*.status))]
+// text: ffi-1
+#[error("reading the system's {} folder: {}", .folder.name(), known_folder_answer(*.status))]
 pub struct KnownFolderError {
     /// The folder.
     pub folder: KnownFolder,
     /// The platform's answer, an `HRESULT`.
     pub status: u32,
+}
+
+/// What a known folder's call answered, in words: the system's form of an error, or, for an answer
+/// of success, that the call gave no path.
+fn known_folder_answer(status: u32) -> String {
+    // An HRESULT with its top bit set is a failure.
+    if status >= 0x8000_0000 {
+        system_form(status)
+    } else {
+        "the call reported success and gave no path".to_owned()
+    }
 }
 
 /// A platform error in the system's own form: its code in hexadecimal and, where the system has a

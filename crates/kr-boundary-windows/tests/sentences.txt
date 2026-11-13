@@ -262,6 +262,67 @@ policy-2 | the policy holds an entry that this program does not understand: | th
 platform_error | Windows error {code} | what: Windows error N | read: the platform's error number of the failed call (GetLastError, or the status that the call returned)
 platform_error | what.to_owned() | what, with no number | read: the failure is one that no call returned (code 0): a check that the setup program made itself
 
+# ---- win/applocker.rs, win/launch.rs, win/journal.rs, win/ffi.rs (the `#[error]` messages that a person reads)
+applocker-1 | could not be started: | PowerShell or the event log query could not be started: error | read: the program was not run: the system's Windows directory could not be read, PowerShell's own working directory could not be made, the program's path could not be trusted, or the spawn returned an error; the error is printed
+applocker-2 | failed: {source} | making the policy file failed: error, or writing the policy file failed: error | read: fresh::named_file, or the write or the sync of the made file, returned an error (Channel::set), printed
+applocker-3 | failed with | PowerShell or the event log query failed with status: output | read: the program ran and ended with a status other than success, and what it wrote is printed
+applocker-4 | did not end by its deadline | the event log query did not end by its deadline | read: the run's outcome was TimedOut at the query's bound
+applocker-5 | the deadline passed before the event log was asked | the deadline passed before the event log was asked | read: the deadline was compared with the time now before the query was made
+applocker-6 | {what} {}: {source} | the event log query could not be started, or failed: the launcher's error | read: LaunchError::outcome_words, which says "could not be started" only for the errors that say nothing was started and "failed" for any other, and the launcher's own error, printed
+applocker-7 | {0} | the text of the answer that could not be read | read: the events' text did not parse, the policy's text did not parse (its own words), or PowerShell's answer after a success named no record; the text is printed
+launch-1 | the program could not be started: Windows error | the program could not be started: Windows error N | read: CreateProcess returned the error number
+launch-2 | the job could not be applied at creation, and nothing was started: | the job could not be applied at creation, and nothing was started: error | read: the call that makes the creation's attribute list or applies the job failed before the process was made
+launch-3 | the program's path is not absolute, and nothing was started | the program's path is not absolute, and nothing was started | read: VerifiedPath::new found that the path is not absolute
+launch-4 | a pipe end is not inheritable, and nothing was started | a pipe end is not inheritable, and nothing was started | read: OwnedPipeEnd::new read the handle's flags and the inherit flag was not set
+launch-5 | the child was not suspended exactly once, and it was ended | the child was not suspended exactly once, and it was ended | read: ResumeThread returned a suspend count other than 1 (and not the failure value); dropping the child ends it
+launch-6 | the deadline passed before the program was started | the deadline passed before the program was started | read: the deadline was compared with the time now before the job was made
+launch-7 | the service was stopping before the program was started | the service was stopping before the program was started | read: the stop was set before the program was started (every setter of the stop ends the service)
+launch-8 | the new process was not in its job and was ended | the new process was not in its job and was ended | read: the job's membership call answered that the new process is not in it; the child is dropped, which ends it
+launch-9 | the permit to resume is for another child, and the child was ended | the permit to resume is for another child, and the child was ended | read: the permit's invocation, process or creation time differs from the child's; dropping the child ends it
+launch-10 | the end is not proved: {0} | the end is not proved: the reasons | read: the job was not shown empty, or a child or a pipe was not shown to have ended; the reasons are the job's and the run's own
+launch-11 | transparent | the platform's error as ffi::Error prints it | read: a call failed, with the call's context and the platform's error number
+outcome_words | "could not be started" | the program could not be started | read: the launcher's error is one whose own text says that nothing was started (NotStarted, Job, PathNotAbsolute, PipeEndNotInheritable, DeadlinePassed, Stopped)
+outcome_words | => "failed" | the program failed | read: the launcher's error is one of a program that may have been made (NotSuspendedOnce, NotInJob, PermitForAnotherChild, EndUncertain), or of a call that does not say (Platform)
+journal-1 | the journal's directory or a file in it: | the journal's directory or a file in it: error | read: the directory could not be listed or a file in it could not be made, opened, read, written or flushed; the error is printed
+ffi-1 | reading the system's {} folder: | reading the system's X folder: the system's form of the error, or that the call reported success and gave no path | read: SHGetKnownFolderPath returned a failure status, or a success with no path
+
+# ---- win/setup.rs, win/broker.rs and the programs' non-Windows lines (the prints that a person reads)
+setup-1 | eprintln!("kr-boundary-setup: {message} | kr-boundary-setup: the message of the rejected command line | rule: the words are setup_args' own messages, which carry their own rows
+setup-2 | setup_args::USAGE | the usage text | rule: the words are setup_args::USAGE, which has its own row
+setup-3 | known_folder_unreadable( | kr-boundary-setup: the words of remedy::known_folder_unreadable | read: Paths::system could not read a known folder, with the folder's name and the system's form of the answer
+setup-4 | eprintln!("kr-boundary-setup: {error} | kr-boundary-setup: the error that ended the command | read: the command's own error, printed with the words of the place that made it
+setup-5 | no manifest is recorded, and no service, account or program directory of the installation's names was found | no manifest is recorded, and no service, account or program directory of the installation's names was found | read: entry found no manifest in the data directory (or no data directory), no account of the two names, no service of the name, and no program directory; the policy and the machine's other state are not read
+setup-6 | the manifest records a finished installation: | the manifest records a finished installation: N recorded objects, M enrolled | read: the manifest's state is Installed, with its object and person counts; nothing of the machine is read beside it
+setup-7 | partial: the manifest records an installation that has not finished | partial: the manifest records an installation that has not finished (N recorded objects) | read: the manifest's state is InProgress, with its object count; another run may be under way
+setup-8 | runs on Windows only | kr-boundary-setup installs the Windows execution boundary and runs on Windows only | rule: the program built for another platform says what it is
+broker-1 | runs as a Windows service and is started by the service manager | kr-boundary-broker runs as a Windows service and is started by the service manager | read: the dispatcher's call failed with ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, the answer for a program started from a console
+broker-2 | could not start the service dispatcher: error | kr-boundary-broker could not start the service dispatcher: error N | read: the dispatcher's call failed with a number other than the connect error, printed
+broker-3 | runs on Windows only | kr-boundary-broker is the Windows execution boundary's service and runs on Windows only | rule: the program built for another platform says what it is
+
+# ---- win/walk.rs (the `#[error]` messages that a person reads)
+walk-1 | the volume uses {0}, and only NTFS volumes are supported | the volume uses X, and only NTFS volumes are supported | read: GetVolumeInformationByHandleW's file system name, printed
+walk-2 | crate::remedy::REMOTE_VOLUME | the words of REMOTE_VOLUME | read: the volume's device characteristics say remote; the words and their read are REMOTE_VOLUME's row
+walk-3 | the volume is on removable media, and only fixed volumes are supported | the volume is on removable media, and only fixed volumes are supported | read: the volume's device characteristics hold FILE_REMOVABLE_MEDIA
+walk-4 | the volume is not on an ordinary disk (device type {0}) | the volume is not on an ordinary disk (device type N) | read: the device type of the volume as the platform gave it
+walk-5 | the identifier names another object | the identifier names another object | read: the object opened by its identifier is a reparse point or is not a directory
+walk-6 | the object is no longer directly beneath its directory | the object is no longer directly beneath its directory | read: the opened object's final path is not its directory's path plus the name
+walk-7 | the object could not be opened ({}) | the object could not be opened (Windows error N), or (the name is too long for the platform) | read: the open of the child by its name or identifier returned the error number; the number 0 is the check of the name's length, which no call answered
+walk-8 | the object is not a directory | the object is not a directory | read: the attributes of the object at the anchor do not hold FILE_ATTRIBUTE_DIRECTORY
+walk-9 | {0} | the words of the volume's refusal | read: the volume check refused the volume; the words are those of walk-1 to walk-4
+
+# ---- the contexts that were corrected (win/registry.rs, win/service.rs, win/pipe.rs, win/launch.rs, win/verify.rs, win/walk.rs, win/install.rs)
+registry-1 | opening or making the key | opening or making the key K: Windows error N | read: RegCreateKeyExW returned the error; the call opens a key that is there and makes one that is not
+registry-2 | is not a DWORD (type | the value V is not a DWORD (type T) | read: RegQueryValueExW succeeded and the value's type is not REG_DWORD; no call returned an error
+service-1 | the service {} is in state | the service S is in state N, not stopped (or not running) | read: the wait's bound ran out with the last status that the service manager gave; no call failed
+pipe-1 | opening the pipe | opening the pipe P: Windows error N | read: CreateFileW returned an invalid handle for the pipe's name; the call opens and makes nothing
+launch-12 | opening this process's token | opening this process's token: Windows error N | read: OpenProcessToken failed, in whichever program called the launcher
+launch-13 | this process's token | this process's token: Windows error N | read: the token handle that OpenProcessToken returned could not be taken up
+launch-14 | copying this process's token | copying this process's token: Windows error N | read: DuplicateTokenEx failed
+launch-15 | the copy of this process's token | the copy of this process's token: Windows error N | read: the handle that DuplicateTokenEx returned could not be taken up
+verify-1 | Windows did not verify its signature | P: Windows did not verify its signature (the system's form of the status) | read: WinVerifyTrust returned a status other than success, whatever it says (no signature, a signature that does not hold, a check that could not be made)
+walk-10 | a name too long for the platform | a name too long for the platform | read: the name's length in bytes is over the limit of the platform's name type; no call was made
+open_directory_relative-1 | beneath a held directory | opening (or opening or making) N beneath a held directory: Windows error N | read: NtCreateFile returned the error; with the open-if disposition the same call makes a directory that is not there
+
 # ---- public words outside remedy.rs and records.rs
 APPLICATION_CONTROL_STARTING | Windows starts application control after the service starts | Windows starts application control after the service starts, and the installation waits for it | rule: said after the Application Identity service starts; the wait's own bound is 300 seconds and no time of the platform is said
 STILL_STARTING | Windows is still starting application control after the restart | Windows is still starting application control after the restart; try again in a few minutes | flow: the broker's answer to every request while its proof of the boundary has not passed
@@ -277,29 +338,24 @@ listed | #[error] | frame.rs | 9 | to be read into rows: the audit (parts E and 
 listed | #[error] | journal/framing.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | journal/replay.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | journal/rows.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | win/applocker.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | win/ffi.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | win/install.rs | 7 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | win/journal.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | win/launch.rs | 9 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | #[error] | win/journal.rs | 7 | reaches no person: the other errors of the journal come from making, resuming and appending to a file, which no program that a person runs reads
 listed | #[error] | win/root.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | win/walk.rs | 14 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | #[error] | win/walk.rs | 5 | reaches no person: a child that is gone is passed over, the walk of a tree has one caller that no person reaches, and the anchor's reparse point has its own words in the refusal
 listed | Handle::new( | win/acl.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | Handle::new( | win/install.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | Handle::new( | win/job.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/launch.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | Handle::new( | win/pipe.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | Handle::new( | win/launch.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | Handle::new( | win/pipe.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | Handle::new( | win/privilege.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | Handle::new( | win/token.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | Handle::new( | win/walk.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | anchor_refusal( | win/install.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | child_refusal( | win/install.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | eprint!( | bin/kr-launch-stand-in.rs | 1 | the stand-in program of the tests, which a test runs and no person does
-listed | eprintln!( | bin/kr-boundary-broker.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | eprintln!( | bin/kr-boundary-setup.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | eprintln!( | bin/kr-launch-stand-in.rs | 3 | the stand-in program of the tests, which a test runs and no person does
-listed | eprintln!( | win/broker.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | eprintln!( | win/setup.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | eprintln!( | win/broker.rs | 1 | reaches no person: the service has no console
+listed | eprintln!( | win/setup.rs | 1 | reaches no person: Paths::system gives only a known folder error, which has its own line
 listed | error( | win/account.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | error( | win/acl.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | error( | win/boot.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
@@ -307,14 +363,13 @@ listed | error( | win/ffi.rs | 1 | to be read into rows: the audit (parts E and 
 listed | error( | win/job.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | error( | win/pipe.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | error( | win/privilege.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/registry.rs | 9 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | error( | win/registry.rs | 7 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | error( | win/root.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | error( | win/sd.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/service.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | error( | win/token.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/verify.rs | 4 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | error( | win/walk.rs | 4 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | ffi::error( | win/install.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | error( | win/verify.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | error( | win/walk.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | ffi::error( | win/install.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | ffi::error( | win/launch.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | ffi::last( | win/install.rs | 4 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | io_error( | win/install.rs | 15 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
@@ -322,7 +377,7 @@ listed | last( | win/account.rs | 1 | to be read into rows: the audit (parts E a
 listed | last( | win/acl.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | last( | win/ffi.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | last( | win/job.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | last( | win/launch.rs | 14 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | last( | win/launch.rs | 12 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | last( | win/pipe.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | last( | win/privilege.rs | 5 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | last( | win/root.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
@@ -335,7 +390,6 @@ listed | print!( | bin/kr-launch-stand-in.rs | 4 | the stand-in program of the t
 listed | print!( | win/install.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | println!( | bin/kr-launch-stand-in.rs | 12 | the stand-in program of the tests, which a test runs and no person does
 listed | println!( | win/install.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | println!( | win/setup.rs | 3 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | program_refusal( | win/install.rs | 4 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | pub const | names.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | notice.rs | 1 | the notice: its words are fixed and do not change

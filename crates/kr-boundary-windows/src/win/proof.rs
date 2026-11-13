@@ -259,7 +259,7 @@ pub fn run_captured_until(
     let readers = match (out, err) {
         (Ok(out), Ok(err)) if out.ended && err.ended => Ok((out, err)),
         (Ok(out), Ok(err)) => Err(format!(
-            "a pipe of a program of the proof was still open after the end of its job (standard output ended {}, standard error ended {})",
+            "a pipe of the program was still open after the end of its job (standard output ended {}, standard error ended {})",
             out.ended, err.ended
         )),
         _ => Err("a reader of the program's output failed".to_owned()),
@@ -330,7 +330,7 @@ fn settled(job: &Job, ended: Ended) -> Result<(), LaunchError> {
 fn uncertain_end(job: &Job, ended: Ended) -> LaunchError {
     let reasons = job.unproved_reasons().join("; ");
     LaunchError::EndUncertain(format!(
-        "a program of the proof was not shown to have ended (exited {}, job empty {}): {reasons}",
+        "the program was not shown to have ended (exited {}, job empty {}): {reasons}",
         ended.all_exited, ended.active_zero
     ))
 }

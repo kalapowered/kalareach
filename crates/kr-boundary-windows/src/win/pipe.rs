@@ -886,7 +886,8 @@ fn open_client(kind: Kind) -> Result<Handle> {
             null_mut(),
         )
     };
-    Handle::new(opened, "opening the broker's pipe")
+    // text: pipe-1
+    Handle::new(opened, &format!("opening the pipe {}", kind.name()))
 }
 
 /// How long the installer's own connection waits for an instance of the pipe to be free.

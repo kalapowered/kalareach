@@ -449,7 +449,7 @@ unsafe fn finding_in(
         // every read of the identifier.
         if !unsafe { entry_holds_its_identifier(allowed) } {
             return Ok(Some(Finding::Unevaluated(
-                "its permission list has an entry whose size does not hold its identifier"
+                "its permission list has an entry whose identifier is not a valid one or does not fit in the entry's size"
                     .to_owned(),
             )));
         }

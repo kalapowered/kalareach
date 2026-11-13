@@ -8,6 +8,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(windows))]
 fn main() -> std::process::ExitCode {
+    // text: broker-3
     eprintln!(
         "kr-boundary-broker is the Windows execution boundary's service and runs on Windows only"
     );

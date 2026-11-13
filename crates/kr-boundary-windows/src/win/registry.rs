@@ -75,7 +75,8 @@ pub fn create(subkey: &str) -> Result<Key> {
     if status == ERROR_SUCCESS {
         Ok(Key(key))
     } else {
-        Err(error(status, format!("creating the key {subkey}")))
+        // text: registry-1
+        Err(error(status, format!("opening or making the key {subkey}")))
     }
 }
 
@@ -136,7 +137,11 @@ impl Key {
         };
         match status {
             ERROR_SUCCESS if kind == REG_DWORD => Ok(Some(u32::from_le_bytes(data))),
-            ERROR_SUCCESS => Err(error(0, format!("the value {name} is not a number"))),
+            // text: registry-2
+            ERROR_SUCCESS => Err(error(
+                0,
+                format!("the value {name} is not a DWORD (type {kind})"),
+            )),
             ERROR_FILE_NOT_FOUND => Ok(None),
             other => Err(error(other, format!("reading the value {name}"))),
         }

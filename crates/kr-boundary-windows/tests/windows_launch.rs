@@ -2872,3 +2872,56 @@ fn base64(bytes: &[u8]) -> String {
     }
     text
 }
+
+/// A message that names a program says that it "could not be started" only where the launcher's
+/// error says that nothing was started; for a program that may have been made it says that the
+/// program "failed". A relative path and a handle that is not for the child are each said in their
+/// own words, and a standard handle is named only where one is the fault.
+#[test]
+fn a_launch_error_says_could_not_be_started_only_where_nothing_was_started() {
+    use kr_boundary_windows::win::applocker::Error;
+    let said = |source: LaunchError| {
+        Error::Launch {
+            what: "the event log query",
+            source,
+            by_the_deadline: false,
+        }
+        .to_string()
+    };
+    let relative = VerifiedPath::new("wevtutil.exe").expect_err("a relative path is refused");
+    assert!(
+        matches!(relative, LaunchError::PathNotAbsolute),
+        "{relative:?}"
+    );
+    assert_eq!(
+        said(relative),
+        "the event log query could not be started: the program's path is not absolute, and nothing was started"
+    );
+    assert_eq!(
+        said(LaunchError::DeadlinePassed),
+        "the event log query could not be started: the deadline passed before the program was started"
+    );
+    assert_eq!(
+        said(LaunchError::EndUncertain(
+            "a pipe of the program was still open".to_owned()
+        )),
+        "the event log query failed: the end is not proved: a pipe of the program was still open"
+    );
+    assert_eq!(
+        said(LaunchError::NotSuspendedOnce),
+        "the event log query failed: the child was not suspended exactly once, and it was ended"
+    );
+    for source in [
+        LaunchError::PathNotAbsolute,
+        LaunchError::PipeEndNotInheritable,
+        LaunchError::NotSuspendedOnce,
+    ] {
+        assert!(!source.to_string().contains("standard handle"), "{source}");
+    }
+    let file = Error::File {
+        what: "making the policy file",
+        source: std::io::Error::other("the disk is full"),
+    }
+    .to_string();
+    assert_eq!(file, "making the policy file failed: the disk is full");
+}
