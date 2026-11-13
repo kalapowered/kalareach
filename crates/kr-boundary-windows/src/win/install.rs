@@ -1048,8 +1048,16 @@ impl Made {
         let directory = directory.map_or(Taken::NotMade, MadeObject::take_away);
         let folder = match parent {
             None => Taken::NotMade,
+            // The folder is not tried while the data directory's own removal did not finish. The
+            // words give what that removal answered and no more: a directory that holds an entry
+            // and another object at the directory's name are different answers.
             Some(_) if matches!(directory, Taken::Stays(_)) => {
-                Taken::Stays("the data directory in it stays".to_owned())
+                let Taken::Stays(why) = &directory else {
+                    unreachable!("the arm matched a directory that stays")
+                };
+                Taken::Stays(format!(
+                    "not tried: the removal of the data directory did not finish ({why})"
+                ))
             }
             Some(_) if directory == Taken::NotFound => Taken::Stays(
                 "the data directory that this run made in it was not found at its name, so the rollback did nothing with it"
@@ -4054,8 +4062,9 @@ impl Run {
     /// and the folder above it where this run made that too, whatever happened before, so that what
     /// keeps them is named. Returns what the rollback came to for each object, by its path: those
     /// that it marked for removal, in the order that it took them, and those that it did not take
-    /// away, with the reason (a directory whose name was not found is named with the words of a name
-    /// that was not found, and a file of the run that is not at its name counts as gone). The
+    /// away, with the reason (an object of the run whose name was not found, a file or a directory,
+    /// is named with the words of a name that was not found, and counts neither as gone nor as a
+    /// record that was marked). The
     /// records are deleted only where the run wrote records (the earlier-state record, the
     /// manifest) and the rollback marked each of them.
     fn take_away(&mut self) -> Rolled {
@@ -4079,14 +4088,9 @@ impl Run {
             + usize::from(manifest.is_some());
         let mut records_marked = 0;
         let mut rolled = Rolled::default();
-        let object = |object: Option<MadeObject>| {
-            object.map(|object| {
-                let directory = object.directory;
-                (directory, object.take_away())
-            })
-        };
-        let mut take = |taken: Option<(bool, Taken)>, path: &Path, record: bool| -> bool {
-            let Some((directory, taken)) = taken else {
+        let object = |object: Option<MadeObject>| object.map(MadeObject::take_away);
+        let mut take = |taken: Option<Taken>, path: &Path, record: bool| -> bool {
+            let Some(taken) = taken else {
                 return true;
             };
             match taken {
@@ -4096,9 +4100,9 @@ impl Run {
                     records_marked += usize::from(record);
                     true
                 }
-                // A file of this run that is not at its name has nothing that stays, and the
-                // rollback marked nothing: it is not a record that was marked.
-                Taken::NotFound if !directory => true,
+                // An object of this run that is not found at its name gets the words of a name
+                // that was not found, and is not counted as gone or as a record that was marked:
+                // nothing read shows where it is.
                 taken => {
                     rolled
                         .stayed
@@ -4113,21 +4117,13 @@ impl Run {
         // made it, wherever the object is by now: at the replacement's name, or at the manifest's.
         if gone && let Some(file) = replacement {
             let path = file.path.clone();
-            gone = take(
-                Some((false, file.take_away(directory.as_ref()))),
-                &path,
-                true,
-            );
+            gone = take(Some(file.take_away(directory.as_ref())), &path, true);
         }
         // The earlier-state record, while the run still holds the handle that made it, goes through
         // that handle.
         if gone && let Some(file) = prior_creating {
             let path = file.path.clone();
-            gone = take(
-                Some((false, file.take_away(directory.as_ref()))),
-                &path,
-                true,
-            );
+            gone = take(Some(file.take_away(directory.as_ref())), &path, true);
         }
         if gone {
             gone = take(object(prior), &self.paths.prior, true);
@@ -6629,7 +6625,10 @@ mod tests {
         );
         assert_eq!(
             folder,
-            Taken::Stays("the data directory in it stays".to_owned())
+            Taken::Stays(
+                "not tried: the removal of the data directory did not finish (another object stands at its name, so nothing was marked)"
+                    .to_owned()
+            )
         );
         assert!(std::fs::metadata(above.join("data")).unwrap().is_dir());
         assert!(std::fs::metadata(above.join("aside")).unwrap().is_dir());
@@ -6901,7 +6900,7 @@ mod tests {
             "{stayed:?}"
         );
         assert!(
-            stayed[1].contains("the data directory in it stays"),
+            stayed[1].contains("not tried: the removal of the data directory did not finish"),
             "{stayed:?}"
         );
         // What the rollback marked is named, the records among it, and what stays is not.
@@ -7263,5 +7262,30 @@ mod tests {
             journal.try_exists().unwrap(),
             "a journal file stays while the broker may still write it"
         );
+    }
+
+    #[test]
+    fn a_file_of_the_run_that_is_not_found_at_its_name_is_named_and_is_not_counted_as_gone() {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        // The manifest that the run holds is moved aside: its name answers not found.
+        std::fs::rename(&run.paths.manifest, top.path().join("aside.json")).unwrap();
+        let rolled = run.take_away();
+        assert!(
+            rolled.stayed.iter().any(|entry| entry
+                .contains(&run.paths.manifest.display().to_string())
+                && entry.contains("its name was not found in the directory that holds it")),
+            "{rolled:?}"
+        );
+        assert!(
+            !rolled
+                .marked
+                .contains(&run.paths.manifest.display().to_string())
+        );
+        assert!(
+            !rolled.records_deleted,
+            "no record is said to be deleted where one was not found at its name: {rolled:?}"
+        );
+        assert!(top.path().join("aside.json").try_exists().unwrap());
     }
 }

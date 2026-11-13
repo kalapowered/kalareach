@@ -1258,8 +1258,9 @@ pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &s
     }
 }
 
-/// The words that end a rollback whose steps ended without a failure but that could not take away
-/// all that the run laid in the data directory's place: each object that stays, with the platform's
+/// The words that end a rollback whose steps that undo the policy, the service, the accounts and
+/// the program directory ended without a failure, but that could not take away all that the run
+/// laid in the data directory's place: each object that stays, with the platform's
 /// words and, for a directory, the entries that it holds, and then each object that was marked for
 /// removal through the identity that the run kept of it, where there is one. They say what was read
 /// and no more, and give no step: nothing in them tells a person to move, remove or correct
@@ -1276,7 +1277,7 @@ pub fn rollback_laid_stays(stayed: &[String], marked: &[String]) -> String {
         )
     };
     format!(
-        "The steps of the rollback ended without a failure, but this run could not take away all that it made: {}.{marked_words}",
+        "The rollback's steps that undo the policy, the service, the accounts and the program directory ended without a failure, but this run could not take away all that it laid in the data directory's place: {}.{marked_words}",
         stayed.join("; ")
     )
 }
