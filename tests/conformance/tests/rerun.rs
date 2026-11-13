@@ -1,10 +1,17 @@
 //! A step whose first run ends in a file the linker wrote that the system would not start is run
 //! again, and the result says so; any other failure is left as it is.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
-use kr_conformance::fault::{self, Cause};
-use kr_conformance::plan::{Group, Platform, Reading, Step};
+use kr_conformance::fault;
+#[cfg(unix)]
+use kr_conformance::fault::Cause;
+#[cfg(unix)]
+use kr_conformance::plan::Platform;
+use kr_conformance::plan::{Group, Reading, Step};
+#[cfg(unix)]
 use kr_conformance::report::{self, Document, Options};
 use kr_conformance::run::Place;
 
@@ -135,6 +142,7 @@ fn a_step_that_fails_in_another_way_is_not_run_again() {
 }
 
 /// The report over the `forms` tree with `step` as its only step, building into `target`.
+#[cfg(unix)]
 fn report_over(step: Step, target: &Path, evidence: &Path) -> Document {
     let options = Options {
         root: Path::new(env!("CARGO_MANIFEST_DIR"))
