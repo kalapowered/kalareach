@@ -174,13 +174,9 @@ async fn a_workflow_decision_reads_the_wall_clock_once_its_lock_is_held() {
     }
 }
 
-/// While the floor is owed its record, a workflow's grant that reads the clock is not decided,
-/// and a personal grant that never expires, under no time bound of this host's policy, is
-/// decided as before. Once the floor is written down, the expiring grant is decided again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
-    let temp = kr_ipc::testing::TempHost::create();
-    let controller = daemon(&temp).await;
+/// Makes every write of the host's policy fail from here, as it would on a full disk. The fault
+/// is lifted by dropping its trigger on the returned connection.
+fn refuse_policy_writes(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connection {
     let registry = rusqlite::Connection::open(temp.environment().registry_database())
         .expect("opens the registry");
     registry
@@ -193,6 +189,17 @@ async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
                  BEGIN SELECT RAISE(ABORT, 'no room'); END;",
         )
         .expect("the fault is in place");
+    registry
+}
+
+/// While the floor is owed its record, a workflow's grant that reads the clock is not decided,
+/// and a personal grant that never expires, under no time bound of this host's policy, is
+/// decided as before. Once the floor is written down, the expiring grant is decided again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = daemon(&temp).await;
+    let registry = refuse_policy_writes(&temp);
     // A lapse this host found and could not write down. It is kept strictly above the floor: a
     // write of the floor already in flight when the fault was put in place, by the daemon's own
     // tick, may cover the floor's own moment. This is no tolerance.
@@ -241,4 +248,32 @@ async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
             controller.continuous_now(),
         )
         .expect("once the floor is written down, the grant is decided on its merits");
+}
+
+/// A lapse at exactly the moment the floor on disk reaches is not owed its record: the floor
+/// already covers it. A grant that expires is decided, though this host can write nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lapse_the_floor_on_disk_already_covers_leaves_the_floor_owed_nothing() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = daemon(&temp).await;
+    // The floor is written down at this host's reading now, and then nothing more can be.
+    controller.settled_now_ms();
+    let _registry = refuse_policy_writes(&temp);
+    controller.keep_lapse(controller.utc_floor().written());
+
+    let now_ms = kr_ipc::now_ms().get();
+    let expiring = held(
+        &controller,
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(now_ms + 60 * 60 * 1000),
+        },
+    );
+    controller
+        .decide_for_workflow(
+            &expiring,
+            ActorIngress::PairedDevice,
+            now_ms,
+            controller.continuous_now(),
+        )
+        .expect("a lapse the floor on disk covers is owed nothing, so the grant is decided");
 }
