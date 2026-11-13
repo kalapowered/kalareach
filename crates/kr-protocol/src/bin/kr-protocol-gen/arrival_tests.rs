@@ -1362,6 +1362,32 @@ fn a_new_method_does_not_pass_where_a_reference_can_reach_another_place() {
     }
 }
 
+/// A keyword that gives a place an address, a name, a target that depends on the place that
+/// evaluates it or a dialect is refused in data as well (the value of a `default`): a resolver that
+/// searches the whole document for an address or an anchor finds one there as it finds one in a
+/// schema. Each of the eight is refused by itself, so that a keyword missing from the list is seen.
+#[test]
+fn each_scope_keyword_is_refused_in_data() {
+    for keyword in [
+        "$id",
+        "id",
+        "$anchor",
+        "$dynamicAnchor",
+        "$recursiveAnchor",
+        "$dynamicRef",
+        "$recursiveRef",
+        "$schema",
+    ] {
+        let extra =
+            json!({ "D": { "default": { "kind": { keyword: "https://example.test/x" } } } });
+        let lines = level_lines(
+            &with_methods(&extra, &["a"]),
+            &with_methods(&extra, &["a", "b"]),
+        );
+        assert_eq!(lines, vec![added("b")], "{keyword} in a default");
+    }
+}
+
 /// The keywords of the schema beside `$defs` use definitions too: a use of `Method` at the root
 /// that does not widen blocks the line, as one in a definition does, and the root's properties,
 /// which is how the generated schemas use definitions, widen. The root may name the one dialect
