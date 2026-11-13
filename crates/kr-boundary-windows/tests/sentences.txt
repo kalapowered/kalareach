@@ -56,7 +56,7 @@ supported_layout | This layout is not supported: the setup program installs the 
 ancestor_refusal | shared_refusal( | X is a folder above the boundary's data or program directory | rule: Paths::system places the tree below that folder
 ancestor_refusal | shared_refusal( | a drive letter that is not the root of its volume: it leads to Y | read: final_path_of of the opened root against is_the_volumes_own_root
 ancestor_refusal | shared_refusal( | It is on a volume that the installation does not use (reason) | read: walk::check_volume (the volume's information)
-ancestor_refusal | shared_refusal( | It is refused because it is a link or a mounted folder | read: attributes_of shows a reparse point
+ancestor_refusal | shared_refusal( | It is refused because it is a reparse point, such as a link or a mounted folder | read: attributes_of shows the reparse attribute; the tag is not read, so the words do not say which kind
 ancestor_refusal | shared_refusal( | It is refused because it is not a folder | read: attributes_of has no directory bit
 ancestor_refusal | shared_refusal( | the folder's list gives to others the right to swap a folder below it for a link, or to replace that program | read: the list of the handle; rule that names the risk
 ancestor_refusal | shared_refusal( | It is refused because it could not be opened or read to be checked (error) | read: the call failed, error printed
@@ -154,7 +154,7 @@ qualify_git-3 | git_permissions_refusal | the words of remedy::git_permissions_r
 qualify_git-4 | Git could not be run: | Git could not be run: error | read: starting git returned an error, printed
 qualify_git-5 | Git did not report its version: it ended with | Git did not report its version: it ended with S and wrote T | read: git's exit status and standard output
 stage_payload-1 | payload_file_not_reached | the words of remedy::payload_file_not_reached | read: see payload_file_not_reached
-stage_payload-2 | is a link, not a file | X is a link, not a file | read: symlink_metadata shows a symbolic link or a reparse attribute
+stage_payload-2 | is a reparse point (a link, or a file that a filter serves), not a plain file | X is a reparse point (a link, or a file that a filter serves), not a plain file | read: symlink_metadata shows a symbolic link or the reparse attribute; the tag is not read
 stage_payload-3 | is signed by | X is signed by A, not by B | read: the Authenticode check's signer subject against the expected subject
 keep-1 | {what} failed: {error} | step failed: error | read: the failed step's error, printed
 confirm-1 | say(NOTICE) | the notice, which the setup program says before it asks | rule: the constant of the notice; no machine fact

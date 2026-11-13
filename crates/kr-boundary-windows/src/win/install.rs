@@ -560,7 +560,7 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
     {
         return Err(parent_refusal(
             paths,
-            "it is a link or not a folder",
+            "it is a reparse point or not a folder",
             ParentCure::MoveAside,
         ));
     }
@@ -1003,7 +1003,7 @@ fn attributes_of(handle: &ffi::Handle, what: &str) -> Result<u32, Error> {
 fn not_a_plain_directory(handle: &ffi::Handle, shown: &str) -> Result<Option<&'static str>, Error> {
     let attributes = attributes_of(handle, shown)?;
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Ok(Some("it is a link"));
+        return Ok(Some("it is a reparse point"));
     }
     if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Ok(Some("it is not a directory"));
@@ -1264,7 +1264,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 return Err(child_refusal(
                     paths,
                     &shown,
-                    "it is a link",
+                    "it is a reparse point",
                     &Origin::Foreign,
                 ));
             }
@@ -1532,7 +1532,7 @@ fn inspect_layout(
                     paths,
                     dir,
                     &shown,
-                    "it is a link",
+                    "it is a reparse point",
                     &Origin::Foreign,
                 ));
             }
@@ -1673,7 +1673,7 @@ fn program_refusal(
 fn anchor_refusal(paths: &Paths, refusal: &AnchorRefusal, recorded: bool) -> Error {
     let (why, cure) = match refusal {
         AnchorRefusal::Volume(_) => (refusal.to_string(), Cure::Volume),
-        AnchorRefusal::ReparsePoint => ("it is a link".to_owned(), Cure::RemoveLink),
+        AnchorRefusal::ReparsePoint => ("it is a reparse point".to_owned(), Cure::RemoveLink),
         AnchorRefusal::NotADirectory => (refusal.to_string(), Cure::RemoveEntry),
     };
     program_refusal(
@@ -2061,7 +2061,7 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
                     paths,
                     dir,
                     &shown,
-                    "it is a link",
+                    "it is a reparse point",
                     &Origin::Foreign,
                 ));
             }
@@ -2199,7 +2199,11 @@ fn inspect_within(
             ));
         }
         if opened.kind == Kind::ReparsePoint {
-            return Err(refuse("it is a link", Cure::RemoveLink, &Origin::Foreign));
+            return Err(refuse(
+                "it is a reparse point",
+                Cure::RemoveLink,
+                &Origin::Foreign,
+            ));
         }
         if opened.kind == Kind::File && opened.links > 1 {
             return Err(refuse(
@@ -2605,7 +2609,7 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
         {
             // text: stage_payload-2
             return Err(Error::Refused(format!(
-                "{} is a link, not a file",
+                "{} is a reparse point (a link, or a file that a filter serves), not a plain file",
                 source.display()
             )));
         }
