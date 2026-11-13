@@ -864,38 +864,54 @@ mod tests {
     }
 
     /// A run whose work never finishes, with a standard error nobody reads, is held by neither
-    /// past the bound, by the run's own clock: the work waits for ever, the diagnostic's write
-    /// stalls, and the run is through at the deadline and the allowance after its start, inside the
-    /// one-second timeout a session ending is given.
+    /// past the bound: the work waits for ever, the diagnostic's write stalls, and the run is
+    /// through at the bound the run set itself, the deadline or the allowance after its answer,
+    /// with the write still stalled. That bound, the deadline and the allowance after the run's
+    /// start, is inside the one-second timeout a session ending is given. How soon after its
+    /// bound the machine lets a run end is the machine's: it is not held against the run.
     #[test]
     fn a_run_that_waits_for_ever_and_whose_diagnostic_nobody_reads_ends_at_the_bound() {
-        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let (release_work, stalled_work) = std::sync::mpsc::channel::<()>();
+        let (release_write, stalled_write) = std::sync::mpsc::channel::<()>();
+        let write_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = std::sync::Arc::clone(&write_ended);
         let started = std::time::Instant::now();
-        let mut answered = false;
+        let mut answered_at = None;
         run_with(
             started,
             move |_| {
                 // Waits until the test lets it go, which is after the run is through.
-                let _ = stalled.recv_timeout(Duration::from_secs(30));
+                let _ = stalled_work.recv_timeout(HUNG_WRITER);
                 Ok(())
             },
             || {},
-            || answered = true,
-            |_| {
-                // The write stalls too.
-                std::thread::sleep(Duration::from_secs(30));
+            || answered_at = Some(std::time::Instant::now()),
+            move |_| {
+                // The write stalls too, until the test lets it go.
+                let _ = stalled_write.recv_timeout(HUNG_WRITER);
+                ended.store(true, std::sync::atomic::Ordering::SeqCst);
             },
         );
-        let ran_for = started.elapsed();
-        drop(release);
-        assert!(answered, "the answer is written");
+        let through = std::time::Instant::now();
+        let write_had_ended = write_ended.load(std::sync::atomic::Ordering::SeqCst);
+        drop(release_work);
+        drop(release_write);
+        let answered_at = answered_at.expect("the answer is written");
         assert!(
-            ran_for >= HOOK_DEADLINE + DIAGNOSTIC_ALLOWANCE,
-            "it waited the allowance for the line: {ran_for:?}"
+            answered_at >= started + HOOK_DEADLINE,
+            "work that never finishes is answered at the deadline"
         );
         assert!(
-            ran_for < SESSION_END_TIMEOUT,
-            "it was through inside the one-second timeout of a session ending: {ran_for:?}"
+            through >= answered_at + DIAGNOSTIC_ALLOWANCE,
+            "it waited the allowance for the line"
+        );
+        assert!(
+            !write_had_ended,
+            "it was through while the write was stalled, not when the write ended"
+        );
+        assert!(
+            HOOK_DEADLINE + DIAGNOSTIC_ALLOWANCE < SESSION_END_TIMEOUT,
+            "the bound is inside the one-second timeout of a session ending"
         );
     }
 
