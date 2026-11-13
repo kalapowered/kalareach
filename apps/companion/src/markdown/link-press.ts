@@ -268,11 +268,16 @@ function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
   // A touch's or a pen's click comes from the press's first point; a mouse's from where it is released.
   if (press.own && liesInView(pane, press.start.link, by ? press.at : press.current)) return true
   if (!by) return false
-  // The rule opens a link only from plain text of the pane, as at the pointer down: where a scroll has put
-  // another control, another link or an element outside the pane under the point, the click is that
-  // element's and the rule adds nothing.
   const hit = document.elementFromPoint(press.at.x, press.at.y)
-  if (hit === null || !pane.contains(hit) || namedBy(hit) !== 'neither') return false
+  if (hit === null || !pane.contains(hit)) return false
+  // Where a scroll has put the lit link's own element under the point, the engine's click names that element
+  // and opens the link, which is what the press lit: the press keeps its look while the link still opens
+  // what it opened at the press.
+  if (hit.closest('.md-link') === press.start.link && press.start.link.title === press.start.destination) return true
+  // Otherwise the rule opens a link only from plain text of the pane, as at the pointer down: where a scroll
+  // has put another control or another link under the point, the click is that element's and the rule adds
+  // nothing.
+  if (namedBy(hit) !== 'neither') return false
   return keepsPress(press, (point) => layoutNear(pane, point.x, point.y))
 }
 
