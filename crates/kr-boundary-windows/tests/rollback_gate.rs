@@ -157,16 +157,26 @@ fn the_steps_act_on_an_account_the_service_and_the_identity_service_only_behind_
     // The accounts: the one step that deletes an account is behind the rule, and the rule's refusal
     // leaves the account before anything of it is read or changed.
     let gate = steps
-        .find("if !object.acted_on_by(rollback) {")
+        .find("let acts = if object.acted_on_by(rollback) {")
         .expect("the account step asks whether a result lets it act");
     let first_change = steps.find("account::revoke_all_rights(").unwrap();
     assert!(
         gate < first_change,
         "the rule stands before the first change"
     );
+    assert!(steps[gate..first_change].contains("if !acts {"));
     assert!(steps[gate..first_change].contains("continue;"));
+    // A rollback leaves an account that has no result of its own run; only the removal reads the
+    // object for an intent with no result.
+    assert!(steps[gate..first_change].contains("} else if rollback {"));
+    assert!(steps[gate..first_change].contains("read_account_intent("));
     // The service: the maintenance step and the deletion both start from the same value.
-    assert!(steps.contains(".is_some_and(|object| object.acted_on_by(rollback));"));
+    assert!(steps.contains("Some(object) if object.acted_on_by(rollback) => true,"));
+    assert!(steps.contains("Some(object) if !rollback && object.outcome.is_none() => {"));
+    // The policy and the Application Identity service's start type are put back by a rollback only
+    // where its own write is on record.
+    assert!(steps.contains(".any(|object| !rollback || object.acted_on_by(true));"));
+    assert!(steps.contains("&& (!rollback || object.acted_on_by(true))"));
     assert_eq!(
         count(&steps, "if service_is_ours && let Some(service) ="),
         2
@@ -201,6 +211,23 @@ fn the_installation_records_each_result_after_the_call_that_made_the_object() {
     let made = at("manager.create(");
     let result = at("run.conclude(ObjectKind::Service, SERVICE, Outcome::Made)?;");
     assert!(intent < made && made < result);
+    // The policy's rules and the start type each get a result after the call that writes them.
+    let write = at("channel.set(&wanted.render())?");
+    let result =
+        at("run.manifest\n            .conclude(ObjectKind::PolicyRule, id, Outcome::Made);");
+    assert!(write < result);
+    let set = at("Identity(&appid).set_automatic()?;");
+    let result = at("run.conclude(ObjectKind::AppIdentity, APPID, Outcome::Made)?;");
+    assert!(set < result);
+    // The two points where a killed program leaves an intent with no result.
+    let add = at("account::add(name)?;");
+    let die = at("die_at(\"account\");");
+    let made = at("run.conclude(ObjectKind::Account, name, Outcome::Made)?;");
+    assert!(add < die && die < made);
+    let create = at("manager.create(");
+    let die = at("die_at(\"service\");");
+    let made = at("run.conclude(ObjectKind::Service, SERVICE, Outcome::Made)?;");
+    assert!(create < die && die < made);
     // The Application Identity service's start is recorded where the manager accepted the request.
     assert!(lay.contains(
         ".start(|| run.conclude(ObjectKind::AppIdentityStarted, APPID, Outcome::Made))?;"

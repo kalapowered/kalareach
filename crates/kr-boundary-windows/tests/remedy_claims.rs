@@ -7,9 +7,11 @@ use std::path::Path;
 use kr_boundary_windows::manifest::Outcome;
 use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
-    CASE_SENSITIVE_WHY, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Standing, Taken,
-    choose, data_ending, data_made_ending, ending, left_alone, parent_advice, program_keeping,
-    program_open_advice, rollback_ending, rollback_entry, rollback_laid_stays, unnamed_root_why,
+    CASE_SENSITIVE_WHY, EntryKind, Grounds, IntentAct, IntentRead, Origin, ParentCure, Presence,
+    Purpose, Standing, Taken, choose, data_ending, data_made_ending, ending, intent_words,
+    left_alone, parent_advice, program_keeping, program_open_advice, rollback_ending,
+    rollback_entry, rollback_laid_stays, rollback_not_changed, service_program_is,
+    unnamed_root_why,
 };
 
 /// An installation whose reads found nothing of the installation: the one run that may name a move.
@@ -655,11 +657,11 @@ fn the_ending_of_a_rollback_says_records_are_deleted_only_where_the_run_wrote_an
 }
 
 #[test]
-fn the_words_for_an_object_that_was_left_say_what_the_record_holds_and_give_no_step() {
+fn the_words_for_an_object_that_a_rollback_left_say_what_the_record_holds_and_give_no_step() {
     let words = [
-        left_alone("account", "krb-checkout", None, true),
-        left_alone("account", "krb-checkout", Some(Outcome::Found), true),
-        left_alone("the service", "KalaReachBoundary", None, false),
+        left_alone("account", "krb-checkout", None),
+        left_alone("account", "krb-checkout", Some(Outcome::Found)),
+        rollback_not_changed("the policy"),
     ];
     for text in &words {
         assert!(text.contains("left it as it is"), "{text}");
@@ -678,5 +680,66 @@ fn the_words_for_an_object_that_was_left_say_what_the_record_holds_and_give_no_s
     }
     assert!(words[0].contains("holds no result that the step made it"));
     assert!(words[1].contains("found it where it looked and did not make it"));
-    assert!(words[2].contains("nothing shows that the installation made it"));
+    assert!(words[2].contains("holds no result that this run changed it"));
+}
+
+#[test]
+fn the_removal_decides_about_an_intent_with_no_result_by_a_read_of_the_object() {
+    let mark = "the comment that the installation gives its accounts";
+    let read = |read: &IntentRead| intent_words("account", "krb-checkout", mark, read);
+    // Nothing is there: nothing to remove, no failure.
+    assert_eq!(IntentRead::NotThere.act(), IntentAct::Leave);
+    assert!(read(&IntentRead::NotThere).contains("there is nothing to remove"));
+    // It is there with the installation's mark: removed as one that the installation made.
+    assert_eq!(IntentRead::Marked.act(), IntentAct::Remove);
+    let marked = read(&IntentRead::Marked);
+    assert!(marked.contains("no result of that step"), "{marked}");
+    assert!(marked.contains(mark), "{marked}");
+    assert!(marked.contains("removes it as it removes one that the installation made"));
+    // It is there without the mark: left, and no failure.
+    assert_eq!(IntentRead::Unmarked.act(), IntentAct::Leave);
+    assert!(read(&IntentRead::Unmarked).contains("without the installation's mark"));
+    // A read that fails leaves it and fails the removal, so that its records stay.
+    let failed = IntentRead::Failed("Windows error 5".to_owned());
+    assert_eq!(failed.act(), IntentAct::LeaveAndFail);
+    let text = read(&failed);
+    assert!(
+        text.contains("a read of it failed (Windows error 5)"),
+        "{text}"
+    );
+    assert!(text.contains("its records stay"), "{text}");
+    // None of them tells anybody to remove, move or correct anything.
+    for text in [
+        read(&IntentRead::NotThere),
+        marked,
+        read(&IntentRead::Unmarked),
+        text,
+    ] {
+        for forbidden in ["remove it by", "delete it", "move it", "rename"] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
+    }
+}
+
+#[test]
+fn the_service_is_the_installations_where_its_program_is_the_broker_in_the_program_directory() {
+    let broker = r"C:\Program Files\KalaReach\Boundary\kr-boundary-broker.exe";
+    // The service manager answers the path that the installation wrote, in quotation marks.
+    assert!(service_program_is(&format!("\"{broker}\""), broker));
+    assert!(service_program_is(
+        &format!("\"{}\"", broker.to_ascii_uppercase()),
+        broker
+    ));
+    assert!(service_program_is(broker, broker));
+    // Another file of the same folder, a program elsewhere, an argument and nothing are not it.
+    assert!(!service_program_is(
+        "\"C:\\Program Files\\KalaReach\\Boundary\\kr-boundary-credential.exe\"",
+        broker
+    ));
+    assert!(!service_program_is(
+        "\"C:\\Windows\\System32\\notepad.exe\"",
+        broker
+    ));
+    assert!(!service_program_is(&format!("\"{broker}\" -x"), broker));
+    assert!(!service_program_is("", broker));
 }
