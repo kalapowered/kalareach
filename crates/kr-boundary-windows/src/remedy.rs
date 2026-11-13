@@ -1186,8 +1186,13 @@ pub enum Taken {
     /// The object that this run made was marked for removal through the handle of the call that
     /// made it.
     Marked,
-    /// The object that this run made stays: the platform's refusal of the reopen or of the mark, or
-    /// the reason that the cleanup did not try (the directory in the folder stays).
+    /// The cleanup opened the object by its name in the directory that holds it, and the platform
+    /// answered that the name was not found: nothing was read of the object, so nothing says that it
+    /// stays or that it is gone, and the cleanup did nothing with it.
+    NotFound,
+    /// The object that this run made stays: the platform's refusal of the open or of the mark, what
+    /// stands at its name, or the reason that the cleanup did not try (the directory in the folder
+    /// stays, or was not found).
     Stays(String),
 }
 
@@ -1196,7 +1201,9 @@ pub enum Taken {
 /// made them leaves nothing of the run for the person to move or to correct. `directory` and
 /// `folder` are what the cleanup came to for each, with `data` and `above` their paths. The words
 /// say that the data directory was removed only where this run made it and marked it, name each
-/// object that stays with its reason, and say that nothing is left only where nothing stays.
+/// object that stays with its reason, say that nothing is left only where nothing stays, and say of
+/// an object whose name was not found only that it was not found at its name and that the rollback
+/// did nothing with it.
 #[must_use]
 // text: data_made_ending
 pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &str) -> String {
@@ -1206,6 +1213,31 @@ pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &s
     }
     if let Taken::Stays(why) = folder {
         stayed.push(format!("{above} ({why})"));
+    }
+    if *directory == Taken::NotFound || *folder == Taken::NotFound {
+        // An object whose name was not found is said to be neither removed nor kept: nothing was
+        // read of it, and the rollback did nothing with it.
+        let mut sentences = Vec::new();
+        if *directory == Taken::Marked {
+            sentences.push("This run removed the data directory that it made.".to_owned());
+        }
+        if *directory == Taken::NotFound {
+            sentences.push(format!(
+                "The data directory that this run made, {data}, was not found at its name, and the rollback did nothing with it."
+            ));
+        }
+        if *folder == Taken::NotFound {
+            sentences.push(format!(
+                "The folder that this run made above the data directory, {above}, was not found at its name, and the rollback did nothing with it."
+            ));
+        }
+        if !stayed.is_empty() {
+            sentences.push(format!(
+                "This run could not remove the rest of what it made: {}.",
+                stayed.join("; ")
+            ));
+        }
+        return sentences.join(" ");
     }
     if stayed.is_empty() {
         "This run removed what it made, so nothing of it is left.".to_owned()
@@ -1233,6 +1265,22 @@ pub fn rollback_laid_stays(stayed: &[String]) -> String {
         "The steps of the rollback ended without a failure, but this run could not take away all that it made: {}.",
         stayed.join("; ")
     )
+}
+
+/// The entry of the rollback's list for one object that this run made, or none where the cleanup
+/// took the object away or did not make it: the object's path with the platform's words where it
+/// stays, and with the words of a name that was not found, which say that the rollback did nothing
+/// with the object and nothing of whether it stays. `path` is the object's path.
+#[must_use]
+// text: rollback_entry
+pub fn rollback_entry(taken: &Taken, path: &str) -> Option<String> {
+    match taken {
+        Taken::NotMade | Taken::Marked => None,
+        Taken::NotFound => Some(format!(
+            "{path} (its name was not found in the directory that holds it, and the rollback did nothing with it)"
+        )),
+        Taken::Stays(why) => Some(format!("{path} ({why})")),
+    }
 }
 
 /// Why a private root is refused when no journal names it: what the journals say, and nothing of
