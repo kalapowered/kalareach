@@ -1272,6 +1272,15 @@ pnpm -C apps/companion tauri build
 macOS is the first target. Windows and Linux compile from the same source; their packaging is not
 covered by the checks above.
 
+On Windows the Tauri command line asks for the static Visual C++ runtime unless the environment says
+`STATIC_VCRUNTIME=false`, and the application links the dynamic one, so the build script refuses to
+go on and names the variable. Set it first, in PowerShell:
+
+```powershell
+$env:STATIC_VCRUNTIME = 'false'
+pnpm -C apps/companion tauri build
+```
+
 On Windows, with Microsoft's linker, the build links the application manifest into every binary it
 makes, the test binaries included. The native dialogs need version 6 of the common controls, and a
 binary without the manifest that selects it cannot start.
