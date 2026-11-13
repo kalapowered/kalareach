@@ -24,6 +24,8 @@ let boxes = new WeakMap<Element, Box>()
 let reads: Element[] = []
 /** The listeners the handler has on the document now, by event type. */
 const listening = new Map<string, EventListener>()
+/** Whether each of those listeners was added for the capture phase. */
+const capturing = new Map<string, boolean>()
 /** The links the handler opened: the clicks that the link's own element received. */
 let opened: HTMLElement[] = []
 /** The overflow that the made page's elements have, by axis; an element not named here does not clip. */
@@ -40,9 +42,11 @@ beforeEach(() => {
   reads = []
   opened = []
   listening.clear()
+  capturing.clear()
   Object.defineProperty(window, 'visualViewport', { configurable: true, value: null })
-  vi.spyOn(document, 'addEventListener').mockImplementation(((type: string, listener: EventListener) => {
+  vi.spyOn(document, 'addEventListener').mockImplementation(((type: string, listener: EventListener, options?: boolean | AddEventListenerOptions) => {
     listening.set(type, listener)
+    capturing.set(type, options === true || (typeof options === 'object' && options.capture === true))
   }) as typeof document.addEventListener)
   vi.spyOn(document, 'removeEventListener').mockImplementation(((type: string) => {
     listening.delete(type)
@@ -353,6 +357,8 @@ describe('where the handler’s listeners stand', () => {
       'viewport resize',
       'viewport scroll'
     ])
+    // Scroll events do not bubble, so only the capture phase on the document hears the scroll of every box.
+    expect(capturing.get('scroll'), 'the scroll listener is in the capture phase').toBe(true)
     stop()
     expect([...listening.keys()]).toEqual([])
   })
@@ -373,6 +379,9 @@ describe('where the handler’s listeners stand', () => {
     fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
     fire('pointermove', pointer(pane, { clientX: 4, clientY: 45 }))
     expect(standing(), 'listeners after a move past the slop').toEqual([])
+    // A press that lights nothing has no look to keep and stands on no scroll.
+    fire('pointerdown', pointer(pane, { clientX: 300, clientY: 700 }))
+    expect(standing(), 'listeners for a press that lit nothing').toEqual([])
   })
 
   it('opens a link for a tap on the pane’s bare area, where no message lies', () => {
@@ -632,6 +641,48 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     fire('pointerdown', pointer(texts[1], { pointerId: 2, clientX: 300, clientY: 150 }))
     expect(isLit(links[3]?.[0]), 'the look after the next press').toBe(false)
   })
+
+  it('ends the look of a press at a next press outside the pane, and lights nothing for it', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look of the first press').toBe(true)
+    fire('pointerdown', pointer(document.body, { pointerId: 2, clientX: 5, clientY: 5 }))
+    expect(isLit(links[3]?.[0]), 'the look after a press outside the pane').toBe(false)
+  })
+
+  it('lights nothing for a press outside the pane, though a link of the pane lies under its point', () => {
+    const { pane, links } = between({ left: 100, top: 100, right: 140, bottom: 117 })
+    start(pane)
+    clock(100)
+    const outside = document.createElement('div')
+    document.body.append(outside)
+    fire('pointerdown', pointer(outside, { clientX: 120, clientY: 125 }))
+    expect(isLit(links[0]), 'the look for a press outside the pane').toBe(false)
+  })
+
+  it('keeps a press when another pointer moves, and ends it when its own pointer moves past the slop', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointermove', pointer(texts[3], { pointerId: 2, clientY: y - 40 }))
+    expect(isLit(links[3]?.[0]), 'the look after another finger moved').toBe(true)
+    fire('pointermove', pointer(texts[3], { clientY: y - 40 }))
+    expect(isLit(links[3]?.[0]), 'the look after its own finger moved').toBe(false)
+  })
+
+  it('keeps a press for a move of 9 px and ends it for a move of 11 px, the slop being 10', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointermove', pointer(texts[3], { clientY: y - 9 }))
+    expect(isLit(links[3]?.[0]), 'the look after 9 px').toBe(true)
+    fire('pointermove', pointer(texts[3], { clientY: y - 11 }))
+    expect(isLit(links[3]?.[0]), 'the look after 11 px').toBe(false)
+  })
 })
 
 describe('a scroll under a held press', () => {
@@ -678,6 +729,22 @@ describe('a scroll under a held press', () => {
       document.body.replaceChildren()
       listening.clear()
     }
+  })
+
+  it('keeps the look of a press on the strip that only the link’s own button holds while the button lies under the point, and ends it when it does not', () => {
+    // The largest text size: the words end 8 px above the button's own edge, where the rule holds no point.
+    const { pane, links } = between({ left: 100, top: 100, right: 140, bottom: 156 })
+    boxes.set(links[0], { left: 100, top: 92, right: 140, bottom: 164 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[0], { clientX: 120, clientY: 95 }))
+    expect(isLit(links[0]), 'the look on the strip').toBe(true)
+    scrolled(3)
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after a scroll of 3 px: the button still lies under the point').toBe(true)
+    scrolled(80)
+    fire('scroll', {} as Event)
+    expect(isLit(links[0]), 'the look after a scroll that took the button away').toBe(false)
   })
 
   it('ends the look of a press on a link’s own element when the link no longer lies under the press’s point', () => {
@@ -727,6 +794,15 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     fire('pointerup', pointer(text, { clientX: 35, clientY: 128, timeStamp: 120 }))
     fire('click', click(text, { clientX: 35, clientY: 128 }))
     expect(opened).toEqual([])
+  })
+
+  it('shows no link below an inner box whose bottom lies above the pane’s: the nearest box on each edge clips', () => {
+    const { pane, text, links } = between({ left: 100, top: 170, right: 140, bottom: 187 })
+    clip(text, { left: 40, top: 100, right: 350, bottom: 160 }, 'hidden')
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(text, { clientX: 120, clientY: 178 }))
+    expect(isLit(links[0]), 'the look for a tap under the inner box').toBe(false)
   })
 
   it('shows no link that the visual viewport of a zoomed page has left off the screen', () => {
