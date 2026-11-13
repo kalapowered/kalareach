@@ -990,7 +990,7 @@ async fn a_transfer_action_recorded_before_a_late_attempt_is_not_given_back_whil
     let given = late().await;
     assert!(given.is_copied(), "the late attempt is given the record");
     given
-        .into_answer()
+        .into_answer_for_test()
         .expect("with nothing owed the late attempt is answered from the record");
 
     controller.hold_fence(true);
@@ -1002,7 +1002,7 @@ async fn a_transfer_action_recorded_before_a_late_attempt_is_not_given_back_whil
     controller.hold_fence(false);
     late()
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("once the fence is gone it is answered again");
 
     controller.admitted_write().remove(&connection_id);
@@ -1099,7 +1099,7 @@ async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_
                 carried(&controller, connection_id),
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
     };
     late()
         .await
@@ -1138,7 +1138,7 @@ async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_
                     carried,
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
         }
     });
     tokio::time::timeout(Duration::from_secs(30), arrived)
@@ -1561,9 +1561,9 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
 
     // The control: nothing owed, so the changes are made. A refresh asks the platform, which this
     // machine may not have, and what it must not be is a refusal for a fence.
-    enrol(1).await.into_answer().expect("enrolled");
+    enrol(1).await.into_answer_for_test().expect("enrolled");
     assert!(recorded(1));
-    if let Err(error) = refresh(1).await.into_answer() {
+    if let Err(error) = refresh(1).await.into_answer_for_test() {
         assert!(!error.to_string().contains("fence"), "{error}");
     }
 
@@ -1574,7 +1574,7 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("an enrolment is stopped")
             .to_protocol_error(),
     );
@@ -1584,7 +1584,7 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a forgetting is stopped")
             .to_protocol_error(),
     );
@@ -1594,14 +1594,14 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a refresh is stopped")
             .to_protocol_error(),
     );
 
     forget(1)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("forgotten once nothing is owed");
     assert!(!recorded(1));
 }
@@ -1761,7 +1761,7 @@ impl Refreshing {
             controller
                 .environment_record(&actor, false, &mutation, method, carried)
                 .await
-                .into_answer()
+                .into_answer_for_test()
         }
     }
 
@@ -2730,7 +2730,7 @@ async fn a_fence_this_host_owes_stops_an_ssh_hosts_refresh_before_its_helper_is_
             carried,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the ssh host is enrolled");
 
     controller.hold_fence(true);
@@ -2751,7 +2751,7 @@ async fn a_fence_this_host_owes_stops_an_ssh_hosts_refresh_before_its_helper_is_
             carried,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a refresh is stopped while a fence is owed");
     refused_for_a_fence(&refused.to_protocol_error());
 }
@@ -2793,7 +2793,7 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
             carried,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the ssh host is enrolled");
     actor.ingress = kr_protocol::actor::ActorIngress::PairedDevice;
 
@@ -2852,7 +2852,7 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
     assert!(scoped(), "the channel is established");
     refresh()
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("with nothing owed the refresh is answered");
     assert!(
         !scoped(),
@@ -2868,7 +2868,7 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a fence that landed after the answer stops its write")
             .to_protocol_error(),
     );
@@ -2910,7 +2910,7 @@ async fn a_refresh_of_an_environment_no_bridge_reaches_is_given_as_a_copy_of_its
         !enrolled.is_copied() && !enrolled.is_withheld(),
         "an enrolment is what this request did"
     );
-    enrolled.into_answer().expect("enrolled");
+    enrolled.into_answer_for_test().expect("enrolled");
 
     let refresh = mutation_of(
         &rig.temp,
@@ -2936,7 +2936,7 @@ async fn a_refresh_of_an_environment_no_bridge_reaches_is_given_as_a_copy_of_its
         "the row of an environment no bridge reaches is the record's"
     );
     let result: EnvironmentRefreshResult = refreshed
-        .into_answer()
+        .into_answer_for_test()
         .expect("a refresh is answered")
         .to_typed()
         .expect("a result");
@@ -2999,11 +2999,13 @@ async fn an_installation_answered_from_its_record_is_given_as_a_copy() {
         !first.is_copied() && !first.is_withheld(),
         "the first attempt is what this request did"
     );
-    first.into_answer().expect("the first attempt installs");
+    first
+        .into_answer_for_test()
+        .expect("the first attempt installs");
 
     let repeat = install().await;
     assert!(repeat.is_copied(), "a repeat is the record's answer");
-    repeat.into_answer().expect("a repeat is answered");
+    repeat.into_answer_for_test().expect("a repeat is answered");
 
     let mut records = Vec::new();
     action_records(controller.paths.state_dir(), &mut records);
@@ -3015,7 +3017,7 @@ async fn an_installation_answered_from_its_record_is_given_as_a_copy() {
         "a record this host cannot read says a record exists"
     );
     unread
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("an unreadable record is not an answer");
 }
 
@@ -3041,7 +3043,7 @@ async fn what_organisation_policy_apply_answers_is_given_as_a_copy_of_the_polici
         .await;
     assert!(given.is_copied(), "the answer derives from policies held");
     given
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a request that names no policy is refused");
 }
 
@@ -3117,7 +3119,10 @@ async fn the_refusal_from_a_stored_subject_is_given_back_as_a_copy_of_the_record
         refusal.is_copied(),
         "the refusal is what the journal stores"
     );
-    assert_eq!(refusal.into_answer().code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        refusal.into_answer_for_test().code,
+        ErrorCode::InvalidArgument
+    );
 }
 
 /// The file that holds an installation's own record: the one that lists what was changed.
@@ -3185,7 +3190,7 @@ async fn an_installation_record_this_host_cannot_read_is_given_as_a_copy() {
             carried,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first attempt installs");
 
     // A different request for the same installation meets the record the first one left, which
@@ -3207,7 +3212,7 @@ async fn an_installation_record_this_host_cannot_read_is_given_as_a_copy() {
             "a record this host cannot read says a record exists"
         );
         unread
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("an unreadable record is no answer");
     }
 }
@@ -3241,7 +3246,7 @@ async fn a_file_of_the_agents_this_host_cannot_read_is_the_requests_own_refusal(
         "nothing about the request's own files names a record"
     );
     assert!(matches!(
-        refused.into_answer(),
+        refused.into_answer_for_test(),
         Err(crate::error::ControllerError::Storage { .. })
     ));
 }

@@ -237,7 +237,7 @@ impl RemoteConnection {
             Ok(Ok(given)) => given,
             // The effect is still running, so a wait that ended says the outcome is not known
             // rather than that the action failed.
-            Ok(Err(_)) | Err(_) => Given::Fresh(failure(request_id, outcome_unknown())),
+            Ok(Err(_)) | Err(_) => Given::fresh(failure(request_id, outcome_unknown())),
         })
     }
 }

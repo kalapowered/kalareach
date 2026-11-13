@@ -37,7 +37,7 @@ fn revoke_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
 
 /// The error a frame carries.
 fn told(frame: Option<Recorded<ControlFrame>>) -> kr_protocol::error::ProtocolError {
-    let frame = frame.map(|recorded| recorded.copied().into_answer());
+    let frame = frame.map(|recorded| recorded.copied().into_answer_for_test());
     let Some(ControlFrame::Response(response)) = frame else {
         panic!("a repeat the registry cannot be asked about is answered: {frame:?}");
     };
@@ -123,7 +123,7 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
         .voice_answered(&actor_id, &mutation)
         .await
         .copied()
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a claim that cannot be read does not answer the repeat");
     registry
         .execute_batch("ALTER TABLE authority_receipts_aside RENAME TO authority_receipts;")
@@ -149,7 +149,7 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
         .voice_answered(&actor_id, &mutation)
         .await
         .copied()
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a result that cannot be read back does not answer the repeat");
     assert_eq!(undecoded.code(), ErrorCode::OutcomeUnknown, "{undecoded}");
 
@@ -165,7 +165,7 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
         .voice_answered(&actor_id, &mutation)
         .await
         .copied()
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a refusal that cannot be read back does not answer the repeat");
     assert_eq!(
         unknown_code.code(),
@@ -275,7 +275,7 @@ async fn a_voice_change_whose_claim_cannot_be_read_where_it_is_made_is_told_the_
         .execute_batch("ALTER TABLE authority_receipts_aside RENAME TO authority_receipts;")
         .expect("the claims can be read again");
     let unread = given
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a claim that cannot be read is not one this change may be made under");
     assert_eq!(unread.code(), ErrorCode::OutcomeUnknown, "{unread}");
 }
@@ -347,7 +347,7 @@ async fn a_voice_change_whose_claim_cannot_be_begun_is_told_the_outcome_is_unkno
         .wait_for_storage_up_to(std::time::Duration::from_secs(5))
         .expect("the store waits as it does");
     let unbegun = given
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a claim that cannot be begun is not one this change may be made under");
     assert_eq!(unbegun.code(), ErrorCode::OutcomeUnknown, "{unbegun}");
 }

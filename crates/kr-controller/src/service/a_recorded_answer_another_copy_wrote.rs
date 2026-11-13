@@ -187,7 +187,7 @@ async fn a_repeated_create_is_given_what_its_first_attempt_made_only_under_its_a
         "the repeat is read from the reservation"
     );
     let kept = control
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("what the reservation leaves is the launch's failure");
     assert_ne!(kept.code(), ErrorCode::PermissionDenied, "{kept}");
 
@@ -370,7 +370,9 @@ async fn a_late_copy_of_a_kept_refusal(
     )
     .await;
     assert!(!first.is_copied(), "the first copy answers for itself");
-    let first = first.into_answer().expect_err("the service refuses it");
+    let first = first
+        .into_answer_for_test()
+        .expect_err("the service refuses it");
 
     let late = async || {
         project_answer(
@@ -393,7 +395,9 @@ async fn a_late_copy_of_a_kept_refusal(
     .await;
     assert!(control.is_copied(), "the late copy reads the record");
     assert_eq!(
-        control.into_answer().expect_err("the kept refusal"),
+        control
+            .into_answer_for_test()
+            .expect_err("the kept refusal"),
         first,
         "it is given what the first copy was told"
     );
@@ -470,7 +474,7 @@ async fn a_project_action_that_settles_while_its_admission_is_asked_is_not_given
     assert!(control.is_copied(), "the copy is given the settled record");
     assert_eq!(
         control
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("the planted refusal")
             .message,
         "planted"
@@ -561,7 +565,7 @@ async fn a_project_action_whose_claim_is_open_is_not_told_while_a_fence_is_owed(
         "a claim says that an earlier attempt began the action, so the answer is a copy"
     );
     let control = control
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("what became of the action is not known");
     assert_eq!(control.code, ErrorCode::OutcomeUnknown, "{control:?}");
 
@@ -617,7 +621,7 @@ async fn a_project_action_another_copy_recorded_while_it_ran_is_not_given_back_w
     );
     assert_eq!(
         control
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("the planted refusal")
             .message,
         "planted"
@@ -688,7 +692,7 @@ async fn a_project_action_whose_record_cannot_be_written_is_given_the_other_copy
     );
     assert_eq!(
         control
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("the planted refusal")
             .message,
         "planted"
@@ -767,7 +771,7 @@ async fn a_change_set_action_recorded_before_a_late_attempts_look_is_not_given_b
     let first = changeset_answer(&controller, &actor_id, &mutation, admission).await;
     assert!(!first.is_copied(), "the first copy answers for itself");
     let first = first
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a version nobody captured is refused");
 
     let late = async || {
@@ -778,7 +782,9 @@ async fn a_change_set_action_recorded_before_a_late_attempts_look_is_not_given_b
     let control = changeset_answer(&controller, &actor_id, &mutation, admission).await;
     assert!(control.is_copied(), "the late copy reads the record");
     assert_eq!(
-        control.into_answer().expect_err("the kept refusal"),
+        control
+            .into_answer_for_test()
+            .expect_err("the kept refusal"),
         first,
         "it is given what the first copy was told"
     );
@@ -826,7 +832,7 @@ async fn a_change_set_action_whose_claim_another_copy_holds_is_not_told_after_a_
     assert!(control.is_copied(), "the copy meets the other copy's claim");
     assert_eq!(
         control
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("what became of the action is not known")
             .code,
         ErrorCode::OutcomeUnknown
@@ -949,14 +955,16 @@ async fn a_catalogue_receipt_kept_before_a_late_attempts_claim_is_not_given_back
     let first = attempt(false).await;
     assert!(!first.is_copied(), "the first copy answers for itself");
     let first = first
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a catalogue nobody enrolled is refused");
     assert_ne!(first.code, ErrorCode::PermissionDenied, "{first:?}");
 
     let control = attempt(false).await;
     assert!(control.is_copied(), "the late copy reads the receipt");
     assert_eq!(
-        control.into_answer().expect_err("the kept refusal"),
+        control
+            .into_answer_for_test()
+            .expect_err("the kept refusal"),
         first,
         "it is given what the first copy was told"
     );
@@ -1146,12 +1154,12 @@ async fn an_attention_action_recorded_before_a_late_attempts_look_is_not_given_b
     let admission = carried(&controller, connection_id);
     let first = attention_answer(&controller, &actor_id, &mutation, admission).await;
     assert!(!first.is_copied(), "the first copy answers for itself");
-    let first = first.into_answer().expect("the window is set");
+    let first = first.into_answer_for_test().expect("the window is set");
 
     let control = attention_answer(&controller, &actor_id, &mutation, admission).await;
     assert!(control.is_copied(), "the late copy reads the record");
     assert_eq!(
-        control.into_answer().expect("the record's answer"),
+        control.into_answer_for_test().expect("the record's answer"),
         first,
         "it is given what the first copy was told"
     );
@@ -1176,7 +1184,7 @@ async fn an_attention_record_that_cannot_be_read_is_not_told_after_a_fence_lands
     let admission = carried(&controller, connection_id);
     attention_answer(&controller, &actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the window is set");
     let store =
         rusqlite::Connection::open(temp.environment().state_dir().join("attention.sqlite3"))
@@ -1191,7 +1199,7 @@ async fn an_attention_record_that_cannot_be_read_is_not_told_after_a_fence_lands
     let told =
         a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, false)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("an answer that cannot be decoded does not answer the repeat");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
@@ -1335,12 +1343,14 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
     };
     let first = attempt().await;
     assert!(!first.is_copied(), "the first copy answers for itself");
-    let first = first.into_answer().expect("the first copy installs it");
+    let first = first
+        .into_answer_for_test()
+        .expect("the first copy installs it");
 
     let control = attempt().await;
     assert!(control.is_copied(), "the late copy reads the record");
     assert_eq!(
-        control.into_answer().expect("the record's answer"),
+        control.into_answer_for_test().expect("the record's answer"),
         first,
         "it is given what the first copy was told"
     );
@@ -1445,7 +1455,7 @@ async fn a_late_capability_copy_at_the_record(
     release.send(()).expect("the late copy goes on");
     let answered = late.await.expect("the late copy finishes");
     controller.hold_fence(false);
-    answered.into_answer()
+    answered.into_answer_for_test()
 }
 
 /// KR-REQ-09.09, the disclosed checks: a request for them that another copy answered is read back
@@ -1463,7 +1473,7 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_after_a_fenc
     let first = controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first copy is answered");
 
     let control =
@@ -1493,13 +1503,13 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_once_its_hol
     let first = controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first copy is answered");
 
     let control = controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("with nothing owed the late copy is answered from the record");
     assert_eq!(control, first, "it is given what the first copy was told");
 
@@ -1508,7 +1518,7 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_once_its_hol
         controller.start_capability_checks(&actor_id, &mutation, admission),
     )
     .await
-    .into_answer()
+    .into_answer_for_test()
     .expect_err("a fence that landed once the hold had ended stops the answer");
     refused_for_a_fence(&refused.to_protocol_error());
 }
@@ -1529,7 +1539,7 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_when_its_fen
     controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first copy is answered");
 
     let (arrived, release) = controller.before_a_capability_check_looks.arm();
@@ -1568,7 +1578,7 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_when_its_fen
     };
     controller.hold_fence(false);
     let refused = answered
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a fence that stood while the answer was in hand stops it, though it is gone");
     refused_for_a_fence(&refused.to_protocol_error());
 }
@@ -1587,7 +1597,7 @@ async fn a_reused_capability_check_identifier_is_not_refused_as_a_conflict_after
     controller
         .start_capability_checks(&actor_id, &first, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first copy is answered");
     let reused = capability_request(&temp, Some(first.action_id), Some("/authorised.txt"));
 
@@ -1622,7 +1632,7 @@ async fn a_capability_check_answer_that_cannot_be_read_is_not_told_after_a_fence
     controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first copy is answered");
     let record = rusqlite::Connection::open(
         temp.environment()
@@ -1702,12 +1712,16 @@ async fn a_confirmation_request_another_copy_was_given_is_not_given_back_while_a
     };
     let first = attempt().await;
     assert!(!first.is_copied(), "the first copy answers for itself");
-    let first = first.into_answer().expect("the first request is answered");
+    let first = first
+        .into_answer_for_test()
+        .expect("the first request is answered");
 
     let control = attempt().await;
     assert!(control.is_copied(), "the repeat reads the record");
     assert_eq!(
-        control.into_answer().expect("the repeat is answered"),
+        control
+            .into_answer_for_test()
+            .expect("the repeat is answered"),
         first,
         "with the challenge the first was given"
     );

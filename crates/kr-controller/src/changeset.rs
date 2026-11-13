@@ -374,9 +374,9 @@ impl ChangeSetModule {
         {
             let refusal = Err(refusal.to_protocol_error());
             return if copied {
-                Given::Withheld(refusal)
+                Given::withheld(refusal)
             } else {
-                Given::Fresh(refusal)
+                Given::fresh(refusal)
             };
         }
         Given::of(answer, copied)

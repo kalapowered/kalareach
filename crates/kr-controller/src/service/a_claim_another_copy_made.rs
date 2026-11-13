@@ -115,7 +115,7 @@ async fn an_authority_changes_conflict_is_not_told_after_a_fence_lands() {
                 admission,
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
             .map_err(|error| error.to_protocol_error())
     };
     let rotating = mutation_of(&temp, Method::DevicePreviewKeyUpdate, ParamsValue::empty());
@@ -124,7 +124,7 @@ async fn an_authority_changes_conflict_is_not_told_after_a_fence_lands() {
         controller
             .preview_key_update_action(&actor_id, &rotating, admission)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .map_err(|error| error.to_protocol_error())
     };
     let registering = mutation_of(&temp, Method::DevicePushRegister, ParamsValue::empty());
@@ -133,7 +133,7 @@ async fn an_authority_changes_conflict_is_not_told_after_a_fence_lands() {
         controller
             .push_register_action(&actor_id, &registering, admission)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .map_err(|error| error.to_protocol_error())
     };
 
@@ -231,7 +231,7 @@ async fn a_transfers_conflict_is_not_told_while_a_fence_is_owed() {
                 None,
             )
             .await
-            .into_answer()
+            .into_answer_for_test()
     };
     write(&mutation).await.expect("the first attempt records");
 

@@ -616,14 +616,14 @@ impl Controller {
                 }
         );
         if !copied && !reused {
-            return Given::Fresh(found);
+            return Given::fresh(found);
         }
         #[cfg(feature = "testing")]
         self.after_the_retained_lookup.wait().await;
         match self.check_retained_under(carried) {
             Ok(()) => Given::of(found, copied),
-            Err(lapsed) if copied => Given::Withheld(lapsed),
-            Err(lapsed) => Given::Fresh(lapsed),
+            Err(lapsed) if copied => Given::withheld(lapsed),
+            Err(lapsed) => Given::fresh(lapsed),
         }
     }
 

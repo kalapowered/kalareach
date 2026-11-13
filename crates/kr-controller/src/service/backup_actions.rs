@@ -133,7 +133,7 @@ impl Controller {
         crate::testing::note_backup_enable(self.paths.environment_id(), mutation);
         let params: BackupEnableParams = match parse(&mutation.params) {
             Ok(params) => params,
-            Err(refusal) => return Given::Fresh(Err(refusal)),
+            Err(refusal) => return Given::fresh(Err(refusal)),
         };
         let admission = std::sync::Arc::new(SetupStands {
             controller: std::sync::Arc::clone(self),
@@ -154,7 +154,7 @@ impl Controller {
     ) -> Given<Result<BackupEnableResult>> {
         match self.backup_setup_of() {
             Ok(setup) => setup.enable(params, admission).await,
-            Err(refusal) => Given::Fresh(Err(refusal)),
+            Err(refusal) => Given::fresh(Err(refusal)),
         }
     }
 

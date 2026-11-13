@@ -75,7 +75,7 @@ async fn a_project_action_performed_and_not_recorded_is_told_the_outcome_is_unkn
                 None,
             )
             .await;
-        let answer = given.into_answer();
+        let answer = given.into_answer_for_test();
         if refused {
             let told = answer.expect_err("the answer cannot be kept");
             assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");

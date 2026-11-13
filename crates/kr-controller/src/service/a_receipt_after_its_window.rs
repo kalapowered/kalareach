@@ -60,21 +60,23 @@ async fn a_project_action_another_copy_recorded_is_given_back_after_its_window_h
     let mutation = cancellation(&temp);
     let first = project_answer_under(&controller, &actor_id, &mutation, admission).await;
     assert!(!first.is_copied(), "the first copy answers for itself");
-    let first = first.into_answer().expect_err("the service refuses it");
+    let first = first
+        .into_answer_for_test()
+        .expect_err("the service refuses it");
 
     the_window_passes(&clock);
     for late in [admission, without_freshness(admission)] {
         let given = project_answer_under(&controller, &actor_id, &mutation, late).await;
         assert!(given.is_copied(), "the late copy is given the record");
         assert_eq!(
-            given.into_answer().expect_err("the kept refusal"),
+            given.into_answer_for_test().expect_err("the kept refusal"),
             first,
             "it is given what the first copy was told"
         );
         let new = cancellation(&temp);
         let refused = project_answer_under(&controller, &actor_id, &new, late)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("an action with no record is refused for its window");
         refused_for_its_window(&refused);
     }
@@ -106,7 +108,7 @@ async fn an_automation_action_another_copy_recorded_is_given_back_after_its_wind
     let first = ask(&mutation, admission).await;
     assert!(!first.is_copied(), "the first copy answers for itself");
     let first = first
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a workflow nobody installed is refused");
 
     the_window_passes(&clock);
@@ -114,13 +116,13 @@ async fn an_automation_action_another_copy_recorded_is_given_back_after_its_wind
         let given = ask(&mutation, late).await;
         assert!(given.is_copied(), "the late copy is given the record");
         assert_eq!(
-            given.into_answer().expect_err("the kept refusal"),
+            given.into_answer_for_test().expect_err("the kept refusal"),
             first,
             "it is given what the first copy was told"
         );
         let refused = ask(&enabling(), late)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("an action with no record is refused for its window");
         refused_for_its_window(&refused);
     }
@@ -135,20 +137,20 @@ async fn an_attention_action_another_copy_recorded_is_given_back_after_its_windo
     let mutation = setting_quiet_hours(&temp);
     let first = attention_answer(&controller, &actor_id, &mutation, admission).await;
     assert!(!first.is_copied(), "the first copy answers for itself");
-    let first = first.into_answer().expect("the window is set");
+    let first = first.into_answer_for_test().expect("the window is set");
 
     the_window_passes(&clock);
     for late in [admission, without_freshness(admission)] {
         let given = attention_answer(&controller, &actor_id, &mutation, late).await;
         assert!(given.is_copied(), "the late copy is given the record");
         assert_eq!(
-            given.into_answer().expect("the record's answer"),
+            given.into_answer_for_test().expect("the record's answer"),
             first,
             "it is given what the first copy was told"
         );
         let refused = attention_answer(&controller, &actor_id, &setting_quiet_hours(&temp), late)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("an action with no record is refused for its window");
         refused_for_its_window(&refused);
     }
@@ -193,20 +195,20 @@ async fn a_catalogue_receipt_another_copy_kept_is_given_back_after_its_window_ha
     let first = ask(&mutation).await;
     assert!(!first.is_copied(), "the first copy answers for itself");
     let first = first
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a catalogue nobody enrolled is refused");
 
     the_window_passes(&clock);
     let given = ask(&mutation).await;
     assert!(given.is_copied(), "the late copy is given the receipt");
     assert_eq!(
-        given.into_answer().expect_err("the kept refusal"),
+        given.into_answer_for_test().expect_err("the kept refusal"),
         first,
         "it is given what the first copy was told"
     );
     let refused = ask(&pinning())
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("an action with no receipt is refused for its window");
     refused_for_its_window(&refused);
 }
@@ -225,7 +227,7 @@ async fn a_capability_check_another_copy_answered_is_given_back_after_its_window
     let first = controller
         .start_capability_checks(&actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the first copy is answered");
 
     the_window_passes(&clock);
@@ -233,13 +235,13 @@ async fn a_capability_check_another_copy_answered_is_given_back_after_its_window
         let given = controller
             .start_capability_checks(&actor_id, &mutation, late)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect("the late copy is given the record");
         assert_eq!(given, first, "it is given what the first copy was told");
         let refused = controller
             .start_capability_checks(&actor_id, &capability_request(&temp, None, None), late)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a first start is refused for its window");
         refused_for_its_window(&refused.to_protocol_error());
     }
@@ -282,7 +284,7 @@ async fn a_copy_at_the_local_attention_route_is_given_the_record_after_its_windo
     let mutation = setting_quiet_hours(&temp);
     let first = attention_answer(&controller, &actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the window is set");
 
     the_window_passes(&clock);
@@ -330,7 +332,7 @@ async fn a_copy_at_the_local_change_set_route_is_given_the_record_after_its_wind
     let mutation = materialisation(&temp);
     let first = changeset_answer(&controller, &actor_id, &mutation, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a version nobody captured is refused, and the refusal is kept");
 
     the_window_passes(&clock);
