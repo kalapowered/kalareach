@@ -8,7 +8,7 @@ use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
     CASE_SENSITIVE_WHY, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Standing, Taken,
     choose, data_ending, data_made_ending, ending, parent_advice, program_keeping,
-    program_open_advice, rollback_laid_stays, unnamed_root_why,
+    program_open_advice, rollback_entry, rollback_laid_stays, unnamed_root_why,
 };
 
 /// An installation whose reads found nothing of the installation: the one run that may name a move.
@@ -322,26 +322,58 @@ const ABOVE: &str = r"C:\Kala";
 
 /// Every pair of what the cleanup came to for the directory and for the folder above it: the words
 /// say that the data directory was removed only where this run made it and marked it, name each
-/// object that stays and nothing else, and say that nothing is left only where nothing stays. A run
-/// that made only the folder, and whose mark was refused, is never told that it removed a data
-/// directory: it made none.
+/// object that stays and nothing else, say that nothing is left only where nothing stays or was not
+/// found, and say of an object whose name was not found that it was not found at its name and that
+/// the rollback did nothing with it, never that it stays. A run that made only the folder, and
+/// whose mark was refused, is never told that it removed a data directory: it made none.
 #[test]
 fn the_ending_of_what_a_run_made_claims_each_object_only_where_the_cleanup_came_to_it() {
-    let each = |why: &str| [Taken::NotMade, Taken::Marked, Taken::Stays(why.to_owned())];
+    let each = |why: &str| {
+        [
+            Taken::NotMade,
+            Taken::Marked,
+            Taken::NotFound,
+            Taken::Stays(why.to_owned()),
+        ]
+    };
     for directory in each("d") {
         for folder in each("f") {
             let text = data_made_ending(&directory, DATA, &folder, ABOVE);
             let label = format!("{directory:?} {folder:?}: {text}");
             let directory_stays = matches!(directory, Taken::Stays(_));
             let folder_stays = matches!(folder, Taken::Stays(_));
+            let directory_lost = directory == Taken::NotFound;
+            let folder_lost = folder == Taken::NotFound;
             assert_eq!(
                 text.contains("removed the data directory"),
-                directory == Taken::Marked && folder_stays,
+                directory == Taken::Marked && (folder_stays || folder_lost),
                 "{label}"
             );
             assert_eq!(
                 text.contains("nothing of it is left"),
-                !directory_stays && !folder_stays,
+                !directory_stays && !folder_stays && !directory_lost && !folder_lost,
+                "{label}"
+            );
+            assert_eq!(
+                text.contains(&format!("{DATA}, was not found at its name")),
+                directory_lost,
+                "{label}"
+            );
+            assert_eq!(
+                text.contains(&format!("{ABOVE}, was not found at its name")),
+                folder_lost,
+                "{label}"
+            );
+            assert_eq!(
+                text.matches("the rollback did nothing with it").count(),
+                usize::from(directory_lost) + usize::from(folder_lost),
+                "{label}"
+            );
+            // "That folder stays." is said only of a folder whose answer was a reason that it stays,
+            // after a data directory that was removed.
+            assert_eq!(
+                text.contains("That folder stays"),
+                directory == Taken::Marked && folder_stays,
                 "{label}"
             );
             assert_eq!(
@@ -356,11 +388,80 @@ fn the_ending_of_what_a_run_made_claims_each_object_only_where_the_cleanup_came_
             );
             assert_eq!(
                 text.contains("could not remove what it made"),
-                directory_stays || (directory != Taken::Marked && folder_stays),
+                !directory_lost
+                    && !folder_lost
+                    && (directory_stays || (directory != Taken::Marked && folder_stays)),
                 "{label}"
             );
         }
     }
+}
+
+/// An object whose name was not found at the cleanup's open is said to be not found at its name, and
+/// the rollback is said to have done nothing with it: nothing was read that says that it stays or
+/// that it is gone, and no step stands in the words.
+#[test]
+fn the_ending_of_an_object_whose_name_was_not_found_says_only_that_and_gives_no_step() {
+    let folder = data_made_ending(&Taken::Marked, DATA, &Taken::NotFound, ABOVE);
+    assert_eq!(
+        folder,
+        format!(
+            "This run removed the data directory that it made. The folder that this run made above the data directory, {ABOVE}, was not found at its name, and the rollback did nothing with it."
+        )
+    );
+    let directory = data_made_ending(&Taken::NotFound, DATA, &Taken::Stays("w".to_owned()), ABOVE);
+    assert_eq!(
+        directory,
+        format!(
+            "The data directory that this run made, {DATA}, was not found at its name, and the rollback did nothing with it. This run could not remove the rest of what it made: {ABOVE} (w)."
+        )
+    );
+    let alone = data_made_ending(&Taken::NotFound, DATA, &Taken::NotMade, ABOVE);
+    assert_eq!(
+        alone,
+        format!(
+            "The data directory that this run made, {DATA}, was not found at its name, and the rollback did nothing with it."
+        )
+    );
+    for text in [&folder, &directory, &alone] {
+        for wrong in [
+            "stays",
+            "is gone",
+            "nothing of it is left",
+            "could not remove what it made",
+            "Move it aside",
+            "Turn the flag",
+            "Leave the system",
+            "again",
+        ] {
+            assert!(!text.contains(wrong), "{wrong}: {text}");
+        }
+    }
+}
+
+/// The rollback's list names an object that stays with the words that were read, an object whose
+/// name was not found with the words of a name that was not found, and no object that was taken
+/// away or that the run did not make.
+#[test]
+fn the_rollbacks_entry_for_an_object_says_what_the_cleanup_came_to_and_no_more() {
+    assert_eq!(rollback_entry(&Taken::NotMade, DATA), None);
+    assert_eq!(rollback_entry(&Taken::Marked, DATA), None);
+    assert_eq!(
+        rollback_entry(&Taken::Stays("w".to_owned()), DATA),
+        Some(format!("{DATA} (w)"))
+    );
+    let lost = rollback_entry(&Taken::NotFound, DATA).unwrap();
+    assert_eq!(
+        lost,
+        format!(
+            "{DATA} (its name was not found in the directory that holds it, and the rollback did nothing with it)"
+        )
+    );
+    for wrong in ["stays", "is gone", "nothing was marked"] {
+        assert!(!lost.contains(wrong), "{wrong}: {lost}");
+    }
+    let ending = rollback_laid_stays(&[lost]);
+    assert!(ending.ends_with("did nothing with it)."), "{ending}");
 }
 
 /// A refusal in the program directory says that the manifest records the installation, which a read

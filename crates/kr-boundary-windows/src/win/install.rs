@@ -820,9 +820,11 @@ impl MadeObject {
     /// that this run made; where it is the same, the mark is set on that same handle. Another object
     /// at the name is marked by nothing. The handle of the open is closed before the object's own
     /// handle and the directory's, so that the caller turns to the directory that holds this one
-    /// with none of this object's handles open. The words are the platform's refusal, or what was
-    /// found at the name.
-    fn take_away(self) -> Result<(), String> {
+    /// with none of this object's handles open. Returns [`Taken::Marked`] where the mark was set,
+    /// [`Taken::NotFound`] where the open answered that the name is not found (nothing was read of
+    /// the object and nothing was done with it), and [`Taken::Stays`] with the platform's refusal,
+    /// or what was found at the name.
+    fn take_away(self) -> Taken {
         let MadeObject {
             identity,
             holder,
@@ -837,13 +839,7 @@ impl MadeObject {
                     if failure.code == ERROR_FILE_NOT_FOUND
                         || failure.code == ERROR_PATH_NOT_FOUND =>
                 {
-                    // A file of this run that is not at its name has nothing that stays; a
-                    // directory that is not at its name is said not to have been marked.
-                    return if directory {
-                        Err("its name was not found in the directory that holds it, so nothing was marked".to_owned())
-                    } else {
-                        Ok(())
-                    };
+                    return Ok(Taken::NotFound);
                 }
                 Err(failure) => {
                     return Err(remedy::platform_error(
@@ -865,23 +861,28 @@ impl MadeObject {
             if found != made {
                 return Err("another object stands at its name, so nothing was marked".to_owned());
             }
-            super::root::delete(&at_name).map_err(|failure| {
-                let words = remedy::platform_error(
-                    "the platform refused to mark it for removal",
-                    failure.code,
-                );
-                // A directory that holds an entry stays: the entries are named, read through the
-                // object's own handle.
-                if directory {
-                    format!("{words}; {}", names_held_by(&identity))
-                } else {
-                    words
-                }
-            })
+            super::root::delete(&at_name)
+                .map(|()| Taken::Marked)
+                .map_err(|failure| {
+                    let words = remedy::platform_error(
+                        "the platform refused to mark it for removal",
+                        failure.code,
+                    );
+                    // A directory that holds an entry stays: the entries are named, read through the
+                    // object's own handle.
+                    if directory {
+                        format!("{words}; {}", names_held_by(&identity))
+                    } else {
+                        words
+                    }
+                })
         })();
         // The handle of the open is closed, then the object's own, then the directory's.
         drop((identity, holder));
-        marked
+        match marked {
+            Ok(taken) => taken,
+            Err(words) => Taken::Stays(words),
+        }
     }
 }
 
@@ -910,26 +911,22 @@ impl Made {
     /// above it is marked, where this run made that too, and only once the directory is gone. The
     /// caller has closed its own handles of both. Returns what came of the directory and of the
     /// folder: each is [`Taken::NotMade`] where this run did not make it, [`Taken::Marked`] where
-    /// the platform marked it, and [`Taken::Stays`] with the platform's refusal, or what stands at
-    /// its name (a folder that is not tried because the directory in it stays says so).
+    /// the platform marked it, [`Taken::NotFound`] where its name was not found, and
+    /// [`Taken::Stays`] with the platform's refusal, or what stands at its name (a folder that is
+    /// not tried because the directory in it stays, or was not found, says so).
     fn take_away(self) -> (Taken, Taken) {
         let Made { parent, directory } = self;
-        let directory = match directory {
-            None => Taken::NotMade,
-            Some(object) => match object.take_away() {
-                Ok(()) => Taken::Marked,
-                Err(words) => Taken::Stays(words),
-            },
-        };
+        let directory = directory.map_or(Taken::NotMade, MadeObject::take_away);
         let folder = match parent {
             None => Taken::NotMade,
             Some(_) if matches!(directory, Taken::Stays(_)) => {
                 Taken::Stays("the data directory in it stays".to_owned())
             }
-            Some(object) => match object.take_away() {
-                Ok(()) => Taken::Marked,
-                Err(words) => Taken::Stays(words),
-            },
+            Some(_) if directory == Taken::NotFound => Taken::Stays(
+                "the data directory that this run made in it was not found at its name, so the rollback did nothing with it"
+                    .to_owned(),
+            ),
+            Some(object) => object.take_away(),
         };
         (directory, folder)
     }
@@ -3655,7 +3652,9 @@ impl Run {
     /// deleted before this), and the manifest, each only once what it follows is gone, so that a
     /// run that is made again from the records that stay finds them. The data directory goes last,
     /// and the folder above it where this run made that too, whatever happened before, so that what
-    /// keeps them is named. Returns each object that stays, with the reason.
+    /// keeps them is named. Returns each object that the rollback did not take away, with the
+    /// reason: a directory whose name was not found is named with the words of a name that was not
+    /// found, and a file of the run that is not at its name counts as gone.
     fn take_away(&mut self) -> Vec<String> {
         self.directory = None;
         let Laid {
@@ -3668,10 +3667,16 @@ impl Run {
         } = std::mem::take(&mut *ffi::locked(&self.laid));
         let mut stayed = Vec::new();
         let mut take = |object: Option<MadeObject>, path: &Path| -> bool {
-            match object.map(MadeObject::take_away) {
-                None | Some(Ok(())) => true,
-                Some(Err(words)) => {
-                    stayed.push(format!("{} ({words})", path.display()));
+            let Some(object) = object else {
+                return true;
+            };
+            let directory = object.directory;
+            match object.take_away() {
+                Taken::NotMade | Taken::Marked => true,
+                // A file of this run that is not at its name has nothing that stays.
+                Taken::NotFound if !directory => true,
+                taken => {
+                    stayed.extend(remedy::rollback_entry(&taken, &path.display().to_string()));
                     false
                 }
             }
@@ -3692,9 +3697,7 @@ impl Run {
             (directory, &self.paths.data),
             (folder, &self.paths.data_parent().to_path_buf()),
         ] {
-            if let Taken::Stays(words) = taken {
-                stayed.push(format!("{} ({words})", path.display()));
-            }
+            stayed.extend(remedy::rollback_entry(&taken, &path.display().to_string()));
         }
         stayed
     }
@@ -5498,7 +5501,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let object = made_in(held(dir.path()), "made");
         assert!(std::fs::metadata(dir.path().join("made")).unwrap().is_dir());
-        object.take_away().unwrap();
+        assert_eq!(object.take_away(), Taken::Marked);
+        assert!(!dir.path().join("made").try_exists().unwrap());
+    }
+
+    #[test]
+    fn a_directory_that_is_not_at_its_name_is_not_found_and_nothing_is_done_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = made_in(held(dir.path()), "made");
+        // The object that the run made is moved away, and nothing stands at its name.
+        std::fs::rename(dir.path().join("made"), dir.path().join("aside")).unwrap();
+        assert_eq!(object.take_away(), Taken::NotFound);
+        assert!(
+            std::fs::metadata(dir.path().join("aside"))
+                .unwrap()
+                .is_dir()
+        );
         assert!(!dir.path().join("made").try_exists().unwrap());
     }
 
@@ -5509,7 +5527,9 @@ mod tests {
         // The object that the run made is moved away and another directory is put at its name.
         std::fs::rename(dir.path().join("made"), dir.path().join("aside")).unwrap();
         std::fs::create_dir(dir.path().join("made")).unwrap();
-        let words = object.take_away().unwrap_err();
+        let Taken::Stays(words) = object.take_away() else {
+            panic!("another object at the name must stay");
+        };
         assert!(
             words.contains("another object stands at its name, so nothing was marked"),
             "{words}"
@@ -5527,7 +5547,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let object = made_in(held(dir.path()), "made");
         std::fs::write(dir.path().join("made").join("entry"), b"x").unwrap();
-        let words = object.take_away().unwrap_err();
+        let Taken::Stays(words) = object.take_away() else {
+            panic!("a directory that holds an entry must stay");
+        };
         assert!(
             words.contains("the platform refused to mark it for removal"),
             "{words}"
@@ -5575,6 +5597,24 @@ mod tests {
             Taken::Stays("the data directory in it stays".to_owned())
         );
         assert!(std::fs::metadata(above.join("data")).unwrap().is_dir());
+        assert!(std::fs::metadata(above.join("aside")).unwrap().is_dir());
+    }
+
+    #[test]
+    fn a_folder_is_not_tried_where_the_data_directory_in_it_was_not_found_at_its_name() {
+        let top = tempfile::tempdir().unwrap();
+        let folder = made_in(held(top.path()), "above");
+        let above = top.path().join("above");
+        let data = made_in(held(&above), "data");
+        std::fs::rename(above.join("data"), above.join("aside")).unwrap();
+        let made = Made {
+            parent: Some(folder),
+            directory: Some(data),
+        };
+        let (directory, folder) = made.take_away();
+        assert_eq!(directory, Taken::NotFound);
+        assert!(matches!(folder, Taken::Stays(_)), "{folder:?}");
+        assert!(std::fs::metadata(&above).unwrap().is_dir());
         assert!(std::fs::metadata(above.join("aside")).unwrap().is_dir());
     }
 
