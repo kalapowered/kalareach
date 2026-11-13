@@ -293,6 +293,37 @@ impl Drop for PrivateTempDir {
     }
 }
 
+/// A task that serves a fixture and is cancelled when this is dropped.
+///
+/// A task whose handle is dropped keeps running, with everything it holds, until the test's
+/// runtime ends. A fixture that serves a worker service from such a task has the service's files
+/// open for as long, and where an open file refuses the removal of the folder it is in, the
+/// fixture's directory cannot go. A fixture keeps this as a field declared before its directory, so
+/// that the task is cancelled before the directory is removed.
+#[derive(Debug)]
+pub struct Serving(tokio::task::AbortHandle);
+
+impl Serving {
+    /// Spawns `task` on the current runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no Tokio runtime is running.
+    pub fn spawn<F>(task: F) -> Self
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        Self(tokio::spawn(task).abort_handle())
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Holds the process's file-creation mask at 022, the one a login starts with, until it is dropped.
 ///
 /// A directory made without a mode of its own comes out 0755 under it, which is what a daemon that

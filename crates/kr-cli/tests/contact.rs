@@ -44,6 +44,7 @@ struct Hosted {
     client: RunningService<rmcp::RoleClient, ()>,
     service: Arc<WorkerService>,
     _pipes: Pipes,
+    _serving: kr_ipc::testing::Serving,
     // Declared last: the directory is removed after every field above has let go of its files.
     temp: Arc<kr_ipc::testing::TempHost>,
 }
@@ -226,7 +227,7 @@ async fn session_in(
         )
         .expect("a worker service"),
     );
-    tokio::spawn(Arc::clone(&service).serve(listener));
+    let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
 
     let descriptor = WorkerDescriptor {
         session_id,
@@ -280,6 +281,7 @@ async fn session_in(
         client,
         service,
         _pipes: Pipes { directory },
+        _serving: serving,
     }
 }
 
