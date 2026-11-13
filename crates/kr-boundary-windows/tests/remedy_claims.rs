@@ -8,7 +8,7 @@ use kr_boundary_windows::records::{Held, Look, next_step};
 use kr_boundary_windows::remedy::{
     CASE_SENSITIVE_WHY, EntryKind, Grounds, Origin, ParentCure, Presence, Purpose, Standing, Taken,
     choose, data_ending, data_made_ending, ending, parent_advice, program_keeping,
-    program_open_advice, unnamed_root_why,
+    program_open_advice, rollback_laid_stays, unnamed_root_why,
 };
 
 /// An installation whose reads found nothing of the installation: the one run that may name a move.
@@ -452,4 +452,39 @@ fn an_empty_data_directory_that_stayed_is_not_said_to_be_held() {
         "{text}"
     );
     assert!(!text.contains("close what holds it"), "{text}");
+}
+
+/// The rollback's ending names each object that stays with the words that were read, and gives no
+/// step: no instruction to move, remove, correct or delete anything stands in it.
+#[test]
+fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_gives_no_step() {
+    let one = rollback_laid_stays(&[
+        "C:\\Data (the platform refused to mark it for removal: Windows error 145; it holds a.txt)"
+            .to_owned(),
+    ]);
+    assert_eq!(
+        one,
+        "The steps of the rollback ended without a failure, but this run could not take away all that it made: C:\\Data (the platform refused to mark it for removal: Windows error 145; it holds a.txt)."
+    );
+    let two = rollback_laid_stays(&[
+        "C:\\Data (another object stands at its name, so nothing was marked)".to_owned(),
+        "C:\\Above (the data directory in it stays)".to_owned(),
+    ]);
+    assert!(two.contains("C:\\Data (another object stands at its name, so nothing was marked); C:\\Above (the data directory in it stays)."));
+    for text in [&one, &two] {
+        for step in [
+            "Remove",
+            "remove it",
+            "Move",
+            "move it",
+            "Delete",
+            "delete it",
+            "Correct",
+            "run the",
+            "Run the",
+            "by hand",
+        ] {
+            assert!(!text.contains(step), "{step}: {text}");
+        }
+    }
 }
