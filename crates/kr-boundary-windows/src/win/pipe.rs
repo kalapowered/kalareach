@@ -370,8 +370,33 @@ fn stopping(stop: &Stop) -> io::Error {
 fn stopping_with(stop: &Stop, also: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
-        format!("{}{also}", stop.reason()),
+        Stopped {
+            text: format!("{}{also}", stop.reason()),
+            cancel_failed: !also.is_empty(),
+        },
     )
+}
+
+/// What the stop's own ending of a transfer carries: the reason, and whether the cancel's own wait
+/// failed beside it (the transfer is then not seen to be over). The listener tells this error from
+/// every other, so that it ends quietly at a stop and never hides an error that is not the stop's.
+#[derive(Debug)]
+struct Stopped {
+    text: String,
+    cancel_failed: bool,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// The stop's ending of a transfer in this error, or none where the error is any other.
+fn the_stop_in(error: &io::Error) -> Option<&Stopped> {
+    error.get_ref()?.downcast_ref::<Stopped>()
 }
 
 fn stuck_error() -> io::Error {
@@ -810,9 +835,21 @@ impl Listener {
                                 format!("waiting for a client failed ({error})"),
                             ));
                         }
-                        Err(_) if self.stop.is_set() => {
-                            // The instance stays with the listener until the listener ends.
+                        // The stop ended the wait. The instance stays with the listener until the
+                        // listener ends. Where the cancel's own wait failed beside it, the
+                        // transfer is not seen to be over, and the listener ends with that error;
+                        // an error that is not the stop's is never taken for it.
+                        Err(error) if the_stop_in(&error).is_some() => {
                             self.next = Some(pipe);
+                            if the_stop_in(&error).is_some_and(|stop| stop.cancel_failed) {
+                                // text: pipe_accept-stop-1
+                                return Err(ffi::error(
+                                    0,
+                                    format!(
+                                        "the stop ended the wait for a client, and the transfer was not seen to end ({error})"
+                                    ),
+                                ));
+                            }
                             return Ok(None);
                         }
                         // A client that went shows as the number of a pipe that is broken, not

@@ -347,6 +347,11 @@ fn after_failed_launch(
     let ended = job.end(&[], end_by(deadline, stop));
     match settled(job, ended) {
         Ok(()) => error,
+        // The launch's own error is kept beside the end that is not proved, as it is beside the
+        // reads of the pipes.
+        Err(LaunchError::EndUncertain(reason)) => {
+            LaunchError::EndUncertain(format!("{reason}; the launch had also failed: {error}"))
+        }
         Err(uncertain) => uncertain,
     }
 }
