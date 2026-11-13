@@ -156,6 +156,12 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
                 if let Origin::Owned(read) = &origin {
                     assert!(text.contains(read.as_str()), "{what}");
                 }
+                // The owner is read only for an owner outside the class and for the system's class:
+                // a link or another kind of object has no owner read, so nothing is said of one.
+                if origin == Origin::Foreign {
+                    assert!(!text.contains("Whoever"), "{what}");
+                    assert!(!text.contains("owner"), "{what}");
+                }
                 if not_set && standing == Standing::MayBeInstalled {
                     for claim in ["move it aside", "Move", "rename", "makes the directory new"] {
                         assert!(!text.contains(claim), "{claim}: {what}");

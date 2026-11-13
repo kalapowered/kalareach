@@ -954,6 +954,41 @@ fn the_removal_compares_the_present_mode_with_the_records_and_lets_another_mode_
     );
     assert!(left.is_empty() && stays.is_some(), "{left:?}");
 
+    // What each way of leaving the collection writes: the record's mode, nothing (as found) where the
+    // mode is already the record's, where another stays and where the record was not read, and not
+    // configured otherwise.
+    assert_eq!(
+        Restore::Record(Mode::AuditOnly).emptied(),
+        Emptied::Mode(Mode::AuditOnly)
+    );
+    for left in [
+        Restore::Same(Mode::AuditOnly),
+        Restore::Stays {
+            present: Mode::AuditOnly,
+            recorded: Mode::Enabled,
+        },
+        Restore::Unread("why".to_owned()),
+    ] {
+        assert_eq!(left.emptied(), Emptied::AsFound, "{left:?}");
+    }
+    assert_eq!(Restore::NotConfigured.emptied(), Emptied::NotConfigured);
+    // A record that holds an enabled empty collection and a collection that was set to audit only
+    // after the installation: audit only stays.
+    let enabled_record = Recorded::of(Policy::parse(
+        r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="Enabled"></RuleCollection></AppLockerPolicy>"#,
+    ));
+    assert_eq!(
+        policy::restore_for(&enabled_record, Mode::AuditOnly, false),
+        Restore::Stays {
+            present: Mode::AuditOnly,
+            recorded: Mode::Enabled
+        }
+    );
+    // A collection that still holds the installation's rules is no collection that stays: the rules
+    // are a difference whatever the mode.
+    let with_rules = Policy::parse(&with_mode("NotConfigured")).unwrap();
+    let (_, stays) = policy::expected_after(&baseline, &with_rules);
+    assert!(stays.is_none());
     // The mode that the installation set, left in place after the removal, is a difference that
     // keeps the removal from finishing: no allowance is made for it.
     let still_enforced = Policy::parse(&with_mode("Enabled")).unwrap();
