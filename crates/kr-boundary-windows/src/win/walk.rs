@@ -79,7 +79,7 @@ pub enum VolumeRefusal {
     #[error("the volume uses {0}, and only NTFS volumes are supported")]
     NotNtfs(String),
     /// The volume is on another computer.
-    #[error("the volume is on another computer, and only local volumes are supported")]
+    #[error("{}", crate::remedy::REMOTE_VOLUME)]
     Remote,
     /// The volume is on removable media.
     #[error("the volume is on removable media, and only fixed volumes are supported")]
