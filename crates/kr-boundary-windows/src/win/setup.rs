@@ -69,7 +69,7 @@ pub fn main() -> ExitCode {
         }
         Command::Remove => install::confirm(None, "remove the boundary")
             .and_then(|()| install::remove(&paths, false)),
-        Command::Status => install::entry(&paths).map(|entry| match entry {
+        Command::Status => install::status(&paths).map(|entry| match entry {
             // text: setup-5
             Entry::Fresh => println!(
                 "no manifest is recorded, and no service, account or program directory of the installation's names was found"

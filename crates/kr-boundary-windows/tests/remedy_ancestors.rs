@@ -1587,8 +1587,8 @@ fn the_line_for_a_known_folder_that_cannot_be_read_names_the_folder_and_the_erro
 }
 
 /// What an own folder's words claim of contents that nothing read: nothing. The folder that holds
-/// the data directory, where no data directory is, may be removed or renamed if nothing else needs
-/// what is in it.
+/// the data directory, where no data directory is, is told to be corrected and never to be removed
+/// or renamed: the reads that would show that nothing of an installation is left are made in it.
 #[test]
 fn the_words_for_a_parent_with_no_data_directory_claim_nothing_of_its_contents() {
     let text = parent_advice(&ParentCure::Correct(Presence::Absent));
@@ -1596,10 +1596,10 @@ fn the_words_for_a_parent_with_no_data_directory_claim_nothing_of_its_contents()
         text.contains("Nothing is at the data directory's name in it."),
         "{text}"
     );
-    assert!(
-        text.contains("If nothing else needs what is in it, remove or rename the folder"),
-        "{text}"
-    );
+    assert!(text.contains("Correct its list"), "{text}");
+    for step in ["remove", "rename", "Move"] {
+        assert!(!text.contains(step), "{step}: {text}");
+    }
     for claim in ["loses nothing", "holds other things"] {
         assert!(!text.contains(claim), "{claim}: {text}");
     }

@@ -143,19 +143,81 @@ pub fn origin_of_shape(kind: EntryKind, shape: Shape, owner: &dyn Fn() -> Origin
     if wrong_kind { Origin::Foreign } else { owner() }
 }
 
-/// What the person is told to do about one refused entry.
+/// What the setup program is doing when it reads the installation. The purpose decides whether an
+/// ending may tell an administrator to take an object that stands on the way to the installation's
+/// records out of its place: see [`Grounds::clearance`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purpose {
+    /// An installation.
+    Install,
+    /// A repair of an installation.
+    Repair,
+    /// A removal.
+    Remove,
+    /// A status report.
+    Status,
+}
+
+/// What the setup program is doing and how it finds out what its reads showed of the rest of the
+/// installation. The reads are made only when the answer can matter: a removal, a repair and a status
+/// report never read for it.
+#[derive(Clone, Copy)]
+pub struct Grounds<'a> {
+    purpose: Purpose,
+    reads: &'a dyn Fn() -> Standing,
+}
+
+impl<'a> Grounds<'a> {
+    /// The purpose of the run, and the reads that show what the computer holds of the installation
+    /// (made only for an installation, and only when an ending asks).
+    #[must_use]
+    pub fn new(purpose: Purpose, reads: &'a dyn Fn() -> Standing) -> Self {
+        Self { purpose, reads }
+    }
+
+    /// The purpose of the run.
+    #[must_use]
+    pub fn purpose(&self) -> Purpose {
+        self.purpose
+    }
+
+    /// The one way to get a [`Clearance`]: only an installation whose reads found nothing of the
+    /// installation has one. A removal, a repair and a status report have none, and neither has an
+    /// installation where a read found a part of the installation or failed.
+    #[must_use]
+    pub fn clearance(&self) -> Option<Clearance> {
+        (self.purpose == Purpose::Install && (self.reads)() == Standing::NothingFound)
+            .then_some(Clearance(()))
+    }
+}
+
+/// What lets an ending tell an administrator to move, rename or remove an object that stands on the
+/// way to the installation's records (the folder above the data directory, the data directory, the
+/// manifest, the journal and every other entry in it). It cannot be made except by
+/// [`Grounds::clearance`], and every ending that names such a step takes one, so no ending of a
+/// removal, a repair or a status report, and none where a read failed or found a part of the
+/// installation, can name one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clearance(());
+
+/// What the person is told to do about one refused entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Remedy {
     /// Remove the entry: its handle shows the system's class, and it is no record of the layout, or
     /// nothing is recorded about it (no manifest, or a root that no journal names).
-    Remove,
+    Remove(Clearance),
     /// Correct the entry's owner and list: the system's class owns it and a manifest is there.
     Correct,
-    /// Move the entry out of the data directory: the handle shows, or the entry's own list shows,
-    /// that the installation did not make it, or nothing shows who made it.
-    MoveAside,
+    /// Move the entry out of the data directory: the handle shows that the installation did not
+    /// make it, or the manifest holds no record of it.
+    MoveAside(Clearance),
+    /// Give the ownership back: another account owns the entry (the text is the owner's
+    /// identifier, as the handle showed it). The one step rests on what the administrator knows.
+    OwnerStep(String),
     /// Close the program that holds the entry open: nothing says who made it until it is read.
     Unreadable,
+    /// No step: the words name what was read, and where a read failed, that it failed.
+    NoStep,
 }
 
 /// What the manifest's own record showed of a refused entry, where the refusal read it: the
@@ -170,49 +232,67 @@ pub enum Record {
 }
 
 /// The remedy for a refused entry of the given kind, from what its handle showed (`origin`), from
-/// what the manifest's record of it showed (`record`) and from the lookup of the manifest. An entry
-/// that the manifest holds no record of is moved aside, whatever its owner shows: nothing shows
-/// what wrote what is in it, and removing a record, the manifest above all, would hide what a
-/// removal reads. A record is corrected into place only when its handle shows the
-/// system's class and a manifest may be there; it is removed only when its handle shows the system's
-/// class and nothing records it. A name that the layout does not give is no record, and takes the
-/// same four states: it is removed when its handle shows the system's class, moved aside when it
-/// shows another account's, a link or a second name or when its list refuses the check, and
-/// closed on when a program holds it.
+/// what the manifest's record of it showed (`record`) and from the lookup of the manifest. A step
+/// that takes an entry out of its place (a move or a removal) exists only where the run has a
+/// [`Clearance`]; without one the entry's records are never told to go: another account's owner
+/// gets the one step that gives the ownership back, and every other state gets no step. Where the
+/// origin rests on a failed read (the entry's own list refused the open, the read failed, or the
+/// object changed while it was read), no step exists for any purpose. A record is corrected into
+/// place only when its handle shows the system's class and a manifest may be there. A name that the
+/// layout does not give is no record, and takes the same states: with a clearance it is removed when
+/// its handle shows the system's class and moved aside when it shows a link, a second name or
+/// another account's owner, and a program that holds it open is closed on.
 #[must_use]
 pub fn choose(
+    grounds: &Grounds<'_>,
     kind: EntryKind,
     origin: &Origin,
     manifest: &Presence,
     record: Option<Record>,
 ) -> Remedy {
+    let aside = || {
+        grounds
+            .clearance()
+            .map_or(Remedy::NoStep, Remedy::MoveAside)
+    };
+    let removed = || grounds.clearance().map_or(Remedy::NoStep, Remedy::Remove);
     if record == Some(Record::NotRecorded) {
-        return Remedy::MoveAside;
+        return aside();
     }
     match origin {
-        Origin::Foreign
-        | Origin::Owned(_)
-        | Origin::Refused(_)
-        | Origin::Unknown(_)
-        | Origin::Changed(_) => Remedy::MoveAside,
+        Origin::Foreign => aside(),
+        Origin::Owned(owner) => grounds
+            .clearance()
+            .map_or_else(|| Remedy::OwnerStep(owner.clone()), Remedy::MoveAside),
+        Origin::Refused(_) | Origin::Unknown(_) | Origin::Changed(_) => Remedy::NoStep,
         Origin::Held(_) => Remedy::Unreadable,
-        Origin::System if matches!(kind, EntryKind::Other | EntryKind::UnnamedRoot) => {
-            Remedy::Remove
-        }
-        Origin::System if matches!(manifest, Presence::Absent) => Remedy::Remove,
+        Origin::System if matches!(kind, EntryKind::Other | EntryKind::UnnamedRoot) => removed(),
+        Origin::System if matches!(manifest, Presence::Absent) => removed(),
         Origin::System => Remedy::Correct,
     }
 }
 
+/// What the reads of the run showed, said where a step that takes an object out of its place
+/// stands: the run is an installation, and every read found nothing of the installation. The move
+/// itself rests on what the administrator knows, which no read of this program shows.
+const FOUND_NOTHING: &str =
+    "The reads of this run found no service, no account and no rule of the installation.";
+
+/// The one step for an object that another account owns, where the run has no clearance to move
+/// it: it rests on what the administrator knows, and on nothing that a read of this program
+/// showed.
+const OWNER_STEP: &str = "If you made that change, give the ownership back to the Administrators group, then run the setup program again.";
+
 /// The words that end the refusal of an entry: the one remedy, with what the next run then finds.
 /// The manifest is said to stay only where the lookup found one; nothing is said of the journal or
 /// of what the entry holds, which no read showed; "the next run makes it new" is said only of what
-/// the installation makes.
+/// the installation makes. A remedy that takes the entry out of its place carries a [`Clearance`],
+/// so these words name no move and no removal for a removal, a repair or a status report.
 #[must_use]
 // text: ending
 pub fn ending(
     entry: &std::path::Path,
-    remedy: Remedy,
+    remedy: &Remedy,
     origin: &Origin,
     kind: EntryKind,
     manifest: &Presence,
@@ -220,8 +300,38 @@ pub fn ending(
 ) -> String {
     let data = entry.parent().map(|data| data.display().to_string());
     let entry = entry.display();
+    let not_recorded = record == Some(Record::NotRecorded);
+    if not_recorded && kind == EntryKind::Manifest {
+        // The reason is all that the read shows: the manifest was read and holds no record of its
+        // own data directory. No step is named, since the setup program has none for it, and no
+        // forecast is made of what a run after any change of the manifest says.
+        let data = data.unwrap_or_default();
+        return format!(
+            "The manifest in {data} holds no record of {data} itself. The setup program names no step for this state."
+        );
+    }
+    let basis = match origin {
+        _ if not_recorded => format!(
+            "The manifest holds no record of {entry}, and {entry} holds entries: nothing shows what wrote them."
+        ),
+        Origin::Refused(error) => format!(
+            "Nothing shows who made {entry}: it could not be opened ({error}). A permission list that refuses the Administrators group gives that error, and no list of the installation's does; an entry with a delete pending gives it too."
+        ),
+        Origin::Unknown(error) => {
+            format!("Nothing shows who made {entry}, because it could not be read ({error}).")
+        }
+        Origin::Changed(error) => format!(
+            "Nothing shows who made {entry}: it changed or moved while it was read ({error})."
+        ),
+        Origin::System => format!(
+            "The handle of {entry} shows an owner of the system's class, and nothing shows that the installation made it."
+        ),
+        _ => format!(
+            "The handle of {entry} shows what the installation does not leave there: an owner that is not the system or the Administrators group, a reparse point, a second name for a file, or another kind of object than its layout gives at that name."
+        ),
+    };
     match remedy {
-        Remedy::Remove => {
+        Remedy::Remove(_) => {
             if matches!(manifest, Presence::Present) {
                 format!(
                     "Remove {entry}, and nothing else, then run the setup program again: the entry at the manifest's name stays where it is."
@@ -230,38 +340,14 @@ pub fn ending(
                 format!("Remove {entry}, and nothing else, then run the setup program again.")
             }
         }
-        Remedy::MoveAside => {
-            let not_recorded = record == Some(Record::NotRecorded);
-            if not_recorded && kind == EntryKind::Manifest {
-                // The reason is all that the read shows: the manifest was read and holds no record
-                // of its own data directory. No step is named, since the setup program has none
-                // for it, and no forecast is made of what a run after any change of the manifest
-                // says.
-                let data = data.unwrap_or_default();
-                return format!(
-                    "The manifest in {data} holds no record of {data} itself. The setup program names no step for this state."
-                );
-            }
-            let basis = match origin {
-                _ if not_recorded => format!(
-                    "The manifest holds no record of {entry}, and {entry} holds entries: nothing shows what wrote them."
-                ),
-                Origin::Refused(error) => format!(
-                    "Nothing shows who made {entry}: it could not be opened ({error}). A permission list that refuses the Administrators group gives that error, and no list of the installation's does; an entry with a delete pending gives it too, and a rename of such an entry fails: if its delete is pending, close the program that holds it, and the entry goes."
-                ),
-                Origin::Unknown(error) => format!(
-                    "Nothing shows who made {entry}, because it could not be read ({error})."
-                ),
-                Origin::Changed(error) => format!(
-                    "Nothing shows who made {entry}: it changed or moved while it was read ({error})."
-                ),
-                _ => format!(
-                    "The handle of {entry} shows what the installation does not leave there: an owner that is not the system or the Administrators group, a reparse point, a second name for a file, or another kind of object than its layout gives at that name."
-                ),
-            };
+        Remedy::NoStep => format!("{basis} The setup program names no step for it."),
+        Remedy::OwnerStep(owner) => format!(
+            "The handle of {entry} shows an owner that is not the system or the Administrators group: {owner}. The setup program does not use it while that account owns it. {OWNER_STEP}"
+        ),
+        Remedy::MoveAside(_) => {
             let next = match kind {
                 EntryKind::Manifest => {
-                    "The directory then holds no manifest, and nothing records what else is in it: the next run reads those entries one at a time on their own handles, and for the first it finds says to remove it, when its handle shows the system's class, to move it aside, when its handle shows that the installation did not make it or shows nothing of who made it (its list refuses the check, it could not be read, or it changed or moved while it was read), or to close the program that holds it open."
+                    "The directory then holds no manifest, and nothing records what else is in it: the next run reads those entries one at a time on their own handles, and says what the handle of the first it finds shows."
                 }
                 EntryKind::Prior | EntryKind::Staging | EntryKind::Journal | EntryKind::Run => {
                     "An installation or a repair run next finds the entry absent and makes it new."
@@ -275,7 +361,7 @@ pub fn ending(
                 EntryKind::Other => "The next run finds the entry absent.",
             };
             format!(
-                "{basis} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again. {next}"
+                "{basis} {FOUND_NOTHING} Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside: out of the data directory, to a folder that is not inside it (a new name beside it is a name the layout does not give: the next run reads it on its own handle like every other entry, and says what to do about it), then run the setup program again. {next}"
             )
         }
         Remedy::Unreadable => format!(
@@ -287,29 +373,33 @@ pub fn ending(
     }
 }
 
-/// What a refusal of the folder above the data directory is cured by, which its reason decides.
+/// What a refusal of the folder above the data directory is cured by, which its reason decides. No
+/// cure moves, renames or removes the folder, for any purpose: it holds the data directory, and the
+/// reads that would show that nothing of an installation is left run a program in a working
+/// directory under this folder, which is the object that was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParentCure {
     /// Another program holds the folder open: closing that program cures it, and a change of owner
     /// or list does not.
     Close,
-    /// The handle shows an owner that is not the system's class: move the folder aside, and do not
-    /// correct it into place.
-    MoveAside,
-    /// The handle shows no directory bit: what is at the folder's name is not a folder, and it is
-    /// moved aside.
+    /// The handle shows an owner that is not the system's class (the text is the owner's identifier,
+    /// as the handle showed it): the one step is to give the ownership back, which rests on what the
+    /// administrator knows. The folder is never corrected into place.
+    Owned(String),
+    /// The handle shows no directory bit: what is at the folder's name is not a folder. No step is
+    /// named.
     NotAFolder,
     /// The system's class owns it and its list is wrong: correct the list. Only a lookup of the
-    /// data directory's name in it is known, which decides whether removal is offered: an entry at
-    /// that name is not read, so it is said to be something that can hold an installation.
+    /// data directory's name in it is known: an entry at that name is not read, so it is said to be
+    /// something that can hold an installation.
     Correct(Presence),
     /// A reparse point (a link or a mounted folder) is at the folder's place: the folder is the
     /// installation's own, so the words are those of an own folder of the program tree that is a
     /// reparse point, with what the setup program does and does not change.
     Link(Stage),
     /// The folder could not be opened to be checked, for a reason that is no program holding it
-    /// open (that is [`ParentCure::Close`]): nothing shows who made it, so it is neither corrected
-    /// nor removed, and moving it aside keeps everything in it.
+    /// open (that is [`ParentCure::Close`]): nothing shows who made it, and a failed read gives no
+    /// step for any purpose.
     Unreadable,
 }
 
@@ -319,14 +409,14 @@ pub enum ParentCure {
 // text: parent_advice
 pub fn parent_advice(cure: &ParentCure) -> String {
     match cure {
-        ParentCure::Unreadable => "Nothing shows who made this folder, because it could not be opened to be checked. Do not correct its owner or its list, and do not remove it: either would hide what it is. Move the folder aside (rename it, which keeps everything in it), then run the setup program again. Where the boundary is not installed, the installation then makes the folder new.".to_owned(),
+        ParentCure::Unreadable => "Nothing shows who made this folder, because it could not be opened to be checked. Do not correct its owner or its list, and do not remove it: either would hide what it is. The setup program names no step for it.".to_owned(),
         ParentCure::Close => "Close the program that holds it open, then run the setup program again: a change of its owner or its list does not close a handle. Do not remove it.".to_owned(),
         ParentCure::Link(stage) => own_link_words(*stage),
-        ParentCure::MoveAside => "The handle of this folder shows an owner that is not the system or the Administrators group, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again. Where the boundary is not installed, the installation then makes the folder new.".to_owned(),
-        ParentCure::NotAFolder => "What is at this folder's name is not a folder, and the layout gives a folder there. Move it aside (rename it), then run the setup program again. Where the boundary is not installed, the installation then makes the folder new.".to_owned(),
+        ParentCure::Owned(owner) => format!("The handle of this folder shows an owner that is not the system or the Administrators group: {owner}. It can hold files that another account wrote. The setup program does not use what is in it while that account owns it. {OWNER_STEP}"),
+        ParentCure::NotAFolder => "What is at this folder's name is not a folder, and the layout gives a folder there. The setup program names no step for it.".to_owned(),
         ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again."),
-        ParentCure::Correct(Presence::Present) => "Do not remove it: something is at the data directory's name in it, and that can hold the manifest, the journals and the private roots of an installation, which removing this folder would destroy. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
-        ParentCure::Correct(Presence::Absent) => "Nothing is at the data directory's name in it. If nothing else needs what is in it, remove or rename the folder, then run the setup program again.".to_owned(),
+        ParentCure::Correct(Presence::Present) =>"Do not remove it: something is at the data directory's name in it, and that can hold the manifest, the journals and the private roots of an installation, which removing this folder would destroy. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
+        ParentCure::Correct(Presence::Absent) => "Nothing is at the data directory's name in it. Correct its list: give it a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
     }
 }
 
@@ -956,7 +1046,7 @@ const DATA_REMEDY: &str = "Leave the system and the Administrators group as the 
 /// The words that tell an administrator to move the data directory aside. They stand only at an
 /// installation where reads that succeeded found no service, no account and no rule of the
 /// installation, and where the handle shows that the installation did not make the directory.
-const DATA_NOT_MADE: &str = "The reads of this run found no service, no account and no rule of the installation. The directory can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
+const DATA_NOT_MADE: &str = "The directory can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the directory new.";
 
 /// What the handle of a data directory shows when it is a link or not a directory.
 const DATA_KIND: &str = "The handle of this directory shows a reparse point or an object that is not a directory, which the installation does not leave there.";
@@ -979,51 +1069,54 @@ pub const CASE_SENSITIVE_WHY: &str = "it separates names that differ only by cas
 /// the system: said only where a read of the directory's owner and list succeeded.
 const DATA_CAN_BE_CHANGED: &str = "Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system.";
 
-/// What the reads of one run showed of the rest of the installation, where the data directory is
-/// refused.
+/// What the reads of one run showed of the rest of the installation. Only an installation can have
+/// [`Standing::NothingFound`]: see [`Grounds::clearance`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Standing {
     /// An installation, and every read of the service, of the two accounts and of the policy
     /// succeeded and found nothing of the installation.
     NothingFound,
-    /// A removal or a repair, or an installation where a read found a part of the installation or
-    /// failed: the records in the directory may be the only record of what is on the computer.
+    /// A read found a part of the installation or failed: the records in the data directory may be
+    /// the only record of what is on the computer.
     MayBeInstalled,
 }
 
 /// The words that end the refusal of the data directory itself, from what its own handle showed
-/// (`origin`), whether the reason is the directory's case-sensitive flag, and what the reads of the
-/// run showed of the rest of the installation (`standing`). One refusal gets one remedy. Only a
-/// directory that the system's class owns is told what to correct. The words that tell the
-/// administrator to move it aside stand only at an installation where the handle shows that the
-/// installation did not set what it found (a link, another kind of object, or an owner outside the
-/// system's class) and every read found nothing of the installation: where a part of the
-/// installation may be on the computer, the records in the directory are the only record of it, so
-/// no ending takes the directory away. An owner that was read is named, with the one step that
-/// rests on the administrator's own knowledge. Where a read failed, nothing is established about who
-/// made the directory or what it holds: the words name the failed read and its error and give no
-/// step and no forecast.
+/// (`origin`), whether the reason is the directory's case-sensitive flag, and the run's grounds. One
+/// refusal gets one remedy. Only a directory that the system's class owns is told what to correct.
+/// The words that tell the administrator to move it aside stand only where the run has a
+/// [`Clearance`] (an installation whose every read found nothing of the installation) and the handle
+/// shows that the installation did not set what it found (a link, another kind of object, or an
+/// owner outside the system's class): otherwise the records in the directory may be the only record
+/// of what is installed, so no ending takes the directory away. An owner that was read is named, with
+/// the one step that rests on the administrator's own knowledge. Where a read failed, nothing is
+/// established about who made the directory or what it holds: the words name the failed read and its
+/// error and give no step and no forecast.
 #[must_use]
 // text: data_ending
-pub fn data_ending(origin: &Origin, case_sensitive: bool, standing: Standing) -> String {
-    match (origin, standing) {
-        (Origin::Foreign, Standing::NothingFound) => format!("{DATA_KIND} {DATA_NOT_MADE}"),
-        (Origin::Foreign, Standing::MayBeInstalled) => format!("{DATA_KIND} {DATA_KIND_STANDS}"),
-        (Origin::Owned(owner), Standing::NothingFound) => format!(
-            "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. {DATA_NOT_MADE}"
-        ),
-        (Origin::Owned(owner), Standing::MayBeInstalled) => format!(
-            "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. The setup program does not use the records in it while that account owns it. If you made that change, give the ownership back to the Administrators group, then run the setup program again."
-        ),
-        (Origin::System, _) if case_sensitive => format!("{DATA_CAN_BE_CHANGED} {CASE_REMEDY}"),
-        (Origin::System, _) => format!("{DATA_CAN_BE_CHANGED} {DATA_REMEDY}"),
-        (Origin::Held(failure) | Origin::Refused(failure) | Origin::Unknown(failure), _) => {
+pub fn data_ending(grounds: &Grounds<'_>, origin: &Origin, case_sensitive: bool) -> String {
+    match origin {
+        Origin::Foreign => match grounds.clearance() {
+            Some(_) => format!("{DATA_KIND} {FOUND_NOTHING} {DATA_NOT_MADE}"),
+            None => format!("{DATA_KIND} {DATA_KIND_STANDS}"),
+        },
+        Origin::Owned(owner) => match grounds.clearance() {
+            Some(_) => format!(
+                "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. {FOUND_NOTHING} {DATA_NOT_MADE}"
+            ),
+            None => format!(
+                "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. The setup program does not use the records in it while that account owns it. {OWNER_STEP}"
+            ),
+        },
+        Origin::System if case_sensitive => format!("{DATA_CAN_BE_CHANGED} {CASE_REMEDY}"),
+        Origin::System => format!("{DATA_CAN_BE_CHANGED} {DATA_REMEDY}"),
+        Origin::Held(failure) | Origin::Refused(failure) | Origin::Unknown(failure) => {
             format!(
                 "A read of it failed ({failure}), so nothing shows who made it. The setup program names no step for it."
             )
         }
         // The data directory is opened by its own path, so no loss of a listed child reaches it.
-        (Origin::Changed(reason), _) => format!(
+        Origin::Changed(reason) => format!(
             "It changed or moved while it was read ({reason}), so nothing shows who made it. The setup program names no step for it."
         ),
     }

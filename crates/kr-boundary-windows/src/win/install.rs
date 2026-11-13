@@ -38,7 +38,7 @@ use crate::messages;
 use crate::notice::NOTICE;
 use crate::policy::{self, Policy};
 use crate::records::{self, Records, is_hex32, is_manifest_replacement};
-use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Shape};
+use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Purpose, Shape};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -368,17 +368,20 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     entered(paths, Purpose::Install)
 }
 
-/// What the setup program does when it reads the data directory: an installation, a repair or a
-/// removal. A refusal of the data directory tells the administrator to move it aside only at an
-/// installation, and only after reads that succeeded found nothing of the installation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Purpose {
-    Install,
-    Repair,
-    Remove,
+/// [`entry`] for a status report: it reads what an installation reads and refuses the same objects,
+/// but its refusals never tell the administrator to move, rename or remove anything, since a status
+/// report is no installation.
+///
+/// # Errors
+///
+/// Returns [`Error::Refused`] naming the foreign object, or the failure of the call that looked.
+pub fn status(paths: &Paths) -> Result<Entry, Error> {
+    entered(paths, Purpose::Status)
 }
 
-/// [`entry`] for a run with this purpose.
+/// [`entry`] for a run with this purpose. A refusal of an object on the way to the installation's
+/// records tells the administrator to move, rename or remove it only at an installation, and only
+/// after reads that succeeded found nothing of the installation (see [`remedy::Grounds`]).
 fn entered(paths: &Paths, purpose: Purpose) -> Result<Entry, Error> {
     check_shape(paths, remedy::Stage::Before)?;
     // What the data directory holds is read on handles before any of it is used: the manifest
@@ -509,7 +512,8 @@ pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
 }
 
 /// [`check_data_parent`] with the stage of the run that reads the folder, so that a refusal says
-/// only what is so of the run's changes.
+/// only what is so of the run's changes. No refusal of the folder tells the administrator to move,
+/// rename or remove it, for any purpose: it holds the data directory.
 fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ffi::Handle>, Error> {
     let parent = paths.data_parent();
     // Every folder above the data parent is another program's: the known folder `ProgramData` and
@@ -605,10 +609,9 @@ fn check_data_parent_at(paths: &Paths, stage: remedy::Stage) -> Result<Option<ff
     }
     if let Some(finding) = acl::changeable_by_others_on(&handle, false)? {
         // The handle's own owner tells whether the system's class made the folder.
-        let cure = if check_owner(&handle)?.is_some() {
-            ParentCure::MoveAside
-        } else {
-            ParentCure::Correct(presence_of(&paths.data))
+        let cure = match owner_outside_class(&handle)? {
+            Some(owner) => ParentCure::Owned(owner),
+            None => ParentCure::Correct(presence_of(&paths.data)),
         };
         // text: refusal_check_data_parent_at-1
         return Err(parent_refusal(paths, &finding.to_string(), cure));
@@ -676,6 +679,9 @@ impl DataChild {
 /// change by path follows a link and rewrites the tree it leads to.
 pub struct DataHolds {
     paths: Paths,
+    /// What the run that holds these does: a refusal of a child that appeared since the check says only
+    /// what the purpose allows.
+    purpose: Purpose,
     _parent: ffi::Handle,
     /// Set where this run made the data directory: whether it made the folder above it too.
     made: Option<Made>,
@@ -757,13 +763,25 @@ impl DataHolds {
         let shown = which.path(&self.paths).display().to_string();
         if let Some(why) = not_a_plain_directory(&handle, &shown)? {
             // text: refusal_directory-2
-            return Err(child_refusal(&self.paths, &name, why, &Origin::Foreign));
+            return Err(child_refusal(
+                &self.paths,
+                self.purpose,
+                &name,
+                why,
+                &Origin::Foreign,
+            ));
         }
         if !created {
             // It appeared between the listing and this call: it is checked like one that was there.
             if let Some(why) = check_held_object(&handle)? {
                 // text: refusal_directory-1
-                return Err(child_refusal(&self.paths, &name, &why, &origin_of(&handle)));
+                return Err(child_refusal(
+                    &self.paths,
+                    self.purpose,
+                    &name,
+                    &why,
+                    &origin_of(&handle),
+                ));
             }
             protect_handle(&handle, &descriptor, &shown)?;
         }
@@ -782,8 +800,9 @@ fn data_descriptor() -> Result<sd::OwnedSd, Error> {
 /// comes from what the directory's own handle showed, and one refusal gives one ending: a step only
 /// where a read that succeeded shows what it is, and no step where a read failed.
 fn data_refusal(paths: &Paths, why: &str, origin: &Origin, purpose: Purpose) -> Error {
-    let standing = standing_of(paths, purpose, origin);
-    let ending = remedy::data_ending(origin, why == remedy::CASE_SENSITIVE_WHY, standing);
+    let ending = with_grounds(paths, purpose, |grounds| {
+        remedy::data_ending(grounds, origin, why == remedy::CASE_SENSITIVE_WHY)
+    });
     // text: data_refusal-1
     Error::Refused(format!(
         "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. {ending}",
@@ -791,17 +810,25 @@ fn data_refusal(paths: &Paths, why: &str, origin: &Origin, purpose: Purpose) -> 
     ))
 }
 
-/// What the reads of this run show of the rest of the installation, for the refusal of a data
-/// directory that the installation did not set. Only the words that move the directory aside rest
-/// on it: they stand at an installation, where the handle showed a link, another kind of object or
-/// an owner outside the system's class, and where the service, both accounts and the policy were
-/// read and showed nothing of the installation. A removal and a repair never ask, and a read that
-/// fails or finds something leaves the answer at "may be installed".
-fn standing_of(paths: &Paths, purpose: Purpose, origin: &Origin) -> remedy::Standing {
-    if purpose == Purpose::Install
-        && matches!(origin, Origin::Foreign | Origin::Owned(_))
-        && nothing_of_the_installation_found(paths)
-    {
+/// Calls `f` with the grounds of a run: its purpose, and the reads that show what the computer
+/// holds of the rest of the installation. The reads are made only when `f` asks for a clearance, and
+/// only for an installation: a removal, a repair and a status report never read for it. The folder
+/// above the data directory was checked and held before any caller gets here, so the reads may work
+/// in it.
+fn with_grounds<T>(
+    paths: &Paths,
+    purpose: Purpose,
+    f: impl FnOnce(&remedy::Grounds<'_>) -> T,
+) -> T {
+    let reads = || standing_of(paths);
+    f(&remedy::Grounds::new(purpose, &reads))
+}
+
+/// What the reads of this run show of the rest of the installation: nothing found only where the
+/// service, both accounts and the policy were each read and showed nothing of the installation. A
+/// read that fails or finds something leaves the answer at "may be installed".
+fn standing_of(paths: &Paths) -> remedy::Standing {
+    if nothing_of_the_installation_found(paths) {
         remedy::Standing::NothingFound
     } else {
         remedy::Standing::MayBeInstalled
@@ -883,27 +910,49 @@ fn refuse_made_data_directory(
 
 /// The refusal of what is inside the data directory: a child that is not the installation's own, or
 /// is not what the manifest says.
-fn child_refusal(paths: &Paths, name: &OsStr, why: &str, origin: &Origin) -> Error {
-    entry_refusal(paths, &paths.data, name, why, origin)
+fn child_refusal(
+    paths: &Paths,
+    purpose: Purpose,
+    name: &OsStr,
+    why: &str,
+    origin: &Origin,
+) -> Error {
+    entry_refusal(paths, purpose, &paths.data, name, why, origin)
 }
 
 /// The refusal of an entry that the layout never gives as a record (a name it does not give, what is
 /// in `staging`, a directory that no manifest records): it holds nothing the manifest and the
 /// journal say, and it takes its remedy from what its own handle showed, like a record: it is named
 /// to remove only when the handle shows the system's class, and moved aside when it shows another
-/// account's, a link or a second name.
-fn removal_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, origin: &Origin) -> Error {
-    refusal_with(paths, dir, name, why, EntryKind::Other, origin, None)
+/// account's, a link or a second name: both only at an installation whose reads found nothing of
+/// the installation.
+fn removal_refusal(
+    paths: &Paths,
+    purpose: Purpose,
+    dir: &Path,
+    name: &OsStr,
+    why: &str,
+    origin: &Origin,
+) -> Error {
+    refusal_with(
+        paths,
+        purpose,
+        dir.join(name),
+        why,
+        EntryKind::Other,
+        origin,
+        None,
+    )
 }
 
 /// The refusal of the manifest, or of a directory of the data directory, that the manifest's own
 /// record does not show: the entry's own handle passed its checks, so the remedy comes from the
 /// manifest's record of it, which says that the manifest does not record the entry.
-fn unrecorded_refusal(paths: &Paths, name: &OsStr, why: &str) -> Error {
+fn unrecorded_refusal(paths: &Paths, purpose: Purpose, name: &OsStr, why: &str) -> Error {
     refusal_with(
         paths,
-        &paths.data,
-        name,
+        purpose,
+        paths.data.join(name),
         why,
         kind_of(paths, &paths.data, name, true),
         &Origin::System,
@@ -995,14 +1044,22 @@ fn origin_of_lost(lost: &Lost) -> Origin {
 /// The refusal of one entry in a directory of the installation. The remedy comes from what the
 /// entry's own handle showed (`origin`) and from the lookup of the manifest, and never from the
 /// words of the reason: for a name the layout gives as a record, the system's class's own is
-/// corrected while a manifest may be there, another account's is moved out, and one that could not
-/// be read is neither corrected nor removed; any other name, and what is in `staging`, is named to
-/// remove.
-fn entry_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, origin: &Origin) -> Error {
+/// corrected while a manifest may be there, another account's is moved out only at an installation
+/// whose reads found nothing of the installation (otherwise its owner is named, with the one step
+/// that gives the ownership back), and one that could not be read gets no step; any other name, and
+/// what is in `staging`, is named to remove only at such an installation.
+fn entry_refusal(
+    paths: &Paths,
+    purpose: Purpose,
+    dir: &Path,
+    name: &OsStr,
+    why: &str,
+    origin: &Origin,
+) -> Error {
     refusal_with(
         paths,
-        dir,
-        name,
+        purpose,
+        dir.join(name),
         why,
         kind_of(paths, dir, name, true),
         origin,
@@ -1011,9 +1068,11 @@ fn entry_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str, origin: &Or
 }
 
 /// The refusal of a private root that no journal names: its own handle decides, and only one that
-/// the system's class owns is named to remove.
+/// the system's class owns is named to remove, at an installation whose reads found nothing of the
+/// installation.
 fn unnamed_root_refusal(
     paths: &Paths,
+    purpose: Purpose,
     dir: &Path,
     name: &OsStr,
     why: &str,
@@ -1021,8 +1080,8 @@ fn unnamed_root_refusal(
 ) -> Error {
     refusal_with(
         paths,
-        dir,
-        name,
+        purpose,
+        dir.join(name),
         why,
         kind_of(paths, dir, name, false),
         origin,
@@ -1032,17 +1091,18 @@ fn unnamed_root_refusal(
 
 fn refusal_with(
     paths: &Paths,
-    dir: &Path,
-    name: &OsStr,
+    purpose: Purpose,
+    entry: PathBuf,
     why: &str,
     kind: EntryKind,
     origin: &Origin,
     record: Option<remedy::Record>,
 ) -> Error {
-    let entry = dir.join(name);
     let manifest = presence_of(&paths.manifest);
-    let remedy = remedy::choose(kind, origin, &manifest, record);
-    let ending = remedy::ending(&entry, remedy, origin, kind, &manifest, record);
+    let ending = with_grounds(paths, purpose, |grounds| {
+        let remedy = remedy::choose(grounds, kind, origin, &manifest, record);
+        remedy::ending(&entry, &remedy, origin, kind, &manifest, record)
+    });
     // text: refusal_with-1
     Error::Refused(format!(
         "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because of {}: {why}. Whatever is in it that another account made or can change could be read by the broker, running as the system, as its own. {ending}",
@@ -1381,7 +1441,11 @@ fn is_journal_file_name(name: &str) -> bool {
 /// directory of the private roots only directories. The manifest is read last, after everything it
 /// could lead the installation to use has passed, and it must record the data directory and each
 /// directory in it.
-fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, Error> {
+fn inspect_data_directory(
+    paths: &Paths,
+    purpose: Purpose,
+    data: &DirHandle,
+) -> Result<Inspected, Error> {
     let listed = data.children()?;
     let mut inspected = Inspected {
         manifest: None,
@@ -1421,6 +1485,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             };
             return Err(entry_refusal(
                 paths,
+                purpose,
                 &paths.data,
                 &shown,
                 "no manifest records this directory, and a directory that no manifest records must be empty",
@@ -1444,6 +1509,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 };
                 return Err(removal_refusal(
                     paths,
+                    purpose,
                     &paths.data,
                     &shown,
                     "the layout does not give that name there",
@@ -1464,6 +1530,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 // text: refusal_inspect_data_directory-6
                 return Err(child_refusal(
                     paths,
+                    purpose,
                     &shown,
                     &lost_reason(&lost),
                     &origin_of_lost(&lost),
@@ -1475,6 +1542,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 // text: refusal_inspect_data_directory-5
                 return Err(child_refusal(
                     paths,
+                    purpose,
                     &shown,
                     "it is a reparse point",
                     &Origin::Foreign,
@@ -1485,6 +1553,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 // text: refusal_inspect_data_directory-4
                 return Err(child_refusal(
                     paths,
+                    purpose,
                     &shown,
                     "it is a directory, not a file",
                     &Origin::Foreign,
@@ -1494,6 +1563,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                 // text: refusal_inspect_data_directory-3
                 return Err(child_refusal(
                     paths,
+                    purpose,
                     &shown,
                     "it is a file, not a directory",
                     &Origin::Foreign,
@@ -1504,6 +1574,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             // text: refusal_inspect_data_directory-2
             return Err(child_refusal(
                 paths,
+                purpose,
                 &shown,
                 "it has more than one name",
                 &Origin::Foreign,
@@ -1513,6 +1584,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             // text: refusal_inspect_data_directory-1
             return Err(child_refusal(
                 paths,
+                purpose,
                 &shown,
                 &why,
                 &origin_of(&opened.handle),
@@ -1536,17 +1608,25 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
     }
     inspect_layout(
         paths,
+        purpose,
         &paths.staging,
         inspected.staging.as_ref(),
         Layout::Staging,
     )?;
     inspect_layout(
         paths,
+        purpose,
         &paths.journal,
         inspected.journal.as_ref(),
         Layout::Journal,
     )?;
-    inspect_layout(paths, &paths.run, inspected.run.as_ref(), Layout::Run)?;
+    inspect_layout(
+        paths,
+        purpose,
+        &paths.run,
+        inspected.run.as_ref(),
+        Layout::Run,
+    )?;
     let manifest = Manifest::load(&paths.manifest)?;
     let records = |path: &Path| {
         manifest
@@ -1556,6 +1636,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
     if !records(&paths.data) {
         return Err(unrecorded_refusal(
             paths,
+            purpose,
             &names[0].0,
             "its manifest does not record this directory, and a directory that no manifest records must be empty",
         ));
@@ -1571,6 +1652,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
         {
             return Err(unrecorded_refusal(
                 paths,
+                purpose,
                 path.file_name().unwrap_or_default(),
                 "the manifest holds no record of this directory, and a directory that the manifest holds no record of must be empty",
             ));
@@ -1639,11 +1721,14 @@ const WITHIN_DEPTH: usize = 8;
 /// The reason an object is not the installation's own by its owner alone: the system or the
 /// administrators own what the installation or the broker made.
 fn check_owner(handle: &ffi::Handle) -> Result<Option<String>, Error> {
+    Ok(owner_outside_class(handle)?.map(|owner| format!("it is owned by {owner}")))
+}
+
+/// The identifier of the handle's owner, where the owner is not the system or the Administrators
+/// group.
+fn owner_outside_class(handle: &ffi::Handle) -> Result<Option<String>, Error> {
     let summary = sd::summary_of_handle(handle)?;
-    Ok(
-        (![SYSTEM, ADMINISTRATORS].contains(&summary.owner.as_str()))
-            .then(|| format!("it is owned by {}", summary.owner)),
-    )
+    Ok((![SYSTEM, ADMINISTRATORS].contains(&summary.owner.as_str())).then_some(summary.owner))
 }
 
 /// The reason an object that every account may read is not the installation's own: another account
@@ -1664,6 +1749,7 @@ fn check_readable_object(handle: &ffi::Handle) -> Result<Option<String>, Error> 
 /// owner, since its list names the invocation's own group.
 fn inspect_layout(
     paths: &Paths,
+    purpose: Purpose,
     dir: &Path,
     held: Option<&DirHandle>,
     layout: Layout,
@@ -1701,6 +1787,7 @@ fn inspect_layout(
             };
             return Err(removal_refusal(
                 paths,
+                purpose,
                 dir,
                 &shown,
                 "the installation does not give that name there",
@@ -1721,6 +1808,7 @@ fn inspect_layout(
                 .collect();
             return Err(unnamed_root_refusal(
                 paths,
+                purpose,
                 dir,
                 &shown,
                 &remedy::unnamed_root_why(&damaged),
@@ -1738,6 +1826,7 @@ fn inspect_layout(
             Err(lost) => {
                 return Err(entry_refusal(
                     paths,
+                    purpose,
                     dir,
                     &shown,
                     &lost_reason(&lost),
@@ -1749,6 +1838,7 @@ fn inspect_layout(
             (Kind::ReparsePoint, _) => {
                 return Err(entry_refusal(
                     paths,
+                    purpose,
                     dir,
                     &shown,
                     "it is a reparse point",
@@ -1759,6 +1849,7 @@ fn inspect_layout(
             (Kind::Directory, _) => {
                 return Err(entry_refusal(
                     paths,
+                    purpose,
                     dir,
                     &shown,
                     "it is a directory, not a file",
@@ -1768,6 +1859,7 @@ fn inspect_layout(
             (Kind::File, _) => {
                 return Err(entry_refusal(
                     paths,
+                    purpose,
                     dir,
                     &shown,
                     "it is a file, not a directory",
@@ -1778,6 +1870,7 @@ fn inspect_layout(
         if opened.kind == Kind::File && opened.links > 1 {
             return Err(entry_refusal(
                 paths,
+                purpose,
                 dir,
                 &shown,
                 "it has more than one name",
@@ -1792,6 +1885,7 @@ fn inspect_layout(
         if let Some(why) = why {
             return Err(entry_refusal(
                 paths,
+                purpose,
                 dir,
                 &shown,
                 &why,
@@ -1801,9 +1895,9 @@ fn inspect_layout(
         if layout == Layout::Staging && opened.kind == Kind::Directory {
             let inner = DirHandle::from_opened(opened)?;
             if text.starts_with("proof-") {
-                inspect_proof_directory(paths, &dir.join(&shown), &inner)?;
+                inspect_proof_directory(paths, purpose, &dir.join(&shown), &inner)?;
             } else {
-                inspect_within(paths, Scope::Staging, &dir.join(&shown), &inner, 1)?;
+                inspect_within(paths, Scope::Staging(purpose), &dir.join(&shown), &inner, 1)?;
             }
         }
     }
@@ -1814,7 +1908,7 @@ fn inspect_layout(
 #[derive(Clone, Copy)]
 enum Scope {
     /// A directory of `staging`: a refusal takes its remedy from the entry's own handle.
-    Staging,
+    Staging(Purpose),
     /// The program directory: a refusal names the owner and the list to correct. `recorded` says
     /// whether a manifest records the installation, which decides whether the words promise a repair
     /// or say that the manifest records the directory.
@@ -2249,7 +2343,12 @@ const PROOF_PROGRAM: &str = "unlisted.exe";
 
 /// Reads what a proof directory holds: the unlisted program and nothing else, a file with one
 /// name, on its own handle, owned as the installation's own and changeable by no other account.
-fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Result<(), Error> {
+fn inspect_proof_directory(
+    paths: &Paths,
+    purpose: Purpose,
+    dir: &Path,
+    held: &DirHandle,
+) -> Result<(), Error> {
     for child in held.children()? {
         let shown = OsString::from_wide(&child.name);
         let opened = match held.open_child(&child, READ_CONTROL)? {
@@ -2259,6 +2358,7 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
             Err(lost) => {
                 return Err(removal_refusal(
                     paths,
+                    purpose,
                     dir,
                     &shown,
                     &lost_reason(&lost),
@@ -2269,6 +2369,7 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
         if !shown.to_string_lossy().eq_ignore_ascii_case(PROOF_PROGRAM) {
             return Err(removal_refusal(
                 paths,
+                purpose,
                 dir,
                 &shown,
                 "the installation puts nothing but the unlisted program in a proof directory",
@@ -2280,6 +2381,7 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
             Kind::File => {
                 return Err(removal_refusal(
                     paths,
+                    purpose,
                     dir,
                     &shown,
                     "it has more than one name",
@@ -2289,6 +2391,7 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
             Kind::ReparsePoint => {
                 return Err(removal_refusal(
                     paths,
+                    purpose,
                     dir,
                     &shown,
                     "it is a reparse point",
@@ -2298,6 +2401,7 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
             Kind::Directory => {
                 return Err(removal_refusal(
                     paths,
+                    purpose,
                     dir,
                     &shown,
                     "it is a directory, not a file",
@@ -2308,6 +2412,7 @@ fn inspect_proof_directory(paths: &Paths, dir: &Path, held: &DirHandle) -> Resul
         if let Some(why) = check_readable_object(&opened.handle)? {
             return Err(removal_refusal(
                 paths,
+                purpose,
                 dir,
                 &shown,
                 &why,
@@ -2428,7 +2533,7 @@ fn inspect_within(
         // Below `staging` an entry takes its remedy from its own handle; in the program directory
         // the reason decides what is corrected or removed.
         let refuse = |why: &str, cure: Cure, origin: &Origin| match scope {
-            Scope::Staging => removal_refusal(paths, dir, &shown, why, origin),
+            Scope::Staging(purpose) => removal_refusal(paths, purpose, dir, &shown, why, origin),
             // text: refusal_inspect_within-2
             Scope::Program { recorded } => program_refusal(paths, dir, &shown, why, cure, recorded),
         };
@@ -2527,7 +2632,7 @@ fn inspect_existing_data(
         Err(error) => return Err(data_unread(paths, "a read of it", error)),
     }
     let data = held_directory(handle)?;
-    let inspected = inspect_data_directory(paths, &data)?;
+    let inspected = inspect_data_directory(paths, purpose, &data)?;
     Ok(Some((data, inspected)))
 }
 
@@ -2649,10 +2754,11 @@ fn make_data_directory_for(paths: &Paths, purpose: Purpose) -> Result<DataHolds,
             replacements: Vec::new(),
         }
     } else {
-        inspect_data_directory(paths, &data)?
+        inspect_data_directory(paths, purpose, &data)?
     };
     Ok(DataHolds {
         paths: paths.clone(),
+        purpose,
         _parent: held,
         made: created.then_some(Made {
             parent: parent_made,
