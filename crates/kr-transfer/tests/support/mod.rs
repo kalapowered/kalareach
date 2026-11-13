@@ -75,14 +75,15 @@ pub fn boot_clock_at(milliseconds: u64) -> kr_ipc::clock::ManualSharedClock {
 
 /// One environment's transfer service, its clock and its host tree.
 pub struct Harness {
-    /// The disposable host tree. Dropped last, so it outlives the service.
-    pub host: TempHost,
     /// The service under test.
     pub service: TransferService,
     /// The clock the service reads expiries from.
     pub clock: Arc<ManualClock>,
     /// The principal every call in a test is made as.
     pub actor: ActorId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    /// The disposable host tree. Dropped last, so it outlives the service.
+    pub host: TempHost,
 }
 
 impl Harness {

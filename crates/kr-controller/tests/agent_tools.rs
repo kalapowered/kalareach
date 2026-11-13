@@ -57,11 +57,12 @@ fn build() -> BuildId {
 }
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     _controller: Arc<Controller>,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     state_dir: std::path::PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 async fn host() -> Host {

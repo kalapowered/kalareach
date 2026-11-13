@@ -141,9 +141,10 @@ pub fn restricted_profile_fixture() -> serde_json::Value {
 /// Its directories are under the platform's temporary directory, which is on the internal disk, so
 /// nothing a test starts reaches the workspace.
 pub struct Fixture {
-    host: TempHost,
     service: ProjectService,
     work: tempfile::TempDir,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: TempHost,
 }
 
 impl Fixture {

@@ -76,7 +76,6 @@ impl WorkerSupervisor for NoWorkers {
 /// A host signed in to the stand-in's account, with its daemon, and directories of its own for the
 /// commands it runs.
 struct Rig {
-    temp: kr_ipc::testing::TempHost,
     served: Arc<Served>,
     timer: Arc<HeldTimer>,
     endpoint: Endpoint,
@@ -84,6 +83,8 @@ struct Rig {
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: PathBuf,
     home: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Rig {

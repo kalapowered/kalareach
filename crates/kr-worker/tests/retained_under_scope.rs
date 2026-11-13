@@ -67,7 +67,6 @@ fn next_request() -> RequestId {
 // ---------------------------------------------------------------------------------------------
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
@@ -75,6 +74,8 @@ struct Host {
     endpoint: kr_ipc::paths::Endpoint,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Host {

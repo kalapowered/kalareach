@@ -396,7 +396,6 @@ mod hosted {
     /// A worker for a desktop-bound session, serving its endpoint in this process, and the session's
     /// terminal: a program that keeps every byte it reads.
     struct Worker {
-        _temp: kr_ipc::testing::TempHost,
         _service: Arc<WorkerService>,
         runtime: Arc<SessionRuntime>,
         session_id: SessionId,
@@ -404,6 +403,8 @@ mod hosted {
         endpoint: kr_ipc::paths::Endpoint,
         controller: Arc<ControllerIdentity>,
         boot: kr_protocol::identity::BootIdentity,
+        // Declared last: the directory is removed after every field above has let go of its files.
+        _temp: kr_ipc::testing::TempHost,
     }
 
     impl Worker {

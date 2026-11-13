@@ -30,11 +30,12 @@ const DAY: u64 = 86_400_000;
 
 /// What the daemon's four collections hold, and the way to ask each of them to forget.
 struct Collections<'a> {
-    temp: &'a kr_ipc::testing::TempHost,
     controller: &'a Arc<Controller>,
     voice: crate::voice::GrantAuthority,
     device: DeviceId,
     delegation: kr_protocol::voice::VoiceDelegationId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: &'a kr_ipc::testing::TempHost,
 }
 
 impl<'a> Collections<'a> {

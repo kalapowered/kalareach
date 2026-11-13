@@ -37,7 +37,6 @@ use serde_json::{Value, json};
 ///
 /// The host tree is shared, so a second session can be started in the same environment.
 struct Hosted {
-    temp: Arc<kr_ipc::testing::TempHost>,
     session_id: SessionId,
     descriptor: WorkerDescriptor,
     journal: PathBuf,
@@ -45,6 +44,8 @@ struct Hosted {
     client: RunningService<rmcp::RoleClient, ()>,
     service: Arc<WorkerService>,
     _pipes: Pipes,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: Arc<kr_ipc::testing::TempHost>,
 }
 
 /// The two named pipes the tool server's standard streams are on.

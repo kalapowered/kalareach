@@ -36,7 +36,6 @@ use common::{Keys, LIVENESS_DEADLINE, carries, take_the_keys};
 
 /// A session this test hosts, served on its own endpoint.
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     #[cfg_attr(
         not(unix),
         expect(
@@ -49,6 +48,8 @@ struct Host {
     session_id: SessionId,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Host {

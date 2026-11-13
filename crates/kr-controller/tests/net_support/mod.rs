@@ -218,13 +218,11 @@ fn held_address(
 
 /// One daemon, its local endpoint and its network, with a temporary environment of its own.
 pub struct Host {
-    temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     network: Network,
     pub environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
-    work: kr_ipc::testing::PrivateTempDir,
     /// The owner device the host was bootstrapped with.
     pub owner: Option<DeviceRecord>,
     /// That device's own endpoint and keys, for a suite that connects it.
@@ -244,6 +242,9 @@ pub struct Host {
     boot: Option<BootIdentity>,
     /// What else the host was started with, which a restart keeps.
     waits: Waits,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
+    work: kr_ipc::testing::PrivateTempDir,
 }
 
 /// A wall clock a suite moves by hand: the machine's own, and the time added to it.
@@ -1467,9 +1468,6 @@ impl Host {
 
 /// A daemon a suite shut down, and what the next one on its environment tree starts from.
 pub struct Stopped {
-    temp: kr_ipc::testing::TempHost,
-    /// The directory the suite built its repositories in, which outlives the daemon.
-    work: kr_ipc::testing::PrivateTempDir,
     room: room::TestRoom,
     owner: Option<DeviceRecord>,
     settings: NetworkSettings,
@@ -1478,6 +1476,10 @@ pub struct Stopped {
     clocks: Clocks,
     boot: Option<BootIdentity>,
     waits: Waits,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
+    /// The directory the suite built its repositories in, which outlives the daemon.
+    work: kr_ipc::testing::PrivateTempDir,
 }
 
 impl Stopped {

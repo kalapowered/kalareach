@@ -63,9 +63,10 @@ fn report_part(part: u32, parts: u32) -> ControlFrame {
 /// A worker that takes the snapshot's parts and then writes each report part after its delay,
 /// and afterwards holds the connection open.
 struct Worker {
-    _tree: kr_ipc::testing::TempHost,
     endpoint: kr_ipc::paths::Endpoint,
     serving: tokio::task::JoinHandle<()>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _tree: kr_ipc::testing::TempHost,
 }
 
 impl Worker {

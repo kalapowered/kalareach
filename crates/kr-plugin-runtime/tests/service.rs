@@ -36,11 +36,12 @@ const HANG_GUARD: core::time::Duration = core::time::Duration::from_secs(60 * 60
 
 /// A plugin host serving in this process, with a client connected to it.
 struct Served {
-    _temp: kr_ipc::testing::TempHost,
     packages: std::path::PathBuf,
     descriptor: HostDescriptor,
     host: Arc<PluginHost>,
     serving: tokio::task::JoinHandle<()>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Served {

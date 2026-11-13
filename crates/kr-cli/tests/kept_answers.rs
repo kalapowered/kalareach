@@ -140,7 +140,6 @@ struct Arrival {
 
 /// A host tree with one scripted session in it, holding one question.
 struct Host {
-    temp: kr_ipc::testing::TempHost,
     home: PathBuf,
     state: Arc<Mutex<State>>,
     serving: tokio::task::JoinHandle<()>,
@@ -149,6 +148,8 @@ struct Host {
     environment: EnvironmentPaths,
     /// Where the session's descriptor is published.
     descriptor: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Host {

@@ -53,11 +53,12 @@ fn built(name: &str) -> PathBuf {
 /// The gateway of one session: the stand-in as the `codex` the shell finds, the launcher, and the
 /// package that declares the integration.
 pub struct Gateway {
-    host: kr_ipc::testing::TempHost,
     launcher: PathBuf,
     executable: PathBuf,
     backends: Arc<kr_worker::broker::commands::CommandBackends>,
     generation: AtomicU64,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: kr_ipc::testing::TempHost,
 }
 
 /// A terminal a test started, and what it printed.

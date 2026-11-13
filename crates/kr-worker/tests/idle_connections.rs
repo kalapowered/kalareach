@@ -60,12 +60,13 @@ const BEAT_BOUND: Duration = Duration::from_secs(60);
 const LOOK: Duration = Duration::from_millis(300);
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
     session_id: SessionId,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 fn build() -> BuildId {

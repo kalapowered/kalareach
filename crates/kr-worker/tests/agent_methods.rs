@@ -2630,8 +2630,9 @@ fn declared(id: &str, effect: &str) -> ActionDeclaration {
 /// records what each preparation it is asked for was given to work within.
 struct SilentHost {
     asked: std::sync::Arc<std::sync::Mutex<Vec<AskedToPrepare>>>,
-    _temp: kr_ipc::testing::TempHost,
     _serving: tokio::task::JoinHandle<()>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 /// What a preparation request carried: the call's deadline and when its token expires.

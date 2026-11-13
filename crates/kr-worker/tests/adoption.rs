@@ -62,7 +62,6 @@ fn session() -> SessionId {
 /// A host tree with packages admitted, the stand-in placed under the name they recognise, and one
 /// session's adoptions on a broker of its own.
 struct Setup {
-    host: kr_ipc::testing::TempHost,
     broker: Arc<Broker>,
     adoptions: Adoptions,
     program: PathBuf,
@@ -72,6 +71,8 @@ struct Setup {
     packages: Vec<ConnectorSource>,
     admissions: Admissions,
     sources: ConnectorSources,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    host: kr_ipc::testing::TempHost,
 }
 
 impl Setup {

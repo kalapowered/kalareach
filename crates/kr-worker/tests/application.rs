@@ -73,7 +73,6 @@ impl Drop for Store {
 /// A worker service over a live session, with one gateway instance bound to the answering package
 /// and a connection open on its tables.
 struct World {
-    _temp: kr_ipc::testing::TempHost,
     _store: Store,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
@@ -84,6 +83,8 @@ struct World {
     _client: tokio::io::DuplexStream,
     writes: tokio::task::JoinHandle<()>,
     connection: kr_protocol::ids::GatewayConnectionId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl World {
