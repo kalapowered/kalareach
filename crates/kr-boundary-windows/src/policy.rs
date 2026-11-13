@@ -209,6 +209,25 @@ impl Policy {
             .all(|collection| collection.mode != Mode::Enabled && collection.rules.is_empty())
     }
 
+    /// The mode of the executable collection as this policy, an earlier-state record, holds it
+    /// where the collection has no rule and a mode other than not configured: the state that a
+    /// computer can be in before the installation and that the removal writes back as it was.
+    #[must_use]
+    pub fn recorded_empty_mode(&self) -> Option<Mode> {
+        self.collections
+            .get(EXE)
+            .filter(|collection| {
+                collection.rules.is_empty() && collection.mode != Mode::NotConfigured
+            })
+            .map(|collection| collection.mode)
+    }
+
+    /// The mode of the executable collection, where the policy holds one.
+    #[must_use]
+    pub fn exe_mode(&self) -> Option<Mode> {
+        self.collections.get(EXE).map(|collection| collection.mode)
+    }
+
     /// The rules of the executable collection that are not this installation's own.
     #[must_use]
     pub fn foreign_exe_rules(&self) -> Vec<&Rule> {
@@ -559,15 +578,27 @@ fn close(
     }
 }
 
+/// What [`strip`] writes for an executable collection that is left with no rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Emptied {
+    /// The collection goes back to not configured.
+    NotConfigured,
+    /// The collection is written with this mode, as an earlier-state record holds an empty
+    /// collection of that mode.
+    Mode(Mode),
+    /// The collection's own element is left as the platform wrote it, mode and all.
+    AsFound,
+}
+
 /// Takes the rules with the given identifiers out of a policy's own XML and leaves everything
 /// else exactly as the platform wrote it: another rule's name, its kind and its conditions, and the
-/// collections this crate does not model. An executable collection left with no rule goes back to
-/// not configured.
+/// collections this crate does not model. An executable collection left with no rule is written as
+/// `emptied` says.
 ///
 /// # Errors
 ///
 /// Returns [`PolicyError::Unreadable`] when the text is not a policy.
-pub fn strip(xml: &str, drop: &[&str]) -> Result<String, PolicyError> {
+pub fn strip(xml: &str, drop: &[&str], emptied: Emptied) -> Result<String, PolicyError> {
     let unreadable = |error: &dyn std::fmt::Display| PolicyError::Unreadable(error.to_string());
     let policy = Policy::parse(xml)?;
     let exe_left = policy.collections.get(EXE).map_or(0, |collection| {
@@ -577,6 +608,7 @@ pub fn strip(xml: &str, drop: &[&str]) -> Result<String, PolicyError> {
             .filter(|id| !drop.contains(&id.as_str()))
             .count()
     });
+    let rewrite = emptied != Emptied::AsFound;
     let mut reader = Reader::from_str(xml);
     let mut writer = Writer::new(Vec::new());
     let mut skipping = 0_usize;
@@ -599,11 +631,11 @@ pub fn strip(xml: &str, drop: &[&str]) -> Result<String, PolicyError> {
             Event::Eof => break,
             Event::Start(element) if dropped(&element, drop)? => skipping = 1,
             Event::Empty(element) if dropped(&element, drop)? => {}
-            Event::Start(element) if exe_is_empty(&element, exe_left)? => writer
-                .write_event(Event::Start(not_configured()))
+            Event::Start(element) if rewrite && exe_is_empty(&element, exe_left)? => writer
+                .write_event(Event::Start(emptied_collection(emptied)))
                 .map_err(|error| unreadable(&error))?,
-            Event::Empty(element) if exe_is_empty(&element, exe_left)? => writer
-                .write_event(Event::Empty(not_configured()))
+            Event::Empty(element) if rewrite && exe_is_empty(&element, exe_left)? => writer
+                .write_event(Event::Empty(emptied_collection(emptied)))
                 .map_err(|error| unreadable(&error))?,
             other => writer
                 .write_event(other)
@@ -631,10 +663,19 @@ fn exe_is_empty(element: &BytesStart<'_>, exe_left: usize) -> Result<bool, Polic
         && attribute(element, "Type")?.as_deref() == Some(EXE))
 }
 
-fn not_configured() -> BytesStart<'static> {
+/// The element of an executable collection that [`strip`] left with no rule, with its type and its
+/// mode and nothing else.
+fn emptied_collection(emptied: Emptied) -> BytesStart<'static> {
+    let mode = match emptied {
+        Emptied::Mode(Mode::AuditOnly) => "AuditOnly",
+        Emptied::Mode(Mode::Enabled) => "Enabled",
+        Emptied::NotConfigured | Emptied::Mode(Mode::NotConfigured) | Emptied::AsFound => {
+            "NotConfigured"
+        }
+    };
     let mut element = BytesStart::new("RuleCollection");
     element.push_attribute(("Type", EXE));
-    element.push_attribute(("EnforcementMode", "NotConfigured"));
+    element.push_attribute(("EnforcementMode", mode));
     element
 }
 
