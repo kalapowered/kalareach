@@ -137,11 +137,16 @@ fn a_table_that_carries_a_listed_member_needs_a_range_that_starts_at_its_arrival
             }],
         }] });
     };
+    // A refusal for a range that admits an earlier SDK version says so; a refusal for a range with
+    // a prerelease part says that the check cannot decide it, and gives the cure.
+    const BELOW: &str = "admits an SDK version below it";
+    const PRERELEASE: &str =
+        "state the range with release versions only, for example `>=0.1.7, <0.2.0`";
     for (range, refused) in [
-        (">=0.1.6, <0.2.0", true),
-        (">=0.1.7, <0.2.0", false),
-        (">=0.1.7-alpha, <0.2.0", true),
-        (">=0.1.7, <0.2.0-rc.1", true),
+        (">=0.1.6, <0.2.0", Some((BELOW, PRERELEASE))),
+        (">=0.1.7, <0.2.0", None),
+        (">=0.1.7-alpha, <0.2.0", Some((PRERELEASE, BELOW))),
+        (">=0.1.7, <0.2.0-rc.1", Some((PRERELEASE, BELOW))),
     ] {
         let home = tempfile::tempdir().expect("a directory");
         let directory = package(home.path(), Some(range), carries);
@@ -150,11 +155,21 @@ fn a_table_that_carries_a_listed_member_needs_a_range_that_starts_at_its_arrival
             .iter()
             .find(|finding| finding.detail.contains("SelectionRoute.hidden_when"));
         match (refused, arrival) {
-            (true, Some(finding)) => {
+            (Some((words, other)), Some(finding)) => {
                 assert_eq!(finding.code, FindingCode::ConnectorTableInvalid, "{range}");
                 assert!(finding.detail.contains("SDK 0.1.7"), "{}", finding.detail);
+                assert!(
+                    finding.detail.contains(words),
+                    "{range}: {}",
+                    finding.detail
+                );
+                assert!(
+                    !finding.detail.contains(other),
+                    "{range}: {}",
+                    finding.detail
+                );
             }
-            (false, None) => {
+            (None, None) => {
                 assert!(findings.is_empty(), "{range}: {findings:?}");
             }
             _ => panic!("{range}: {findings:?}"),
