@@ -689,7 +689,9 @@ fn removal_keeps_an_administrators_later_rule_and_the_rule_that_lets_others_run(
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_eq!(code, 0, "{output}");
     assert!(
-        output.contains("administrator's rule"),
+        output.contains(&format!(
+            "a rule that the installation did not make, with the identifier {theirs}, is in the executable collection, so the allow-all rule and the collection's mode stay in force beside it"
+        )),
         "the removal says what it kept: {output}"
     );
 
@@ -859,7 +861,10 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
     assert_eq!(code, 0, "{output}");
     let (code, output) = case.install();
     assert_ne!(code, 0, "{output}");
-    assert!(output.contains("already installed"), "{output}");
+    assert!(
+        output.contains("says that the installation finished: use repair or remove"),
+        "{output}"
+    );
 
     let other_name = format!("krother{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
     let other = account::create(&other_name).unwrap();
@@ -1427,7 +1432,10 @@ fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_
     ] {
         let text = refused.to_string();
         assert!(text.contains("it is a reparse point"), "{text}");
-        assert!(text.contains("did not make"), "{text}");
+        assert!(
+            text.contains("can hold files that another account wrote"),
+            "{text}"
+        );
         assert!(text.contains("Move it aside"), "{text}");
         assert!(text.contains("do not remove it"), "{text}");
         assert!(!text.contains("Make the Administrators group"), "{text}");
@@ -1703,7 +1711,12 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
             text.contains(&owner.to_text().unwrap()),
             "the refusal is for the owner: {text}"
         );
-        assert!(text.contains("Make the Administrators group"), "{text}");
+        assert!(
+            text.contains(
+                "Correct what the reason names (the Administrators group, or the system, owns it"
+            ),
+            "{text}"
+        );
         assert!(text.contains("Do not remove it"), "{text}");
     }
     give_to(&paths.program, "*S-1-5-32-544");
@@ -1868,7 +1881,9 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
             .to_string();
         assert!(text.contains(&owner.to_text().unwrap()), "{text}");
         assert!(
-            text.contains("The installation did not make this folder"),
+            text.contains(
+                "The handle of this folder shows an owner that is not the system or the Administrators group, and it can hold files that another account wrote."
+            ),
             "{text}"
         );
         assert!(text.contains("Move the folder aside"), "{text}");
@@ -2050,7 +2065,10 @@ fn a_records_remedy_comes_from_what_its_handle_shows_and_what_cannot_be_read_is_
     set_owner(&paths.manifest, USERS);
     let text = refusal();
     assert!(text.contains("more than one name"), "{text}");
-    assert!(text.contains("did not make"), "{text}");
+    assert!(
+        text.contains("shows what the installation does not leave there"),
+        "{text}"
+    );
     assert!(text.contains("Move it aside"), "{text}");
     assert!(text.contains("do not remove it"), "{text}");
     for other in ["Correct what the reason names", "Remove "] {
@@ -2224,11 +2242,13 @@ fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link
     paths.program_top = link.clone();
     paths.git = paths.program.join("git");
     for text in refused(&paths, "a link above the program directory") {
-        assert!(text.contains("it is a reparse point"), "{text}");
         assert!(
-            text.contains("does not go through a reparse point at or above its trees"),
+            text.contains(
+                "the path that the system gives for it is not the final path of the folder that it opens"
+            ),
             "{text}"
         );
+        assert!(text.contains("This layout is not supported"), "{text}");
         assert!(text.contains(&link.display().to_string()), "{text}");
     }
     std::fs::remove_dir(&link).unwrap();
@@ -2484,7 +2504,10 @@ fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
         .to_string();
     assert!(text.contains("more than one name"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
-    assert!(text.contains("did not make"), "{text}");
+    assert!(
+        text.contains("shows what the installation does not leave there"),
+        "{text}"
+    );
     // Without it, nothing is listed and every name is read by its own handle. Only the two
     // replacements are left, so the first entry read is one of them: its handle shows two names,
     // so it is moved aside and not removed.
@@ -2504,7 +2527,10 @@ fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
         .to_string();
     assert!(text.contains("manifest-"), "{text}");
     assert!(text.contains("Move it aside"), "{text}");
-    assert!(text.contains("did not make"), "{text}");
+    assert!(
+        text.contains("shows what the installation does not leave there"),
+        "{text}"
+    );
     assert!(text.contains("out of the data directory"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
     let _ = std::fs::remove_dir_all(&folder);
@@ -2793,7 +2819,10 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         );
     };
     let moved_aside_text = |text: &str| {
-        assert!(text.contains("did not make"), "{text}");
+        assert!(
+            text.contains("shows what the installation does not leave there"),
+            "{text}"
+        );
         assert!(text.contains("Move it aside"), "{text}");
         assert!(text.contains("do not remove it"), "{text}");
         assert!(!text.contains("Remove "), "{text}");
@@ -3277,7 +3306,10 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .to_string();
     assert!(text.contains(&"ab".repeat(16)), "{text}");
     assert!(text.contains(&owner.to_text().unwrap()), "{text}");
-    assert!(text.contains("did not make"), "{text}");
+    assert!(
+        text.contains("shows what the installation does not leave there"),
+        "{text}"
+    );
     assert!(text.contains("Move it aside"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
     give_to(&root, "*S-1-5-32-544");
