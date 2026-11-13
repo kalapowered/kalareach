@@ -16,6 +16,7 @@
 //! identifier is a byte string in CBOR), so their kinds and ranges stay with the typed layer, and
 //! the golden frames and the real previous release are what cover them.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -499,14 +500,19 @@ impl Comparer<'_> {
             self.node(old_inner, new_inner, at);
             return;
         }
-        let old_heads = heads(old);
-        let new_heads = heads(new);
-        let mut names: BTreeSet<&String> = BTreeSet::new();
+        let (Ok(old_heads), Ok(new_heads)) = (heads(old), heads(new)) else {
+            self.report(at, DifferenceKind::Changed, "two branches with one key");
+            return;
+        };
+        let mut names: BTreeSet<&BranchKey> = BTreeSet::new();
         names.extend(old_heads.keys());
         names.extend(new_heads.keys());
-        for head in names {
-            let nested = format!("{at}#{head}");
-            match (old_heads.get(head), new_heads.get(head)) {
+        for key in names {
+            let nested = match key {
+                (text, 0) => format!("{at}#{text}"),
+                (text, number) => format!("{at}#{text}@{number}"),
+            };
+            match (old_heads.get(key), new_heads.get(key)) {
                 (Some(old), Some(new)) => self.node(old, new, &nested),
                 (Some(_), None) => self.report(&nested, DifferenceKind::Removed, "a variant"),
                 (None, Some(_)) => self.report(&nested, DifferenceKind::Added, "a variant"),
@@ -582,16 +588,38 @@ fn head(branch: &Value) -> String {
         .map_or_else(|| "any".to_owned(), |kind| format!("type:{kind}"))
 }
 
-fn heads(branches: &[Value]) -> BTreeMap<String, &Value> {
+/// A branch's key: the text that tells it from the others, and its number among the branches that
+/// have that text. The number is a part of the key, not of the text, so no text can equal another
+/// branch's key.
+type BranchKey = (String, usize);
+
+/// The branches of a choice by key, or the key that two of them would share.
+fn heads(branches: &[Value]) -> Result<BTreeMap<BranchKey, &Value>, BranchKey> {
     let mut found = BTreeMap::new();
-    for (position, branch) in branches.iter().enumerate() {
-        let mut name = head(branch);
-        if found.contains_key(&name) {
-            name = format!("{name}@{position}");
-        }
-        found.insert(name, branch);
+    let mut counted: BTreeMap<String, usize> = BTreeMap::new();
+    for branch in branches {
+        let text = head(branch);
+        let number = counted.entry(text.clone()).or_default();
+        let key = (text, *number);
+        *number += 1;
+        insert_branch(&mut found, key, branch)?;
     }
-    found
+    Ok(found)
+}
+
+/// Adds a branch under its key; a key that is taken is an error, never a replacement.
+fn insert_branch<'a>(
+    found: &mut BTreeMap<BranchKey, &'a Value>,
+    key: BranchKey,
+    branch: &'a Value,
+) -> Result<(), BranchKey> {
+    match found.entry(key) {
+        Entry::Occupied(taken) => Err(taken.key().clone()),
+        Entry::Vacant(free) => {
+            free.insert(branch);
+            Ok(())
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------------------------- */
@@ -924,5 +952,45 @@ fn describe(value: &CanonicalValue) -> String {
         CanonicalValue::Bool(_) => "a boolean".to_owned(),
         CanonicalValue::Integer(_) => "an integer".to_owned(),
         CanonicalValue::Bytes(_) => "a byte string".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{heads, insert_branch};
+
+    /// A branch whose key is taken is an error and the branch already there stays: a key is never
+    /// replaced.
+    #[test]
+    fn a_taken_branch_key_is_an_error_and_not_a_replacement() {
+        let (first, second) = (json!({ "const": "a" }), json!({ "const": "b" }));
+        let mut found = std::collections::BTreeMap::new();
+        let key = ("const:a".to_owned(), 0);
+        assert_eq!(insert_branch(&mut found, key.clone(), &first), Ok(()));
+        assert_eq!(
+            insert_branch(&mut found, key.clone(), &second),
+            Err(key.clone())
+        );
+        assert_eq!(found.get(&key), Some(&&first));
+    }
+
+    /// The text of a branch never stands for another branch: the numbered key of a repeated text
+    /// differs from the key of a branch whose own text ends the same way.
+    #[test]
+    fn a_branch_text_cannot_stand_for_another_branchs_key() {
+        let branches = [
+            json!({ "const": "{}@2" }),
+            json!({ "const": {} }),
+            json!({ "const": {} }),
+        ];
+        let found = heads(&branches).expect("three keys");
+        assert_eq!(found.len(), 3);
+        assert_eq!(
+            found.get(&("const:{}@2".to_owned(), 0)),
+            Some(&&branches[0])
+        );
+        assert_eq!(found.get(&("const:{}".to_owned(), 1)), Some(&&branches[2]));
     }
 }

@@ -740,6 +740,71 @@ fn literal_data_is_compared_whole_for_both_comparisons() {
     assert!(lines.is_empty(), "a member named default: {lines:?}");
 }
 
+/// The text of a string constant can be anything, so no text may stand for another branch: a
+/// branch beside two equal branches, whose text is the twins' text with a number added, is
+/// compared like any other. A changed keyword in it is a difference for both comparisons, beside a
+/// member that passes too.
+#[test]
+fn branch_keys_cannot_collide_for_both_comparisons() {
+    let protocol = protocol_schema();
+    for (text, twin) in [
+        (r#"{"title":"x"}@2"#, json!({ "title": "x" })),
+        ("{}@2", json!({})),
+    ] {
+        let mut old = sdk_schema();
+        old["$defs"]["Route"]["properties"]["choice"] = json!({ "anyOf": [
+            { "const": text, "maxLength": 100 },
+            { "const": twin },
+            { "const": twin },
+        ] });
+        let mut new = old.clone();
+        new["$defs"]["Route"]["properties"]["choice"]["anyOf"][0]["maxLength"] = json!(0);
+        let wanted = vec![format!("Route.choice#const:{text} changed: maxLength")];
+        let lines = crate::public_contract::compare(&old, &new).expect("compares");
+        assert_eq!(lines, wanted, "the protocol's comparison: {text}");
+        let outcome = compare(
+            &old,
+            &with_hidden(&new),
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", Some(LISTED)),
+        );
+        assert_eq!(outcome.passed.len(), 1, "{text}");
+        assert_eq!(outcome.lines, wanted, "the SDK's comparison: {text}");
+    }
+}
+
+/// Two equal branches are told apart by their number, and a third branch that differs is reported
+/// by its own key, for both comparisons.
+#[test]
+fn equal_branches_beside_one_that_differs_compare_by_number() {
+    let protocol = protocol_schema();
+    let mut old = sdk_schema();
+    old["$defs"]["Route"]["properties"]["choice"] = json!({ "anyOf": [
+        { "const": {}, "maxLength": 5 },
+        { "const": {}, "maxLength": 5 },
+        { "type": "string", "maxLength": 100 },
+    ] });
+    for (position, key) in [(0, "const:{}"), (1, "const:{}@1"), (2, "type:string")] {
+        let mut new = old.clone();
+        new["$defs"]["Route"]["properties"]["choice"]["anyOf"][position]["maxLength"] = json!(0);
+        let wanted = vec![format!("Route.choice#{key} changed: maxLength")];
+        let lines = crate::public_contract::compare(&old, &new).expect("compares");
+        assert_eq!(lines, wanted, "the protocol's comparison: {key}");
+        let outcome = compare(
+            &old,
+            &with_hidden(&new),
+            (&protocol, &protocol),
+            &contract("0.1.6", None),
+            &contract("0.1.7", Some(LISTED)),
+        );
+        assert_eq!(outcome.passed.len(), 1, "{key}");
+        assert_eq!(outcome.lines, wanted, "the SDK's comparison: {key}");
+    }
+    let same = crate::public_contract::compare(&old, &old.clone()).expect("compares");
+    assert!(same.is_empty(), "{same:?}");
+}
+
 /// A member of a definition that the protocol schema has stays under the protocol's rule: the
 /// table cannot list it into the SDK's, whichever release the protocol schema is of.
 #[test]
