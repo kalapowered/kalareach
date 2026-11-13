@@ -4429,11 +4429,17 @@ fn refused_service() -> Error {
 
 /// Makes the folder directly above the program directory where it is not there, and records what
 /// became of it: the intent before the call, then the folder's identity and the result `made` where
-/// the run's own call made it, or the result `found` where something stood there (an earlier run's
-/// result `made` stays). The folders above that one are the system's and are made by path where
+/// the run's own call made it, or, in a new installation, the result `found` where something stood
+/// there. A repair that finds the folder writes no result: what an earlier run recorded (its intent
+/// with the identity, or its result) stays as it is. The folders above that one are the system's and are made by path where
 /// they are missing, as before; the installation never removes them. The folder that this run made
 /// is held in the run's value from the call that made it, before any record is written.
-fn make_program_folder(run: &mut Run, paths: &Paths, readable: &Principals) -> Result<(), Error> {
+fn make_program_folder(
+    run: &mut Run,
+    paths: &Paths,
+    readable: &Principals,
+    existing: bool,
+) -> Result<(), Error> {
     let Some(folder) = paths.program.parent() else {
         return Ok(());
     };
@@ -4460,6 +4466,12 @@ fn make_program_folder(run: &mut Run, paths: &Paths, readable: &Principals) -> R
             run.record(ObjectKind::ProgramFolder, &id, Some(identity?.as_str()))?;
             run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Made)
         }
+        // A repair's read of a folder that stands there shows nothing of whether it stood there
+        // before the installation: what an earlier run recorded of it (its intent with the
+        // identity, or its result) stays as it is, and the removal decides from that.
+        None if existing => Ok(()),
+        // A new installation's own read of a folder that stands there, before any call of its own
+        // on it, is what the result `found` says.
         None => run.conclude(ObjectKind::ProgramFolder, &id, Outcome::Found),
     }
 }
@@ -4644,7 +4656,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         remedy::Stage::After
     };
     check_program_parents(&paths, after)?;
-    make_program_folder(run, &paths, &readable)?;
+    make_program_folder(run, &paths, &readable, existing)?;
     fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)
         // text: install_lay_down-1
         .map_err(io_error("making the program directory"))?;
@@ -7250,6 +7262,37 @@ mod tests {
                 .is_none()
         );
         assert!(is_folder(&by_hand));
+    }
+
+    #[test]
+    fn a_repair_keeps_the_intent_of_a_folder_that_an_earlier_run_made_and_a_new_installation_finds_it_as_found()
+     {
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        let readable = Principals {
+            users_may_read: true,
+            ..Principals::default()
+        };
+        let folder = top.path().join("folder");
+        run.paths.program = folder.join("program");
+        let id = folder.display().to_string();
+        // An earlier run made the folder and saved its identity, then died before its result.
+        let made = create_folder_above(&folder, SdKind::AdminDir, &readable)
+            .unwrap()
+            .expect("the call made the folder");
+        let identity = file_key(&made.identity).unwrap().to_string();
+        run.manifest
+            .record(ObjectKind::ProgramFolder, &id, Some(&identity));
+        let paths = run.paths.clone();
+        // A repair finds the folder and keeps the intent and its identity, with no result.
+        make_program_folder(&mut run, &paths, &readable, true).unwrap();
+        let kept = run.manifest.find(ObjectKind::ProgramFolder, &id).unwrap();
+        assert_eq!(kept.outcome, None);
+        assert_eq!(kept.detail.as_deref(), Some(identity.as_str()));
+        // A new installation that finds a folder that stands there writes the result `found`.
+        make_program_folder(&mut run, &paths, &readable, false).unwrap();
+        let found = run.manifest.find(ObjectKind::ProgramFolder, &id).unwrap();
+        assert_eq!(found.outcome, Some(Outcome::Found));
     }
 
     #[test]
