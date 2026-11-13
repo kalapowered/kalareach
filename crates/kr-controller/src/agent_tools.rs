@@ -803,27 +803,22 @@ impl Installer {
         })
     }
 
-    /// Refuses a removal that cannot be carried out, without carrying any of it out.
-    ///
-    /// Everything here reads. It runs before the dispatch marker, so a removal this host will not
-    /// do is refused rather than recorded as a change whose outcome nobody knows.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::PermissionDenied`] where a document it would rewrite has access
-    /// controls a replacement could not carry, [`ControllerError::Storage`] where they cannot be
-    /// read, and [`ControllerError::InvalidArgument`] when the scope needs a project directory
-    /// that was not given, or the record cannot be read.
-    pub fn check_removal(&self, params: &AgentToolsParams) -> Result<()> {
-        self.removable(params).map(|_| ())
-    }
-
     /// Reads what a removal would work from, refusing everything it cannot do.
     fn removable(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
         // A removal of something never installed still has to know where it would have been, or it
         // is not the removal of anything in particular.
         self.layout(params)?;
-        let Some(record) = self.recorded(params)? else {
+        let recorded = self.recorded(params)?;
+        self.removable_from(recorded)
+    }
+
+    /// Refuses what a removal that works from `recorded` cannot do, and gives back what it would
+    /// work from. Everything here reads, and the record is read before it, by the caller.
+    fn removable_from(
+        &self,
+        recorded: Option<InstallationRecord>,
+    ) -> Result<Option<InstallationRecord>> {
+        let Some(record) = recorded else {
             return Ok(None);
         };
         // Every document this removal would rewrite. A removal that took the package and then
@@ -853,17 +848,18 @@ impl Installer {
     /// scope needs a project directory that was not given.
     pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
         let layout = self.layout(params)?;
-        let root = layout.skills.clone();
-        self.check_before_writing(params, &layout, &root)
+        let recorded = self.recorded(params)?;
+        self.check_before_writing(&layout, recorded.as_ref())
     }
 
+    /// What an installation that `recorded` describes would not do to the agent's tree, read
+    /// from the tree.
     fn check_before_writing(
         &self,
-        params: &AgentToolsParams,
         layout: &Layout,
-        root: &Path,
+        recorded: Option<&InstallationRecord>,
     ) -> Result<()> {
-        let recorded = self.recorded(params)?;
+        let root = layout.skills.as_path();
         for (name, _) in files() {
             let path = root.join(name);
             let Some(present) = read_digest(&path)? else {
@@ -878,7 +874,7 @@ impl Installer {
             // package version says so — and repairing then replaces this host's own file.
             // Anything else at that path is somebody's own file, and an installation does not
             // write over one.
-            let ours = recorded.as_ref().is_some_and(|record| {
+            let ours = recorded.is_some_and(|record| {
                 record
                     .manifest
                     .operations
@@ -1624,27 +1620,35 @@ impl Installer {
 
     /// What an installation or a removal is refused for before anything is written, with a refusal
     /// that a record this host cannot read causes kept apart from the ones about the request
-    /// itself: the first says that a record exists.
+    /// itself: the first says that a record exists, and the second, which includes a file or a
+    /// document of the agent's own that cannot be read, does not.
+    ///
+    /// Everything here reads. It runs before the dispatch marker, so a change this host will not
+    /// make is refused rather than recorded as a change whose outcome nobody knows.
     ///
     /// # Errors
     ///
-    /// Returns what [`Self::check`] or [`Self::check_removal`] refuses with.
+    /// Returns [`Declined::ByTheRequest`] with [`ControllerError::PermissionDenied`] where a
+    /// document it would rewrite has access controls a replacement could not carry or a file is
+    /// there that this host did not write, [`ControllerError::Storage`] where they cannot be
+    /// read, and [`ControllerError::InvalidArgument`] when the scope needs a project directory
+    /// that was not given; and [`Declined::ByARecord`] when the record of the installation
+    /// cannot be read or does not parse.
     pub(crate) fn declined_before_writing(
         &self,
         params: &AgentToolsParams,
         removal: bool,
     ) -> std::result::Result<(), Declined> {
-        match if removal {
-            self.check_removal(params)
+        let layout = self.layout(params).map_err(Declined::ByTheRequest)?;
+        let recorded = self
+            .recorded(params)
+            .map_err(|error| Declined::ByARecord(Recorded::read(error)))?;
+        if removal {
+            self.removable_from(recorded).map(|_| ())
         } else {
-            self.check(params)
-        } {
-            Ok(()) => Ok(()),
-            Err(error @ ControllerError::Storage { .. }) => {
-                Err(Declined::ByARecord(Recorded::read(error)))
-            }
-            Err(error) => Err(Declined::ByTheRequest(error)),
+            self.check_before_writing(&layout, recorded.as_ref())
         }
+        .map_err(Declined::ByTheRequest)
     }
 
     /// Commits the dispatch marker, before anything on disk changes.
