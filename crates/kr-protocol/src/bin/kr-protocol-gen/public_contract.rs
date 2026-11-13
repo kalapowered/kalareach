@@ -87,11 +87,13 @@ const METADATA_OBJECT_KEYS: [&str; 6] = [
 /// an item or an `anyOf` or `allOf` branch; where it is used under a `oneOf`, a `not` or an `if`,
 /// the member narrows the object and so can widen the place, which [`accepted`] checks with
 /// [`is_used_only_where_it_widens`]. A `$ref`, a nullable pair or a list of branches gives a label
-/// of the same form from another list, and a closed object refuses the member.
+/// of the same form from another list, and a closed object refuses the member. The keys that the
+/// rule reads have the form that it reads ([`has_plain_forms`]).
 fn is_a_metadata_object(schema: &Value, definition: &str) -> bool {
     let node = &schema["$defs"][definition];
     node.get("type").and_then(Value::as_str) == Some("object")
         && node.get("additionalProperties").is_none()
+        && has_plain_forms(node)
         && node.as_object().is_some_and(|members| {
             members
                 .keys()
@@ -229,8 +231,8 @@ fn is_used_only_where_it_widens(schema: &Value, name: &str) -> bool {
 /// (see [`is_used_only_where_it_widens`]): no `$ref` reaches it, from a definition or from a
 /// keyword of the root, and every keyword of every definition and of the root is one that the walk
 /// models, so that no keyword that the walk does not read can reach it in another form. The one use
-/// that stands is the bundle's own: an entry of the root's `properties` that is a bare reference
-/// (the schema lists its messages there, and a use as a property widens with its target).
+/// that stands is the bundle's own: one entry of the root's `properties` that is a bare reference
+/// (see [`bundle_entries_stand`]).
 fn is_not_used(schema: &Value, name: &str) -> bool {
     walk(schema, name, false)
 }
@@ -238,7 +240,8 @@ fn is_not_used(schema: &Value, name: &str) -> bool {
 /// The walk of [`is_used_only_where_it_widens`] and [`is_not_used`]: the dialect gate, the
 /// definitions that reach `name`, and every definition and root keyword read with `widening` as the
 /// state of a use: `true` where a use may stand where a wider definition widens, `false` where
-/// none may stand.
+/// none may stand (there the root's `properties` are read by [`bundle_entries_stand`]). A schema
+/// with no `$defs` object holds no definition to read, and the walk refuses it.
 fn walk(schema: &Value, name: &str, widening: bool) -> bool {
     // A root that names no dialect is read in whatever dialect the reader defaults to, and an older
     // one has no `const` and ignores what stands beside a `$ref`: the walk reads neither.
@@ -246,7 +249,7 @@ fn walk(schema: &Value, name: &str, widening: bool) -> bool {
         return false;
     }
     let Some(definitions) = schema["$defs"].as_object() else {
-        return true;
+        return false;
     };
     let mut reaching: BTreeSet<&str> = BTreeSet::from([name]);
     loop {
@@ -276,14 +279,43 @@ fn walk(schema: &Value, name: &str, widening: bool) -> bool {
                 // The dialect is the walk's own, as checked above.
                 "$schema" => true,
                 // The bundle's entries stand where no other use does.
-                "properties" if !widening => member.as_object().is_some_and(|entries| {
-                    entries.values().all(|entry| match bare_reference(entry) {
-                        Some(reference) => reference_widens(reference, &reaching, true),
-                        None => schema_widens(entry, &reaching, false),
-                    })
-                }),
+                "properties" if !widening => bundle_entries_stand(member, &reaching),
                 _ => widens_at(keyword, member, &reaching, widening),
             })
+}
+
+/// Whether the entries of the root's `properties`, where no use may stand, are the bundle's own: the
+/// bundle lists each of its types once, under a name made from the type, so an entry that is a bare
+/// `$ref` of a readable form is the type itself and adds no place that carries it, and at most one
+/// such entry points at a definition of `reaching`, since a second one is another type that has the
+/// schema of the first, and a host can answer with it. Any other entry is read with no use allowed.
+fn bundle_entries_stand(properties: &Value, reaching: &BTreeSet<&str>) -> bool {
+    let Some(entries) = properties.as_object() else {
+        return false;
+    };
+    let mut entries_of_the_place = 0;
+    for entry in entries.values() {
+        match bare_reference(entry) {
+            Some(reference) => {
+                if !reference_widens(reference, reaching, true) {
+                    return false;
+                }
+                if reference
+                    .as_str()
+                    .and_then(|target| target.strip_prefix("#/$defs/"))
+                    .is_some_and(|target| reaching.contains(target))
+                {
+                    entries_of_the_place += 1;
+                }
+            }
+            None => {
+                if !schema_widens(entry, reaching, false) {
+                    return false;
+                }
+            }
+        }
+    }
+    entries_of_the_place <= 1
 }
 
 /// The `$ref` of an entry that has nothing else: a schema that is a bare reference.
@@ -415,10 +447,13 @@ fn widens_at(keyword: &str, member: &Value, reaching: &BTreeSet<&str>, widening:
     }
 }
 
-/// The keywords that the walk reads as plain data: the validation keywords that judge the instance
-/// alone, the annotations, and the two that the product's schemas add (`tsType` and the read-only
-/// marker, which no validator reads). Any other keyword at a place that the walk reads is refused,
-/// so a line is excused only where every keyword of both schemas is one that the walk models.
+/// The keywords that the walk reads as plain data: the validation keywords whose value is data and
+/// that judge the instance (`minContains` and `maxContains` also read a `contains` beside them,
+/// which the walk reads where no use may stand), the annotations, and the two that the product's
+/// schemas add: `tsType`, which no validator reads, and the read-only marker, which only the
+/// product's own check reads, for the unknown members of its own object. Any other keyword at a
+/// place that the walk reads is refused, so a line is excused only where every keyword of both
+/// schemas is one that the walk models.
 const PLAIN_KEYWORDS: [&str; 33] = [
     "type",
     "enum",
@@ -853,6 +888,20 @@ fn is_a_listed_arrival(
     }))
 }
 
+/// Whether the keys of a definition that a rule reads have the form that it reads: `required` is a
+/// list of texts (a rule that finds it no list takes the member for one that is not required, and a
+/// reader that iterates a text reads it as a list of letters), and `description` and `title` are
+/// texts, as the comparer leaves out only a text.
+fn has_plain_forms(node: &Value) -> bool {
+    node.get("required").is_none_or(|required| {
+        required
+            .as_array()
+            .is_some_and(|names| names.iter().all(Value::is_string))
+    }) && ["description", "title"]
+        .iter()
+        .all(|keyword| node.get(keyword).is_none_or(Value::is_string))
+}
+
 /// The keys a plain closed object's definition may have at its top, as the generator writes them:
 /// the shape (`type`, `properties`, `required`, `additionalProperties`) and the annotations the
 /// comparison ignores (`description`, `title`).
@@ -870,7 +919,8 @@ const PLAIN_OBJECT_KEYS: [&str; 6] = [
 /// [`PLAIN_OBJECT_KEYS`]. Any other key at its top (`allOf`, `anyOf`, `oneOf`, `not`, `if`, `$ref`,
 /// `patternProperties`, `unevaluatedProperties`, a marker of the protocol) composes or loosens the
 /// object, so a name that appears in its `properties` may restrict a member the definition has
-/// another way, and a member added to it is not one an earlier reader meets as a new member.
+/// another way, and a member added to it is not one an earlier reader meets as a new member. The
+/// keys that a rule reads have the form that it reads ([`has_plain_forms`]).
 fn plain_closed_object(definition: &str, schema: &Value, name: &str) -> Result<(), String> {
     let node = &schema["$defs"][definition];
     if node.get("type").and_then(Value::as_str) != Some("object") {
@@ -894,6 +944,13 @@ fn plain_closed_object(definition: &str, schema: &Value, name: &str) -> Result<(
         return Err(format!(
             "{definition} is not closed in {name} SDK schema (additionalProperties is not false), \
              and a member listed in the arrival table has to be a member of a plain closed object"
+        ));
+    }
+    if !has_plain_forms(node) {
+        return Err(format!(
+            "{definition} has a required that is not a list of texts, or a description or a title \
+             that is not a text, in {name} SDK schema, and a member listed in the arrival table has \
+             to be a member of a plain closed object"
         ));
     }
     Ok(())

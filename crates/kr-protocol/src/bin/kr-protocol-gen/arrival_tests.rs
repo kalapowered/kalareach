@@ -2223,7 +2223,9 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
     // A keyword of the schema's own root that uses the document: in a `oneOf` beside a plain
     // object, the old root accepts `{"push": {}}` (only the plain object matches) and the new one
     // refuses it (both match). A bare reference among the root's `properties` is the bundle's own
-    // entry, and a use as a property only widens with its target; any other entry is read.
+    // entry: the type itself under the name that the bundle gives it, which adds no place that
+    // carries the document (one such entry stands, a second is another type); any other entry is
+    // read, and so is any use as a property.
     let with_root = |schema: &Value, keyword: &str, member: Value| {
         let mut schema = schema.clone();
         schema[keyword] = member;
@@ -2316,12 +2318,14 @@ fn a_new_section_passes_only_in_a_plain_closed_document() {
 
 /// A new section is excused only where every keyword of both schemas, at the place and on the path
 /// from the root to it, is one that the walk models: an unmodelled keyword anywhere (at the root, in
-/// another definition, inside the document) and a reference to the document under a keyword that the
-/// walk does not read as a reference (`$dynamicRef`, `$recursiveRef`) leave the section as a line, as
-/// does a use that the walk reads. A schema that names no dialect is refused as it is for the other
+/// another definition, inside the document), a `$dynamicRef` to the document and a `$recursiveRef`
+/// (a target that depends on the place that evaluates it) leave the section as a line, as does a
+/// use that the walk reads. A schema that names no dialect is refused as it is for the other
 /// rules. The keyword stands in both schemas, in the earlier one only and in the new one only, so
-/// that the section is the only difference that can be excused. (A `$ref` of another form is
-/// refused when the schema is cut, which is not this rule's.)
+/// that the section is the only difference that can be excused. (A `$ref` of another form in a
+/// definition or in a keyword of the root other than `properties` is refused when the schema is
+/// cut, before this rule reads it; among the root's `properties`, which the cut does not read, the
+/// walk refuses it.)
 #[test]
 fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
     let schema = |with_push: bool| {
@@ -2352,7 +2356,7 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         "modelled keywords"
     );
     type Edit = fn(&mut Value);
-    let rows: [(&str, Edit); 11] = [
+    let rows: [(&str, Edit); 12] = [
         ("an unmodelled keyword at the root", |schema| {
             schema["x-unmodelled"] = json!(true);
         }),
@@ -2401,6 +2405,10 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
                 { "$ref": "#/$defs/ConfigurationDocument" }, { "type": "null" }] } });
             },
         ),
+        ("a second bundle entry for the document", |schema| {
+            schema["properties"] = json!({ "a": { "$ref": "#/$defs/ConfigurationDocument" },
+                "b": { "$ref": "#/$defs/ConfigurationDocument" } });
+        }),
         ("a dynamic reference with an address", |schema| {
             schema["$defs"]["Holder"] = json!({ "type": "object", "properties": {
                 "c": { "$dynamicRef": "https://example.com/bundle#/$defs/ConfigurationDocument" } } });
@@ -2439,6 +2447,100 @@ fn a_new_section_passes_only_where_every_keyword_of_both_schemas_is_modelled() {
         }
     }
     assert!(excused.is_empty(), "the section passed: {excused:#?}");
+}
+
+/// The keys of a place that a rule reads have the form that it reads: a `required` that is a text
+/// or holds a non-text, and a `description` or a `title` that is not a text, leave the member as a
+/// line for each of the three rules that read a definition's keys. The comparer reads `required`
+/// only as a list of texts and leaves out an annotation whatever its value, so no other line shows
+/// the change. The form stands in both schemas, in the earlier one only and in the new one only.
+#[test]
+fn a_place_whose_required_or_annotation_has_another_form_excuses_nothing() {
+    type Edit = fn(&mut Value);
+    let forms: [(&str, Edit); 4] = [
+        ("a required that is a text", |node| {
+            node["required"] = json!("member");
+        }),
+        ("a required that holds a number", |node| {
+            node["required"] = json!(["id", 1]);
+        }),
+        ("a description that is an object", |node| {
+            node["description"] = json!({ "a": 1 });
+        }),
+        ("a title that is a number", |node| {
+            node["title"] = json!(5);
+        }),
+    ];
+    let placements = [(true, true), (true, false), (false, true)];
+    let mut excused = Vec::new();
+    for (says, edit) in forms {
+        for (in_the_old, in_the_new) in placements {
+            // The new section: `ConfigurationDocument.push`.
+            let document = |with_push: bool, edited: bool| {
+                let mut node = json!({ "type": "object", "additionalProperties": false,
+                    "properties": { "version": { "type": "integer" } } });
+                if with_push {
+                    node["properties"]["push"] = json!({ "type": "object" });
+                }
+                if edited {
+                    edit(&mut node);
+                }
+                json!({ "$schema": DIALECT, "$defs": { "ConfigurationDocument": node } })
+            };
+            let (lines, passed) =
+                section_lines(&document(false, in_the_old), &document(true, in_the_new));
+            if !passed.is_empty()
+                || !lines.contains(&"ConfigurationDocument.push added: a member".to_owned())
+            {
+                excused.push(format!(
+                    "the new section: {says} ({in_the_old}, {in_the_new})"
+                ));
+            }
+            // The listed arrival: `Route.hidden`.
+            let protocol = protocol_schema();
+            let mut old = sdk_schema();
+            let mut new = with_hidden(&old);
+            if in_the_old {
+                edit(&mut old["$defs"]["Route"]);
+            }
+            if in_the_new {
+                edit(&mut new["$defs"]["Route"]);
+            }
+            let outcome = compare(
+                &old,
+                &new,
+                (&protocol, &protocol),
+                &contract("0.1.6", None),
+                &contract("0.1.7", Some(LISTED)),
+            );
+            if !outcome.passed.is_empty() {
+                excused.push(format!(
+                    "the listed arrival: {says} ({in_the_old}, {in_the_new})"
+                ));
+            }
+            // The read-only member: `Info.note`.
+            let info = |with_note: bool, edited: bool| {
+                let mut node = json!({ "type": "object", "x-kalareach-read-only-metadata": true,
+                    "properties": { "id": { "type": "string" } }, "required": ["id"] });
+                if with_note {
+                    node["properties"]["note"] = json!({ "type": "string" });
+                }
+                if edited {
+                    edit(&mut node);
+                }
+                json!({ "$schema": DIALECT, "$defs": { "Info": node } })
+            };
+            let lines =
+                crate::public_contract::compare(&info(false, in_the_old), &info(true, in_the_new))
+                    .expect("compares");
+            if !lines.contains(&"Info.note added: a member".to_owned()) {
+                excused.push(format!(
+                    "the read-only member: {says} ({in_the_old}, {in_the_new})"
+                ));
+            }
+        }
+    }
+    assert!(excused.is_empty(), "a member passed: {excused:#?}");
 }
 
 /// A listed member of the SDK's schema arrives only where every use of its definition widens with
