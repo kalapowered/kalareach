@@ -4997,13 +4997,13 @@ async fn an_unfinished_key_registration_is_not_answered_with_another_actions_reg
     controller
         .preview_key_update_action(&actor, &second, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("the second action registers the key");
 
     let refusal = controller
         .preview_key_update_action(&actor, &first, admission)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("the first action is not answered with the second one's registration");
     assert_eq!(
         refusal.code(),

@@ -1501,7 +1501,7 @@ async fn a_recorded_key_registration_is_told_as_unknown_when_a_feed_refusal_rise
                     },
                 )
                 .await
-                .into_answer()
+                .into_answer_for_test()
                 .expect_err("a device registers only its own key");
         };
         let answered = if second_lookup {

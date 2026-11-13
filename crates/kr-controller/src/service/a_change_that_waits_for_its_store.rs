@@ -447,7 +447,7 @@ async fn a_privacy_change_whose_admission_lapses_while_it_waits(lapse: Lapse) {
     let refused = changing
         .await
         .expect("the change finishes")
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a change whose admission lapsed while it waited changes nothing");
     assert!(lapse.is_refused_by(&refused), "{lapse:?}: {refused}");
     let report = controller.privacy.status(kr_ipc::now_ms());
@@ -480,7 +480,7 @@ async fn a_privacy_change_whose_admission_lapses_while_it_waits(lapse: Lapse) {
     controller
         .privacy_set(&mutation, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("a change under a standing admission is recorded");
     assert!(controller.privacy.state().is_private());
 }
@@ -884,7 +884,7 @@ async fn enabling_privacy_mode_after_the_tick_slept_owes_nothing_for_a_session_t
     controller
         .privacy_set(&mutation, carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("privacy mode is turned on");
     let report = controller.privacy.status(kr_ipc::now_ms());
     assert!(report.enabled);
@@ -1094,7 +1094,7 @@ async fn asked_after_a_create(private: bool) -> Vec<(SessionId, i64)> {
     controller
         .session_create(&actor_id, &create_request(temp.environment_id()), carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("this test starts no workers");
     let asked = asked.lock().expect("the record is not poisoned");
     asked.clone()
@@ -1150,7 +1150,7 @@ async fn a_create_whose_admission_lapses_while_it_waits_for_the_record(lapse: La
             controller
                 .session_create(&actor_id, &mutation, carried)
                 .await
-                .into_answer()
+                .into_answer_for_test()
         }
     });
     // The create has reserved its session, which it does before it waits for the record. Where it
@@ -1244,7 +1244,7 @@ async fn a_create_whose_obligation_cannot_be_written_starts_nothing() {
     let refused = controller
         .session_create(&actor_id, &create_request(temp.environment_id()), carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a create whose obligation cannot be recorded starts nothing");
     assert!(
         refused.to_string().contains("refused the obligation"),
@@ -1306,7 +1306,7 @@ async fn privacy_mode_turned_on_obliges_every_launch_a_worker_may_still_come_of(
             carried,
         )
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("privacy mode is turned on");
     let report: kr_protocol::privacy::PrivacyReport = report.to_typed().expect("decodes");
     let mut owing: Vec<SessionId> = report.sessions.iter().map(|owed| owed.session_id).collect();
@@ -1337,7 +1337,7 @@ async fn a_create_that_cannot_say_what_it_started_leaves_a_launch_forgotten_unle
         controller
             .session_create(&actor_id, &create_request(temp.environment_id()), carried)
             .await
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a create that cannot say what it started fails");
         let spawned = controller
             .registry
@@ -1386,7 +1386,9 @@ async fn the_report_of_a_privacy_change_is_given_as_a_copy_of_what_earlier_expor
         )
         .await;
     assert!(given.is_copied(), "the report is a copy of earlier records");
-    let report = given.into_answer().expect("privacy mode is turned on");
+    let report = given
+        .into_answer_for_test()
+        .expect("privacy mode is turned on");
     let report: kr_protocol::privacy::PrivacyReport = report.to_typed().expect("decodes");
     assert!(report.enabled);
 }
@@ -1412,6 +1414,6 @@ async fn the_answer_to_removing_a_retained_copy_is_given_as_a_copy_of_the_export
         .await;
     assert!(given.is_copied(), "the answer derives from earlier exports");
     given
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("no export left a copy of that reference");
 }

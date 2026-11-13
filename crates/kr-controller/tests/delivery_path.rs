@@ -2115,7 +2115,7 @@ async fn a_push_registration_recorded_before_an_attempt_claims_it_is_not_given_b
     let given = attempt(carried).await;
     assert!(given.is_copied(), "the attempt found the record");
     let repeated: DevicePushRegisterResult = given
-        .into_answer()
+        .into_answer_for_test()
         .expect("the recorded result is given back")
         .to_typed()
         .expect("a registration result");
@@ -2125,7 +2125,7 @@ async fn a_push_registration_recorded_before_an_attempt_claims_it_is_not_given_b
     controller.hold_fence(true);
     let refused = attempt(carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a fence this host owes stops the recorded answer");
     controller.hold_fence(false);
     assert_eq!(
@@ -2138,7 +2138,7 @@ async fn a_push_registration_recorded_before_an_attempt_claims_it_is_not_given_b
     // more than once.
     let again: DevicePushRegisterResult = attempt(carried)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect("answered again once nothing is owed")
         .to_typed()
         .expect("a registration result");
