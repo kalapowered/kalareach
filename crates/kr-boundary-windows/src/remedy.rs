@@ -1405,6 +1405,94 @@ pub fn service_program_is(program: &str, broker: &str) -> bool {
     unquoted.eq_ignore_ascii_case(broker)
 }
 
+/// What a read of the manifest's name showed where it did not find the manifest that the run holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotProved {
+    /// The read answered that nothing is at the name.
+    Absent,
+    /// An object is at the name that is not the one the run's last proved write made, or the bytes
+    /// are not the run's own record.
+    Differs,
+    /// A read failed, with its words.
+    Unread(String),
+}
+
+impl NotProved {
+    /// What the read found, for the words of an ending.
+    #[must_use]
+    // text: not_proved
+    pub fn words(&self) -> String {
+        match self {
+            NotProved::Absent => {
+                "A read of the manifest's name afterwards found nothing there".to_owned()
+            }
+            NotProved::Differs => "A read of the manifest's name afterwards found an object or bytes that are not the manifest that this run holds".to_owned(),
+            NotProved::Unread(why) => format!(
+                "A read of the manifest's name afterwards failed ({why}), so what stands there is not known"
+            ),
+        }
+    }
+}
+
+/// What a rollback that ended with a failed step did with the run's record, which the
+/// administrator's removal reads: the manifest as this run holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordLeft {
+    /// A read of the manifest's name, after the failure, found the manifest that this run holds.
+    Proved {
+        /// The manifest's path.
+        manifest: String,
+    },
+    /// The read did not find it, and the run wrote its record again through the write that proves
+    /// it.
+    Saved {
+        /// The manifest's path.
+        manifest: String,
+        /// What the read found.
+        found: NotProved,
+    },
+    /// The read did not find it, and the write failed too: the run's record is not on disk.
+    NotSaved {
+        /// What the read found.
+        found: NotProved,
+        /// The words of the failed write.
+        why: String,
+        /// Each object that this run made and that stays, by path.
+        stays: Vec<String>,
+    },
+}
+
+/// The words that end a rollback with a failed step: what failed, what became of the run's record,
+/// and that the administrator's removal takes the rest where the record is on disk. Where the record
+/// could not be written again, they say so and name what stays. They never say that records are kept
+/// where none is on disk, and they give no step. `unread_prior` is the words that a removal adds
+/// where the earlier-state record was not read (empty, or starting with a full stop).
+#[must_use]
+// text: rollback_failed
+pub fn rollback_failed(failures: &[String], record: &RecordLeft, unread_prior: &str) -> String {
+    let failed = failures.join("; ");
+    match record {
+        RecordLeft::Proved { manifest } => format!(
+            "the removal did not finish: {failed}. A read of {manifest} afterwards found the manifest that this run holds, and the administrator's removal takes the rest{unread_prior}"
+        ),
+        RecordLeft::Saved { manifest, found } => format!(
+            "the removal did not finish: {failed}. {}, so this run wrote its record again at {manifest}, through the write that proves it, and the administrator's removal takes the rest{unread_prior}",
+            found.words()
+        ),
+        RecordLeft::NotSaved { found, why, stays } => {
+            let left = if stays.is_empty() {
+                "this run held no object that it had made".to_owned()
+            } else {
+                stays.join("; ")
+            };
+            format!(
+                "the removal did not finish: {failed}. {}, and writing this run's record again failed ({why}), so no record of this run is on disk for the administrator's removal to use. What this run made and the rollback did not take away: {left}{unread_prior}",
+                found.words()
+            )
+        }
+    }
+}
+
 /// The entry of the rollback's list for one object that this run made, or none where the cleanup
 /// took the object away or did not make it: the object's path with the platform's words where it
 /// stays, and with the words of a name that was not found, which say that the rollback did nothing

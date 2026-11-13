@@ -219,6 +219,26 @@ fn make_after(run: &Run, step: &str) -> Result<(), Error> {
     })
 }
 
+/// Fails the step of the undoing that `KR_BOUNDARY_FAIL_UNDO` names (`account`, `policy` or
+/// `service`), as a platform refusal would, so that a case shows what a rollback leaves where one of
+/// its steps failed. The test build only.
+#[cfg(feature = "testing")]
+fn fail_undo(step: &str) -> Result<(), Error> {
+    if std::env::var("KR_BOUNDARY_FAIL_UNDO").as_deref() == Ok(step) {
+        // text: inject-4
+        return Err(Error::Failed(format!(
+            "a failure was injected into the {step} step of the undoing"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "testing"))]
+#[allow(clippy::unnecessary_wraps)]
+fn fail_undo(_step: &str) -> Result<(), Error> {
+    Ok(())
+}
+
 /// Ends the process at once, as a program that was killed, where `KR_BOUNDARY_DIE_AT` names the
 /// point: `account` right after the call that made the first account returned and before its
 /// result is recorded, `service` likewise for the service. What a killed run leaves is an intent
@@ -3756,6 +3776,115 @@ impl Run {
         Ok(())
     }
 
+    /// Reads the manifest's name, relative to the handle of the data directory, against the record
+    /// that this run holds: the object must be the one that the last proved write made, and its
+    /// bytes the ones that this run's record serializes to.
+    fn manifest_on_disk(&self) -> Result<(), remedy::NotProved> {
+        use std::mem::ManuallyDrop;
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
+        // A manifest is a few kilobytes; a longer object is not this run's record.
+        const LIMIT: u64 = 1 << 20;
+        let Some(directory) = &self.directory else {
+            return Err(remedy::NotProved::Unread(
+                "the run holds no handle of the data directory".to_owned(),
+            ));
+        };
+        let name: Vec<u16> = self
+            .paths
+            .manifest
+            .file_name()
+            .unwrap_or_default()
+            .encode_wide()
+            .collect();
+        let opened =
+            match DirHandle::open_beneath(directory, &name, FILE_READ_DATA, true, FILE_OPEN) {
+                Ok(opened) => opened,
+                Err(failure)
+                    if failure.code == ERROR_FILE_NOT_FOUND
+                        || failure.code == ERROR_PATH_NOT_FOUND =>
+                {
+                    return Err(remedy::NotProved::Absent);
+                }
+                Err(failure) => {
+                    return Err(remedy::NotProved::Unread(remedy::platform_error(
+                        "an open of the name failed",
+                        failure.code,
+                    )));
+                }
+            };
+        let unread = |error: &dyn std::fmt::Display| remedy::NotProved::Unread(error.to_string());
+        let at_name = file_key(&opened).map_err(|error| unread(&error))?;
+        let held = match &ffi::locked(&self.laid).manifest {
+            Some(made) => file_key(&made.identity).map_err(|error| unread(&error))?,
+            None => return Err(remedy::NotProved::Differs),
+        };
+        if held != at_name {
+            return Err(remedy::NotProved::Differs);
+        }
+        let wanted = self.manifest.to_bytes().map_err(|error| unread(&error))?;
+        let mut bytes = Vec::new();
+        // SAFETY: the handle is open for reading and stays open; the file is never dropped, so the
+        // handle is not closed twice.
+        let mut file = ManuallyDrop::new(unsafe { fs::File::from_raw_handle(opened.raw().cast()) });
+        (&mut *file)
+            .take(LIMIT)
+            .read_to_end(&mut bytes)
+            .map_err(|error| unread(&error))?;
+        if bytes == wanted {
+            Ok(())
+        } else {
+            Err(remedy::NotProved::Differs)
+        }
+    }
+
+    /// Where a step of a rollback failed, makes sure that the run's record is on disk for the
+    /// administrator's removal: a read of the manifest's name that finds the record as this run
+    /// holds it leaves it; any other answer (never saved, damaged, another object) is followed by
+    /// the proved write of the record as it stands in memory. Says which of the three came to pass.
+    fn keep_record(&self) -> remedy::RecordLeft {
+        let manifest = self.paths.manifest.display().to_string();
+        let found = match self.manifest_on_disk() {
+            Ok(()) => return remedy::RecordLeft::Proved { manifest },
+            Err(found) => found,
+        };
+        match self.save() {
+            Ok(()) => remedy::RecordLeft::Saved { manifest, found },
+            Err(error) => remedy::RecordLeft::NotSaved {
+                found,
+                why: error.to_string(),
+                stays: self.held_paths(),
+            },
+        }
+    }
+
+    /// Each object that this run made and still holds, by path: what stays where the rollback did not
+    /// take it away.
+    fn held_paths(&self) -> Vec<String> {
+        let laid = ffi::locked(&self.laid);
+        let paths = &self.paths;
+        let mut stays = Vec::new();
+        let mut add = |held: bool, path: &Path| {
+            if held {
+                stays.push(path.display().to_string());
+            }
+        };
+        add(laid.made.parent.is_some(), paths.data_parent());
+        add(laid.made.directory.is_some(), &paths.data);
+        add(laid.staging.is_some(), &paths.staging);
+        add(laid.journal.is_some(), &paths.journal);
+        add(laid.run.is_some(), &paths.run);
+        add(
+            laid.prior.is_some() || laid.prior_creating.is_some(),
+            &paths.prior,
+        );
+        add(laid.manifest.is_some(), &paths.manifest);
+        if let Some(file) = &laid.replacement {
+            add(true, &file.path);
+        }
+        stays
+    }
+
     /// Writes the earlier-state record, new, beside the held handle of the data directory, and keeps
     /// it with the run. The file is the run's from the call that made it: the write tells the run
     /// its handle at once (no call that can fail stands between the create and this record, since
@@ -4912,7 +5041,13 @@ fn roll_back(run: &mut Run) -> Result<(), Error> {
         .find(ObjectKind::Directory, &paths.program.display().to_string())
         .is_some();
     let program_checked = if recorded {
-        match check_program_directory(&paths, true, remedy::Stage::Rollback) {
+        // The refusal's words say that the manifest records the installation and stays where it
+        // is only where a read just now found the manifest as this run holds it.
+        match check_program_directory(
+            &paths,
+            matches!(run.manifest_on_disk(), Ok(())),
+            remedy::Stage::Rollback,
+        ) {
             Ok(checked) => checked,
             Err(error) => {
                 earlier.push(format!("checking the program directory: {error}"));
@@ -5166,6 +5301,7 @@ fn undo_recorded(
     if has_rules {
         keep(
             (|| -> Result<(), Error> {
+                fail_undo("policy")?;
                 let (xml, effective) = channel.effective()?;
                 let (_, kept) = effective.without_ours();
                 if let Some(shared) = shared_rules(&effective) {
@@ -5404,6 +5540,7 @@ fn undo_recorded(
     }
     keep(
         (|| -> Result<(), Error> {
+            fail_undo("service")?;
             if service_is_ours
                 && let Some(manager) = &manager
                 && let Some(service) = manager.open(SERVICE)?
@@ -5461,6 +5598,7 @@ fn undo_recorded(
         }
         keep(
             (|| -> Result<(), Error> {
+                fail_undo("account")?;
                 // The account is looked up by the identifier that the manifest records, so an
                 // account that has been renamed is found; only where the manifest records none is
                 // it looked up by its name. A lookup that failed ends this step before anything of
@@ -5662,11 +5800,27 @@ fn undo_recorded(
             }
         }
     } else {
-        // text: remove_at-26
-        Err(Error::Failed(format!(
-            "the removal did not finish and its records are kept: {}{unread_prior}",
-            failures.join("; ")
-        )))
+        match &tree {
+            DataTree::ByName => {
+                // text: remove_at-26
+                Err(Error::Failed(format!(
+                    "the removal did not finish and its records are kept: {}{unread_prior}",
+                    failures.join("; ")
+                )))
+            }
+            // A rollback that ended with a failed step leaves the record that the administrator's
+            // removal reads: the run's own, as it stands in memory, written through the proved
+            // write where a read does not find it on disk.
+            DataTree::Laid(run) => {
+                let record = run.keep_record();
+                // text: remove_at-35
+                Err(Error::Failed(remedy::rollback_failed(
+                    &failures,
+                    &record,
+                    &unread_prior,
+                )))
+            }
+        }
     }
 }
 
@@ -6182,15 +6336,82 @@ mod tests {
 
     /// A run that wrote no record has none that the rollback could have marked: the objects it
     /// marked are named, and nothing says that records are deleted.
-    /// A failed read in an early step of a rollback is kept in its result and the later steps still
+    /// The forced failure is the process's: the cases that use one share this lock.
+    #[cfg(feature = "testing")]
+    static FORCED: Mutex<()> = Mutex::new(());
+
+    /// A rollback that ended with a failed step leaves the run's record on disk for the
+    /// administrator's removal: a record that a read finds as the run holds it is left, one that is
+    /// damaged is written again through the proved write, and where that write fails too the ending
+    /// says so and names what stays.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_rollback_that_ends_with_a_failed_step_leaves_the_run_s_record_for_the_removal() {
+        let _one = ffi::locked(&FORCED);
+        // The record is on disk as the run holds it: it is read and left.
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        run.save().unwrap();
+        crate::manifest::forced::fail_the_next("manager");
+        let error = roll_back(&mut run).unwrap_err().to_string();
+        assert!(
+            error.contains("found the manifest that this run holds"),
+            "{error}"
+        );
+        assert!(!error.contains("records are kept"), "{error}");
+        assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), run.manifest);
+        // The record is damaged: it is written again, and the removal can read it.
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        run.manifest.record(
+            ObjectKind::Directory,
+            &run.paths.data.display().to_string(),
+            None,
+        );
+        crate::manifest::forced::fail_the_next("manager");
+        let error = roll_back(&mut run).unwrap_err().to_string();
+        assert!(
+            error.contains("so this run wrote its record again"),
+            "{error}"
+        );
+        assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), run.manifest);
+        // The record is gone: it is written again.
+        std::fs::remove_file(&run.paths.manifest).unwrap();
+        crate::manifest::forced::fail_the_next("manager");
+        let error = roll_back(&mut run).unwrap_err().to_string();
+        assert!(error.contains("found nothing there"), "{error}");
+        assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), run.manifest);
+        // The write fails too (no handle of the data directory is held): the ending says so, names
+        // what stays, and never says that a record is kept.
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        run.directory = None;
+        crate::manifest::forced::fail_the_next("manager");
+        let error = roll_back(&mut run).unwrap_err().to_string();
+        assert!(
+            error.contains("writing this run's record again failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("What this run made and the rollback did not take away"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&run.paths.data.display().to_string()),
+            "{error}"
+        );
+        assert!(!error.contains("records are kept"), "{error}");
+        assert!(!error.contains("stays where it is"), "{error}");
+    }
+
+    /// A failed early read in an early step of a rollback is kept in its result and the later steps still
     /// run: a journal file of the run is deleted whichever of the service manager's open and the
     /// broker's first open and status read failed. The forced failure is the process's, so the
     /// cases that use one share a lock.
     #[cfg(feature = "testing")]
     #[test]
     fn a_failed_early_read_of_a_rollback_is_kept_and_the_later_steps_still_run() {
-        static ONE: Mutex<()> = Mutex::new(());
-        let _one = ffi::locked(&ONE);
+        let _one = ffi::locked(&FORCED);
         for (point, words) in [
             ("manager", "opening the service manager"),
             ("broker", "reading the broker's service"),
