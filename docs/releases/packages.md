@@ -237,8 +237,12 @@ compares the plugin SDK schema
 (`packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json`, read from the committed file of the
 commit and of each release) in the same way, but only a definition that is new and an optional
 member that the SDK's arrival table lists pass there, and the read-only marker means nothing in it.
-A new method is a variant added to `Method` that is one plain string constant, whose name no variant
-of the earlier release had and no other variant has. Descriptions and titles are ignored. A
+A new method is a name that this commit's `Method` adds to the earlier release's. Both are a list
+of plain string constants and nothing else, each name stands once in the shape of a method name
+(lower-case words of letters, digits and underscores, with single dots between), and the earlier
+names are all still there. Every use of `Method` in the schema must also be one that a wider
+`Method` only widens: a property, an item, an `anyOf` or an `allOf`, and not a `oneOf`, a `not` or
+an `if`. Descriptions and titles are ignored. A
 release from before `worker-surface.json` has no table to compare, so its tables are left out and
 its schema, plugin host protocol and table of public majors are compared. A release of the level without the SDK schema file or the SDK's
 `package-contract.json`, or whose file does not read, fails the check. When no release is at the commit's level, the commit moves it, and the check
