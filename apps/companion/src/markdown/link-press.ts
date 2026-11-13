@@ -9,25 +9,39 @@
  *
  * - At a primary pointer down the pane writes a record of the press: its pointer type, where it went
  *   down, and the link it lights, with what that link opens. A press on a link's own element lights that
- *   link, whatever the words' rectangles say, since the browser sends its click to that element; a press
- *   on another control lights nothing; elsewhere `linkAt` names the link at that point. The record ends
- *   at the pointer's cancel and at the next primary pointer down, in the pane or outside it. No match
- *   of pointer numbers is asked of the click: the engines differ, and a click that no pointer made
- *   (a keyboard's, a screen reader's) has a detail of 0 and adds nothing.
- * - The pressed look shows on that link until the pointer comes up or is cancelled. It decides nothing.
- *   The open at the click runs the same rule at the press's own point, so what lights at the press is
- *   what opens at the release.
+ *   link for every pointer type, whatever the words' rectangles say, since the browser sends its click to
+ *   that element; a press on another control lights nothing; a press on plain text lights the link that
+ *   `linkAt` names at that point, and only for a pointer that `opensByRule` (a touch or a pen): a mouse's
+ *   click on plain text opens nothing, so its press lights nothing. No match of pointer numbers is asked
+ *   of the click: the engines differ, and a click that no pointer made (a keyboard's, a screen reader's)
+ *   has a detail of 0 and adds nothing.
+ * - A press is live or dead. The pressed look shows on the lit link only while the press lives, and a
+ *   dead press opens nothing. It lives from the pointer down to the pointer up, and dies at the first of:
+ *   a move past the slop, a pointer cancel, the next primary pointer down (in the pane or outside it),
+ *   and a scroll of any box or of the visual viewport, or a resize of the viewport, after which the rule
+ *   no longer names the lit link at the press's point. At its death the look ends at once. The open at
+ *   the click runs the same rule at the press's own point, so for a touch or a pen what lights at the
+ *   press is what opens at the release. A layout that moves under a held finger with no scroll (an image
+ *   that loads above the link, text that grows above it) ends nothing: the click's own check refuses the
+ *   open, and the look stays until the release. Watching the content's size would end presses whenever
+ *   an answer streams below the link, which is the usual state.
  *
  * Where the listeners stand: all on the document, in the capture phase for the pointer down and the
  * click. A press outside the pane must end the pane's record and its look, so the pointer down is not on
- * the pane; the pointer move, up and cancel are on the document from a press to its end, because a
- * release or a cancel can come outside the pane when the finger slides out; and the click acts only on
- * a click whose target lies in the pane. A click listener on the pane itself gave no click at any point
- * where the document's gives none: the points that get none in a desktop WebKit are its scroll bar's
- * strip at the pane's right edge, which no listener changes and which the phones do not have.
+ * the pane; the pointer move, up and cancel, the scroll of any box (a scroll does not bubble, so only
+ * the capture phase on the document hears every box) and the visual viewport's scroll and resize stand
+ * from a press to its end, because a release or a cancel can come outside the pane when the finger
+ * slides out; and the click acts only on a click whose target lies in the pane. A click listener on the
+ * pane itself gave no click at any point where the document's gives none: the points that get none in a
+ * desktop WebKit are its scroll bar's strip at the pane's right edge, which no listener changes and
+ * which the phones do not have. iOS sends a click on plain text because the page's own listeners sit on
+ * the root element below the body (React's), which makes the page respond to clicks; a pane mounted
+ * outside that root would get no click on plain text, and its taps near a link would open nothing.
  *
- * The pane's bounds are its client box: what holds content and can be tapped, with no border and no
- * scroll bar's strip that takes up room. A press or a click outside it lights and opens nothing.
+ * A link's view is what every box that clips it leaves of the page (see `viewOf`): the pane's client
+ * box (what holds content and can be tapped, with no border and no scroll bar's strip), the scrollers
+ * inside and outside the pane, and the visual viewport. A press or a click where no link has a view
+ * lights and opens nothing.
  */
 
 import { useEffect, type RefObject } from 'react'
