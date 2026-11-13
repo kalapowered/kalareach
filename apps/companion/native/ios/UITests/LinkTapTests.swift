@@ -197,7 +197,7 @@ final class LinkTapTests: HarnessTestCase {
     /// Says what one tap did, one line, where the run's log can be read for it.
     private func report(_ result: Result, at point: CGPoint) {
         let list = result.events.map {
-            "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail),\($0.kind) pointer \($0.pointer) \($0.pointerType),at \(Int($0.point.x)) \(Int($0.point.y)))"
+            "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail),\($0.kind) pointer \($0.pointer) \($0.pointerType),at \(String(format: "%.1f %.1f", $0.point.x, $0.point.y)))"
         }.joined(separator: " ")
         say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit at the press: \(result.events.first(where: { $0.type == "pointerdown" })?.lit ?? "nothing") | press-to-click: \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
     }
@@ -260,13 +260,22 @@ final class LinkTapTests: HarnessTestCase {
 
     // MARK: Starting
 
+    /// Opens the second session, the one whose conversation is short before the record adds to it.
+    private func openSecondSession() {
+        app.buttons["Sessions"].tap()
+        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Session 2'")).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 20), "no second session in the list")
+        row.tap()
+        XCTAssertTrue(composer.waitForExistence(timeout: 20), "the session did not open")
+    }
+
     /// Starts the harness at a text size, starts the tap record and opens the session that it filled.
     private func start(size: String?, short: Bool = false) {
         var arguments = ["-KRColourMode", "light"]
         if let size { arguments += ["-UIPreferredContentSizeCategoryName", size] }
         launchHarness(arguments)
         strip(short ? "Short link taps" : "Link taps")
-        openFirstSession()
+        if short { openSecondSession() } else { openFirstSession() }
         Thread.sleep(forTimeInterval: 1.5)
         XCTAssertTrue(
             app.buttons[short ? "a short link" : "first notes"].waitForExistence(timeout: 20) || app.buttons["docs"].waitForExistence(timeout: 20),
@@ -303,17 +312,24 @@ final class LinkTapTests: HarnessTestCase {
     /// on the link's own button (which is taller than its words at the largest size and lights by design), the system's
     /// click names the link's button.
     private func tapAround(_ edge: Link, named: String) {
-        let edgeShift = offset(of: edge)
+        var edgeShift = offset(of: edge)
         let room = pane().room
         let words = edge.words[0]
         let area = Self.areaOf(words, in: edge.view)
         let (left, top, right, bottom) = (area.minX, area.minY, area.maxX, area.maxY)
         say("LINKTAP \(named): \(edge.name) words \(words), pane \(room), view \(edge.view), box \(edge.box), area \(left) \(top) \(right) \(bottom)")
-        let inset: CGFloat = 0.5
-        let step: CGFloat = 2
+        let inset: CGFloat = 1
+        let step: CGFloat = 3
         let xs = [left, (left + right) / 2, right]
         let ys = [top, (top + bottom) / 2, bottom]
         let centre = tap("\(named): \(edge.name), the words' middle", at: CGPoint(x: words.midX, y: words.midY), shift: edgeShift)
+        // The system's frame of a link's button is not its page box to the point, and a tap at the area's edge is
+        // within a point of the page's own area: the first tap's own position says where the page's coordinates lie.
+        if let down = centre.events.first(where: { $0.type == "pointerdown" }) {
+            let miss = CGVector(dx: words.midX - down.point.x, dy: words.midY - down.point.y)
+            say("LINKTAP \(named): \(edge.name), the first tap landed \(miss.dx) \(miss.dy) points from the words' middle")
+            if abs(miss.dx) < 4 && abs(miss.dy) < 4 { edgeShift = CGVector(dx: edgeShift.dx + miss.dx, dy: edgeShift.dy + miss.dy) }
+        }
         expectOpened(centre, edge.name)
         for (row, y) in ys.enumerated() {
             for (column, x) in xs.enumerated() where !(row == 1 && column == 1) {
@@ -395,16 +411,20 @@ final class LinkTapTests: HarnessTestCase {
     }
 
     /// A conversation shorter than the pane: the link's area is whole, and the pane's bare area lies under it. A tap
-    /// there gets the system's click on the pane itself, which opens nothing and lights nothing.
+    /// there gets the system's click on the pane itself, which opens nothing and lights nothing. This runs at the
+    /// default size only: at the largest size the shortest conversation the page can show (one line before the link)
+    /// is 424 points tall in a pane of 217, so there is no bare area, and the last-line case holds the pane's bottom.
     private func runShort(size: String?, named: String) {
         continueAfterFailure = true
         start(size: size, short: true)
+        say("LINKTAP \(named): the record: \(recordText("TAPLINKS"))")
         say("LINKTAP size \(named)")
         let last = link("short-last")
         tapAround(last, named: named)
         let shift = offset(of: last)
         let room = pane().room
         let words = last.words[0]
+        XCTAssertLessThanOrEqual(pane().most, 1, "\(named): the short conversation is taller than the pane")
         // The lowest point that the link's area or its own button reaches.
         let lowest = max(Self.areaOf(words, in: last.view).maxY, last.box.intersection(last.view).maxY)
         for below in [12, 40, 120, 300] as [CGFloat] {
@@ -631,10 +651,6 @@ final class LinkTapTests: HarnessTestCase {
 
     func testAShortConversationAtTheDefaultTextSize() {
         runShort(size: nil, named: "short, default size")
-    }
-
-    func testAShortConversationAtTheLargestTextSize() {
-        runShort(size: Self.largest, named: "short, largest size")
     }
 
     func testTheLastLineAtTheDefaultTextSize() {

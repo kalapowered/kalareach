@@ -19,6 +19,8 @@ import { useEffect, type ReactNode } from 'react'
 import type { FakeHostControls } from './host/fake'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+/** The build session, whose conversation holds one line before anything is added: the short conversation's. */
+const SHORT_SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
 /**
  * What the taps need on the conversation: two table rows, text after a link, a link with another on
@@ -44,16 +46,16 @@ const TAP_MESSAGES: readonly string[] = [
   'The last words of the conversation end with [a link](https://example.org/last-line)'
 ]
 
-/** A conversation shorter than the pane: one message, with its link at the end of the only line. */
-const SHORT_MESSAGES: readonly string[] = ['The only words of a short conversation end with [a short link](https://example.org/short-last)']
+/** A conversation shorter than the pane: one message, which is the link alone, in a session that holds one other line. */
+const SHORT_MESSAGES: readonly string[] = ['[a short link](https://example.org/short-last)']
 
-/** Puts the messages of the taps on the first session, or the short conversation's one message. */
+/** Puts the messages of the taps on the first session, or the short conversation's one message on the second. */
 export function fillForTaps(controls: FakeHostControls, short = false): void {
   // The link at the end of a line has its words end at the pane's right edge, as a full line's last word does.
   const style = document.createElement('style')
   style.textContent = ".m-node p:has(.md-link[title$='at-end']) { text-align: justify; text-align-last: justify; }"
   document.head.append(style)
-  for (const message of short ? SHORT_MESSAGES : TAP_MESSAGES) controls.records.appendEntry(SESSION, 'message', message)
+  for (const message of short ? SHORT_MESSAGES : TAP_MESSAGES) controls.records.appendEntry(short ? SHORT_SESSION : SESSION, 'message', message)
   document.dispatchEvent(new Event('visibilitychange'))
 }
 
@@ -129,9 +131,14 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
       const pane = room && scroller
         ? `P ${[room.left, room.top, room.right, room.bottom, scroller.scrollTop, scroller.scrollHeight - scroller.clientHeight].map(round).join(' ')}`
         : 'P 0 0 0 0 0 0'
+      // Where the layout stands: the panes there are, the links that no pane holds, the page's own scroll, and the box of the
+      // scroller that holds the links.
+      const holder = document.querySelector('.m-node .md-link')?.closest('.m-pane')
+      const held = holder?.getBoundingClientRect()
+      const where = `D panes ${String(document.querySelectorAll('.m-pane').length)} outside ${String(document.querySelectorAll('.m-node .md-link').length - document.querySelectorAll('.m-pane .m-node .md-link').length)} scroll ${round(window.scrollY)} holder ${held ? [held.left, held.top, held.right, held.bottom].map(round).join(' ') : 'none'}`
       const texts: [HTMLElement, string][] = [
         [log, `TAPLOG ${seen.join(' ; ')}`],
-        [places, `TAPLINKS ${[pane, ...rectangles].join(' ; ')}`],
+        [places, `TAPLINKS ${[pane, where, ...rectangles].join(' ; ')}`],
         [opened, `TAPOPENED ${String(controls.openedLinks.length)} ${controls.openedLinks.join(' ')}`],
         [focus, `TAPFOCUS active=${describe(document.activeElement)}`]
       ]
