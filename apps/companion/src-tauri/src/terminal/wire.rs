@@ -430,6 +430,10 @@ mod tests {
             Ok(())
         }
 
+        fn stream_opener(&self) -> Option<Arc<dyn kr_client::transport::StreamOpener>> {
+            None
+        }
+
         fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
             let refusal = self.refusal.lock().expect("the refusal").take();
             Box::pin(async move {

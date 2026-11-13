@@ -3402,6 +3402,10 @@ impl kr_client::transport::ControlTransport for HeldWrite {
         })
     }
 
+    fn stream_opener(&self) -> Option<Arc<dyn kr_client::transport::StreamOpener>> {
+        None
+    }
+
     fn revoke_streams(&self) {}
 
     fn close(&self) {}

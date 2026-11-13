@@ -38,7 +38,7 @@ use kr_client::pairing::BoxFuture;
 use kr_client::pairing::link::{EndpointHold, HostInUse, HostLink, LinkError, Presentation};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::session::Session;
-use kr_client::transport::{ControlTransport, Reach, TransportFuture};
+use kr_client::transport::{ControlTransport, Reach, StreamOpener, TransportFuture};
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
@@ -429,7 +429,15 @@ impl HostLink for Budgeted {
     }
 }
 
-/// A transport that holds a place until it is closed or dropped.
+/// A transport that holds a place until it is closed or dropped, and ends its connection first.
+///
+/// A data stream is a stream of the connection that holds the place: it takes no place of its own
+/// and the host counts no connection for it, so the opener answers as the inner transport's does.
+/// What keeps the host's count within the budget is the order in which the connection ends: the
+/// inner transport is closed, which revokes every stream it has open and refuses every later open,
+/// and only then is the place free. That holds on every road that gives the place back. A
+/// transport that is merely dropped does not end its connection by itself while an opener it
+/// handed out, or a stream it opened, is still held, so a drop closes it too.
 struct Placed {
     inner: Arc<dyn ControlTransport>,
     place: Mutex<Option<Place>>,
@@ -495,6 +503,10 @@ impl ControlTransport for Placed {
         self.inner.recv()
     }
 
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        self.inner.stream_opener()
+    }
+
     fn revoke_streams(&self) {
         self.inner.revoke_streams();
     }
@@ -505,6 +517,14 @@ impl ControlTransport for Placed {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+    }
+}
+
+impl Drop for Placed {
+    fn drop(&mut self) {
+        // Before the fields drop, so before the place is free. Closing a transport that is
+        // already closed does nothing more.
+        self.inner.close();
     }
 }
 
@@ -550,8 +570,142 @@ mod tests {
         fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
             unreachable!("a case that only closes")
         }
+        fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+            None
+        }
         fn revoke_streams(&self) {}
         fn close(&self) {}
+    }
+
+    /// The streams of one connection, as far as its place is concerned: they open until the
+    /// connection is closed, and that is told to whoever waits for it.
+    #[derive(Debug)]
+    struct Streams {
+        ended: tokio::sync::watch::Sender<bool>,
+        /// How many opens reached this connection.
+        reached: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StreamOpener for Streams {
+        fn open(
+            &self,
+            _header: kr_protocol::frame::StreamHeader,
+        ) -> TransportFuture<'_, kr_transport::streams::DataStream> {
+            Box::pin(async move {
+                self.reached.fetch_add(1, Ordering::SeqCst);
+                if *self.ended.borrow() {
+                    return Err(kr_client::ClientError::ConnectionEnded);
+                }
+                // What the host says to a stream it will not take: a stream of a real connection is
+                // the real cases' to open.
+                Err(kr_client::ClientError::Host(ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "the host takes no stream",
+                )))
+            })
+        }
+
+        fn revoked(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let mut ended = self.ended.subscribe();
+            Box::pin(async move {
+                let _ = ended.wait_for(|ended| *ended).await;
+            })
+        }
+    }
+
+    /// A connection that has data streams and, when it is closed, ends them and notes how many
+    /// places its host held at that moment.
+    struct Streaming {
+        places: Arc<Places>,
+        host: DeviceId,
+        streams: Arc<Streams>,
+        held_at_close: Mutex<Vec<usize>>,
+    }
+
+    impl std::fmt::Debug for Streaming {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.debug_struct("Streaming").finish_non_exhaustive()
+        }
+    }
+
+    impl Streaming {
+        fn over(places: &Arc<Places>, host: DeviceId) -> Arc<Self> {
+            Arc::new(Self {
+                places: Arc::clone(places),
+                host,
+                streams: Arc::new(Streams {
+                    ended: tokio::sync::watch::channel(false).0,
+                    reached: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                held_at_close: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ControlTransport for Streaming {
+        fn connection_id(&self) -> ConnectionId {
+            unreachable!("a case that only opens streams and closes")
+        }
+        fn limits(&self) -> ReceiveLimits {
+            unreachable!("a case that only opens streams and closes")
+        }
+        fn initial_action_window(&self) -> ActionWindow {
+            unreachable!("a case that only opens streams and closes")
+        }
+        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+            None
+        }
+        fn send<'a>(&'a self, _frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+            unreachable!("a case that only opens streams and closes")
+        }
+        fn send_before<'a>(
+            &'a self,
+            _frame: &'a ControlFrame,
+            _not_after: tokio::time::Instant,
+            _wanted: &'a (dyn Fn() -> bool + Send + Sync),
+        ) -> TransportFuture<'a, bool> {
+            unreachable!("a case that only opens streams and closes")
+        }
+        fn claim_receiver(&self) -> Result<()> {
+            Ok(())
+        }
+        fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+            unreachable!("a case that only opens streams and closes")
+        }
+        fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+            Some(Arc::clone(&self.streams) as Arc<dyn StreamOpener>)
+        }
+        fn revoke_streams(&self) {
+            self.streams.ended.send_replace(true);
+        }
+        fn close(&self) {
+            self.held_at_close
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.places.held_on(self.host));
+            self.revoke_streams();
+        }
+    }
+
+    /// The header of an attachment chunk stream, which the connection above never reads.
+    fn a_stream_header() -> kr_protocol::frame::StreamHeader {
+        use kr_protocol::frame::{StreamKind, StreamResource};
+        use kr_protocol::ids::{EnvironmentId, TransferId};
+        use kr_protocol::scalars::Nullable;
+
+        kr_protocol::frame::StreamHeader {
+            kind: StreamKind::AttachmentChunks,
+            connection_id: ConnectionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            stream_id: Nullable::null(),
+            resource: StreamResource {
+                environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
+                session_id: Nullable::null(),
+                attachment_id: Nullable::null(),
+                transfer_id: Nullable::some(TransferId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([3; 16]),
+                )),
+            },
+        }
     }
 
     /// KR-REQ-19.08: with every place but the main link's held by other kinds, and more dials
@@ -650,6 +804,109 @@ mod tests {
             "given the place at the close"
         );
         drop(second);
+    }
+
+    /// KR-REQ-19.08, KR-REQ-23.21: a placed connection opens its data streams on the connection that
+    /// holds the place, which take no place of their own, and a connection that has no data
+    /// streams stays without them.
+    #[tokio::test]
+    async fn a_placed_connection_opens_its_streams_on_the_connection_that_holds_the_place() {
+        let places = Places::new(3);
+        let inner = Streaming::over(&places, host(1));
+        let place = places.try_take(host(1), Kind::Other).expect("a place");
+        let connection = Placed::over(Arc::clone(&inner) as Arc<dyn ControlTransport>, place);
+        let opener = connection
+            .stream_opener()
+            .expect("a connection with data streams has an opener");
+
+        let refused = opener.open(a_stream_header()).await.err();
+
+        assert!(
+            matches!(refused, Some(kr_client::ClientError::Host(_))),
+            "the open reached the inner connection and its answer came back"
+        );
+        assert_eq!(inner.streams.reached.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            places.held_on(host(1)),
+            1,
+            "an open takes no place of its own"
+        );
+        let streamless = Placed::over(
+            Arc::new(Closed),
+            places.try_take(host(2), Kind::Other).expect("a place"),
+        );
+        assert!(
+            streamless.stream_opener().is_none(),
+            "a connection that has no data streams stays without them"
+        );
+    }
+
+    /// KR-REQ-19.08, KR-REQ-23.21: a connection that is closed ends its data streams, and refuses
+    /// every later open through an opener that was taken before, while its place is still held; the
+    /// place is free after that.
+    #[tokio::test]
+    async fn a_closed_connection_ends_its_streams_before_its_place_is_free() {
+        let places = Places::new(3);
+        let inner = Streaming::over(&places, host(1));
+        let place = places.try_take(host(1), Kind::Other).expect("a place");
+        let connection = Placed::over(Arc::clone(&inner) as Arc<dyn ControlTransport>, place);
+        let opener = connection.stream_opener().expect("an opener");
+
+        connection.close();
+
+        assert_eq!(
+            *inner
+                .held_at_close
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            [1],
+            "the place was still held when the connection ended"
+        );
+        assert_eq!(places.held_on(host(1)), 0, "and it is free after");
+        tokio::time::timeout(Duration::from_secs(60), opener.revoked())
+            .await
+            .expect("the streams of a closed connection are revoked");
+        assert!(
+            matches!(
+                opener.open(a_stream_header()).await.err(),
+                Some(kr_client::ClientError::ConnectionEnded)
+            ),
+            "no stream opens through an opener taken before the close"
+        );
+    }
+
+    /// KR-REQ-19.08, KR-REQ-23.21: a connection that is dropped ends as one that is closed does,
+    /// even while an opener it handed out is kept, so the host holds no connection that the budget
+    /// has stopped counting.
+    #[tokio::test]
+    async fn a_dropped_connection_ends_its_streams_before_its_place_is_free() {
+        let places = Places::new(3);
+        let inner = Streaming::over(&places, host(1));
+        let place = places.try_take(host(1), Kind::Other).expect("a place");
+        let connection = Placed::over(Arc::clone(&inner) as Arc<dyn ControlTransport>, place);
+        let opener = connection.stream_opener().expect("an opener");
+
+        drop(connection);
+
+        assert_eq!(
+            *inner
+                .held_at_close
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            [1],
+            "the place was still held when the connection ended"
+        );
+        assert_eq!(places.held_on(host(1)), 0, "and it is free after");
+        tokio::time::timeout(Duration::from_secs(60), opener.revoked())
+            .await
+            .expect("the streams of a dropped connection are revoked");
+        assert!(
+            matches!(
+                opener.open(a_stream_header()).await.err(),
+                Some(kr_client::ClientError::ConnectionEnded)
+            ),
+            "no stream opens through an opener kept after the drop"
+        );
     }
 
     /// KR-REQ-19.08: the reserved place belongs to the main link that is current. A main link that a
