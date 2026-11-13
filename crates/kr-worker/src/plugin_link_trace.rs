@@ -102,6 +102,8 @@ pub enum Outcome {
     Unavailable,
     /// Its limit passed before an answer came.
     Limit,
+    /// It was given up before an answer came, because its binding went.
+    Gone,
     /// The runtime answered, and the component declared a fault of its own.
     Faulted,
     /// It came to no answer that could be used: the other end was not reached, its limit passed,
@@ -116,6 +118,7 @@ impl Outcome {
             Self::Refused => "refused",
             Self::Unavailable => "unavailable",
             Self::Limit => "limit",
+            Self::Gone => "gone",
             Self::Faulted => "faulted",
             Self::Failed => "failed",
         }

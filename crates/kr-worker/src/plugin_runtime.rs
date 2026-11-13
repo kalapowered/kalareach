@@ -146,6 +146,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         request,
         client: None,
         registered: BTreeMap::new(),
+        abandoned: BTreeSet::new(),
         refused: BTreeMap::new(),
         told_facts: BTreeMap::new(),
         pace: Pacing::default(),
@@ -160,7 +161,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         };
         #[cfg(feature = "testing")]
         link_trace::pass(wants.len());
-        let delay = link.settle(&broker, wants).await;
+        let delay = link.settle(&broker, &changes, wants).await;
         link.wait(&broker, &changes, delay).await;
     }
 }
@@ -228,6 +229,30 @@ async fn privacy_sync(broker: Weak<Broker>) {
     }
 }
 
+/// Returns when the plugin runtime is no longer wanted for a binding's component: the binding
+/// ended, was forgotten, lost its rich capabilities, or the broker is gone.
+///
+/// It follows the broker's changes from before it looks, so a change made at any moment after is
+/// one it sees, and it takes nothing the link's own wait is woken by.
+async fn until_unwanted(
+    broker: &Weak<Broker>,
+    changes: &crate::broker::component::ComponentChanges,
+    binding_id: BrokerBindingId,
+) {
+    let mut following = changes.follow();
+    loop {
+        if !broker
+            .upgrade()
+            .is_some_and(|broker| broker.component_wanted(binding_id))
+        {
+            return;
+        }
+        if following.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Ends a task when it is dropped.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -244,6 +269,10 @@ struct Link {
     /// was registered: the component holds what it was offered since, whichever generation the
     /// instance has reached.
     registered: BTreeMap<BrokerBindingId, u64>,
+    /// The bindings whose registration on `client` was given up because the binding went while the
+    /// runtime held the call: the runtime may register one all the same, and each is removed when
+    /// the runtime next answers a registration or the health question.
+    abandoned: BTreeSet<BrokerBindingId>,
     /// The bindings the runtime refused on `client`, and when each may be offered again.
     refused: BTreeMap<BrokerBindingId, Refusal>,
     /// When the runtime may next be reached for.
@@ -357,6 +386,7 @@ impl Link {
     async fn settle(
         &mut self,
         broker: &Weak<Broker>,
+        changes: &crate::broker::component::ComponentChanges,
         wants: Vec<ComponentWant>,
     ) -> Option<Duration> {
         // The streams producers push at all are the streams some binding takes.
@@ -368,7 +398,7 @@ impl Link {
                 .iter()
                 .any(|want| want.observing && want.streams.terminal),
         );
-        let registering = self.register_wanted(broker, &wants).await;
+        let registering = self.register_wanted(broker, changes, &wants).await;
         let keeping = self.keep_up(broker, &wants).await;
         self.revise_facts(broker, &wants).await;
         match (registering, keeping) {
@@ -381,6 +411,7 @@ impl Link {
     async fn register_wanted(
         &mut self,
         broker: &Weak<Broker>,
+        changes: &crate::broker::component::ComponentChanges,
         wants: &[ComponentWant],
     ) -> Option<Duration> {
         let wanted: BTreeSet<BrokerBindingId> = wants.iter().map(|want| want.binding_id).collect();
@@ -502,6 +533,7 @@ impl Link {
             self.pace.connected(tokio::time::Instant::now());
         }
 
+        let mut heard = false;
         for want in pending {
             let Some(client) = self.client.as_ref() else {
                 return Some(self.pace.remaining(tokio::time::Instant::now()));
@@ -530,23 +562,42 @@ impl Link {
                 Some(want.binding_id),
                 kr_plugin_service::client::REGISTER_DEADLINE,
             );
-            let registered = client
-                .register(
-                    service_id(want.binding_id),
-                    &identity,
-                    &facts_of(want, kr_ipc::now_ms().get()),
-                    &want.executable,
-                    &ComponentSource {
-                        path: want.component.path.clone(),
-                        digest: PayloadDigest::from_bytes(*want.component.digest.as_bytes()),
-                        bytes: want.component.bytes,
-                    },
-                )
-                .await;
+            // A call the runtime holds for as long as it likes is given up when its binding goes,
+            // and the pass goes on from what the broker wants now: a binding that came meanwhile is
+            // registered at once, and not when the call's limit has passed.
+            let facts = facts_of(want, kr_ipc::now_ms().get());
+            let source = ComponentSource {
+                path: want.component.path.clone(),
+                digest: PayloadDigest::from_bytes(*want.component.digest.as_bytes()),
+                bytes: want.component.bytes,
+            };
+            let registration = client.register(
+                service_id(want.binding_id),
+                &identity,
+                &facts,
+                &want.executable,
+                &source,
+            );
+            // Checked first, so a binding that has gone already has no registration started.
+            let registered = tokio::select! {
+                biased;
+                () = until_unwanted(broker, changes, want.binding_id) => None,
+                registered = registration => Some(registered),
+            };
             #[cfg(feature = "testing")]
-            link_trace::ended(began, link_trace::Outcome::of(&registered));
+            link_trace::ended(
+                began,
+                registered
+                    .as_ref()
+                    .map_or(link_trace::Outcome::Gone, link_trace::Outcome::of),
+            );
+            let Some(registered) = registered else {
+                self.abandoned.insert(want.binding_id);
+                return Some(Duration::ZERO);
+            };
             match registered {
                 Ok(registration) => {
+                    heard = true;
                     self.registered.insert(want.binding_id, want.generation);
                     self.told_facts
                         .insert(want.binding_id, want.execution.clone());
@@ -586,6 +637,7 @@ impl Link {
                 Err(
                     ServiceError::Protocol { detail: reason } | ServiceError::Disabled { reason },
                 ) => {
+                    heard = true;
                     self.refuse(broker, want.binding_id, &reason);
                 }
                 Err(error) => {
@@ -607,7 +659,43 @@ impl Link {
                 }
             }
         }
+        if heard && !self.unbind_abandoned(broker).await {
+            return Some(self.pace.remaining(tokio::time::Instant::now()));
+        }
         self.until_a_refusal_is_over(tokio::time::Instant::now())
+    }
+
+    /// Removes from the runtime the registrations given up while it held them, which it may have
+    /// made all the same. It is done once the runtime has answered something since, and not before:
+    /// a runtime that answers nothing would hold every call for its limit and be lost for it, and
+    /// the registrations the broker wants now would wait behind them. Returns false where the
+    /// runtime was lost on the way.
+    async fn unbind_abandoned(&mut self, broker: &Weak<Broker>) -> bool {
+        while let Some(binding_id) = self.abandoned.pop_first() {
+            let Some(client) = self.client.as_ref() else {
+                self.abandoned.clear();
+                break;
+            };
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::Unbind,
+                Some(binding_id),
+                kr_plugin_service::client::DEFAULT_DEADLINE,
+            );
+            let unbound = client.unbind(service_id(binding_id)).await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&unbound));
+            match unbound {
+                Ok(_) | Err(ServiceError::Protocol { .. } | ServiceError::Disabled { .. }) => {}
+                Err(error) => {
+                    #[cfg(feature = "testing")]
+                    link_trace::lost(link_trace::Why::of(&error));
+                    self.lose(broker, &error.to_string());
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// How long until the soonest binding the runtime refused may be offered again, where any is.
@@ -1014,7 +1102,12 @@ impl Link {
             #[cfg(feature = "testing")]
             link_trace::ended(began, link_trace::Outcome::of(&health));
             match health {
-                Ok(_) => self.health_failures = 0,
+                Ok(_) => {
+                    self.health_failures = 0;
+                    if !self.unbind_abandoned(broker).await {
+                        return Some(self.pace.remaining(tokio::time::Instant::now()));
+                    }
+                }
                 Err(ServiceError::Unavailable { detail }) => {
                     #[cfg(feature = "testing")]
                     link_trace::lost(link_trace::Why::Unavailable);
@@ -1124,6 +1217,8 @@ impl Link {
     /// Keeps the connection to the runtime, or lets it go, and tells the broker, which asks
     /// components to prepare actions over it.
     fn hold(&mut self, broker: &Weak<Broker>, client: Option<Arc<PluginClient>>) {
+        // Registrations belong to the connection they were made on.
+        self.abandoned.clear();
         if client.is_some() {
             // Before anything is registered on it, so that its notices are judged by privacy mode
             // from the start of the connection.

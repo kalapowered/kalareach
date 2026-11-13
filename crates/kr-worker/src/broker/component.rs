@@ -323,6 +323,9 @@ pub(super) fn report_of(
 pub struct ComponentChanges {
     link: tokio::sync::Notify,
     decoding: Arc<crate::broker::decoding::DecodeQueue>,
+    /// How many changes there have been, for a task that must notice one while it waits for
+    /// something else, and so cannot take the wake the link waits for.
+    count: tokio::sync::watch::Sender<u64>,
 }
 
 impl ComponentChanges {
@@ -330,6 +333,7 @@ impl ComponentChanges {
         Self {
             link: tokio::sync::Notify::new(),
             decoding,
+            count: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -337,11 +341,37 @@ impl ComponentChanges {
     pub fn notify_one(&self) {
         self.link.notify_one();
         self.decoding.wake();
+        self.count.send_modify(|count| *count += 1);
     }
 
     /// Waits for a change, as the link does.
     pub async fn notified(&self) {
         self.link.notified().await;
+    }
+
+    /// Follows the changes from now on, without taking the wake [`Self::notified`] waits for: a
+    /// change made after this is returned is one that [`watch::Receiver::changed`] reports.
+    ///
+    /// [`watch::Receiver::changed`]: tokio::sync::watch::Receiver::changed
+    #[must_use]
+    pub fn follow(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.count.subscribe()
+    }
+}
+
+impl Binding {
+    /// Returns true when the plugin runtime is wanted for this binding's component: its rich
+    /// capabilities are not disabled, it is not due to end, and a component could be established
+    /// for it.
+    fn wants_a_component(&self) -> bool {
+        self.rich_disabled.is_none()
+            && !self.ending
+            && self
+                .component
+                .as_ref()
+                .is_some_and(|component| component.refusal.is_none())
+            && self.release.is_some()
+            && self.repository_generation.is_some()
     }
 }
 
@@ -400,12 +430,9 @@ impl Broker {
         state
             .bindings
             .values()
-            .filter(|binding| binding.rich_disabled.is_none() && !binding.ending)
+            .filter(|binding| binding.wants_a_component())
             .filter_map(|binding| {
                 let component = binding.component.as_ref()?;
-                if component.refusal.is_some() {
-                    return None;
-                }
                 let release = binding.release.as_ref()?;
                 Some(ComponentWant {
                     binding_id: binding.binding_id,
@@ -450,6 +477,16 @@ impl Broker {
                 })
             })
             .collect()
+    }
+
+    /// Returns true while the plugin runtime is wanted for this binding's component, which is while
+    /// [`Self::component_wants`] holds it.
+    #[must_use]
+    pub fn component_wanted(&self, binding_id: BrokerBindingId) -> bool {
+        self.state()
+            .bindings
+            .get(&binding_id)
+            .is_some_and(Binding::wants_a_component)
     }
 
     /// Records where the plugin runtime has the component of one binding.

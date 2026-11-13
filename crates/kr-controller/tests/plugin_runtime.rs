@@ -473,6 +473,18 @@ fn stop(process: &ProcessStartIdentity) {
     rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stopped");
 }
 
+/// Lets a process that was stopped run again, as a signal from a terminal would.
+fn resume(process: &ProcessStartIdentity) {
+    assert_eq!(
+        kr_ipc::identity::process_state(process),
+        ProcessState::Running,
+        "the process is still the one it was"
+    );
+    let pid = rustix::process::Pid::from_raw(i32::try_from(process.pid.get()).expect("a pid"))
+        .expect("a process");
+    rustix::process::kill_process(pid, rustix::process::Signal::CONT).expect("resumed");
+}
+
 /// Waits until the kernel says `process` has ended.
 async fn ended(process: &ProcessStartIdentity) {
     until("the process to end", || async {
@@ -1933,6 +1945,113 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
         Some(traffic.count()).filter(|count| *count > after_the_end + 20)
     })
     .await;
+}
+
+/// A registration the plugin runtime holds unanswered for a binding that goes is given up, and the
+/// binding that takes its place is registered at once and not when the call's limit has passed;
+/// what the runtime registered for the binding that went is removed when it answers.
+///
+/// The runtime hangs and a second program's registration is sent. The program ends, so its binding
+/// goes while the runtime holds the call, and a third program is run. The worker sends the third
+/// binding's registration while the runtime still answers nothing, and the runtime, let go, ends up
+/// holding the two bindings the broker holds and no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registration_held_for_a_binding_that_goes_is_given_up_for_the_binding_that_takes_its_place()
+ {
+    let Some(component) = well_behaved() else {
+        return;
+    };
+    let world = World::start(&component).await;
+    let created = world.session().await;
+    let (mut typing, _first_agent) = world.run_agent(&created).await;
+    world.registering(1).await;
+    world.components_are(1, ComponentState::Registered).await;
+    let first_binding = world.reported().await[0].0;
+    let host = world.published_host().expect("the runtime is published");
+
+    // The first program goes to the background of the session, and the runtime hangs. The second
+    // program is run at the prompt it leaves, and its registration is sent and left unanswered.
+    typing.send("\u{1a}").await;
+    typing.send("bg\n").await;
+    stop(&host);
+    let second_agent = world.start_agent(&mut typing, "").await;
+    let second_binding = until_found(
+        PATIENCE,
+        "the second binding's registration to be sent and left unanswered",
+        || async {
+            let look = world.looked().await;
+            match look
+                .reports
+                .iter()
+                .find(|(binding, report)| *binding != first_binding && registering(report))
+            {
+                Some((binding, _)) => Ok(*binding),
+                None => Err(reports_in_words(
+                    &look.reports,
+                    first_binding,
+                    counting_in_words(look.counted),
+                )),
+            }
+        },
+        || world.rounds_in_words(),
+    )
+    .await;
+
+    // The second program ends, and its binding with it, while the runtime holds the call. A third
+    // program is run at the prompt it leaves.
+    kill(&second_agent);
+    ended(&second_agent).await;
+    until_found(
+        PATIENCE,
+        "the second binding to go",
+        || async {
+            let look = world.looked().await;
+            if look
+                .reports
+                .iter()
+                .all(|(binding, _)| *binding != second_binding)
+            {
+                Ok(())
+            } else {
+                Err(reports_in_words(
+                    &look.reports,
+                    first_binding,
+                    counting_in_words(look.counted),
+                ))
+            }
+        },
+        || world.rounds_in_words(),
+    )
+    .await;
+    let _third_agent = world.start_agent(&mut typing, "").await;
+
+    // Its binding is told that its registration is being sent, with the runtime still answering
+    // nothing: the call for the binding that went does not hold it back.
+    until_found(
+        PATIENCE,
+        "the third binding's registration to be sent while the runtime holds the second's",
+        || async {
+            let look = world.looked().await;
+            match look.reports.iter().find(|(binding, report)| {
+                *binding != first_binding && *binding != second_binding && registering(report)
+            }) {
+                Some(_) => Ok(()),
+                None => Err(reports_in_words(
+                    &look.reports,
+                    first_binding,
+                    counting_in_words(look.counted),
+                )),
+            }
+        },
+        || world.rounds_in_words(),
+    )
+    .await;
+
+    // The runtime goes on: it answers what it was sent, and what it registered for the binding that
+    // went is removed, so that it holds the two bindings the broker holds.
+    resume(&host);
+    world.components_are(2, ComponentState::Registered).await;
+    world.holding(2).await;
 }
 
 /// A registration the plugin runtime holds unanswered is named in the worker's own account of
