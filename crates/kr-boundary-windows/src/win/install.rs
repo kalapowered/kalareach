@@ -36,7 +36,7 @@ use crate::manifest::{
 };
 use crate::messages;
 use crate::notice::NOTICE;
-use crate::policy::{self, Emptied, Mode, Policy};
+use crate::policy::{self, Emptied, Policy};
 use crate::records::{self, Records, is_hex32, is_manifest_replacement};
 use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Shape};
 
@@ -3924,30 +3924,32 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                 // Where the earlier-state record holds an executable collection with no rule and a
                 // mode, a collection that holds only what the installation set (its mode, and no
                 // rule but its own) is written back as the record holds it; one that holds more is
-                // written as it is found, without the installation's rules.
-                let recorded = recorded_empty_mode(prior.as_ref());
-                let emptied = match recorded {
-                    Some(mode) if shared_rules(&effective).is_none() => {
-                        if effective.exe_mode() == Some(Mode::Enabled) {
-                            Emptied::Mode(mode)
-                        } else {
-                            Emptied::AsFound
-                        }
-                    }
-                    _ => Emptied::NotConfigured,
-                };
+                // written as it is found, without the installation's rules. A record that was not
+                // read gives no mode, so the collection is written as it is found.
+                let recorded = recorded_of(prior.as_ref(), prior_error.as_deref());
+                let emptied = policy::emptied_for(
+                    &recorded,
+                    effective.exe_mode(),
+                    shared_rules(&effective).is_some(),
+                );
                 let stripped = policy::strip(&xml, drop, emptied);
                 // text: remove_at-9
                 let stripped = stripped.map_err(|error| Error::Failed(error.to_string()))?;
                 channel.set(&stripped)?;
-                match (emptied, recorded) {
+                match (emptied, &recorded) {
+                    (_, policy::Recorded::Unread(why)) => {
+                        // text: remove_at-10-unread
+                        say(&format!(
+                            "the earlier state could not be read ({why}), so nothing is written back from it: the policy is written without the installation's rules, and the executable collection is left as it is found"
+                        ));
+                    }
                     (Emptied::Mode(mode), _) => {
                         // text: remove_at-10-record
                         say(&format!(
                             "the policy is written without the installation's rules, and the executable collection is written as the earlier-state record holds it: no rule, and the mode {mode:?}"
                         ));
                     }
-                    (Emptied::AsFound, Some(mode)) => {
+                    (Emptied::AsFound, policy::Recorded::Read(Some(mode))) => {
                         // text: remove_at-10-differs
                         say(&format!(
                             "the executable collection differs from the earlier-state record in more than the installation's rules, so it is written as it is found, without them, and the record's mode {mode:?} is not written back"
@@ -4174,8 +4176,15 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
             Ok(Residue {
                 left,
                 shared,
+                unread,
                 accounts,
             }) if left.is_empty() => {
+                if let Some(why) = &unread {
+                    // text: remove_at-22-unread
+                    say(&format!(
+                        "the earlier state could not be read ({why}), so nothing was written back from it and nothing was compared with it"
+                    ));
+                }
                 if let Some(shared) = shared {
                     // text: remove_at-22-present
                     say(&format!(
@@ -4186,6 +4195,11 @@ fn remove_at(paths: &Paths, quiet_when_empty: bool, stage: remedy::Stage) -> Res
                         } else {
                             ""
                         }
+                    ));
+                } else if unread.is_some() {
+                    // text: remove_at-22-unread-rules
+                    say(&format!(
+                        "the policy holds no rule of the installation; {accounts}, the sign-in list has no value for either name, the broker's service is not there or is marked for deletion, and the program directory is not there"
                     ));
                 } else {
                     // text: remove_at-22
@@ -4369,13 +4383,15 @@ impl Shared {
     }
 }
 
-/// The mode of the earlier-state record's executable collection, where the record holds one with
-/// no rule and a mode other than not configured; none where the record holds no such collection or
-/// is not there or cannot be read (the check after the removal says that it could not).
-fn recorded_empty_mode(prior: Option<&Prior>) -> Option<Mode> {
-    match Policy::parse(&prior?.policy_xml) {
-        Ok(record) => record.recorded_empty_mode(),
-        Err(_) => None,
+/// What the earlier-state record gives for the executable collection, from the record that was
+/// loaded (or the error that loading it gave).
+fn recorded_of(prior: Option<&Prior>, load_error: Option<&str>) -> policy::Recorded {
+    match prior {
+        Some(prior) => policy::Recorded::of(Policy::parse(&prior.policy_xml)),
+        None => policy::Recorded::Unread(match load_error {
+            Some(error) => format!("the record could not be loaded: {error}"),
+            None => "no record of it was read".to_owned(),
+        }),
     }
 }
 
@@ -4396,6 +4412,9 @@ pub struct Residue {
     /// The rules that the installation did not make, where the policy was compared with the present
     /// policy less the installation's rules.
     pub shared: Option<Shared>,
+    /// Why the earlier-state record's policy was not read, where it does not parse: the policy was
+    /// then not compared with it.
+    pub unread: Option<String>,
     /// What the check read of the two accounts where nothing of them was found: for each, that no
     /// account has the identifier that the manifest records, or the name where it records none.
     pub accounts: String,
@@ -4416,22 +4435,27 @@ pub struct Residue {
 pub fn residue(prior: &Prior, paths: &Paths, manifest: &Manifest) -> Result<Residue, Error> {
     let mut left = Vec::new();
     let (_, effective) = Channel::new(&paths.staging).effective()?;
-    let baseline = Policy::parse(&prior.policy_xml).map_err(|error| {
-        // text: residue-1
-        Error::Failed(format!(
-            "the policy in the earlier-state record could not be read: {error}"
-        ))
-    })?;
+    // The record's policy is read here as the removal read it. Where it does not parse, nothing is
+    // compared with it: the present policy is only looked at for the installation's rules, and the
+    // lines say so.
+    let baseline = Policy::parse(&prior.policy_xml);
+    let (baseline, unread) = match baseline {
+        Ok(baseline) => (Some(baseline), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     // Where a rule that the installation did not make has since joined the executable collection, the
     // removal keeps the allow-all rule, where it is there, and the collection's mode beside it on
     // purpose; everything else of ours is gone.
     let shared = shared_rules(&effective);
-    let expected = if shared.is_some() {
-        effective.without_ours().0
-    } else {
-        baseline
-    };
-    left.extend(effective.differences(&expected));
+    match (&shared, baseline) {
+        (Some(_), _) => left.extend(effective.differences(&effective.without_ours().0)),
+        (None, Some(baseline)) => left.extend(effective.differences(&baseline)),
+        (None, None) => {
+            if effective.holds_our_rules() {
+                left.push("the policy still holds a rule of the installation".to_owned());
+            }
+        }
+    }
     let mut read = Vec::new();
     for name in [CHECKOUT, CONNECT] {
         // Each account is looked up by the identifier that the manifest records for it, so an
@@ -4484,6 +4508,7 @@ pub fn residue(prior: &Prior, paths: &Paths, manifest: &Manifest) -> Result<Resi
     Ok(Residue {
         left,
         shared,
+        unread,
         accounts: read.join("; "),
     })
 }
