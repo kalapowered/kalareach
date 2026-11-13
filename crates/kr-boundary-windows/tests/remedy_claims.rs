@@ -690,6 +690,7 @@ fn the_words_for_an_object_that_a_rollback_left_say_what_the_record_holds_and_gi
     let words = [
         left_alone("account", "krb-checkout", None),
         left_alone("account", "krb-checkout", Some(Outcome::Found)),
+        left_alone("the service", "S", Some(Outcome::Refused)),
         rollback_not_changed("the policy"),
     ];
     for text in &words {
@@ -709,7 +710,8 @@ fn the_words_for_an_object_that_a_rollback_left_say_what_the_record_holds_and_gi
     }
     assert!(words[0].contains("holds no result that the step made it"));
     assert!(words[1].contains("found it where it looked and did not make it"));
-    assert!(words[2].contains("holds no result that this run changed it"));
+    assert!(words[2].contains("went no further with it"));
+    assert!(words[3].contains("holds no result that this run changed it"));
 }
 
 #[test]
@@ -895,6 +897,11 @@ fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_insta
     // read; a made folder and an intent that holds an identity are read.
     assert_eq!(
         FolderRecord::of(Some(Outcome::Found), true),
+        FolderRecord::Found
+    );
+    // A result of refused belongs to the service and is never read as a folder to remove.
+    assert_eq!(
+        FolderRecord::of(Some(Outcome::Refused), true),
         FolderRecord::Found
     );
     assert_eq!(
