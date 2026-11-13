@@ -3763,3 +3763,135 @@ async fn a_copy_that_found_no_claim_is_given_the_record_the_first_attempt_left_m
     assert_eq!(given, begun, "the action was carried out once");
     host.stop().await;
 }
+
+/// KR-REQ-09.09: the record a copy of a transfer action is given, read after it found no claim, is
+/// told under the strict check at the door. A fence this host comes to owe after the copy looked and
+/// before it is told keeps the record from the caller, who is told that what became of the action is
+/// not shown; the action stands, and the same copy asked again once the fence is let go is given the
+/// record. The control is `a_copy_that_found_no_claim_is_given_the_record_the_first_attempt_left_meanwhile`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_a_copy_is_given_after_it_found_no_claim_is_not_shown_when_a_fence_lands_at_the_pause()
+ {
+    let host = host().await;
+    let mut first = client(&host).await;
+    let bytes = pattern(64);
+    let params = begin_params(&host, &bytes, "held.bin");
+    let original = first
+        .compose(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the mutation is composed");
+    let (arrived, let_it_go_on) = host.controller.pause_before_a_door_effect();
+    let (looked, let_the_copy_go_on) = host.controller.pause_after_a_copy_looked_for_a_claim();
+    let running = {
+        let original = original.clone();
+        tokio::spawn(async move { first.repeat(&original).await })
+    };
+    arrived
+        .await
+        .expect("the first attempt has been admitted and has not reached the service");
+
+    let mut second = client(&host).await;
+    let copy_original = original.clone();
+    let copy = tokio::spawn(async move {
+        let told = second.repeat(&copy_original).await;
+        (second, told)
+    });
+    looked
+        .await
+        .expect("the copy has looked for a claim and found none");
+
+    let_it_go_on.send(()).expect("the first attempt is waiting");
+    let begun = running
+        .await
+        .expect("the first attempt ran")
+        .expect("the call reaches the daemon")
+        .expect("upload.begin succeeds");
+    host.controller.hold_fence(true);
+    let_the_copy_go_on.send(()).expect("the copy is waiting");
+    let (mut second, told) = copy.await.expect("the copy ran");
+    let told = failure(told.expect("the call reaches the daemon"));
+    host.controller.hold_fence(false);
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        told.message.contains("may have been carried out"),
+        "the record is not shown: {told:?}"
+    );
+
+    let given = second
+        .repeat(&original)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the copy asked again is given the record");
+    assert_eq!(given, begun, "the action was carried out once");
+    host.stop().await;
+}
+
+/// KR-REQ-09.09: a copy of a transfer action that finds the first attempt still carrying the action
+/// out is told that the attempt has not finished, a record of that attempt's claim, under the strict
+/// check at the door. A fence this host comes to owe after the copy looked for a claim and before it
+/// is told gives the caller the word that what became of the action is not shown, in place of the
+/// host's own account of the attempt; the first attempt goes on and carries the action out once.
+/// The control is
+/// `a_copy_that_arrives_before_the_first_attempt_has_reached_the_service_is_told_the_outcome_is_unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attempt_a_copy_finds_still_running_is_not_shown_when_a_fence_lands_at_the_pause() {
+    let host = host().await;
+    let mut first = client(&host).await;
+    let bytes = pattern(64);
+    let params = begin_params(&host, &bytes, "held.bin");
+    let original = first
+        .compose(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the mutation is composed");
+    let (arrived, let_it_go_on) = host.controller.pause_before_a_door_effect();
+    let (looked, let_the_copy_go_on) = host.controller.pause_after_a_copy_looked_for_a_claim();
+    let running = {
+        let original = original.clone();
+        tokio::spawn(async move { first.repeat(&original).await })
+    };
+    arrived
+        .await
+        .expect("the first attempt has been admitted and has not reached the service");
+
+    let mut second = client(&host).await;
+    let copy = tokio::spawn(async move { second.repeat(&original).await });
+    looked
+        .await
+        .expect("the copy has looked for a claim and found none");
+
+    host.controller.hold_fence(true);
+    let_the_copy_go_on.send(()).expect("the copy is waiting");
+    let told = failure(
+        copy.await
+            .expect("the copy ran")
+            .expect("the call reaches the daemon"),
+    );
+    host.controller.hold_fence(false);
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        told.message.contains("may have been carried out"),
+        "the host's account of the attempt is not shown: {told:?}"
+    );
+    assert!(
+        !told.message.contains("has not finished"),
+        "the host's account of the attempt is not shown: {told:?}"
+    );
+
+    let_it_go_on.send(()).expect("the first attempt is waiting");
+    running
+        .await
+        .expect("the first attempt ran")
+        .expect("the call reaches the daemon")
+        .expect("upload.begin succeeds");
+    host.stop().await;
+}
