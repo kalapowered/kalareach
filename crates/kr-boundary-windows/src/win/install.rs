@@ -2842,7 +2842,17 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
                 std::thread::sleep(Duration::from_millis(250));
                 true
             },
-        )?;
+        )
+        .map_err(|failure| match failure {
+            // A repair has no rollback, so its words say what the refusal was and what the run left;
+            // an installation's own failure path says what is undone.
+            remedy::StopFailure::Refused(error) if existing => {
+                Error::Failed(remedy::broker_stop_refused(&error.to_string()))
+            }
+            remedy::StopFailure::Refused(error) | remedy::StopFailure::Read(error) => {
+                Error::from(error)
+            }
+        })?;
         if !stopped {
             return Err(Error::Failed(remedy::broker_not_stopped(existing)));
         }

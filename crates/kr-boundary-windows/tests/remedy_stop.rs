@@ -6,7 +6,8 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 
 use kr_boundary_windows::remedy::{
-    ServiceState, StopStep, broker_not_stopped, stop_broker, stop_step,
+    ServiceState, StopFailure, StopStep, broker_not_stopped, broker_stop_refused, stop_broker,
+    stop_step,
 };
 
 /// The states that a fake service reports, one for each read, and the last one for every read after.
@@ -40,7 +41,7 @@ fn run(
     states: &[ServiceState],
     bound: usize,
     refuse_request: bool,
-) -> (Result<bool, &'static str>, usize, usize) {
+) -> (Result<bool, StopFailure<&'static str>>, usize, usize) {
     let fake = Fake::new(states);
     let result = stop_broker(
         || Ok(fake.state()),
@@ -134,26 +135,130 @@ fn a_service_that_does_not_stop_is_never_said_to_be_stopped() {
     assert_eq!(waits, 4);
 }
 
-/// A request that is refused while the service stays running ends the run with the platform's
-/// error; one that is refused because the service went on its way down in the meantime is a race and
-/// is waited out.
+/// A request that is refused while the service stays in a state that accepts one ends the run with
+/// the platform's error, said apart from a failed read; one that is refused because the service went
+/// on its way down or is stopped by then is a race: a pending service is waited out, and a read that
+/// says stopped ends the run with success at once, even when the bound has run out.
 #[test]
 fn a_refused_request_ends_the_run_unless_the_state_changed() {
     assert_eq!(
         run(&[Running, Running], 5, true),
-        (Err("the request is refused"), 1, 0)
+        (Err(StopFailure::Refused("the request is refused")), 1, 0)
+    );
+    assert_eq!(
+        run(&[Running, Other], 5, true),
+        (Err(StopFailure::Refused("the request is refused")), 1, 0)
     );
     assert_eq!(run(&[Running, Pending, Stopped], 5, true), (Ok(true), 1, 1));
-    assert_eq!(run(&[Running, Stopped], 5, true), (Ok(true), 1, 1));
+    assert_eq!(run(&[Running, Stopped], 5, true), (Ok(true), 1, 0));
 }
 
-/// A read that fails ends the run with its error: a service that could not be read is never said to
-/// be stopped.
+/// The read that says stopped after a refused request decides, whatever the wait says: the order
+/// `read Running; request fails; read Stopped; wait returns false` is a stopped service.
+#[test]
+fn a_refused_request_and_a_read_that_says_stopped_is_a_stopped_service_at_the_bound() {
+    assert_eq!(run(&[Running, Stopped], 0, true), (Ok(true), 1, 0));
+}
+
+/// When the bound has run out, one last read decides: a service that says stopped at it is stopped,
+/// and one that is still pending or running is not.
+#[test]
+fn one_last_read_decides_when_the_bound_runs_out() {
+    // The bound ends right after the request: the last read says stopped.
+    assert_eq!(run(&[Running, Stopped], 0, false), (Ok(true), 1, 1));
+    // A refused request, a pending service, the bound ends: the last read says stopped.
+    assert_eq!(run(&[Running, Pending, Stopped], 0, true), (Ok(true), 1, 1));
+    // The same, and the last read still says pending.
+    assert_eq!(
+        run(&[Running, Pending, Pending], 0, true),
+        (Ok(false), 1, 1)
+    );
+    // A service that is pending from the start and says stopped at the last read.
+    assert_eq!(run(&[Pending, Stopped], 0, false), (Ok(true), 0, 1));
+    // The last read says running: not stopped.
+    assert_eq!(run(&[Running, Running], 0, false), (Ok(false), 1, 1));
+}
+
+/// A read that fails ends the run with its error, said apart from a refused request: after a
+/// request that was refused, and at the last read of the bound. A service that could not be read is
+/// never said to be stopped.
 #[test]
 fn a_read_that_fails_is_never_a_stopped_service() {
-    let result: Result<bool, &str> =
+    let result: Result<bool, StopFailure<&str>> =
         stop_broker(|| Err("the status could not be read"), || Ok(()), || true);
-    assert_eq!(result, Err("the status could not be read"));
+    assert_eq!(
+        result,
+        Err(StopFailure::Read("the status could not be read"))
+    );
+
+    // The first read answers, the one after a refused request fails.
+    let reads = Cell::new(0);
+    let result = stop_broker(
+        || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 {
+                Ok(Running)
+            } else {
+                Err("the status could not be read")
+            }
+        },
+        || Err("the request is refused"),
+        || true,
+    );
+    assert_eq!(
+        result,
+        Err(StopFailure::Read("the status could not be read"))
+    );
+
+    // The last read of the bound fails.
+    let reads = Cell::new(0);
+    let result = stop_broker(
+        || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 {
+                Ok(Pending)
+            } else {
+                Err("the status could not be read")
+            }
+        },
+        || Ok(()),
+        || false,
+    );
+    assert_eq!(
+        result,
+        Err(StopFailure::Read("the status could not be read"))
+    );
+}
+
+/// A repair whose stop request was refused is told what the refusal was and what the run left: its
+/// words are a repair's, and say neither that the service did not reach the stopped state (nothing
+/// was waited for) nor that it stays stopped.
+#[test]
+fn the_words_for_a_refused_stop_request_are_a_repairs() {
+    let words = broker_stop_refused("access is denied (error 5)");
+    assert!(
+        words.starts_with(
+            "The broker's service refused the request to stop it (access is denied (error 5))"
+        ),
+        "{words}"
+    );
+    assert!(
+        words.contains("so this run stopped before it changed the program directory."),
+        "{words}"
+    );
+    assert!(
+        words.contains("What it had already changed stays, and a repair has no rollback."),
+        "{words}"
+    );
+    assert!(
+        words.ends_with("Run the setup program again when the service is stopped or running."),
+        "{words}"
+    );
+    assert!(
+        !words.contains("did not reach the stopped state"),
+        "{words}"
+    );
+    assert!(!words.contains("stays stopped"), "{words}");
 }
 
 /// The words for a service that did not stop are chosen by the run: a repair says that what it had

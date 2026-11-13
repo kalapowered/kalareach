@@ -1007,38 +1007,53 @@ pub fn stop_step(state: ServiceState) -> StopStep {
     }
 }
 
+/// Why the stop of the broker's service failed, apart from a service that did not reach the stopped
+/// state: the error is the platform's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopFailure<E> {
+    /// A read of the service's state failed: nothing shows what state it is in.
+    Read(E),
+    /// The service refused the request to stop, and a read after that showed it neither stopped
+    /// nor on its way to either state.
+    Refused(E),
+}
+
 /// Stops the broker's service and waits for it, bounded: reads its state, asks it to stop where the
 /// state accepts a request, waits where it is pending (running is waited for as well as stopped, and
-/// a service that runs again is asked again), and returns `Ok(true)` only after a read that said
-/// stopped. `wait` pauses for one poll and says whether the bound has not run out; where it has,
-/// the result is `Ok(false)`. A request that is refused where the state read again is still not
-/// pending or stopped ends the run with its error; a read that fails ends it with that error.
+/// a service that runs again is asked again), and returns `Ok(true)` at the first read that says
+/// stopped, never otherwise. `wait` pauses for one poll and says whether the bound has not run out;
+/// where it has, one last read decides: `Ok(true)` if it says stopped, `Ok(false)` if not. A request
+/// that is refused is followed by a read: stopped ends the run with success, pending is waited for,
+/// and any other state ends it with the request's error.
 ///
 /// # Errors
 ///
-/// Returns the error of a read that failed, or of a request that was refused while the service
-/// stayed in a state that accepts one.
+/// Returns [`StopFailure::Read`] for a read that failed, and [`StopFailure::Refused`] for a request
+/// that was refused while the service stayed in a state that accepts one.
 pub fn stop_broker<E>(
     mut read: impl FnMut() -> Result<ServiceState, E>,
     mut request: impl FnMut() -> Result<(), E>,
     mut wait: impl FnMut() -> bool,
-) -> Result<bool, E> {
+) -> Result<bool, StopFailure<E>> {
     loop {
-        match stop_step(read()?) {
+        match stop_step(read().map_err(StopFailure::Read)?) {
             StopStep::Done => return Ok(true),
             StopStep::Wait => {}
             StopStep::Request => {
-                // A refusal where the service has moved on since the read is a race, and the next
-                // read decides.
-                if let Err(error) = request()
-                    && stop_step(read()?) == StopStep::Request
-                {
-                    return Err(error);
+                // A refusal where the service has moved on since the read is a race, and the read
+                // after it decides.
+                if let Err(error) = request() {
+                    match stop_step(read().map_err(StopFailure::Read)?) {
+                        StopStep::Done => return Ok(true),
+                        StopStep::Wait => {}
+                        StopStep::Request => return Err(StopFailure::Refused(error)),
+                    }
                 }
             }
         }
         if !wait() {
-            return Ok(false);
+            let last = read().map_err(StopFailure::Read)?;
+            return Ok(stop_step(last) == StopStep::Done);
         }
     }
 }
@@ -1057,6 +1072,16 @@ pub fn broker_not_stopped(repair: bool) -> String {
     } else {
         first.to_owned()
     }
+}
+
+/// What a repair says when the broker's service refused the request to stop: the platform's error,
+/// what was read after it, and what the run left. A repair has no rollback; an installation's own
+/// failure path says what is undone, so only a repair uses these words.
+#[must_use]
+pub fn broker_stop_refused(error: &str) -> String {
+    format!(
+        "The broker's service refused the request to stop it ({error}), and a read of its state after that showed it neither stopped nor changing state, so this run stopped before it changed the program directory. What it had already changed stays, and a repair has no rollback. Run the setup program again when the service is stopped or running."
+    )
 }
 
 /// A folder's final path as a person can use it: without the `\\?\` prefix of the extended form, and
