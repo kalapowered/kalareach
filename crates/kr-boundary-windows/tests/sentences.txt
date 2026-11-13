@@ -230,6 +230,9 @@ refuse_while_unfinished-1 | reading the journal: | reading the journal: error | 
 refuse_while_unfinished-2 | unfinished work is recorded, so nothing was changed | unfinished work is recorded, so nothing was changed | read: the journals hold unfinished work (refuse_while_unfinished)
 residue-1 | Policy::parse( | the error of reading the earlier-state record's policy | read: Policy::parse of the recorded policy failed, its error printed
 
+platform_error | Windows error {code} | what: Windows error N | read: the platform's error number of the failed call (GetLastError, or the status that the call returned)
+platform_error | what.to_owned() | what, with no number | read: the failure is one that no call returned (code 0): a check that the setup program made itself
+
 # ---- public words outside remedy.rs and records.rs
 APPLICATION_CONTROL_STARTING | Windows needs about two minutes to start application control | Windows needs about two minutes to start application control, so the installation waits for it | rule: said after the Application Identity service starts; the two minutes are a time that no read on this machine established (the wait's bound is 300 seconds)
 STILL_STARTING | Windows is still starting application control after the restart | Windows is still starting application control after the restart; try again in a few minutes | flow: the broker's answer to every request while its proof of the boundary has not passed
@@ -248,7 +251,7 @@ listed | #[error] | journal/rows.rs | 1 | to be read into rows: the audit (parts
 listed | #[error] | manifest.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | policy.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | win/applocker.rs | 6 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
-listed | #[error] | win/ffi.rs | 2 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
+listed | #[error] | win/ffi.rs | 1 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | win/install.rs | 7 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | win/journal.rs | 8 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row
 listed | #[error] | win/launch.rs | 9 | to be read into rows: the audit (parts E and F) names it, and each text of it that a person reads gets an identifier and a row

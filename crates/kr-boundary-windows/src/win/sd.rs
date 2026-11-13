@@ -27,7 +27,6 @@ use windows_sys::Win32::Security::{
 use super::ffi::{Handle, Result, Sid, error, last, wide};
 
 const SDDL_REVISION_1: u32 = 1;
-const ERROR_INVALID_PARAMETER: u32 = 87;
 
 /// Every right on a process or a thread.
 const ALL_ACCESS: &str = "0x1fffff";
@@ -183,12 +182,7 @@ impl std::fmt::Debug for OwnedSd {
 }
 
 fn needed<'a>(sid: Option<&'a Sid>, what: &str) -> Result<&'a Sid> {
-    sid.ok_or_else(|| {
-        error(
-            ERROR_INVALID_PARAMETER,
-            format!("a descriptor needs {what} and none was given"),
-        )
-    })
+    sid.ok_or_else(|| error(0, format!("a descriptor needs {what} and none was given")))
 }
 
 /// The text form of a kind's descriptor, for the identities given.
@@ -305,10 +299,7 @@ unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
         return Err(last("reading a descriptor's owner"));
     }
     if owner.is_null() {
-        return Err(error(
-            ERROR_INVALID_PARAMETER,
-            "the descriptor has no owner",
-        ));
+        return Err(error(0, "the descriptor has no owner"));
     }
     // SAFETY: the owner pointer is inside the valid descriptor.
     let owner = unsafe { Sid::from_ptr(owner) }.to_text();

@@ -1218,6 +1218,19 @@ pub fn foreign_rules_refusal(ids: &[&str]) -> String {
     }
 }
 
+/// A failed platform call in words: what was being done and, where the platform returned a number
+/// for the failure, the number. A failure that no call returned (a check that the setup program made
+/// itself) carries the code 0, which no failed call returns, and its words have no number.
+#[must_use]
+// text: platform_error
+pub fn platform_error(what: &str, code: u32) -> String {
+    if code == 0 {
+        what.to_owned()
+    } else {
+        format!("{what}: Windows error {code}")
+    }
+}
+
 /// What the setup program says of Smart App Control's state value, or of its absence: nothing for
 /// the value 0 (off). The values 1 and 2 are on and evaluating, which is the state's own meaning; a
 /// value outside those three is one that the setup program does not know, and it is refused as
