@@ -831,3 +831,135 @@ fn a_failure_of_the_earlier_state_record_in_a_new_installation_is_rolled_back_cl
         );
     }
 }
+
+/// One installation by the setup program, for a person made for the run, with the given test
+/// variables. Returns the exit code and the output; the person is deleted again.
+fn an_installation_with(environment: &[(&str, &str)]) -> (Option<i32>, String) {
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..6];
+    let person_name = format!("krperson{id}");
+    let person = account::create(&person_name).expect("the person's account is made");
+    let (code, text) = run_setup(
+        &["install", "--person", &person.to_text().unwrap()],
+        environment,
+        None,
+    );
+    println!("--- kr-boundary-setup install {environment:?} -> {code:?}\n{text}");
+    let _ = account::delete(&person_name);
+    (code, text)
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_failure_after_the_application_identity_step_leaves_that_service_as_it_was_before_the_run() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        token::current_is_administrator().unwrap(),
+        "the case must run elevated"
+    );
+    let before = snapshot();
+    assert_clean(&before);
+    observed(&format!(
+        "before the run the Application Identity service runs: {}, start type {}",
+        before.appid_running, before.appid_start
+    ));
+    let (code, text) = an_installation_with(&[("KR_BOUNDARY_FAIL_AFTER", "appid")]);
+    assert_ne!(code, Some(0), "{text}");
+    assert!(
+        text.contains("a failure was injected after the appid step")
+            && text.contains("the removal after the failure finished")
+            && !text.contains("also failed"),
+        "the rollback did not end without a failure: {text}"
+    );
+    observed(&format!(
+        "after the rollback the Application Identity service runs: {}",
+        snapshot().appid_running
+    ));
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the rollback the computer is as it was: {text}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn an_account_that_stood_at_its_name_when_the_run_made_it_is_not_undone_by_the_rollback() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        token::current_is_administrator().unwrap(),
+        "the case must run elevated"
+    );
+    let before = snapshot();
+    assert_clean(&before);
+    let (code, text) = an_installation_with(&[("KR_BOUNDARY_MAKE_AFTER", "payload:account")]);
+    let account_stands = account::find(CHECKOUT).unwrap().is_some();
+    observed(&format!(
+        "after the rollback the account {CHECKOUT} stands: {account_stands}"
+    ));
+    // The case's own cleanup: the account that the case made through the test seam.
+    let _ = account::delete(CHECKOUT);
+    assert_ne!(code, Some(0), "{text}");
+    assert!(
+        text.contains("making the account") && text.contains("2224"),
+        "the run did not end at the making of the account with error 2224: {text}"
+    );
+    assert!(
+        !text.contains(&format!("account {CHECKOUT} is removed")),
+        "the rollback says that it removed an account that it did not make: {text}"
+    );
+    assert!(
+        account_stands,
+        "the rollback took away an account that the run did not make: {text}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the case's own cleanup the computer is as it was: {text}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_service_that_stood_at_the_brokers_name_when_the_run_made_it_is_not_undone_by_the_rollback() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        token::current_is_administrator().unwrap(),
+        "the case must run elevated"
+    );
+    let before = snapshot();
+    assert_clean(&before);
+    let (code, text) = an_installation_with(&[("KR_BOUNDARY_MAKE_AFTER", "accounts:service")]);
+    let service_stands = service::manager()
+        .unwrap()
+        .open(SERVICE)
+        .unwrap()
+        .is_some_and(|service| !service.marked_for_deletion().unwrap());
+    observed(&format!(
+        "after the rollback the service {SERVICE} stands: {service_stands}"
+    ));
+    // The case's own cleanup: the service that the case made through the test seam.
+    let removed = Command::new("sc.exe")
+        .args(["delete", SERVICE])
+        .output()
+        .unwrap();
+    observed(&format!(
+        "sc delete: {}",
+        String::from_utf8_lossy(&removed.stdout).trim()
+    ));
+    assert_ne!(code, Some(0), "{text}");
+    assert!(
+        text.contains(&format!(
+            "a service named {SERVICE} stood on this computer when this run was to make it"
+        )),
+        "the run did not end at the service that stood there: {text}"
+    );
+    assert!(
+        service_stands,
+        "the rollback took away a service that the run did not make: {text}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the case's own cleanup the computer is as it was: {text}"
+    );
+}
