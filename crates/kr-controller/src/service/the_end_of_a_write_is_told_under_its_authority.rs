@@ -358,3 +358,57 @@ async fn a_copy_is_told_only_under_the_revision_it_was_admitted_under() {
         "a result of this request's own effect needs only the registration: {fresh:?}"
     );
 }
+
+/// KR-REQ-09.09, 09.12: a barrier that advanced the revision between the publication of the
+/// request's own debt and its own barrier, the debt pass's for another request's debt, withdrew
+/// the connection before the request's own barrier did, so the proof is refused and the result
+/// is not shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_of_the_debt_pass_before_the_requests_own_proves_nothing() {
+    let (_temp, controller, _clock) = daemon().await;
+    let (connection_id, _) = admitted(&controller).await;
+    let own = a_host_wide_debt(&controller, "the request's own withdrawal");
+    // Another request's debt, left to the debt pass, which raises its barrier first.
+    let other = controller
+        .owe_debt("another request's withdrawal", Reach::Host)
+        .expect("written");
+    drop(controller.publish_debts(&[(other, Reach::Host)]));
+    controller
+        .raise_owed_barrier()
+        .await
+        .expect("the pass's barrier");
+    let (_barrier, proof) = controller.barrier_proving(own).await.expect("the barrier");
+    assert!(
+        proof.is_none(),
+        "a barrier advanced the revision after the debt was published"
+    );
+    let told = told_as(&controller, connection_id, a_result_carrying(proof)).await;
+    not_shown(&told);
+}
+
+/// KR-REQ-09.09, 09.12: a fence owed by a restriction that published its debt while the proof was
+/// waiting for the registry is seen, and the result is not shown: the revision and the fence are
+/// read under the registry's lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_debt_published_while_the_proof_waits_for_the_registry_stops_the_result() {
+    let (_temp, controller, _clock) = daemon().await;
+    let (connection_id, _) = admitted(&controller).await;
+    let (_barrier, proof) = controller
+        .barrier_proving(a_host_wide_debt(
+            &controller,
+            "the request's own withdrawal",
+        ))
+        .await
+        .expect("the barrier");
+    assert!(proof.is_some(), "its own debt, alone, is the proof");
+    let registry = controller.registry.lock().await;
+    let telling = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { told_as(&controller, connection_id, a_result_carrying(proof)).await }
+    });
+    // Another request's restriction publishes its debt while the registry is held, as one does.
+    controller.hold_fence(true);
+    drop(registry);
+    not_shown(&telling.await.expect("the door tells it"));
+    controller.hold_fence(false);
+}
