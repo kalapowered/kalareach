@@ -136,7 +136,12 @@ pub struct Job {
     handle: Handle,
     port: Handle,
     state: State,
+    /// What makes an end uncertain: what the children and the end itself reported as not shown to
+    /// have ended. The proof of an end reads this list and no other.
     reports: Reports,
+    /// What describes the way to a proved end and proves nothing: an error that a later read
+    /// recovered from. It is told beside a proved end and never makes the end uncertain.
+    diagnostics: Reports,
 }
 
 impl Job {
@@ -196,6 +201,7 @@ impl Job {
             port,
             state: State::Fresh,
             reports: Reports::default(),
+            diagnostics: Reports::default(),
         };
         let read = job.read_back()?;
         if read.flags != LIMIT_FLAGS
@@ -217,10 +223,21 @@ impl Job {
     }
 
     /// What the job's children and its own end reported as not shown to have ended. An owner that
-    /// closes a job without ending it reads this before it treats the children as gone.
+    /// closes a job without ending it reads this before it treats the children as gone. Only what
+    /// keeps an end from being proved is in it; the errors that a later read recovered from are in
+    /// [`Job::diagnostics`].
     #[must_use]
     pub fn unproved_reasons(&self) -> Vec<String> {
         self.reports.all()
+    }
+
+    /// What the end of the job met on the way to a proved end and recovered from: a refused call to
+    /// end the job, a wait or a read of the count that failed before the reads that proved the end.
+    /// It describes and proves nothing, so a proved end is never judged by it; it is told beside the
+    /// end ([`super::proof::run_captured_until`] says it).
+    #[must_use]
+    pub fn diagnostics(&self) -> Vec<String> {
+        self.diagnostics.all()
     }
 
     /// The raw handle, still owned by the job.
@@ -358,6 +375,7 @@ impl Job {
             port: copy(&self.port, 0x0010_0000)?,
             state: self.state,
             reports: self.reports.clone(),
+            diagnostics: self.diagnostics.clone(),
         })
     }
 
@@ -388,8 +406,9 @@ impl Job {
     /// A job that is not seen empty at the bound is reported with the reason, beside what its
     /// children reported, and its end is not proved. A refused call to end the job does not by
     /// itself keep the end from being proved: the observation decides. The refusal, and a wait or a
-    /// read of the count that failed before the reads that proved the end, are in the report either
-    /// way, so that a proved end hides no error.
+    /// read of the count that failed before the reads that proved the end, are kept either way: in
+    /// the reasons of an end that is not proved, and in the diagnostics beside one that is proved,
+    /// so that a proved end hides no error and no error makes it uncertain.
     pub fn end(&mut self, retained: &[&Child], deadline: Instant) -> Ended {
         self.state = State::Ended;
         // SAFETY: the handle is open.
@@ -431,8 +450,8 @@ impl Job {
             if (all_exited && active_zero) || remaining.is_zero() {
                 if all_exited && active_zero {
                     // Later reads that succeeded prove the end. The errors that came before them, and
-                    // the refused call to end the job, are still said, apart from the reasons that
-                    // make an end uncertain.
+                    // the refused call to end the job, are still said, in the diagnostics and not in
+                    // the reasons that make an end uncertain.
                     let mut kept = Vec::new();
                     if let Some(error) = terminate_error {
                         kept.push(format!("the call to end the job failed ({error})"));
@@ -448,7 +467,7 @@ impl Job {
                         ));
                     }
                     if !kept.is_empty() {
-                        self.reports.add(format!(
+                        self.diagnostics.add(format!(
                             "the job was seen empty by the reads that came last, though {}",
                             kept.join("; ")
                         ));
