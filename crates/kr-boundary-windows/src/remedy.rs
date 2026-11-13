@@ -279,9 +279,16 @@ const FOUND_NOTHING: &str =
     "The reads of this run found no service, no account and no rule of the installation.";
 
 /// The one step for an object that another account owns, where the run has no clearance to move
-/// it: it rests on what the administrator knows, and on nothing that a read of this program
-/// showed.
-const OWNER_STEP: &str = "If you made that change, give the ownership back to the Administrators group, then run the setup program again.";
+/// it. It rests on what the administrator knows and on no read of this program, and it says all that
+/// it rests on: that the administrator made the change, and that no program of that account could
+/// have changed the object or what is in it while that account owned it. It gives the ownership back
+/// for the object and everything in it, since a change of the owner of a directory is made for the
+/// directory and everything in it. `what` names the object ("the data directory", "this folder").
+fn owner_step(what: &str) -> String {
+    format!(
+        "If you made that change, and you know that no program of that account could have changed {what} or anything in it while that account owned it, give the ownership of {what} and of everything in it back to the Administrators group, then run the setup program again."
+    )
+}
 
 /// The words that end the refusal of an entry: the one remedy, with what the next run then finds.
 /// The manifest is said to stay only where the lookup found one; nothing is said of the journal or
@@ -342,7 +349,8 @@ pub fn ending(
         }
         Remedy::NoStep => format!("{basis} The setup program names no step for it."),
         Remedy::OwnerStep(owner) => format!(
-            "The handle of {entry} shows an owner that is not the system or the Administrators group: {owner}. The setup program does not use it while that account owns it. {OWNER_STEP}"
+            "The handle of {entry} shows an owner that is not the system or the Administrators group: {owner}. The setup program does not use it while that account owns it. {}",
+            owner_step("the data directory")
         ),
         Remedy::MoveAside(_) => {
             let next = match kind {
@@ -412,7 +420,7 @@ pub fn parent_advice(cure: &ParentCure) -> String {
         ParentCure::Unreadable => "Nothing shows who made this folder, because it could not be opened to be checked. Do not correct its owner or its list, and do not remove it: either would hide what it is. The setup program names no step for it.".to_owned(),
         ParentCure::Close => "Close the program that holds it open, then run the setup program again: a change of its owner or its list does not close a handle. Do not remove it.".to_owned(),
         ParentCure::Link(stage) => own_link_words(*stage),
-        ParentCure::Owned(owner) => format!("The handle of this folder shows an owner that is not the system or the Administrators group: {owner}. It can hold files that another account wrote. The setup program does not use what is in it while that account owns it. {OWNER_STEP}"),
+        ParentCure::Owned(owner) => format!("The handle of this folder shows an owner that is not the system or the Administrators group: {owner}. It can hold files that another account wrote. The setup program does not use what is in it while that account owns it. {}", owner_step("this folder")),
         ParentCure::NotAFolder => "What is at this folder's name is not a folder, and the layout gives a folder there. The setup program names no step for it.".to_owned(),
         ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again."),
         ParentCure::Correct(Presence::Present) =>"Do not remove it: something is at the data directory's name in it, and that can hold the manifest, the journals and the private roots of an installation, which removing this folder would destroy. Correct its list instead: give it a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
@@ -1105,7 +1113,8 @@ pub fn data_ending(grounds: &Grounds<'_>, origin: &Origin, case_sensitive: bool)
                 "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. {FOUND_NOTHING} {DATA_NOT_MADE}"
             ),
             None => format!(
-                "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. The setup program does not use the records in it while that account owns it. {OWNER_STEP}"
+                "{DATA_CAN_BE_CHANGED} Its owner is {owner}, which is not the system or the Administrators group. The setup program does not use the records in it while that account owns it. {}",
+                owner_step("the data directory")
             ),
         },
         Origin::System if case_sensitive => format!("{DATA_CAN_BE_CHANGED} {CASE_REMEDY}"),

@@ -525,7 +525,7 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
 fn each_state_of_the_parent_folder_is_told_one_remedy() {
     const REMEDIES: [&str; 4] = [
         "Close the program",
-        "give the ownership back to the Administrators group",
+        "give the ownership of this folder and of everything in it back to the Administrators group",
         "Correct its list",
         "The setup program names no step for it.",
     ];
