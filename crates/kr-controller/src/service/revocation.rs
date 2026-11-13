@@ -206,6 +206,27 @@ impl Controller {
         carried: Option<&crate::authority::AdmittedMutation>,
         claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
+        self.revoke_device_authority_proving(device_id, carried, claim)
+            .await
+            .map(|(answer, _)| answer)
+    }
+
+    /// [`Self::revoke_device_authority`], with the proof that the revocation's own debts withdrew
+    /// the whole host when they did: a device whose names reach more than a notice carries
+    /// ([`super::barrier::HostWithdrawal`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke_device_authority`].
+    pub(super) async fn revoke_device_authority_proving(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        carried: Option<&crate::authority::AdmittedMutation>,
+        claim: Option<&crate::grants::ClaimHold>,
+    ) -> Result<(
+        kr_protocol::sharing::RevocationResult,
+        Option<super::barrier::HostWithdrawal>,
+    )> {
         let now_ms = self.settled_now_ms();
         // Every write this makes happens while the registry guard is held, and the guard goes
         // before the fence, which takes it again. The block is what drops it: nothing this holds
@@ -339,7 +360,7 @@ impl Controller {
                 Err(error)
             }
             None => {
-                self.complete_revocation(
+                self.complete_revocation_proving(
                     Audience::Host,
                     None,
                     revocation.revoked.iter().copied().collect(),
@@ -451,11 +472,28 @@ impl Controller {
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
         own: OwnBarrier,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
+        self.complete_revocation_proving(audience, named, revoked_grants, own)
+            .await
+            .map(|(answer, _)| answer)
+    }
+
+    /// [`Self::complete_revocation`], with the proof that the request's own debts withdrew the
+    /// whole host when they did ([`super::barrier::HostWithdrawal`]).
+    pub(super) async fn complete_revocation_proving(
+        &self,
+        audience: Audience,
+        named: Option<kr_protocol::ids::GrantId>,
+        revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
+        own: OwnBarrier,
+    ) -> Result<(
+        kr_protocol::sharing::RevocationResult,
+        Option<super::barrier::HostWithdrawal>,
+    )> {
         // Both come from the barrier: it reads the registry, which is where a revision is
         // allocated, and a second reading taken separately can be a different one. An answer that
         // named one revision and carried a barrier for another would be evidence of no single
         // moment.
-        let barrier = self.barrier(own).await?;
+        let (barrier, withdrew) = self.barrier_proving(own).await?;
         let barrier = self.barrier_for(audience, named, barrier)?;
         // A revoked owner is no longer a key the feed may be told can remove this host.
         if let Some(runtime) = self.feed_runtime() {
@@ -471,7 +509,7 @@ impl Controller {
         if !answer.fits_a_frame() {
             Self::report_uncarriable_answer("a revocation");
         }
-        Ok(answer)
+        Ok((answer, withdrew))
     }
 
     /// The barrier as `audience` is told of it.
