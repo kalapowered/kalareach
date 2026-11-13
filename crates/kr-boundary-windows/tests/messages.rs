@@ -6,7 +6,7 @@ use kr_boundary_windows::messages;
 fn the_installers_wait_and_the_brokers_answer_say_these_words() {
     assert_eq!(
         messages::APPLICATION_CONTROL_STARTING,
-        "Windows needs about two minutes to start application control, so the installation waits for it."
+        "Windows starts application control after the service starts, and the installation waits for it."
     );
     assert_eq!(
         messages::STILL_STARTING,

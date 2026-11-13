@@ -952,7 +952,10 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
         text.contains("remove or rename the folder"),
         "what to do: {text}"
     );
-    assert!(text.contains("holds no data directory"), "{text}");
+    assert!(
+        text.contains("Nothing is at the data directory's name in it"),
+        "{text}"
+    );
 
     // The same refusal for a folder that holds the data directory, with its manifest, journals and
     // roots, never says to remove it: it says what to correct.
@@ -964,7 +967,7 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     assert!(!text.contains("remove or rename the folder"), "{text}");
     assert!(!text.contains("remove the folder"), "{text}");
     assert!(text.contains("Do not remove it"), "{text}");
-    assert!(text.contains("Correct it instead"), "{text}");
+    assert!(text.contains("Correct its list instead"), "{text}");
     assert!(text.contains("protected list"), "{text}");
     std::fs::remove_dir(inherited.join("Boundary")).unwrap();
 
@@ -1860,7 +1863,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
             &[
                 "remove or rename the folder",
                 "remove the folder",
-                "Correct it instead",
+                "Correct its list instead",
                 "loses nothing",
             ],
         );
@@ -1892,7 +1895,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
         &[
             "remove or rename the folder",
             "remove the folder",
-            "Correct it instead",
+            "Correct its list instead",
         ],
     );
     std::fs::remove_dir(&link).unwrap();
@@ -1908,7 +1911,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
         .unwrap_err()
         .to_string();
     assert!(text.contains("could not be read"), "{text}");
-    assert!(text.contains("Correct it instead"), "{text}");
+    assert!(text.contains("Correct its list instead"), "{text}");
     never(
         &text,
         &[
@@ -1940,7 +1943,7 @@ fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handl
         &[
             "remove or rename the folder",
             "protected list",
-            "Correct it instead",
+            "Correct its list instead",
         ],
     );
 
@@ -1979,7 +1982,7 @@ fn a_parent_folder_that_cannot_be_opened_is_told_to_be_moved_aside_and_not_to_be
     for other in [
         "remove or rename the folder",
         "remove the folder",
-        "Correct it instead",
+        "Correct its list instead",
         "Close the program",
     ] {
         assert!(!text.contains(other), "one remedy: {text}");

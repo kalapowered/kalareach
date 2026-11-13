@@ -97,7 +97,7 @@ fn the_words_for_an_entry_at_the_data_directorys_name_claim_nothing_of_it() {
         ),
         "{text}"
     );
-    assert!(text.contains("Correct it instead"), "{text}");
+    assert!(text.contains("Correct its list instead"), "{text}");
     assert!(!text.contains("it holds the data directory"), "{text}");
     assert!(!text.contains("what they say"), "{text}");
     // Where the lookup failed, the words say that it did and that the entry can hold the records.

@@ -272,7 +272,7 @@ fn each_state_of_the_parent_folder_is_told_one_remedy() {
     const REMEDIES: [&str; 4] = [
         "Close the program",
         "Move the folder aside",
-        "Correct it instead",
+        "Correct its list instead",
         "remove or rename the folder",
     ];
     let said = |text: &str| -> Vec<&str> {
@@ -286,10 +286,13 @@ fn each_state_of_the_parent_folder_is_told_one_remedy() {
         (ParentCure::Close, "Close the program"),
         (ParentCure::MoveAside, "Move the folder aside"),
         (ParentCure::Unreadable, "Move the folder aside"),
-        (ParentCure::Correct(Presence::Present), "Correct it instead"),
+        (
+            ParentCure::Correct(Presence::Present),
+            "Correct its list instead",
+        ),
         (
             ParentCure::Correct(Presence::Unknown("Windows error 5".to_owned())),
-            "Correct it instead",
+            "Correct its list instead",
         ),
         (
             ParentCure::Correct(Presence::Absent),
