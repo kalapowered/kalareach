@@ -195,6 +195,65 @@ fn no_ending_of_any_object_tells_a_removal_a_repair_or_a_status_report_to_move_i
     assert!(moves_said > 0, "the walk met no ending with a move");
 }
 
+/// The one step for an owner outside the class says all that it rests on, in the same words for the
+/// folder above the data directory, the data directory and an entry that another account owns: that
+/// the administrator made the change, that no program of that account could have changed what is in
+/// it meanwhile, and that the ownership of the object and of everything in it is given back.
+#[test]
+fn the_owner_step_says_all_that_it_rests_on_for_the_folder_the_directory_and_an_entry() {
+    let owner = "S-1-5-21-1-2-3-1001";
+    let folder = parent_advice(&ParentCure::Owned(owner.to_owned()));
+    let mut texts = vec![("the folder above".to_owned(), "this folder", folder)];
+    each_run(|purpose, _, grounds, moves| {
+        if moves {
+            return;
+        }
+        let origin = Origin::Owned(owner.to_owned());
+        texts.push((
+            format!("the data directory, {purpose:?}"),
+            "the data directory",
+            data_ending(grounds, &origin, false),
+        ));
+        let remedy = choose(
+            grounds,
+            EntryKind::Manifest,
+            &origin,
+            &Presence::Present,
+            None,
+        );
+        assert_eq!(remedy, Remedy::OwnerStep(owner.to_owned()), "{purpose:?}");
+        let text = ending(
+            Path::new(r"D:\data\manifest.json"),
+            &remedy,
+            &origin,
+            EntryKind::Manifest,
+            &Presence::Present,
+            None,
+        );
+        texts.push((
+            format!("the manifest, {purpose:?}"),
+            "the data directory",
+            text,
+        ));
+    });
+    assert!(texts.len() > 2);
+    for (which, what, text) in texts {
+        for part in [
+            "If you made that change, and ".to_owned(),
+            format!(
+                "you know that no program of that account could have changed {what} or anything in it while that account owned it, "
+            ),
+            format!(
+                "give the ownership of {what} and of everything in it back to the Administrators group, then run the setup program again."
+            ),
+            owner.to_owned(),
+        ] {
+            assert!(text.contains(&part), "{which}: {part}: {text}");
+        }
+        assert!(!says_a_move(&text), "{which}: {text}");
+    }
+}
+
 /// A step that rests on a read that failed does not exist for any purpose: where the origin is a
 /// refused open, a failed read or an object that changed, the ending names the read and gives no
 /// step, with or without a clearance.

@@ -197,7 +197,9 @@ fn the_endings_of_the_data_directory_claim_nothing_of_what_it_holds() {
                     }
                     assert!(text.contains("does not use the records in it"), "{what}");
                     assert_eq!(
-                        text.contains("give the ownership back to the Administrators group"),
+                        text.contains(
+                            "give the ownership of the data directory and of everything in it back to the Administrators group"
+                        ),
                         matches!(origin, Origin::Owned(_)),
                         "{what}"
                     );
