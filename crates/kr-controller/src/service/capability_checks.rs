@@ -346,8 +346,9 @@ enum Begun {
     Started(CapabilityChecks),
     /// The record answered, and the answer waits for the check the cleanup leaves to be asked.
     Answer(Recorded<Result<CapabilityChecks>>),
-    /// An answer that needs no further check: another request's identifier, which the fence was
-    /// asked about under the hold, or a record that cannot be read.
+    /// An answer that ends the call before the cleanup: another request's identifier, a record
+    /// that cannot be read, or a fence that stopped the record's answer, each already asked about
+    /// the fence under the hold.
     Given(Given<Result<CapabilityChecks>>),
 }
 
@@ -445,8 +446,13 @@ impl Controller {
             // the caller that a record exists.
             match self.capability_answers.recall(actor_id, mutation.action_id) {
                 Ok(Some(held)) if held.digest == digest => {
-                    self.check_fence()?;
-                    return Ok(Begun::Answer(Recorded::read(Ok(held.answer))));
+                    let answer = Recorded::read(Ok(held.answer));
+                    // A fence stops the record's answer here, before the cleanup, and the answer
+                    // it stops is a copy this host withholds.
+                    return Ok(match self.check_fence() {
+                        Ok(()) => Begun::Answer(answer),
+                        Err(refusal) => Begun::Given(answer.refused_by(Err(refusal))),
+                    });
                 }
                 Ok(Some(_)) => {
                     self.check_fence()?;
@@ -458,9 +464,9 @@ impl Controller {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.check_fence()?;
                     return Ok(Begun::Given(
-                        Recorded::read(Err(error.found_unreadable(ANSWERS))).copied(),
+                        Recorded::read(Err(error.found_unreadable(ANSWERS)))
+                            .checked(|| self.check_fence()),
                     ));
                 }
             }
@@ -502,6 +508,20 @@ impl Controller {
             Ok(Ok(begun)) => begun,
             Ok(Err(refusal)) | Err(refusal) => return Given::Fresh(Err(refusal)),
         };
+        let framed = |given: Given<Result<CapabilityChecks>>| {
+            given.map(|view| {
+                view.and_then(|view| {
+                    ParamsValue::from_typed(&view)
+                        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+                })
+            })
+        };
+        // A reused identifier, a row that cannot be read and a fence that stopped the record's
+        // answer end the call here: the cleanup is for an answer that was written or answered.
+        let begun = match begun {
+            Begun::Given(given) => return framed(given),
+            other => other,
+        };
         self.forget_old_capability_answers();
         // The hold ended before the cleanup, which waits for locks and for storage, and nothing in
         // it keeps a fence this host owes, or a registration withdrawn, from landing. The record's
@@ -511,12 +531,7 @@ impl Controller {
             Begun::Answer(recorded) => self.retained_given(&carried, recorded).await,
             Begun::Given(given) => given,
         };
-        given.map(|view| {
-            view.and_then(|view| {
-                ParamsValue::from_typed(&view)
-                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
-            })
-        })
+        framed(given)
     }
 
     /// Lets go of the answers older than the retention section 9 gives a de-duplication record,

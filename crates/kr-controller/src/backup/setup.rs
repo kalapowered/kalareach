@@ -662,8 +662,12 @@ impl BackupSetup {
         let backup = Arc::clone(&self.backup);
         let held = tokio::task::spawn_blocking(move || backup.setup())
             .await
-            .map_err(|_| unknown(None))?
             .map_err(|_| unknown(None))?;
+        // A saved setup that cannot be read says that one may exist, and the answer is the same
+        // whether or not it does. It asks no authority check, as it never did.
+        let Ok(held) = held else {
+            return Ok(Step::Held(Recorded::read(Ok(unknown(None))).copied()));
+        };
 
         // 1. Preconditions.
         if let Some(Setup { record, .. }) = &held {
@@ -1182,6 +1186,7 @@ mod tests {
         setup: BackupSetup,
         repeat: BackupEnableParams,
         another_archive: BackupEnableParams,
+        same_archive_made_another_way: BackupEnableParams,
         _directories: (tempfile::TempDir, tempfile::TempDir),
     }
 
@@ -1208,6 +1213,10 @@ mod tests {
         };
         let repeat = params_for(1);
         let another_archive = params_for(2);
+        let same_archive_made_another_way = BackupEnableParams {
+            enabled_at_ms: TimestampMs::new(2),
+            ..repeat.clone()
+        };
         let record = SetupRecord {
             archive_id: repeat.archive_id,
             origin: origin.as_str().to_owned(),
@@ -1241,6 +1250,7 @@ mod tests {
             setup,
             repeat,
             another_archive,
+            same_archive_made_another_way,
             _directories: (root, runtime),
         }
     }
@@ -1282,21 +1292,26 @@ mod tests {
     #[tokio::test]
     async fn that_a_setup_already_stands_is_a_copy_whichever_fence_is_owed() {
         let finished = a_finished_setup().await;
-        for owed in [false, true] {
-            let given = finished
-                .setup
-                .enable(finished.another_archive.clone(), Arc::new(Fenced { owed }))
-                .await;
-            assert!(given.is_copied(), "fence owed: {owed}");
-            assert!(
-                matches!(
-                    given.into_answer(),
-                    Ok(BackupEnableResult::Declined {
-                        cause: BackupEnableCause::AlreadySetUp {}
-                    })
-                ),
-                "fence owed: {owed}"
-            );
+        for asked in [
+            &finished.another_archive,
+            &finished.same_archive_made_another_way,
+        ] {
+            for owed in [false, true] {
+                let given = finished
+                    .setup
+                    .enable(asked.clone(), Arc::new(Fenced { owed }))
+                    .await;
+                assert!(given.is_copied(), "fence owed: {owed}");
+                assert!(
+                    matches!(
+                        given.into_answer(),
+                        Ok(BackupEnableResult::Declined {
+                            cause: BackupEnableCause::AlreadySetUp {}
+                        })
+                    ),
+                    "fence owed: {owed}"
+                );
+            }
         }
     }
 }

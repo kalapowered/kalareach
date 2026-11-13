@@ -774,8 +774,7 @@ impl RemoteConnection {
                 self.connection_id,
                 Some(validated),
             )
-            .await
-            .map_err(|refusal| refusal.to_protocol_error())?;
+            .await;
         if held.is_none() && crate::project::ProjectModule::serves(entry.method) {
             held = self
                 .controller

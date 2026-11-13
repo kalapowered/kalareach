@@ -3119,3 +3119,72 @@ async fn the_refusal_from_a_stored_subject_is_given_back_as_a_copy_of_the_record
     );
     assert_eq!(refusal.into_answer().code, ErrorCode::InvalidArgument);
 }
+
+/// KR-REQ-09.09: an installation record this host cannot read says that a record exists, so the
+/// refusal is given as a copy of it, not as the request's own refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_record_this_host_cannot_read_is_given_as_a_copy() {
+    use kr_protocol::skill::{AgentTarget, AgentToolsParams, InstallScope};
+
+    /// The file that holds the installation's own record: the one that lists what was changed.
+    fn installation_record(directory: &std::path::Path) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(directory).expect("a directory reads") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                if let Some(found) = installation_record(&path) {
+                    return Some(found);
+                }
+            } else if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(record) = serde_json::from_str::<serde_json::Value>(&text)
+                && record.get("manifest").is_some()
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: controller.clock.now().checked_add(Duration::from_secs(60)),
+    };
+    let project = tempfile::TempDir::new().expect("a project directory of this test's own");
+    let installing = || {
+        mutation_of(
+            &temp,
+            Method::AgentToolsInstall,
+            ParamsValue::from_typed(&AgentToolsParams {
+                agent: AgentTarget::Codex,
+                scope: InstallScope::Project,
+                project_dir: Nullable::some(project.path().display().to_string()),
+            })
+            .expect("encodes"),
+        )
+    };
+    controller
+        .agent_tools_change(&actor_id, &installing(), Method::AgentToolsInstall, carried)
+        .await
+        .into_answer()
+        .expect("the first attempt installs");
+
+    // A different request for the same installation meets the record the first one left, which
+    // bytes that are no text make unreadable.
+    let record = installation_record(controller.paths.state_dir())
+        .expect("the installation left its record");
+    std::fs::write(&record, [0xff, 0xfe]).expect("the record is spoiled");
+    let unread = controller
+        .agent_tools_change(&actor_id, &installing(), Method::AgentToolsInstall, carried)
+        .await;
+    assert!(
+        unread.is_copied(),
+        "a record this host cannot read says a record exists"
+    );
+    unread
+        .into_answer()
+        .expect_err("an unreadable record is no answer");
+}

@@ -516,11 +516,6 @@ impl Controller {
     /// whether it is the same action or a reused identifier. Only `session.create` has a retained
     /// record here; a close is retained by the worker that owns the session, which answers its own
     /// duplicates.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal of the check an installation's lookup asks before it reads, which names
-    /// no record.
     pub(super) async fn retained(
         self: &Arc<Self>,
         actor_id: &ActorId,
@@ -528,13 +523,13 @@ impl Controller {
         method: Method,
         connection_id: ConnectionId,
         admitted: Option<AuthorityRevision>,
-    ) -> Result<Option<Recorded<ControlFrame>>> {
+    ) -> Option<Recorded<ControlFrame>> {
         if matches!(method, Method::AgentToolsInstall | Method::AgentToolsRemove) {
             return self
                 .retained_installation(actor_id, mutation, connection_id, admitted)
                 .await;
         }
-        Ok(self.retained_by_store(actor_id, mutation, method).await)
+        self.retained_by_store(actor_id, mutation, method).await
     }
 
     async fn retained_by_store(
@@ -1051,19 +1046,9 @@ impl Controller {
         // authority the other door refuses the same mutation under. A retained answer is checked
         // against it, and so is every effect this door performs.
         let admitted = self.admitted_revision(connection_id).ok();
-        let mut retained = match self
+        let mut retained = self
             .retained(actor_id, &mutation, method, connection_id, admitted)
-            .await
-        {
-            Ok(retained) => retained,
-            Err(refusal) => {
-                return DoorReply::Refused(error_reply(
-                    mutation.request_id,
-                    refusal.code(),
-                    refusal.to_string(),
-                ));
-            }
-        };
+            .await;
         if retained.is_none() && crate::transfer::TransferModule::serves(method) {
             retained = self.transfer.retained(actor_id, &mutation, method).await;
         }
@@ -1295,22 +1280,21 @@ impl Controller {
         mutation: &MutationRequest,
         connection_id: ConnectionId,
         admitted: Option<AuthorityRevision>,
-    ) -> Result<Option<Recorded<ControlFrame>>> {
-        let Ok(installer) = self.installer() else {
-            return Ok(None);
-        };
-        let Ok(digest) = kr_protocol::digest::mutation_digest(mutation, actor_id) else {
-            return Ok(None);
-        };
+    ) -> Option<Recorded<ControlFrame>> {
+        let installer = self.installer().ok()?;
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
         let _admission = self.agent_tools.lock().await;
         // Waiting for that lock takes time, and a retained result is a read of somebody's action.
         // Section 9 checks current authority before returning one, so it is checked after the wait
-        // rather than before it.
-        self.check_retained_answer(connection_id, admitted)?;
-        Ok(installer
+        // rather than before it. A refusal made here goes out as a retained answer does, through
+        // the check every retained answer is owed once the lookups have ended.
+        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
+            return Some(Recorded::read(respond(mutation.request_id, Err(error))));
+        }
+        installer
             .retained(actor_id, mutation.action_id, &digest)
             .present()
-            .map(|found| found.respond(mutation.request_id)))
+            .map(|found| found.respond(mutation.request_id))
     }
 }
 
