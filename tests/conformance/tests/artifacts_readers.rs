@@ -79,6 +79,16 @@ impl Reader {
     /// Runs the reader with `value` as the variable (or with none) and `temporary` as the
     /// temporary folder (or the machine's own).
     fn read(self, value: Option<&OsStr>, temporary: Option<&Path>) -> Reading {
+        self.read_in(value, temporary, None)
+    }
+
+    /// As [`Reader::read`], with `directory` as the reader's working directory.
+    fn read_in(
+        self,
+        value: Option<&OsStr>,
+        temporary: Option<&Path>,
+        directory: Option<&Path>,
+    ) -> Reading {
         let root = repository();
         let mut run = match self {
             Reader::Shell => {
@@ -111,6 +121,9 @@ impl Reader {
             }
         };
         run.env_remove(VARIABLE).env("NO_COLOR", "1");
+        if let Some(directory) = directory {
+            run.current_dir(directory);
+        }
         if let Some(value) = value {
             run.env(VARIABLE, value);
         }
@@ -153,7 +166,8 @@ fn same(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn assert_refused(reader: Reader, reading: &Reading, what: &str) {
+/// Asserts that the reader refused `what` in words that name the variable, the roots and `why`.
+fn assert_refused(reader: Reader, reading: &Reading, what: &str, why: &str) {
     assert!(
         !reading.succeeded,
         "{reader:?} accepted {what}: {reading:?}"
@@ -164,10 +178,17 @@ fn assert_refused(reader: Reader, reading: &Reading, what: &str) {
         reading.words
     );
     assert!(
+        reading.words.contains(why),
+        "{reader:?} refused {what} for another reason than {why:?}: {}",
+        reading.words
+    );
+    assert!(
         reading.directory.is_none(),
         "{reader:?} named a directory for {what}: {reading:?}"
     );
 }
+
+const OUTSIDE: &str = "not inside a temporary root";
 
 fn elsewhere() -> PathBuf {
     if cfg!(windows) {
@@ -185,6 +206,7 @@ fn a_value_outside_the_temporary_roots_is_refused_with_its_words() {
             reader,
             &reader.read(Some(outside.as_os_str()), None),
             "a folder outside the roots",
+            OUTSIDE,
         );
         assert!(!outside.exists(), "a refused directory is never made");
     }
@@ -237,18 +259,18 @@ fn a_name_that_only_begins_like_a_root_a_relative_value_and_an_empty_value_are_r
     for reader in readers() {
         let temporary = real(&std::env::temp_dir());
         let lookalike = PathBuf::from(format!("{}foo", temporary.display())).join("evidence");
-        let mut values: Vec<PathBuf> = vec![
-            lookalike,
-            PathBuf::from("evidence"),
-            PathBuf::from("./evidence"),
-            PathBuf::new(),
+        let mut values: Vec<(PathBuf, &str)> = vec![
+            (lookalike, OUTSIDE),
+            (PathBuf::from("evidence"), "not an absolute path"),
+            (PathBuf::from("./evidence"), "not an absolute path"),
+            (PathBuf::new(), "it is empty"),
         ];
         if cfg!(unix) {
-            values.push(PathBuf::from("/tmpfoo"));
+            values.push((PathBuf::from("/tmpfoo"), OUTSIDE));
         }
-        for value in values {
+        for (value, why) in values {
             let reading = reader.read(Some(value.as_os_str()), None);
-            assert_refused(reader, &reading, &format!("{value:?}"));
+            assert_refused(reader, &reading, &format!("{value:?}"), why);
         }
     }
 }
@@ -263,7 +285,27 @@ fn a_step_up_is_refused_even_when_it_ends_inside_a_root() {
             .join("..")
             .join("evidence");
         let reading = reader.read(Some(value.as_os_str()), None);
-        assert_refused(reader, &reading, "a path with a step up");
+        assert_refused(
+            reader,
+            &reading,
+            "a path with a step up",
+            "steps up a directory",
+        );
+    }
+}
+
+#[test]
+fn a_relative_value_that_names_a_folder_under_the_working_directory_is_still_refused() {
+    for reader in readers() {
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        std::fs::create_dir(temporary.path().join("sub")).expect("makes a folder to name");
+        let reading = reader.read_in(Some(OsStr::new("sub")), None, Some(temporary.path()));
+        assert_refused(
+            reader,
+            &reading,
+            "a relative folder that exists",
+            "not an absolute path",
+        );
     }
 }
 
@@ -275,7 +317,12 @@ fn a_link_inside_a_root_that_leads_out_of_it_is_refused() {
         std::os::unix::fs::symlink("/etc", temporary.path().join("escape")).expect("a link");
         let value = temporary.path().join("escape").join("kr-evidence");
         let reading = reader.read(Some(value.as_os_str()), None);
-        assert_refused(reader, &reading, "a path through a link out of the root");
+        assert_refused(
+            reader,
+            &reading,
+            "a path through a link out of the root",
+            OUTSIDE,
+        );
         assert!(!Path::new("/etc/kr-evidence").exists());
     }
 }
@@ -303,7 +350,12 @@ fn a_temporary_folder_behind_a_link_is_honoured_and_its_neighbours_are_not() {
             assert!(same(directory, &expected), "{reader:?}: {directory:?}");
         }
         let reading = reader.read(Some(neighbour.join("evidence").as_os_str()), Some(&link));
-        assert_refused(reader, &reading, "a folder beside the temporary folder");
+        assert_refused(
+            reader,
+            &reading,
+            "a folder beside the temporary folder",
+            OUTSIDE,
+        );
     }
 }
 

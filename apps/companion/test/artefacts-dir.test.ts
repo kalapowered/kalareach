@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
 import { platform, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { cwd } from 'node:process'
+import { chdir, cwd } from 'node:process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { VARIABLE, artefactsDirectory } from '../e2e/evidence'
@@ -54,15 +54,32 @@ describe('the evidence directory reader', () => {
   })
 
   it.each([
-    ['a name that only begins like a root', `${realpathSync.native(tmpdir())}foo${windows ? '\\' : '/'}evidence`],
-    ['a relative value', 'evidence'],
-    ['a relative value with a dot', './evidence'],
-    ['an empty value', ''],
+    [
+      'a name that only begins like a root',
+      `${realpathSync.native(tmpdir())}foo${windows ? '\\' : '/'}evidence`,
+      'not inside a temporary root'
+    ],
+    ['a relative value', 'evidence', 'not an absolute path'],
+    ['a relative value with a dot', './evidence', 'not an absolute path'],
+    ['an empty value', '', 'it is empty'],
     // Written out, because `join` would remove the step up before the reader saw it.
-    ['a step up that ends inside a root', `${tmpdir()}/evidence/../evidence`],
-    ['the root itself', realpathSync.native(tmpdir())]
-  ])('refuses %s', (_name, value) => {
+    ['a step up that ends inside a root', `${tmpdir()}/evidence/../evidence`, 'steps up a directory'],
+    ['the root itself', realpathSync.native(tmpdir()), 'not inside a temporary root']
+  ])('refuses %s', (_name, value, why) => {
     expect(() => read(value)).toThrow(/KR_TEST_ARTIFACTS_DIR.*temporary roots/s)
+    expect(() => read(value)).toThrow(why)
+  })
+
+  it('refuses a relative value that names a folder under the working directory', () => {
+    const parent = folder(tmpdir())
+    mkdirSync(join(parent, 'sub'), { recursive: true })
+    const before = cwd()
+    chdir(parent)
+    try {
+      expect(() => read('sub')).toThrow('not an absolute path')
+    } finally {
+      chdir(before)
+    }
   })
 
   it.skipIf(windows)('refuses a link inside a root that leads out of it', () => {
