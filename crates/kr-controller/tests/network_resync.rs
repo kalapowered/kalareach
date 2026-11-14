@@ -7,15 +7,17 @@
 //! it is then sent are read on the device, from what arrives on its own connection.
 //!
 //! The session keeps no spool and retains a few kilobytes, which is what the case configures. A
-//! session on a host keeps a spool that holds a hundred megabytes before it gives any up, and a
-//! case that reached that bound would write more output than it can write quickly. The decision
-//! that a position lies behind what is kept is the worker's own line, which takes the oldest
-//! cursor of the session's history whichever layers hold it, so the window of the session here is
-//! smaller than a host's and the decision made about it is the same one.
+//! session on a host keeps a spool that holds up to 128 MiB of one session's output, and a case
+//! that reached that bound would write more output than it can write quickly. So the window here
+//! is smaller than a host's, and the case runs the layout that keeps only the resident window: the
+//! gap it is told carries no cause, where a spool's eviction records one. The decision that a
+//! position lies behind what is kept is the worker's own line, which takes the oldest cursor of
+//! the session's history whichever layers hold it, so the decision made about this window is the
+//! one made about a host's.
 //!
-//! The application follows a file, so the output is written when the case writes the file, and the
-//! case waits for the worker to have retained it by the condition of the oldest cursor that the
-//! owner reads, never by a length of time.
+//! The application follows a file from its start, so the output is written when the case writes
+//! the file, and the case waits for the worker to have retained the last line it wrote, as the
+//! owner reads the retained output, never by a length of time.
 
 #![cfg(unix)]
 
@@ -66,8 +68,14 @@ const READY: &str = "kr-ready.";
 const LAST_AWAY: &str = "kr-away-last";
 
 /// The application: it says it is ready and then prints what is appended to a file.
+///
+/// The file is empty when the application starts and is followed from its first byte, so what is
+/// written before the reader has opened it is read as well.
 fn application(output: &std::path::Path) -> String {
-    format!("printf '{READY}'; exec tail -f -n 0 '{}'", output.display())
+    format!(
+        "printf '{READY}'; exec tail -f -n +1 '{}'",
+        output.display()
+    )
 }
 
 fn output_stream() -> StreamId {
@@ -146,6 +154,7 @@ async fn join(session: &Session, environment_id: EnvironmentId, session_id: Sess
 
     let mut projection = Projection::new();
     let mut gap_notice = None;
+    let mut screen_begun = false;
     within_liveness("the host to send its screen", async {
         loop {
             let notification = events.recv().await.expect("the connection is open");
@@ -154,10 +163,15 @@ async fn join(session: &Session, environment_id: EnvironmentId, session_id: Sess
                 &notification.payload,
             ) else {
                 if notification.event_type.as_str() == "session.gap" {
+                    assert!(
+                        !screen_begun,
+                        "the notice of a gap comes before the screen the stream opens with"
+                    );
                     gap_notice = Some(notification.payload.to_typed().expect("a gap"));
                 }
                 continue;
             };
+            screen_begun = true;
             if matches!(projection.apply(event), Applied::Installed) {
                 break;
             }
@@ -244,9 +258,10 @@ fn write(output: &std::path::Path, text: &str) {
         .expect("the output is added to");
 }
 
-/// What the owner reads of the worker's retained output, on the worker's own socket: the oldest
-/// cursor it keeps and the cursor after the last byte it holds.
-async fn retained(worker: &Worker) -> (u64, u64) {
+/// What the owner reads of the worker's retained output, on the worker's own socket: the page from
+/// the oldest cursor it keeps, whole. The case uses it to know when the worker holds what the
+/// application printed, and asserts nothing about what it reads.
+async fn retained(worker: &Worker) -> HistoryPageResult {
     let page: HistoryPageResult = worker
         .client()
         .await
@@ -263,7 +278,16 @@ async fn retained(worker: &Worker) -> (u64, u64) {
         .expect("the owner is served the page")
         .to_typed()
         .expect("decodes");
-    (page.oldest_retained_cursor.get(), page.next_cursor.get())
+    page
+}
+
+/// The bytes of a page without the carriage returns the terminal adds to each line end.
+fn without_returns(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .copied()
+        .filter(|&byte| byte != b'\r')
+        .collect()
 }
 
 /// Asks `check` until it answers, or the liveness bound runs out.
@@ -300,6 +324,10 @@ async fn within_liveness<T>(what: &str, wait: impl std::future::Future<Output = 
 /// written while the device was away, and the device installs it at the cursor the subscription
 /// named, past the gap. The output written after that arrives as updates, each continuing from
 /// the cursor the screen before it was at, the first from the snapshot's own.
+///
+/// The host sends a projected attachment a fresh screen with every subscription, so the case shows
+/// that the device is told of the gap and installs the screen as it stands past it, not that the
+/// screen is sent because of the gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_behind_the_bounded_history_is_told_of_the_gap_and_sent_a_fresh_snapshot() {
     let kept = tempfile::tempdir().expect("a directory for what the application follows");
@@ -328,8 +356,10 @@ async fn a_paired_device_behind_the_bounded_history_is_told_of_the_gap_and_sent_
     })
     .await;
     until("the application's first output", || async {
-        let (oldest, end) = retained(&worker).await;
-        (oldest == 0 && end >= READY.len() as u64).then_some(())
+        let page = retained(&worker).await;
+        (page.oldest_retained_cursor.get() == 0
+            && page.bytes.as_slice().ends_with(READY.as_bytes()))
+        .then_some(())
     })
     .await;
 
@@ -385,15 +415,17 @@ async fn a_paired_device_behind_the_bounded_history_is_told_of_the_gap_and_sent_
     }
     away.push_str(&format!("{LAST_AWAY}\n"));
     write(&output, &away);
-    let (oldest, _) = until("the worker's history to move past the device", || async {
-        let (oldest, end) = retained(&worker).await;
-        (oldest > held && end >= held + away.len() as u64).then_some((oldest, end))
-    })
+    until(
+        "the worker to hold the last line and have lost the device's position",
+        || async {
+            let page = retained(&worker).await;
+            (page.oldest_retained_cursor.get() > held
+                && without_returns(page.bytes.as_slice())
+                    .ends_with(format!("{LAST_AWAY}\n").as_bytes()))
+            .then_some(())
+        },
+    )
     .await;
-    assert!(
-        oldest > held,
-        "the position the device holds is behind what the worker keeps"
-    );
 
     // The return, with the position the ended connection carried.
     let session =
@@ -425,6 +457,10 @@ async fn a_paired_device_behind_the_bounded_history_is_told_of_the_gap_and_sent_
     assert!(
         gap.to_cursor.get() > held,
         "the history that remains begins past the position held"
+    );
+    assert!(
+        gap.to_cursor.get() < second.subscribed.from_cursor.get(),
+        "some of the history remains after the gap, up to the cursor the screen is at"
     );
 
     // The stream the device is sent opens with the same notice, before the screen, and the first
