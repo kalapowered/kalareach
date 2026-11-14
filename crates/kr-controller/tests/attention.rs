@@ -221,16 +221,19 @@ impl Worker {
     /// The session's worker started again over the journal this one kept: the old one takes no
     /// more connections, and a new one, at another endpoint, reads what the journal holds and goes
     /// on from it, as a worker that is started again for a session does. The old worker's session
-    /// stays live, and a shell that ended would write its closure into the journal the new worker
-    /// reads, so the shell is one that lasts as long as the session.
+    /// is not closed, so it leaves no closure in the journal, and a shell that ended would write
+    /// its closure into the journal the new worker reads, so the shell is one that lasts as long as
+    /// the session.
     async fn restarted(self) -> Self {
         let Self {
             _temp,
             session_id,
             controller,
             serving,
+            mut _closing,
             ..
         } = self;
+        _closing.disarm();
         serving.abort();
         let _ = serving.await;
         worker_on(
