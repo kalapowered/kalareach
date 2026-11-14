@@ -268,11 +268,12 @@ mod tests {
     fn an_empty_value_a_relative_value_and_a_step_up_are_refused() {
         let root = temporary();
         let roots = [real(root.path())];
-        assert!(confine_in(Path::new(""), &roots).is_err());
-        assert!(confine_in(Path::new("kr-test-artifacts"), &roots).is_err());
-        assert!(confine_in(Path::new("./evidence"), &roots).is_err());
+        let why = |value: &Path| confine_in(value, &roots).expect_err("refused").to_string();
+        assert!(why(Path::new("")).contains("it is empty"));
+        assert!(why(Path::new("kr-test-artifacts")).contains("not an absolute path"));
+        assert!(why(Path::new("./evidence")).contains("not an absolute path"));
         let up = root.path().join("evidence").join("..").join("elsewhere");
-        assert!(confine_in(&up, &roots).is_err());
+        assert!(why(&up).contains("steps up a directory"));
     }
 
     #[cfg(unix)]
@@ -306,7 +307,15 @@ mod tests {
     /// Runs this test binary again with `value` as the variable (or none), as a program of its own,
     /// so that the variable is read from a real environment.
     fn read_in_a_run(value: Option<&OsStr>) -> std::process::Output {
+        read_in_a_run_from(value, None)
+    }
+
+    /// As [`read_in_a_run`], with `directory` as the program's working directory.
+    fn read_in_a_run_from(value: Option<&OsStr>, directory: Option<&Path>) -> std::process::Output {
         let mut run = Command::new(std::env::current_exe().expect("this program"));
+        if let Some(directory) = directory {
+            run.current_dir(directory);
+        }
         run.args([
             "--exact",
             "tests::the_variable_is_read_in_a_run",
@@ -354,6 +363,14 @@ mod tests {
             let output = read_in_a_run(Some(OsStr::new(refused)));
             assert!(!output.status.success(), "{refused:?}: {output:?}");
         }
+
+        // A relative value that names a folder under the working directory, which is inside a
+        // root, is still refused: the value has to be absolute.
+        std::fs::create_dir(root.path().join("sub")).expect("makes a folder to name");
+        let output = read_in_a_run_from(Some(OsStr::new("sub")), Some(root.path()));
+        assert!(!output.status.success(), "{output:?}");
+        let words = String::from_utf8_lossy(&output.stderr);
+        assert!(words.contains("not an absolute path"), "{words}");
 
         let output = read_in_a_run(None);
         assert!(output.status.success(), "{output:?}");

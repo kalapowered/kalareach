@@ -9,4 +9,5 @@
 declare module 'node:process' {
   export const env: Record<string, string | undefined>
   export function cwd(): string
+  export function chdir(directory: string): void
 }
