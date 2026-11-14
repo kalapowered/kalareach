@@ -292,9 +292,12 @@ mod waits_only_through_the_seam {
          => hook::run(&qoder_cli::HOOKS, started),",
     ];
 
-    /// Whether `lib.rs`'s `run` begins with its `match` on the invocation, holds the three hook arms
-    /// word for word, and writes `started` nowhere else: a statement before the `match`, a changed
-    /// arm, or a copy of an arm in a comment each change what is counted or compared.
+    /// Whether `lib.rs`'s `run` begins with its `match` on the invocation, contains the three hook
+    /// arms word for word, and writes `started` as many times as there are arms. A statement before
+    /// the `match`, a `held(...)` around an arm, an arm besides the three that names `started`, and
+    /// a copy of an arm in a comment beside an arm that still names `started` each fail it. It does
+    /// not fail an arm that is changed to give a hook a start of its own while a copy of the held
+    /// arm stands in a comment beside it, nor a further arm that does not name `started`.
     fn lib_run_holds(source: &str) -> bool {
         let body = body_of(source, "run");
         body.starts_with("matchcommand{")
@@ -312,11 +315,16 @@ mod waits_only_through_the_seam {
     ///   belong. `observe` is the run's work, which the run abandons at its deadline; `wait_by` is
     ///   the system's wait that `run` passes; `start` and `finish` are the report writer's own
     ///   thread and its closing wait, which the channel server runs and a hook run never does.
-    /// - By equality of text, the chain from the process's start to `run_with`, word for word: the
-    ///   body of `main`, the three hook arms of `lib.rs`'s `run` (with `started` written nowhere
-    ///   else in it), the whole body of `hook::run`, the body of `report_by`, the claim's wrapper,
-    ///   `wait_by`, and `claim_answer` in `helper.rs`. Nothing can be added to these, or changed
-    ///   in them, without a change of the held text.
+    /// - By equality of text, word for word: the whole body of `main`, the whole body of
+    ///   `hook::run`, the body of `report_by`, the claim's wrapper, `wait_by`, and `claim_answer`
+    ///   in `helper.rs`. A change in any of these changes the held text.
+    /// - By a text found in the body and a count of the start's name, not by equality: the three
+    ///   hook arms of `lib.rs`'s `run`. Each arm is found as text in the body, and `started` is
+    ///   written as many times as there are arms. An arm that is changed while a copy of the held
+    ///   arm stands in a comment beside it passes, and so does a further arm that does not name
+    ///   `started`.
+    /// - Not held: the body of `resumed`, which gives a run its start on Unix. The cases hold
+    ///   `resumed_by` on each path, and nothing holds the call that `resumed` makes of it.
     /// - The boundary: code that runs on the main thread in other crates is outside the scan
     ///   (`kr_ipc::clock::boot_elapsed_ms`, which `resumed` calls, and
     ///   `kr_ipc::install::this_process()`), as are the callers of `observe` and the functions
