@@ -19,7 +19,9 @@ use kr_protocol::attachment::{
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
-use kr_protocol::ids::{ActionId, AttachmentId, InputLeaseEpoch, InputSequence, SessionId};
+use kr_protocol::ids::{
+    ActionId, AttachmentId, InputLeaseEpoch, InputSequence, RequestId, SessionId,
+};
 use kr_protocol::input::{
     InputAck, InputAcquireParams, InputAcquireResult, InputFrame, input_claim,
 };
@@ -820,5 +822,385 @@ async fn a_device_that_finishes_its_stream_is_answered_for_all_it_wrote() {
         Some(2),
         "the last frame was answered before the end"
     );
+    rig.stop().await;
+}
+
+/// What ends a stream whose stages are full.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// The device's connection, and with it its control stream, ends.
+    ConnectionClosed,
+    /// The device is revoked: its grant ends.
+    DeviceRevoked,
+    /// A newer stream for the same attachment is opened.
+    NewerStream,
+    /// The worker's lane ends, as when its session closes.
+    LaneClosed,
+}
+
+/// A rig whose stages are full: 32 frames are on the lane and unanswered, with the credit spent; two
+/// more are read and held, and the rest of what the device wrote is unread. Returns the rig, the
+/// device's stream and what it wrote.
+async fn full_stages() -> (Rig, DataStream, Vec<Vec<u8>>) {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut full = stages.reads_full();
+    rig.lane.hold_answers();
+    rig.lane.withhold_credit();
+    let frames = counters(usize::try_from(LANE_FRAMES + READ_AHEAD + 2).expect("a count"));
+    for (sequence, bytes) in frames.iter().enumerate() {
+        stream
+            .write_message(&rig.frame(sequence as u64, bytes))
+            .await
+            .expect("the frame is written");
+    }
+    tokio::time::timeout(WAIT, full.wait_for(|turns| *turns >= 1))
+        .await
+        .expect("the host stopped reading in time")
+        .expect("the count stands");
+    rig.lane
+        .until("the 32 frames the credit allows", |read| {
+            read.len() as u64 == LANE_FRAMES
+        })
+        .await;
+    let counts = stages.counts();
+    assert_eq!(
+        counts.read,
+        LANE_FRAMES + READ_AHEAD,
+        "no frame beyond the bound is read"
+    );
+    assert_eq!(counts.held, READ_AHEAD);
+    assert_eq!(counts.unanswered, LANE_FRAMES);
+    (rig, stream, frames)
+}
+
+/// C6: with every stage at its bound, an end of the stream resets it at once, nothing is accepted or
+/// passed on afterwards, every count falls to zero, and none was ever above its bound.
+async fn full_stages_then(ending: Ending) {
+    let (rig, mut stream, _frames) = full_stages().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let before = *ended.borrow();
+    match ending {
+        Ending::ConnectionClosed => rig.device.close(),
+        Ending::DeviceRevoked => {
+            rig.adopted
+                .host
+                .network()
+                .revoke_device(rig._paired.1.device_id)
+                .await
+                .expect("the device is revoked");
+        }
+        Ending::NewerStream => {
+            let _newer = rig.open().await;
+            tokio::time::timeout(WAIT, ended.wait_for(|ends| *ends > before))
+                .await
+                .expect("the older stream's task ended in time")
+                .expect("the count stands");
+            assert!(next_or_reset(&mut stream).await.is_err(), "reset at once");
+        }
+        Ending::LaneClosed => rig.lane.close(),
+    }
+    tokio::time::timeout(WAIT, ended.wait_for(|ends| *ends > before))
+        .await
+        .expect("the stream's task ended in time")
+        .expect("the count stands");
+    until("every stage is empty", || {
+        let counts = stages.counts();
+        counts.held == 0 && counts.unanswered == 0
+    })
+    .await;
+    // Whatever the device is still told is no acceptance: the lane answered nothing.
+    rig.lane.release_answers();
+    while let Ok(Some(ack)) = next_or_reset(&mut stream).await {
+        assert!(
+            !matches!(ack, InputAck::Accepted { .. }),
+            "nothing is accepted after the end: {ack:?}"
+        );
+    }
+    assert_eq!(
+        rig.lane.frames().len() as u64,
+        LANE_FRAMES,
+        "nothing was passed on after the end"
+    );
+    let counts = stages.counts();
+    assert!(counts.held_peak <= READ_AHEAD, "{counts:?}");
+    assert!(counts.unanswered_peak <= LANE_FRAMES, "{counts:?}");
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_stages_are_emptied_when_the_connection_closes() {
+    full_stages_then(Ending::ConnectionClosed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_stages_are_emptied_when_the_device_is_revoked() {
+    full_stages_then(Ending::DeviceRevoked).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_stages_are_emptied_when_a_newer_stream_replaces_the_stream() {
+    full_stages_then(Ending::NewerStream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_stages_are_emptied_when_the_workers_lane_ends() {
+    full_stages_then(Ending::LaneClosed).await;
+}
+
+/// C7, the host's half: a worker that does not answer or give credit stops the host reading, control
+/// is answered throughout, and when the worker goes on every byte arrives once and in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_does_not_answer_stops_the_reading_and_control_goes_on() {
+    let (rig, mut stream, frames) = full_stages().await;
+    for _ in 0..3 {
+        rig.device
+            .read(Method::HostInfo, &NoParams {})
+            .await
+            .expect("control is answered while the stages are full");
+    }
+    let claim = input_claim(2);
+    rig.lane.release_answers();
+    rig.lane.send_credit(
+        rig.epoch.get(),
+        u32::try_from(claim.frames as u64 * LANE_FRAMES).expect("a count"),
+        claim.bytes as u64 * LANE_FRAMES,
+    );
+    let last = frames.len() as u64 - 1;
+    loop {
+        let ack = next(&mut stream).await.expect("the stream stays open");
+        assert!(
+            !matches!(ack, InputAck::Refused { .. }),
+            "nothing is refused: {ack:?}"
+        );
+        if matches!(ack, InputAck::Accepted { through, .. } if through.get() == last) {
+            break;
+        }
+    }
+    let written = rig.lane.frames();
+    for (index, frame) in written.iter().enumerate() {
+        assert_eq!(frame.sequence, index as u64, "contiguous, once each");
+    }
+    assert_eq!(rig.lane.bytes(), frames.concat(), "every byte, in order");
+    rig.stop().await;
+}
+
+/// C9: a flood of control requests behind a held handler still ends the connection, and typing
+/// accepted before the flood was delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_flood_ends_the_connection_and_the_typing_before_it_was_delivered() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let frames = counters(4);
+    send_all(&rig, &mut stream, &frames).await;
+
+    let (answered, release) = rig.adopted.host.pause_after_a_frame_is_answered();
+    rig.device
+        .read(Method::HostInfo, &NoParams {})
+        .await
+        .expect("the read is answered");
+    tokio::time::timeout(WAIT, answered)
+        .await
+        .expect("the handler reached its pause")
+        .expect("the pause is armed");
+    let device = Arc::clone(&rig.device);
+    let flood = tokio::spawn(async move {
+        for _ in 0..80 {
+            device.submit_read(Method::HostInfo, &NoParams {}).await;
+        }
+    });
+    assert_eq!(
+        rig.device
+            .answered_before_closing(RequestId::new(u64::MAX), WAIT)
+            .await,
+        Some(false),
+        "the host ends the control stream, answering nothing more"
+    );
+    let reason = next_or_reset(&mut stream)
+        .await
+        .expect_err("the input stream goes with the connection");
+    println!("the input stream's end: {reason:?}");
+    assert_eq!(
+        rig.lane.bytes(),
+        frames.concat(),
+        "the typing was delivered"
+    );
+    let _ = flood.await;
+    drop(release);
+    rig.stop().await;
+}
+
+/// A second paired device, attached to the same session, and its input stream.
+struct Second {
+    device: Arc<RawDevice>,
+    _paired: (Device, DeviceRecord),
+    attachment: AttachmentId,
+}
+
+impl Rig {
+    /// Pairs a second device, attaches it to the rig's session and returns it.
+    async fn second_typist(&self) -> Second {
+        let host = &self.adopted.host;
+        let device = Device::create().await;
+        let record = pair_with(
+            host,
+            &device,
+            &self.adopted.owner,
+            proposal(&[ActionRight::SessionView, ActionRight::TerminalInput]),
+        )
+        .await;
+        let connection = RawDevice::connect(host, &device, &record).await;
+        self.attach_second(connection, device, record).await
+    }
+
+    /// Attaches a second device's connection to the rig's session, asking for input.
+    async fn attach_second(
+        &self,
+        connection: RawDevice,
+        device: Device,
+        record: DeviceRecord,
+    ) -> Second {
+        let host = &self.adopted.host;
+        let worker: &Worker = &self.adopted.workers[0];
+        connection.claim();
+        let attached: SessionAttachResult = connection
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                worker.target(host.environment_id),
+                &attach_params(
+                    worker.session_id,
+                    &[
+                        AttachmentCapability::ObserveTerminal,
+                        AttachmentCapability::Input,
+                    ],
+                ),
+            )
+            .await
+            .expect("the second device attaches")
+            .to_typed()
+            .expect("an attachment");
+        Second {
+            device: Arc::new(connection),
+            _paired: (device, record),
+            attachment: attached.attachment.attachment_id,
+        }
+    }
+
+    /// Opens the second device's input stream and reads the host's `Ready`.
+    async fn open_second(&self, second: &Second) -> DataStream {
+        let mut header = self.header_for(second.attachment);
+        header.connection_id = second.device.connection_id();
+        let mut stream = second.device.open_stream(header).await;
+        let first = next_or_reset(&mut stream).await;
+        assert!(
+            matches!(first, Ok(Some(InputAck::Ready { .. }))),
+            "the host was to say Ready to the second device, and it said {first:?}"
+        );
+        stream
+    }
+}
+
+/// Writes `bytes` as the frame at `sequence` and waits for it to be accepted.
+async fn type_and_wait(rig: &Rig, stream: &mut DataStream, sequence: u64, bytes: &[u8]) {
+    stream
+        .write_message(&rig.frame(sequence, bytes))
+        .await
+        .expect("the frame is written");
+    loop {
+        match next(stream).await {
+            Some(InputAck::Accepted { through, .. }) if through.get() >= sequence => return,
+            Some(InputAck::Accepted { .. }) => {}
+            other => panic!("the typing was to be accepted, and the host said {other:?}"),
+        }
+    }
+}
+
+/// The authority revision the lane saw on the frame that carried `bytes`.
+fn revision_of(rig: &Rig, bytes: &[u8]) -> u64 {
+    rig.lane
+        .frames()
+        .iter()
+        .find(|frame| frame.bytes == bytes)
+        .and_then(|frame| frame.revision)
+        .expect("the frame reached the lane with a validated revision")
+}
+
+/// The rig's own device types beside `named`, which is the one a restriction is made on; both have
+/// typed one frame before it. Returns what the case needs after the restriction.
+async fn two_typists_then(
+    named: Second,
+    rig: Rig,
+    restrict: impl AsyncFnOnce(&Rig, &Second),
+) -> (Rig, DataStream, DataStream) {
+    let mut unaffected = rig.open().await;
+    let mut named_stream = rig.open_second(&named).await;
+    type_and_wait(&rig, &mut unaffected, 0, b"1a").await;
+    type_and_wait(&rig, &mut named_stream, 0, b"2a").await;
+    restrict(&rig, &named).await;
+    (rig, named_stream, unaffected)
+}
+
+/// What a restriction that names one device leaves, whichever way it names it: the device the restriction names loses its stream and nothing more of
+/// its typing reaches the lane; the other device, which it does not reach, keeps typing, and the
+/// host decides each of its frames afresh at the revision the restriction raised.
+async fn the_other_device_keeps_typing(
+    rig: Rig,
+    mut named_stream: DataStream,
+    mut unaffected: DataStream,
+) {
+    assert!(
+        next_or_reset(&mut named_stream).await.is_err(),
+        "the device the restriction names is reset"
+    );
+    type_and_wait(&rig, &mut unaffected, 1, b"1b").await;
+    assert!(
+        revision_of(&rig, b"1b") > revision_of(&rig, b"1a"),
+        "the frame after the restriction is decided at the newer revision"
+    );
+    assert!(
+        rig.lane.frames().iter().all(|frame| frame.bytes != b"2b"),
+        "nothing of the named device's typing was passed on"
+    );
+    rig.stop().await;
+}
+
+/// C16a, the host's half: a restriction that names a holder by its device only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restriction_that_names_a_device_ends_its_stream_and_leaves_the_other_typing() {
+    let rig = Rig::start().await;
+    let named = rig.second_typist().await;
+    let (rig, named_stream, unaffected) = two_typists_then(named, rig, async |rig, named| {
+        rig.adopted
+            .host
+            .network()
+            .revoke_device(named._paired.1.device_id)
+            .await
+            .expect("the device is revoked");
+    })
+    .await;
+    the_other_device_keeps_typing(rig, named_stream, unaffected).await;
+}
+
+/// C16c, the host's half: a restriction that reaches the whole host takes every remote stream, and
+/// nothing more of any remote typing reaches the lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restriction_that_reaches_the_whole_host_ends_every_remote_stream() {
+    let rig = Rig::start().await;
+    let named = rig.second_typist().await;
+    let (rig, mut named_stream, mut unaffected) =
+        two_typists_then(named, rig, async |rig, _named| {
+            rig.adopted
+                .host
+                .controller()
+                .raise_the_unverified_withdrawal_refusal()
+                .await;
+        })
+        .await;
+    assert!(next_or_reset(&mut named_stream).await.is_err());
+    assert!(next_or_reset(&mut unaffected).await.is_err());
+    assert_eq!(rig.lane.frames().len(), 2, "nothing was passed on after it");
     rig.stop().await;
 }
