@@ -67,6 +67,9 @@ pub struct Executed {
     pub tools: Vec<(String, String)>,
     /// Why it could not be run or read, when it could not.
     pub error: Option<String>,
+    /// The programs its log says could not be run, and what their files looked like when the
+    /// step ended, when it failed so.
+    pub observation: Option<crate::observe::Observed>,
 }
 
 /// Where a step runs: the repository it runs from, the evidence directory, and the variables it
@@ -130,6 +133,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         lane: None,
         tools: Vec::new(),
         error: None,
+        observation: None,
     };
     if let Err(error) = std::fs::create_dir_all(&logs) {
         executed.error = Some(format!("the log directory could not be made: {error}"));
@@ -310,7 +314,7 @@ fn reconcile(
 
 /// The last component of an executable's path, which carries Cargo's hash and so names one build
 /// of one target.
-fn file_name(path: &str) -> String {
+pub(crate) fn file_name(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned()
 }
 
