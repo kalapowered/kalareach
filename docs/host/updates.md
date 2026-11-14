@@ -79,8 +79,10 @@ the same way and holds the release until the command ends, so the packages one r
 one release and the PowerShell package's executable, which the command starts to ask where a profile
 is, is still there. On Windows the scheduled task starts the starter by
 `current\bin\kr-controller.exe`, through the junction, and the starter starts the daemon by its own
-path; a start of the starter at the moment a switch replaces the junction has not been measured
-there. The paths in the list above are written for something else to start later, so they keep the
+path. A switch points the junction at the new release in place and replaces nothing, so a start
+through it finds the old release or the new one. A start of the starter during a switch has not
+been measured there; opens of a program through the junction during switches have, and none was
+refused. The paths in the list above are written for something else to start later, so they keep the
 link. Where the host checks that a program or a file is there before it writes a path (an agent's
 command and a shell's entry, and the forwarder when the control daemon opens its catalogue), it asks
 the release it read, and it writes the registration of a native bridge from that answer without
@@ -614,12 +616,23 @@ top directory and the same `release.json` as the other platforms' archive.
 
 ### The current link
 
-`current` is a directory junction, which any account can make. An update replaces it by renaming a
-new junction over it with `SetFileInformationByHandle`, the `FileRenameInfoEx` class, and the flags
-that replace an existing name and give the rename POSIX semantics. Microsoft documents
-`FileRenameInformationEx` from Windows 10, version 1709 (OS build 16299), so an older Windows
-cannot make the swap: its first switch fails with the system's error, after the release is in the
-store. The swap is one step, so a program that reads `current` at any moment finds a whole release.
+`current` is a directory junction, which any account can make. An update points the junction that
+is there at the new release in place. It opens the junction itself, checks through that handle that
+it is a junction, sets its target through the same handle with `FSCTL_SET_REPARSE_POINT`, flushes
+that handle, and checks that the name still names the object it changed; if it does not, the switch
+fails and says so. The junction is never replaced, so a program that reads `current`, or walks a
+path through it, at any moment of a switch finds the old release or the new one whole. Renaming a
+new junction over it would replace the object, and an open that met the old one on its way out
+would be answered with access denied. A junction that this account cannot open to change makes the
+switch fail, and it is not replaced.
+
+Where no `current` exists, as at a first install, or where what is there is not a junction, an
+update renames a new junction over the name with `SetFileInformationByHandle`, the `FileRenameInfoEx`
+class, and the flags that replace an existing name and give the rename POSIX semantics. Microsoft
+documents `FileRenameInformationEx` from Windows 10, version 1709 (OS build 16299), so an older
+Windows cannot make that rename: its first switch fails with the system's error, after the release
+is in the store. A symbolic link that a person put at `current` is replaced the same way, and a
+program that reads it during that switch can still be refused.
 
 A junction names an absolute path. A store that is moved or copied has a `current` that still
 names the place it was made for, and `kr` refuses it as naming something other than a release of
