@@ -195,7 +195,10 @@ fn inject(run: &Run, step: &str) -> Result<(), Error> {
 /// `<step>:account` makes the checkout account, `<step>:service` a service at the broker's name, with
 /// the broker's own file as its program (the steps are those of `KR_BOUNDARY_FAIL_AFTER`). A case
 /// that makes the account after `payload`, or the service after `accounts`, shows what the
-/// rollback does with an object that this run did not make. The test build only.
+/// rollback does with an object that this run did not make; the service made at
+/// `service-open:service` stands between the service step's open and its creation, so that the
+/// creation fails as it does where another administrator makes the service in that moment. The
+/// test build only.
 #[cfg(feature = "testing")]
 fn make_after(run: &Run, step: &str) -> Result<(), Error> {
     let wanted = std::env::var("KR_BOUNDARY_MAKE_AFTER");
@@ -4532,6 +4535,20 @@ fn refuse_service(run: &mut Run) -> Error {
     }
 }
 
+/// Puts the refusal back in the record of a repair whose creation of the service failed after the
+/// repair had turned the refusal into an intent: the creation made nothing, so `refused` is still
+/// the true record. Returns the creation's error, and where the write of the record fails too, the
+/// error says both.
+fn restore_refusal(run: &mut Run, creation: Error) -> Error {
+    match run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused) {
+        Ok(()) => creation,
+        // text: lay_down-21-restore
+        Err(failure) => Error::Failed(format!(
+            "{creation}; putting the refusal back in the record also failed ({failure})"
+        )),
+    }
+}
+
 /// Makes the folder directly above the program directory where it is not there, and records what
 /// became of it: the intent before the call, then the folder's identity and the result `made` where
 /// the run's own call made it, or, in a new installation, the result `found` where something stood
@@ -4894,14 +4911,25 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             // with no result before the call, so that a death after the call leaves a record by
             // which a removal decides from the service's own mark, and never a service that the
             // record still calls refused.
-            if run.manifest.drop_refusal(ObjectKind::Service, SERVICE) {
+            let dropped = run.manifest.drop_refusal(ObjectKind::Service, SERVICE);
+            if dropped {
                 run.save()?;
             }
-            let made = manager.create(
+            // The test build makes the service here, as another administrator would between the
+            // open and the creation (`service-open:service` of the seam that makes objects).
+            #[cfg(feature = "testing")]
+            make_after(run, "service-open")?;
+            // A creation that fails made nothing, so where this step changed a refusal into an
+            // intent the refusal is the true record again.
+            let made = match manager.create(
                 SERVICE,
                 DISPLAY,
                 &paths.program.join(BROKER).display().to_string(),
-            )?;
+            ) {
+                Ok(made) => made,
+                Err(error) if dropped => return Err(restore_refusal(run, error.into())),
+                Err(error) => return Err(error.into()),
+            };
             die_at("service");
             run.conclude(ObjectKind::Service, SERVICE, Outcome::Made)?;
             made
