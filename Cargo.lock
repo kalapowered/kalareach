@@ -6241,8 +6241,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c01a35be3ed37558c8db69554419f24eff8a63599b54f711bbe3863ec727c47d"
+source = "git+https://github.com/kalapowered/noq?rev=9c56f81afad3defdeec7d36a4ba9d0b02d5d9e7a#9c56f81afad3defdeec7d36a4ba9d0b02d5d9e7a"
 dependencies = [
  "aes-gcm",
  "bytes",
