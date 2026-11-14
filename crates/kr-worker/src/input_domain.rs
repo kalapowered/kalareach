@@ -984,8 +984,8 @@ impl InputDomain {
     /// without a writer of its own, as a test that stands in for the terminal does, must settle
     /// them the same way, or the room stays charged for input that has long been written.
     pub(crate) fn settle_written(&self, batch: &InputBatch) {
-        let mut owed = self.writer.room.owed_for(batch);
-        owed.written(batch.len());
+        // Dropping what is owed gives back the entry and every byte that was not written.
+        drop(self.writer.room.owed_for(batch));
         if matches!(batch, InputBatch::Reply { .. }) {
             crate::runtime::release(&self.writer.unwritten_replies, batch.len());
         }
