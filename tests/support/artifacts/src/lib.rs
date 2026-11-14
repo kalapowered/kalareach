@@ -194,7 +194,9 @@ fn resolve(path: &Path) -> std::io::Result<PathBuf> {
     for component in path.components() {
         if rest.is_empty() {
             let candidate = existing.join(component);
-            if candidate.exists() {
+            // A drive or share and its root are the start of the path, not names to look for.
+            let start = matches!(component, Component::Prefix(_) | Component::RootDir);
+            if start || candidate.exists() {
                 existing = candidate;
                 continue;
             }

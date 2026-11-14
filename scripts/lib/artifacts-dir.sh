@@ -57,6 +57,10 @@ _kr_artifacts_roots() {
     case "$_kr_candidate" in /*) ;; *) continue ;; esac
     _kr_real="$(cd -P -- "$_kr_candidate" 2>/dev/null && pwd -P)" || continue
     if [ -n "$_kr_real" ] && [ "$_kr_real" != / ]; then
+      # A drive's top (/c) is a filesystem root on Windows, as / is elsewhere.
+      if [ "$_kr_windows" = 1 ]; then
+        case "$_kr_real" in /?) continue ;; esac
+      fi
       # Two names for one folder (/tmp and the folder TMPDIR names) are one root.
       case "$_kr_seen" in *$'\n'"$_kr_real"$'\n'*) continue ;; esac
       _kr_seen="$_kr_seen$_kr_real"$'\n'
