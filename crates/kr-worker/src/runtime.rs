@@ -818,7 +818,7 @@ impl SessionRuntime {
         let domain = session.input();
         let (
             gate,
-            queued_input,
+            room,
             dropped_replies,
             unwritten_replies,
             queued_lease,
@@ -831,7 +831,7 @@ impl SessionRuntime {
             let writer = input.writer();
             (
                 Arc::clone(&writer.gate),
-                Arc::clone(&writer.queued_input_bytes),
+                Arc::clone(&writer.room),
                 Arc::clone(&writer.dropped_replies),
                 Arc::clone(&writer.unwritten_replies),
                 Arc::clone(&writer.queued_lease_bytes),
@@ -973,7 +973,7 @@ impl SessionRuntime {
 
         let writer_fence = Arc::clone(&fence);
         let writer_gate = Arc::clone(&gate);
-        let writer_queued = Arc::clone(&queued_input);
+        let writer_room = Arc::clone(&room);
         let writer_dropped_replies = Arc::clone(&dropped_replies);
         let writer_unwritten_replies = Arc::clone(&unwritten_replies);
         let writer_lease = Arc::clone(&queued_lease);
@@ -996,6 +996,11 @@ impl SessionRuntime {
             // a batch this writer never wrote never happened to the application.
             let mut last_fence = writer_fence.load(Ordering::Acquire);
             while let Some(batch) = input_receiver.blocking_recv() {
+                // What this batch holds in the room is given back however the writer is done with
+                // it: by the bytes the terminal takes as they are written, and for the rest when
+                // this goes out of scope, whether the batch was written whole, dropped as stale or
+                // expired, abandoned part way, or the writer ended.
+                let mut owed = writer_room.owed_for(&batch);
                 #[cfg(feature = "testing")]
                 writer_hold.stand();
                 #[cfg(feature = "testing")]
@@ -1056,9 +1061,9 @@ impl SessionRuntime {
                 // the new holder's command line. The host's own answer to a query the application
                 // asked is not a keystroke and is never dropped: nothing else can supply it.
                 if epoch.is_some_and(|epoch| epoch < fence) {
-                    // Only the whole budget is given back. The lease's own share was taken by the
-                    // lease change that made these bytes stale, and reported there as discarded.
-                    release(&writer_queued, bytes.len());
+                    // Only the room is given back, by `owed` as this goes out of scope. The lease's
+                    // own share was taken by the lease change that made these bytes stale, and
+                    // reported there as discarded.
                     continue;
                 }
                 let lease_epoch = epoch.unwrap_or_default();
@@ -1090,8 +1095,7 @@ impl SessionRuntime {
                 if expired(writer_clock.as_ref()) {
                     // Only a lease batch carries an authority deadline, and the lease itself has
                     // not moved: its share of the queue is still counted against it, so it comes
-                    // back here with the whole budget.
-                    release(&writer_queued, bytes.len());
+                    // back here, and the room with it as this goes out of scope.
                     writer_lease.release(lease_epoch, bytes.len());
                     continue;
                 }
@@ -1117,7 +1121,7 @@ impl SessionRuntime {
                     },
                     &mut |written| {
                         // Released only once the application has it. Until then it is owed.
-                        release(&writer_queued, written);
+                        owed.written(written);
                         if is_reply {
                             release(&writer_unwritten_replies, written);
                         }
@@ -1168,12 +1172,12 @@ impl SessionRuntime {
                     // that has run out, so it is not written. What was delivered is what the
                     // application has, and a takeover reports the remainder as discarded.
                     let remainder = bytes.len().saturating_sub(delivered);
-                    // Counted before the bytes stop being owed: a reader of the two counts that
-                    // sees nothing owed has to see the drop that settled it.
+                    // Counted before the bytes stop being owed, which they do when `owed` goes out of
+                    // scope: a reader of the two counts that sees nothing owed has to see the drop
+                    // that settled it.
                     if lane_deadline.is_some() && delivered == 0 {
                         writer_dropped_replies.fetch_add(1, Ordering::AcqRel);
                     }
-                    release(&writer_queued, remainder);
                     if is_reply {
                         release(&writer_unwritten_replies, remainder);
                     }
