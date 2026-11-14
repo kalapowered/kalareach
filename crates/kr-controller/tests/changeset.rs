@@ -1635,6 +1635,10 @@ async fn a_version_captured_is_not_shown_when_a_fence_lands_after_the_route_answ
     host.controller.hold_fence(false);
     let told = failure(told.expect("the call reaches the daemon"));
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        told.message.contains("may have been carried out"),
+        "what is told is that what became of the action is not shown: {told:?}"
+    );
 
     let captured: ChangesetCaptureResult = typed(
         &control
@@ -1664,6 +1668,19 @@ async fn a_version_captured_is_not_shown_when_a_fence_lands_after_the_route_answ
     assert_eq!(
         read.version.content_digest, captured.version.content_digest,
         "the version the first attempt captured stands"
+    );
+    // A capture that names no change set makes one, so a repeat that captured again would have left
+    // a second: the workspace holds the one the first attempt made.
+    let held = host
+        .controller
+        .changesets()
+        .service()
+        .newest_versions_after(&std::collections::BTreeMap::new())
+        .expect("the change set store reads");
+    assert_eq!(
+        held.len(),
+        1,
+        "the repeat was answered from the first capture and made no change set of its own"
     );
     host.clients.abort();
     let _ = host.clients.await;

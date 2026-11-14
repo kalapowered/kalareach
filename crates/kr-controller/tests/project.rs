@@ -5050,6 +5050,10 @@ async fn a_project_made_is_not_shown_when_a_fence_lands_after_the_route_answers_
     let told = failure(told.expect("the call reaches the daemon"));
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
     assert!(
+        told.message.contains("may have been carried out"),
+        "what is told is that what became of the action is not shown: {told:?}"
+    );
+    assert!(
         host.work().join("made/.git").is_dir(),
         "the repository was made"
     );

@@ -344,11 +344,14 @@ fn params_for_a_route(
     }
 }
 
-/// The local writes the walk sends with parameters that do not reach their route: each needs a
-/// fixture of its own that a walk of the whole table cannot build alone, so the envelope declines
-/// it for its empty parameters and its reply is the declined one, which `declined` made and the
-/// sink consumed. They are listed so that no write passes unnamed; one that gains parameters here
-/// leaves the list.
+/// The local writes for which the walk builds no parameters that reach their route: each needs a
+/// fixture of its own that a walk of the whole table cannot build alone, so the walk sends it empty
+/// parameters. What happens to those depends on the write: the envelope declines most of them, and
+/// the reply is then the declined one, which `declined` made and the sink consumed; a few (the
+/// pairing methods, `host.clock.establish`, and the account and storage sign-in and sign-out
+/// methods) read no parameters, or take `{}` as complete, and their routes answer. The list does
+/// not say which of the two a write is. It names every write that has no parameters built here, so
+/// that no write passes unnamed; one that gains parameters here leaves the list.
 const WITHOUT_A_FIXTURE: &[Method] = &[
     Method::EnvironmentEnrol,
     Method::EnvironmentRefresh,

@@ -198,8 +198,9 @@ async fn a_claimed_actions_repeat_is_a_copy_across_a_restamp_and_its_first_attem
 
 /// KR-REQ-09.09: the whole answer of a deletion of the copies privacy mode lists is a copy of what
 /// earlier exports left, whatever it says. The request here names no copy the host holds, so the
-/// answer is the route's refusal of it, and a restamp has the door tell it is not shown, where the
-/// refusal is given when nothing moved.
+/// answer is the route's refusal of it, and a restamp has the door tell it is not shown, where with
+/// nothing moved it is told as the route made it, whatever its code: the control asserts only that
+/// it is not the not-shown word.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_derived_report_across_a_restamp_is_not_shown() {
     let (temp, controller, _clock) = daemon().await;
