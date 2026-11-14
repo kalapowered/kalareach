@@ -39,7 +39,7 @@ DENIED = re.compile(
 API_SET = re.compile(r"^(api|ext)-ms-win-", re.I)
 # What an API set import looks like: the contract name and `.dll`, nothing else. The API set query is made
 # for no other form.
-API_SET_NAME = re.compile(r"(api|ext)-ms-win-[a-z0-9-]+\.dll", re.I)
+API_SET_NAME = re.compile(r"(api|ext)-ms-win-[a-z0-9-]+\.dll", re.I | re.ASCII)
 
 
 def dependents(text):
@@ -133,7 +133,7 @@ def read_imports(dumpbin, program, system_dir, api_present=api_set_present):
         "DENIED": "a runtime library, which no program of the product imports",
         "NOT FOUND": "a library that is no Windows API set and is not in the system directory",
         "NOT A PLAIN NAME": "a name with a path part, a drive or a dot segment, or an API set name of another form, which no import has and which the system is not asked about",
-        "NOT CHECKED": "an API set that this machine cannot be asked about (it can be asked on Windows only), so it is not accepted",
+        "NOT CHECKED": "an API set that cannot be asked about here (the system's API set question is not available), so it is not accepted",
     }
     problems = [f"{program} imports {name}{note}, {why[what]}" for name, what, note in rows if what in why]
     return rows, problems
@@ -359,6 +359,10 @@ def self_test():
         check("the longest API set name is a plain name and is asked about", (len(longest), question(longest)), (255, ("a Windows API set", [longest])))
         for name in ("api-ms-win-" + "a" * 241 + ".dll", "api-ms-win-" + "a" * 300 + ".dll", "ext-ms-win-" + "b" * 1000 + ".dll", "k" * 252 + ".dll", "k" * 300 + ".dll"):
             check(f"the name of {len(name)} characters is refused as no plain name, and no question is asked", question(name), ("NOT A PLAIN NAME", []))
+        # Under `re.I` alone four non-ASCII letters match the ASCII ones (`ſ`, `ı`, `İ` and the Kelvin sign): such a
+        # name is no API set name, and the system is asked nothing for it.
+        for name in ("api-ms-win-core-\u017fynch-l1-2-0.dll", "ext-ms-win-core-\u212aernel-l1-1-0.dll", "ap\u0131-ms-win-core-synch-l1-2-0.dll", "api-ms-win-core-\u0130o-l1-1-0.dll"):
+            check(f"the name {name!r} with a non-ASCII letter is refused as no plain name, and no question is asked", question(name), ("NOT A PLAIN NAME", []))
         check("an API set name in capitals is a plain name and is asked about", question("API-MS-WIN-CORE-X-L1-1-0.DLL", None), ("a Windows API set", ["API-MS-WIN-CORE-X-L1-1-0.DLL"]))
         for name in ("api-ms-win-x/../helper.dll", "api-ms-win-" + "a" * 300 + ".dll"):
             try:
@@ -379,6 +383,11 @@ def self_test():
             "a loader that does not": (CLEAN, lambda n: False, 1, ["api-ms-win-core-synch-l1-2-0.dll, a library that is no Windows API set"]),
             "a name with a path part": (CLEAN.replace("    ntdll.dll\n", "    ntdll.dll\n    api-ms-win-x/../helper.dll\n"), lambda n: True, 1, ["api-ms-win-x/../helper.dll"]),
         }
+        # A list with no API set name asks nothing, so where the system cannot be asked it passes when every
+        # import is a library of the system directory.
+        plain_list = CLEAN.replace("    api-ms-win-core-synch-l1-2-0.dll\n", "").replace("    api-ms-win-core-realtime-l1-1-1.dll\n", "")
+        check("the list with no API set name has none", [n for n in dependents(plain_list)[0] if API_SET.match(n)], [])
+        records["no loader, a list with no API set name"] = (plain_list, lambda n: None, 0, [])
         for label, (record, loader, want_exit, want_in) in records.items():
             answer = subprocess.CompletedProcess([], 0, stdout=record, stderr="")
             out = io.StringIO()
@@ -388,6 +397,10 @@ def self_test():
             errors = [row for row in out.getvalue().splitlines() if row.startswith("::error::")]
             check(f"it names the cause with {label}", all(any(text in row for row in errors) for text in want_in), True)
             check(f"it reports an error only when it refuses with {label}", bool(errors), want_exit == 1)
+        calls = []
+        with unittest.mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=plain_list, stderr="")), contextlib.redirect_stdout(io.StringIO()):
+            imports_command("dumpbin", [str(program)], system, lambda n: calls.append(n))
+        check("no question is asked for a list with no API set name", calls, [])
 
     for name in (
         "VCRUNTIME140.dll", "vcruntime140_1.dll", "VCRUNTIME140D.dll", "MSVCP140.dll", "msvcp140d.dll", "VCOMP140.DLL",
