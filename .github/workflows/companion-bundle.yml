@@ -106,11 +106,11 @@ jobs:
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The entry's own cases, which no other job runs.
+      # The entry's own cases, which no other job runs. They start bash, which must be Git's and not
+      # the one the Windows subsystem for Linux brings, so they run in a bash step.
       - name: Run the entry's cases
-        run: |
-          pnpm -C apps/companion test:desktop
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        shell: bash
+        run: pnpm -C apps/companion test:desktop
 
       # The bundle build, as a person starts it, with the variable that the Tauri command line would
       # have set. The log is kept for the next step to read.
