@@ -2420,6 +2420,101 @@ async fn a_takeover_stops_the_keystrokes_waiting_for_the_terminal_and_not_the_ho
     .expect("the writer gave back the answer's place in the room");
 }
 
+/// KR-REQ-08.49: the host answers 256 questions a second, and the places those answers took in the
+/// room are free again once the terminal's writer has written them.
+///
+/// A full second's questions are asked at once and every answer is written. A question asked once
+/// the clock has moved a second is then answered too. A place that the writer did not give back
+/// would hold the answer out for good, whatever the rate allowed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answers_a_writer_has_written_leave_their_share_free_for_the_next_second() {
+    let (_host, runtime, clock, _session_id, holder, epoch) = echoing_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let room = runtime.input().lock().input_room();
+
+    {
+        let mut session = runtime.session();
+        session.ingest_output(&STATUS_QUESTION.repeat(256));
+        runtime.flush_input();
+    }
+    until_the_room_holds(&room, kr_worker::input_room::Cost::default()).await;
+    assert_eq!(
+        room.held_replies(),
+        0,
+        "the places of the answers the writer wrote are given back"
+    );
+
+    {
+        clock.advance(Duration::from_secs(1));
+        let mut session = runtime.session();
+        session.ingest_output(STATUS_QUESTION);
+        // The writer is serial and the application echoes in order, so once this key has come
+        // back, every answer in front of it has come back or was never written.
+        session
+            .write_input(holder, epoch, 0, b"kr-end", None, Instant::now())
+            .expect("the holder types");
+        runtime.flush_input();
+    }
+    let seen = retained_within(&runtime, b"kr-end", LIVENESS_DEADLINE).await;
+    assert_eq!(
+        count(&seen, STATUS_ANSWER),
+        257,
+        "the question of the next second is answered beside the 256 of the first"
+    );
+}
+
+/// A harness that plays the terminal's writer settles what it takes as the writer settles what it
+/// writes: the room, the answers' places, the unwritten answer bytes and the lease's queued bytes
+/// are all given back, so a long exchange is held to the bounds of the product and not to those of
+/// a queue that nothing empties.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_harness_takes_and_settles_is_given_back_as_a_written_batch_is() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "exec cat");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let holder = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let epoch = session
+        .acquire_input(holder, connection(), None)
+        .expect("the keys")
+        .lease
+        .epoch
+        .get();
+    session
+        .write_input(holder, epoch, 0, b"keys", None, Instant::now())
+        .expect("accepted");
+    session.ingest_output(STATUS_QUESTION);
+    let room = session.input().lock().input_room();
+    let unwritten = session.input().lock().unwritten_replies();
+
+    let taken = session.take_pending_input();
+    assert!(
+        taken
+            .iter()
+            .any(|batch| matches!(batch, kr_worker::session::InputBatch::Lease { .. })),
+        "the keys were queued"
+    );
+    assert!(
+        taken
+            .iter()
+            .any(|batch| matches!(batch, kr_worker::session::InputBatch::Reply { .. })),
+        "the answer was queued"
+    );
+    assert_ne!(
+        room.held(),
+        kr_worker::input_room::Cost::default(),
+        "taking a batch does not write it"
+    );
+
+    kr_worker::testing::settle_written_input(&session, &taken);
+    assert_eq!(room.held(), kr_worker::input_room::Cost::default());
+    assert_eq!(room.held_replies(), 0);
+    assert_eq!(unwritten.load(std::sync::atomic::Ordering::Acquire), 0);
+    assert_eq!(session.input().lock().queued_lease_bytes().load(), 0);
+    drop(session);
+}
+
 /// KR-REQ-08.48: authority that ends while a batch waits for the terminal ends the keystrokes
 /// and not the host's answer to the application.
 ///
