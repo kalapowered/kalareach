@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use kr_conformance::fault;
 #[cfg(unix)]
-use kr_conformance::fault::{Cause, Reads};
+use kr_conformance::fault::{Budget, Cause, Reads};
 #[cfg(unix)]
 use kr_conformance::plan::Platform;
 use kr_conformance::plan::{Group, Reading, Step};
@@ -167,7 +167,7 @@ fn a_step_that_linked_an_empty_program_is_run_again_and_the_result_names_the_run
         7,
         &tree.place(),
         &[],
-        &mut Duration::from_secs(3600),
+        &mut Budget::of(Duration::from_secs(3600)),
         &Evidence::SHOWN.reads(),
         &mut |line| told.push(line.to_owned()),
     );
@@ -225,7 +225,7 @@ fn a_step_that_fails_in_another_way_is_not_run_again() {
         1,
         &place,
         &[],
-        &mut std::time::Duration::from_secs(3600),
+        &mut Budget::of(Duration::from_secs(3600)),
         &no_evidence(),
         &mut |_| {},
     );
@@ -255,7 +255,7 @@ fn a_file_that_no_build_wrote_is_not_a_reason_to_run_a_step_again() {
             1,
             &tree.place(),
             &[],
-            &mut Duration::from_secs(3600),
+            &mut Budget::of(Duration::from_secs(3600)),
             &no_evidence(),
             &mut |_| {},
         );
@@ -277,7 +277,7 @@ fn a_step_whose_first_run_took_longer_than_the_time_left_is_not_run_again() {
         .join("build/x-0123456789abcdef/build-script-build");
     let mut slow = step(&[&tree.marker, &program]);
     slow.command[2] = format!("sleep 1; {SCRIPT}");
-    let mut nothing_left = Duration::ZERO;
+    let mut nothing_left = Budget::of(Duration::ZERO);
     let done = fault::execute(
         &slow,
         1,
@@ -298,8 +298,8 @@ fn a_step_whose_first_run_took_longer_than_the_time_left_is_not_run_again() {
 #[cfg(unix)]
 #[test]
 fn the_time_a_second_run_takes_is_taken_from_the_time_left_for_second_runs() {
-    let mut left = Duration::from_secs(1);
-    let run = |left: &mut Duration| {
+    let mut left = Budget::of(Duration::from_secs(1));
+    let run = |left: &mut Budget| {
         let tree = Tree::new();
         std::fs::create_dir_all(tree.profile.join(".fingerprint/x-0123456789abcdef")).unwrap();
         let program = tree
@@ -319,7 +319,11 @@ fn the_time_a_second_run_takes_is_taken_from_the_time_left_for_second_runs() {
     };
     let first = run(&mut left);
     assert!(first.rerun.is_some(), "the first step was run again");
-    assert_eq!(left, Duration::ZERO, "its second run took the second left");
+    assert_eq!(
+        left.left(),
+        Duration::ZERO,
+        "its second run took the second left"
+    );
     let second = run(&mut left);
     assert!(
         second.rerun.is_none(),
@@ -328,6 +332,142 @@ fn the_time_a_second_run_takes_is_taken_from_the_time_left_for_second_runs() {
     assert_eq!(second.exit, Some(101));
     let error = second.error.expect("the step has the reason");
     assert!(error.contains("is not run again"), "{error}");
+}
+
+/// The step's script, with what its second run does in place of passing: it names its own number
+/// and its child's in the file its fourth argument names, and waits for the child, which sleeps far
+/// longer than any case lets a second run take.
+#[cfg(unix)]
+fn script_with_a_sleeping_second_run() -> String {
+    let passing = "echo second-$((1 + 1)); exit 0";
+    assert!(SCRIPT.contains(passing));
+    SCRIPT.replacen(
+        passing,
+        "echo $$ > \"$4\"; sleep 120 & echo $! >> \"$4\"; wait",
+        1,
+    )
+}
+
+/// Whether the process with this number is running. A process that ended and has not been
+/// collected yet is not.
+#[cfg(unix)]
+fn running(pid: u32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&output.stdout);
+    !state.trim().is_empty() && !state.trim().starts_with('Z')
+}
+
+/// Ends, by their exact numbers, the processes a case started that are still running: where the
+/// case's own assertions failed, they are not left to sleep.
+#[cfg(unix)]
+struct Started(Vec<u32>);
+
+#[cfg(unix)]
+impl Drop for Started {
+    fn drop(&mut self) {
+        for pid in self.0.iter().filter(|pid| running(**pid)) {
+            let _ = std::process::Command::new("kill")
+                .args(["-s", "KILL", &pid.to_string()])
+                .status();
+        }
+    }
+}
+
+/// A step that sleeps in its second run, run under `budget`: the step's error is the second run's
+/// deadline, the step's processes are gone, and the report keeps what the step did.
+#[cfg(unix)]
+fn run_a_step_that_sleeps_in_its_second_run(
+    mut budget: Budget,
+) -> (kr_conformance::run::Executed, Started) {
+    let tree = Tree::new();
+    let (program, _unit) = unit_of(&tree);
+    let pids = tree.directory.path().join("pids");
+    let mut sleeping = step(&[&tree.marker, &program, Path::new(""), &pids]);
+    sleeping.command[2] = script_with_a_sleeping_second_run();
+    let done = fault::execute(
+        &sleeping,
+        1,
+        &tree.place(),
+        &[],
+        &mut budget,
+        &Evidence::SHOWN.reads(),
+        &mut |_| {},
+    );
+    let numbers: Vec<u32> = std::fs::read_to_string(&pids)
+        .expect("the second run named its processes")
+        .lines()
+        .map(|line| line.trim().parse().expect("a process number"))
+        .collect();
+    assert_eq!(numbers.len(), 2, "the shell and its child: {numbers:?}");
+    (done, Started(numbers))
+}
+
+/// What the second run of a step that sleeps came to, and that none of its processes is left. The
+/// step ends red, not green, with the reason, and the evidence of the first run is still in its
+/// result.
+#[cfg(unix)]
+fn assert_ended_at_its_deadline(done: &kr_conformance::run::Executed, started: &Started) {
+    assert_eq!(done.exit, None, "the second run did not end by itself");
+    let error = done.error.as_deref().expect("the step has an error");
+    assert!(error.contains(fault::PASSED_ITS_TIME), "{error}");
+    let rerun = done.rerun.as_ref().expect("the step was run again");
+    assert_eq!(rerun.first_exit, Some(101));
+    // The processes are ended when the run returns, and the system collects the ones that were
+    // not the run's own children a moment later.
+    for _ in 0..100 {
+        if !started.0.iter().any(|pid| running(*pid)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "a process of the second run is still running: {:?}",
+        started.0
+    );
+}
+
+/// A second run that is still going when the time left for second runs is up is ended: the group
+/// of its processes is asked to end and then killed, the step ends red, and no process of it stays.
+#[cfg(unix)]
+#[test]
+fn a_second_run_that_passes_the_time_left_is_ended_with_its_processes_and_the_step_ends_red() {
+    let (done, started) =
+        run_a_step_that_sleeps_in_its_second_run(Budget::of(Duration::from_secs(2)));
+    assert_ended_at_its_deadline(&done, &started);
+}
+
+/// The job's limit ends a second run as well, less the time the report keeps to write its result,
+/// whichever is sooner: here the account would allow an hour, and the limit leaves two seconds.
+#[cfg(unix)]
+#[test]
+fn a_second_run_is_ended_at_the_jobs_limit_less_the_reserve_where_that_is_sooner() {
+    let ends = std::time::SystemTime::now() + fault::RESULT_RESERVE + Duration::from_secs(2);
+    let budget = Budget::of(Duration::from_secs(3600)).until(ends);
+    let (done, started) = run_a_step_that_sleeps_in_its_second_run(budget);
+    assert_ended_at_its_deadline(&done, &started);
+}
+
+/// Where the job's limit is nearer than the time the report keeps for its result, the step is not
+/// run again at all.
+#[cfg(unix)]
+#[test]
+fn a_step_is_not_run_again_where_the_jobs_limit_leaves_less_than_the_reserve() {
+    let tree = Tree::new();
+    let (program, _unit) = unit_of(&tree);
+    let ends = std::time::SystemTime::now() + Duration::from_secs(30);
+    let done = fault::execute(
+        &step(&[&tree.marker, &program]),
+        1,
+        &tree.place(),
+        &[],
+        &mut Budget::of(Duration::from_secs(3600)).until(ends),
+        &no_evidence(),
+        &mut |_| {},
+    );
+    assert_run_once_with_reason(&done, "left for a second run");
 }
 
 /// A step run again whose first run's evidence could not be kept ends red, whatever its second run
@@ -348,7 +488,7 @@ fn a_step_run_again_whose_first_runs_evidence_was_not_kept_ends_red() {
         1,
         &tree.place(),
         &[],
-        &mut Duration::from_secs(3600),
+        &mut Budget::of(Duration::from_secs(3600)),
         &Evidence::SHOWN.reads(),
         &mut |_| {},
     );
@@ -394,7 +534,7 @@ fn a_link_below_a_unit_ends_the_step_red_with_nothing_of_the_unit_removed_and_no
         1,
         &tree.place(),
         &[],
-        &mut Duration::from_secs(3600),
+        &mut Budget::of(Duration::from_secs(3600)),
         &no_evidence(),
         &mut |_| {},
     );
@@ -426,7 +566,7 @@ fn a_file_of_a_unit_that_the_step_did_not_write_is_not_removed_and_the_step_is_n
         1,
         &tree.place(),
         &[],
-        &mut Duration::from_secs(3600),
+        &mut Budget::of(Duration::from_secs(3600)),
         &no_evidence(),
         &mut |_| {},
     );
@@ -511,7 +651,7 @@ fn a_mount_below_a_unit_is_not_entered_and_the_step_is_not_run_again() {
         1,
         &tree.place(),
         &[],
-        &mut Duration::from_secs(3600),
+        &mut Budget::of(Duration::from_secs(3600)),
         &no_evidence(),
         &mut |_| {},
     );
@@ -523,7 +663,13 @@ fn a_mount_below_a_unit_is_not_entered_and_the_step_is_not_run_again() {
 /// The report over the `forms` tree with `step` as its only step, building into `target`, with the
 /// cause of a rerun read from `evidence`.
 #[cfg(unix)]
-fn report_over(step: Step, target: &Path, evidence: &Path, reads: &Reads) -> Document {
+fn report_over(
+    steps: Vec<Step>,
+    target: &Path,
+    evidence: &Path,
+    reads: &Reads,
+    budget: Budget,
+) -> Document {
     let options = Options {
         root: Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -538,7 +684,7 @@ fn report_over(step: Step, target: &Path, evidence: &Path, reads: &Reads) -> Doc
         lanes: &[],
         ignored_runs: None,
         applications: None,
-        steps: Some(vec![step]),
+        steps: Some(steps),
         lister: PathBuf::from(env!("CARGO_BIN_EXE_kr-conformance")),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -546,7 +692,8 @@ fn report_over(step: Step, target: &Path, evidence: &Path, reads: &Reads) -> Doc
         )],
         part: None,
     };
-    report::run_with(&options, reads, &mut |_| {}).unwrap_or_else(|stopped| panic!("{stopped:?}"))
+    report::run_with(&options, reads, budget, &mut |_| {})
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"))
 }
 
 /// A report over a step that writes `source` (or an empty file) where a build script goes, in a
@@ -569,7 +716,13 @@ fn rerun_report(
     let marker = directory.path().join("ran-once");
     let mut arguments: Vec<&Path> = vec![&marker, &program];
     arguments.extend(source);
-    let document = report_over(step(&arguments), &target, kept.path(), &evidence.reads());
+    let document = report_over(
+        vec![step(&arguments)],
+        &target,
+        kept.path(),
+        &evidence.reads(),
+        Budget::of(Duration::from_secs(3600)),
+    );
     (document, kept, program)
 }
 
@@ -686,6 +839,65 @@ fn a_whole_program_the_linker_signed_is_not_taken_for_the_runner_s_disk() {
     assert!(document.rerun_annotations().is_empty());
 }
 
+/// A second run that is ended at its deadline does not stop the report: the step is red with the
+/// reason, the step after it runs, and the run returns its result, which is not a pass.
+#[cfg(unix)]
+#[test]
+fn the_report_returns_its_result_after_a_second_run_that_passed_its_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let kept = tempfile::Builder::new()
+        .prefix("kr-conformance-evidence.")
+        .tempdir()
+        .expect("an evidence directory");
+    let target = directory.path().join("target");
+    let unit = target.join("debug/build/x-0123456789abcdef");
+    std::fs::create_dir_all(&unit).unwrap();
+    std::fs::create_dir_all(target.join("debug/.fingerprint/x-0123456789abcdef")).unwrap();
+    let marker = directory.path().join("ran-once");
+    let pids = directory.path().join("pids");
+    let program = unit.join("build-script-build");
+    let mut sleeping = step(&[&marker, &program, Path::new(""), &pids]);
+    sleeping.command[2] = script_with_a_sleeping_second_run();
+    let mut after = step(&[]);
+    after.what = "a step after it".to_owned();
+    after.command = ["sh", "-c", "exit 0", "after"]
+        .iter()
+        .map(|word| (*word).to_owned())
+        .collect();
+    let document = report_over(
+        vec![sleeping, after],
+        &target,
+        kept.path(),
+        &Evidence::SHOWN.reads(),
+        Budget::of(Duration::from_secs(2)),
+    );
+    let numbers: Vec<u32> = std::fs::read_to_string(&pids)
+        .unwrap()
+        .lines()
+        .map(|line| line.trim().parse().unwrap())
+        .collect();
+    let started = Started(numbers);
+    let error = document.steps[0]
+        .error
+        .as_deref()
+        .expect("the step's error");
+    assert!(error.contains(fault::PASSED_ITS_TIME), "{error}");
+    assert_eq!(document.steps[1].exit, Some(0), "the step after it ran");
+    assert!(!document.passed());
+    assert_eq!(document.summary.failed_steps, [1]);
+    assert!(document.rerun_annotations().is_empty());
+    for _ in 0..100 {
+        if !started.0.iter().any(|pid| running(*pid)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "a process of the second run is still running: {:?}",
+        started.0
+    );
+}
+
 /// A run in which no step was run again prints neither the warning nor the count.
 #[cfg(unix)]
 #[test]
@@ -701,10 +913,11 @@ fn a_run_with_no_step_run_again_prints_no_warning_and_no_count() {
         .map(|word| (*word).to_owned())
         .collect();
     let document = report_over(
-        passing,
+        vec![passing],
         &directory.path().join("target"),
         evidence.path(),
         &no_evidence(),
+        Budget::of(Duration::from_secs(3600)),
     );
     assert!(document.passed());
     assert!(document.summary.rerun_steps.is_empty());

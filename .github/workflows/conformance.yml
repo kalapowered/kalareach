@@ -140,12 +140,18 @@ jobs:
       # 155 to 210. The limits of the job's steps add up to 286 of its 300 minutes, the other steps'
       # each at least twice the longest its step took in those nights (the disk step, at 2.7
       # minutes, has 6). The report's 240 minutes are 33 over the slowest night, and 10 over it with
-      # the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) added.
+      # the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) added. The
+      # step gives the report the moment its limit ends it (KR_REPORT_DEADLINE, from
+      # REPORT_MINUTES, which is the limit), so that a step run again is ended before the limit
+      # ends the report with no result.
       - name: The conformance report
         timeout-minutes: 240
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
+          REPORT_MINUTES: 240
         run: |
+          KR_REPORT_DEADLINE="$(( $(date +%s) + REPORT_MINUTES * 60 ))"
+          export KR_REPORT_DEADLINE
           read -r -a names <<< "$REPORT_GROUPS"
           arguments=()
           for name in ${names[@]+"${names[@]}"}; do
@@ -368,12 +374,17 @@ jobs:
       # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The report's 287
       # minutes are 22 over 8 November's need with its outage, 25 over it without, and 3 over it
       # with the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) in place
-      # of the outage.
+      # of the outage. The step gives the report the moment its limit ends it
+      # (KR_REPORT_DEADLINE, from REPORT_MINUTES, which is the limit), so that a step run again is
+      # ended before the limit ends the report with no result.
       - name: The conformance report
         timeout-minutes: 287
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
+          REPORT_MINUTES: 287
         run: |
+          KR_REPORT_DEADLINE="$(( $(date +%s) + REPORT_MINUTES * 60 ))"
+          export KR_REPORT_DEADLINE
           read -r -a names <<< "$REPORT_GROUPS"
           arguments=()
           for name in ${names[@]+"${names[@]}"}; do
@@ -554,14 +565,19 @@ jobs:
       # theirs, less 3 minutes for the set-up and clean-up that no step limit counts: the limits of
       # the job's steps add up to 352 of its 355 minutes. A part takes about half of the plan and
       # the two builds that open it: 128 and 123 minutes in the run of 12 November, so the limit
-      # is more than twice what a part needs and a part keeps more than a quarter of it.
+      # is more than twice what a part needs and a part keeps more than a quarter of it. The step
+      # gives the report the moment its limit ends it (KR_REPORT_DEADLINE, from REPORT_MINUTES,
+      # which is the limit), so that a step run again is ended before the limit ends the report with
+      # no result.
       - name: The conformance report
         if: ${{ !cancelled() }}
         timeout-minutes: 281
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
           REPORT_PART: ${{ matrix.part }}
+          REPORT_MINUTES: 281
         run: |
+          $env:KR_REPORT_DEADLINE = [string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + [long]$env:REPORT_MINUTES * 60)
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $arguments = @()

@@ -901,3 +901,36 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
         }
     }
 }
+
+/// The report step of each job gives the report the moment its limit ends it, so that a step run
+/// again is ended before the limit ends the report with no result. The minutes it names are the
+/// step's own limit, and the step turns them into the moment before the report starts.
+#[test]
+fn the_report_step_of_each_conformance_job_gives_the_report_the_moment_its_limit_ends_it() {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
+        .expect("the conformance workflow");
+    let mut seen = 0;
+    for name in jobs_of(&workflow) {
+        for step in steps_of(&job(&workflow, &name))
+            .iter()
+            .filter(|step| step.contains("name: The conformance report"))
+        {
+            seen += 1;
+            let limit = value_at(step, 8, "timeout-minutes").expect("the step's limit");
+            let minutes = value_at(step, 10, "REPORT_MINUTES");
+            assert_eq!(
+                minutes.as_deref(),
+                Some(limit.as_str()),
+                "the report step of the {name} job names its limit as REPORT_MINUTES"
+            );
+            assert!(
+                step.contains("KR_REPORT_DEADLINE") && step.contains("REPORT_MINUTES * 60"),
+                "the report step of the {name} job does not give the moment its limit ends it"
+            );
+        }
+    }
+    assert_eq!(
+        seen, 3,
+        "the linux, macos and windows jobs each have a report step"
+    );
+}

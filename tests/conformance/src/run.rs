@@ -99,9 +99,18 @@ impl Place<'_> {
     }
 }
 
-/// Runs `step`, the `number`th, at `place`, keeping its log under the evidence directory.
+/// Runs `step`, the `number`th, at `place`, keeping its log under the evidence directory. Where
+/// `deadline` is given, every process the step starts (its build, its listing and its run) is ended
+/// at it, as a group and then by a kill, and the step's error is the deadline's words, with the log
+/// as far as it was written.
 #[must_use]
-pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Package]) -> Executed {
+pub fn execute(
+    step: &Step,
+    number: usize,
+    place: &Place<'_>,
+    packages: &[Package],
+    deadline: Option<&Deadline>,
+) -> Executed {
     let logs = place.evidence.join("conformance").join("logs");
     let slug: String = step
         .what
@@ -154,10 +163,10 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
     let tests =
         step.reading == Reading::Cargo && step.command.get(1).is_some_and(|word| word == "test");
     if tests {
-        let prepared = build_first(step, place, &log_path, packages)
+        let prepared = build_first(step, place, &log_path, packages, deadline)
             .and_then(|(built, map)| {
                 executed.built = built;
-                let listed = list(step, place, &log_path, &map, packages)?;
+                let listed = list(step, place, &log_path, &map, packages, deadline)?;
                 executables = map;
                 Ok(listed)
             })
@@ -175,7 +184,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
             }
         }
     }
-    let status = run_logged(&step.command, place, &log_path, &environment);
+    let status = run_logged(&step.command, place, &log_path, &environment, deadline);
     executed.seconds = started.elapsed().as_secs();
     match status {
         Ok(code) => executed.exit = code,
@@ -579,6 +588,7 @@ fn list(
     log_path: &Path,
     executables: &BTreeMap<String, TargetId>,
     packages: &[Package],
+    deadline: Option<&Deadline>,
 ) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
     let (variable, runner) = runner(place, "list-one")?;
     let own: Vec<&str> = executables
@@ -593,14 +603,14 @@ fn list(
         .cloned()
         .collect();
     command.extend(["--".to_owned(), "--list".to_owned()]);
-    let output = place
-        .command(&command)
+    let mut listing = place.command(&command);
+    listing
         .env(&variable, runner)
         .env(OWN_HARNESS_VARIABLE, own.join(","))
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("the step's tests could not be listed: {error}"))?;
+        .stdin(Stdio::null());
+    let output = run_bounded(&mut listing, (true, true), deadline).map_err(|unended| {
+        unended.said(|error| format!("the step's tests could not be listed: {error}"))
+    })?;
     let standard_error = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         let command = command.join(" ");
@@ -1015,6 +1025,7 @@ fn build_first(
     place: &Place<'_>,
     log_path: &Path,
     packages: &[Package],
+    deadline: Option<&Deadline>,
 ) -> Result<Built, String> {
     let mut command: Vec<String> = step
         .command
@@ -1031,14 +1042,13 @@ fn build_first(
         .map_err(|error| format!("{} could not be opened: {error}", log_path.display()))?;
     let _ = writeln!(log, "== the build before the run: {}", command.join(" "));
     let began = SystemTime::now();
-    let output = place
-        .command(&command)
-        .stdin(Stdio::null())
-        .stderr(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .output()
-        .map_err(|error| format!("{} could not be started: {error}", command[0]))?;
+    let mut build = place.command(&command);
+    build.stdin(Stdio::null()).stderr(Stdio::from(
+        log.try_clone().map_err(|error| error.to_string())?,
+    ));
+    let output = run_bounded(&mut build, (true, false), deadline).map_err(|unended| {
+        unended.said(|error| format!("{} could not be started: {error}", command[0]))
+    })?;
     if !output.status.success() {
         return Err(format!(
             "the step's tests did not build (exit {}); the log has the compiler's output",
@@ -1403,6 +1413,156 @@ fn is_named_by_digest(name: &str) -> bool {
     stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// When a step's run is ended, and what is said then.
+#[derive(Clone, Copy, Debug)]
+pub struct Deadline {
+    /// The moment the run is ended.
+    pub at: Instant,
+    /// The step's error when it is.
+    pub says: &'static str,
+}
+
+/// How long a step's processes are given to end when they are asked to, before the group they run
+/// in is killed.
+const END_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a run that has a deadline looks for its end.
+const POLL: Duration = Duration::from_millis(50);
+
+/// Why a run that was bounded did not give an exit status.
+enum Unended {
+    /// The program could not be started or waited for.
+    Io(std::io::Error),
+    /// The run passed its deadline and was ended, with what the deadline says.
+    Late(&'static str),
+}
+
+impl Unended {
+    /// The step's error: the deadline's own words, or `started` of the system's.
+    fn said(self, started: impl FnOnce(std::io::Error) -> String) -> String {
+        match self {
+            Self::Io(error) => started(error),
+            Self::Late(says) => says.to_owned(),
+        }
+    }
+}
+
+/// Puts the program in a process group of its own, which a deadline ends as a whole.
+#[cfg(unix)]
+fn in_own_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn in_own_group(_command: &mut Command) {}
+
+/// Ends the program and every process of its group: asks the group to end, gives it `END_GRACE`,
+/// then kills the group and the program. The group is named by the program's own number, which
+/// `in_own_group` made its number.
+#[cfg(unix)]
+fn end_tree(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let signal = |name: &str| {
+        let _ = Command::new("sh")
+            .args(["-c", "kill -s \"$1\" -- \"$2\"", "kill", name, &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    signal("TERM");
+    let asked = Instant::now();
+    while asked.elapsed() < END_GRACE && child.try_wait().is_ok_and(|ended| ended.is_none()) {
+        std::thread::sleep(POLL);
+    }
+    signal("KILL");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Ends the program and the processes it started, which `taskkill` follows by their parentage.
+#[cfg(not(unix))]
+fn end_tree(child: &mut std::process::Child) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reads a pipe to its end on a thread of its own, and sends what it held.
+fn drained(mut pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        let _ = send.send(bytes);
+    });
+    receive
+}
+
+/// What a drained pipe held, waiting `END_GRACE` for it: a process that outlives the program and
+/// keeps the pipe open leaves its end unread, and is not waited for.
+fn held(pipe: Option<std::sync::mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
+    pipe.and_then(|receive| receive.recv_timeout(END_GRACE).ok())
+        .unwrap_or_default()
+}
+
+/// Runs the program of `command` to its end and returns what `output` of the standard library
+/// would: the exit status and the standard output and error that are asked to be `capture`d, which
+/// are the first and second of the pair. A program whose output is redirected by `command` itself
+/// is not captured. Where `deadline` is given the program runs in a process group of its own, and
+/// when the deadline passes the group is ended, with what it wrote kept where it was written, and
+/// the run is [`Unended::Late`].
+fn run_bounded(
+    command: &mut Command,
+    capture: (bool, bool),
+    deadline: Option<&Deadline>,
+) -> Result<std::process::Output, Unended> {
+    if capture.0 {
+        command.stdout(Stdio::piped());
+    }
+    if capture.1 {
+        command.stderr(Stdio::piped());
+    }
+    let Some(deadline) = deadline else {
+        return command
+            .spawn()
+            .and_then(std::process::Child::wait_with_output)
+            .map_err(Unended::Io);
+    };
+    in_own_group(command);
+    let mut child = command.spawn().map_err(Unended::Io)?;
+    let standard_output = child.stdout.take().map(drained);
+    let standard_error = child.stderr.take().map(drained);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(std::process::Output {
+                    status,
+                    stdout: held(standard_output),
+                    stderr: held(standard_error),
+                });
+            }
+            Ok(None) if Instant::now() >= deadline.at => {
+                end_tree(&mut child);
+                return Err(Unended::Late(deadline.says));
+            }
+            Ok(None) => {
+                std::thread::sleep(POLL.min(deadline.at.saturating_duration_since(Instant::now())))
+            }
+            Err(error) => {
+                end_tree(&mut child);
+                return Err(Unended::Io(error));
+            }
+        }
+    }
+}
+
 /// Runs `command` at `place`, its standard output and error both appended to `log`, and returns
 /// its exit status (none when a signal ended it).
 fn run_logged(
@@ -1410,6 +1570,7 @@ fn run_logged(
     place: &Place<'_>,
     log_path: &Path,
     environment: &[(String, String)],
+    deadline: Option<&Deadline>,
 ) -> Result<Option<i32>, String> {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -1418,15 +1579,15 @@ fn run_logged(
         .map_err(|error| format!("{} could not be opened: {error}", log_path.display()))?;
     let _ = writeln!(log, "== {}", command.join(" "));
     let errors = log.try_clone().map_err(|error| error.to_string())?;
-    let status = place
-        .command(command)
-        .envs(environment.iter().map(|(name, value)| (name, value)))
+    let mut run = place.command(command);
+    run.envs(environment.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(errors))
-        .status()
-        .map_err(|error| format!("{} could not be started: {error}", command[0]))?;
-    Ok(status.code())
+        .stderr(Stdio::from(errors));
+    let output = run_bounded(&mut run, (false, false), deadline).map_err(|unended| {
+        unended.said(|error| format!("{} could not be started: {error}", command[0]))
+    })?;
+    Ok(output.status.code())
 }
 
 #[cfg(test)]

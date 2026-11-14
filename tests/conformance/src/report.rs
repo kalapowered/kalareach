@@ -446,10 +446,16 @@ pub fn map_for(options: &Options) -> Map {
 /// Returns why the run stopped before it ran anything: a mention the grammar refuses, or a map
 /// that cannot be trusted.
 pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document, Stopped> {
-    run_with(options, &fault::Reads::system(), progress)
+    run_with(
+        options,
+        &fault::Reads::system(),
+        fault::Budget::from_environment(),
+        progress,
+    )
 }
 
-/// Runs everything `options` asks for, with the evidence of a rerun's cause read from `reads`.
+/// Runs everything `options` asks for, with the evidence of a rerun's cause read from `reads` and
+/// the time for second runs that `budget` holds.
 ///
 /// # Errors
 ///
@@ -457,6 +463,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
 pub fn run_with(
     options: &Options,
     reads: &fault::Reads,
+    mut budget: fault::Budget,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Document, Stopped> {
     let started = timestamp();
@@ -532,7 +539,6 @@ pub fn run_with(
         None => steps,
     };
     let mut executed = Vec::new();
-    let mut rerun_budget = fault::RERUN_BUDGET;
     for (index, step) in steps.iter().enumerate() {
         progress(&format!(
             "step {} of {}: {} ({})",
@@ -551,7 +557,7 @@ pub fn run_with(
                 lister: &options.lister,
             },
             &map.packages,
-            &mut rerun_budget,
+            &mut budget,
             reads,
             &mut *progress,
         );

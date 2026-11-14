@@ -19,7 +19,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -45,12 +45,92 @@ const CODE_SIGNATURE: u32 = 0x1d;
 const HEAD_BYTES: usize = 65_536;
 
 /// How much time, in all, the report spends on the second runs of steps, counted by what each
-/// second run took. A step is not run again when nothing is left, or when its first run took
-/// longer than what is left, which is the least its second run takes: the report's own limit would
-/// end the run before it wrote its result, and a run that ends red with its result is better than
-/// one that ends with none. Five minutes is under the 10.5 that the slowest night, which ran the
-/// report to 276 of its 287 minutes, left.
+/// second run took, and the most any one second run is given: a second run is ended when the time
+/// left is up. A step is not run again when nothing is left, or when its first run took longer than
+/// what is left, which is the least its second run takes. Five minutes is under the 10.5 that the
+/// slowest night, which ran the report to 276 of its 287 minutes, left.
 pub const RERUN_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// What the report keeps back, at the end of the time its job gives it, to write its result: a
+/// second run is ended this long before the job's own limit would end the report with no result.
+pub const RESULT_RESERVE: Duration = Duration::from_secs(2 * 60);
+
+/// The variable in which the workflow gives the moment its limit ends the report, in whole
+/// seconds since the epoch.
+pub const DEADLINE_VARIABLE: &str = "KR_REPORT_DEADLINE";
+
+/// What a step's error says when its second run was ended at its deadline.
+pub const PASSED_ITS_TIME: &str = "the second run passed its time";
+
+/// The time the report leaves for second runs: an account of [`RERUN_BUDGET`] that each second run
+/// takes its time from, and, where the workflow gives it, the moment the job's limit ends the
+/// report, less [`RESULT_RESERVE`].
+#[derive(Clone, Copy, Debug)]
+pub struct Budget {
+    left: Duration,
+    report_ends: Option<SystemTime>,
+}
+
+impl Budget {
+    /// An account of `left`, with no limit of the job's.
+    #[must_use]
+    pub fn of(left: Duration) -> Self {
+        Self {
+            left,
+            report_ends: None,
+        }
+    }
+
+    /// The same account, with the report ended by the job's limit at `ends`.
+    #[must_use]
+    pub fn until(self, ends: SystemTime) -> Self {
+        Self {
+            report_ends: Some(ends),
+            ..self
+        }
+    }
+
+    /// The account of [`RERUN_BUDGET`] and the job's limit that [`DEADLINE_VARIABLE`] names. A
+    /// value that is not a number of seconds is a limit that has already passed, so that no step
+    /// is run again on a workflow that gave one that could not be read.
+    #[must_use]
+    pub fn from_environment() -> Self {
+        Self::from_deadline(std::env::var(DEADLINE_VARIABLE).ok().as_deref())
+    }
+
+    /// The same, with the variable's value, where it is set, given.
+    fn from_deadline(value: Option<&str>) -> Self {
+        let account = Self::of(RERUN_BUDGET);
+        value.map_or(account, |text| {
+            account.until(text.trim().parse::<u64>().map_or(UNIX_EPOCH, |seconds| {
+                UNIX_EPOCH + Duration::from_secs(seconds)
+            }))
+        })
+    }
+
+    /// What is left of the account.
+    #[must_use]
+    pub fn left(&self) -> Duration {
+        self.left
+    }
+
+    /// How long a second run that starts at `now` may take: what is left of the account, or what
+    /// the job's limit leaves after [`RESULT_RESERVE`], whichever is less.
+    #[must_use]
+    pub fn allowed(&self, now: SystemTime) -> Duration {
+        self.report_ends.map_or(self.left, |ends| {
+            ends.duration_since(now)
+                .unwrap_or_default()
+                .saturating_sub(RESULT_RESERVE)
+                .min(self.left)
+        })
+    }
+
+    /// Takes the time a second run took from the account.
+    fn charge(&mut self, took: Duration) {
+        self.left = self.left.saturating_sub(took);
+    }
+}
 
 /// How long a program that was asked to end is given before it is killed.
 #[cfg(target_os = "macos")]
@@ -1229,21 +1309,26 @@ fn has_failed_test(done: &Executed) -> bool {
 /// and the report fails, and so it does where the first run's evidence could not be kept. The file
 /// has to be a program of Cargo's making that the step wrote. A step in which a test failed is not
 /// run again, and neither is one whose first run took longer than what `budget`, the time the
-/// report leaves for second runs, still holds; `budget` is what the second run takes from it. Nor
-/// is a step run again when what its removal would take cannot all be taken (see [`removal_of`]):
-/// it ends red with the reason and nothing of its units is removed.
+/// report leaves for second runs, still holds. Nor is a step run again when what its removal would
+/// take cannot all be taken (see [`removal_of`]): it ends red with the reason and nothing of its
+/// units is removed.
+///
+/// The second run has a deadline: what `budget` allows when the run starts. At it every process of
+/// the step is ended, and the step ends red with [`PASSED_ITS_TIME`] and its log as far as it was
+/// written, so that the report goes on to write its result. What the second run took is taken from
+/// `budget`.
 #[must_use]
 pub fn execute(
     step: &Step,
     number: usize,
     place: &Place<'_>,
     packages: &[Package],
-    budget: &mut Duration,
+    budget: &mut Budget,
     reads: &Reads,
     progress: &mut dyn FnMut(&str),
 ) -> Executed {
     let began = SystemTime::now();
-    let mut first = run::execute(step, number, place, packages);
+    let mut first = run::execute(step, number, place, packages, None);
     if first.error.is_none() && first.exit == Some(0) {
         return first;
     }
@@ -1278,13 +1363,14 @@ pub fn execute(
             .cloned()
             .collect::<Vec<_>>(),
     );
+    let allowed = budget.allowed(SystemTime::now());
     let refusal = if has_failed_test(&first) {
         Some("a test of the step failed".to_owned())
-    } else if budget.is_zero() || took > *budget {
+    } else if allowed.is_zero() || took > allowed {
         Some(format!(
-            "its first run took {} s and {} s are left for second runs",
+            "its first run took {} s and {} s are left for a second run",
             took.as_secs(),
-            budget.as_secs()
+            allowed.as_secs()
         ))
     } else {
         removal
@@ -1380,8 +1466,14 @@ pub fn execute(
         "  a file the step linked could not be started: {}; {reason}; the step is run again",
         relative.join(", ")
     ));
-    let mut second = run::execute(step, number, place, packages);
-    *budget = budget.saturating_sub(Duration::from_secs(second.seconds));
+    // The second run is given what is left when it starts, which the evidence read before it has
+    // taken from what was left when it was allowed.
+    let deadline = run::Deadline {
+        at: Instant::now() + budget.allowed(SystemTime::now()),
+        says: PASSED_ITS_TIME,
+    };
+    let mut second = run::execute(step, number, place, packages, Some(&deadline));
+    budget.charge(Duration::from_secs(second.seconds));
     if cause == Cause::Unexplained {
         let said = format!(
             "a file the step linked could not be started, and it was {reason}: the cause may be this repository's"
@@ -1649,6 +1741,48 @@ mod tests {
         assert_eq!(lowest_sample(text, 100, 130), Some(1_500_000));
         assert_eq!(lowest_sample(text, 111, 119), None);
         assert_eq!(lowest_sample("", 0, 10), None);
+    }
+
+    #[test]
+    fn a_second_run_is_allowed_what_the_account_and_the_jobs_limit_both_leave() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let seconds = Duration::from_secs;
+        let account = Budget::of(seconds(300));
+        assert_eq!(account.allowed(now), seconds(300), "no limit is given");
+        assert_eq!(
+            account.until(now + seconds(3600)).allowed(now),
+            seconds(300)
+        );
+        assert_eq!(
+            account
+                .until(now + RESULT_RESERVE + seconds(40))
+                .allowed(now),
+            seconds(40),
+            "the limit, less what the report keeps for its result, is the sooner"
+        );
+        assert_eq!(
+            account.until(now + seconds(30)).allowed(now),
+            Duration::ZERO
+        );
+        assert_eq!(account.until(now - seconds(5)).allowed(now), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_jobs_limit_is_read_from_the_variable_and_one_that_cannot_be_read_allows_nothing() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(Budget::from_deadline(None).allowed(now), RERUN_BUDGET);
+        assert_eq!(
+            Budget::from_deadline(Some("1010000")).allowed(now),
+            RERUN_BUDGET
+        );
+        assert_eq!(
+            Budget::from_deadline(Some("1000130")).allowed(now),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            Budget::from_deadline(Some("soon")).allowed(now),
+            Duration::ZERO
+        );
     }
 
     fn write(path: &Path, bytes: &[u8]) {
