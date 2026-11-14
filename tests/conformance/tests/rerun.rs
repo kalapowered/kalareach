@@ -361,38 +361,42 @@ fn a_file_of_a_unit_that_the_step_did_not_write_is_not_removed_and_the_step_is_n
     assert!(program.exists());
 }
 
-/// A disk image mounted below a unit, the case of a directory on another device. It is mounted
-/// for the case alone, and is ended with it.
+/// A disk image of 4 MiB, in the case's own directory on the disk the temporary directory is on,
+/// attached with no browser window at a directory of the case's own, never under `/Volumes`. It
+/// is detached when this is dropped, which happens on every ending of the case that unwinds. The
+/// image's file name is the case's name, so that a run that was killed and left its image
+/// attached can be found with `hdiutil info | grep a_mount_below_a_unit` and ended with
+/// `hdiutil detach -force <the mount point it shows>`.
 #[cfg(target_os = "macos")]
 struct Mounted(PathBuf);
 
 #[cfg(target_os = "macos")]
 impl Mounted {
-    fn at(directory: &Path, image: &Path) -> Self {
-        let succeeded = |command: &mut std::process::Command| {
-            command
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
+    /// Makes the image from the files of `source`, so that nothing but `hdiutil` writes to it, and
+    /// attaches it at `directory`. Where the image cannot be made or attached, the case fails with
+    /// what `hdiutil` said.
+    fn at(directory: &Path, image: &Path, source: &Path) -> Self {
+        let run = |command: &mut std::process::Command| {
+            let output = command
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("hdiutil could not be started");
+            assert!(
+                output.status.success(),
+                "hdiutil {:?} failed: {}{}",
+                command.get_args().collect::<Vec<_>>(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
-        assert!(
-            succeeded(
-                std::process::Command::new("hdiutil")
-                    .args(["create", "-size", "4m", "-fs", "HFS+", "-ov"])
-                    .arg(image)
-            ),
-            "the image was not made"
-        );
-        assert!(
-            succeeded(
-                std::process::Command::new("hdiutil")
-                    .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
-                    .arg(directory)
-                    .arg(image)
-            ),
-            "the image was not mounted"
-        );
+        run(std::process::Command::new("hdiutil")
+            .args(["create", "-size", "4m", "-fs", "HFS+", "-ov", "-srcfolder"])
+            .arg(source)
+            .arg(image));
+        run(std::process::Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
+            .arg(directory)
+            .arg(image));
         Self(directory.to_path_buf())
     }
 }
@@ -401,7 +405,7 @@ impl Mounted {
 impl Drop for Mounted {
     fn drop(&mut self) {
         let _ = std::process::Command::new("hdiutil")
-            .arg("detach")
+            .args(["detach", "-force"])
             .arg(&self.0)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -411,6 +415,8 @@ impl Drop for Mounted {
 
 /// A directory below a unit that is a mount of another volume is not entered: a removal that
 /// entered it would empty it. The step is not run again, and what is on the mounted volume stays.
+/// The image's one file is written by `hdiutil` when the image is made; the case reads nothing
+/// from the image but whether that file is still there.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_mount_below_a_unit_is_not_entered_and_the_step_is_not_run_again() {
@@ -418,8 +424,14 @@ fn a_mount_below_a_unit_is_not_entered_and_the_step_is_not_run_again() {
     let (program, unit) = unit_of(&tree);
     let point = unit.join("out");
     std::fs::create_dir_all(&point).unwrap();
-    let _mounted = Mounted::at(&point, &tree.directory.path().join("volume.dmg"));
-    std::fs::write(point.join("kept"), "kept").unwrap();
+    let source = tree.directory.path().join("volume-source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("kept"), "kept").unwrap();
+    let image = tree
+        .directory
+        .path()
+        .join("a_mount_below_a_unit_is_not_entered_and_the_step_is_not_run_again.dmg");
+    let _mounted = Mounted::at(&point, &image, &source);
     let done = fault::execute(
         &step(&[&tree.marker, &program]),
         1,
