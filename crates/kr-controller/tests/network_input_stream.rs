@@ -628,6 +628,72 @@ async fn a_detach_ends_the_stream_after_the_notice_of_the_lease_is_written_whole
     rig.stop().await;
 }
 
+/// The notice of an earlier epoch does not stand for the notice of the epoch the view holds when
+/// it is detached: the view lost the lease, took it again in a newer epoch, and is detached before
+/// that epoch's notice comes. The stream waits for that notice and tells the device, as a detach
+/// that follows no earlier notice does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_waits_for_the_notice_of_the_epoch_the_view_holds() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    rig.lane.send_window(lease_ended(&rig));
+    assert_eq!(
+        next_or_reset(&mut stream).await.expect("not reset"),
+        Some(InputAck::EpochEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+        "the device is told its first epoch ended"
+    );
+    let held = InputLeaseEpoch::new(rig.epoch.get() + 2);
+    rig.lane.send_window(LaneWindow {
+        epoch: held,
+        holder: true,
+        frames: 64,
+        bytes: U64::new(512 * 1024),
+        ended: Nullable::null(),
+    });
+
+    detach(&rig).await;
+    // One read is kept pending across the wait: a read that is dropped part way resets the stream.
+    let told = {
+        let mut read = std::pin::pin!(stream.read_message::<InputAck>());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut read)
+                .await
+                .is_err(),
+            "the stream waits for the notice of the epoch the view holds"
+        );
+        rig.lane.send_window(LaneWindow {
+            epoch: InputLeaseEpoch::new(held.get() + 1),
+            holder: false,
+            frames: 0,
+            bytes: U64::new(0),
+            ended: Nullable::some(LaneEnded {
+                epoch: held,
+                fenced_bytes: U64::new(3),
+            }),
+        });
+        tokio::time::timeout(WAIT, &mut read)
+            .await
+            .expect("the host answers in time")
+            .expect("not reset")
+    };
+    assert_eq!(
+        told,
+        Some(InputAck::EpochEnded {
+            epoch: held,
+            fenced_bytes: U64::new(3),
+        }),
+        "the device is told its newer epoch ended"
+    );
+    assert!(
+        matches!(next_or_reset(&mut stream).await, Ok(None)),
+        "the stream then ends cleanly"
+    );
+    rig.stop().await;
+}
+
 /// A detach whose worker sends no notice ends the stream when the wait for it is over, and the
 /// device is told nothing it was not told.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
