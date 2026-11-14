@@ -1073,9 +1073,9 @@ impl Controller {
     /// fence withdraws every connection, the one the presentation arrived on included. The
     /// presentation waits for that barrier, as a request that withdraws the host does, and settles
     /// with the proof of it ([`HostWithdrawal`]): the answer is then told while that revision is
-    /// still the one in force, since the only movement is the request's own. Every other answer,
-    /// a repeat of a lease in force with no change of its own and a refusal among them, derives
-    /// from an earlier event and is a copy.
+    /// still the one in force, since the only movement against this connection is the request's
+    /// own. Every other answer, a repeat of a lease in force with no change of its own and a
+    /// refusal among them, derives from an earlier event and is a copy.
     ///
     /// [`HostWithdrawal`]: super::barrier::HostWithdrawal
     pub(crate) async fn membership_present_settled(
@@ -1098,8 +1098,9 @@ impl Controller {
             }
             // A barrier that gave no proof, or that could not be raised (a fence may be owed, or the
             // registration may be gone), proves nothing of this request's own: the answer is a
-            // copy, which the door tells only under the strict check. The connection that the
-            // host-wide barrier withdrew fails it, so the caller is told it is not shown.
+            // copy, which the door tells only under the strict check. Either the host-wide barrier
+            // withdrew the connection, or the debt it did not retire stays published and a fence is
+            // owed: each fails the check, so the caller is told it is not shown.
             Ok((_, None)) | Err(_) => crate::given::Settled::of(Given::copied(answered)),
         }
     }

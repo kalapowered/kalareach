@@ -1270,8 +1270,8 @@ async fn a_lease_for_the_local_owner_that_ends_sooner_is_told_while_its_own_barr
 /// host a fence: the presentation waits for the barrier that retires it and settles with the proof
 /// of it, so its answer is told while that revision is still the one in force. The dropped lease has
 /// ended: its device is refused on a new connection. This is what `kr organisation present --chain`
-/// is told, and a hand-back that is limited to a lease that ends sooner would leave this answer to
-/// the debt pass's race.
+/// is told. A hand-back that is limited to a lease that ends sooner would leave this answer a copy,
+/// and the door would never tell it; the debt pass's race decides only which assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_in_force_presented_with_a_chain_that_drops_a_lease_is_told_while_its_own_barrier_stands()
  {
