@@ -206,6 +206,25 @@ async fn next_or_reset(stream: &mut DataStream) -> kr_transport::Result<Option<I
         .expect("the host answers or ends the stream in time")
 }
 
+/// Reads the stream to its end. A frame written after a restriction may be answered before the
+/// stream ends, and no answer may accept it: `first_unaccepted` is the sequence of the first frame
+/// written after the restriction. Returns what ended the stream.
+async fn reads_to_the_end(
+    stream: &mut DataStream,
+    first_unaccepted: u64,
+) -> kr_transport::Result<Option<InputAck>> {
+    loop {
+        match next_or_reset(stream).await {
+            Ok(Some(InputAck::Accepted { through, .. })) => assert!(
+                through.get() < first_unaccepted,
+                "a frame written after the restriction was accepted"
+            ),
+            Ok(Some(_)) => {}
+            ended => return ended,
+        }
+    }
+}
+
 /// Waits for a hold to say that what it holds has arrived.
 async fn arrived(at: tokio::sync::oneshot::Receiver<()>) {
     tokio::time::timeout(WAIT, at)
@@ -1125,18 +1144,20 @@ fn revision_of(rig: &Rig, bytes: &[u8]) -> u64 {
 }
 
 /// The rig's own device types beside `named`, which is the one a restriction is made on; both have
-/// typed one frame before it. Returns what the case needs after the restriction.
+/// typed one frame before it. Returns what the case needs after the restriction, and the second
+/// device itself: a device that is dropped can no longer learn that its stream ended, so the case
+/// holds it until it has read the stream.
 async fn two_typists_then(
     named: Second,
     rig: Rig,
     restrict: impl AsyncFnOnce(&Rig, &Second),
-) -> (Rig, DataStream, DataStream) {
+) -> (Rig, Second, DataStream, DataStream) {
     let mut unaffected = rig.open().await;
     let mut named_stream = rig.open_second(&named).await;
     type_and_wait(&rig, &mut unaffected, 0, b"1a").await;
     type_and_wait(&rig, &mut named_stream, 0, b"2a").await;
     restrict(&rig, &named).await;
-    (rig, named_stream, unaffected)
+    (rig, named, named_stream, unaffected)
 }
 
 /// What a restriction that names one device leaves, whichever way it names it: the device the restriction names loses its stream and nothing more of
@@ -1144,11 +1165,15 @@ async fn two_typists_then(
 /// host decides each of its frames afresh at the revision the restriction raised.
 async fn the_other_device_keeps_typing(
     rig: Rig,
+    named: Second,
     mut named_stream: DataStream,
     mut unaffected: DataStream,
 ) {
+    // The named device types once more after the restriction. Whether the write is refused or the
+    // stream is already reset, the frame is never given to the worker.
+    let _ = named_stream.write_message(&rig.frame(1, b"2b")).await;
     assert!(
-        next_or_reset(&mut named_stream).await.is_err(),
+        reads_to_the_end(&mut named_stream, 1).await.is_err(),
         "the device the restriction names is reset"
     );
     type_and_wait(&rig, &mut unaffected, 1, b"1b").await;
@@ -1160,6 +1185,7 @@ async fn the_other_device_keeps_typing(
         rig.lane.frames().iter().all(|frame| frame.bytes != b"2b"),
         "nothing of the named device's typing was passed on"
     );
+    drop(named);
     rig.stop().await;
 }
 
@@ -1168,16 +1194,17 @@ async fn the_other_device_keeps_typing(
 async fn a_restriction_that_names_a_device_ends_its_stream_and_leaves_the_other_typing() {
     let rig = Rig::start().await;
     let named = rig.second_typist().await;
-    let (rig, named_stream, unaffected) = two_typists_then(named, rig, async |rig, named| {
-        rig.adopted
-            .host
-            .network()
-            .revoke_device(named._paired.1.device_id)
-            .await
-            .expect("the device is revoked");
-    })
-    .await;
-    the_other_device_keeps_typing(rig, named_stream, unaffected).await;
+    let (rig, named, named_stream, unaffected) =
+        two_typists_then(named, rig, async |rig, named| {
+            rig.adopted
+                .host
+                .network()
+                .revoke_device(named._paired.1.device_id)
+                .await
+                .expect("the device is revoked");
+        })
+        .await;
+    the_other_device_keeps_typing(rig, named, named_stream, unaffected).await;
 }
 
 /// C16c, the host's half: a restriction that reaches the whole host takes every remote stream, and
@@ -1186,7 +1213,7 @@ async fn a_restriction_that_names_a_device_ends_its_stream_and_leaves_the_other_
 async fn a_restriction_that_reaches_the_whole_host_ends_every_remote_stream() {
     let rig = Rig::start().await;
     let named = rig.second_typist().await;
-    let (rig, mut named_stream, mut unaffected) =
+    let (rig, named, mut named_stream, mut unaffected) =
         two_typists_then(named, rig, async |rig, _named| {
             rig.adopted
                 .host
@@ -1195,9 +1222,19 @@ async fn a_restriction_that_reaches_the_whole_host_ends_every_remote_stream() {
                 .await;
         })
         .await;
-    assert!(next_or_reset(&mut named_stream).await.is_err());
-    assert!(next_or_reset(&mut unaffected).await.is_err());
+    // Both devices type once more after the restriction; neither frame is given to the worker.
+    let _ = named_stream.write_message(&rig.frame(1, b"2b")).await;
+    let _ = unaffected.write_message(&rig.frame(1, b"1b")).await;
+    assert!(
+        reads_to_the_end(&mut named_stream, 1).await.is_err(),
+        "the second device's stream is reset"
+    );
+    assert!(
+        reads_to_the_end(&mut unaffected, 1).await.is_err(),
+        "the first device's stream is reset"
+    );
     assert_eq!(rig.lane.frames().len(), 2, "nothing was passed on after it");
+    drop(named);
     rig.stop().await;
 }
 
