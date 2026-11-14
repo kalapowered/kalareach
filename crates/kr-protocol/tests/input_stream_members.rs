@@ -488,6 +488,24 @@ fn the_lane_messages_refuse_what_they_have_no_place_for() {
     ])));
 }
 
+/// The lane's messages refuse an unknown member in their JSON form as well.
+#[test]
+fn the_lane_messages_refuse_an_unknown_member_in_json() {
+    let lane = serde_json::json!({
+        "proxy_connection": "71717171-7171-7171-7171-717171717171",
+        "attachment_id": "61616161-6161-6161-6161-616161616161",
+    });
+    assert!(serde_json::from_value::<InputLane>(lane.clone()).is_ok());
+    let mut extra = lane;
+    extra["epoch"] = serde_json::json!("1");
+    assert!(serde_json::from_value::<InputLane>(extra).is_err());
+    let ended = serde_json::json!({ "epoch": "3", "fenced_bytes": "0" });
+    assert!(serde_json::from_value::<LaneEnded>(ended.clone()).is_ok());
+    let mut extra = ended;
+    extra["reason"] = serde_json::json!("takeover");
+    assert!(serde_json::from_value::<LaneEnded>(extra).is_err());
+}
+
 /// The messages that existed before the lane keep their bytes.
 #[test]
 fn the_events_before_the_lane_keep_their_bytes() {
