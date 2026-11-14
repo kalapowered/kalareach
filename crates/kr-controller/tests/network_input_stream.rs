@@ -1204,3 +1204,50 @@ async fn a_restriction_that_reaches_the_whole_host_ends_every_remote_stream() {
     assert_eq!(rig.lane.frames().len(), 2, "nothing was passed on after it");
     rig.stop().await;
 }
+
+/// C6, the end the plan is for: the device's control stream ends while its connection stands. The
+/// input stream goes with it, the next frame the device writes is never forwarded, and the lane
+/// ends.
+async fn the_control_stream_ends_while_the_connection_stands(reset: bool) {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+
+    if reset {
+        rig.device.reset_control().await;
+    } else {
+        rig.device.finish_control().await;
+    }
+    // The device keeps typing on its input stream: whatever the host does with the frame, it is
+    // never given to the worker.
+    let _ = stream.write_message(&rig.frame(1, b"b")).await;
+    let ended = loop {
+        match next_or_reset(&mut stream).await {
+            Ok(Some(InputAck::Accepted { through, .. })) => {
+                assert_eq!(through.get(), 0, "only the first frame was accepted");
+            }
+            other => break other,
+        }
+    };
+    assert!(
+        !matches!(ended, Ok(Some(_))),
+        "the input stream ends with the control stream: {ended:?}"
+    );
+    rig.lane.until_ended().await;
+    assert_eq!(
+        rig.lane.frames().len(),
+        1,
+        "the frame written after the control stream ended was not forwarded"
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_input_stream_ends_when_the_control_stream_is_finished_and_the_connection_stands() {
+    the_control_stream_ends_while_the_connection_stands(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_input_stream_ends_when_the_control_stream_is_reset_and_the_connection_stands() {
+    the_control_stream_ends_while_the_connection_stands(true).await;
+}
