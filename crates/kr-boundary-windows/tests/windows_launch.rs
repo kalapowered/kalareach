@@ -2866,10 +2866,12 @@ Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.
 /// command line that the machine's malware protection can stop before the service is asked; this
 /// case asks through the documented cmdlets, so that its output says what the service does with
 /// the request. Each step writes down its own answer (the result, or the exception's type, code
-/// and text), so that the run's output says which party refused. A refusal by another party's
-/// protection is not a result of the boundary's own means: the case still asserts that nothing
-/// started outside the job, and it does not say that the boundary holds where another party acted
-/// first.
+/// and text, and the text of every inner exception), so that the run's output says which party
+/// refused; the import of the module is a step of its own, so that a module that cannot be loaded
+/// in the child's own environment is told apart from a request that the service refused. A
+/// refusal by another party's protection is not a result of the boundary's own means: the case
+/// still asserts that nothing started outside the job, and it does not say that the boundary holds
+/// where another party acted first.
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_bits_cmdlets_start_nothing_outside_the_job_from_a_launched_child() {
@@ -2884,8 +2886,9 @@ fn the_bits_cmdlets_start_nothing_outside_the_job_from_a_launched_child() {
     let script = format!(
         r#"$m = '{program}'; $d = '{scratch}'
 'ran' | Out-File -FilePath "$d\ran.txt"
-function Step($label, [scriptblock]$body) {{ try {{ $r = & $body; "$label ok: $(($r | Out-String).Trim() -replace '\s+', ' ')" }} catch {{ "$label failed: $($_.Exception.GetType().Name) 0x$($_.Exception.HResult.ToString('X8')) $($_.Exception.Message.Trim() -replace '\s+', ' ')" }} }}
+function Step($label, [scriptblock]$body) {{ try {{ $r = & $body; "$label ok: $(($r | Out-String).Trim() -replace '\s+', ' ')" }} catch {{ $e = $_.Exception; $t = "$label failed: $($e.GetType().Name) 0x$($e.HResult.ToString('X8')) $($e.Message.Trim() -replace '\s+', ' ')"; $i = $e.InnerException; while ($i) {{ $t += " | inner: $($i.GetType().Name) 0x$($i.HResult.ToString('X8')) $($i.Message.Trim() -replace '\s+', ' ')"; $i = $i.InnerException }}; $t }} }}
 Step 'Get-Command' {{ (Get-Command Start-BitsTransfer -Syntax) }}
+Step 'Import-Module' {{ Import-Module BitsTransfer -ErrorAction Stop; 'loaded' }}
 Step 'Start-BitsTransfer' {{ $global:j = Start-BitsTransfer -Source 'C:\Windows\System32\drivers\etc\hosts' -Destination "$d\bits-ps-out.txt" -DisplayName 'KrLaunchPsJob' -NotifyCmdLine @($m, "x marker $d\bits-ps.txt") -Asynchronous -ErrorAction Stop; "state $($global:j.JobState)" }}
 Start-Sleep 10
 Step 'Get-BitsTransfer' {{ $s = Get-BitsTransfer -Name 'KrLaunchPsJob' -ErrorAction Stop; "state $($s.JobState)" }}
