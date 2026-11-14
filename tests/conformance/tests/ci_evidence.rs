@@ -3107,6 +3107,85 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             "",
             None,
         ),
+        (
+            "a Rust variable rebound on the line after a one-line first block",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let root = TempDir::new().unwrap();\nlet root = workspace.join(\"t\");\ncmd.env(\"@V@\", root.join(\"e\"));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let root = TempDir::new().unwrap();\n...\n| cmd.env(\"@V@\", root.join(\"e\"));\n\
+             value: root.join(\"e\")\nfolder: let root = TempDir::new().unwrap();",
+            Some("names the helper"),
+        ),
+        (
+            "a Rust field of self that the value flows through, assigned between the blocks",
+            vec![(
+                "crates/x/tests/t.rs",
+                "root: TempDir::new().unwrap(),\nfn path(&self, relative: &str) -> PathBuf {\n    self.root.path().join(relative)\n}\nself.root = other;\ncmd.env(\"@V@\", self.path(\"evidence\"));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| root: TempDir::new().unwrap(),\n| fn path(&self, relative: &str) -> PathBuf {\n\
+             | self.root.path().join(relative)\n| }\n...\n| cmd.env(\"@V@\", self.path(\"evidence\"));\n\
+             value: self.path(\"evidence\")\nfolder: root: TempDir::new().unwrap(),",
+            Some("names the helper"),
+        ),
+        (
+            "a Rust variable that a let of the value's variable names, rebound between the blocks",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = dir.path();\nlet dir = other();\ncmd.env(\"@V@\", root.join(\"e\"));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n| let root = dir.path();\n...\n\
+             | cmd.env(\"@V@\", root.join(\"e\"));\nvalue: root.join(\"e\")\nfolder: let dir = TempDir::new().unwrap();",
+            Some("names the helper"),
+        ),
+        (
+            "a Rust method of the same name as one in the value, called between the blocks",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = dir.path();\nlet x = other.join(\"y\");\ncmd.env(\"@V@\", root.join(\"e\"));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n| let root = dir.path();\n...\n\
+             | cmd.env(\"@V@\", root.join(\"e\"));\nvalue: root.join(\"e\")\nfolder: let dir = TempDir::new().unwrap();",
+            None,
+        ),
+        (
+            "a Rust function called in the value and between the blocks",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = dir.path();\nlet x = subdir(\"z\");\ncmd.env(\"@V@\", root.join(subdir(\"e\")));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n| let root = dir.path();\n...\n\
+             | cmd.env(\"@V@\", root.join(subdir(\"e\")));\nvalue: root.join(subdir(\"e\"))\nfolder: let dir = TempDir::new().unwrap();",
+            None,
+        ),
+        (
+            "a use of a constant that holds the name, read through the environment, that no entry holds",
+            vec![
+                a,
+                (
+                    "crates/x/src/lib.rs",
+                    "const ENV: &str = \"@V@\";\nfn f() { std::env::var_os(ENV); }\n",
+                ),
+            ],
+            held_a,
+            Some("a use of the constant"),
+        ),
+        (
+            "a held read whose first line is no read of the environment",
+            vec![("crates/x/src/lib.rs", "echo hi\nreturn;\n")],
+            "file: crates/x/src/lib.rs\nkind: read\n| echo hi\n| return;\nwhy: a reason",
+            Some("is not a read of the environment"),
+        ),
+        (
+            "a Rust field of the value, whose name another variable has, bound between the blocks",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = 5;\ncmd.env(\"@V@\", cfg.root);\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n...\n| cmd.env(\"@V@\", cfg.root);\n\
+             value: cfg.root\nfolder: let dir = TempDir::new().unwrap();",
+            None,
+        ),
     ];
     for (name, files, held, fails_with) in cases {
         let problems = findings(&tree(&files), &format!("\n{}\n", named(held)));
