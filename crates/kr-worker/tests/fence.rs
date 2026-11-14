@@ -10268,7 +10268,9 @@ async fn kr_req_13_11_the_answers_recorded_for_the_page_are_the_ones_a_worker_gi
 }
 
 /// Whether anything holds a file under `root` open: a file that is open without sharing cannot be
-/// opened without sharing, and that is also what refuses the removal of the folder it is in.
+/// opened without sharing, and that is also what refuses the removal of the folder it is in. It
+/// tests files and not directory handles: a directory that a process has as its current directory
+/// or holds open refuses the removal too, and is not seen here.
 #[cfg(windows)]
 fn a_file_under_is_held(root: &std::path::Path) -> bool {
     use std::os::windows::fs::OpenOptionsExt as _;
@@ -10313,9 +10315,10 @@ async fn a_closed_session_lets_go_of_its_files_when_its_fixture_is_dropped() {
     let _holder = holder_over(&mut client, &wired).await;
     let temp = wired.end().await;
     let root = temp.root().to_path_buf();
-    // The client is still connected. What is waited for is the condition, and the bound only
-    // says how long a failure takes.
-    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+    // The client is still connected. What is waited for is the condition, and the bound is how long
+    // the drop of a fixture's directory tries its removal again, so that this case fails where
+    // that drop prints its line.
+    let _ = tokio::time::timeout(kr_ipc::testing::REMOVAL_PATIENCE, async {
         while !files_open_under(&root).is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -10338,8 +10341,9 @@ async fn the_directory_of_a_closed_session_is_removed_at_the_first_try() {
     let temp = wired.end().await;
     let root = temp.root().to_path_buf();
     // Tasks and a thread of the session let go of its files after the fixture is dropped. What is
-    // waited for is the condition, and the bound only says how long a failure takes.
-    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+    // waited for is the condition, and the bound is how long the drop of a fixture's directory
+    // tries its removal again, so that this case fails where that drop prints its line.
+    let _ = tokio::time::timeout(kr_ipc::testing::REMOVAL_PATIENCE, async {
         while a_file_under_is_held(&root) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

@@ -228,7 +228,7 @@ impl PrivateTempDir {
 /// that did not end it, which the line the drop prints names by its case, and the directory is
 /// left to the cleanup of the temporary folder. A case that needs the tree gone, as one that starts
 /// a daemon whose own sweep holds a file for up to thirty seconds does, waits for it itself.
-const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+pub const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Removes `root` and what is in it. A removal that is refused is tried again for no longer than
 /// `patience`, which is no time at all when it is zero; the refusal that is left at the end is
