@@ -1249,9 +1249,9 @@ impl Store {
         Ok(())
     }
 
-    /// Refuses a store whose place is not on an NTFS volume: its `current` is a junction replaced
-    /// by the file system's own rename, and the store's files are read-only by access-control
-    /// list, which other file systems do not give the same meaning.
+    /// Refuses a store whose place is not on an NTFS volume: its `current` is a junction that is
+    /// pointed at a release in place, and the store's files are read-only by access-control list,
+    /// which other file systems do not give the same meaning.
     #[cfg(windows)]
     fn require_ntfs(&self) -> Result<()> {
         // The nearest directory that exists decides, since the store's own may not be made yet.
@@ -1275,9 +1275,9 @@ impl Store {
     /// A read that finds no `current`, or on Unix a `current` that is no link, reads again (three
     /// times in all) before it says so: on macOS a switch that runs while a read is under way can
     /// take away the link the read had looked up. A read held up three times in a row for as long
-    /// as a switch takes still gives that answer. On Windows a switch points the junction that is
-    /// there at the new release in place, so a read finds the old release or the new one whole at
-    /// every moment of it, and a read that is refused is an error that is not read again.
+    /// as a switch takes still gives that answer. On Windows a switch points the junction that the
+    /// store made at the new release in place, so a read finds the old release or the new one whole
+    /// at every moment of it, and a read that is refused is an error that is not read again.
     ///
     /// # Errors
     ///
@@ -2376,11 +2376,12 @@ impl Store {
     /// Makes `release` current: a `current` that is a junction is pointed at the release in place,
     /// in one step, and flushed. Where nothing is named `current`, as in a first install, or what
     /// is there is not a junction, a new junction is renamed over the name in one step instead, and
-    /// the store's directory is flushed so the rename survives a crash. Nothing else changes.
+    /// the store's directory is flushed so the rename survives a crash. Nothing else changes, and a
+    /// name that something else took meanwhile is left as it is.
     ///
-    /// A program that reads the link or walks a path through it meanwhile finds the old release or
-    /// the new one whole: the junction is not replaced while it is there, so no reader can meet it
-    /// half gone. A rename over it would replace the junction, and a reader whose open met the old
+    /// Where `current` is the junction this store made, a program that reads the link or walks a
+    /// path through it meanwhile finds the old release or the new one whole: the junction is not
+    /// replaced while it is there, so no reader can meet it half gone. A rename over it would replace the junction, and a reader whose open met the old
     /// one on its way out would be answered with access denied. A junction that this account cannot
     /// open to change is an error, and is not replaced by a rename.
     ///
@@ -2433,7 +2434,7 @@ impl Store {
             windows::Pointed::Moved => {
                 return Err(InstallError::Replaced {
                     path: self.current_link(),
-                    reason: "was replaced by something else while the switch pointed it at the release",
+                    reason: "no longer names the junction that the switch pointed at the release",
                 });
             }
             windows::Pointed::NotAJunction => {}
