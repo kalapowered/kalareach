@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +37,9 @@ DENIED = re.compile(
     r"^(vcruntime|msvcp|vcomp|concrt|vccorlib|vcamp|mfc\d|ucrtbase|msvcr|api-ms-win-crt-|libsodium)", re.I
 )
 API_SET = re.compile(r"^(api|ext)-ms-win-", re.I)
+# What an API set import looks like: the contract name and `.dll`, nothing else. The API set query is made
+# for no other form.
+API_SET_NAME = re.compile(r"(api|ext)-ms-win-[a-z0-9-]+\.dll", re.I)
 
 
 def dependents(text):
@@ -59,35 +63,54 @@ def dependents(text):
     return imports, delay
 
 
+def plain(name):
+    """Whether an import is a file name alone: no path part, no drive and no dot segment."""
+    return not any(mark in name for mark in "/\\:\0") and name not in (".", "..")
+
+
 def api_set_present(name):
-    """Whether this machine implements an API set contract, asked of the loader, which resolves the name
-    through the system's API set schema; None where the loader cannot be asked (not Windows)."""
+    """Whether this machine implements an API set contract, asked of the system's `IsApiSetImplemented`,
+    which answers from the API set schema and loads nothing; None where it cannot be asked (not Windows).
+
+    Only a plain API set name is asked about: the question takes the contract name without `.dll`."""
+    if API_SET_NAME.fullmatch(name) is None:
+        raise ValueError(f"{name!r} is no plain API set name, so the API set query is not made for it")
     if os.name != "nt":
         return None
     import ctypes
 
     try:
-        ctypes.WinDLL(name)
-    except OSError:
-        return False
-    return True
+        query = ctypes.WinDLL("api-ms-win-core-apiquery-l2-1-0.dll").IsApiSetImplemented
+    except (OSError, AttributeError):
+        return None
+    query.argtypes = [ctypes.c_char_p]
+    query.restype = ctypes.c_int
+    return bool(query(name[: -len(".dll")].encode("ascii")))
 
 
 def classify(name, system_dir, api_present=api_set_present):
-    """What a library is: DENIED, a Windows API set, a library of the system directory, or NOT FOUND.
+    """What a library is: DENIED, a Windows API set, a library of the system directory, NOT FOUND, a name
+    that is NOT A PLAIN NAME or an API set that this machine cannot be asked about (NOT CHECKED).
 
-    An API set is a name the loader resolves, so a name that this machine does not implement is NOT
-    FOUND, however well it is spelled."""
+    An import is a file name alone, so a name with a path part, a drive or a dot segment is refused, and
+    so is an API set name of any other form than the contract name and `.dll`. An API set is a name the
+    system resolves, so a name that this machine does not implement is NOT FOUND, however well it is
+    spelled, and where the system cannot be asked the name is not accepted by its prefix."""
+    if not plain(name):
+        return "NOT A PLAIN NAME"
     if DENIED.match(name):
         return "DENIED"
     if API_SET.match(name):
-        return "NOT FOUND" if api_present(name) is False else "a Windows API set"
+        if API_SET_NAME.fullmatch(name) is None:
+            return "NOT A PLAIN NAME"
+        answer = api_present(name)
+        return "NOT CHECKED" if answer is None else "a Windows API set" if answer else "NOT FOUND"
     if system_dir is not None and (system_dir / name).is_file():
         return "a Windows system library"
     return "NOT FOUND"
 
 
-def read_imports(dumpbin, program, system_dir):
+def read_imports(dumpbin, program, system_dir, api_present=api_set_present):
     """Each library the program imports with what it is, and the problems found; a read that cannot be made is a problem."""
     run = subprocess.run([dumpbin, "/nologo", "/dependents", str(program)], capture_output=True, text=True)
     if run.returncode != 0:
@@ -95,17 +118,19 @@ def read_imports(dumpbin, program, system_dir):
     imports, delay = dependents(run.stdout)
     if not imports:
         return [], [f"dumpbin listed no library for {program}, so its imports cannot be read"]
-    rows = [(name, classify(name, system_dir), "") for name in imports]
-    rows += [(name, classify(name, system_dir), " (delay-load)") for name in delay]
+    rows = [(name, classify(name, system_dir, api_present), "") for name in imports]
+    rows += [(name, classify(name, system_dir, api_present), " (delay-load)") for name in delay]
     why = {
         "DENIED": "a runtime library, which no program of the product imports",
         "NOT FOUND": "a library that is no Windows API set and is not in the system directory",
+        "NOT A PLAIN NAME": "a name with a path part, a drive or a dot segment, or an API set name of another form, which no import has and which the system is not asked about",
+        "NOT CHECKED": "an API set that this machine cannot be asked about (it can be asked on Windows only), so it is not accepted",
     }
     problems = [f"{program} imports {name}{note}, {why[what]}" for name, what, note in rows if what in why]
     return rows, problems
 
 
-def imports_command(dumpbin, programs, system_dir):
+def imports_command(dumpbin, programs, system_dir, api_present=api_set_present):
     problems = []
     for program in programs:
         path = Path(program)
@@ -114,7 +139,7 @@ def imports_command(dumpbin, programs, system_dir):
             continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         print(f"== {path.name}: {path.stat().st_size} bytes, sha256 {digest}")
-        rows, found = read_imports(dumpbin, path, system_dir)
+        rows, found = read_imports(dumpbin, path, system_dir, api_present)
         for name, what, note in rows:
             print(f"   {name + note:<44} {what}")
         problems += found
@@ -192,7 +217,7 @@ def control_command(dumpbin, system_dir):
     keep (no flag or setting of ours changes the level of the linker's messages).
     """
     failed = []
-    # The loader resolves an API set by name: a real contract must resolve here and one that does not exist must not.
+    # The system answers for an API set by name: a real contract must be implemented here and one that does not exist must not.
     for name, want in (("api-ms-win-core-synch-l1-2-0.dll", True), ("api-ms-win-core-nothing-of-the-kind-l1-1-0.dll", False)):
         got = api_set_present(name)
         print(f"control API set {name}: this machine implements it: {got}")
@@ -293,9 +318,53 @@ def self_test():
         check("an extension API set is named so", classify("ext-ms-win-gdi-desktop-l1-1-0.dll", system, implemented), "a Windows API set")
         check("a library that is nowhere is not found", classify("nowhere.dll", system), "NOT FOUND")
         check("with no system directory a plain library is not found", classify("kernel32.dll", None), "NOT FOUND")
-        for answer, want in ((False, "NOT FOUND"), (True, "a Windows API set"), (None, "a Windows API set")):
+        # The loader answers for a plain API set name alone: a plain name it knows, one it does not know, and
+        # where it cannot be asked (a machine that is not Windows) the name is not accepted by its prefix.
+        for answer, want in ((False, "NOT FOUND"), (True, "a Windows API set"), (None, "NOT CHECKED")):
             check(f"an API set that the loader answers {answer} for", classify("api-ms-win-core-x-l1-1-0.dll", None, lambda n, a=answer: a), want)
         check("a denied name is refused before the loader is asked", classify("api-ms-win-crt-heap-l1-1-0.dll", None, lambda n: True), "DENIED")
+        asked = []
+
+        def listening(name):
+            asked.append(name)
+            return True
+
+        for name in (
+            "api-ms-win-x/../helper.dll", "api-ms-win-core-x-l1-1-0.dll\\..\\helper.dll", "ext-ms-win-x/y.dll", "api-ms-win-core-x-l1-1-0.dll.exe",
+            "api-ms-win-core_x-l1-1-0.dll", "api-ms-win-core-x-l1-1-0", "ext-ms-win-c:x.dll", "api-ms-win-.dll", "api-ms-win-core-x-l1-1-0.dll\n",
+            "C:\\Windows\\System32\\kernel32.dll", "..\\kernel32.dll", "sub/kernel32.dll", "..", ".",
+        ):
+            check(f"the name {name!r} is refused as no plain name", classify(name, system, listening), "NOT A PLAIN NAME")
+        check("no such name is asked of the loader", asked, [])
+        check("an API set name in capitals is a plain name", classify("API-MS-WIN-CORE-X-L1-1-0.DLL", None, listening), "a Windows API set")
+        check("and the loader is asked for it", asked, ["API-MS-WIN-CORE-X-L1-1-0.DLL"])
+        try:
+            api_set_present("api-ms-win-x/../helper.dll")
+            check("the loader's question refuses a name that is not plain", "answered", "ValueError")
+        except ValueError:
+            pass
+        if os.name != "nt":
+            check("where the loader cannot be asked the answer is None", api_set_present("api-ms-win-core-synch-l1-2-0.dll"), None)
+
+        # The whole read, with `dumpbin` answering from a record: a program that lists an API set that the
+        # loader cannot be asked about, or a name with a path part, is refused with an error that says so.
+        program = system / "program.exe"
+        program.write_bytes(b"MZ")
+        records = {
+            "no loader": (CLEAN, lambda n: None, 1, ["cannot be asked about"]),
+            "a loader that knows them": (CLEAN, lambda n: True, 0, []),
+            "a loader that does not": (CLEAN, lambda n: False, 1, ["api-ms-win-core-synch-l1-2-0.dll, a library that is no Windows API set"]),
+            "a name with a path part": (CLEAN.replace("    ntdll.dll\n", "    ntdll.dll\n    api-ms-win-x/../helper.dll\n"), lambda n: True, 1, ["api-ms-win-x/../helper.dll"]),
+        }
+        for label, (record, loader, want_exit, want_in) in records.items():
+            answer = subprocess.CompletedProcess([], 0, stdout=record, stderr="")
+            out = io.StringIO()
+            with unittest.mock.patch.object(subprocess, "run", return_value=answer), contextlib.redirect_stdout(out):
+                code = imports_command("dumpbin", [str(program)], system, loader)
+            check(f"the read of a program with {label} ends with {want_exit}", code, want_exit)
+            errors = [row for row in out.getvalue().splitlines() if row.startswith("::error::")]
+            check(f"it names the cause with {label}", all(any(text in row for row in errors) for text in want_in), True)
+            check(f"it reports an error only when it refuses with {label}", bool(errors), want_exit == 1)
 
     for name in (
         "VCRUNTIME140.dll", "vcruntime140_1.dll", "VCRUNTIME140D.dll", "MSVCP140.dll", "msvcp140d.dll", "VCOMP140.DLL",
