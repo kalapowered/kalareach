@@ -112,9 +112,10 @@ pub fn dependencies(checkout: &Path, target: &str) -> Result<ReleaseDependencies
     })
 }
 
-/// The archive a Windows MSVC build links in place of compiling libsodium: the one the placing
-/// script holds by name and digest, which the cryptography reference must name the same. No other
-/// target links one.
+/// The archive a Windows MSVC build links in place of compiling libsodium when its environment
+/// names the directory the placing script filled: the one the script holds by name and digest,
+/// which the cryptography reference must name the same. The manifest of every other target leaves
+/// the member out. It records what the script fixes, not what a build linked.
 fn prebuilt_archive(checkout: &Path, target: &str) -> Result<Option<PrebuiltArchive>> {
     if !target.ends_with("-pc-windows-msvc") {
         return Ok(None);
