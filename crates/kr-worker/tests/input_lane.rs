@@ -1709,6 +1709,11 @@ async fn five_replacements_in_a_row_leave_no_lane_behind_but_the_last() {
     // Its window is whole, and it types: the flood's refusals stand ahead of the answer to the new
     // frame, which has to be an acceptance, and the terminal gets the key.
     last.sequence = 0;
+    assert_ne!(
+        rig.runtime.input().lock().ledger().reserved,
+        Cost::default(),
+        "the window is with the last lane"
+    );
     let typed = last.send(b"k").await;
     loop {
         match last.next_event().await {
