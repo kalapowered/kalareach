@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::session::{InputBatch, MAX_QUEUED_INPUT_BYTES, MAX_QUEUED_INPUT_FRAMES};
 
@@ -115,6 +115,11 @@ pub struct InputRoom {
     /// shut. Room that comes back while this is set is room for them, and the writer says so to
     /// the pump.
     replies_waiting: AtomicBool,
+    /// When the first answer that waits in the lane lapses, as a reading of the session's
+    /// continuous clock in milliseconds, or nothing when none waits. The pump looks again then, so
+    /// that an answer past its deadline is dropped and recorded when no room comes back and
+    /// nothing else happens.
+    reply_expiry_ms: AtomicU64,
     /// Woken when something is owed that only the session can do, among it the answers that wait
     /// in the lane for room.
     pump: Arc<tokio::sync::Notify>,
@@ -169,6 +174,21 @@ impl InputRoom {
         if self.replies_waiting() {
             self.pump.notify_one();
         }
+    }
+
+    /// Records when the first answer that waits in the lane lapses, and returns whether that
+    /// differs from what was recorded. Zero is no deadline: a clock reading of zero is the moment
+    /// the session began, and no answer is offered then.
+    pub(crate) fn set_reply_expiry(&self, at_ms: Option<u64>) -> bool {
+        self.reply_expiry_ms
+            .swap(at_ms.unwrap_or(0), Ordering::AcqRel)
+            != at_ms.unwrap_or(0)
+    }
+
+    /// Returns when the first answer that waits in the lane lapses, when one waits.
+    #[must_use]
+    pub(crate) fn reply_expiry(&self) -> Option<u64> {
+        Some(self.reply_expiry_ms.load(Ordering::Acquire)).filter(|at_ms| *at_ms != 0)
     }
 
     /// Returns what wakes the pump that serves the session.
