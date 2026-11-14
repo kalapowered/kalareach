@@ -1694,6 +1694,10 @@ pub enum RecordLeft {
         /// write that failed before that (before it created anything, or before the rename) changed
         /// nothing there, so nothing says that it published a record.
         renamed: bool,
+        /// Whether the run holds a write of its record from an earlier save (a proved one, or a
+        /// replacement that an earlier rename put at the manifest's name): that record may stand at
+        /// the name whatever became of the save that failed.
+        earlier_write: bool,
     },
 }
 
@@ -1720,6 +1724,7 @@ pub fn rollback_failed(failures: &[String], record: &RecordLeft, unread_prior: &
             why,
             stays,
             renamed,
+            earlier_write,
         } => {
             let left = if stays.is_empty() {
                 "this run held no object that it had made".to_owned()
@@ -1732,16 +1737,21 @@ pub fn rollback_failed(failures: &[String], record: &RecordLeft, unread_prior: &
                     found.words()
                 )
             } else {
-                // The write put nothing at the manifest's name. What stands there is what the read
-                // found: where it found nothing, or no read was made because the run never held a
-                // handle of the data directory (so it never wrote), no manifest of this run does.
+                // This write put nothing at the manifest's name; the words speak of this write
+                // alone. What stands there is what the read found: where it found nothing, or no
+                // read was made because the run never held a handle of the data directory (so it
+                // never wrote), no manifest of this run does; where it found an object or failed
+                // and the run holds an earlier write of its record, that record may stand there.
                 let nothing = match found {
                     NotProved::Absent => ", so no manifest of this run stands there",
                     NotProved::NotRead => ", so this run wrote no manifest",
+                    NotProved::Differs | NotProved::Unread(_) if *earlier_write => {
+                        ", and a record that an earlier write of this run left may stand there"
+                    }
                     NotProved::Differs | NotProved::Unread(_) => "",
                 };
                 format!(
-                    "the removal did not finish: {failed}. {}, and no write of this run's record reached the manifest's name ({why}){nothing}. What this run made and the rollback did not take away: {left}{unread_prior}",
+                    "the removal did not finish: {failed}. {}, and this write of the run's record did not reach the manifest's name ({why}){nothing}. What this run made and the rollback did not take away: {left}{unread_prior}",
                     found.words()
                 )
             }
