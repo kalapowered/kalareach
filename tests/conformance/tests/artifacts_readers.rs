@@ -421,3 +421,71 @@ fn a_report_that_only_looks_makes_nothing_where_the_variable_is_not_set() {
     let refused = run(Some(OsStr::new("/etc/kr-evidence")));
     assert!(!refused.status.success());
 }
+
+/// The store script's device leg keeps its output under the store's own folder, which is outside
+/// every temporary root, and runs the release check with an evidence folder its reader accepts.
+#[cfg(unix)]
+#[test]
+fn the_store_legs_release_check_keeps_its_evidence_under_the_temporary_folder() {
+    let outside = tempfile::Builder::new()
+        .prefix("store-leg-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("a folder beside the build");
+    let case = tempfile::tempdir().expect("a folder for the case");
+    let tree = case.path().join("tree");
+    let scratch = case.path().join("scratch");
+    std::fs::create_dir_all(tree.join("scripts/lib")).expect("makes the tree");
+    std::fs::create_dir_all(&scratch).expect("makes the temporary folder");
+    std::fs::copy(
+        repository().join("scripts/lib/artifacts-dir.sh"),
+        tree.join("scripts/lib/artifacts-dir.sh"),
+    )
+    .expect("copies the reader");
+    // The release check as far as the evidence goes: it reads the directory through the reader and
+    // keeps a file in it, as the real one does.
+    std::fs::write(
+        tree.join("scripts/e2e-android-release.sh"),
+        r#". "$(dirname "$0")/lib/artifacts-dir.sh"
+kr_artifacts_dir
+mkdir -p "$kr_artifacts/release-tls-android"
+printf '%s\n' "$KR_RELEASE_APK" >"$kr_artifacts/release-tls-android/run.log"
+"#,
+    )
+    .expect("writes the check");
+    let leg = outside.path().join("device").join("leg");
+    std::fs::create_dir_all(&leg).expect("makes the leg");
+    let run = Command::new("bash")
+        .args([
+            "-c",
+            r#". "$1"; kr_store_release_tls "$2" "$3" "$4""#,
+            "bash",
+        ])
+        .arg(repository().join("scripts/lib/store-build.sh"))
+        .arg(&tree)
+        .arg("universal.apk")
+        .arg(&leg)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", case.path())
+        .env("TMPDIR", &scratch)
+        .output()
+        .expect("runs the helper");
+    let log = std::fs::read_to_string(leg.join("e2e-release.log")).unwrap_or_default();
+    assert!(
+        run.status.success(),
+        "the release check ended with {:?}: {log}",
+        run.status
+    );
+    assert_eq!(
+        std::fs::read_to_string(leg.join("e2e/release-tls-android/run.log")).unwrap_or_default(),
+        "universal.apk\n",
+        "the leg did not get the check's evidence: {log}"
+    );
+    let left: Vec<_> = std::fs::read_dir(&scratch)
+        .expect("reads the temporary folder")
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the evidence folder was left behind: {left:?}"
+    );
+}

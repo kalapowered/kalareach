@@ -289,3 +289,19 @@ kr_store_guard_end() {
     kr_guard_repo=""
     return "$failed"
 }
+
+# kr_store_release_tls <repository> <package> <leg>: runs the release TLS check on <package> and
+# keeps its output in <leg>/e2e, where the leg's scan for secrets reads it. The check writes its
+# evidence under the temporary folder, as every test run does (a store's output folder is outside
+# the temporary roots, and the check refuses an evidence folder there), and the leg takes a copy.
+# Returns the check's status.
+kr_store_release_tls() {
+    local repository=$1 package=$2 leg=$3 evidence status
+    evidence="$(mktemp -d "${TMPDIR:-/tmp}/kr-store-evidence.XXXXXX")" || return 1
+    KR_TEST_ARTIFACTS_DIR="$evidence" KR_RELEASE_APK="$package" bash "$repository/scripts/e2e-android-release.sh" \
+        >"$leg/e2e-release.log" 2>&1
+    status=$?
+    mkdir -p "${leg:?}/e2e" && cp -R "$evidence/." "$leg/e2e/" || status=1
+    rm -rf -- "${evidence:?}"
+    return "$status"
+}
