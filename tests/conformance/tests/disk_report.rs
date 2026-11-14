@@ -55,6 +55,19 @@ fn the_sampler_ends_by_its_stop_file_and_a_process_that_holds_its_old_number_is_
 }
 
 #[test]
+fn a_stop_file_that_holds_another_token_does_not_stop_the_sampler() {
+    let state = tempfile::tempdir().expect("a state directory");
+    let body = "mkdir -p \"$state\"\n: > \"$samples\"\ninterval=0.2\n\
+         echo another-token > \"$stopfile\"\nstart_sampler\nsleep 1.5\n\
+         grep -q '^E ' \"$samples\" && { echo 'it ended on another token'; exit 1; }\n\
+         stop_sampler\n\
+         grep -q '^E ' \"$samples\" || { echo 'it did not end on its own'; exit 1; }\n\
+         echo done";
+    let (text, ok) = in_shell(state.path(), body);
+    assert!(ok && text.lines().any(|line| line == "done"), "{text}");
+}
+
+#[test]
 fn a_read_that_ends_at_once_signals_nothing_and_one_that_does_not_end_is_ended_by_its_own_alarm() {
     let state = tempfile::tempdir().expect("a state directory");
     let body = format!(
