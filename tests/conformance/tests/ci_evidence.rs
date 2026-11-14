@@ -1163,8 +1163,8 @@ enum Kind {
     Argument,
     /// A line that cannot run and that no line rule lets through.
     Comment,
-    /// A line that reads the variable and may fall back to a value of its own (a Rust read that is
-    /// not a `let ... else` that leaves); the first line of the entry is the read, the lines after
+    /// A line that reads the variable and may fall back to a value of its own (every Rust read);
+    /// the first line of the entry is the read, the lines after
     /// it hold the fallback.
     Read,
     /// Lines that name a helper variable of another entry and give it no new value (a message, a
@@ -1399,10 +1399,10 @@ fn occurrences(line: &str) -> Vec<usize> {
 /// - a shell expansion that gives no value: `$NAME`, `${NAME}`, `${NAME:?...}` and `${NAME:+...}`
 ///   (`${NAME:-}` with an empty default is a read only inside a block of a held entry, which holds
 ///   what the script falls back on; a default with text is a write);
-/// - the argument of Rust's `env::var` or `env::var_os` in a `let ... else {` statement, whose
-///   `else` has to leave, so that nothing falls back (any other Rust read is a held read);
+/// - the argument of Rust's `env::var` or `env::var_os` on the first line of a held read (every
+///   Rust read is held with its whole statement, so that what it falls back on is held too);
 /// - alone on an `export` line, which gives the variable no new value.
-fn is_a_read(line: &str, at: usize) -> bool {
+fn is_a_read(line: &str, at: usize, held_read: bool) -> bool {
     let (before, after) = (&line[..at], &line[at + VARIABLE.len()..]);
     if before.chars().next_back().is_some_and(is_word) || after.chars().next().is_some_and(is_word)
     {
@@ -1423,16 +1423,10 @@ fn is_a_read(line: &str, at: usize) -> bool {
     } else if before.ends_with('$') {
         !rest.starts_with('=')
     } else if before.ends_with("env::var_os(\"") || before.ends_with("env::var(\"") {
-        after.starts_with("\")") && is_let_else(line)
+        after.starts_with("\")") && held_read
     } else {
         before.trim() == "export" && after.trim().is_empty()
     }
-}
-
-/// Whether a line is a `let ... else {` statement, whose `else` block has to leave the function.
-fn is_let_else(line: &str) -> bool {
-    let line = line.trim();
-    line.starts_with("let ") && line.ends_with(" else {")
 }
 
 /// Whether the name at `at` is an expansion with an empty default, `${NAME:-}`.
@@ -1619,6 +1613,90 @@ fn helpers_of(entry: &Held) -> Vec<(String, bool)> {
     helpers
 }
 
+/// The variables of a Rust expression: lower-case words that are not a method or a path segment
+/// (after `.` or `::`), not a call or a macro (before `(` or `!`), not inside a string literal, and
+/// not a keyword.
+fn rust_variables(expression: &str) -> Vec<String> {
+    const KEYWORDS: [&str; 16] = [
+        "self", "crate", "super", "mut", "ref", "as", "true", "false", "in", "let", "if", "else",
+        "match", "return", "move", "fn",
+    ];
+    let characters: Vec<char> = expression.chars().collect();
+    let (mut variables, mut quoted, mut at) = (Vec::new(), false, 0);
+    while at < characters.len() {
+        let character = characters[at];
+        if character == '"' {
+            quoted = !quoted;
+        }
+        let starts = !quoted
+            && (character.is_ascii_lowercase() || character == '_')
+            && (at == 0 || !is_word(characters[at - 1]));
+        if !starts {
+            at += 1;
+            continue;
+        }
+        let end = (at..characters.len())
+            .find(|index| !is_word(characters[*index]))
+            .unwrap_or(characters.len());
+        let word: String = characters[at..end].iter().collect();
+        let previous = characters[..at].iter().rev().find(|c| !c.is_whitespace());
+        let next = characters[end..].iter().find(|c| !c.is_whitespace());
+        if !matches!(previous, Some('.' | ':'))
+            && !matches!(next, Some('(' | '!' | ':'))
+            && !KEYWORDS.contains(&word.as_str())
+        {
+            variables.push(word);
+        }
+        at = end;
+    }
+    variables
+}
+
+/// The name and the right-hand side of a Rust line `let name = rhs` or `let mut name = rhs`.
+fn rust_let(line: &str) -> Option<(String, &str)> {
+    let rest = line.trim().strip_prefix("let ")?;
+    let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+    let end = rest.find(|character: char| !is_word(character))?;
+    let right = rest[end..].trim_start().strip_prefix('=')?;
+    Some((rest[..end].to_owned(), right))
+}
+
+/// The Rust variables that an entry's value flows through: the variables of its value, the fields
+/// its definition lines read through `self.`, and the variables of the right-hand side of each
+/// `let` of those lines that binds one already found.
+fn rust_helpers_of(entry: &Held) -> Vec<String> {
+    let definitions = entry.definitions();
+    let mut helpers = rust_variables(&entry.value);
+    for line in &definitions {
+        for (at, _) in line.match_indices("self.") {
+            let field: String = line[at + 5..].chars().take_while(|c| is_word(*c)).collect();
+            if !field.is_empty() && !line[at + 5 + field.len()..].starts_with('(') {
+                helpers.push(field);
+            }
+        }
+    }
+    loop {
+        let before = helpers.len();
+        for line in &definitions {
+            if let Some((bound, right)) = rust_let(line)
+                && helpers.contains(&bound)
+            {
+                for variable in rust_variables(right) {
+                    if !helpers.contains(&variable) {
+                        helpers.push(variable);
+                    }
+                }
+            }
+        }
+        if helpers.len() == before {
+            break;
+        }
+    }
+    helpers.sort();
+    helpers.dedup();
+    helpers
+}
+
 /// Whether what follows a PowerShell variable assigns it, or may: an assignment operator, `++`,
 /// `--`, a list (`,`) or `in` (a `foreach`).
 fn assignment_follows(rest: &str) -> bool {
@@ -1634,6 +1712,13 @@ fn assignment_follows(rest: &str) -> bool {
 /// text, `$name` that no assignment follows. A bare `name`, `name=`, `read name`, `${name:=...}`,
 /// `${name%/}` and the like all name the helper otherwise, and fail.
 fn mentions_helper(line: &str, name: &str, powershell: bool) -> bool {
+    // PowerShell takes a name in any letter case.
+    let (line, name) = if powershell {
+        (line.to_ascii_lowercase(), name.to_ascii_lowercase())
+    } else {
+        (line.to_owned(), name.to_owned())
+    };
+    let (line, name) = (line.as_str(), name.as_str());
     line.match_indices(name).any(|(at, _)| {
         let (before, after) = (&line[..at], &line[at + name.len()..]);
         if before.chars().next_back().is_some_and(is_word)
@@ -1650,11 +1735,36 @@ fn mentions_helper(line: &str, name: &str, powershell: bool) -> bool {
     })
 }
 
+/// What is wrong with a held mention's own lines: a line that gives a variable a value gives it one
+/// that lies in a temporary folder.
+fn mention_problem(entry: &Held) -> Option<String> {
+    let text = entry
+        .parts
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    entry.parts.iter().flatten().find_map(|line| {
+        let (name, _) = assigned_name(line)?;
+        values_of(line, name)
+            .iter()
+            .any(|value| !lies_in_a_temporary_folder(value, &text, 6))
+            .then(|| {
+                format!(
+                    "held mention for {}: the line gives {name} a value outside a temporary folder: {line}",
+                    entry.file
+                )
+            })
+    })
+}
+
 /// What is wrong with an entry's proof that its value lies in a temporary folder.
 fn proof_problem(entry: &Held) -> Option<String> {
     let label = format!("held entry for {} ({})", entry.file, entry.held_line());
     match (&entry.kind, &entry.proof) {
-        (Kind::Comment | Kind::Mention, _) | (_, Proof::Reason) => None,
+        (Kind::Mention, _) => mention_problem(entry),
+        (Kind::Comment, _) | (_, Proof::Reason) => None,
         (_, Proof::Folder(folder)) => {
             let makes_one = ["TempDir::new(", "tempdir(", "env::temp_dir()"]
                 .iter()
@@ -1697,12 +1807,22 @@ fn located<'a>(files: &'a [(String, Vec<u8>)], entry: &Held) -> Result<Located<'
 fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
     let held = parse_held(held_text);
     let mut problems = Vec::new();
-    // The lines that the blocks of the entries of a file hold.
+    // The lines that the blocks of the entries of a file hold, and the Rust variables that the values
+    // of a file's entries flow through.
     let mut block_lines: HashSet<(&str, usize)> = HashSet::new();
+    let mut rust_names: HashMap<&str, Vec<String>> = HashMap::new();
     for entry in &held {
         if let Ok((_, spans)) = located(files, entry) {
             for (from, to) in spans {
                 block_lines.extend((from..to).map(|line| (entry.file.as_str(), line)));
+            }
+            if matches!(entry.proof, Proof::Folder(_))
+                && matches!(entry.kind, Kind::Write | Kind::Argument)
+            {
+                rust_names
+                    .entry(entry.file.as_str())
+                    .or_default()
+                    .extend(rust_helpers_of(entry));
             }
         }
     }
@@ -1720,6 +1840,19 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
         };
         problems.extend(proof_problem(entry));
         if entry.kind == Kind::Mention {
+            // A mention does not bind a Rust variable that a value of the file flows through.
+            for line in entry.parts.iter().flatten() {
+                if let Some((bound, _)) = rust_let(line)
+                    && rust_names
+                        .get(entry.file.as_str())
+                        .is_some_and(|names| names.contains(&bound))
+                {
+                    problems.push(format!(
+                        "held mention for {}: the line binds {bound}, a variable that a held value flows through: {line}",
+                        entry.file
+                    ));
+                }
+            }
             continue;
         }
         let last = if entry.kind == Kind::Read {
@@ -1757,6 +1890,31 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
                             entry.file,
                             number + 1,
                             text.trim()
+                        ));
+                    }
+                }
+            }
+        }
+        // A Rust variable that the entry's value flows through is bound from its first block to the
+        // held line; every line between them that names it, outside the blocks, is held as a mention.
+        if matches!(entry.proof, Proof::Folder(_))
+            && matches!(entry.kind, Kind::Write | Kind::Argument)
+        {
+            let passes = lines_that_cannot_run(&entry.file, &lines);
+            for name in rust_helpers_of(entry) {
+                for number in spans[0].0 + 1..last {
+                    if !passes[number]
+                        && !block_lines.contains(&(entry.file.as_str(), number))
+                        && !word_positions(lines[number], &name).is_empty()
+                    {
+                        problems.push(format!(
+                            "{}:{}: this line names the helper {name} of a held entry, a variable \
+                             that its value flows through, outside the lines it holds: {}\n  Write \
+                             the line another way, or add it to the held list as a `kind: mention` \
+                             entry with its reason.",
+                            entry.file,
+                            number + 1,
+                            lines[number].trim()
                         ));
                     }
                 }
@@ -1814,10 +1972,11 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
                 .map_or(&[][..], Vec::as_slice);
             if entries
                 .iter()
-                .any(|entry| matches!(held[*entry].kind, Kind::Comment | Kind::Read))
+                .any(|entry| held[*entry].kind == Kind::Comment)
             {
                 continue;
             }
+            let held_read = entries.iter().any(|entry| held[*entry].kind == Kind::Read);
             if passes[index] || occurrences(line).is_empty() {
                 continue;
             }
@@ -1834,7 +1993,7 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
             let held_block = block_lines.contains(&(path.as_str(), index));
             let unexplained = occurrences(line).into_iter().any(|at| {
                 !spans.iter().any(|(from, to)| (*from..*to).contains(&at))
-                    && !is_a_read(line, at)
+                    && !is_a_read(line, at, held_read)
                     && !(held_block && is_empty_default(line, at))
             });
             if unexplained {
@@ -1883,8 +2042,7 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
                 if !passes[index]
                     && !uses.is_empty()
                     && alias_of(line).as_deref() != Some(name)
-                    && !held_read
-                    && !(is_let_else(line) && uses.iter().all(read))
+                    && !(held_read && uses.iter().all(read))
                 {
                     problems.push(format!(
                         "{path}:{}: a use of the constant {name}, which holds the variable's name, \
@@ -1972,19 +2130,30 @@ fn tracked_files(root: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
 ///    `for name`, `printf -v name`, `unset name`, `${name:=x}`, `${name%/}` and a bare word in a
 ///    message. The case lists no assignment form; it knows plain uses and refuses the rest. This
 ///    refuses some lines that change nothing (a log line that prints `name=$name`, a trailing
-///    comment or quoted text that names the helper, an assignment for one child command). A person
-///    then writes the line another way, or holds it as a `mention` entry with its reason.
-/// 3. A held read with a fallback. A read of the variable that is not a `let ... else {` statement
-///    (whose `else` has to leave, so that it falls back on nothing) is a held read: its entry
-///    holds the lines that follow it, and shows by a folder line that what it falls back on is a
-///    temporary directory, or states that it falls back on no value. A shell read with an empty
+///    comment or quoted text that names the helper, an assignment for one child command, and in
+///    PowerShell a read of the variable that a comma follows, as in `@($env:NAME, $other)`, since a
+///    comma can also make the variable one of several assignment targets). A person then writes
+///    the line another way (the name last in the list, or read into a variable first), or holds
+///    it as a `mention` entry with its reason. A held mention may not give a helper a value
+///    outside a temporary folder, nor bind a Rust variable that a held value flows through.
+///    A Rust variable that the value of an entry with a folder proof flows through (the variables
+///    of its value, the fields its lines read through `self.`, and the variables of the `let`
+///    lines that bind them) is held the same way, from the entry's first block to its held line,
+///    where a Rust name is bound from its `let` to the end of its block: every line there that
+///    names it, outside the blocks, is held as a mention or fails.
+/// 3. A held read. Every Rust read of the variable is held with its whole statement, since an
+///    `else` block can return a value of its own: the entry holds the `let ... else {` line, the
+///    `else` block and its closing line, or the `if let` and the lines that follow it, so that a
+///    changed `else` or fallback breaks the hold. It shows by a folder line that what the read
+///    falls back on is a temporary directory, or states a reason that it falls back on no value.
+///    A shell read with an empty
 ///    default (`${NAME:-}`) is allowed only inside a block of an entry, which holds the lines that
 ///    give the script's own default. A default with text (`${NAME:-default}`) is a held write.
 /// 4. A known read, and only these: `${{ env.NAME }}` in a workflow, `$env:NAME` in PowerShell, a
 ///    shell's `$NAME`, `${NAME}`, `${NAME:?...}` and `${NAME:+...}`, a call of Rust's `env::var` or
-///    `env::var_os` in a `let ... else {` statement, and a bare `export NAME`. A constant that
+///    `env::var_os` on the first line of a held read, and a bare `export NAME`. A constant that
 ///    holds the name (`const X: &str = "..."`) is allowed when every use of `X` in a file of its
-///    type is such a call.
+///    type is such a call on the first line of a held read.
 /// 5. A line that cannot run, by these rules only: a line that starts with `#` in a `.sh`,
 ///    `.bash`, `.yml`, `.yaml`, `.py` or `.ps1` file, but not one that starts with `#>` (which ends
 ///    a PowerShell block comment and may go on) or `#!`; a line that starts with `//` (so `///`
@@ -2002,7 +2171,8 @@ fn tracked_files(root: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
 /// joined string, a use of this file's own constant for the name), what an `env` entry does to
 /// `TEMP`, and a file that is not yet added to the index. A text hold detects a change to the lines
 /// it holds, and not a wrong change: it does not show that a held Rust value uses the directory its
-/// folder line makes, and a Rust helper is not guarded by name. A comment marker that stands first
+/// folder line makes, and a Rust variable is guarded only between the entry's first block and its
+/// held line. A comment marker that stands first
 /// on a line inside a string or a template literal is let through as a comment.
 ///
 /// Not shown here: that each run gets a directory of its own (the scripts' fixed default is shared
@@ -2367,7 +2537,9 @@ fn the_source_case_fails_on_what_it_does_not_know() {
                     "const ENV: &str = \"@V@\";\nfn f() {\n    let Some(x) = std::env::var_os(ENV) else {\n        return;\n    };\n}\n",
                 ),
             ],
-            held_a,
+            "file: scripts/a.sh\n| d=\"${@V@:-/tmp/kr-a}\"\nvalue: /tmp/kr-a\n\n\
+             file: crates/x/src/lib.rs\nkind: read\n| let Some(x) = std::env::var_os(ENV) else {\n| return;\n| };\n\
+             why: the else block leaves with no value",
             None,
         ),
         (
@@ -2735,13 +2907,13 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             Some("names the helper"),
         ),
         (
-            "a Rust read that is a let-else statement",
+            "a Rust let-else read that no entry holds",
             vec![(
                 "crates/x/src/lib.rs",
                 "fn f() {\n    let Some(x) = std::env::var_os(\"@V@\") else {\n        return;\n    };\n}\n",
             )],
             "",
-            None,
+            Some(unknown),
         ),
         (
             "a Rust read with a fallback that no entry holds",
@@ -2817,6 +2989,123 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             )],
             held_w,
             Some("names the helper"),
+        ),
+        (
+            "a Rust let-else read whose else returns a value of its own",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    let Some(x) = std::env::var_os(\"@V@\") else {\n        return PathBuf::from(\"target/e\");\n    };\n}\n",
+            )],
+            "",
+            Some(unknown),
+        ),
+        (
+            "a Rust let-else read that an entry holds",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    let Some(x) = std::env::var_os(\"@V@\") else {\n        return;\n    };\n}\n",
+            )],
+            "file: crates/x/src/lib.rs\nkind: read\n| let Some(x) = std::env::var_os(\"@V@\") else {\n| return;\n| };\nwhy: the else block leaves with no value",
+            None,
+        ),
+        (
+            "a held Rust let-else read whose else was changed",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    let Some(x) = std::env::var_os(\"@V@\") else {\n        return PathBuf::from(\"target/e\");\n    };\n}\n",
+            )],
+            "file: crates/x/src/lib.rs\nkind: read\n| let Some(x) = std::env::var_os(\"@V@\") else {\n| return;\n| };\nwhy: the else block leaves with no value",
+            Some("no line stands"),
+        ),
+        (
+            "a write on the first line of a held read",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    std::env::set_var(\"@V@\", \"/home/x\"); let Some(x) = std::env::var_os(\"@V@\") else {\n        return;\n    };\n}\n",
+            )],
+            "file: crates/x/src/lib.rs\nkind: read\n| std::env::set_var(\"@V@\", \"/home/x\"); let Some(x) = std::env::var_os(\"@V@\") else {\n| return;\n| };\n\
+             why: the else block leaves with no value",
+            Some(unknown),
+        ),
+        (
+            "a Rust variable that the value flows through, rebound between the blocks",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = dir.path();\nlet root = workspace.join(\"t\");\ncmd.env(\"@V@\", root.join(\"e\"));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n| let root = dir.path();\n...\n| cmd.env(\"@V@\", root.join(\"e\"));\nvalue: root.join(\"e\")\nfolder: let dir = TempDir::new().unwrap();",
+            Some("names the helper"),
+        ),
+        (
+            "a Rust variable that the value flows through, with no line between the blocks",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = dir.path();\nlet x = 1;\ncmd.env(\"@V@\", root.join(\"e\"));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n| let root = dir.path();\n...\n| cmd.env(\"@V@\", root.join(\"e\"));\nvalue: root.join(\"e\")\nfolder: let dir = TempDir::new().unwrap();",
+            None,
+        ),
+        (
+            "a Rust variable that the value flows through, bound again below the held line",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = dir.path();\ncmd.env(\"@V@\", root.join(\"e\"));\nlet root = 5;\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n| let root = dir.path();\n...\n| cmd.env(\"@V@\", root.join(\"e\"));\nvalue: root.join(\"e\")\nfolder: let dir = TempDir::new().unwrap();",
+            None,
+        ),
+        (
+            "a Rust variable that the value flows through, named in a held mention",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = dir.path();\nprintln!(\"{}\", root.display());\ncmd.env(\"@V@\", root.join(\"e\"));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n| let root = dir.path();\n...\n| cmd.env(\"@V@\", root.join(\"e\"));\nvalue: root.join(\"e\")\nfolder: let dir = TempDir::new().unwrap();\n\nfile: crates/x/tests/t.rs\nkind: mention\n| println!(\"{}\", root.display());\nwhy: a message",
+            None,
+        ),
+        (
+            "a held mention that binds the Rust variable again",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\nlet root = dir.path();\nlet root = workspace.join(\"t\");\ncmd.env(\"@V@\", root.join(\"e\"));\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n| let root = dir.path();\n...\n| cmd.env(\"@V@\", root.join(\"e\"));\nvalue: root.join(\"e\")\nfolder: let dir = TempDir::new().unwrap();\n\nfile: crates/x/tests/t.rs\nkind: mention\n| let root = workspace.join(\"t\");\nwhy: a reason",
+            Some("binds root"),
+        ),
+        (
+            "a held mention that gives a helper a value outside a temporary folder",
+            vec![("scripts/b.sh", "d=/tmp/x\nexport @V@=\"$d/e\"\nd=/home/y\n")],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e\n\n\
+             file: scripts/b.sh\nkind: mention\n| d=/home/y\nwhy: a reason",
+            Some("outside a temporary folder"),
+        ),
+        (
+            "a held mention that gives a helper a value in a temporary folder",
+            vec![("scripts/b.sh", "d=/tmp/x\nexport @V@=\"$d/e\"\nd=/tmp/y\n")],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e\n\n\
+             file: scripts/b.sh\nkind: mention\n| d=/tmp/y\nwhy: a reason",
+            None,
+        ),
+        (
+            "a PowerShell helper given another value in another letter case",
+            vec![(
+                ".github/workflows/w.yml",
+                "$t = (Get-Item $env:TEMP).FullName\n\"@V@=$t\\e\" >> $env:GITHUB_ENV\n$T = 'C:\\y'\n",
+            )],
+            held_w,
+            Some("names the helper"),
+        ),
+        (
+            "a PowerShell read that a comma follows",
+            vec![(".github/workflows/w.yml", "$paths = @($env:@V@, $x)\n")],
+            "",
+            Some(unknown),
+        ),
+        (
+            "a PowerShell read that ends a list",
+            vec![(".github/workflows/w.yml", "$paths = @($x, $env:@V@)\n")],
+            "",
+            None,
         ),
     ];
     for (name, files, held, fails_with) in cases {
@@ -3070,6 +3359,10 @@ folder: root: TempDir::new().expect("a directory for the case"),
 file: tests/e2e/m1b/tests/origin.rs
 | let path = std::env::temp_dir().join(format!("krm-{name}-{}-{nanos}", std::process::id()));
 ...
+| let scratch = Scratch::new("origin-checker");
+...
+| let scratch = Scratch::new("origin-scripts");
+...
 | let artefacts = scratch.0.join("artefacts");
 ...
 | .env("KR_TEST_ARTIFACTS_DIR", &artefacts)
@@ -3158,10 +3451,125 @@ kind: mention
 | mkdir -p "${artefacts_base:?}"
 why: guarded expansions (${name:?} stops when the name is empty); none gives a variable a value
 
+file: .github/workflows/wsl-acceptance.yml
+kind: mention
+| New-Item -ItemType Directory -Force C:\wsl\first | Out-Null
+why: the word Directory in a New-Item command for another folder (PowerShell names take any letter case); it gives no variable a value
+
 file: scripts/run-conformance.sh
 kind: mention
 | echo "  cargo run --locked -p kr-conformance --bin kr-conformance -- run --root . --evidence <a directory under %TEMP%>" >&2
 ...
 | echo "run-conformance: platform $platform, evidence $evidence"
 why: a usage message and a progress message that print the word evidence; neither gives a variable a value
+
+file: crates/kr-term/tests/perf.rs
+kind: read
+| let Some(dir) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
+| return;
+| };
+why: the else block leaves with no value: the read falls back on nothing
+
+file: crates/kr-transport/tests/support/conditions.rs
+kind: read
+| let Some(dir) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
+| return;
+| };
+why: the else block leaves with no value: the read falls back on nothing
+
+file: tests/conformance/tests/applications/harness.rs
+kind: read
+| let Some(directory) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
+| return;
+| };
+why: the else block leaves with no value: the read falls back on nothing
+
+file: tests/conformance/tests/fixtures/known/tests/flow.rs
+kind: read
+| let Some(directory) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
+| return;
+| };
+why: the else block leaves with no value: the read falls back on nothing
+
+file: tests/conformance/tests/device_scripts.rs
+kind: mention
+| let tree = root.join("tree");
+| let tools = root.join("tools");
+| let sdk = root.join("sdk");
+| let record = root.join("calls.log");
+...
+| fs::create_dir_all(companion.join("dist-harness")).expect("a directory");
+...
+| );
+| fs::create_dir_all(package.parent().expect("a parent")).expect("a directory");
+...
+| let package = outputs.join(package);
+| fs::create_dir_all(package.parent().expect("a parent")).expect("a directory");
+...
+| fs::create_dir_all(driver.parent().expect("a parent")).expect("a directory");
+...
+| fs::create_dir_all(&output).expect("a directory");
+...
+| let upload = root.join("secrets/android-upload");
+| fs::create_dir_all(&upload).expect("a directory");
+...
+| stand_in(&root.join("java/bin"), tool, &record, "exit 0");
+...
+| fs::write(root.join("avds.txt"), format!("{}\n", listed.join("\n"))).expect("a list");
+...
+| fs::write(root.join("running.txt"), format!("{serial}\tdevice\n")).expect("a device");
+| fs::write(root.join("running-avd.txt"), format!("{name}\n")).expect("a name");
+...
+| fs::write(root.join("booted"), "").expect("a flag");
+...
+| if let Some(name) = setup.boots_as {
+| fs::write(root.join("running-avd.txt"), format!("{name}\n")).expect("a name");
+...
+| fs::write(root.join("installs-fail"), "").expect("a flag");
+...
+| let folder = root.join("artefacts/pairing-device-android");
+| fs::create_dir_all(&folder).expect("a directory");
+...
+| let shots = root.join("shots");
+| fs::create_dir_all(&shots).expect("a directory");
+...
+| let stopped = root.join("emulator-stopped");
+...
+| root.join("avds.txt").display(),
+...
+| root.join("started.txt").display(),
+...
+| running_avd = root.join("running-avd.txt").display(),
+| booted = root.join("booted").display(),
+| running = root.join("running.txt").display(),
+| started = root.join("started.txt").display(),
+| installs_fail = root.join("installs-fail").display(),
+...
+| fs::create_dir_all(root.join("home")).expect("a directory");
+| fs::create_dir_all(root.join("scratch")).expect("a directory");
+...
+| .env("HOME", root.join("home"))
+| .env("TMPDIR", root.join("scratch"))
+why: the lines between the case's own directory and the environment it builds name the directory and its path; none binds either again
+
+file: tests/e2e/m1b/tests/origin.rs
+kind: mention
+| std::fs::create_dir(&path).expect("a scratch directory of this test's own");
+...
+| fn checker(scratch: &Path) -> PathBuf {
+| let placed = scratch.join("kr-e2e-m1b-origin");
+...
+| let checker = checker(&scratch.0);
+| let check = |arguments: &[&str]| {
+...
+| let checker = checker(&scratch.0);
+| let bin = scratch.0.join("bin");
+...
+| let text = scratch.0.join("cargo.text");
+...
+| let record = scratch.0.join("asked");
+...
+| let made = std::fs::read_dir(&artefacts).map_or(0, Iterator::count);
+| let _ = std::fs::remove_dir_all(&artefacts);
+why: the lines between the scratch directory and the environment the case builds name the directory and its artefacts folder; none binds either again
 "##;
