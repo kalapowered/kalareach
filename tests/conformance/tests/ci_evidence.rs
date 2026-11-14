@@ -1126,12 +1126,18 @@ fn leading_variable(value: &str) -> Option<&str> {
     (end > 0).then(|| &rest[..end])
 }
 
-/// Every non-empty value `text` gives the variable `name`, in a shell's spelling (`name=value`) or
-/// PowerShell's (`$name = value`).
-fn values_of(text: &str, name: &str) -> Vec<String> {
+/// Every non-empty value `text` gives the variable `name`, each with the line it stands on (counted
+/// from 0): in a shell's spelling (`name=value`), PowerShell's (`$name = value`) or a workflow's
+/// `env` (`name: value`).
+fn definitions_of(text: &str, name: &str) -> Vec<(usize, String)> {
     text.lines()
-        .filter_map(|line| {
+        .enumerate()
+        .filter_map(|(number, line)| {
             let line = line.trim();
+            if let Some(entry) = line.strip_prefix(&format!("{name}: ")) {
+                let value = unquoted(without_comment(entry));
+                return (!value.is_empty()).then(|| (number, value.to_owned()));
+            }
             let line = ["local ", "export ", "readonly "]
                 .iter()
                 .find_map(|word| line.strip_prefix(word))
@@ -1151,15 +1157,40 @@ fn values_of(text: &str, name: &str) -> Vec<String> {
             } else {
                 leading_value(rest)
             };
-            (!value.is_empty()).then_some(value)
+            (!value.is_empty()).then_some((number, value))
         })
         .collect()
 }
 
+/// Every non-empty value `text` gives the variable `name`, wherever it stands.
+fn values_of(text: &str, name: &str) -> Vec<String> {
+    definitions_of(text, name)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// The lines of `text` ahead of the line `number` (counted from 0).
+fn lines_before(text: &str, number: usize) -> String {
+    text.lines().take(number).collect::<Vec<_>>().join("\n")
+}
+
+/// Whether the variable `name` has a definition in `text` and every one lies in a temporary folder,
+/// each read from the lines that stand ahead of it: a definition made from a variable that is
+/// defined below it was made from nothing.
+fn defined_in_a_temporary_folder(name: &str, text: &str, depth: usize) -> bool {
+    let definitions = definitions_of(text, name);
+    !definitions.is_empty()
+        && definitions.iter().all(|(number, value)| {
+            lies_in_a_temporary_folder(value, &lines_before(text, *number), depth - 1)
+        })
+}
+
 /// Whether `value`, as a script or a workflow writes it, lies in a temporary folder: it begins with
 /// one, or with the default that a `${NAME:-default}` falls back on, or with a command that makes a
-/// directory in one, or with another variable of `text` whose every value does. A value made from
-/// the variable's own value is the one checked where that was set. A step up (`..`) is never inside.
+/// directory in one, or with another variable defined in `text` whose every value does, each read
+/// from what stands ahead of it. A value made from the variable's own value is the one checked where
+/// that was set. A step up (`..`) is never inside.
 fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
     let value = unquoted(value);
     if depth == 0 || value.is_empty() || value.split(['/', '\\']).any(|part| part == "..") {
@@ -1181,12 +1212,7 @@ fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
         } else if ["TMPDIR", "RUNNER_TEMP", "TEMP", "TMP"].contains(&name) {
             default == "/tmp" || in_a_folder
         } else {
-            let values = values_of(text, name);
-            in_a_folder
-                && !values.is_empty()
-                && values
-                    .iter()
-                    .all(|value| lies_in_a_temporary_folder(value, text, depth - 1))
+            in_a_folder && defined_in_a_temporary_folder(name, text, depth)
         };
     }
     if TEMPORARY_FOLDERS
@@ -1207,13 +1233,7 @@ fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
         }
         return lies_in_a_temporary_folder(&leading_value(rest), text, depth - 1);
     }
-    leading_variable(value).is_some_and(|name| {
-        let values = values_of(text, name);
-        !values.is_empty()
-            && values
-                .iter()
-                .all(|value| lies_in_a_temporary_folder(value, text, depth - 1))
-    })
+    leading_variable(value).is_some_and(|name| defined_in_a_temporary_folder(name, text, depth))
 }
 
 /// Every file under `directory` whose name ends in one of `endings`.
@@ -1247,12 +1267,104 @@ fn never_runs(step: &str) -> bool {
     })
 }
 
+/// Whether a line is a job's key in a workflow: two spaces and a name and a colon.
+fn is_job_key(line: &str) -> bool {
+    let line = without_comment(line);
+    line.len() > 3
+        && line.starts_with("  ")
+        && !line.starts_with("   ")
+        && !line.trim_start().starts_with('#')
+        && line.ends_with(':')
+}
+
+/// The lines a write on the line `number` (counted from 0) of `text` can read a definition from. In
+/// a workflow: the lines ahead of the jobs (the workflow's `env`), the job's lines down to its
+/// `steps:` (its `env`), and the lines of the step from its `- ` line to the write. A step is a shell
+/// of its own, so what an earlier step defines does not reach it, and nothing below the write does.
+/// In any other file: the lines above the write.
+fn visible_before(text: &str, number: usize, workflow: bool) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let before = &lines[..number.min(lines.len())];
+    let jobs = lines
+        .iter()
+        .position(|line| without_comment(line) == "jobs:")
+        .filter(|&jobs| workflow && jobs < before.len());
+    let Some(jobs) = jobs else {
+        return before.join("\n");
+    };
+    let job = before
+        .iter()
+        .rposition(|line| is_job_key(line))
+        .filter(|&at| at > jobs)
+        .unwrap_or(jobs);
+    let steps = before[job..]
+        .iter()
+        .position(|line| without_comment(line) == "    steps:")
+        .map(|at| job + at);
+    let mut visible = before[..jobs].to_vec();
+    if let Some(steps) = steps {
+        visible.extend_from_slice(&before[job..steps]);
+        let step = before[steps..]
+            .iter()
+            .rposition(|line| line.starts_with("      - "))
+            .map_or(before.len(), |at| steps + at);
+        visible.extend_from_slice(&before[step..]);
+    } else {
+        visible.extend_from_slice(&before[job..]);
+    }
+    visible.join("\n")
+}
+
+/// What the file `name` (a path under the repository) with the text `text` gives the artefacts
+/// directory that this case refuses, one line each, and how many values it read: a write of the
+/// variable that `writes_unread` reports, and a value, or a default, that does not lie in a
+/// temporary folder. A variable a value names is read from what `visible_before` gives for the line.
+fn refused_values(name: &str, text: &str) -> (Vec<String>, usize) {
+    let workflow = name.ends_with(".yml") || name.ends_with(".yaml");
+    let mut refused = Vec::new();
+    let mut seen = 0_usize;
+    for (number, line) in text.lines().enumerate() {
+        if writes_unread(line) {
+            refused.push(format!(
+                "{name}:{}: a write of the variable this case does not read: {}",
+                number + 1,
+                line.trim()
+            ));
+        }
+        let mut values: Vec<String> = artifacts_assignment(line).into_iter().collect();
+        seen += values.len();
+        if let Some(excused) = UNFOLLOWED_ASSIGNMENTS
+            .iter()
+            .find(|(file, needle, _)| *file == name && line.contains(needle))
+        {
+            assert!(!excused.2.is_empty(), "an exception names its reason");
+            values.clear();
+        }
+        for default in artifacts_defaults(line) {
+            seen += 1;
+            values.push(default);
+        }
+        if values.is_empty() {
+            continue;
+        }
+        let visible = visible_before(text, number, workflow);
+        for value in values {
+            if !lies_in_a_temporary_folder(&value, &visible, 6) {
+                refused.push(format!("{name}:{}: {value}", number + 1));
+            }
+        }
+    }
+    (refused, seen)
+}
+
 /// KR-REQ-27.03, the part about the build's directory: every workflow and script of the repository
 /// that gives the artefacts directory a value, or a default, puts it in a temporary folder (`/tmp`,
 /// or the runner's or the platform's own), and a job that runs a screenshot tool has the variable
 /// set when that step starts. The values are read as text, so a value spelled in a way this does
 /// not know is refused, and so is a write of the variable that it cannot read; the one assignment it
-/// cannot follow is named, with its reason.
+/// cannot follow is named, with its reason. A variable a value names is read from the lines of its
+/// own step ahead of the write, and from the `env` of its job and its workflow, never from a later
+/// line or step.
 ///
 /// Not shown here: that each run gets a directory of its own (the scripts' fixed default is shared
 /// by successive runs on one machine) and that on macOS the default is the OS-resolved `$TMPDIR`
@@ -1279,33 +1391,9 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
             .into_owned();
         let text =
             fs::read_to_string(path).unwrap_or_else(|error| panic!("{name} is read: {error}"));
-        for (number, line) in text.lines().enumerate() {
-            if writes_unread(line) {
-                outside.push(format!(
-                    "{name}:{}: a write of the variable this case does not read: {}",
-                    number + 1,
-                    line.trim()
-                ));
-            }
-            let mut values: Vec<String> = artifacts_assignment(line).into_iter().collect();
-            seen += values.len();
-            if let Some(excused) = UNFOLLOWED_ASSIGNMENTS
-                .iter()
-                .find(|(file, needle, _)| *file == name && line.contains(needle))
-            {
-                assert!(!excused.2.is_empty(), "an exception names its reason");
-                values.clear();
-            }
-            for default in artifacts_defaults(line) {
-                seen += 1;
-                values.push(default);
-            }
-            for value in values {
-                if !lies_in_a_temporary_folder(&value, &text, 6) {
-                    outside.push(format!("{name}:{}: {value}", number + 1));
-                }
-            }
-        }
+        let (refused, read) = refused_values(&name, &text);
+        outside.extend(refused);
+        seen += read;
     }
     assert!(seen >= 30, "the case found only {seen} values to read");
     assert!(
@@ -1476,4 +1564,190 @@ fn a_comparison_or_a_read_of_the_artifacts_directory_is_no_write() {
         "read as a write:\n{}",
         wrongly.join("\n")
     );
+}
+
+/// The lines of a sample workflow or script, as the file holds them.
+fn text_of(lines: &[&str]) -> String {
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+/// A sample workflow with one job, whose steps are the lines given, each step from its `- ` line.
+fn one_job(steps: &[&str]) -> String {
+    let head = [
+        "name: sample",
+        "jobs:",
+        "  windows:",
+        "    runs-on: windows-2025",
+        "    steps:",
+    ];
+    text_of(&[&head[..], steps].concat())
+}
+
+/// The step of the Windows job that writes the directory to the job's environment file, with
+/// `before` and `after` as the lines the step runs ahead of the write and below it.
+fn choosing_step<'a>(before: &[&'a str], after: &[&'a str]) -> Vec<&'a str> {
+    let mut step = vec![
+        "      - name: Choose where the tests keep their artefacts",
+        "        run: |",
+    ];
+    step.extend_from_slice(before);
+    step.push(WRITES_THE_DIRECTORY);
+    step.extend_from_slice(after);
+    step
+}
+
+const WRITES_THE_DIRECTORY: &str =
+    r#"          "KR_TEST_ARTIFACTS_DIR=$temporary\kr-test-artifacts" >> $env:GITHUB_ENV"#;
+const FINDS_THE_TEMPORARY_FOLDER: &str = "          $temporary = (Get-Item $env:TEMP).FullName";
+
+/// The refusals of `refused_values` for `text`, which holds one write of the variable.
+fn refusals_of(name: &str, text: &str) -> Vec<String> {
+    let (refused, seen) = refused_values(name, text);
+    assert!(seen >= 1, "the sample's write was not read");
+    refused
+}
+
+/// A variable a write names is resolved from the lines of its own step ahead of the write, and from
+/// nothing later. With the definition ahead of the write the write is read.
+#[test]
+fn a_definition_ahead_of_the_write_in_its_step_resolves_it() {
+    let workflow = one_job(&choosing_step(&[FINDS_THE_TEMPORARY_FOLDER], &[]));
+    let refused = refusals_of("workflow.yml", &workflow);
+    assert!(
+        refused.is_empty(),
+        "the right order is refused: {refused:?}"
+    );
+
+    let script = text_of(&[
+        "work=/tmp/kr-work",
+        r#"export KR_TEST_ARTIFACTS_DIR="$work/artifacts""#,
+    ]);
+    let refused = refusals_of("scripts/sample.sh", &script);
+    assert!(
+        refused.is_empty(),
+        "the right order is refused: {refused:?}"
+    );
+}
+
+/// The sequence the case once accepted: the step that writes the directory runs before the step
+/// that defines the folder it names, so the write gives a path under the drive's root, and a search
+/// of the whole workflow found the definition.
+#[test]
+fn a_definition_in_a_later_step_does_not_resolve_a_write() {
+    let later = [
+        "",
+        "      - name: Find the temporary folder",
+        "        run: |",
+        FINDS_THE_TEMPORARY_FOLDER,
+    ];
+    let steps = [choosing_step(&[], &[]), later.to_vec()].concat();
+    let refused = refusals_of("workflow.yml", &one_job(&steps));
+    assert_eq!(refused.len(), 1, "a later step resolves it: {refused:?}");
+}
+
+#[test]
+fn a_definition_after_the_write_in_its_step_does_not_resolve_it() {
+    let workflow = one_job(&choosing_step(&[], &[FINDS_THE_TEMPORARY_FOLDER]));
+    let refused = refusals_of("workflow.yml", &workflow);
+    assert_eq!(refused.len(), 1, "a line below resolves it: {refused:?}");
+}
+
+#[test]
+fn a_definition_below_the_write_of_a_script_does_not_resolve_it() {
+    let script = text_of(&[
+        r#"export KR_TEST_ARTIFACTS_DIR="$work/artifacts""#,
+        "work=/tmp/kr-work",
+    ]);
+    let refused = refusals_of("scripts/sample.sh", &script);
+    assert_eq!(refused.len(), 1, "a line below resolves it: {refused:?}");
+}
+
+/// Each step of a job is a shell of its own, so a variable one step defines is no definition for
+/// the next.
+#[test]
+fn a_definition_in_an_earlier_step_does_not_reach_a_later_one() {
+    let workflow = one_job(&[
+        "      - name: Find the temporary folder",
+        "        run: |",
+        "          temporary=/tmp/kr-temporary",
+        "",
+        "      - name: Choose where the tests keep their artefacts",
+        "        run: |",
+        r#"          export KR_TEST_ARTIFACTS_DIR="$temporary/evidence""#,
+    ]);
+    let refused = refusals_of("workflow.yml", &workflow);
+    assert_eq!(refused.len(), 1, "an earlier step resolves it: {refused:?}");
+}
+
+/// The workflow's `env` and the `env` of the job a write stands in stand before every step of it,
+/// and no other job's does.
+#[test]
+fn the_env_of_the_workflow_and_of_its_own_job_resolve_a_write() {
+    let workflow = text_of(&[
+        "name: sample",
+        "env:",
+        "  FOLDER: /tmp/kr-folder",
+        "jobs:",
+        "  first:",
+        "    runs-on: ubuntu-24.04",
+        "    env:",
+        "      JOB_FOLDER: /tmp/kr-job-folder",
+        "    steps:",
+        "      - name: Choose where the tests keep their artefacts",
+        "        run: |",
+        r#"          export KR_TEST_ARTIFACTS_DIR="$FOLDER/a""#,
+        r#"          export KR_TEST_ARTIFACTS_DIR="$JOB_FOLDER/b""#,
+        "  second:",
+        "    runs-on: ubuntu-24.04",
+        "    steps:",
+        "      - name: Choose where the tests keep their artefacts",
+        "        run: |",
+        r#"          export KR_TEST_ARTIFACTS_DIR="$FOLDER/c""#,
+        r#"          export KR_TEST_ARTIFACTS_DIR="$JOB_FOLDER/d""#,
+    ]);
+    let (refused, seen) = refused_values("workflow.yml", &workflow);
+    assert_eq!(seen, 4);
+    assert!(
+        refused.len() == 1 && refused[0].contains("$JOB_FOLDER/d"),
+        "the env of the workflow and the job: {refused:?}"
+    );
+}
+
+/// A chain of definitions is read in the order it runs: a variable made from another one that is
+/// defined after it was made from nothing.
+#[test]
+fn a_chain_of_definitions_is_read_in_the_order_it_runs() {
+    let in_order = text_of(&[
+        "base=/tmp/kr-base",
+        r#"folder="$base/folder""#,
+        r#"export KR_TEST_ARTIFACTS_DIR="$folder""#,
+    ]);
+    let refused = refusals_of("scripts/sample.sh", &in_order);
+    assert!(
+        refused.is_empty(),
+        "the right order is refused: {refused:?}"
+    );
+
+    let out_of_order = text_of(&[
+        r#"folder="$base/folder""#,
+        "base=/tmp/kr-base",
+        r#"export KR_TEST_ARTIFACTS_DIR="$folder""#,
+    ]);
+    let refused = refusals_of("scripts/sample.sh", &out_of_order);
+    assert_eq!(
+        refused.len(),
+        1,
+        "a later definition resolves it: {refused:?}"
+    );
+}
+
+/// A command that gives the variable and defines another on the same line expands its values before
+/// it assigns any, so the definition is no definition for that line.
+#[test]
+fn a_definition_on_the_line_of_the_write_does_not_resolve_it() {
+    let script = text_of(&[r#"work=/tmp/kr-work KR_TEST_ARTIFACTS_DIR="$work/e" run-it"#]);
+    let refused = refusals_of("scripts/sample.sh", &script);
+    assert_eq!(refused.len(), 1, "the same line resolves it: {refused:?}");
 }
