@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 pub mod environment;
+pub mod lane;
 pub mod pairing;
 pub mod room;
 pub mod worker;
