@@ -103,6 +103,24 @@ fn from_bash(text: &str) -> PathBuf {
     }
 }
 
+/// `path` as the reader is given it so that it reaches the reader as written: Git Bash on Windows
+/// is given `/c/Users/x`, since it settles a `C:\Users\x` before the reader sees it.
+fn spelled_for(reader: Reader, path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    if cfg!(windows)
+        && matches!(reader, Reader::Shell)
+        && bytes.len() >= 3
+        && bytes[1] == b':'
+        && bytes[0].is_ascii_alphabetic()
+    {
+        let drive = char::from(bytes[0].to_ascii_lowercase());
+        PathBuf::from(format!("/{drive}{}", text[2..].replace('\\', "/")))
+    } else {
+        path.to_owned()
+    }
+}
+
 fn readers() -> Vec<Reader> {
     let mut readers = Vec::new();
     if shell().is_some() {
@@ -326,8 +344,10 @@ fn a_run_without_the_variable_gets_a_directory_of_its_own_that_exists() {
                 .is_some_and(|exported| same(exported, &directory)),
             "{reader:?}: {reading:?}"
         );
+        // By its own name: Git Bash writes the rest of the path as `/c/Users/...`.
+        let name = directory.file_name().expect("a name").to_string_lossy();
         assert!(
-            reading.words.contains(&directory.display().to_string()),
+            reading.words.contains(&*name),
             "{reader:?} does not say where the directory is: {}",
             reading.words
         );
@@ -371,6 +391,9 @@ fn a_step_up_is_refused_even_when_it_ends_inside_a_root() {
             .join("evidence")
             .join("..")
             .join("evidence");
+        // Git Bash makes a Windows-style value into a Unix-style one and settles a step up while
+        // it does, so the value is given in the form it leaves alone.
+        let value = spelled_for(reader, &value);
         let reading = reader.read(Some(value.as_os_str()), None);
         assert_refused(
             reader,
