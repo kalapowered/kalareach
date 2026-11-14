@@ -35,11 +35,12 @@
 // - a Windows target on a machine that is not Windows, and on Windows an MSVC target that the
 //   configuration of `.cargo/config.toml` does not name (x86-64 and ARM64): the setting is made for the
 //   machine this runs on, and the target feature that makes the link static is given to those two;
-// - after a bare `--`, every word that begins with cargo's own `--config`, `--target` (`--target-dir`
-//   too), `--profile`, `--release` or `--manifest-path`, and the short forms `-r` and `-m`, alone or in a
-//   cluster of short flags (`-vr`): each can set the environment, the flags, the target, the profile or the directory that this
-//   command holds, and the build of libsodium's crate that is removed first is the one for the profile
-//   and target this command reads;
+// - after a bare `--`, every word but the ones that change no output (`--locked`, `--offline`, `--frozen`,
+//   `-v`, `-vv`, `-q`, `-j N`, `--jobs N`, `--keep-going`, `--timings`, `--color WHEN` and
+//   `--message-format FMT`): any other can set the environment, the flags, the target, the profile or the
+//   directory that this command holds, or make cargo build something else, or nothing, so that the bundle
+//   holds an earlier program, and the build of libsodium's crate that is removed first is the one for the
+//   profile and target this command reads;
 // - `CARGO_BUILD_TARGET`: the command line tool does not read it, so cargo would build for it into the
 //   directory of that target and the bundle would be made from the program of another build; a target
 //   is given as `--target`;
@@ -213,6 +214,44 @@ function targetProblem(triple, platform) {
   return null
 }
 
+/** What a value that follows `--color`, `--message-format` and `--jobs` can be (`cargo build --help` of the pinned toolchain). */
+const CARGO_WORDS = {
+  flags: ['--locked', '--offline', '--frozen', '--keep-going', '--timings'],
+  verbosity: /^-(v+|q)$/,
+  values: new Map([
+    ['--color', /^(auto|always|never)$/],
+    ['--message-format', /^(human|short|json|json-diagnostic-short|json-diagnostic-rendered-ansi|json-render-diagnostics)$/],
+    ['--jobs', /^(default|-?[0-9]+)$/],
+    ['-j', /^(default|-?[0-9]+)$/]
+  ])
+}
+
+/**
+ * The first word after a bare `--` that is not one of the words which change no output, or undefined. A value
+ * that follows as its own word is read with its option, so `--color always` is taken and `--color --release`
+ * is not (cargo reads the next word as the value and ends in an error where it is none). Cargo takes `-j`'s
+ * value glued (`-j4`), after an equals sign (`-j=4`) or as the next word, and `--jobs`' and the other two's
+ * after an equals sign or as the next word.
+ */
+export function cargoWordNotTaken(words) {
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index]
+    if (CARGO_WORDS.flags.includes(word) || CARGO_WORDS.verbosity.test(word)) continue
+    const value = CARGO_WORDS.values.get(word)
+    if (value !== undefined) {
+      if (words[index + 1] !== undefined && value.test(words[index + 1])) {
+        index += 1
+        continue
+      }
+      return words[index + 1] === undefined ? word : `${word} ${words[index + 1]}`
+    }
+    const joined = /^(--(?:color|message-format|jobs))=(.*)$/s.exec(word) ?? /^(-j)=?(.+)$/s.exec(word)
+    if (joined !== null && CARGO_WORDS.values.get(joined[1]).test(joined[2])) continue
+    return word
+  }
+  return undefined
+}
+
 /**
  * What is wrong with the arguments, or with the environment, that this was given, or null when it can
  * run them. The platform and the environment are passed in, so that each platform's answer can be held
@@ -255,20 +294,20 @@ export function refusal(argv, platform = process.platform, env = process.env) {
       "repository's Tauri configuration like `--config`, and can switch the bundle off or change what the bundle holds."
     )
   }
-  // What follows a bare `--` goes to cargo, which reads there what the checks here do not: `--config` can
-  // set the environment and the flags of the build, `--target` and `--manifest-path` choose what is built,
-  // and `--release`, `--profile` and `--target-dir` choose the build that this command holds and clears. Their
-  // short forms are refused too. Cargo reads a cluster of short flags from the left and ends it at the first
-  // letter that takes a value (`-p`, `-F`, `-j`, `-m`, `-Z`), so `r` and `m` count only where nothing but
-  // the flags `v`, `q` and `h` stand before them (`-rv`, `-vr`, `-qr`, `-vm path`; not `-pr`, a package `r`).
-  // A long option is refused by its name as a prefix, since Tauri reads its own options by prefix while cargo
-  // ends in an error on a word it does not know (`--profile-x=dev`); cargo takes no abbreviation of a name.
+  // What follows a bare `--` goes to cargo, which reads there what the checks here do not: `--config` can set the
+  // environment and the flags of the build, `--target`, `--manifest-path`, `--lib`, `-p` and `--workspace` choose
+  // what is built (or nothing, with exit 0, so that the bundle holds an earlier program), `--release` and
+  // `--profile` choose the build that this command holds and clears, and Tauri reads some of its own options
+  // from the same words. So only the words that change no output are taken (see CARGO_WORDS), and every other
+  // word is refused.
   const cargo = rest.includes('--') ? rest.slice(rest.indexOf('--') + 1) : []
-  const own = cargo.find((word) => /^(--(config|target|profile|release|manifest-path)|-[vqh]*[rm])/.test(word))
-  if (own !== undefined) {
+  const other = cargoWordNotTaken(cargo)
+  if (other !== undefined) {
     return (
-      `pnpm desktop does not pass \`${own}\` on to cargo (it was given \`${given}\`): it can change the environment, ` +
-      'the compiler flags, the target, the profile or the directory that this command holds. Give a target as `--target` ' +
+      `pnpm desktop does not pass \`${other}\` on to cargo (it was given \`${given}\`): after the \`--\` it takes only ` +
+      '`--locked`, `--offline`, `--frozen`, `-v`, `-vv`, `-q`, `-j N` and `--jobs N` (`-jN`, `-j=N`, `--jobs=N`), ' +
+      '`--keep-going`, `--timings`, `--color WHEN` and `--message-format FMT`, which change no output. Any other word can ' +
+      'change the environment, the compiler flags, the target, the profile or what is built. Give a target as `--target` ' +
       'before the `--`; a debug build is `--debug`.'
     )
   }
@@ -342,14 +381,17 @@ export function childArguments(argv) {
  * directory is shared by two sets of bytes. A name the caller gives is resolved by the rule of the
  * platform that runs, from where this was started, and is written with forward slashes: on Windows it
  * has a drive or a server in it, so that the placing script (the bash of Git for Windows) and the
- * crate's build script (a Windows program) read the same directory. A name that starts with a separator
- * and has no drive, `/c/cache`, is read from the root of the working directory's drive, as a Windows
- * program reads it, and not through Git's mount table, which would read it as `C:\cache`.
+ * crate's build script (a Windows program) read the same directory. A name that starts with one
+ * separator and has no drive, `/c/cache`, is read from the root of the working directory's drive, as a
+ * Windows program reads it, and not through Git's mount table, which would read it as `C:\cache`. A name
+ * with a drive and no separator after it (`C:cache`) is relative to the current directory of that drive,
+ * which the working directory, the placing script and the build do not read alike: the answer is null.
  */
 export function archiveDirectory(env, home, key, platform = process.platform, cwd = process.cwd()) {
   const named = environmentValue(env, ARCHIVE_VARIABLE, platform)
   const slashed = (path) => path.replaceAll('\\', '/')
   if (named === undefined || named === '') return slashed(`${home}/${key}`)
+  if (platform === WINDOWS && /^[A-Za-z]:(?![\\/])/.test(named)) return null
   return slashed((platform === WINDOWS ? win32 : posix).resolve(cwd, named))
 }
 
@@ -372,6 +414,12 @@ export function placeArchive(env, home = homedir(), platform = process.platform)
     return refused(key.error ? key.error.message : `\`--key\` ended with ${key.status}: ${key.stderr.trim()}`)
   }
   const directory = archiveDirectory(env, home, key.stdout.trim(), platform)
+  if (directory === null) {
+    return refused(
+      `${ARCHIVE_VARIABLE} is \`${environmentValue(env, ARCHIVE_VARIABLE, platform)}\`, a name relative to the current directory of a drive, ` +
+        'which this command, the script and the build do not read alike: give it a separator after the drive (`C:\\cache`) or no drive'
+    )
+  }
   const placed = spawnSync('bash', [ARCHIVE_SCRIPT, directory], {
     cwd: REPOSITORY,
     encoding: 'utf8',
