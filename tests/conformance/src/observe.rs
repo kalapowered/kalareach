@@ -56,11 +56,13 @@ pub struct Observed {
 }
 
 impl Observed {
-    /// Whether a program the step could not run shows damage, and no test ran and failed.
+    /// Whether every program the step could not run shows damage, and no test ran and failed. A
+    /// step that also names a program that is whole is not one the fault fits.
     #[must_use]
     pub fn damage_seen(&self) -> bool {
         !self.test_failed
-            && self.programs.iter().any(|program| {
+            && !self.programs.is_empty()
+            && self.programs.iter().all(|program| {
                 matches!(
                     &program.file,
                     Found::Read {
@@ -554,6 +556,7 @@ pub fn damage_of(head: &[u8], length: u64) -> Option<String> {
         || head.starts_with(b"\x7fELF")
         || head.starts_with(b"MZ")
         || head.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
+        || head.starts_with(&[0xca, 0xfe, 0xba, 0xbf])
     {
         return None;
     }
@@ -731,8 +734,9 @@ mod tests {
     }
 
     #[test]
-    fn a_step_with_a_failed_test_does_not_count_as_one_with_damage_seen() {
-        let damaged = Program {
+    fn a_step_counts_as_one_with_damage_seen_only_when_every_program_it_names_shows_damage_and_no_test_failed()
+     {
+        let program = |damage: Option<&str>| Program {
             path: "/t/a".to_owned(),
             lines: Vec::new(),
             said_by_runner: false,
@@ -742,17 +746,24 @@ mod tests {
                 first_bytes: String::new(),
                 modified: None,
                 created: None,
-                damage: Some("the file is empty".to_owned()),
+                damage: damage.map(str::to_owned),
             },
         };
-        let mut observed = Observed {
+        let observed = |programs: Vec<Program>, test_failed: bool| Observed {
             log: None,
-            programs: vec![damaged],
-            test_failed: false,
+            programs,
+            test_failed,
         };
-        assert!(observed.damage_seen());
-        observed.test_failed = true;
-        assert!(!observed.damage_seen());
+        let damaged = || program(Some("the file is empty"));
+        assert!(observed(vec![damaged()], false).damage_seen());
+        assert!(observed(vec![damaged(), damaged()], false).damage_seen());
+        assert!(!observed(vec![damaged()], true).damage_seen());
+        assert!(
+            !observed(vec![damaged(), program(None)], false).damage_seen(),
+            "a whole program beside a damaged one"
+        );
+        assert!(!observed(vec![program(None)], false).damage_seen());
+        assert!(!observed(Vec::new(), false).damage_seen());
     }
 
     #[test]
@@ -816,6 +827,8 @@ mod tests {
     fn a_short_script_or_a_program_of_another_system_is_not_shown_to_be_damaged() {
         assert_eq!(damage_of(b"#!/bin/sh\nexit 1\n", 17), None);
         assert_eq!(damage_of(b"\x7fELF\x02\x01", 6), None);
+        assert_eq!(damage_of(&[0xca, 0xfe, 0xba, 0xbe, 0, 0], 6), None);
+        assert_eq!(damage_of(&[0xca, 0xfe, 0xba, 0xbf, 0, 0], 6), None);
     }
 
     #[test]

@@ -292,11 +292,12 @@ impl Summary {
     #[must_use]
     pub fn failure_line(&self) -> Option<String> {
         (!self.failed_steps.is_empty()).then(|| {
+            let (failed, damaged) = (self.failed_steps.len(), self.failed_with_damage_seen.len());
             format!(
-                "{} failed steps: {} carry an observation of a program that could not be run with \
-                 damage seen, {} failed otherwise",
-                self.failed_steps.len(),
-                self.failed_with_damage_seen.len(),
+                "{failed} failed {}: {damaged} {} an observation of a program that could not be \
+                 run with damage seen, {} failed otherwise",
+                if failed == 1 { "step" } else { "steps" },
+                if damaged == 1 { "carries" } else { "carry" },
                 self.failed_otherwise.len()
             )
         })
@@ -410,8 +411,14 @@ fn build_directories(options: &Options) -> Vec<PathBuf> {
         .find(|(name, _)| name == "CARGO_TARGET_DIR")
         .map(|(_, value)| std::ffi::OsString::from(value))
         .or_else(|| std::env::var_os("CARGO_TARGET_DIR"));
-    std::iter::once(options.root.clone())
-        .chain(given.map(PathBuf::from))
+    directories_built_in(&options.root, given.as_deref())
+}
+
+/// The repository and the target directory `given`, which a step reads from the repository: a
+/// relative one lies below it.
+fn directories_built_in(root: &Path, given: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    std::iter::once(root.to_path_buf())
+        .chain(given.map(|target| root.join(target)))
         .collect()
 }
 
@@ -1853,6 +1860,51 @@ fn reproducing(runs: &[RunRecord]) -> Option<&RunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_target_directory_is_read_from_the_repository_a_step_runs_in() {
+        let root = Path::new("/work/repository");
+        let given = |target: &str| directories_built_in(root, Some(std::ffi::OsStr::new(target)));
+        assert_eq!(
+            given("target"),
+            [
+                PathBuf::from("/work/repository"),
+                PathBuf::from("/work/repository/target")
+            ]
+        );
+        assert_eq!(given("/cache/target")[1], PathBuf::from("/cache/target"));
+        assert_eq!(directories_built_in(root, None).len(), 1);
+    }
+
+    #[test]
+    fn the_last_line_counts_one_failed_step_in_the_singular() {
+        let summary = |failed: &[usize], damaged: &[usize]| Summary {
+            failed_steps: failed.to_vec(),
+            failed_with_damage_seen: damaged.to_vec(),
+            failed_otherwise: failed
+                .iter()
+                .filter(|step| !damaged.contains(step))
+                .copied()
+                .collect(),
+            ..Summary::default()
+        };
+        assert_eq!(
+            summary(&[1], &[1]).failure_line().unwrap(),
+            "1 failed step: 1 carries an observation of a program that could not be run with \
+             damage seen, 0 failed otherwise"
+        );
+        assert_eq!(
+            summary(&[1, 2], &[1]).failure_line().unwrap(),
+            "2 failed steps: 1 carries an observation of a program that could not be run with \
+             damage seen, 1 failed otherwise"
+        );
+        assert_eq!(
+            summary(&[3, 4], &[3, 4]).failure_line().unwrap(),
+            "2 failed steps: 2 carry an observation of a program that could not be run with \
+             damage seen, 0 failed otherwise"
+        );
+        assert_eq!(summary(&[], &[]).failure_line(), None);
+    }
 
     #[test]
     fn a_step_that_failed_before_listing_is_named_only_for_the_targets_it_would_have_run() {
