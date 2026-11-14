@@ -29,12 +29,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Libraries no program of the product imports: Visual C++'s runtime, its C++ library, OpenMP, the
-# concurrency runtime, C++/CX and C++ AMP, MFC, the universal runtime (the API sets and the library
-# behind them, debug builds included), older and debug runtimes (`msvcr120`, `msvcrt`, `msvcp140d`),
-# and libsodium's own library. The Windows component `msvcp_win` has the prefix of the C++ library and is
-# refused with it: no program of the product imports it.
+# concurrency runtime, C++/CX and C++ AMP, MFC and its managed libraries (`mfcm140`), the universal
+# runtime (the API sets and the library behind them, debug builds included), older and debug runtimes
+# (`msvcr120`, `msvcrt`, `msvcp140d`), and libsodium's own library. The Windows component `msvcp_win`
+# has the prefix of the C++ library and is refused with it: no program of the product imports it.
 DENIED = re.compile(
-    r"^(vcruntime|msvcp|vcomp|concrt|vccorlib|vcamp|mfc\d|ucrtbase|msvcr|api-ms-win-crt-|libsodium)", re.I
+    r"^(vcruntime|msvcp|vcomp|concrt|vccorlib|vcamp|mfcm?\d|ucrtbase|msvcr|api-ms-win-crt-|libsodium)", re.I
 )
 API_SET = re.compile(r"^(api|ext)-ms-win-", re.I)
 # What an API set import looks like: the contract name and `.dll`, nothing else. The API set query is made
@@ -370,9 +370,10 @@ def self_test():
         "VCRUNTIME140.dll", "vcruntime140_1.dll", "VCRUNTIME140D.dll", "MSVCP140.dll", "msvcp140d.dll", "VCOMP140.DLL",
         "CONCRT140.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "API-MS-WIN-CRT-STDIO-L1-1-0.dll", "ucrtbase.dll", "UCRTBASED.dll",
         "MSVCR120.dll", "msvcr100d.dll", "MSVCRT.dll", "libsodium.dll", "libsodium-26.dll",
+        "mfc140.dll", "MFC140U.dll", "mfcm140.dll", "MFCM140U.dll", "mfcm100d.dll",
     ):
         check(f"{name} is on the deny list", classify(name, None), "DENIED")
-    for name in ("api-ms-win-core-file-l1-2-0.dll", "KERNEL32.dll", "oleaut32.dll", "mscoree.dll", "bcryptprimitives.dll"):
+    for name in ("api-ms-win-core-file-l1-2-0.dll", "KERNEL32.dll", "oleaut32.dll", "mscoree.dll", "bcryptprimitives.dll", "mfcore.dll", "mfcmapi.dll"):
         check(f"{name} is not on the deny list", classify(name, None) == "DENIED", False)
 
     check("the program that imports the dynamic runtime has three more libraries", len(dependents(DYNAMIC)[0]), 13)
