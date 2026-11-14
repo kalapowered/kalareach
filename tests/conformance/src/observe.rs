@@ -189,7 +189,9 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
     let mut saw_126 = false;
     let mut shell_left_out = false;
     let mut compile_failed = false;
-    let mut failed_commands: Vec<String> = Vec::new();
+    // The commands of failed programs, each with whether the status it shows is the one the runner
+    // ends with for a program it could not start.
+    let mut failed_commands: Vec<(String, bool)> = Vec::new();
     // Whether a target's failure line was read and no cause has followed it yet.
     let mut target_without_cause = false;
     let mut in_test_output = false;
@@ -228,7 +230,8 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
         if let Some((_, rest)) = trimmed.split_once("process didn't exit successfully: `") {
             target_without_cause = false;
             if failed_commands.len() < MOST_FAILED_COMMANDS {
-                failed_commands.push(rest.split('`').next().unwrap_or_default().to_owned());
+                let (command, status) = rest.split_once('`').unwrap_or((rest, ""));
+                failed_commands.push((command.to_owned(), is_a_refusal_status(status)));
             } else {
                 facts.unexplained_failure = true;
             }
@@ -298,11 +301,22 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
     }
     facts.unexplained_failure |= compile_failed
         || target_without_cause
-        || failed_commands.iter().any(|command| {
-            !program_of(command)
-                .is_some_and(|program| found.iter().any(|known| known.path == program))
+        || failed_commands.iter().any(|(command, refusal_status)| {
+            !(*refusal_status
+                && program_of(command)
+                    .is_some_and(|program| found.iter().any(|known| known.path == program)))
         });
     (found, facts)
+}
+
+/// Whether `status`, the text after a failed command in Cargo's line about it, is a status that a
+/// program gets for not being started: 1, which the runner ends with, or 126, which the shell does.
+fn is_a_refusal_status(status: &str) -> bool {
+    status
+        .trim_start()
+        .strip_prefix("(exit status: ")
+        .and_then(|rest| rest.split_once(')'))
+        .is_some_and(|(code, _)| matches!(code, "1" | "126"))
 }
 
 /// Whether `line` is Cargo's first line about a target that failed.
@@ -1079,6 +1093,28 @@ mod tests {
             ])
             .unexplained_failure
         );
+    }
+
+    #[test]
+    fn a_failed_command_of_a_refused_program_is_accounted_for_only_with_the_status_the_runner_gives()
+     {
+        // The runner ends with status 1 for a program it could not start, and only that status (or
+        // the shell's 126) accounts for the failed command of a refused program.
+        let refused = "kr-conformance run-one: /t/a could not start: no";
+        let facts = |status: &str| {
+            let failed =
+                format!("  process didn't exit successfully: `/r run-one /t/a` ({status})");
+            refusals(text(&[refused, &failed])).1
+        };
+        assert!(!facts("exit status: 1").unexplained_failure);
+        // The shell ends with 126 for a program it could not execute.
+        assert!(!facts("exit status: 126").unexplained_failure);
+        assert!(facts("exit status: 101").unexplained_failure);
+        assert!(facts("exit status: 2").unexplained_failure);
+        assert!(facts("exit status: 10").unexplained_failure);
+        assert!(facts("signal: 9, SIGKILL: kill").unexplained_failure);
+        let bare = "  process didn't exit successfully: `/r run-one /t/a`";
+        assert!(refusals(text(&[refused, bare])).1.unexplained_failure);
     }
 
     #[test]

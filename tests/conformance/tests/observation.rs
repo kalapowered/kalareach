@@ -349,6 +349,51 @@ fn a_step_that_a_later_step_follows_keeps_the_file_as_it_was_when_it_ended() {
     assert!(document.steps[1].observation.is_none());
 }
 
+/// A first step that runs no test program, so that a refusal is in a later step.
+fn a_step_before() -> Step {
+    Step::cargo(
+        Group::Rust,
+        "the tree's check",
+        &["check", "--locked", "--workspace"],
+    )
+}
+
+#[test]
+fn a_program_the_runner_refused_in_a_later_step_is_recorded_for_that_step_at_the_run_and_at_the_listing()
+ {
+    for (arm, failed_at_the_listing) in [("run-one", false), ("list-one", true)] {
+        let held = tempfile::tempdir().unwrap();
+        let evidence = tempfile::tempdir().unwrap();
+        let runner = runner_that(
+            held.path(),
+            arm,
+            &format!(
+                "{RECORD}echo \"kr-conformance {arm}: $2 could not start: Exec format error (os error 8)\" >&2; exit 1"
+            ),
+        );
+        let document = run(
+            evidence.path(),
+            runner,
+            vec![
+                a_step_before(),
+                Step::cargo(
+                    Group::Rust,
+                    "the tree's tests",
+                    &["test", "--locked", "--workspace", "--no-fail-fast"],
+                ),
+            ],
+        );
+        assert_eq!(document.summary.failed_steps, [2], "{arm}");
+        assert_eq!(
+            document.steps[1].exit.is_none(),
+            failed_at_the_listing,
+            "{arm}"
+        );
+        let observed = document.steps[1].observation.as_ref().expect("observed");
+        assert!(observed.programs[0].said_by_runner, "{arm}: {observed:?}");
+    }
+}
+
 #[test]
 fn a_program_the_runner_refused_at_the_listing_is_observed_though_the_step_has_no_exit_code() {
     let held = tempfile::tempdir().unwrap();

@@ -94,10 +94,26 @@ fn starts_an_item(tokens: &[Token]) -> bool {
             at += 1;
         }
     }
-    tokens
-        .get(at)
-        .and_then(Token::ident)
-        .is_some_and(|word| ITEM_WORDS.contains(&word))
+    let Some(word) = tokens.get(at).and_then(Token::ident) else {
+        return false;
+    };
+    if !ITEM_WORDS.contains(&word) {
+        return false;
+    }
+    // The lexer reads a raw identifier such as `r#type` as the keyword, so a field, an argument or
+    // an assignment can look like an item. No item word is followed by a colon of its own, an `=`,
+    // a comma, a closing bracket, a semicolon or a dot, nor by `::` (but for `use`, and `extern`
+    // does not take it either) or by a parenthesis (but for `impl`).
+    let punct = |at: usize, c: char| tokens.get(at).is_some_and(|token| token.is_punct(c));
+    let colon = punct(at + 1, ':');
+    let single_colon = colon && !punct(at + 2, ':');
+    let double_colon = colon && word != "use";
+    let ends = tokens.get(at + 1).is_none()
+        || ['=', ',', ')', '}', ';', '.']
+            .iter()
+            .any(|c| punct(at + 1, *c));
+    let paren = word != "impl" && punct(at + 1, '(');
+    !(single_colon || double_colon || ends || paren)
 }
 
 /// The index after the `]` that closes the `[` at `open`, or the end of `tokens`.
@@ -348,6 +364,9 @@ fn what_is_under_cfg_test_is_not_read_and_what_follows_it_is() {
         "#[cfg(test)]\npub(crate) fn helper() { std::fs::remove_file(x); }",
         "#[cfg(test)]\nimpl X { fn f(&self) { child.kill(); } }",
         "#[cfg(test)]\nconst X: u8 = { std::fs::remove_file(x); 1 };",
+        "#[cfg(test)]\ntype T = u8;\nfn product() {}",
+        "#[cfg(test)]\nuse ::std::fs;\nfn product() {}",
+        "#[cfg(test)]\nunsafe impl Send for X {}\nfn product() {}",
     ] {
         assert!(
             found(code).expect("a source").is_empty(),
@@ -364,6 +383,11 @@ fn what_is_under_cfg_test_is_not_read_and_what_follows_it_is() {
         "fn p() { foo(#[cfg(test)] 1, std::fs::remove_file(p)); }",
         "fn p() { let s = S { #[cfg(test)] a: 1, b: std::fs::remove_file(p) }; }",
         "fn p() { #[cfg(test)] let a = 1; std::fs::remove_file(p); }",
+        // A field named by a raw identifier is read by the lexer as the keyword, and is no item.
+        "fn p() { let _ = S { #[cfg(test)] r#type: 1, value: std::fs::remove_file(p) }; }",
+        "fn p() { let _ = S { #[cfg(test)] r#type, value: std::fs::remove_file(p) }; }",
+        "fn p() { let _ = S { #[cfg(test)] r#fn: 1, value: std::fs::remove_file(p) }; }",
+        "fn p() { let _ = S { #[cfg(test)] r#use: 1, value: std::fs::remove_file(p) }; }",
     ] {
         assert!(
             !found(code).expect("a source").is_empty(),
