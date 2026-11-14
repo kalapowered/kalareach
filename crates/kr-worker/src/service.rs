@@ -2916,6 +2916,10 @@ impl WorkerService {
         // a rejection. Both end with this call.
         tasks.spawn(Arc::clone(&self).settle_what_is_owed_to_the_session());
         tasks.spawn(Arc::clone(&self).settle_what_is_owed_to_the_authority());
+        // The same for a lease whose batch the writer dropped at its authority's deadline.
+        if let Some(dropped) = self.runtime.take_epoch_expiry() {
+            tokio::spawn(Arc::clone(&self).end_leases_of_dropped_batches(dropped));
+        }
         // The components of this session's bindings are registered with the plugin runtime from
         // here. Nothing is asked of anybody until a binding wants one.
         if let Some(request) = self.plugin_runtime.clone() {
@@ -3039,6 +3043,36 @@ impl WorkerService {
                         },
                         None,
                     );
+                }
+                service.runtime.flush_input();
+            })
+            .await;
+        }
+    }
+
+    /// Ends the lease of each epoch whose batch the terminal's writer dropped at its authority's
+    /// deadline, under the dispatch barrier, on a thread for blocking work: the writer never
+    /// waits for the session.
+    async fn end_leases_of_dropped_batches(
+        self: Arc<Self>,
+        mut dropped: tokio::sync::mpsc::UnboundedReceiver<u64>,
+    ) {
+        while let Some(first) = dropped.recv().await {
+            let mut epochs = std::collections::BTreeSet::from([first]);
+            while let Ok(more) = dropped.try_recv() {
+                epochs.insert(more);
+            }
+            let service = Arc::clone(&self);
+            let _ = tokio::task::spawn_blocking(move || {
+                let _barrier = service
+                    .dispatch
+                    .lock()
+                    .expect("the dispatch barrier is not poisoned");
+                for epoch in epochs {
+                    service
+                        .runtime
+                        .session()
+                        .end_lease_whose_batch_expired(epoch);
                 }
                 service.runtime.flush_input();
             })
@@ -11323,7 +11357,10 @@ impl WorkerService {
                 // attachment the session no longer has. The session let go of it as one made under
                 // a grant when it removed it.
                 state.facts.remove_attachment(attachment_id);
-                let result = outcome?;
+                let mut result = outcome?;
+                if !params.fenced_report {
+                    result.fenced_bytes = None;
+                }
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionClose => {
@@ -11378,12 +11415,13 @@ impl WorkerService {
             }
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(params)?;
-                let lease = session.release_input(params.attachment_id, params.epoch.get())?;
+                let (lease, fenced) =
+                    session.release_input(params.attachment_id, params.epoch.get())?;
                 self.runtime.flush_input();
                 Ok((
                     encode(&InputLeaseResult {
                         lease,
-                        fenced_bytes: None,
+                        fenced_bytes: params.fenced_report.then(|| U64::new(fenced)),
                     })?,
                     AfterEffect::None,
                 ))
