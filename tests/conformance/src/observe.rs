@@ -341,12 +341,31 @@ fn shell_refusal(line: &str) -> Option<String> {
 }
 
 /// What a step's log, read at the moment the step ended, says of the programs it could not run.
-/// `records` is the directory in which the runner records a program that it could not start.
-/// `None` when the log names none and was read whole, or when there is no log. A log that is a link
-/// or another object that is not a regular file, or that cannot be read in ten seconds, or whose
-/// read failed part of the way, is recorded as such, and what it names before that is kept.
+/// `records` is the directory in which the runner records, for each step, a program that it could
+/// not start, and `step` is the step's number. `None` when the log names none and was read whole,
+/// or when there is no log. A log that is a link or another object that is not a regular file, or
+/// whose read failed part of the way, is recorded as such, and what it names before that is kept. A
+/// log or a record that cannot be read in ten seconds is recorded as not read, and no program is
+/// then named.
 #[must_use]
-pub fn observe_log(log: &Path, records: &Path, now: SystemTime) -> Option<Observed> {
+pub fn observe_log(log: &Path, records: &Path, step: usize, now: SystemTime) -> Option<Observed> {
+    let records = records.to_path_buf();
+    observe_within(
+        READ_LIMIT,
+        log,
+        move |program| recorded_by_runner(&records, step, program),
+        now,
+    )
+}
+
+/// [`observe_log`] with `recorded`, which says whether the runner recorded that it could not start
+/// a program, and the time the reads are given.
+fn observe_within(
+    limit: Duration,
+    log: &Path,
+    recorded: impl Fn(&str) -> bool + Send + 'static,
+    now: SystemTime,
+) -> Option<Observed> {
     if matches!(std::fs::symlink_metadata(log), Err(error) if error.kind() == ErrorKind::NotFound) {
         return None;
     }
@@ -364,16 +383,28 @@ pub fn observe_log(log: &Path, records: &Path, now: SystemTime) -> Option<Observ
         Err(found) => return unread(found),
     };
     let owned = log.to_path_buf();
-    let read = match bounded(READ_LIMIT, move || read_log(&owned, &seen)) {
-        Ok(Ok(read)) => read,
-        Ok(Err(found)) => return unread(found),
-        Err(reason) => return unread(Found::NotRead { reason }),
-    };
-    observed(read, records, now)
+    // The records are read in the same wait as the log: a read that does not end holds neither the
+    // report nor the step that follows.
+    let read = bounded(limit, move || {
+        let read = read_log(&owned, &seen)?;
+        let said: Vec<bool> = read
+            .refused
+            .iter()
+            .map(|refusal| recorded(&refusal.path))
+            .collect();
+        Ok((read, said))
+    });
+    match read {
+        Ok(Ok((read, said))) => observed(read, &said, now),
+        Ok(Err(found)) => unread(found),
+        Err(reason) => unread(Found::NotRead { reason }),
+    }
 }
 
 /// The observation of what a log held, or `None` when it named no program and was read whole.
-fn observed(read: LogRead, records: &Path, now: SystemTime) -> Option<Observed> {
+/// `said` has, for each program the log names, whether the runner recorded that it could not
+/// start it.
+fn observed(read: LogRead, said: &[bool], now: SystemTime) -> Option<Observed> {
     if read.refused.is_empty() && read.error.is_none() {
         return None;
     }
@@ -384,9 +415,10 @@ fn observed(read: LogRead, records: &Path, now: SystemTime) -> Option<Observed> 
         programs: read
             .refused
             .into_iter()
-            .map(|refusal| Program {
+            .enumerate()
+            .map(|(at, refusal)| Program {
                 file: observe_file(Path::new(&refusal.path)),
-                said_by_runner: recorded_by_runner(records, &refusal.path),
+                said_by_runner: said.get(at).copied().unwrap_or(false),
                 path: refusal.path,
                 lines: refusal.lines,
                 observed_at: epoch(now).unwrap_or(0),
@@ -398,22 +430,25 @@ fn observed(read: LogRead, records: &Path, now: SystemTime) -> Option<Observed> 
     })
 }
 
-/// Whether the runner recorded in `records` that it could not start `program`: a file named for the
-/// program's last path part whose first line is the program's path.
-fn recorded_by_runner(records: &Path, program: &str) -> bool {
-    let name = crate::run::file_name(program);
-    if matches!(name.as_str(), "" | "." | "..") {
-        return false;
+/// Whether the runner recorded, in the folder `records` holds for step number `step`, that it
+/// could not start `program`: a numbered file, a regular one, whose first line is the program's
+/// whole path. The folder holds at most [`crate::run::MOST_RECORDS`] files, in order from 0.
+fn recorded_by_runner(records: &Path, step: usize, program: &str) -> bool {
+    let folder = records.join(step.to_string());
+    for number in 0..crate::run::MOST_RECORDS {
+        let path = folder.join(number.to_string());
+        match std::fs::symlink_metadata(&path) {
+            Err(_) => return false,
+            Ok(seen) if !seen.is_file() => continue,
+            Ok(_) => {}
+        }
+        let mut text = String::new();
+        let read = File::open(&path).and_then(|file| file.take(4096).read_to_string(&mut text));
+        if read.is_ok() && text.lines().next() == Some(program) {
+            return true;
+        }
     }
-    let path = records.join(name);
-    if !std::fs::symlink_metadata(&path).is_ok_and(|seen| seen.is_file()) {
-        return false;
-    }
-    let mut text = String::new();
-    File::open(&path)
-        .and_then(|file| file.take(4096).read_to_string(&mut text))
-        .is_ok()
-        && text.lines().next() == Some(program)
+    false
 }
 
 /// What a log that was opened holds.
@@ -1058,6 +1093,80 @@ mod tests {
         assert!(facts("/r run-one").unexplained_failure);
     }
 
+    /// Makes the runner's record of the numbered refusal of step `step` in `records`.
+    fn recorded(records: &Path, step: usize, number: usize, text: &str) {
+        let folder = records.join(step.to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(number.to_string()), text).unwrap();
+    }
+
+    #[test]
+    fn a_program_is_recorded_by_the_runner_for_its_step_and_by_its_whole_path() {
+        let held = tempfile::tempdir().unwrap();
+        let records = held.path();
+        recorded(records, 2, 0, "/t/one/deps/a-0123\nExec format error\n");
+        recorded(records, 2, 1, "/t/two/deps/a-0123\nExec format error\n");
+        assert!(recorded_by_runner(records, 2, "/t/one/deps/a-0123"));
+        assert!(recorded_by_runner(records, 2, "/t/two/deps/a-0123"));
+        // The same last part of another path, a path that begins with a recorded one, and a path
+        // that a record holds below its first line are not recorded.
+        assert!(!recorded_by_runner(records, 2, "/t/three/deps/a-0123"));
+        assert!(!recorded_by_runner(records, 2, "/t/one/deps/a-0123-extra"));
+        assert!(!recorded_by_runner(records, 2, "/t/one/deps"));
+        assert!(!recorded_by_runner(records, 2, "Exec format error"));
+        // Another step's record is not this step's, whichever program it names.
+        assert!(!recorded_by_runner(records, 1, "/t/one/deps/a-0123"));
+        assert!(!recorded_by_runner(records, 3, "/t/one/deps/a-0123"));
+    }
+
+    #[test]
+    fn a_log_that_names_a_program_that_only_another_step_recorded_does_not_say_the_runner_did() {
+        let held = tempfile::tempdir().unwrap();
+        let (log, records) = (held.path().join("step.log"), held.path().join("refusals"));
+        std::fs::write(
+            &log,
+            "kr-conformance run-one: /t/p could not start: Exec format error (os error 8)\n",
+        )
+        .unwrap();
+        recorded(&records, 1, 0, "/t/p\nExec format error\n");
+        let said = |step| {
+            let observed = observe_log(&log, &records, step, SystemTime::now()).unwrap();
+            observed.programs[0].said_by_runner
+        };
+        assert!(said(1));
+        assert!(!said(2));
+    }
+
+    #[test]
+    fn a_read_of_the_records_that_does_not_end_is_given_up_with_the_log() {
+        let held = tempfile::tempdir().unwrap();
+        let log = held.path().join("step.log");
+        std::fs::write(
+            &log,
+            "kr-conformance run-one: /t/p could not start: Exec format error (os error 8)\n",
+        )
+        .unwrap();
+        // The records are read by a call that never returns, as a read of a stalled disk does not.
+        // The wait is generous only so that a regression ends this case.
+        let observed = bounded(Duration::from_secs(5), move || {
+            observe_within(
+                Duration::from_millis(200),
+                &log,
+                |_| loop {
+                    std::thread::park();
+                },
+                SystemTime::now(),
+            )
+        })
+        .expect("the observation was not held by the read of the records")
+        .expect("an observation");
+        assert!(observed.programs.is_empty(), "{observed:?}");
+        assert!(
+            matches!(observed.log, Some(Found::NotRead { .. })),
+            "{observed:?}"
+        );
+    }
+
     #[test]
     fn a_ninth_refused_program_makes_the_record_incomplete() {
         let lines = |count: usize| -> Vec<String> {
@@ -1093,8 +1202,7 @@ mod tests {
         let first = "kr-conformance run-one: /t/a could not start: no\n";
         let read = read_lines(FailsAfter(std::io::Cursor::new(first.as_bytes().to_vec())));
         assert_eq!(read.refused.len(), 1);
-        let seen = observed(read, Path::new("/no-such-records"), SystemTime::now())
-            .expect("a log that failed is recorded");
+        let seen = observed(read, &[], SystemTime::now()).expect("a log that failed is recorded");
         let Some(Found::NotRead { reason }) = &seen.log else {
             panic!("{seen:?}");
         };
@@ -1105,7 +1213,7 @@ mod tests {
         assert_eq!(seen.programs.len(), 1);
         assert!(!seen.damage_seen());
         let whole = read_lines("running 1 test\n".as_bytes());
-        assert!(observed(whole, Path::new("/no-such-records"), SystemTime::now()).is_none());
+        assert!(observed(whole, &[], SystemTime::now()).is_none());
     }
 
     #[test]
@@ -1311,7 +1419,7 @@ mod files {
         .unwrap();
         let log = held.path().join("step.log");
         std::os::unix::fs::symlink(&real, &log).unwrap();
-        let observed = observe_log(&log, Path::new("/no-such-records"), SystemTime::now())
+        let observed = observe_log(&log, Path::new("/no-such-records"), 1, SystemTime::now())
             .expect("the log is recorded");
         assert!(matches!(&observed.log, Some(Found::Other { kind }) if kind == "a link"));
         assert!(observed.programs.is_empty());
@@ -1326,7 +1434,7 @@ mod files {
         pipe(&log);
         // The call is given a generous wait only so that a regression ends this case.
         let read = bounded(Duration::from_secs(5), move || {
-            observe_log(&log, Path::new("/no-such-records"), SystemTime::now())
+            observe_log(&log, Path::new("/no-such-records"), 1, SystemTime::now())
         });
         let Ok(Some(observed)) = read else {
             panic!("the read of a pipe waited for a writer: {read:?}");
@@ -1372,11 +1480,12 @@ mod files {
         let held = tempfile::tempdir().unwrap();
         let log = held.path().join("step.log");
         std::fs::write(&log, "running 1 test\ntest a ... ok\n").unwrap();
-        assert!(observe_log(&log, Path::new("/no-such-records"), SystemTime::now()).is_none());
+        assert!(observe_log(&log, Path::new("/no-such-records"), 1, SystemTime::now()).is_none());
         assert!(
             observe_log(
                 &held.path().join("gone.log"),
                 Path::new("/no-such-records"),
+                1,
                 SystemTime::now()
             )
             .is_none()
@@ -1397,7 +1506,7 @@ mod files {
             ),
         )
         .unwrap();
-        let observed = observe_log(&log, Path::new("/no-such-records"), SystemTime::now())
+        let observed = observe_log(&log, Path::new("/no-such-records"), 1, SystemTime::now())
             .expect("one program");
         assert!(observed.damage_seen());
         assert_eq!(observed.programs[0].path, program.to_string_lossy());

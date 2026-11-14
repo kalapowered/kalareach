@@ -157,13 +157,17 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         let prepared = build_first(step, place, &log_path, packages)
             .and_then(|(built, map)| {
                 executed.built = built;
-                let listed = list(step, place, &log_path, &map, packages)?;
+                let listed = list(step, number, place, &log_path, &map, packages)?;
                 executables = map;
                 Ok(listed)
             })
             .and_then(|listed| {
-                environment =
-                    recording(place, &standard_harness(&executables, packages), &records)?;
+                environment = recording(
+                    place,
+                    number,
+                    &standard_harness(&executables, packages),
+                    &records,
+                )?;
                 Ok(listed)
             });
         match prepared {
@@ -336,32 +340,54 @@ pub const LISTING_BEGIN: &str = "\u{1}kr-conformance listing\t";
 pub const LISTING_END: &str = "\u{1}kr-conformance listed\t";
 
 /// The directory, beside the runner's own program in the report's private directory, where the
-/// runner records a program it could not start, one file for each, named for the program's last
-/// path part, with the program's path on its first line. No program that a step runs is told of it.
+/// runner records a program it could not start. It holds a folder for each step, named for the
+/// step's number (the number [`STEP_VARIABLE`] gives the runner), and in it one file for each such
+/// program, numbered from 0, with the program's whole path on its first line.
 pub const REFUSALS: &str = "refusals";
 
-/// Records that `executable` could not be started: the report reads this, and not the log, to know
-/// that a program never ran. A record that cannot be made is not made, and the program then counts
-/// as one that ran and failed.
+/// The variable that gives the runner the number of the step it runs for, which keys its record.
+pub const STEP_VARIABLE: &str = "KR_CONFORMANCE_STEP";
+
+/// How many programs the runner records for one step; a program that could not be started after
+/// that is not recorded.
+pub const MOST_RECORDS: usize = 64;
+
+/// Records that `executable` could not be started in this step: the report reads this, and not the
+/// log, to know that a program never ran. A record that cannot be made is not made, and the
+/// program then counts as one that ran and failed.
 fn record_refusal(executable: &str, error: &std::io::Error) {
+    let Some(step) = std::env::var(STEP_VARIABLE)
+        .ok()
+        .filter(|step| !step.is_empty() && step.chars().all(|c| c.is_ascii_digit()))
+    else {
+        return;
+    };
     let Ok(program) = std::env::current_exe() else {
         return;
     };
     if let Some(directory) = program.parent() {
-        record_refusal_in(&directory.join(REFUSALS), executable, error);
+        record_refusal_in(&directory.join(REFUSALS).join(step), executable, error);
     }
 }
 
 fn record_refusal_in(directory: &Path, executable: &str, error: &std::io::Error) {
-    let name = file_name(executable);
-    if matches!(name.as_str(), "" | "." | "..") || std::fs::create_dir_all(directory).is_err() {
+    if std::fs::create_dir_all(directory).is_err() {
         return;
     }
-    let _ = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(directory.join(name))
-        .and_then(|mut record| writeln!(record, "{executable}\n{error}"));
+    for number in 0..MOST_RECORDS {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join(number.to_string()))
+        {
+            Ok(mut record) => {
+                let _ = writeln!(record, "{executable}\n{error}");
+                return;
+            }
+            Err(taken) if taken.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// The variable naming the test binaries with a harness of its own, by file name, comma separated.
@@ -489,9 +515,11 @@ pub const RECORDED_BINARIES: &str = "binaries.txt";
 
 /// Makes the directory for the harness's records, and lists in it the binaries of `harness`. It
 /// returns the variables that make Cargo run every test binary, and rustdoc's programs, through this
-/// program, which gives the binaries listed the option to write a record there.
+/// program, which gives the binaries listed the option to write a record there, and tells it the
+/// step's number `number`.
 fn recording(
     place: &Place<'_>,
+    number: usize,
     harness: &BTreeSet<String>,
     records: &Path,
 ) -> Result<Vec<(String, String)>, String> {
@@ -506,6 +534,7 @@ fn recording(
             RECORDS_VARIABLE.to_owned(),
             records.to_string_lossy().into_owned(),
         ),
+        (STEP_VARIABLE.to_owned(), number.to_string()),
     ])
 }
 
@@ -606,6 +635,7 @@ fn host(place: &Place<'_>) -> Result<String, String> {
 /// named in the error.
 fn list(
     step: &Step,
+    number: usize,
     place: &Place<'_>,
     log_path: &Path,
     executables: &BTreeMap<String, TargetId>,
@@ -627,6 +657,7 @@ fn list(
     let output = place
         .command(&command)
         .env(&variable, runner)
+        .env(STEP_VARIABLE, number.to_string())
         .env(OWN_HARNESS_VARIABLE, own.join(","))
         .stdin(Stdio::null())
         .stderr(Stdio::piped())

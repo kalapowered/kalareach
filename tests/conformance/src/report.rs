@@ -555,6 +555,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             done.observation = observe::observe_log(
                 &options.evidence.join(&done.log),
                 &runner_records,
+                index + 1,
                 SystemTime::now(),
             );
         }

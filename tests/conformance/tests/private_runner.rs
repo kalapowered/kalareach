@@ -113,24 +113,65 @@ fn a_build_directory_that_holds_the_copy_s_base_ends_the_run_before_its_first_st
     );
 }
 
+/// Runs `command` of the runner `runner` for `program`, which cannot be started, as step `step`
+/// when one is given, and returns whether the runner ended with a failure.
+fn refused(runner: &Path, command: &str, step: Option<&str>, program: &Path) -> bool {
+    let mut run = std::process::Command::new(runner);
+    run.arg(command)
+        .arg(program)
+        .env_remove("KR_CONFORMANCE_STEP")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    if let Some(step) = step {
+        run.env("KR_CONFORMANCE_STEP", step);
+    }
+    !run.status().expect("the runner starts").success()
+}
+
 #[test]
-fn the_runner_records_a_program_it_could_not_start_beside_its_own_program_and_nowhere_else() {
-    let held = tempfile::tempdir().expect("a directory");
-    let program = Path::new(env!("CARGO_BIN_EXE_kr-conformance"));
-    let runner = held.path().join(program.file_name().expect("a file name"));
-    std::fs::copy(program, &runner).expect("a copy of the program");
-    let missing = held.path().join("no-such-dir").join("prog-0123");
+fn the_runner_records_a_program_it_could_not_start_for_its_step_by_its_whole_path_and_nowhere_else()
+{
+    // Each command has a folder of its own, so that a record that one made is not read as the
+    // other's.
     for command in ["run-one", "list-one"] {
-        let status = std::process::Command::new(&runner)
-            .arg(command)
-            .arg(&missing)
-            .stderr(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .status()
-            .expect("the runner starts");
-        assert!(!status.success(), "{command}");
-        let record = std::fs::read_to_string(held.path().join("refusals").join("prog-0123"))
-            .expect("the runner recorded the refusal");
-        assert_eq!(record.lines().next(), missing.to_str(), "{command}");
+        let held = tempfile::tempdir().expect("a directory");
+        let program = Path::new(env!("CARGO_BIN_EXE_kr-conformance"));
+        let runner = held.path().join(program.file_name().expect("a file name"));
+        std::fs::copy(program, &runner).expect("a copy of the program");
+        let first = held.path().join("no-such-dir").join("prog-0123");
+        let second = held.path().join("other-dir").join("prog-0123");
+        for (step, program) in [
+            (Some("3"), &first),
+            (Some("3"), &second),
+            (Some("4"), &first),
+        ] {
+            assert!(refused(&runner, command, step, program), "{command}");
+        }
+        // Without a step, or with a word that is no number, there is no record.
+        for step in [None, Some(""), Some("../3"), Some("3x")] {
+            assert!(refused(&runner, command, step, &second), "{command}");
+        }
+        let line = |step: &str, number: &str| {
+            std::fs::read_to_string(held.path().join("refusals").join(step).join(number))
+                .ok()
+                .and_then(|record| record.lines().next().map(str::to_owned))
+        };
+        assert_eq!(line("3", "0").as_deref(), first.to_str(), "{command}");
+        assert_eq!(line("3", "1").as_deref(), second.to_str(), "{command}");
+        assert_eq!(line("4", "0").as_deref(), first.to_str(), "{command}");
+        assert_eq!(line("3", "2"), None, "{command}");
+        assert_eq!(line("4", "1"), None, "{command}");
+        let mut steps: Vec<String> = std::fs::read_dir(held.path().join("refusals"))
+            .expect("the folder of the records")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        steps.sort();
+        assert_eq!(steps, ["3", "4"], "{command}");
     }
 }
