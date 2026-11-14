@@ -59,8 +59,10 @@ pub struct Observed {
     /// Whether the log shows a failure that no refused program accounts for: a failed target that
     /// has no cause after Cargo's line about it that names a refused program (a target that exits
     /// with status 101 has none), a failed command whose program is not a refused one, or a build
-    /// that did not compile. Only lines of Cargo and of the runner are read, and not what a test
-    /// printed.
+    /// that did not compile. The lines outside the standard harness's captured output are read,
+    /// whoever wrote them: a target with a harness of its own, a child process of a test or a direct
+    /// write to a standard stream can add a cause line, or open a captured section that does not
+    /// end, and this is not guarded against.
     pub unexplained_failure: bool,
     /// Whether the log names more programs than the observation holds.
     pub incomplete: bool,
@@ -167,10 +169,11 @@ fn opens_test_output(line: &str) -> bool {
 struct Facts {
     /// A test ran and failed.
     test_failed: bool,
-    /// The log shows a failure that none of the programs named accounts for: a program that ended
-    /// without being refused, or a build that did not compile.
+    /// The log shows a failure that no refused program accounts for: a failed target with no cause
+    /// that names a refused program, a failed command of another program or with another status, or
+    /// a build that did not compile.
     unexplained_failure: bool,
-    /// Another program was refused than the cap lets the record name.
+    /// Another program was refused than the cap lets the observation name.
     incomplete: bool,
 }
 

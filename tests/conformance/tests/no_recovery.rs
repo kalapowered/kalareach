@@ -361,6 +361,8 @@ fn what_is_under_cfg_test_is_not_read_and_what_follows_it_is() {
         "#[cfg(test)]\nuse std::process::Command;\nfn product() {}",
         "#[cfg(test)]\nmod a {\n}\n#[cfg(test)]\nmod b { fn f() { child.kill(); } }",
         "#[cfg(test)]\n#[derive(Debug)]\nstruct X { a: u8 }\nfn product() {}",
+        "#[cfg(test)]\n#[allow(dead_code)]\nfn helper() { std::fs::remove_file(x); }",
+        "#[cfg(test)]\nunsafe { std::fs::remove_file(x); }\nfn product() {}",
         "#[cfg(test)]\npub(crate) fn helper() { std::fs::remove_file(x); }",
         "#[cfg(test)]\nimpl X { fn f(&self) { child.kill(); } }",
         "#[cfg(test)]\nconst X: u8 = { std::fs::remove_file(x); 1 };",
