@@ -159,6 +159,13 @@ struct MaintenancePass {
 /// The event stream name output notifications carry.
 pub const OUTPUT_STREAM: &str = "session.output";
 
+/// What this worker says to a controller connection that no longer holds the authority of its role
+/// because a connection the daemon opened after it holds it: one it replaced, and one whose
+/// presentation came after a later connection's was accepted. The control daemon reads it from the
+/// first answer a new link gets, and opens one more link for the request it is serving.
+pub const LATER_CONNECTION_HOLDS_AUTHORITY: &str =
+    "a later controller connection holds this environment's authority";
+
 /// How many connections one session serves at once.
 ///
 /// Every attachment needs one, and a client that is between attachments needs one more, so the
@@ -208,6 +215,14 @@ struct Authority {
     /// There is one, bound as the others are: a newer one replaces it, and a replacement
     /// generation fences it with the rest.
     checks_connection: Option<ConnectionId>,
+    /// The highest order of connection this worker has accepted for each role that one connection
+    /// at a time speaks through, in the generation it accepts.
+    ///
+    /// A record stays when its connection ends: the authority of a role only moves forward, so a
+    /// connection that said hello before one already accepted is refused whenever its presentation
+    /// is decided, and an older connection that waited for the dispatch boundary cannot displace a
+    /// newer one that did not.
+    orders: AcceptedOrders,
     /// A revision this worker was told about while it was inside a dispatch transition.
     ///
     /// The announcement was refused, because a fence cannot interleave with a dispatch and waiting
@@ -225,6 +240,43 @@ struct Authority {
     /// answer about one of those says nothing about the newest. A higher generation replaces it
     /// with nothing: the replacement is acknowledged to when it announces.
     acknowledged: Option<(ControllerGeneration, kr_protocol::ids::AuthorityRevision)>,
+}
+
+/// The order of the newest connection accepted for each role that replaces its predecessor.
+///
+/// The order of a connection is the number this worker drew when it answered the connection's
+/// hello, so it is the order in which the daemon opened them. The proxy role has no record: its
+/// connections form a set, and none replaces another.
+#[derive(Clone, Copy, Debug, Default)]
+struct AcceptedOrders {
+    authority: Option<u64>,
+    attention: Option<u64>,
+    descriptions: Option<u64>,
+    checks: Option<u64>,
+}
+
+impl AcceptedOrders {
+    /// The highest order accepted for `role`, where the role has a record and has accepted one.
+    const fn highest(&self, role: ControllerConnectionRole) -> Option<u64> {
+        match role {
+            ControllerConnectionRole::Authority => self.authority,
+            ControllerConnectionRole::Attention => self.attention,
+            ControllerConnectionRole::Descriptions => self.descriptions,
+            ControllerConnectionRole::Checks => self.checks,
+            ControllerConnectionRole::Proxy => None,
+        }
+    }
+
+    /// Records that a connection of `order` was accepted for `role`.
+    const fn accept(&mut self, role: ControllerConnectionRole, order: u64) {
+        match role {
+            ControllerConnectionRole::Authority => self.authority = Some(order),
+            ControllerConnectionRole::Attention => self.attention = Some(order),
+            ControllerConnectionRole::Descriptions => self.descriptions = Some(order),
+            ControllerConnectionRole::Checks => self.checks = Some(order),
+            ControllerConnectionRole::Proxy => {}
+        }
+    }
 }
 
 /// A revision this worker owes a fence for, and whose authority it withdrew.
@@ -313,6 +365,14 @@ pub struct WorkerService {
     /// what makes the check mean something by the time the effect happens. Authority changes take
     /// it too, so one cannot slip between the two halves of the other.
     dispatch: Mutex<()>,
+    /// The number the next controller connection's hello is answered with.
+    ///
+    /// Only the order of two numbers is read, so it starts anywhere and is never reused. A
+    /// connection that presents a generation is decided against the numbers of the connections
+    /// accepted before it, so the order in which the daemon opened its links decides which of them
+    /// holds a role, and the order in which their presentations happen to reach the dispatch
+    /// boundary does not.
+    connection_order: std::sync::atomic::AtomicU64,
     /// The attachments whose caller's authority ran out on a keystroke. The lease of each is
     /// released by a task under the dispatch barrier, not by the keystroke.
     expired: tokio::sync::mpsc::UnboundedSender<(AttachmentId, u64)>,
@@ -798,9 +858,11 @@ impl WorkerService {
                 attention_connection: None,
                 descriptions_connection: None,
                 checks_connection: None,
+                orders: AcceptedOrders::default(),
                 owed: None,
                 acknowledged: None,
             }),
+            connection_order: std::sync::atomic::AtomicU64::new(0),
             dispatch: Mutex::new(()),
             expired: expired.0,
             expired_receiver: Mutex::new(Some(expired.1)),
@@ -3445,6 +3507,9 @@ impl WorkerService {
             // A controller has to prove which generation it speaks for before it acts. The
             // challenge is issued here, bound to this connection, and consumed exactly once.
             state.pending_challenge = Self::generation_challenge(state);
+            state.generation_order = self
+                .connection_order
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         // The window is issued when the connection is authenticated, not when it was accepted, so
         // its deadline starts from the handshake the client will quote it against.
@@ -4200,8 +4265,31 @@ impl WorkerService {
                 let superseded = authority
                     .accepted_generation
                     .is_none_or(|accepted| token.generation.get() > accepted.get());
+                // Inside one generation a role goes to the connection the daemon opened last, which
+                // is the one whose hello this worker answered last, and not to the one whose
+                // presentation was decided last: a connection the daemon gave up on can still be
+                // waiting for the boundary when a newer one has been accepted. A higher generation
+                // is not ordered by this: it takes every role at once, and the records begin again
+                // with it. Nothing is changed before this is decided, and the token has been
+                // authenticated by now, so a connection that proved nothing moves no record.
+                if !superseded
+                    && authority
+                        .orders
+                        .highest(state.facts.controller_role)
+                        .is_some_and(|accepted| state.generation_order < accepted)
+                {
+                    drop(authority);
+                    return failure(
+                        RequestId::new(0),
+                        &WorkerError::GenerationFenced {
+                            detail: LATER_CONNECTION_HOLDS_AUTHORITY.to_owned(),
+                        }
+                        .to_protocol_error(),
+                    );
+                }
                 let mut fenced = Vec::new();
                 if superseded {
+                    authority.orders = AcceptedOrders::default();
                     // What was acknowledged to the generation that is replaced is no
                     // acknowledgement to the one that replaces it.
                     authority.acknowledged = None;
@@ -4212,6 +4300,9 @@ impl WorkerService {
                     fenced.extend(authority.checks_connection.take());
                 }
                 authority.accepted_generation = Some(token.generation);
+                authority
+                    .orders
+                    .accept(state.facts.controller_role, state.generation_order);
                 // A bound that carries a lease does not outlive the daemon that held the lease.
                 let lease_taken = self.gate.generation_accepted(token.generation);
                 match state.facts.controller_role {
@@ -5058,8 +5149,7 @@ impl WorkerService {
         };
         if !bound {
             return Err(WorkerError::GenerationFenced {
-                detail: "a later controller connection holds this environment's authority"
-                    .to_owned(),
+                detail: LATER_CONNECTION_HOLDS_AUTHORITY.to_owned(),
             });
         }
         if authority.accepted_generation != facts.generation {
@@ -10483,6 +10573,8 @@ pub struct ConnectionState {
     pub stream_id: StreamId,
     /// The challenge this connection issued to a controller, consumed once.
     pub generation_nonce: Option<Nonce256>,
+    /// The number this worker drew for this connection when it answered the hello.
+    pub generation_order: u64,
     /// The latch this connection's registration is withdrawn by.
     ///
     /// Read where a recovery copy is installed, so a first page that was admitted before the
@@ -10585,6 +10677,7 @@ impl ConnectionState {
             peer_limits: kr_protocol::hello::ReceiveLimits::default(),
             stream_id: StreamId::new(OUTPUT_STREAM).expect("a valid stream name"),
             generation_nonce: None,
+            generation_order: 0,
             withdrawn: Arc::new(Withdrawal::default()),
             subscribed: None,
             close_gate: None,

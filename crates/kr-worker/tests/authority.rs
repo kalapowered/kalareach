@@ -11,11 +11,12 @@ use std::sync::Arc;
 use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
+use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionEpoch, SessionId};
-use kr_protocol::local::LocalClientKind;
+use kr_protocol::local::{ControllerConnectionRole, LocalClientKind};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{Dimensions, DisplayNumber, SessionReadParams, ShellMode};
@@ -172,6 +173,33 @@ async fn present(
     .await
 }
 
+/// A connection that has said hello and been challenged, is declared for `role`, and has not
+/// presented anything.
+async fn declared(host: &Host, role: ControllerConnectionRole) -> BoundLink {
+    let mut link = BoundLink::connect(&host.endpoint, build())
+        .await
+        .expect("connects");
+    link.send(&ControlFrame::ControllerRole(role))
+        .await
+        .expect("declares the role");
+    match link.recv().await.expect("the worker answers") {
+        ControlFrame::ControllerRole(declared) => assert_eq!(declared, role),
+        other => panic!("the worker answered {other:?}"),
+    }
+    link
+}
+
+/// What a presentation that a later connection's acceptance refused came to.
+fn assert_refused_for_order(result: kr_ipc::Result<kr_protocol::worker::GenerationAccepted>) {
+    match result {
+        Err(kr_ipc::IpcError::IdentityUnavailable { detail, .. }) => assert!(
+            detail.contains("a later controller connection"),
+            "the refusal says a later connection holds the authority: {detail}"
+        ),
+        other => panic!("the older presentation was not refused for its order: {other:?}"),
+    }
+}
+
 /// What a refused read came to.
 #[derive(Debug, PartialEq, Eq)]
 enum Refused {
@@ -272,6 +300,61 @@ async fn an_abandoned_presentation_that_is_decided_late_does_not_fence_a_newer_c
     read_session(&mut newer, host.session_id)
         .await
         .expect("the newer connection is still served once the older presentation is decided");
+}
+
+/// KR-REQ-02.05: inside one generation, a role goes to the connection whose hello the worker
+/// answered last, whichever presentation is decided last: a connection that said hello before one
+/// already accepted for its role is refused, for each role that one connection holds at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_said_hello_before_an_accepted_one_is_refused_for_every_replacing_role() {
+    let host = host(1).await;
+    for role in [
+        ControllerConnectionRole::Authority,
+        ControllerConnectionRole::Attention,
+        ControllerConnectionRole::Descriptions,
+        ControllerConnectionRole::Checks,
+    ] {
+        let mut older = declared(&host, role).await;
+        let mut newer = declared(&host, role).await;
+        present(&mut newer, host.signer(), 1)
+            .await
+            .unwrap_or_else(|error| panic!("the later {role:?} connection is accepted: {error}"));
+        assert_refused_for_order(present(&mut older, host.signer(), 1).await);
+        if role == ControllerConnectionRole::Authority {
+            read_session(&mut newer, host.session_id)
+                .await
+                .expect("the later connection is still served");
+            assert_eq!(
+                read_session(&mut older, host.session_id).await,
+                Err(Refused::Link(ErrorCode::PermissionDenied)),
+                "the refused connection holds nothing"
+            );
+        }
+    }
+}
+
+/// KR-REQ-02.05: each role keeps a record of its own, so a connection accepted for one role never
+/// refuses a connection of another, whatever the order of their hellos.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_record_of_one_role_refuses_no_connection_of_another() {
+    let host = host(1).await;
+    let mut checks = declared(&host, ControllerConnectionRole::Checks).await;
+    let mut descriptions = declared(&host, ControllerConnectionRole::Descriptions).await;
+    let mut attention = declared(&host, ControllerConnectionRole::Attention).await;
+    let mut authority = declared(&host, ControllerConnectionRole::Authority).await;
+    for link in [
+        &mut authority,
+        &mut attention,
+        &mut descriptions,
+        &mut checks,
+    ] {
+        present(link, host.signer(), 1)
+            .await
+            .expect("a connection of a role nothing was accepted for is accepted");
+    }
+    read_session(&mut authority, host.session_id)
+        .await
+        .expect("the authority connection is served");
 }
 
 /// KR-REQ-02.05: a controller connection from a generation a newer daemon has replaced cannot
