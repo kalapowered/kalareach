@@ -364,7 +364,8 @@ mod tests {
                 || made.now(),
                 || {
                     made.pass(Duration::from_millis(pause_ms));
-                    // A claim that never ends fails here and does not hang.
+                    // A claim that never ends fails here while it calls its pause; one that stops
+                    // calling its pause can still hang the case.
                     assert!(made.passed() <= within * 10, "the claim never ended");
                 },
             );

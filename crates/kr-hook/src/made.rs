@@ -231,30 +231,104 @@ mod waits_only_through_the_seam {
         squashed(&code[opens.min(closes)..closes].concat())
     }
 
-    /// Whether the code of the function `name` in `source` holds `call`, as it is written.
+    /// Whether the code of the function `name` in `source` holds `call`, as it is written, among
+    /// other code. A hold by this does not see what else the function holds.
     fn holds(source: &str, name: &str, call: &str) -> bool {
         body_of(source, name).contains(&squashed(call))
     }
 
-    /// A hook run waits only through the wait it is given, which is what a clock that a case
-    /// moves holds: there is no other wait in what the run executes that the scan can see, so no
-    /// case passes with such a wait it cannot see.
-    /// - `observe` is the run's work, which the run abandons at its deadline.
-    /// - `wait_by` is the system's wait that `run` passes, and `start` and `finish` are the report
-    ///   writer's own thread and its closing wait, which the channel server runs and a hook run
-    ///   never does.
-    /// - The system's wait is named only in its definition, in `run` and in `report_by`; the claim's
-    ///   entry only in `run`, in the wrapper that `hook.rs` gives it and in its definition in
-    ///   `helper.rs`. A second call of either elsewhere is found.
-    /// - What gives a run the system's clock, the system's wait and the claim is held by its text:
-    ///   `run`'s call of `run_with`, `report_by`'s call of `report_with`, the wrapper's one
-    ///   statement, `wait_by`'s one line, and `claim_answer`'s one statement in `helper.rs`, which
-    ///   passes the system's clock and the pause of a millisecond to `claim`, whose waits are then
-    ///   given by its caller.
+    /// The first line of product code after the test module of `source`, if there is any: the scan
+    /// stops at the test module, so code that stands after it would not be read.
+    fn code_after_tests(source: &str) -> Option<String> {
+        let mut lines = source.lines();
+        let mut previous = "";
+        for line in lines.by_ref() {
+            if line.trim_end() == "mod tests {" && previous.trim() == "#[cfg(test)]" {
+                break;
+            }
+            previous = line;
+        }
+        // The test module ends at the closing brace at the start of a line.
+        for line in lines.by_ref() {
+            if line.trim_end() == "}" {
+                break;
+            }
+        }
+        lines
+            .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with("//"))
+            .map(str::to_owned)
+    }
+
+    /// The body of `hook::run`, whole: the start it passes, what it does with a hook that replaced
+    /// another, and the call that gives `run_with` its work, claim, answer, write, clock and wait.
+    const HELD_RUN: &str = "#[cfg(unix)] let started = match resumed(started) { \
+        Resumed::Passed => { answer(); return std::process::ExitCode::SUCCESS; } \
+        Resumed::At(started) => started, }; \
+        run_with(started, move |started| observe(application, started), claim_answer, answer, \
+        |bytes| { use std::io::Write as _; let _ = std::io::stderr().lock().write_all(bytes); }, \
+        std::time::Instant::now, crate::wait_by,); std::process::ExitCode::SUCCESS";
+
+    /// The call in `HELD_RUN` that gives `run_with` what it waits with.
+    const HELD_CALL: &str = "run_with(started, move |started| observe(application, started), \
+        claim_answer, answer, \
+        |bytes| { use std::io::Write as _; let _ = std::io::stderr().lock().write_all(bytes); }, \
+        std::time::Instant::now, crate::wait_by,);";
+
+    /// The body of `main`, whole: where a hook's clock starts, and where it goes from there.
+    const HELD_MAIN: &str = "let started = std::time::Instant::now(); \
+        match kr_hook::cli::Cli::try_parse() { \
+        Ok(cli) => kr_hook::run(cli.command, started), \
+        Err(error) => kr_hook::held(|| { let _ = error.print(); \
+        if error.use_stderr() { std::process::ExitCode::from(kr_hook::cli::EXIT_USAGE) } \
+        else { std::process::ExitCode::SUCCESS } }), }";
+
+    /// The three arms of `lib.rs`'s `run` that hand a hook the start it was given.
+    const HELD_HOOK_ARMS: [&str; 3] = [
+        "cli::Command::ClaudeCode { surface: cli::ClaudeCode::Hook, } \
+         => hook::run(&claude_code::HOOKS, started),",
+        "cli::Command::GeminiCli { surface: cli::Hooks::Hook, } \
+         => hook::run(&gemini_cli::HOOKS, started),",
+        "cli::Command::QoderCli { surface: cli::Hooks::Hook, } \
+         => hook::run(&qoder_cli::HOOKS, started),",
+    ];
+
+    /// Whether `lib.rs`'s `run` begins with its `match` on the invocation, holds the three hook arms
+    /// word for word, and writes `started` nowhere else: a statement before the `match`, a changed
+    /// arm, or a copy of an arm in a comment each change what is counted or compared.
+    fn lib_run_holds(source: &str) -> bool {
+        let body = body_of(source, "run");
+        body.starts_with("matchcommand{")
+            && body.matches("started").count() == HELD_HOOK_ARMS.len()
+            && HELD_HOOK_ARMS
+                .iter()
+                .all(|arm| body.contains(&squashed(arm)))
+    }
+
+    /// A hook run waits only through the wait it is given, which is what a clock that a case moves
+    /// holds. What is held, and where the boundary is:
+    /// - By a scan of words, in `hook.rs`, `lib.rs`, `helper.rs`, `main.rs` and `cli.rs`, above
+    ///   their test modules and with no product code after them: no blocking word outside the
+    ///   functions named here, and the system's wait and the claim's entry named only where they
+    ///   belong. `observe` is the run's work, which the run abandons at its deadline; `wait_by` is
+    ///   the system's wait that `run` passes; `start` and `finish` are the report writer's own
+    ///   thread and its closing wait, which the channel server runs and a hook run never does.
+    /// - By equality of text, the chain from the process's start to `run_with`, word for word: the
+    ///   body of `main`, the three hook arms of `lib.rs`'s `run` (with `started` written nowhere
+    ///   else in it), the whole body of `hook::run`, the body of `report_by`, the claim's wrapper,
+    ///   `wait_by`, and `claim_answer` in `helper.rs`. Nothing can be added to these, or changed
+    ///   in them, without a change of the held text.
+    /// - The boundary: code that runs on the main thread in other crates is outside the scan
+    ///   (`kr_ipc::clock::boot_elapsed_ms`, which `resumed` calls, and
+    ///   `kr_ipc::install::this_process()`), as are the callers of `observe` and the functions
+    ///   that these files call.
+    /// - A text hold detects a change, not a wrong change. A developer who changes the wiring for
+    ///   a good reason updates the held text, and after that only the review of that commit
+    ///   protects the bound.
     ///
     /// The scan finds words and has limits:
     /// - A word in a string literal is found; a character literal or a raw string that holds a
-    ///   quote, a string that spans lines, and a `/* */` comment are not told apart.
+    ///   quote, a string that spans lines, and a `/* */` comment are not told apart (a comment is
+    ///   compared as text where text is held, and read as code in the scan).
     /// - A primitive that is not in the list is not found: a `select!`, blocking input or output, a
     ///   spin on the clock, a path call such as `Receiver::recv(&rx)`, a lock that another thread
     ///   holds (`std::io::stderr().lock()` after the diagnostic, while the stalled writer holds
@@ -262,8 +336,10 @@ mod waits_only_through_the_seam {
     /// - A call of a function that waits inside it is not followed: `report_by` reaches `wait_by`,
     ///   and `kr_ipc::install::this_process()` can wait.
     /// - A name holds what a function contains, not where it runs: `observe` is safe only while
-    ///   the work that `run` gives `run_with` is its one caller, and `start` and `finish` allow
-    ///   every function of that name in `lib.rs`.
+    ///   the work that `run` gives `run_with` is its one caller; and a name allows every function
+    ///   of that name in its file: `start` and `finish` in `lib.rs`, `observe` and `run` in
+    ///   `hook.rs` (a method `fn run(&self)` there may call `wait_by`), `claim_answer` in
+    ///   `helper.rs`.
     #[test]
     fn a_hook_run_waits_only_through_the_wait_it_is_given() {
         let (hook, lib, helper) = (
@@ -271,6 +347,7 @@ mod waits_only_through_the_seam {
             include_str!("lib.rs"),
             include_str!("helper.rs"),
         );
+        let (main, cli) = (include_str!("main.rs"), include_str!("cli.rs"));
         for (file, source, allowed) in [
             (
                 "hook.rs",
@@ -299,23 +376,33 @@ mod waits_only_through_the_seam {
                     claim: &["claim_answer"],
                 },
             ),
+            ("main.rs", main, Allowed::default()),
+            ("cli.rs", cli, Allowed::default()),
         ] {
             let found = blocking_waits(source, allowed);
             assert!(
                 found.is_empty(),
                 "{file} waits other than through the wait a run is given: {found:#?}"
             );
+            assert_eq!(
+                code_after_tests(source),
+                None,
+                "{file} has product code after its test module, which the scan does not read"
+            );
         }
+        assert_eq!(
+            body_of(main, "main"),
+            squashed(HELD_MAIN),
+            "where a hook's clock starts is not what it was"
+        );
         assert!(
-            holds(
-                hook,
-                "run",
-                "run_with(started, move |started| observe(application, started), claim_answer, \
-                 answer, |bytes| { use std::io::Write as _; \
-                 let _ = std::io::stderr().lock().write_all(bytes); }, \
-                 std::time::Instant::now, crate::wait_by,);"
-            ),
-            "what gives a run its work, its claim, its answer, its clock and its wait is not what it was"
+            lib_run_holds(lib),
+            "what hands a hook its start from the invocation is not what it was"
+        );
+        assert_eq!(
+            body_of(hook, "run"),
+            squashed(HELD_RUN),
+            "what gives a run its start, its work, its claim, its answer, its clock and its wait is not what it was"
         );
         assert_eq!(
             body_of(hook, "claim_answer"),
@@ -463,5 +550,123 @@ mod waits_only_through_the_seam {
             "|| std::time::Instant::now() + std::time::Duration::from_millis(300),",
         );
         assert!(!holds(&later_clock, "run", held), "a clock with time added");
+        // The entry of a run is held whole. Each of these keeps the call that gives `run_with` its
+        // wait and its clock, so a hold that looks for that call finds it; each adds or changes
+        // something around it, so equality of the whole body does not.
+        let run_source =
+            |body: &str| format!("pub fn run(\n    application: A,\n) -> E {{\n    {body}\n}}\n");
+        let held_run = squashed(HELD_RUN);
+        assert_eq!(
+            body_of(&run_source(HELD_RUN), "run"),
+            held_run,
+            "the text that is held"
+        );
+        let wait_plus_50 = HELD_RUN.replace(
+            "crate::wait_by,",
+            "|c, by| crate::wait_by(c, by + std::time::Duration::from_millis(50)),",
+        );
+        let variants = [
+            (
+                "the start moved by 300 ms",
+                HELD_RUN.replacen(
+                    "run_with(",
+                    "let started = started + std::time::Duration::from_millis(300); run_with(",
+                    1,
+                ),
+            ),
+            (
+                "a replaced hook given the start of its own",
+                HELD_RUN.replace(
+                    "Resumed::At(started) => started,",
+                    "Resumed::At(_) => started,",
+                ),
+            ),
+            ("a second claim", format!("{HELD_RUN} claim_answer();")),
+            (
+                "a second wait",
+                format!(
+                    "{HELD_RUN} let _ = crate::wait_by(&receiver, \
+                     std::time::Instant::now() + std::time::Duration::from_millis(50));"
+                ),
+            ),
+            (
+                "a claim bound to two calls",
+                format!(
+                    "let claim_answer = || {{ self::claim_answer(); self::claim_answer(); }}; \
+                     {HELD_RUN}"
+                ),
+            ),
+            (
+                "a copy of the held call in a comment beside a changed call",
+                format!("{wait_plus_50} /* {HELD_CALL} */"),
+            ),
+        ];
+        for (what, body) in variants {
+            let source = run_source(&body);
+            assert!(
+                holds(&source, "run", HELD_CALL),
+                "{what}: a hold that looks for the call finds it"
+            );
+            assert_ne!(
+                body_of(&source, "run"),
+                held_run,
+                "{what}: the whole body is held"
+            );
+        }
+        // The start's chain in `lib.rs`: a statement before the `match`, a changed arm, and a copy
+        // of an arm in a comment beside a changed one.
+        let lib_source = |before: &str, arms: &[&str]| {
+            format!(
+                "pub fn run(command: C, started: S) -> E {{\n    {before}match command {{\n        {}\n    }}\n}}\n",
+                arms.join("\n        ")
+            )
+        };
+        assert!(
+            lib_run_holds(&lib_source("", &HELD_HOOK_ARMS)),
+            "the arms that are held"
+        );
+        let moved = HELD_HOOK_ARMS[0].replace(
+            "started)",
+            "started + std::time::Duration::from_millis(300))",
+        );
+        let commented = format!("/* {} */", HELD_HOOK_ARMS[0]);
+        assert!(
+            !lib_run_holds(&lib_source(
+                "",
+                &[&moved, HELD_HOOK_ARMS[1], HELD_HOOK_ARMS[2]]
+            )),
+            "the start moved by 300 ms in an arm"
+        );
+        assert!(
+            !lib_run_holds(&lib_source(
+                "let started = started + std::time::Duration::from_millis(300); ",
+                &HELD_HOOK_ARMS
+            )),
+            "the start moved by 300 ms before the arms"
+        );
+        let beside = lib_source(
+            "",
+            &[&moved, &commented, HELD_HOOK_ARMS[1], HELD_HOOK_ARMS[2]],
+        );
+        assert!(
+            holds(&beside, "run", HELD_HOOK_ARMS[0]),
+            "a hold that looks for the arm finds its copy in the comment"
+        );
+        assert!(
+            !lib_run_holds(&beside),
+            "a copy of an arm in a comment beside a changed arm"
+        );
+        // Product code after a test module is found, and a comment after it is not.
+        let after =
+            "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn later() { sleep }\n";
+        assert_eq!(
+            code_after_tests(after).as_deref(),
+            Some("fn later() { sleep }")
+        );
+        assert_eq!(
+            code_after_tests("#[cfg(test)]\nmod tests {\n}\n// a comment\n"),
+            None
+        );
+        assert_eq!(code_after_tests("fn a() {}\n"), None);
     }
 }
