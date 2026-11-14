@@ -975,6 +975,24 @@ impl InputDomain {
         taken
     }
 
+    /// Gives back what the terminal's writer gives back for a batch it has written whole: the
+    /// entry and its bytes in the room, the answer's place among the host's own answers, the
+    /// bytes of an answer that were unwritten, and the bytes of a lease's batch that were queued.
+    ///
+    /// The writer settles each batch as it goes, so a host that takes batches out of the queue
+    /// without a writer of its own, as a test that stands in for the terminal does, must settle
+    /// them the same way, or the room stays charged for input that has long been written.
+    pub(crate) fn settle_written(&self, batch: &InputBatch) {
+        let mut owed = self.writer.room.owed_for(batch);
+        owed.written(batch.len());
+        if matches!(batch, InputBatch::Reply { .. }) {
+            crate::runtime::release(&self.writer.unwritten_replies, batch.len());
+        }
+        if let InputBatch::Lease { epoch, .. } = batch {
+            self.writer.queued_lease_bytes.release(*epoch, batch.len());
+        }
+    }
+
     /// Returns how many batches wait in the queue for the terminal behind a published fence that
     /// still holds them back, for this host's own tests.
     #[cfg(feature = "testing")]
