@@ -238,11 +238,16 @@ async fn close(client: &mut LocalClient, host: &Host) -> kr_protocol::session::S
         )
         .await
         .expect("the call reaches the worker");
-    let result = outcome
+    outcome
         .map(|value| value.to_typed().expect("decodes"))
-        .unwrap_or_else(|error| panic!("the authorised stop was refused: {error}"));
-    // The close goes on after it is accepted, and its own steps, the drain among them, end before
-    // the fixture's directory is removed, which would otherwise be refused the journal they hold.
+        .unwrap_or_else(|error| panic!("the authorised stop was refused: {error}"))
+}
+
+/// [`close`], and then the wait for the closure to end: the close goes on after it is accepted,
+/// and its own steps, the drain among them, finish before the fixture's directory is removed,
+/// which would otherwise be refused the journal they hold.
+async fn closed(client: &mut LocalClient, host: &Host) -> kr_protocol::session::SessionCloseResult {
+    let result = close(client, host).await;
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         host.runtime.wait_closed(),
@@ -449,7 +454,7 @@ async fn a_sessions_output_has_times_that_are_written_by_maintenance_and_finishe
     // Output after the pass is in the file by the time the closure is recorded.
     host.runtime.session().ingest_output(b"last\r\n");
     let mut client = cli(&host).await;
-    close(&mut client, &host).await;
+    closed(&mut client, &host).await;
     let finished = kr_worker::output_times::read(&index, 0, 64, 16).expect("reads");
     assert_eq!(
         finished.marks.last().map(|mark| mark.to),
@@ -868,7 +873,7 @@ async fn a_full_store_still_admits_the_authorised_stop_and_says_its_durability_i
         assert!(refusal.to_string().contains("full"), "{refusal}");
     }
     let mut client = cli(&host).await;
-    let result = close(&mut client, &host).await;
+    let result = closed(&mut client, &host).await;
     assert_eq!(result.durability, Durability::Volatile);
 }
 
@@ -3880,7 +3885,7 @@ async fn a_condition_the_store_already_reported_fences_rich_work_before_the_next
     assert!(failure.message.contains("read back"), "{}", failure.message);
 
     // And the authorised stop is not: section 7's exception survives the condition.
-    let result = close(&mut client, &host).await;
+    let result = closed(&mut client, &host).await;
     assert_eq!(result.durability, Durability::Volatile);
 }
 
