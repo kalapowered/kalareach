@@ -570,6 +570,8 @@ pub struct TerminalWrites {
     /// How many batches of a lease's keys have entered the input domain's queue, whether the
     /// writer wrote them or dropped them.
     lease_batches_queued: std::sync::atomic::AtomicU64,
+    /// Whether the terminal refuses every write, as a pseudo-terminal does whose other end is gone.
+    failing: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "testing")]
@@ -591,6 +593,18 @@ impl TerminalWrites {
     pub fn lease_batches_queued(&self) -> u64 {
         self.lease_batches_queued
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Makes every write from now on fail, which is how a test ends the terminal's writer on a
+    /// platform whose pseudo-terminal would still take the bytes.
+    pub(crate) fn fail_from_now_on(&self) {
+        self.failing
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Returns whether the terminal refuses writes.
+    pub(crate) fn is_failing(&self) -> bool {
+        self.failing.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Keeps one write.
