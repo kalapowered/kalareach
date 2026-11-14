@@ -915,6 +915,23 @@ async fn a_detach_waits_for_the_notice_of_the_epoch_the_view_holds() {
         bytes: U64::new(512 * 1024),
         ended: Nullable::null(),
     });
+    // The host has applied the window the view holds once a frame of that epoch is accepted.
+    stream
+        .write_message(&InputFrame {
+            epoch: held,
+            sequence: InputSequence::new(0),
+            bytes: Bytes::new(b"h".to_vec()),
+        })
+        .await
+        .expect("the frame is written");
+    assert_eq!(
+        next(&mut stream).await,
+        Some(InputAck::Accepted {
+            epoch: held,
+            through: InputSequence::new(0),
+        }),
+        "the host applied the window of the epoch the view holds"
+    );
 
     detach(&rig).await;
     // One read is kept pending across the wait: a read that is dropped part way resets the stream.
@@ -989,6 +1006,44 @@ async fn a_detach_the_worker_refuses_before_it_acts_leaves_the_stream_standing()
         "the stream was not told of a detach"
     );
     type_and_wait(&rig, &mut stream, 1, b"b").await;
+    rig.stop().await;
+}
+
+/// A detach that names an attachment which the asking connection does not hold is refused by the
+/// worker before it acts. The attachment belongs to another device, and its stream is untouched: it
+/// goes on, and its next frame is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_that_names_another_devices_attachment_leaves_its_stream_standing() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+
+    let second = rig.second_typist().await;
+    let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    let refused = second
+        .device
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &SessionDetachParams {
+                attachment_id: Nullable::some(rig.attachment),
+                line_token: Nullable::null(),
+                after_input: None,
+                fenced_report: false,
+            },
+        )
+        .await
+        .expect_err("the worker refuses a detach of another device's attachment");
+    println!("the worker's refusal: {refused:?}");
+    assert_eq!(
+        stages.counts().detaches,
+        0,
+        "no stream was told of a detach"
+    );
+    type_and_wait(&rig, &mut stream, 1, b"b").await;
+    drop(second);
     rig.stop().await;
 }
 
@@ -1816,10 +1871,10 @@ async fn a_restriction_that_reaches_the_whole_host_ends_a_stream_opened_after_a_
     rig.stop().await;
 }
 
-/// A feed refusal releases each refused connection's link to its worker and leaves the
-/// connection standing, so the connection's own task never learns of it. The connection's input
-/// streams end with the link all the same. The handler is held, so that the connection stands
-/// through the refusal.
+/// A feed refusal releases each refused connection's link to its worker, and the connection's end
+/// follows from the loss of that link. The connection's input streams end with the release and do
+/// not wait for that end. The handler is held, so the connection's end waits behind it and the
+/// stream's end is the release's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_ends_when_a_feed_refusal_releases_its_connections_link() {
     let rig = Rig::start().await;
@@ -1860,7 +1915,7 @@ async fn a_grant_that_ends_at_its_deadline_ends_the_open_stream() {
     let host = &rig.adopted.host;
     let mut short = proposal(&[ActionRight::SessionView, ActionRight::TerminalInput]);
     short.expiry = kr_protocol::grant::GrantExpiry::At {
-        expires_at_ms: kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get() + 6_000),
+        expires_at_ms: kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get() + 15_000),
     };
     let device = Device::create().await;
     let record = pair_with(host, &device, &rig.adopted.owner, short).await;
