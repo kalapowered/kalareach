@@ -7569,7 +7569,9 @@ mod tests {
         crate::manifest::forced::fail_the_next("manager");
         let error = roll_back(&mut run).unwrap_err().to_string();
         assert!(
-            error.contains("the journal's files stay: the broker's service may have run"),
+            error.contains(
+                "removing the journal's files: the broker's service may have run and its end is not proved"
+            ),
             "{error}"
         );
         assert!(
