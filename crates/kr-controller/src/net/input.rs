@@ -56,11 +56,6 @@ const CLIENT_WINDOW_BYTES: u64 = 512 * 1024;
 /// absolute: waiting for the writer or for room in the socket does not renew it.
 const FRAME_DEADLINE: Duration = CALL_TIMEOUT;
 
-/// How long a detach waits for the worker's word that the attachment's epoch ended before the
-/// stream ends: the word comes on the lane's link and the detach on another, so neither is the
-/// other's cause.
-pub(super) const DETACH_NOTICE_WAIT: Duration = Duration::from_secs(2);
-
 /// How often an admission waiting for a route looks again, besides when a grant choice changes.
 const ROUTE_POLL: Duration = Duration::from_millis(25);
 
@@ -589,12 +584,12 @@ impl Flow {
                         *bytes = bytes.saturating_add(credit.bytes.get());
                     }
                 }
-                ControlEvent::InputLaunchReserved(launch) => {
-                    if launch.attachment_id == self.attachment {
-                        state.acks.push_back(InputAck::LaunchReserved {
-                            launch: launch.launch,
-                        });
-                    }
+                ControlEvent::InputLaunchReserved(launch)
+                    if launch.attachment_id == self.attachment =>
+                {
+                    state.acks.push_back(InputAck::LaunchReserved {
+                        launch: launch.launch,
+                    });
                 }
                 _ => {}
             }
