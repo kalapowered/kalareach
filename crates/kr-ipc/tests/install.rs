@@ -2077,3 +2077,222 @@ fn a_store_on_a_volume_that_is_not_ntfs_is_refused() {
     );
     assert!(!store.root().exists(), "and nothing is made there");
 }
+
+/// A measurement, not a case: readers of `current` run beside a loop of switches, and every
+/// refused read is recorded with the step that was refused, the raw code, and what the same read
+/// did when it was made again at once.
+#[cfg(windows)]
+mod switch_probe {
+    use super::{Duration, Instant, Path, Program, Store, TestStore, release};
+    use std::collections::BTreeMap;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const SHARE_ALL: u32 = 7;
+
+    type Refusal = (&'static str, i32);
+
+    #[derive(Default)]
+    struct Tally {
+        ok: BTreeMap<&'static str, u64>,
+        refused: BTreeMap<Refusal, u64>,
+        lines: Vec<String>,
+        unrecovered: u64,
+        worst_micros: u128,
+    }
+
+    impl Tally {
+        fn run(&mut self, ok_label: &'static str, call: impl Fn() -> Result<(), Refusal>) {
+            let Err((kind, code)) = call() else {
+                *self.ok.entry(ok_label).or_default() += 1;
+                return;
+            };
+            *self.refused.entry((kind, code)).or_default() += 1;
+            let began = Instant::now();
+            let mut attempts = 1_u32;
+            let recovered = loop {
+                attempts += 1;
+                if call().is_ok() {
+                    break true;
+                }
+                if began.elapsed() > Duration::from_secs(2) {
+                    break false;
+                }
+            };
+            let micros = began.elapsed().as_micros();
+            if !recovered {
+                self.unrecovered += 1;
+            }
+            self.worst_micros = self.worst_micros.max(micros);
+            if self.lines.len() < 200 {
+                self.lines.push(format!(
+                    "PROBE-REFUSAL kind={kind} code={code} attempts={attempts} micros={micros} recovered={recovered}"
+                ));
+            }
+        }
+    }
+
+    fn code_of(error: &std::io::Error) -> i32 {
+        error.raw_os_error().unwrap_or(-1)
+    }
+
+    /// What `std::fs::read_link` does, in its two steps, so that a refusal says which step.
+    fn stepped_read(link: &Path) -> Result<(), Refusal> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(link)
+            .map_err(|error| ("open", code_of(&error)))?;
+        let mut buffer = vec![0_u8; 16 * 1024];
+        let mut returned = 0_u32;
+        // SAFETY: the handle is the open file's own, and the buffer is as long as the length says.
+        let done = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_GET_REPARSE_POINT,
+                std::ptr::null(),
+                0,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len()).unwrap_or(0),
+                &raw mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if done == 0 {
+            return Err(("ioctl", code_of(&std::io::Error::last_os_error())));
+        }
+        Ok(())
+    }
+
+    fn code_in(text: &str) -> i32 {
+        text.split("code: ")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or(-1)
+    }
+
+    fn named(store: &Store) -> Result<(), Refusal> {
+        match store.current() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(("current", -2)),
+            Err(error) => Err(("current", code_in(&format!("{error:?}")))),
+        }
+    }
+
+    fn reader(store: &Store, finished: &AtomicBool) -> Tally {
+        let link = store.current_link();
+        let program = link.join("bin").join(Program::Kr.file_name());
+        let mut tally = Tally::default();
+        while !finished.load(Ordering::SeqCst) {
+            tally.run("link", || stepped_read(&link));
+            tally.run("current", || named(store));
+            tally.run("meta", || {
+                std::fs::metadata(&program)
+                    .map(|_| ())
+                    .map_err(|error| ("meta", code_of(&error)))
+            });
+            tally.run("through", || {
+                std::fs::File::open(&program)
+                    .map(|_| ())
+                    .map_err(|error| ("through", code_of(&error)))
+            });
+        }
+        tally
+    }
+
+    fn setting(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    #[test]
+    fn probe_current_during_a_switch() {
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let seconds = setting("KR_PROBE_SECONDS", 120);
+        let cap = setting("KR_PROBE_SWITCHES", 200_000);
+        let default_readers = 2 * std::thread::available_parallelism()
+            .map_or(3, usize::from)
+            .clamp(3, 8);
+        let readers = usize::try_from(setting(
+            "KR_PROBE_READERS",
+            u64::try_from(default_readers).unwrap_or(8),
+        ))
+        .unwrap_or(8);
+        let protection =
+            std::env::var("KR_PROBE_PROTECTION").unwrap_or_else(|_| "unset".to_owned());
+
+        let test = TestStore::create();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let two = release("0.2.0+bbbbbbbbbbbb");
+        test.install(&one);
+        test.install(&two);
+        test.switch(&one);
+        let finished = AtomicBool::new(false);
+        let began = Instant::now();
+        let mut switches = 0_u64;
+        let tallies = std::thread::scope(|scope| {
+            let _stop = Stop(&finished);
+            let handles: Vec<_> = (0..readers)
+                .map(|_| scope.spawn(|| reader(&test.store, &finished)))
+                .collect();
+            while switches < cap && began.elapsed() < Duration::from_secs(seconds) {
+                test.switch(if switches % 2 == 0 { &two } else { &one });
+                switches += 1;
+            }
+            finished.store(true, Ordering::SeqCst);
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a reader ends"))
+                .collect::<Vec<_>>()
+        });
+
+        let mut ok: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut refused: BTreeMap<Refusal, u64> = BTreeMap::new();
+        let mut unrecovered = 0;
+        let mut worst = 0;
+        let mut lines = Vec::new();
+        for tally in tallies {
+            for (label, count) in tally.ok {
+                *ok.entry(label).or_default() += count;
+            }
+            for (key, count) in tally.refused {
+                *refused.entry(key).or_default() += count;
+            }
+            unrecovered += tally.unrecovered;
+            worst = worst.max(tally.worst_micros);
+            lines.extend(tally.lines);
+        }
+        println!(
+            "PROBE-RUN protection={protection} readers={readers} switches={switches} seconds={}",
+            began.elapsed().as_secs()
+        );
+        for (label, count) in &ok {
+            println!("PROBE-OK read={label} count={count}");
+        }
+        for ((kind, code), count) in &refused {
+            println!("PROBE-REFUSED kind={kind} code={code} count={count}");
+        }
+        for line in lines.iter().take(60) {
+            println!("{line}");
+        }
+        println!(
+            "PROBE-END switches={switches} refused_total={} unrecovered={unrecovered} worst_micros={worst}",
+            refused.values().sum::<u64>()
+        );
+    }
+}

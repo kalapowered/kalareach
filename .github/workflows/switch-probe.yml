@@ -1,0 +1,73 @@
+name: switch-probe
+
+# Measures a reader of the store's `current` beside a loop of switches on hosted Windows, with the
+# real-time protection on and off. It starts on a push to this one branch whose newest commit
+# message ends in "(run)", and nowhere else.
+on:
+  push:
+    branches: ["scratch/T-INSTALL-SWITCH-WIN-1-probe"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: switch-probe
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  KR_TEST_ARTIFACTS_DIR: C:\kr-test-artifacts
+
+jobs:
+  probe:
+    name: probe ${{ matrix.protection }} ${{ matrix.n }}
+    if: ${{ endsWith(github.event.head_commit.message, '(run)') }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        protection: [on, off]
+        n: [1, 2, 3, 4]
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Restore the cargo cache
+        id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          name: windows
+
+      - name: Place libsodium's archives
+        id: libsodium
+        uses: ./.github/actions/libsodium-archive
+
+      - name: Build the store's tests
+        run: cargo test --locked -p kr-ipc --test install --no-run
+
+      - name: What this runner is
+        run: |
+          [System.Environment]::OSVersion.VersionString
+          (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+          (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AntivirusEnabled, AMServiceEnabled | Format-List
+
+      - name: Set the real-time protection
+        if: ${{ matrix.protection == 'off' }}
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Start-Sleep -Seconds 5
+          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled | Format-List
+
+      - name: Run the probe
+        env:
+          KR_PROBE_PROTECTION: ${{ matrix.protection }}
+          KR_PROBE_SECONDS: "300"
+        run: cargo test --locked -p kr-ipc --test install probe_current_during_a_switch -- --nocapture --test-threads=1
