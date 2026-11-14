@@ -127,6 +127,9 @@ struct Wired {
     _service: Arc<WorkerService>,
     _serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
     _bridge_task: tokio::task::JoinHandle<()>,
+    // These end the two tasks above when the fixture is dropped, whether or not a case closed it.
+    _serving_ends: kr_ipc::testing::Serving,
+    _bridge_ends: kr_ipc::testing::Serving,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
@@ -691,11 +694,15 @@ async fn wired_built(
     );
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));
 
+    let serving_ends = kr_ipc::testing::Serving::guarding(&serving);
+    let bridge_ends = kr_ipc::testing::Serving::guarding(&bridge_task);
     Wired {
         _temp: temp,
         _service: service,
         _serving: serving,
         _bridge_task: bridge_task,
+        _serving_ends: serving_ends,
+        _bridge_ends: bridge_ends,
         runtime,
         session_id,
         environment_id,
@@ -7026,7 +7033,8 @@ fn activation(session_id: SessionId, modules: Vec<LoadedModule>) -> BridgeEvent 
 
 /// KR-REQ-07.87: a session whose shell holds modules that bind qualifies, and the create that is
 /// waiting on it is answered.
-#[tokio::test]
+// A synchronous drop on a current-thread runtime gives the aborted tasks no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shell_holding_modules_that_bind_qualifies_and_the_create_is_answered() {
     let mut wired = wired_with(ShellMode::Managed, false).await;
     wired
@@ -7051,7 +7059,8 @@ async fn a_shell_holding_modules_that_bind_qualifies_and_the_create_is_answered(
 
 /// KR-REQ-07.87, KR-REQ-07.88: a module the editor cannot bind ends the create with the named
 /// error, never a ready state, and the session it was creating is closed.
-#[tokio::test]
+// A synchronous drop on a current-thread runtime gives the aborted tasks no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_module_the_editor_cannot_bind_ends_the_create_with_the_named_error() {
     let mut wired = wired_with(ShellMode::Managed, false).await;
     wired
@@ -7102,7 +7111,8 @@ async fn a_module_the_editor_cannot_bind_ends_the_create_with_the_named_error() 
 }
 
 /// A session that has been qualified and then closed is no answer to a create that asks afterwards.
-#[tokio::test]
+// A synchronous drop on a current-thread runtime gives the aborted tasks no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_that_closed_after_it_qualified_is_not_answered_ready() {
     let mut wired = wired_with(ShellMode::Managed, false).await;
     wired
@@ -7217,7 +7227,8 @@ async fn a_shell_refused_at_the_handshake_that_has_gone_still_ends_the_create_by
 
 /// A hello refused for what the shell cannot do reaches the create as the named error at once,
 /// where it used to wait out its bound and say the integration did not qualify.
-#[tokio::test]
+// A synchronous drop on a current-thread runtime gives the aborted tasks no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shell_refused_at_the_handshake_ends_the_create_with_the_named_error() {
     let wired = wired_built(
         ShellMode::Managed,
