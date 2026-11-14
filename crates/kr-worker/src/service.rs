@@ -768,8 +768,9 @@ impl WorkerService {
         )));
         let expired = tokio::sync::mpsc::unbounded_channel();
         // What the session's application is doing is read from the broker and the question ledger
-        // when either changes, by a task that ends with the session. A worker built outside a
-        // runtime, which nothing can wake, follows nothing.
+        // when either changes, by a task that ends with the session or with this service,
+        // whichever is first. A worker built outside a runtime, which nothing can wake, follows
+        // nothing.
         let application = crate::application::Producer::new(Arc::downgrade(&runtime));
         let deadline_clock = crate::application::DeadlineClock::default();
         let mut evidence = EvidenceTask(None);
