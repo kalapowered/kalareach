@@ -1457,26 +1457,80 @@ fn in_own_group(command: &mut Command) {
 #[cfg(not(unix))]
 fn in_own_group(_command: &mut Command) {}
 
-/// Ends the program and every process of its group: asks the group to end, gives it `END_GRACE`,
-/// then kills the group and the program. The group is named by the program's own number, which
-/// `in_own_group` made its number.
+/// The processes that are the step's own right now, read afresh from the system's table: the
+/// members of the process group that the step's program `root` leads. A group number is not given
+/// to another process or group while a member of the group lives, so a member is the step's whatever
+/// became of its leader, and a process that is not one is never named here. The list is as old as
+/// the read, and a caller uses it at once.
+#[cfg(unix)]
+fn step_processes(root: u32) -> Vec<u32> {
+    let Ok(output) = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut members: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace().map(|word| word.parse::<u32>().ok());
+            let (pid, _parent, group) = (words.next()??, words.next()??, words.next()??);
+            (group == root).then_some(pid)
+        })
+        .collect();
+    members.sort_unstable();
+    members
+}
+
+/// Sends the signal `name` to each of `pids`, which a caller read just before.
+#[cfg(unix)]
+fn signal_processes(name: &str, pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    let _ = Command::new("sh")
+        .args([
+            "-c",
+            "signal=$1; shift; kill -s \"$signal\" \"$@\"",
+            "kill",
+            name,
+        ])
+        .args(pids.iter().map(u32::to_string))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Ends what is left of the step's processes when the program ended by itself: any member of its
+/// group that it started and did not wait for.
+#[cfg(unix)]
+fn end_leftovers(root: u32) {
+    signal_processes("KILL", &step_processes(root));
+}
+
+#[cfg(not(unix))]
+fn end_leftovers(_root: u32) {}
+
+/// Ends the program and every process of its group: asks them to end, gives them `END_GRACE`, then
+/// kills what is still the step's. Each signal goes to what a read just before shows as the step's
+/// own (see [`step_processes`]).
 #[cfg(unix)]
 fn end_tree(child: &mut std::process::Child) {
-    let group = format!("-{}", child.id());
-    let signal = |name: &str| {
-        let _ = Command::new("sh")
-            .args(["-c", "kill -s \"$1\" -- \"$2\"", "kill", name, &group])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    };
-    signal("TERM");
+    let root = child.id();
+    signal_processes("TERM", &step_processes(root));
     let asked = Instant::now();
-    while asked.elapsed() < END_GRACE && child.try_wait().is_ok_and(|ended| ended.is_none()) {
+    while asked.elapsed() < END_GRACE {
+        // The program is collected when it has ended, so that it does not stay in the table.
+        let _ = child.try_wait();
+        if step_processes(root).is_empty() {
+            break;
+        }
         std::thread::sleep(POLL);
     }
-    signal("KILL");
+    signal_processes("KILL", &step_processes(root));
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1542,6 +1596,7 @@ fn run_bounded(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                end_leftovers(child.id());
                 return Ok(std::process::Output {
                     status,
                     stdout: held(standard_output),

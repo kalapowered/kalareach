@@ -403,18 +403,10 @@ fn run_a_step_that_sleeps_in_its_second_run(
     (done, Started(numbers))
 }
 
-/// What the second run of a step that sleeps came to, and that none of its processes is left. The
-/// step ends red, not green, with the reason, and the evidence of the first run is still in its
-/// result.
+/// That none of the processes is running, allowing a moment for the system to collect the ones that
+/// were not the run's own children.
 #[cfg(unix)]
-fn assert_ended_at_its_deadline(done: &kr_conformance::run::Executed, started: &Started) {
-    assert_eq!(done.exit, None, "the second run did not end by itself");
-    let error = done.error.as_deref().expect("the step has an error");
-    assert!(error.contains(fault::PASSED_ITS_TIME), "{error}");
-    let rerun = done.rerun.as_ref().expect("the step was run again");
-    assert_eq!(rerun.first_exit, Some(101));
-    // The processes are ended when the run returns, and the system collects the ones that were
-    // not the run's own children a moment later.
+fn assert_gone(started: &Started) {
     for _ in 0..100 {
         if !started.0.iter().any(|pid| running(*pid)) {
             return;
@@ -425,6 +417,54 @@ fn assert_ended_at_its_deadline(done: &kr_conformance::run::Executed, started: &
         "a process of the second run is still running: {:?}",
         started.0
     );
+}
+
+/// A second run whose program ends by itself, having started a process it did not wait for, leaves
+/// that process in the step's group: it is ended with the run, and the step's own exit is kept.
+#[cfg(unix)]
+#[test]
+fn a_second_run_that_ends_by_itself_leaves_no_process_of_its_group_behind() {
+    let tree = Tree::new();
+    let (program, _unit) = unit_of(&tree);
+    let pids = tree.directory.path().join("pids");
+    let mut leaving = step(&[&tree.marker, &program, Path::new(""), &pids]);
+    leaving.command[2] = SCRIPT.replacen(
+        "echo second-$((1 + 1)); exit 0",
+        "echo $$ > \"$4\"; sleep 120 & echo $! >> \"$4\"; exit 0",
+        1,
+    );
+    let done = fault::execute(
+        &leaving,
+        1,
+        &tree.place(),
+        &[],
+        &mut Budget::of(Duration::from_secs(3600)),
+        &Evidence::SHOWN.reads(),
+        &mut |_| {},
+    );
+    let started = Started(
+        std::fs::read_to_string(&pids)
+            .unwrap()
+            .lines()
+            .map(|line| line.trim().parse().unwrap())
+            .collect(),
+    );
+    assert_eq!(done.exit, Some(0), "the second run ended by itself");
+    assert_eq!(done.error, None);
+    assert_gone(&started);
+}
+
+/// What the second run of a step that sleeps came to, and that none of its processes is left. The
+/// step ends red, not green, with the reason, and the evidence of the first run is still in its
+/// result.
+#[cfg(unix)]
+fn assert_ended_at_its_deadline(done: &kr_conformance::run::Executed, started: &Started) {
+    assert_eq!(done.exit, None, "the second run did not end by itself");
+    let error = done.error.as_deref().expect("the step has an error");
+    assert!(error.contains(fault::PASSED_ITS_TIME), "{error}");
+    let rerun = done.rerun.as_ref().expect("the step was run again");
+    assert_eq!(rerun.first_exit, Some(101));
+    assert_gone(started);
 }
 
 /// A second run that is still going when the time left for second runs is up is ended: the group
