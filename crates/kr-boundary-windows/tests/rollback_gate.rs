@@ -495,14 +495,20 @@ fn a_replacement_that_became_the_manifest_is_taken_as_the_manifest() {
         &source,
         "    fn save(&self) -> Result<(), Error> {",
     ));
-    let dropped = save
-        .find("if made.is_some_and(|(_, path)| path == self.paths.manifest) {")
-        .expect("the write tells the run of a replacement at the manifest's path");
-    let drop_it = save
+    // The earlier identity is dropped only where the write failed and still holds the replacement
+    // at the manifest's path; where the write marked it (another object stands there) the earlier
+    // identity stays.
+    let failed = save
+        .find("Err(error) => {")
+        .expect("the write's failure is read");
+    let holds = save[failed..]
+        .find(".is_some_and(|file| file.path == self.paths.manifest)")
+        .expect("only a replacement at the manifest's path counts");
+    let drop_it = save[failed..]
         .find("laid.manifest = None;")
         .expect("the earlier identity goes");
-    let hold_it = save.find("laid.replacement = made.map(").unwrap();
-    assert!(dropped < drop_it && drop_it < hold_it);
+    assert!(holds < drop_it);
+    assert!(!save[..failed].contains("laid.manifest = None;"));
     let rollback = code_of(body_of(&source, "    fn take_away(&mut self) -> Rolled {"));
     let split = rollback
         .find("Some(file) if file.path == self.paths.manifest => (None, Some(file)),")
