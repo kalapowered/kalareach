@@ -905,18 +905,27 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
 /// The variable that names the one directory every test artefact of a run is kept in.
 const ARTIFACTS_VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
 
-/// How a value may begin and still lie in a temporary folder: `/tmp`, or the platform's or the
-/// runner's own temporary folder, spelled as each shell and the workflow syntax spell it.
-const TEMPORARY_FOLDERS: [&str; 9] = [
+/// How a value may begin and still lie in a temporary folder: `/tmp`, or the runner's or the
+/// platform's temporary folder, spelled as a shell, PowerShell and the workflow syntax spell it. A
+/// shell's `$TMPDIR` alone is not here, since a shell that has none gives `/`: it needs a default,
+/// which `lies_in_a_temporary_folder` reads.
+const TEMPORARY_FOLDERS: [&str; 7] = [
     "/tmp/",
     "$RUNNER_TEMP",
-    "${RUNNER_TEMP",
+    "${RUNNER_TEMP}",
     "$env:RUNNER_TEMP",
     "${{ runner.temp }}",
-    "$TMPDIR",
-    "${TMPDIR",
     "$env:TEMP",
     "$env:TMP",
+];
+
+/// The values made from the variable's own value, which is the one checked where it was set: the
+/// variable itself, and the two commands that make its path absolute or a Windows path a POSIX one.
+const DERIVED_FROM_ITSELF: [&str; 4] = [
+    "$KR_TEST_ARTIFACTS_DIR",
+    "${KR_TEST_ARTIFACTS_DIR}",
+    "$(cygpath -u \"$KR_TEST_ARTIFACTS_DIR\")",
+    "$(cd \"$KR_TEST_ARTIFACTS_DIR\" && pwd)",
 ];
 
 /// The assignments the build's own scripts make that the case cannot follow to a temporary folder,
@@ -925,11 +934,11 @@ const UNFOLLOWED_ASSIGNMENTS: [(&str, &str, &str); 1] = [(
     "scripts/store-android.sh",
     "KR_TEST_ARTIFACTS_DIR=\"$leg/e2e\"",
     "the store build keeps the logs of its release check beside the signed bundle, in the directory \
-     the caller names, and that check takes no screenshot",
+     the caller names, and that check keeps its screenshots in the folder its own default names",
 )];
 
 /// The tools that take a screenshot, by the name a workflow step runs them under.
-const SCREENSHOT_TOOLS: [&str; 11] = [
+const SCREENSHOT_TOOLS: [&str; 12] = [
     "check-test-evidence.sh",
     "desktop-controls-macos.sh",
     "android-app-launch.sh",
@@ -938,6 +947,7 @@ const SCREENSHOT_TOOLS: [&str; 11] = [
     "e2e-pairing-device.sh",
     "e2e-mobile.sh",
     "e2e-voice-device.sh",
+    "e2e-voice-call-device.sh",
     "e2e-push-device.sh",
     "e2e-update.sh",
     "playwright",
@@ -989,6 +999,24 @@ fn artifacts_assignment(line: &str) -> Option<String> {
     Some(leading_value(&line[at + ARTIFACTS_VARIABLE.len() + 1..]))
 }
 
+/// Whether a line writes the variable in a way `artifacts_assignment` does not read: PowerShell's
+/// `$env:NAME = value`, a script's `os.environ["NAME"] = value`, an object key in a script, or any
+/// other `NAME` followed by an equals sign or a colon that is not a comparison or a default.
+fn writes_unread(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') || trimmed.starts_with("//") || artifacts_assignment(line).is_some()
+    {
+        return false;
+    }
+    line.match_indices(ARTIFACTS_VARIABLE).any(|(at, _)| {
+        let after = line[at + ARTIFACTS_VARIABLE.len()..]
+            .trim_start_matches(['"', '\'', ']', ')'])
+            .trim_start();
+        (after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=~"))
+            || (after.starts_with(':') && !after.starts_with(":-"))
+    })
+}
+
 /// What a script falls back on where the variable is unset: the text of each `${NAME:-default}` on
 /// a line, less the empty ones, which only pass on what the caller gave.
 fn artifacts_defaults(line: &str) -> Vec<String> {
@@ -1013,7 +1041,7 @@ fn artifacts_defaults(line: &str) -> Vec<String> {
 }
 
 /// The name of the variable a value begins with, in a shell's (`$name`, `${name`) or PowerShell's
-/// (`$name`) spelling, and nothing for `$env:` and `$(`.
+/// (`$name`) spelling. `$env:` and `$(` begin no name.
 fn leading_variable(value: &str) -> Option<&str> {
     let rest = value
         .strip_prefix("${")
@@ -1054,24 +1082,30 @@ fn values_of(text: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether `value`, as a script or a workflow writes it, lies in a temporary folder: it begins
-/// with one, or with the default the variable falls back on, or with a command that makes a
-/// directory in one, or with another variable of `text` whose every value does; and a value made
-/// from the variable's own value is the one checked where that was set.
+/// Whether `value`, as a script or a workflow writes it, lies in a temporary folder: it begins with
+/// one, or with the default that a `${NAME:-default}` falls back on, or with a command that makes a
+/// directory in one, or with another variable of `text` whose every value does. A value made from
+/// the variable's own value is the one checked where that was set. A step up (`..`) is never inside.
 fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
     let value = unquoted(value);
-    if depth == 0 || value.is_empty() {
+    if depth == 0 || value.is_empty() || value.split(['/', '\\']).any(|part| part == "..") {
         return false;
     }
-    if let Some(rest) = value.strip_prefix(&format!("${{{ARTIFACTS_VARIABLE}:-")) {
-        let default: String = rest
-            .chars()
-            .take_while(|character| *character != '}')
-            .collect();
-        return default.is_empty() || lies_in_a_temporary_folder(&default, text, depth - 1);
-    }
-    if value.contains(ARTIFACTS_VARIABLE) {
+    if DERIVED_FROM_ITSELF.contains(&value)
+        || value.starts_with("$KR_TEST_ARTIFACTS_DIR/")
+        || value.starts_with("${KR_TEST_ARTIFACTS_DIR}/")
+    {
         return true;
+    }
+    if let Some(rest) = value.strip_prefix("${")
+        && let Some((name, after)) = rest.split_once(":-")
+        && !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        let default: String = after.chars().take_while(|c| *c != '}').collect();
+        return (default.is_empty() && name == ARTIFACTS_VARIABLE)
+            || default == "/tmp"
+            || lies_in_a_temporary_folder(&default, text, depth - 1);
     }
     if TEMPORARY_FOLDERS
         .iter()
@@ -1079,13 +1113,17 @@ fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
     {
         return true;
     }
-    if value.starts_with("$(") && value.contains("mktemp") {
-        let template = value
-            .split("mktemp")
-            .nth(1)
-            .and_then(|after| after.split('"').nth(1));
-        return template
-            .is_some_and(|template| lies_in_a_temporary_folder(template, text, depth - 1));
+    if value.starts_with("$(")
+        && let Some(after) = value.split("mktemp").nth(1)
+    {
+        let mut rest = after.trim_start();
+        while rest.starts_with('-') {
+            rest = rest
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, tail)| tail);
+            rest = rest.trim_start();
+        }
+        return lies_in_a_temporary_folder(&leading_value(rest), text, depth - 1);
     }
     leading_variable(value).is_some_and(|name| {
         let values = values_of(text, name);
@@ -1117,9 +1155,15 @@ fn files_ending(directory: &Path, endings: &[&str], found: &mut Vec<PathBuf>) {
 
 /// KR-REQ-27.03, the part about the build's directory: every workflow and script of the repository
 /// that gives the artefacts directory a value, or a default, puts it in a temporary folder (`/tmp`,
-/// or the platform's or the runner's own), and a job that runs a screenshot tool does not leave it
-/// unset. The values are read as text, so a value spelled in a way this does not know is one it
-/// refuses; the one assignment it cannot follow is named, with its reason.
+/// or the runner's or the platform's own), and a job that runs a screenshot tool has the variable
+/// set when that step starts. The values are read as text, so a value spelled in a way this does
+/// not know is refused, and so is a write of the variable that it cannot read; the one assignment it
+/// cannot follow is named, with its reason.
+///
+/// Not shown here: that each run gets a directory of its own (the scripts' fixed default is shared
+/// by successive runs on one machine) and that on macOS the default is the OS-resolved `$TMPDIR`
+/// rather than `/tmp`; the directory the evidence check accepts is shown by the two cases in the
+/// conformance library.
 #[test]
 fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder() {
     let root = repository();
@@ -1142,6 +1186,13 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
         let text =
             fs::read_to_string(path).unwrap_or_else(|error| panic!("{name} is read: {error}"));
         for (number, line) in text.lines().enumerate() {
+            if writes_unread(line) {
+                outside.push(format!(
+                    "{name}:{}: a write of the variable this case does not read: {}",
+                    number + 1,
+                    line.trim()
+                ));
+            }
             let mut values: Vec<String> = artifacts_assignment(line).into_iter().collect();
             seen += values.len();
             if let Some(excused) = UNFOLLOWED_ASSIGNMENTS
@@ -1169,18 +1220,32 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
         outside.join("\n")
     );
 
-    // The one assignment the case does not follow is made by a store build whose release check
-    // takes no screenshot: that has to stay true, or the exception hides one.
+    // The one assignment the case does not follow is made by a store build whose release check keeps
+    // its screenshots where the check's own default puts them: that has to stay in a temporary
+    // folder, or the exception hides a screenshot outside one.
     let check = fs::read_to_string(root.join("scripts/e2e-android-release.sh")).expect("the check");
-    for word in ["screenshot", ".png", "screencap"] {
-        assert!(
-            !check.to_lowercase().contains(word),
-            "the store build's release check takes a screenshot ({word}), outside a temporary folder"
-        );
-    }
+    let shots = values_of(&check, "shots");
+    assert!(
+        !shots.is_empty()
+            && shots
+                .iter()
+                .all(|value| lies_in_a_temporary_folder(value, &check, 6)),
+        "the store build's release check keeps its screenshots outside a temporary folder: {shots:?}"
+    );
 
-    // A job that runs a screenshot tool has the variable from its workflow, its job or a step.
-    let mut jobs_with_a_tool = 0_usize;
+    // The companion's browser tests keep their screenshots under the variable, and under `/tmp`
+    // where it is unset.
+    let browser =
+        fs::read_to_string(root.join("apps/companion/e2e/evidence.ts")).expect("evidence");
+    assert!(
+        browser.contains("env['KR_TEST_ARTIFACTS_DIR'] ?? '/tmp/kr-test-artifacts'"),
+        "the browser tests' default directory is not under /tmp"
+    );
+
+    // A job that runs a screenshot tool has the variable when that step starts: from its workflow,
+    // from its own `env`, from a step that wrote it to the job's environment file earlier, or from
+    // the step's own `env` or an assignment in the step ahead of the tool.
+    let mut steps_with_a_tool = 0_usize;
     for path in &workflows {
         let name = path
             .file_name()
@@ -1188,33 +1253,50 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
             .to_string_lossy()
             .into_owned();
         let text = fs::read_to_string(path).expect("a workflow");
-        let before_jobs: Vec<&str> = text
-            .lines()
-            .take_while(|line| without_comment(line) != "jobs:")
-            .collect();
-        let set_for_all = before_jobs
-            .iter()
-            .any(|line| artifacts_assignment(line).is_some());
         if !text.lines().any(|line| without_comment(line) == "jobs:") {
             continue;
         }
+        let set_for_all = text
+            .lines()
+            .take_while(|line| without_comment(line) != "jobs:")
+            .any(|line| artifacts_assignment(line).is_some());
         for job_name in jobs_of(&text) {
             let body = job(&text, &job_name);
-            if !SCREENSHOT_TOOLS.iter().any(|tool| body.contains(tool)) {
-                continue;
+            let mut set = set_for_all
+                || body
+                    .lines()
+                    .take_while(|line| !line.starts_with("    steps:"))
+                    .any(|line| artifacts_assignment(line).is_some());
+            for step in steps_of(&body) {
+                if is_disabled(&step) {
+                    continue;
+                }
+                let lines: Vec<&str> = step.lines().collect();
+                let tool = lines
+                    .iter()
+                    .position(|line| SCREENSHOT_TOOLS.iter().any(|tool| line.contains(tool)));
+                let own = lines
+                    .iter()
+                    .position(|line| artifacts_assignment(line).is_some());
+                if let Some(tool) = tool {
+                    steps_with_a_tool += 1;
+                    assert!(
+                        set || own.is_some_and(|own| own <= tool),
+                        "{name}: the job {job_name} runs a screenshot tool in a step that has no \
+                         {ARTIFACTS_VARIABLE} yet:\n{step}"
+                    );
+                }
+                if lines
+                    .iter()
+                    .any(|line| line.contains("GITHUB_ENV") && artifacts_assignment(line).is_some())
+                {
+                    set = true;
+                }
             }
-            jobs_with_a_tool += 1;
-            assert!(
-                set_for_all
-                    || body
-                        .lines()
-                        .any(|line| artifacts_assignment(line).is_some()),
-                "{name}: the job {job_name} runs a screenshot tool and leaves {ARTIFACTS_VARIABLE} unset"
-            );
         }
     }
     assert!(
-        jobs_with_a_tool >= 3,
-        "the case found {jobs_with_a_tool} jobs that run a screenshot tool"
+        steps_with_a_tool >= 3,
+        "the case found {steps_with_a_tool} steps that run a screenshot tool"
     );
 }
