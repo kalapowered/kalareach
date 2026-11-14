@@ -417,14 +417,11 @@ lock_screen_leg() {
     return 0
 }
 
-# Reads the application's record of the microphone against the time the person gave the credential:
-# the call was open, was muted from the lock screen, and was opened again only after the unlock.
-lock_judge_trail() { # <result file>
-    local line at verdict
-    line="$(grep '^check=the microphone followed the taps on the lock screen ok=' "$1" | head -1)"
-    at=""
-    [ ! -s "$harness/unlock-at.txt" ] || at="$(tr -d '\r\n' <"$harness/unlock-at.txt")"
-    verdict="$(python3 -I - "$line" "$at" <<'PY'
+# The judgement of the microphone's record, in a function of its own. A here-document inside a
+# command substitution does not parse under the 3.2 shell that macOS ships, which reads the quotes of
+# the document's text, so the document is not given inside one.
+lock_trail_verdict() { # <the application's result line> <the credential's time in nanoseconds>
+    python3 -I - "$1" "$2" <<'PY'
 import re
 import sys
 
@@ -445,6 +442,15 @@ else:
     ok = last_muted_look >= unlocked
     print("%d the microphone was still muted %d ms after the leg submitted the credential and was seen open %d ms after it" % (ok, last_muted_look - unlocked, int(steps[4][1]) - unlocked))
 PY
-)"
+}
+
+# Reads the application's record of the microphone against the time the person gave the credential:
+# the call was open, was muted from the lock screen, and was opened again only after the unlock.
+lock_judge_trail() { # <result file>
+    local line at verdict
+    line="$(grep '^check=the microphone followed the taps on the lock screen ok=' "$1" | head -1)"
+    at=""
+    [ ! -s "$harness/unlock-at.txt" ] || at="$(tr -d '\r\n' <"$harness/unlock-at.txt")"
+    verdict="$(lock_trail_verdict "$line" "$at")"
     lock_check "the microphone stayed muted until the unlock" "${verdict%% *}" "${verdict#* }"
 }
