@@ -265,15 +265,19 @@ fn a_name_that_only_begins_like_a_root_a_relative_value_and_an_empty_value_are_r
         let temporary = real(&std::env::temp_dir());
         let lookalike = PathBuf::from(format!("{}foo", temporary.display())).join("evidence");
         let mut values: Vec<(PathBuf, &str)> = vec![
-            (lookalike, OUTSIDE),
-            // The temporary folder itself holds no evidence.
-            (temporary.clone(), OUTSIDE),
             (PathBuf::from("evidence"), "not an absolute path"),
             (PathBuf::from("./evidence"), "not an absolute path"),
             (PathBuf::new(), "it is empty"),
         ];
         if cfg!(unix) {
+            // `/tmp` is a root on every Unix, whatever TMPDIR names, so a folder beside the
+            // temporary folder can lie inside it; the root itself and a name that only begins
+            // like it are outside.
+            values.push((real(Path::new("/tmp")), OUTSIDE));
             values.push((PathBuf::from("/tmpfoo"), OUTSIDE));
+        } else {
+            values.push((temporary.clone(), OUTSIDE));
+            values.push((lookalike, OUTSIDE));
         }
         for (value, why) in values {
             let reading = reader.read(Some(value.as_os_str()), None);

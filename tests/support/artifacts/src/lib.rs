@@ -133,6 +133,7 @@ fn own() -> &'static Path {
 /// Makes a directory under the temporary folder that nothing else has, readable by this account
 /// only. The name is made exclusively, so a name an earlier run took is never reused.
 fn make_own() -> std::io::Result<PathBuf> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
