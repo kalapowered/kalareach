@@ -434,11 +434,13 @@ pub struct Notification {
     pub payload: ParamsValue,
 }
 
-/// What the host sends on an authorised control stream outside a response.
+/// What a peer sends on an authorised control stream outside a response.
 ///
 /// The control stream carries ordinary [`Notification`] events once the connection is authorised.
-/// These two messages are the connection's own, not an application event: the freshness resource
-/// and the transport's liveness belong to the connection rather than to any session.
+/// These messages are the connection's own, not an application event. The host sends the first two:
+/// the freshness resource and the transport's liveness belong to the connection rather than to any
+/// session. A worker sends the other three, on the connection of an input lane to the control
+/// daemon, and the host never forwards them to a device.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlEvent {

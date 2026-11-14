@@ -242,8 +242,11 @@ pub struct InputLeaseResult {
 /// against its requests on the control stream. A request that must come after some typing names
 /// the first `count` frames of one lease epoch for one attachment, sequences 0 to `count - 1`,
 /// counted over every frame the client has admitted, including frames it has not yet written. The
-/// worker applies the request only when it has accepted that many frames of the epoch, and
-/// refuses it otherwise. It checks the position and never waits for it.
+/// worker applies the request, while that epoch is the attachment's current one, only when it has
+/// accepted that many frames of it, and refuses it otherwise. It checks the position and never
+/// waits for it. Once the epoch is no longer current there is nothing left to order: the position
+/// is not consulted, a release or a launch of a stale epoch is refused as a lost lease, and a
+/// detach goes ahead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InputBarrier {
@@ -302,11 +305,15 @@ pub const fn max_input_bytes(limit: usize) -> usize {
     limit.saturating_sub(FRAME_LENGTH_PREFIX_LEN + INPUT_FRAME_OVERHEAD)
 }
 
+// The overhead holds a byte string's three-byte head, which a frame of 256 to 65,535 key bytes needs.
+const _: () = assert!(max_input_bytes(crate::limits::MAX_INPUT_FRAME_LEN) <= u16::MAX as usize);
+
 /// One frame of typing on a terminal-input stream, from the client to the host.
 ///
 /// A frame is one batch: the worker accepts all of its bytes or none of them. The sequence counts
-/// frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream. The debug
-/// form shows how many bytes the frame holds and never what they are: they are what a person typed.
+/// frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream.
+// The derived `Debug` shows how many bytes the frame holds and never what they are: `Bytes` hides
+// its content, and the bytes are what a person typed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InputFrame {
