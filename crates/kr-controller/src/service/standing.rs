@@ -74,7 +74,9 @@ impl Controller {
     /// written before the policy, and published once the policy is in force or the write was
     /// refused. A renewal's debt reaches the presenting device alone; a dropped lease may be
     /// anyone's, and its debt reaches the host. The barrier that retires the debt is the debt
-    /// pass's, so the answer does not wait for it.
+    /// pass's, so the answer does not wait for it: except that a caller that is served by
+    /// [`Self::present_lease`] is handed the barrier of a debt that reaches the host, and waits for
+    /// it as a request that withdraws the host does.
     ///
     /// `admission` is the admission of the mutation this serves, with the registry it was decided
     /// against. It is asked again inside the transaction that writes the policy, once the store's
@@ -98,6 +100,40 @@ impl Controller {
             &crate::registry::Registry,
             &crate::authority::AdmittedMutation,
         )>,
+    ) -> Result<
+        std::result::Result<
+            crate::grants::organisation::LeaseInstalled,
+            crate::grants::LeaseRefused,
+        >,
+    > {
+        let mut own_barrier = None;
+        let presented = self.present_lease(
+            device_id,
+            proven_key,
+            lease,
+            chain,
+            admission,
+            &mut own_barrier,
+        );
+        // Dropped, a barrier hands its debt to the debt pass.
+        drop(own_barrier);
+        presented
+    }
+
+    /// [`Self::present_membership_lease`], handing back in `own_barrier` the barrier of the debt
+    /// that the presentation owes the whole host, when it owes one, instead of leaving it to the debt
+    /// pass: the caller raises it, or drops it to leave the debt to the pass.
+    pub(super) fn present_lease(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        proven_key: &kr_protocol::scalars::AuthorisationKey,
+        lease: &kr_protocol::account::MembershipLease,
+        chain: Option<&kr_protocol::account::PolicyAuthority>,
+        admission: Option<(
+            &crate::registry::Registry,
+            &crate::authority::AdmittedMutation,
+        )>,
+        own_barrier: &mut Option<super::barrier::OwnBarrier>,
     ) -> Result<
         std::result::Result<
             crate::grants::organisation::LeaseInstalled,
@@ -266,9 +302,16 @@ impl Controller {
         }
         // Published whether or not the policy was written: a barrier for a restriction that did not
         // land fences once more than it needed, and a debt left pending would never be retired.
-        // The barrier is the debt pass's, which dropping this hands the debt to.
+        // The barrier is the debt pass's, which dropping this hands the debt to, unless the debt
+        // reaches the whole host: that barrier is the caller's to raise.
         if let Some(owed) = owed {
-            drop(self.publish_debts(&[owed]));
+            let reaches_the_host = matches!(owed.1, super::barrier::Reach::Host);
+            let barrier = self.publish_debts(&[owed]);
+            if reaches_the_host {
+                *own_barrier = Some(barrier);
+            } else {
+                drop(barrier);
+            }
         }
         written?;
         Ok(Ok(installed))

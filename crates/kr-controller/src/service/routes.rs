@@ -805,16 +805,18 @@ impl Controller {
             // organisation-managed. The same function the paired door calls does the work, as the
             // host's own device identity and key: the local caller proves no key, the operating
             // system identity the socket authenticated is the proof. The event it answers with
-            // derives from the one an earlier presentation left.
-            (LocalWrite::Derived(_), Method::MembershipPresent) => framed(Given::copied(
-                self.membership_present(
+            // derives from the one an earlier presentation left, so the answer is a copy, but for
+            // the answer of a presentation whose own effect withdrew the whole host through the
+            // barrier it waited for, which settles with the proof of it.
+            (LocalWrite::Derived(_), Method::MembershipPresent) => self
+                .membership_present_settled(
                     self.local_owner_device(),
                     &self.host_authorisation_key,
                     mutation,
                     carried,
                 )
-                .await,
-            )),
+                .await
+                .map(|outcome| respond(request_id, outcome)),
             // Deleting a copy privacy mode lists as having left this host is the person's own
             // action, apart from turning privacy mode on, and privacy mode does not stop it. The
             // registration it was admitted under is asked again in the write that records the

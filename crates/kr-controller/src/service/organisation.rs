@@ -1056,16 +1056,70 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
+        let mut own_barrier = None;
+        let answered = self
+            .membership_presented(device_id, proven_key, mutation, carried, &mut own_barrier)
+            .await;
+        // Dropped, a barrier hands its debt to the debt pass.
+        drop(own_barrier);
+        answered
+    }
+
+    /// `membership.present` for the host's own local owner, settled as the local door tells it.
+    ///
+    /// A presentation that installs a lease that ends sooner than the one before it owes the whole
+    /// host a fence of its own, and the barrier that retires it withdraws every connection, the one
+    /// the presentation arrived on included. The presentation waits for that barrier, as a request
+    /// that withdraws the host does, and settles with the proof of it ([`HostWithdrawal`]): the
+    /// answer of the request that installed the lease is then told while that revision is still
+    /// the one in force. Every other answer, a repeat of a lease in force and a refusal among them,
+    /// derives from an earlier event and is a copy.
+    ///
+    /// [`HostWithdrawal`]: super::barrier::HostWithdrawal
+    pub(crate) async fn membership_present_settled(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        proven_key: &AuthorisationKey,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> crate::given::Settled<Result<ParamsValue>> {
+        let mut own_barrier = None;
+        let answered = self
+            .membership_presented(device_id, proven_key, mutation, carried, &mut own_barrier)
+            .await;
+        let Some(own) = own_barrier.filter(|_| answered.is_ok()) else {
+            return crate::given::Settled::of(Given::copied(answered));
+        };
+        match self.barrier_proving(own).await {
+            Ok((_barrier, proof)) => {
+                crate::given::Settled::withdrawing(Given::fresh(answered), proof)
+            }
+            // The barrier could not be raised: a fence is owed, which the door asks about.
+            Err(_) => crate::given::Settled::of(Given::copied(answered)),
+        }
+    }
+
+    /// [`Self::membership_present`], handing back in `own_barrier` the barrier of the debt that the
+    /// presentation owes the whole host, when it owes one, for a caller that raises it.
+    async fn membership_presented(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        proven_key: &AuthorisationKey,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+        own_barrier: &mut Option<super::barrier::OwnBarrier>,
+    ) -> Result<ParamsValue> {
         let params: MembershipPresentParams = parse(&mutation.params)?;
         let registry = self.registry.lock().await;
         self.check_admission(&registry, &carried)?;
         let installed = self
-            .present_membership_lease(
+            .present_lease(
                 device_id,
                 proven_key,
                 &params.lease,
                 params.authority.as_ref(),
                 Some((&registry, &carried)),
+                own_barrier,
             )?
             .map_err(lease_refusal)?;
         drop(registry);
