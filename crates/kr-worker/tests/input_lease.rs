@@ -2341,9 +2341,37 @@ async fn echoing_session() -> (
     AttachmentId,
     u64,
 ) {
+    running_session("stty raw -echo; printf 'kr-ready.'; exec cat").await
+}
+
+/// As [`echoing_session`], for an application that reads its input and writes nothing, so that
+/// nothing the application does reaches the session while a case waits.
+async fn silent_session() -> (
+    kr_ipc::testing::TempHost,
+    Arc<SessionRuntime>,
+    kr_ipc::clock::ManualSharedClock,
+    SessionId,
+    AttachmentId,
+    u64,
+) {
+    running_session("stty raw -echo; printf 'kr-ready.'; exec cat > /dev/null").await
+}
+
+/// A running session of the program `script`, with its continuous clock in the test's hands, and
+/// the attachment that holds its input lease. The program prints `kr-ready.` when it is there.
+async fn running_session(
+    script: &str,
+) -> (
+    kr_ipc::testing::TempHost,
+    Arc<SessionRuntime>,
+    kr_ipc::clock::ManualSharedClock,
+    SessionId,
+    AttachmentId,
+    u64,
+) {
     let host = kr_ipc::testing::TempHost::create();
     // Raw mode with the echo off: what comes back is what the application received.
-    let mut config = configuration(&host, "stty raw -echo; printf 'kr-ready.'; exec cat");
+    let mut config = configuration(&host, script);
     // The one continuous clock of the session, in the test's hands: the response lane sets an
     // answer's own deadline from it and the writer reads it, so a test that moves it moves both.
     let clock = kr_ipc::clock::ManualSharedClock::new();
@@ -2478,7 +2506,9 @@ async fn the_answers_a_writer_has_written_leave_their_share_free_for_the_next_se
 #[tokio::test(flavor = "multi_thread")]
 async fn answers_held_behind_a_paste_are_all_written_when_it_ends_though_more_than_the_share_waits()
 {
-    let (_host, runtime, clock, _session_id, holder, epoch) = echoing_session().await;
+    // The application writes nothing, so what brings the last answer out of the lane is the room
+    // that the writer gives back and not output from the application.
+    let (_host, runtime, clock, _session_id, holder, epoch) = silent_session().await;
     let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     {
@@ -2498,14 +2528,27 @@ async fn answers_held_behind_a_paste_are_all_written_when_it_ends_though_more_th
         runtime.flush_input();
     }
     // The last answer is written once the writer has given back a place for it, a moment after
-    // the first 256 are written, so the wait is for all of them and not for a key behind them.
-    let seen =
-        common::retained_carrying(&runtime, STATUS_ANSWER, 257, Duration::from_secs(20)).await;
-    assert_eq!(
-        count(&seen, STATUS_ANSWER),
-        257,
-        "every answer the rate allowed was written"
-    );
+    // the first 256 are written, so the wait is for all of them.
+    let written = || -> usize {
+        runtime
+            .input()
+            .terminal_writes()
+            .iter()
+            .map(|write| count(&write.bytes, STATUS_ANSWER))
+            .sum()
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while written() < 257 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the writer wrote {} of the 257 answers the rate allowed",
+            written()
+        )
+    });
 }
 
 /// A harness that plays the terminal's writer settles what it takes as the writer settles what it
