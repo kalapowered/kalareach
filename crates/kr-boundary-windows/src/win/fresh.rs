@@ -319,7 +319,10 @@ pub type Hold<'a> = dyn Fn(Option<(&Arc<ffi::Handle>, &Path)>) + 'a;
 /// stands at the name. Where a read failed, nothing is established, and the object stays at the
 /// name: after a repair it may be the only manifest there is, and a failed read is no reason to
 /// delete it. The error then says which read failed and that the object was left. Where a mark
-/// failed, the run still holds the handle, so that its rollback marks the object again.
+/// failed, the run still holds the handle, so that its rollback marks the object again: with the
+/// record's path where a read failed (the object is at the name as far as anything shows), and with
+/// the path that the replacement was made at where a read showed that another object, or none,
+/// stands at the name.
 ///
 /// # Errors
 ///
@@ -391,6 +394,11 @@ pub fn replace_whole(
                     "the object that was written was marked for removal".to_owned()
                 }
                 Err(error) => {
+                    // Another object, or none, stands at the record's name, so the object that was
+                    // written is not known to be there: the run keeps its handle with the path that
+                    // it was made at and not the record's, and the earlier record's identity, which
+                    // the run holds, stays.
+                    hold(Some((&handle, staging)));
                     format!("the object that was written could not be marked for removal: {error}")
                 }
             };
