@@ -293,7 +293,7 @@ fn a_rollback_that_ends_with_a_failed_step_leaves_a_record_before_it_ends() {
     assert!(words > 0);
     let keep = code_of(body_of(&source, "fn keep_record("));
     assert!(keep.contains("self.manifest_on_disk()"));
-    assert!(keep.contains("self.save()"));
+    assert!(keep.contains("self.save_noting(&renamed)"));
     // The record that is left holds the data directory's entry, which the removal's inspection
     // needs, before the read that decides whether the record on disk is the run's own; and the
     // inspection reads that entry through the same call.
@@ -320,6 +320,46 @@ fn a_rollback_that_ends_with_a_failed_step_leaves_a_record_before_it_ends() {
     let roll = code_of(body_of(&source, "fn roll_back("));
     assert!(roll.contains("matches!(run.manifest_on_disk(), Ok(()))"));
     assert!(!roll.contains("check_program_directory(&paths, true,"));
+}
+
+/// The ending after a failed save is chosen from the stage at which the save failed: a save that
+/// failed before it created anything, or before its rename, changed nothing at the manifest's name
+/// and gives the form that says no write reached it; only a save whose rename had put an object
+/// there can say that the write may have published the record. The run learns the stage from the
+/// write's own report of the replacement's path, which comes after the rename and not before it.
+#[test]
+fn the_ending_after_a_failed_save_is_chosen_from_the_stage_at_which_the_save_failed() {
+    let source = install_source();
+    assert!(!source.contains("write_began"));
+    let keep = code_of(body_of(&source, "fn keep_record("));
+    let begun = keep
+        .find("let renamed = Cell::new(false);")
+        .expect("the stage starts unset");
+    let saved = keep
+        .find("self.save_noting(&renamed)")
+        .expect("the record's save reports its stage");
+    let said = keep
+        .find("renamed: renamed.get(),")
+        .expect("the ending is given the stage at which the save failed");
+    assert!(begun < saved && saved < said);
+    // The stage is set in one place: where the hold is told that the replacement has the manifest's
+    // path, and the plain save does not report it.
+    let save = code_of(body_of(&source, "fn save_noting("));
+    assert_eq!(count(&save, "renamed.set(true)"), 1);
+    assert!(save.contains("path == self.paths.manifest.as_path()"));
+    assert!(code_of(body_of(&source, "fn save(")).contains("self.save_noting(&Cell::new(false))"));
+    // The write tells the run the manifest's path only after its rename, and the replacement's own
+    // path before it.
+    let fresh =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/win/fresh.rs")).unwrap();
+    let whole = code_of(body_of(&fresh, "pub fn replace_whole("));
+    let created = whole.find("hold(Some((&handle, staging)));").unwrap();
+    let rename = whole
+        .find("rename_by_handle(&handle, directory, &name)")
+        .unwrap();
+    let placed = whole.find("hold(Some((&handle, path)));").unwrap();
+    assert!(created < rename && rename < placed);
+    assert_eq!(count(&whole, "hold(Some((&handle, path)));"), 1);
 }
 
 #[test]
