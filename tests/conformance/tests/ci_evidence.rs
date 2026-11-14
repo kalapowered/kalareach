@@ -863,14 +863,29 @@ fn the_reference_host_job_saves_its_cargo_cache_after_a_good_build_whatever_foll
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
         .expect("the landing workflow");
     let text = job(&workflow, "macos-reference");
-    let saves = steps_holding(&text, "uses: ./.github/actions/cargo-cache-save");
-    assert_eq!(saves.len(), 1, "the job does not save its cargo cache once");
+    // Every step that saves a cache, by the shared action or by the cache action itself.
+    let saves: Vec<String> = steps_of(&text)
+        .into_iter()
+        .filter(|step| step.contains("cache-save") || step.contains("cache/save"))
+        .collect();
+    assert_eq!(saves.len(), 1, "the job does not save a cache once");
     let save = &saves[0];
+    assert!(
+        save.contains("uses: ./.github/actions/cargo-cache-save"),
+        "the job's save is not the shared action's"
+    );
     assert!(!is_disabled(save), "the save step is disabled");
     let condition = step_condition(save)
         .expect("the save step has no condition, so a failed step before it ends the job unsaved");
+    // `always()` is the one status function: `success()` or `failure()` beside it would end the
+    // save after a failed step or after a good one, and `cancelled()` would end it in a cancelled
+    // run, which a newer push makes.
     assert!(
-        condition.contains("always()") && !condition.contains("||"),
+        condition.contains("always()")
+            && !condition.contains("||")
+            && ["success()", "failure()", "cancelled()"]
+                .iter()
+                .all(|other| !condition.contains(other)),
         "the save step's condition does not hold after a failed or cut step and after nothing else"
     );
     let named = steps_named(&condition);
