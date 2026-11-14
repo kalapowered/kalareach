@@ -2700,6 +2700,19 @@ impl RawDevice {
         use kr_client::transport::ControlTransport as _;
         self.transport.close();
     }
+
+    /// Finishes the control stream's sending half and leaves the connection standing.
+    pub async fn finish_control(&self) {
+        self.transport
+            .finish_control()
+            .await
+            .expect("the control stream finishes");
+    }
+
+    /// Resets the control stream's sending half and leaves the connection standing.
+    pub async fn reset_control(&self) {
+        self.transport.reset_control().await;
+    }
 }
 
 /// Pairs one device under the rights named and connects it, in one step.
