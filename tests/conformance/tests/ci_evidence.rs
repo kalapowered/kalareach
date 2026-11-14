@@ -18,7 +18,7 @@
 
 #![cfg(unix)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1163,6 +1163,13 @@ enum Kind {
     Argument,
     /// A line that cannot run and that no line rule lets through.
     Comment,
+    /// A line that reads the variable and may fall back to a value of its own (a Rust read that is
+    /// not a `let ... else` that leaves); the first line of the entry is the read, the lines after
+    /// it hold the fallback.
+    Read,
+    /// Lines that name a helper variable of another entry and give it no new value (a message, a
+    /// guarded expansion), accepted with a reason.
+    Mention,
 }
 
 /// How an entry shows that its value lies in a temporary folder.
@@ -1189,17 +1196,25 @@ struct Held {
 }
 
 impl Held {
+    /// The held line: the last line of the last block, or the first line of a read entry.
     fn held_line(&self) -> &str {
-        self.parts
-            .last()
-            .and_then(|part| part.last())
-            .map_or("", String::as_str)
+        let all: Vec<&str> = self.parts.iter().flatten().map(String::as_str).collect();
+        if self.kind == Kind::Read {
+            all[0]
+        } else {
+            all[all.len() - 1]
+        }
     }
 
     /// Every line of the entry but the held one.
     fn definitions(&self) -> Vec<&str> {
-        let all: Vec<&str> = self.parts.iter().flatten().map(String::as_str).collect();
-        all[..all.len() - 1].to_vec()
+        let mut all: Vec<&str> = self.parts.iter().flatten().map(String::as_str).collect();
+        all.remove(if self.kind == Kind::Read {
+            0
+        } else {
+            all.len() - 1
+        });
+        all
     }
 }
 
@@ -1214,6 +1229,8 @@ fn parse_entry(lines: &[&str]) -> Held {
             kind = match rest.trim() {
                 "argument" => Kind::Argument,
                 "comment" => Kind::Comment,
+                "read" => Kind::Read,
+                "mention" => Kind::Mention,
                 other => panic!("an entry of the held list has the kind {other}"),
             };
         } else if let Some(rest) = line.strip_prefix("value:") {
@@ -1239,7 +1256,7 @@ fn parse_entry(lines: &[&str]) -> Held {
         "an entry of the held list for {file} has an empty block"
     );
     assert!(
-        kind == Kind::Comment || !value.is_empty(),
+        matches!(kind, Kind::Comment | Kind::Read | Kind::Mention) || !value.is_empty(),
         "an entry of the held list for {file} gives no value"
     );
     let proof = match (folder, why) {
@@ -1249,8 +1266,12 @@ fn parse_entry(lines: &[&str]) -> Held {
         _ => panic!("an entry of the held list for {file} has no single, non-empty proof"),
     };
     assert!(
-        kind != Kind::Comment || matches!(proof, Proof::Reason),
-        "a comment entry of the held list for {file} states its reason"
+        !matches!(kind, Kind::Comment | Kind::Mention) || matches!(proof, Proof::Reason),
+        "a comment or mention entry of the held list for {file} states its reason"
+    );
+    assert!(
+        kind != Kind::Read || !matches!(proof, Proof::Text),
+        "a read entry of the held list for {file} shows its fallback by a folder line or states a reason"
     );
     Held {
         file,
@@ -1375,9 +1396,11 @@ fn occurrences(line: &str) -> Vec<usize> {
 ///
 /// - in a workflow expression, `${{ env.NAME }}`;
 /// - in PowerShell, `$env:NAME` not followed by an assignment;
-/// - a shell expansion that gives no value: `$NAME`, `${NAME}`, `${NAME:?...}`, `${NAME:+...}` and
-///   `${NAME:-}` with an empty default (a default with text gives a value and is a write);
-/// - the argument of Rust's `env::var` or `env::var_os`;
+/// - a shell expansion that gives no value: `$NAME`, `${NAME}`, `${NAME:?...}` and `${NAME:+...}`
+///   (`${NAME:-}` with an empty default is a read only inside a block of a held entry, which holds
+///   what the script falls back on; a default with text is a write);
+/// - the argument of Rust's `env::var` or `env::var_os` in a `let ... else {` statement, whose
+///   `else` has to leave, so that nothing falls back (any other Rust read is a held read);
 /// - alone on an `export` line, which gives the variable no new value.
 fn is_a_read(line: &str, at: usize) -> bool {
     let (before, after) = (&line[..at], &line[at + VARIABLE.len()..]);
@@ -1396,17 +1419,25 @@ fn is_a_read(line: &str, at: usize) -> bool {
             .iter()
             .any(|start| rest.starts_with(start))
     } else if before.ends_with("${") {
-        after.starts_with('}')
-            || after.starts_with(":?")
-            || after.starts_with(":+")
-            || after.starts_with(":-}")
+        after.starts_with('}') || after.starts_with(":?") || after.starts_with(":+")
     } else if before.ends_with('$') {
         !rest.starts_with('=')
     } else if before.ends_with("env::var_os(\"") || before.ends_with("env::var(\"") {
-        after.starts_with("\")")
+        after.starts_with("\")") && is_let_else(line)
     } else {
         before.trim() == "export" && after.trim().is_empty()
     }
+}
+
+/// Whether a line is a `let ... else {` statement, whose `else` block has to leave the function.
+fn is_let_else(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("let ") && line.ends_with(" else {")
+}
+
+/// Whether the name at `at` is an expansion with an empty default, `${NAME:-}`.
+fn is_empty_default(line: &str, at: usize) -> bool {
+    line[..at].ends_with("${") && line[at + VARIABLE.len()..].starts_with(":-}")
 }
 
 /// The name of the constant that a line makes of the variable's name (`const NAME: &str = "..."`).
@@ -1482,6 +1513,7 @@ fn lines_that_cannot_run(path: &str, lines: &[&str]) -> Vec<bool> {
                     if !trimmed.is_empty()
                         && !trimmed.starts_with("//")
                         && !trimmed.starts_with("#[")
+                        && !trimmed.starts_with("#![")
                     {
                         fenced = false;
                     }
@@ -1540,9 +1572,10 @@ fn names_the_variable(bytes: &[u8]) -> bool {
     String::from_utf8_lossy(&letters.to_ascii_lowercase()).contains(&VARIABLE.to_ascii_lowercase())
 }
 
-/// The variable a line gives a value in a shell's spelling (`name=`, after `export`, `local`,
-/// `readonly`, `declare` or `typeset`) or PowerShell's (`$name =`).
-fn assigned_name(line: &str) -> Option<&str> {
+/// The variable that a line gives a value as its first word, in a shell's spelling (`name=` or
+/// `name+=`, after `export`, `local`, `readonly`, `declare` or `typeset`) or PowerShell's (`$name =`),
+/// and whether it is PowerShell's. It names the helper variables an entry's definitions give.
+fn assigned_name(line: &str) -> Option<(&str, bool)> {
     let mut line = line.trim();
     for word in ["export ", "local ", "readonly ", "declare ", "typeset "] {
         line = line.strip_prefix(word).unwrap_or(line);
@@ -1553,80 +1586,74 @@ fn assigned_name(line: &str) -> Option<&str> {
     let assigns = rest.starts_with('=') && !rest.starts_with("==")
         || rest.starts_with("+=")
         || powershell && rest.trim_start().starts_with('=');
-    (!name.is_empty() && assigns).then_some(name)
+    (!name.is_empty() && assigns).then_some((name, powershell))
 }
 
-/// Whether a line gives `name` a value in one of the ordinary shell and PowerShell ways: `name=` or
-/// `name+=` that starts a word of any command of the line (`test -d x && name=y`, `declare -x
-/// name=y`), PowerShell's `$name`, `$script:name` or `[type]$name` followed by an assignment
-/// operator, `${name:=`, `for name in`, `read name` and `printf -v name`.
-fn gives_value_to(line: &str, name: &str) -> bool {
-    let line = line.trim();
-    let assigned = line.match_indices(name).any(|(at, _)| {
-        let (before, rest) = (&line[..at], &line[at + name.len()..]);
+/// The helper variables of an entry, each with whether it is PowerShell's: the variables its
+/// definition lines give a value, and the variables its value names that those lines mention. The
+/// variable itself and the environment's own variables (`TMPDIR`, `RUNNER_TEMP`, which no line of
+/// the entry gives a value) are not helpers.
+fn helpers_of(entry: &Held) -> Vec<(String, bool)> {
+    let definitions = entry.definitions();
+    let mut helpers: Vec<(String, bool)> = definitions
+        .iter()
+        .filter_map(|line| assigned_name(line))
+        .map(|(name, powershell)| (name.to_owned(), powershell))
+        .collect();
+    for (at, _) in entry.value.match_indices('$') {
+        let rest = &entry.value[at + 1..];
+        let rest = rest.strip_prefix('{').unwrap_or(rest);
+        let name: String = rest.chars().take_while(|c| is_word(*c)).collect();
+        if !name.is_empty()
+            && definitions
+                .iter()
+                .any(|line| !word_positions(line, &name).is_empty())
+        {
+            helpers.push((name, false));
+        }
+    }
+    helpers.retain(|(name, _)| !name.eq_ignore_ascii_case(VARIABLE));
+    helpers.sort();
+    helpers.dedup_by(|a, b| a.0 == b.0);
+    helpers
+}
+
+/// Whether what follows a PowerShell variable assigns it, or may: an assignment operator, `++`,
+/// `--`, a list (`,`) or `in` (a `foreach`).
+fn assignment_follows(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    (rest.starts_with('=') && !rest.starts_with("=="))
+        || ["+=", "-=", "*=", "/=", "%=", "??=", "++", "--", ",", "in "]
+            .iter()
+            .any(|start| rest.starts_with(start))
+}
+
+/// Whether `line` holds the helper `name` as a whole word in any place other than a plain use of
+/// its value: `$name`, `"$name"` and `${name}` (with no operator after the name), and, in PowerShell
+/// text, `$name` that no assignment follows. A bare `name`, `name=`, `read name`, `${name:=...}`,
+/// `${name%/}` and the like all name the helper otherwise, and fail.
+fn mentions_helper(line: &str, name: &str, powershell: bool) -> bool {
+    line.match_indices(name).any(|(at, _)| {
+        let (before, after) = (&line[..at], &line[at + name.len()..]);
         if before.chars().next_back().is_some_and(is_word)
-            || rest.chars().next().is_some_and(is_word)
+            || after.chars().next().is_some_and(is_word)
         {
             return false;
         }
-        let powershell = before.ends_with('$')
-            || before
-                .rsplit_once('$')
-                .is_some_and(|(_, scope)| scope.ends_with(':') && !scope.contains(' '));
-        let operator = rest.trim_start();
-        if powershell {
-            ["=", "+=", "-=", "*=", "/=", "%=", "??="]
-                .iter()
-                .any(|start| operator.starts_with(start))
-                && !operator.starts_with("==")
+        let (plain, rest) = if before.ends_with("${") {
+            (after.starts_with('}'), after.get(1..).unwrap_or(""))
         } else {
-            !before.ends_with(['$', '-', '.', '{', '/'])
-                && ((rest.starts_with('=') && !rest.starts_with("==")) || rest.starts_with("+="))
-        }
-    });
-    assigned
-        || line.contains(&format!("${{{name}:="))
-        || line.contains(&format!("${{{name}="))
-        || line.starts_with(&format!("for {name} in "))
-        || (line.starts_with("read ") && line.split_whitespace().any(|word| word == name))
-        || line.contains(&format!(" -v {name} "))
-}
-
-/// The lines that stand between two blocks of an entry and give a variable that an earlier block
-/// gives a value another one: the text hold of the blocks would not see them.
-fn redefinitions(entry: &Held, lines: &[&str], spans: &[(usize, usize)]) -> Vec<String> {
-    let mut problems = Vec::new();
-    for (gap, pair) in spans.windows(2).enumerate() {
-        let names: Vec<&str> = entry.parts[..=gap]
-            .iter()
-            .flatten()
-            .filter_map(|line| assigned_name(line))
-            .collect();
-        for (number, line) in lines.iter().enumerate().take(pair[1].0).skip(pair[0].1) {
-            if line.trim_start().starts_with('#') {
-                continue;
-            }
-            for name in &names {
-                if gives_value_to(line, name) {
-                    problems.push(format!(
-                        "{}:{}: a line between the held lines of an entry gives {name} another \
-                         value: {}",
-                        entry.file,
-                        number + 1,
-                        line.trim()
-                    ));
-                }
-            }
-        }
-    }
-    problems
+            (before.ends_with('$'), after)
+        };
+        !(plain && !(powershell && assignment_follows(rest)))
+    })
 }
 
 /// What is wrong with an entry's proof that its value lies in a temporary folder.
 fn proof_problem(entry: &Held) -> Option<String> {
     let label = format!("held entry for {} ({})", entry.file, entry.held_line());
     match (&entry.kind, &entry.proof) {
-        (Kind::Comment, _) | (_, Proof::Reason) => None,
+        (Kind::Comment | Kind::Mention, _) | (_, Proof::Reason) => None,
         (_, Proof::Folder(folder)) => {
             let makes_one = ["TempDir::new(", "tempdir(", "env::temp_dir()"]
                 .iter()
@@ -1648,54 +1675,98 @@ fn proof_problem(entry: &Held) -> Option<String> {
     }
 }
 
+/// The lines of an entry's file and where each block of the entry stands, or what is wrong.
+fn located<'a>(
+    files: &'a [(String, Vec<u8>)],
+    entry: &Held,
+) -> Result<(Vec<&'a str>, Vec<(usize, usize)>), String> {
+    let Some((_, bytes)) = files.iter().find(|(path, _)| *path == entry.file) else {
+        return Err("the file is not tracked".to_owned());
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Err("the file is not text".to_owned());
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let spans = locate(entry, &lines)?;
+    Ok((lines, spans))
+}
+
 /// What this case finds wrong in `files` (every tracked file, by path and bytes) when `held_text` is
 /// the held list.
 fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
     let held = parse_held(held_text);
     let mut problems = Vec::new();
+    // The lines that the blocks of the entries of a file hold.
+    let mut block_lines: HashSet<(&str, usize)> = HashSet::new();
+    for entry in &held {
+        if let Ok((_, spans)) = located(files, entry) {
+            for (from, to) in spans {
+                block_lines.extend((from..to).map(|line| (entry.file.as_str(), line)));
+            }
+        }
+    }
     // Each held entry stands once in its file, its value is given by its line, and it shows that the
     // value lies in a temporary folder.
     let mut at_line: HashMap<(&str, usize), Vec<usize>> = HashMap::new();
     let mut covered: HashMap<(&str, usize), Vec<(usize, usize)>> = HashMap::new();
     for (index, entry) in held.iter().enumerate() {
-        let Some((_, bytes)) = files.iter().find(|(path, _)| *path == entry.file) else {
-            problems.push(format!(
-                "held entry for {}: the file is not tracked",
-                entry.file
-            ));
-            continue;
-        };
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            problems.push(format!(
-                "held entry for {}: the file is not text",
-                entry.file
-            ));
-            continue;
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        let spans = match locate(entry, &lines) {
-            Ok(spans) => spans,
+        let (lines, spans) = match located(files, entry) {
+            Ok(found) => found,
             Err(error) => {
                 problems.push(format!("held entry for {}: {error}", entry.file));
                 continue;
             }
         };
-        let last = spans[spans.len() - 1].1 - 1;
-        if matches!(entry.proof, Proof::Text) {
-            problems.extend(redefinitions(entry, &lines, &spans));
+        problems.extend(proof_problem(entry));
+        if entry.kind == Kind::Mention {
+            continue;
         }
+        let last = if entry.kind == Kind::Read {
+            spans[0].0
+        } else {
+            spans[spans.len() - 1].1 - 1
+        };
         at_line
             .entry((entry.file.as_str(), last))
             .or_default()
             .push(index);
-        problems.extend(proof_problem(entry));
         let line = lines[last];
+        if entry.kind == Kind::Read && !line.contains("env::var") {
+            problems.push(format!(
+                "held entry for {}: its first line is not a read of the environment: {line}",
+                entry.file
+            ));
+        }
+        // A helper variable of the entry is named, on every line of the file outside the entry's
+        // blocks and the blocks of the other entries, only as a plain use of its value.
+        if matches!(entry.proof, Proof::Text) && matches!(entry.kind, Kind::Write | Kind::Argument)
+        {
+            let passes = lines_that_cannot_run(&entry.file, &lines);
+            for (name, powershell) in helpers_of(entry) {
+                for (number, text) in lines.iter().enumerate() {
+                    if !passes[number]
+                        && !block_lines.contains(&(entry.file.as_str(), number))
+                        && mentions_helper(text, &name, powershell)
+                    {
+                        problems.push(format!(
+                            "{}:{}: this line names the helper {name} of a held entry \
+                             other than as a plain use of its value: {}\n  Write the line another \
+                             way, or add it to the held list as a `kind: mention` entry with its \
+                             reason.",
+                            entry.file,
+                            number + 1,
+                            text.trim()
+                        ));
+                    }
+                }
+            }
+        }
         let span = match entry.kind {
             Kind::Write => occurrences(line)
                 .into_iter()
                 .find_map(|at| bound_value(line, at, &entry.value).map(|span| (at, span))),
             Kind::Argument => argument_span(line, &entry.value).map(|span| (span.0, span)),
-            Kind::Comment => continue,
+            Kind::Comment | Kind::Read | Kind::Mention => continue,
         };
         match span {
             Some((at, (from, to))) => {
@@ -1742,7 +1813,7 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
                 .map_or(&[][..], Vec::as_slice);
             if entries
                 .iter()
-                .any(|entry| held[*entry].kind == Kind::Comment)
+                .any(|entry| matches!(held[*entry].kind, Kind::Comment | Kind::Read))
             {
                 continue;
             }
@@ -1759,8 +1830,11 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
             let spans = covered
                 .get(&(path.as_str(), index))
                 .map_or(&[][..], Vec::as_slice);
+            let held_block = block_lines.contains(&(path.as_str(), index));
             let unexplained = occurrences(line).into_iter().any(|at| {
-                !spans.iter().any(|(from, to)| (*from..*to).contains(&at)) && !is_a_read(line, at)
+                !spans.iter().any(|(from, to)| (*from..*to).contains(&at))
+                    && !is_a_read(line, at)
+                    && !(held_block && is_empty_default(line, at))
             });
             if unexplained {
                 problems.push(format!(
@@ -1789,7 +1863,12 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
                 continue;
             }
             let lines: Vec<&str> = text.lines().collect();
-            let passes = lines_that_cannot_run(path, &lines);
+            let mut passes = lines_that_cannot_run(path, &lines);
+            if path == THIS_FILE
+                && let Ok(region) = held_region(&lines, held_text)
+            {
+                passes[region].fill(true);
+            }
             for (index, line) in lines.iter().enumerate() {
                 let uses = word_positions(line, name);
                 let read = |at: &usize| {
@@ -1797,9 +1876,14 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
                     (before.ends_with("env::var_os(") || before.ends_with("env::var("))
                         && line[at + name.len()..].starts_with(')')
                 };
+                let held_read = at_line
+                    .get(&(path.as_str(), index))
+                    .is_some_and(|entries| entries.iter().any(|e| held[*e].kind == Kind::Read));
                 if !passes[index]
+                    && !uses.is_empty()
                     && alias_of(line).as_deref() != Some(name)
-                    && !uses.iter().all(read)
+                    && !held_read
+                    && !(is_let_else(line) && uses.iter().all(read))
                 {
                     problems.push(format!(
                         "{path}:{}: a use of the constant {name}, which holds the variable's name, \
@@ -2261,7 +2345,7 @@ fn the_source_case_fails_on_what_it_does_not_know() {
                 a,
                 (
                     "crates/x/src/lib.rs",
-                    "const ENV: &str = \"@V@\";\nfn f() { std::env::var_os(ENV); }\n",
+                    "const ENV: &str = \"@V@\";\nfn f() {\n    let Some(x) = std::env::var_os(ENV) else {\n        return;\n    };\n}\n",
                 ),
             ],
             held_a,
@@ -2411,7 +2495,7 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             "a variable given another value between the held lines",
             vec![("scripts/b.sh", "d=/tmp/x\nd=/home/y\nexport @V@=\"$d/e\"\n")],
             "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
-            Some("another value"),
+            Some("names the helper"),
         ),
         (
             "an unrelated line between the held lines",
@@ -2432,7 +2516,7 @@ fn the_source_case_fails_on_what_it_does_not_know() {
                 "d=/tmp/x\ntest -d \"$PWD\" && d=\"$PWD/e\"\nexport @V@=\"$d/e\"\n",
             )],
             "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
-            Some("another value"),
+            Some("names the helper"),
         ),
         (
             "a variable given another value by a declaration between the held lines",
@@ -2441,7 +2525,7 @@ fn the_source_case_fails_on_what_it_does_not_know() {
                 "d=/tmp/x\ndeclare -x d=\"$PWD/e\"\nexport @V@=\"$d/e\"\n",
             )],
             "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
-            Some("another value"),
+            Some("names the helper"),
         ),
         (
             "a comment between the held lines that names the helper",
@@ -2754,4 +2838,73 @@ file: apps/companion/e2e/evidence.ts
 kind: comment
 | * Section 27 puts every test artefact in one platform-resolved directory, `KR_TEST_ARTIFACTS_DIR`,
 why: a line inside the block comment that opens the module
+
+file: crates/kr-shell-integration/tests/shellpkg/mod.rs
+kind: read
+| if let Some(named) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") {
+| return PathBuf::from(named);
+| }
+| static OWN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+| OWN.get_or_init(|| {
+| tempfile::Builder::new()
+| .prefix("kr-test-artifacts-")
+| .tempdir()
+| .expect("a directory of this run's own in the system's temporary directory")
+| .keep()
+| })
+| .clone()
+folder: .tempdir()
+
+file: tests/perf/src/record.rs
+kind: read
+| let directory = std::env::var_os(ARTIFACTS).map(PathBuf::from);
+| report_in(directory.as_deref(), file, measurement, lines);
+why: an unset variable leaves the directory None, which report_in answers by keeping nothing; it falls back to no value
+
+file: scripts/bench-all.sh
+kind: mention
+| temporary="${TMPDIR:-/tmp}"
+| work="$(mktemp -d "${temporary%/}/kalareach-bench-work.XXXXXX")" || exit 1
+why: the work directory's own use of the name, after the evidence directory is chosen; its value is the default of TMPDIR, a temporary folder, and no write of the variable follows from it
+
+file: scripts/bench-all.sh
+kind: mention
+| echo "bench-all: the evidence directory $KR_TEST_ARTIFACTS_DIR cannot be written" >&2
+...
+| echo "  evidence: $evidence"
+...
+| echo "bench-all: this run could not keep or read back its evidence at $1" >&2
+...
+| lines+=("reference figure  no: the run could not keep or read back all of its evidence, at $lost_places${shortfalls:+; and $shortfalls}")
+...
+| $identifier is not a reference figure: the run could not keep or read back all of its evidence"
+...
+| this run could not keep or read back its evidence at: $lost_places"
+why: messages that print the word evidence; none gives a variable a value
+
+file: scripts/e2e-update.sh
+kind: mention
+| chmod -R u+w "${work:?}" 2> /dev/null || true
+| rm -rf "${work:?}"
+why: the cleanup's guarded expansions of the work directory (${work:?} stops when it is empty); none gives it a value
+
+file: scripts/e2e-voice-call-device.sh
+kind: mention
+| mkdir -p "${artefacts:?}"
+...
+| rm -f "${artefacts:?}/host-judge.rc"
+...
+| rm -rf "${companion:?}/src-tauri/gen/apple/build"
+| mkdir -p "${artefacts_base:?}"
+...
+| say "building the debug application for the emulator${KR_MINIFY_DEBUG:+ (KR_MINIFY_DEBUG=$KR_MINIFY_DEBUG)}"
+| mkdir -p "${artefacts_base:?}"
+why: guarded expansions (${name:?} stops when the name is empty); none gives a variable a value
+
+file: scripts/run-conformance.sh
+kind: mention
+| echo "  cargo run --locked -p kr-conformance --bin kr-conformance -- run --root . --evidence <a directory under %TEMP%>" >&2
+...
+| echo "run-conformance: platform $platform, evidence $evidence"
+why: a usage message and a progress message that print the word evidence; neither gives a variable a value
 "##;
