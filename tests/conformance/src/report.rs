@@ -402,8 +402,10 @@ pub enum Stopped {
     PrivateCopy(String),
 }
 
-/// Every directory a step of `options` builds in: the repository, which holds the build
-/// directories the plan's scripts name, and the target directory a step is given.
+/// The directories a step of `options` builds in that are known from the options and the
+/// environment: the repository, which holds the build directories the plan's scripts name, and the
+/// target directory a step is given by a variable. A target directory set in Cargo's configuration
+/// file is not named.
 fn build_directories(options: &Options) -> Vec<PathBuf> {
     let given = options
         .environment
@@ -1163,8 +1165,8 @@ impl<'a> Resolver<'a> {
         let mut runs = Vec::new();
         for (index, binary) in self.ran.get(target).into_iter().flatten() {
             let step = &self.executed[*index].step;
-            // The runner recorded, in a file no program is told of, that it could not start this test
-            // program.
+            // The runner recorded, in the file it writes for this step, that it could not start this
+            // test program.
             let refused = self.executed[*index]
                 .observation
                 .as_ref()

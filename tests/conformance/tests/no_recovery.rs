@@ -1,8 +1,10 @@
 //! The report's own sources, apart from the items under `#[cfg(test)]`, hold none of the listed
 //! names: the programs that end processes, remove files or read the system's logs and signatures,
-//! and the functions that remove, replace or signal. The case reads tokens and refuses the names,
-//! whatever follows them. It cannot see a name that a macro builds, a file taken in from outside
-//! `src`, or a program started under a name that is not listed. That each step runs once is held by
+//! and the functions that remove, replace or signal. The case reads tokens and refuses the names
+//! wherever they are written, except a `rename` followed by `=` inside an attribute, which is the
+//! attribute's key; an item under `#[cfg(test)]` is skipped only where the attribute is on an item.
+//! It cannot see a name that a macro builds, a file taken in from outside `src`, or a program
+//! started under a name that is not listed. That each step runs once is held by
 //! the case that counts the runs of a failed step
 //! (`a_step_that_could_not_run_a_program_fails_once_and_keeps_the_file_as_it_was_seen` in
 //! `observation.rs`), and what the steps themselves run is the plan's.
