@@ -583,8 +583,8 @@ impl Rig {
     ///
     /// # Panics
     ///
-    /// Panics when the call made more requests than answers were lost, since the service then
-    /// answered one and the call's answer says nothing of a lost one.
+    /// Panics when more requests reached the service than answers were lost, since the service
+    /// then answered one and the call's answer says nothing of a lost one.
     async fn delete_retained_while_answers_are_lost(
         &self,
         reference: &str,
@@ -598,7 +598,7 @@ impl Rig {
         let sent = web.requests_to(DELETE) - before;
         assert!(
             sent <= usize::try_from(ANSWERS_LOST).expect("a small count"),
-            "the call made {sent} requests, more than the {ANSWERS_LOST} whose answers are lost"
+            "{sent} requests reached the service, more than the {ANSWERS_LOST} whose answers are lost"
         );
         answered
     }
@@ -9499,18 +9499,23 @@ async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_a
         assert!(rig.held_at_the_service(object), "{object} is not asked for");
     }
 
-    // The service answers again, so the request asked for again is confirmed.
+    // The service answers again, so the request asked for again is confirmed: by this call, or by
+    // a pass of the carrier that was already owed and sent first, in which case there is nothing
+    // left to ask for and the call is refused.
     rig.served.web().mend();
-    let second = rig
-        .delete_retained(&reference_of(1))
-        .await
-        .expect("asked again");
-    assert!(second.deleted);
-    assert!(
+    let confirmed = |rig: &Rig| {
         rig.objects_of(1)
             .iter()
             .all(|object| object.released_at_ms.is_some())
-    );
+    };
+    match rig.delete_retained(&reference_of(1)).await {
+        Ok(second) => assert!(second.deleted),
+        Err(refused) => assert!(
+            confirmed(&rig),
+            "asked again and refused, though the service has not confirmed: {refused:?}"
+        ),
+    }
+    assert!(confirmed(&rig));
     for object in second_objects() {
         assert!(rig.held_at_the_service(object), "{object} is not asked for");
     }
@@ -9531,10 +9536,15 @@ async fn a_deletion_asked_under_privacy_mode_is_sent_after_a_restart_once_privac
             .deleted
     );
 
-    // The requests the first daemon sent are counted once it has stopped, and the service
-    // answers the restarted daemon's.
+    // The requests the first daemon sent are counted once its carrier has ended, which is when
+    // the count of its passes has no sender left, and the service answers the restarted daemon's.
     let environment = rig.host.environment_id();
+    let mut ended = rig.controller.backup_runtime().expect("a carrier").passes();
     let (host, served, timer) = rig.stop().await;
+    within("the first daemon's carrier ends", async {
+        while ended.changed().await.is_ok() {}
+    })
+    .await;
     let sent = served.web().requests_to(DELETE);
     served.web().mend();
     let (controller, endpoint, _serving) = start_daemon(&host, timer).await;
@@ -9598,7 +9608,7 @@ async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_p
     let before = opened_members(&rig, 1);
 
     // The answers to the first requests are lost, so the host has not confirmed the deletion when
-    // privacy mode goes off, and the service answers the requests it sends after that.
+    // the call answers, and the service answers what the carrier sends after the mend.
     rig.fence().await;
     assert!(
         !rig.delete_retained_while_answers_are_lost(&reference_of(1))
