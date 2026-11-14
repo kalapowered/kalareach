@@ -1723,8 +1723,8 @@ removes them: each run of the legs against a deployment adds a batch of them.
 
 The landing workflow runs `scripts/e2e-deployment.sh` and the checkpoint's pairing leg against the
 production origin at a push to main and at a manual run that sets the `deployment_legs` input. A
-pull request's run and every other manual run leave them out, so a branch's run writes nothing to
-that deployment.
+pull request's run and a manual run that does not set it leave them out and write nothing to that
+deployment.
 
 ## Recovery
 
