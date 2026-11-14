@@ -357,6 +357,53 @@ async fn the_record_of_one_role_refuses_no_connection_of_another() {
         .expect("the authority connection is served");
 }
 
+/// KR-REQ-02.05: a higher generation takes every role at once, whatever the order of its
+/// connection: it fences the connection of the lower generation even though that one said hello
+/// after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_higher_generation_installs_whatever_the_order_of_its_connection() {
+    let host = host(1).await;
+    let mut for_the_higher = declared(&host, ControllerConnectionRole::Authority).await;
+    let mut for_the_lower = declared(&host, ControllerConnectionRole::Authority).await;
+    present(&mut for_the_lower, host.signer(), 1)
+        .await
+        .expect("the lower generation is accepted");
+    read_session(&mut for_the_lower, host.session_id)
+        .await
+        .expect("the lower generation is served");
+    present(&mut for_the_higher, host.signer(), 2)
+        .await
+        .expect("the higher generation installs although its connection said hello first");
+    read_session(&mut for_the_higher, host.session_id)
+        .await
+        .expect("the higher generation is served");
+    assert_eq!(
+        read_session(&mut for_the_lower, host.session_id).await,
+        Err(Refused::Link(ErrorCode::PermissionDenied)),
+        "the lower generation is fenced"
+    );
+}
+
+/// KR-REQ-02.05: the records of every role begin again with a higher generation, including when a
+/// proxy connection is the one that presents it first: an attention connection that said hello
+/// before the one accepted for the lower generation is accepted for the higher.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_records_begin_again_with_a_higher_generation_that_a_proxy_presents_first() {
+    let host = host(1).await;
+    let mut waiting = declared(&host, ControllerConnectionRole::Attention).await;
+    let mut accepted = declared(&host, ControllerConnectionRole::Attention).await;
+    let mut proxy = declared(&host, ControllerConnectionRole::Proxy).await;
+    present(&mut accepted, host.signer(), 1)
+        .await
+        .expect("the attention connection is accepted for the lower generation");
+    present(&mut proxy, host.signer(), 2)
+        .await
+        .expect("a proxy presents the higher generation");
+    present(&mut waiting, host.signer(), 2)
+        .await
+        .expect("the earlier attention connection is accepted for the higher generation");
+}
+
 /// KR-REQ-02.05: a controller connection from a generation a newer daemon has replaced cannot
 /// dispatch anything afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
