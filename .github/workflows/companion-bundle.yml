@@ -25,7 +25,7 @@ name: companion-bundle
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "task/T-WIN-RUNTIME-1"]
     paths:
       - apps/companion/src-tauri/**
       - apps/companion/scripts/desktop.mjs
