@@ -607,8 +607,10 @@ impl TerminalWrites {
 /// removed. The close is asked for and not waited for: its own steps end the session's work, and
 /// the journal is let go of when the last handle to the runtime goes, which is what the removal of
 /// the directory is tried again for.
+#[cfg(feature = "testing")]
 pub struct ClosedOnDrop(Option<std::sync::Arc<crate::runtime::SessionRuntime>>);
 
+#[cfg(feature = "testing")]
 impl ClosedOnDrop {
     /// Closes `runtime`'s session when this is dropped, on Unix alone. On Windows the shell ends
     /// with the job that holds it when the session is dropped, and a close would keep the session's
@@ -626,6 +628,7 @@ impl ClosedOnDrop {
     }
 }
 
+#[cfg(feature = "testing")]
 impl Drop for ClosedOnDrop {
     fn drop(&mut self) {
         // A case that failed may have left the session's lock poisoned, and a panic in a drop
