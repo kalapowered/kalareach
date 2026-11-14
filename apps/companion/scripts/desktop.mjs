@@ -53,7 +53,7 @@
 //   with which libsodium's crate links the library they name and not the archive that was compared.
 import { spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, posix, win32 } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startedAs } from './entry-point.mjs'
 
@@ -312,17 +312,18 @@ export function childArguments(argv) {
 /**
  * The directory libsodium's archive is placed in: the one the caller's environment names, else one in
  * the home directory that is named by the digests the placing script holds (its `--key`), so that no
- * directory is shared by two sets of bytes. It is absolute and written with forward slashes, so that the
- * script and the crate's build script both read the same path.
+ * directory is shared by two sets of bytes. A name the caller gives is resolved by the rule of the
+ * platform that runs, from where this was started, and is written with forward slashes: on Windows it
+ * has a drive or a server in it, so that the placing script (the bash of Git for Windows) and the
+ * crate's build script (a Windows program) read the same directory. A name that starts with a separator
+ * and has no drive, `/c/cache`, is read from the root of the working directory's drive, as a Windows
+ * program reads it, and not through Git's mount table, which would read it as `C:\cache`.
  */
 export function archiveDirectory(env, home, key, platform = process.platform, cwd = process.cwd()) {
   const named = environmentValue(env, ARCHIVE_VARIABLE, platform)
   const slashed = (path) => path.replaceAll('\\', '/')
   if (named === undefined || named === '') return slashed(`${home}/${key}`)
-  // The script reads a relative name from the repository's root and the crate's build script from its
-  // own directory, so the name is made absolute, from where this was started, before either reads it.
-  const absolute = platform === WINDOWS ? /^([A-Za-z]:[\\/]|[\\/])/.test(named) : named.startsWith('/')
-  return slashed(absolute ? named : `${cwd}/${named}`)
+  return slashed((platform === WINDOWS ? win32 : posix).resolve(cwd, named))
 }
 
 /**
