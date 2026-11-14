@@ -1100,7 +1100,7 @@ impl Controller {
             // registration may be gone), proves nothing of this request's own: the answer is a
             // copy, which the door tells only under the strict check. The connection that the
             // host-wide barrier withdrew fails it, so the caller is told it is not shown.
-            Ok((_barrier, None)) | Err(_) => crate::given::Settled::of(Given::copied(answered)),
+            Ok((_, None)) | Err(_) => crate::given::Settled::of(Given::copied(answered)),
         }
     }
 
