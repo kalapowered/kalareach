@@ -1884,7 +1884,7 @@ fn the_source_case_reads_a_script_by_its_strings_and_comments() {
         ),
         (
             script,
-            "function f() { return /\\/\\//.test(a) } const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+            "function f() { return /a\\//.test(a) } const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
             1,
         ),
         // A read inside a template's substitution is a read.
