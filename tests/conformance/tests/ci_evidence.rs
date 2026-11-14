@@ -1278,8 +1278,9 @@ fn parse_held(text: &str) -> Vec<Held> {
 
 /// Where the entry's last line stands in `lines`: every block of the entry stands in exactly one
 /// place, after the block before it.
-fn locate(entry: &Held, lines: &[&str]) -> Result<usize, String> {
+fn locate(entry: &Held, lines: &[&str]) -> Result<Vec<(usize, usize)>, String> {
     let mut next = 0;
+    let mut spans = Vec::new();
     for part in &entry.parts {
         let stands: Vec<usize> = if lines.len() < part.len() {
             Vec::new()
@@ -1294,12 +1295,15 @@ fn locate(entry: &Held, lines: &[&str]) -> Result<usize, String> {
         };
         match stands.as_slice() {
             [] => return Err(format!("no line stands as `{}`", part[0])),
-            [only] if *only >= next => next = only + part.len(),
+            [only] if *only >= next => {
+                spans.push((*only, only + part.len()));
+                next = only + part.len();
+            }
             [_] => return Err(format!("`{}` stands above a line it must follow", part[0])),
             many => return Err(format!("`{}` stands in {} places", part[0], many.len())),
         }
     }
-    Ok(next - 1)
+    Ok(spans)
 }
 
 /// What may stand between the name and the value it is given (`=`, `="`, `: `, `:-`, `", `,
@@ -1317,10 +1321,12 @@ fn is_word(character: char) -> bool {
 /// one (`/tmp/a` is not the start of `/tmp/a/../b`).
 fn delimited(line: &str, start: usize, value: &str) -> Option<(usize, usize)> {
     let rest = line.get(start..)?.strip_prefix(value)?;
-    rest.chars()
+    (rest
+        .chars()
         .next()
         .is_none_or(|character| VALUE_ENDS.contains(&character))
-        .then_some((start, start + value.len()))
+        && !rest.split_whitespace().next().unwrap_or("").contains(".."))
+    .then_some((start, start + value.len()))
 }
 
 /// The span of `value` where the name at `at` is given it: the value stands after nothing but the
@@ -1372,7 +1378,11 @@ fn is_a_read(line: &str, at: usize) -> bool {
     if lower.ends_with("${{ env.") {
         after.starts_with(" }}")
     } else if lower.ends_with("$env:") {
-        !(rest.starts_with('=') || rest.starts_with("+=") || rest.starts_with("-="))
+        // Whatever follows an assignment operator, a default (`??`), a list (`,`) or a line
+        // continuation (a backtick) may give the variable a value.
+        !["=", "+=", "-=", "*=", "/=", "%=", "??", ",", "`"]
+            .iter()
+            .any(|start| rest.starts_with(start))
     } else if before.ends_with("${") {
         after.starts_with('}')
             || after.starts_with(":?")
@@ -1440,19 +1450,23 @@ fn lines_that_cannot_run(path: &str, lines: &[&str]) -> Vec<bool> {
         .map(|line| {
             let trimmed = line.trim_start();
             match extension {
-                "sh" | "bash" | "yml" | "yaml" | "py" | "ps1" => trimmed.starts_with('#'),
+                "sh" | "bash" | "yml" | "yaml" | "py" | "ps1" => {
+                    trimmed.starts_with('#')
+                        && !trimmed.starts_with("#>")
+                        && !trimmed.starts_with("#!")
+                }
                 "rs" | "ts" | "tsx" | "js" | "mjs" => {
                     let doc = trimmed
                         .strip_prefix("///")
                         .or_else(|| trimmed.strip_prefix("//!"));
                     if let Some(body) = doc {
-                        if body.trim_start().starts_with("```") {
+                        let marker = body.trim_start();
+                        if marker.starts_with("```") || marker.starts_with("~~~") {
                             fenced = !fenced;
                             return true;
                         }
-                        return !fenced;
+                        return !fenced && !body.starts_with("    ") && !body.starts_with('\t');
                     }
-                    fenced = false;
                     trimmed.starts_with("//")
                 }
                 "md" => {
@@ -1494,6 +1508,72 @@ fn held_region(lines: &[&str], held_text: &str) -> Result<std::ops::Range<usize>
         ));
     }
     Ok(open + 1..close)
+}
+
+/// Whether a file's bytes name the variable in any letter case, or in UTF-16, which PowerShell reads
+/// and which has a zero byte beside each letter: with the zero bytes left out the letters stand
+/// together.
+fn names_the_variable(bytes: &[u8]) -> bool {
+    let letters: Vec<u8> = if bytes.contains(&0) {
+        bytes.iter().copied().filter(|byte| *byte != 0).collect()
+    } else {
+        bytes.to_vec()
+    };
+    String::from_utf8_lossy(&letters.to_ascii_lowercase()).contains(&VARIABLE.to_ascii_lowercase())
+}
+
+/// The variable a line gives a value in a shell's spelling (`name=`, after `export`, `local`,
+/// `readonly`, `declare` or `typeset`) or PowerShell's (`$name =`).
+fn assigned_name(line: &str) -> Option<&str> {
+    let mut line = line.trim();
+    for word in ["export ", "local ", "readonly ", "declare ", "typeset "] {
+        line = line.strip_prefix(word).unwrap_or(line);
+    }
+    let powershell = line.starts_with('$');
+    let line = line.strip_prefix('$').unwrap_or(line);
+    let (name, rest) = line.split_at(line.find(|character: char| !is_word(character))?);
+    let assigns = rest.starts_with('=') && !rest.starts_with("==")
+        || rest.starts_with("+=")
+        || powershell && rest.trim_start().starts_with('=');
+    (!name.is_empty() && assigns).then_some(name)
+}
+
+/// Whether a line gives `name` a value in one of the ordinary shell and PowerShell ways.
+fn gives_value_to(line: &str, name: &str) -> bool {
+    let line = line.trim();
+    assigned_name(line) == Some(name)
+        || line.contains(&format!("${{{name}:="))
+        || line.contains(&format!("${{{name}="))
+        || line.starts_with(&format!("for {name} in "))
+        || (line.starts_with("read ") && line.split_whitespace().any(|word| word == name))
+        || line.contains(&format!(" -v {name} "))
+}
+
+/// The lines that stand between two blocks of an entry and give a variable that an earlier block
+/// gives a value another one: the text hold of the blocks would not see them.
+fn redefinitions(entry: &Held, lines: &[&str], spans: &[(usize, usize)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (gap, pair) in spans.windows(2).enumerate() {
+        let names: Vec<&str> = entry.parts[..=gap]
+            .iter()
+            .flatten()
+            .filter_map(|line| assigned_name(line))
+            .collect();
+        for (number, line) in lines.iter().enumerate().take(pair[1].0).skip(pair[0].1) {
+            for name in &names {
+                if gives_value_to(line, name) {
+                    problems.push(format!(
+                        "{}:{}: a line between the held lines of an entry gives {name} another \
+                         value: {}",
+                        entry.file,
+                        number + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    problems
 }
 
 /// What is wrong with an entry's proof that its value lies in a temporary folder.
@@ -1547,13 +1627,17 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
-        let last = match locate(entry, &lines) {
-            Ok(last) => last,
+        let spans = match locate(entry, &lines) {
+            Ok(spans) => spans,
             Err(error) => {
                 problems.push(format!("held entry for {}: {error}", entry.file));
                 continue;
             }
         };
+        let last = spans[spans.len() - 1].1 - 1;
+        if matches!(entry.proof, Proof::Text) {
+            problems.extend(redefinitions(entry, &lines, &spans));
+        }
         at_line
             .entry((entry.file.as_str(), last))
             .or_default()
@@ -1584,13 +1668,15 @@ fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
 
     // Every other line that names the variable is a read, a line that cannot run, or a line of the
     // held list in this file.
-    let needle = VARIABLE.to_ascii_lowercase();
     let mut aliases: Vec<(String, String)> = Vec::new();
     for (path, bytes) in files {
-        if !String::from_utf8_lossy(&bytes.to_ascii_lowercase()).contains(&needle) {
+        if !names_the_variable(bytes) {
             continue;
         }
-        let Ok(text) = std::str::from_utf8(bytes) else {
+        let Some(text) = std::str::from_utf8(bytes)
+            .ok()
+            .filter(|_| !bytes.contains(&0))
+        else {
             problems.push(format!(
                 "{path}: a file that is not text names the variable"
             ));
@@ -1729,8 +1815,8 @@ fn tracked_files(root: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
 ///
 /// It reads every tracked file of every type: the checkout's own list, from `git ls-files`, and the
 /// bytes of each file that the checkout holds (a link or a submodule holds a path or a commit and is
-/// not read). The name is searched in any letter case, since Windows takes it in any. A file that
-/// names the variable and is not text fails the case. Each line that names the variable is exactly
+/// not read). The name is searched in any letter case, since Windows takes it in any, and in UTF-16.
+/// A file that names the variable and is not text, or holds a zero byte, fails the case. Each line that names the variable is exactly
 /// one of these, and a line that is none of them fails the case with the lines to add:
 ///
 /// 1. A held write. The held list holds each line that gives the variable a value (a workflow's
@@ -1751,19 +1837,26 @@ fn tracked_files(root: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
 ///    name (`const X: &str = "..."`) is allowed when every use of `X` in a file of its type is
 ///    such a call.
 /// 3. A line that cannot run, by these rules only: a line that starts with `#` in a `.sh`,
-///    `.bash`, `.yml`, `.yaml`, `.py` or `.ps1` file; a line that starts with `//` (so `///` and
+///    `.bash`, `.yml`, `.yaml`, `.py` or `.ps1` file, but not one that starts with `#>` (which ends
+///    a PowerShell block comment and may go on) or `#!`; a line that starts with `//` (so `///` and
 ///    `//!`) in a `.rs`, `.ts`, `.tsx`, `.js` or `.mjs` file, except the lines of a code block in a
-///    doc comment, which the Rust documentation tests run; a line of a `.md` file outside a fenced
+///    doc comment (fenced with three backticks or `~~~`, or indented), which the Rust
+///    documentation tests run; a line of a `.md` file outside a fenced
 ///    code block and not indented as code; and a line of this file between the two lines that open
 ///    and close its held list, which equal the list the program holds, so that every line let
 ///    through is data. A line that has anything before its comment marker, a line that ends a
 ///    block comment, and a line inside a block comment are not let through: the one such line that
 ///    names the variable is held as a comment with its reason.
 ///
-/// A text hold detects a change to the lines it holds, and not a wrong change: it does not read
-/// what a line elsewhere does to a variable that a held line names, or what an `env` entry does
-/// to `TEMP`. A name made at run time (`${!name}`, a joined string) is out of reach of any case
-/// that reads text, and so is a file that is not yet added to the index.
+/// A text hold detects a change to the lines it holds, and not a wrong change. A line between two
+/// blocks of an entry that gives a variable of the earlier block another value fails the case, in
+/// the ordinary shell and PowerShell forms of an assignment; any other way to change a variable
+/// that a held line names is not read, and nor is what an `env` entry does to `TEMP`. A held Rust
+/// value is shown only by a line of the entry that makes a temporary directory, not by following
+/// the expressions between that line and the value. A name made at run time (`${!name}`, a
+/// joined string, a use of this file's own constant for the name) is out of reach of any case that
+/// reads text, and so is a file that is not yet added to the index. A comment marker that stands
+/// first on a line inside a string or a template literal is let through as a comment.
 ///
 /// Not shown here: that each run gets a directory of its own (the scripts' fixed default is shared
 /// by successive runs on one machine) and that on macOS the default is the OS-resolved `$TMPDIR`
@@ -2214,6 +2307,72 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             "file: scripts/d.sh\nkind: argument\n| e=/tmp/x\n...\n| run --evidence x$e\nvalue: $e",
             Some(value),
         ),
+        (
+            "a PowerShell assignment with an operator",
+            vec![a, ("scripts/c.ps1", "$env:@V@ ??= 'C:\\x'\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a PowerShell assignment continued on the next line",
+            vec![a, ("scripts/c.ps1", "$env:@V@ `\n    = 'C:\\x'\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a PowerShell line that ends a block comment and goes on",
+            vec![a, ("scripts/c.ps1", "#> $env:@V@ = 'C:\\x'\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a shebang that gives the variable a value",
+            vec![a, ("scripts/c.sh", "#!/usr/bin/env -S @V@=/home/x bash\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a documentation test in a tilde fence",
+            vec![
+                a,
+                (
+                    "crates/x/src/lib.rs",
+                    "/// ~~~\n/// cmd.env(\"@V@\", \"/home/x\");\n/// ~~~\n",
+                ),
+            ],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "an indented documentation test",
+            vec![
+                a,
+                (
+                    "crates/x/src/lib.rs",
+                    "///     cmd.env(\"@V@\", \"/home/x\");\n",
+                ),
+            ],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a held value followed by a step up after its closing quote",
+            vec![("scripts/c.sh", "export @V@=\"/tmp/x\"/../../home\n")],
+            "file: scripts/c.sh\n| export @V@=\"/tmp/x\"/../../home\nvalue: /tmp/x",
+            Some(value),
+        ),
+        (
+            "a variable given another value between the held lines",
+            vec![("scripts/b.sh", "d=/tmp/x\nd=/home/y\nexport @V@=\"$d/e\"\n")],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
+            Some("another value"),
+        ),
+        (
+            "an unrelated line between the held lines",
+            vec![("scripts/b.sh", "d=/tmp/x\necho hi\nexport @V@=\"$d/e\"\n")],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
+            None,
+        ),
     ];
     for (name, files, held, fails_with) in cases {
         let problems = findings(&tree(&files), &format!("\n{}\n", named(held)));
@@ -2231,6 +2390,21 @@ fn the_source_case_fails_on_what_it_does_not_know() {
     let mut binary = VARIABLE.as_bytes().to_vec();
     binary.push(0xff);
     files.push(("data/x.bin".to_owned(), binary));
+    let problems = findings(&files, &named(held_a));
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("is not text")),
+        "{problems:?}"
+    );
+
+    // A file in UTF-16, which PowerShell reads, with a write in it.
+    let utf16: Vec<u8> = named("export @V@=/home/x\n")
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut files = tree(&[a]);
+    files.push(("scripts/u.ps1".to_owned(), utf16));
     let problems = findings(&files, &named(held_a));
     assert!(
         problems
