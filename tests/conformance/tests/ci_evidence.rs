@@ -917,11 +917,14 @@ const READERS: [&str; 7] = [
     "tests/conformance/tests/ci_evidence.rs",
 ];
 
-/// The languages whose files may name the variable, each with how a whole-line comment begins.
+/// The languages whose files may name the variable, each with how its comments are told.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Language {
-    /// Code with `//` comments.
-    Slashes,
+    /// Rust: `//` comments and nested `/* */` comments, strings (raw ones too) and characters.
+    Rust,
+    /// JavaScript and TypeScript: `//` and `/* */` comments, strings, template strings and regular
+    /// expressions.
+    Script,
     /// Code, a workflow or a manifest with `#` comments.
     Hash,
     /// Prose, where every line is a comment.
@@ -931,46 +934,294 @@ enum Language {
 fn language(path: &str) -> Option<Language> {
     let extension = path.rsplit_once('.')?.1;
     match extension {
-        "rs" | "ts" | "tsx" | "js" | "mjs" => Some(Language::Slashes),
+        "rs" => Some(Language::Rust),
+        // Not `tsx` or `jsx`: the text of JSX looks like code and is none, and the scan cannot tell
+        // the two apart, so a file of either that names the variable is one the case does not know.
+        "ts" | "js" | "mjs" => Some(Language::Script),
         "sh" | "bash" | "ps1" | "psm1" | "yml" | "yaml" | "toml" => Some(Language::Hash),
         "md" => Some(Language::Prose),
         _ => None,
     }
 }
 
-/// For each line, whether the whole line is a comment. A block comment is a comment only up to its
-/// end: a line that closes one and goes on with code is code.
-fn comment_lines(language: Language, text: &str) -> Vec<bool> {
-    let mut inside = false;
-    text.lines()
-        .map(|line| {
-            let line = line.trim();
-            match language {
-                Language::Prose => true,
-                Language::Hash => line.starts_with('#'),
-                Language::Slashes => {
-                    if !inside && line.starts_with("//") {
-                        return true;
-                    }
-                    let mut rest = line;
-                    if !inside {
-                        let Some(opened) = rest.strip_prefix("/*") else {
-                            return false;
-                        };
-                        rest = opened;
-                        inside = true;
-                    }
-                    match rest.find("*/") {
-                        None => true,
-                        Some(end) => {
-                            inside = false;
-                            rest[end + 2..].trim().is_empty()
-                        }
+/// The characters of a file with the byte each starts at.
+type Chars = [(usize, char)];
+
+/// The character at `at`, or NUL past the end (a file that holds NUL is refused before it is read).
+fn char_at(chars: &Chars, at: usize) -> char {
+    chars.get(at).map_or('\0', |&(_, c)| c)
+}
+
+/// The index of the newline that ends the line `from` is on, or the end.
+fn line_end(chars: &Chars, from: usize) -> usize {
+    (from..chars.len())
+        .find(|&at| chars[at].1 == '\n')
+        .unwrap_or(chars.len())
+}
+
+/// The index after the string whose opening quote is at `from`. A backslash escapes the next
+/// character. A string that is not closed ends at its line's end, unless it may span lines.
+fn skip_quoted(chars: &Chars, from: usize, spans_lines: bool) -> usize {
+    let quote = chars[from].1;
+    let mut at = from + 1;
+    while at < chars.len() {
+        match chars[at].1 {
+            '\\' if char_at(chars, at + 1) == '\r' && char_at(chars, at + 2) == '\n' => at += 3,
+            '\\' => at += 2,
+            c if c == quote => return at + 1,
+            '\n' if !spans_lines => return at,
+            _ => at += 1,
+        }
+    }
+    chars.len()
+}
+
+/// Where the text of a template string that starts at `from` ends: after its closing backtick, or
+/// after a `${` (the second value) that opens code inside it.
+fn skip_template(chars: &Chars, from: usize) -> (usize, bool) {
+    let mut at = from;
+    while at < chars.len() {
+        match chars[at].1 {
+            '\\' => at += 2,
+            '`' => return (at + 1, false),
+            '$' if char_at(chars, at + 1) == '{' => return (at + 2, true),
+            _ => at += 1,
+        }
+    }
+    (chars.len(), false)
+}
+
+/// The index after the regular expression whose opening slash is at `from`, flags included. One
+/// that is not closed ends at its line's end.
+fn skip_regex(chars: &Chars, from: usize) -> usize {
+    let mut at = from + 1;
+    let mut class = false;
+    while at < chars.len() {
+        match chars[at].1 {
+            '\\' => at += 2,
+            '\n' => return at,
+            '[' => {
+                class = true;
+                at += 1;
+            }
+            ']' => {
+                class = false;
+                at += 1;
+            }
+            '/' if !class => {
+                at += 1;
+                while char_at(chars, at).is_alphanumeric() {
+                    at += 1;
+                }
+                return at;
+            }
+            _ => at += 1,
+        }
+    }
+    chars.len()
+}
+
+/// The index after the raw string whose `r` is at `from`, or `None` where none starts there.
+fn skip_raw_string(chars: &Chars, from: usize) -> Option<usize> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    if from > 0 {
+        let before = chars[from - 1].1;
+        let prefix = matches!(before, 'b' | 'c') && (from < 2 || !word(chars[from - 2].1));
+        if word(before) && !prefix {
+            return None;
+        }
+    }
+    let mut hashes = 0;
+    while char_at(chars, from + 1 + hashes) == '#' {
+        hashes += 1;
+    }
+    if char_at(chars, from + 1 + hashes) != '"' {
+        return None;
+    }
+    let mut at = from + 2 + hashes;
+    while at < chars.len() {
+        if chars[at].1 == '"' && (1..=hashes).all(|n| char_at(chars, at + n) == '#') {
+            return Some(at + 1 + hashes);
+        }
+        at += 1;
+    }
+    Some(chars.len())
+}
+
+/// The index after the character literal that opens at `from`, or after the quote of a lifetime.
+fn skip_character(chars: &Chars, from: usize) -> usize {
+    if char_at(chars, from + 1) == '\\' {
+        let close = (from + 3..chars.len()).find(|&at| matches!(chars[at].1, '\'' | '\n'));
+        return close.map_or(chars.len(), |at| at + usize::from(chars[at].1 == '\''));
+    }
+    if char_at(chars, from + 2) == '\'' {
+        from + 3
+    } else {
+        from + 1
+    }
+}
+
+/// Calls `comment(from, to)` for each comment of Rust code, as indexes of `chars`.
+fn rust_comments(chars: &Chars, comment: &mut impl FnMut(usize, usize)) {
+    let mut at = 0;
+    while at < chars.len() {
+        match chars[at].1 {
+            '/' if char_at(chars, at + 1) == '/' => {
+                let end = line_end(chars, at);
+                comment(at, end);
+                at = end;
+            }
+            '/' if char_at(chars, at + 1) == '*' => {
+                // Block comments nest.
+                let (mut depth, mut end) = (1, at + 2);
+                while end < chars.len() && depth > 0 {
+                    match (chars[end].1, char_at(chars, end + 1)) {
+                        ('/', '*') => (depth, end) = (depth + 1, end + 2),
+                        ('*', '/') => (depth, end) = (depth - 1, end + 2),
+                        _ => end += 1,
                     }
                 }
+                let end = end.min(chars.len());
+                comment(at, end);
+                at = end;
             }
-        })
-        .collect()
+            '"' => at = skip_quoted(chars, at, true),
+            '\'' => at = skip_character(chars, at),
+            'r' => at = skip_raw_string(chars, at).unwrap_or(at + 1),
+            _ => at += 1,
+        }
+    }
+}
+
+/// Calls `comment(from, to)` for each comment of JavaScript or TypeScript code, as indexes of
+/// `chars`.
+///
+/// This is a scan and no parser. It knows strings (with their escapes), template strings (with the
+/// code of their `${}` parts, nested ones too), regular expressions and both kinds of comment. It
+/// does not know what a slash means, so after a name, a number, a string or `]` a slash divides,
+/// and after anything else, a `)` or `}` included, it opens a regular expression: a division there
+/// can hide a comment opener as the end of a regular expression, and then the comment is read as
+/// code. A quote that is never closed runs to the end of its line. JSX text is not told from code
+/// (the language of a `.tsx` file is not known to this case). Every one of these mistakes reads
+/// a comment as code, which is a finding, and none reads code as a comment.
+fn script_comments(chars: &Chars, comment: &mut impl FnMut(usize, usize)) {
+    // Words after which a slash opens a regular expression.
+    const OPERATORS: [&str; 14] = [
+        "return",
+        "typeof",
+        "instanceof",
+        "in",
+        "of",
+        "new",
+        "delete",
+        "void",
+        "throw",
+        "case",
+        "do",
+        "else",
+        "yield",
+        "await",
+    ];
+    let is_name = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    // The `{` still open in each code part, the last one's being the `${}` part the scan is in.
+    let mut braces = vec![0_usize];
+    let mut value = false;
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at].1;
+        match c {
+            '/' if char_at(chars, at + 1) == '/' => {
+                let end = line_end(chars, at);
+                comment(at, end);
+                at = end;
+            }
+            '/' if char_at(chars, at + 1) == '*' => {
+                let end = (at + 2..chars.len())
+                    .find(|&k| chars[k].1 == '*' && char_at(chars, k + 1) == '/')
+                    .map_or(chars.len(), |k| k + 2);
+                comment(at, end);
+                at = end;
+            }
+            '/' if !value => {
+                at = skip_regex(chars, at);
+                value = true;
+            }
+            '\'' | '"' => {
+                at = skip_quoted(chars, at, false);
+                value = true;
+            }
+            '`' | '}' if c == '`' || (braces.len() > 1 && braces.last() == Some(&0)) => {
+                if c == '}' {
+                    braces.pop();
+                }
+                let (next, code) = skip_template(chars, at + 1);
+                at = next;
+                if code {
+                    braces.push(0);
+                } else {
+                    value = true;
+                }
+            }
+            '{' | '}' => {
+                if let Some(open) = braces.last_mut() {
+                    *open = if c == '{' {
+                        *open + 1
+                    } else {
+                        open.saturating_sub(1)
+                    };
+                }
+                value = false;
+                at += 1;
+            }
+            ']' => {
+                value = true;
+                at += 1;
+            }
+            c if is_name(c) => {
+                let start = at;
+                while is_name(char_at(chars, at)) {
+                    at += 1;
+                }
+                let word: String = chars[start..at].iter().map(|&(_, c)| c).collect();
+                value = !OPERATORS.contains(&word.as_str());
+            }
+            c if c.is_whitespace() => at += 1,
+            _ => {
+                value = false;
+                at += 1;
+            }
+        }
+    }
+}
+
+/// For each byte of `text`, whether it is inside a comment, the comment's own marks included.
+fn comment_bytes(language: Language, text: &str) -> Vec<bool> {
+    let mut mask = vec![false; text.len()];
+    match language {
+        Language::Prose => mask.fill(true),
+        Language::Hash => {
+            let mut start = 0;
+            for line in text.split_inclusive('\n') {
+                if line.trim_start().starts_with('#') {
+                    mask[start..start + line.len()].fill(true);
+                }
+                start += line.len();
+            }
+        }
+        Language::Rust | Language::Script => {
+            let chars: Vec<(usize, char)> = text.char_indices().collect();
+            let mut comment = |from: usize, to: usize| {
+                let end = chars.get(to).map_or(text.len(), |&(byte, _)| byte);
+                mask[chars[from].0..end].fill(true);
+            };
+            if language == Language::Rust {
+                rust_comments(&chars, &mut comment);
+            } else {
+                script_comments(&chars, &mut comment);
+            }
+        }
+    }
+    mask
 }
 
 /// Whether the file names the variable, in any letter case (Windows and a workflow's expressions
@@ -993,94 +1244,195 @@ fn names_variable(bytes: &[u8]) -> bool {
     })
 }
 
-/// One non-blank line of a workflow with its indentation, a list item's dash counted as part of
-/// the indentation so that a step's keys all stand at one column.
+/// What a line of a workflow is, as far as the name on it goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Line {
+    /// Any other line: a script's text, a key, a value.
+    Plain,
+    /// The directory handed to the upload of a run's evidence.
+    Upload,
+    /// The key of an `env:` mapping that names the variable.
+    EnvKey,
+}
+
+/// One non-blank line of a workflow that is not a comment, with its indentation (a list item's dash
+/// counted as part of it, so that a step's keys all stand at one column).
 struct Row {
     line: usize,
     indent: usize,
-    content: String,
-    starts_step: bool,
+    /// The key of a mapping row (`key: value`, `key:`).
+    key: Option<String>,
+    /// What follows the key, or the whole row where it has no key, without a comment.
+    value: String,
+    /// Whether the row opens a list item.
+    item: bool,
+    /// The row whose value this row is the text of: a block scalar's line or the continuation of a
+    /// scalar that spans lines. Such a row is never a key, an item or a step.
+    owner: Option<usize>,
 }
 
-/// For each line of a workflow, whether it is the directory handed to the upload of a run's
-/// evidence: the `path:` of the `with:` of a step that uses `actions/upload-artifact`, as the value
-/// of `path:` or as a line of its list. That step reads files and writes none; the same words
-/// anywhere else (a `run:` script, another action's input, a condition) are a read.
-fn upload_lines(text: &str) -> Vec<bool> {
+/// A mapping row's key and the rest of the row after the comment is taken off: `key: value`,
+/// `key:`, or a row without a key.
+fn key_and_value(content: &str) -> (Option<String>, String) {
+    let uncommented = |text: &str| {
+        let end = if text.starts_with('#') {
+            0
+        } else {
+            text.find(" #").unwrap_or(text.len())
+        };
+        text[..end].trim().to_owned()
+    };
+    let skip = match content.chars().next() {
+        Some(quote @ ('"' | '\'')) => content[1..]
+            .find(quote)
+            .map_or(content.len(), |end| end + 2),
+        _ => 0,
+    };
+    let colon = content[skip..]
+        .match_indices(':')
+        .map(|(at, _)| skip + at)
+        .find(|&at| matches!(content[at + 1..].chars().next(), None | Some(' ' | '\t')));
+    match colon {
+        Some(at) => (
+            Some(content[..at].trim().to_owned()),
+            uncommented(&content[at + 1..]),
+        ),
+        None => (None, uncommented(content)),
+    }
+}
+
+/// Whether a value is a block scalar's header: `|`, `>`, with a chomping or indentation mark.
+fn is_block_scalar(value: &str) -> bool {
+    value.starts_with(['|', '>'])
+        && value[1..]
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '+' || c == '-')
+}
+
+/// What each line of a workflow is. The workflow is read by its structure: a row with a value owns
+/// every deeper row after it as that value's text (a `run:` script, a quoted string over several
+/// lines), so what looks like a step or a key inside it is neither. The upload of a run's evidence
+/// is the `path:` of the `with:` of a step that uses `actions/upload-artifact`, as the value of
+/// `path:` or as a line of its list: that step reads files and writes none, and the same words
+/// anywhere else (a script, another action's input, a condition) are a read. A key of `env:` that
+/// names the variable gives it a value.
+fn workflow_lines(text: &str) -> Vec<Line> {
     let expression = format!("${{{{ ENV.{VARIABLE} }}}}");
-    let mut rows = Vec::new();
-    for (line, text) in text.lines().enumerate() {
-        let trimmed = text.trim_start();
+    let mut rows: Vec<Row> = Vec::new();
+    // The indentation under which rows are the text of the row that owns them.
+    let mut scalar: Option<(usize, usize)> = None;
+    for (line, raw) in text.lines().enumerate() {
+        let trimmed = raw.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let indent = text.len() - trimmed.len();
-        let (indent, content, starts_step) = match trimmed.strip_prefix("- ") {
-            Some(item) => {
-                let item = item.trim_start();
-                (indent + trimmed.len() - item.len(), item, true)
+        let mut indent = raw.len() - trimmed.len();
+        let (content, item) = match trimmed.strip_prefix("- ") {
+            Some(rest) => {
+                let rest = rest.trim_start();
+                indent += trimmed.len() - rest.len();
+                (rest, true)
             }
-            None => (indent, trimmed, false),
+            None => (trimmed, trimmed == "-"),
         };
+        if let Some((limit, owner)) = scalar {
+            if indent > limit {
+                rows.push(Row {
+                    line,
+                    indent,
+                    key: None,
+                    value: trimmed.trim_end().to_owned(),
+                    item: false,
+                    owner: Some(owner),
+                });
+                continue;
+            }
+            scalar = None;
+        }
+        let (key, value) = if content == "-" {
+            (None, String::new())
+        } else {
+            key_and_value(content.trim_end())
+        };
+        if !value.is_empty() {
+            scalar = Some((indent, rows.len()));
+        }
         rows.push(Row {
             line,
             indent,
-            content: content.trim_end().to_owned(),
-            starts_step,
+            key,
+            value,
+            item,
+            owner: None,
         });
     }
-    let parent = |at: usize| {
-        (0..at)
-            .rev()
-            .find(|&row| rows[row].indent < rows[at].indent)
-    };
-    let uses_upload = |with: usize| {
-        let indent = rows[with].indent;
-        let mut start = with;
-        while !(rows[start].indent == indent && rows[start].starts_step) {
-            if start == 0 || rows[start - 1].indent < indent {
-                return false;
-            }
-            start -= 1;
+    // The mapping each row belongs to (the first row of it) and the row that holds it, by
+    // indentation: a list item starts a mapping of its own.
+    let mut levels: Vec<(usize, usize, usize)> = Vec::new();
+    let mut mapping = vec![0; rows.len()];
+    let mut parent: Vec<Option<usize>> = vec![None; rows.len()];
+    for at in 0..rows.len() {
+        if rows[at].owner.is_some() {
+            continue;
         }
-        let mut at = start;
-        loop {
-            if rows[at].indent == indent
-                && rows[at]
-                    .content
-                    .starts_with("uses: actions/upload-artifact@")
-            {
-                return true;
+        while levels.last().is_some_and(|level| level.0 > rows[at].indent) {
+            levels.pop();
+        }
+        match levels.last_mut() {
+            Some(level) if level.0 == rows[at].indent => {
+                if rows[at].item {
+                    level.1 = at;
+                }
+                level.2 = at;
+                mapping[at] = level.1;
             }
-            at += 1;
-            if at == rows.len()
-                || rows[at].indent < indent
-                || (rows[at].indent == indent && rows[at].starts_step)
-            {
-                return false;
+            _ => {
+                levels.push((rows[at].indent, at, at));
+                mapping[at] = at;
             }
         }
-    };
-    let under_with = |at: usize| {
-        parent(at).is_some_and(|with| rows[with].content == "with:" && uses_upload(with))
-    };
-    let mut uploads = vec![false; text.lines().count()];
-    for (at, row) in rows.iter().enumerate() {
-        let folded = row.content.to_ascii_uppercase();
-        let is_upload = if row.content.starts_with("path: ") {
-            folded["path: ".len()..] == expression && under_with(at)
-        } else {
-            folded == expression
-                && parent(at).is_some_and(|path| {
-                    let key = &rows[path].content;
-                    key.starts_with("path:")
-                        && key.ends_with(['|', '>', '-', '+'])
-                        && under_with(path)
-                })
-        };
-        uploads[row.line] = is_upload;
+        parent[at] = levels.len().checked_sub(2).map(|above| levels[above].2);
     }
-    uploads
+    let holds = |at: usize, key: &str| {
+        rows[at].owner.is_none()
+            && rows[at].key.as_deref() == Some(key)
+            && rows[at].value.is_empty()
+    };
+    let is_upload_step = |with: usize| {
+        rows.iter().enumerate().any(|(other, row)| {
+            row.owner.is_none()
+                && mapping[other] == mapping[with]
+                && row.key.as_deref() == Some("uses")
+                && row.value.starts_with("actions/upload-artifact@")
+        })
+    };
+    let under_upload =
+        |at: usize| parent[at].is_some_and(|with| holds(with, "with") && is_upload_step(with));
+    let mut lines = vec![Line::Plain; text.lines().count()];
+    for (at, row) in rows.iter().enumerate() {
+        let names_directory = row.value.to_ascii_uppercase() == expression;
+        let upload = match row.owner {
+            None => row.key.as_deref() == Some("path") && names_directory && under_upload(at),
+            Some(owner) => {
+                names_directory
+                    && rows[owner].key.as_deref() == Some("path")
+                    && is_block_scalar(&rows[owner].value)
+                    && under_upload(owner)
+            }
+        };
+        let env_key = row.owner.is_none()
+            && row
+                .key
+                .as_deref()
+                .is_some_and(|key| key.eq_ignore_ascii_case(VARIABLE))
+            && parent[at].is_some_and(|above| holds(above, "env"));
+        if upload {
+            lines[row.line] = Line::Upload;
+        } else if env_key {
+            lines[row.line] = Line::EnvKey;
+        }
+    }
+    lines
 }
 
 /// Where the name stands in `line` as a whole name, in any letter case.
@@ -1096,34 +1448,31 @@ fn occurrences(line: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Whether the name at `at` is being given a value, in one of the forms a write takes: an
-/// assignment (`NAME=value`, also behind `export`, a quote or a PowerShell `$env:`), a key of a
-/// workflow's `env` (`NAME: value`), or a program's environment (`.env("NAME", value)`). A write
-/// needs no proof here: the reader refuses a wrong value where it is used. A name that stands
-/// inside a brace, parenthesis or bracket opened earlier on the line is bound there
-/// (`const { NAME = x } = process.env`), not assigned, and a value that reads the name is a read.
-fn is_write(line: &str, at: usize) -> bool {
+/// Whether the name at `at` is being given a value, in the one form a write takes in the file's
+/// language: in Rust a program's environment (`.env("NAME", value)`); in a shell, PowerShell, a
+/// workflow's script or a manifest an assignment (`NAME=value`, also behind `export`, a quote or a
+/// PowerShell `$env:`). JavaScript and TypeScript have none: a script's evidence directory is the
+/// reader's. A workflow's own `env:` keys are told by its structure. A write needs no proof here:
+/// the reader refuses a wrong value where it is used. A name on the right of an assignment, or a
+/// second name on the line, is a read.
+fn is_write(language: Language, line: &str, at: usize) -> bool {
     let before = &line[..at];
     let after = &line[at + VARIABLE.len()..];
-    let assigns = after
-        .trim_start()
-        .strip_prefix('=')
-        .is_some_and(|rest| !rest.starts_with(['=', '>']));
-    let target = before.is_empty()
-        || before.ends_with(char::is_whitespace)
-        || before.ends_with(['"', '\'', ';'])
-        || before.to_ascii_lowercase().ends_with("$env:");
-    let opened = before
-        .chars()
-        .filter(|c| matches!(c, '{' | '(' | '['))
-        .count();
-    let closed = before
-        .chars()
-        .filter(|c| matches!(c, '}' | ')' | ']'))
-        .count();
-    let key = before.trim().is_empty() && after.starts_with(": ");
-    let program = before.ends_with(".env(\"") && after.starts_with("\",");
-    (assigns && target && opened <= closed) || key || program
+    match language {
+        Language::Rust => before.ends_with(".env(\"") && after.starts_with("\","),
+        Language::Script | Language::Prose => false,
+        Language::Hash => {
+            let assigns = after
+                .trim_start()
+                .strip_prefix('=')
+                .is_some_and(|rest| !rest.starts_with(['=', '>']));
+            let target = before.is_empty()
+                || before.ends_with(char::is_whitespace)
+                || before.ends_with(['"', '\'', ';'])
+                || before.to_ascii_lowercase().ends_with("$env:");
+            assigns && target
+        }
+    }
 }
 
 /// What is wrong with one file's naming of the variable, one finding for each line.
@@ -1144,26 +1493,33 @@ fn findings(path: &str, bytes: &[u8]) -> Vec<String> {
             "{path}: names {VARIABLE} in a language this case does not know"
         )];
     };
-    let comments = comment_lines(language, text);
-    let uploads = if path.ends_with(".yml") || path.ends_with(".yaml") {
-        upload_lines(text)
+    let comments = comment_bytes(language, text);
+    let kinds = if path.ends_with(".yml") || path.ends_with(".yaml") {
+        workflow_lines(text)
     } else {
-        vec![false; comments.len()]
+        vec![Line::Plain; text.lines().count()]
     };
     let mut found = Vec::new();
-    for (number, line) in text.lines().enumerate() {
-        let names = occurrences(line);
-        if names.is_empty() || comments[number] || uploads[number] {
-            continue;
+    let mut start = 0;
+    for (number, piece) in text.split_inclusive('\n').enumerate() {
+        let line = piece.trim_end_matches(['\n', '\r']);
+        let reads = occurrences(line).into_iter().any(|at| {
+            let key = line[..at].trim().is_empty() && line[at + VARIABLE.len()..].starts_with(':');
+            !comments[start + at]
+                && match kinds[number] {
+                    Line::Upload => false,
+                    Line::EnvKey if key => false,
+                    _ => !is_write(language, line, at),
+                }
+        });
+        if reads {
+            found.push(format!(
+                "{path}:{}: reads {VARIABLE} outside its language's reader: {}",
+                number + 1,
+                line.trim()
+            ));
         }
-        if names.iter().all(|&at| is_write(line, at)) {
-            continue;
-        }
-        found.push(format!(
-            "{path}:{}: reads {VARIABLE} outside its language's reader: {}",
-            number + 1,
-            line.trim()
-        ));
+        start += piece.len();
     }
     found
 }
@@ -1202,16 +1558,23 @@ fn repository_files(root: &Path) -> Vec<String> {
 /// companion's tests.
 ///
 /// So this case holds only what the readers cannot: that nothing else reads the variable. The name
-/// is matched in any letter case. A line that names it passes when it is a whole-line comment, an
-/// assignment whose value does not read it, a workflow `env` key, a program's `.env("NAME", value)`
-/// or, in a workflow, the directory handed to the `path:` of an `actions/upload-artifact` step as
-/// that run's evidence; every other line fails with its file and line, and so does a file that
-/// names it in a language this case does not know or that is not text (UTF-16 included). Writes
-/// are not listed: a wrong write fails at the reader. The readers do not export the name as a
-/// constant, which would let a file read the variable without writing the name.
+/// is matched in any letter case. A name passes when it stands in a comment (found by the
+/// language's own strings and comments, not by lines: a comment opener inside a string opens
+/// none), or is given a value by the one form a write takes in its language (a shell's or a
+/// workflow script's `NAME=value` whose value does not read it, a Rust program's
+/// `.env("NAME", value)`, a key of a workflow's `env:`), or is the directory handed to the
+/// `path:` of a real `actions/upload-artifact` step of a workflow as that run's evidence. Every
+/// other occurrence fails with its file and line, so does a file that names it in a language this
+/// case does not know or that is not text (UTF-16 included), and JavaScript and TypeScript have no
+/// write form at all. Writes are not listed: a wrong write fails at the reader. The readers do not
+/// export the name as a constant, which would let a file read the variable without writing the
+/// name.
 ///
-/// Not seen: a name put together at run time, and a value that reaches a program in an argument
-/// instead of the variable (the conformance runner's `--evidence` passes the same check).
+/// Not seen: a name put together at run time (or spelled with an escape), and a value that
+/// reaches a program in an argument instead of the variable (the conformance runner's
+/// `--evidence` passes the same check). The scan of a script is no parser; its limits all read a
+/// comment as code, a finding, and each has a sample in the case that reads scripts by their
+/// strings and comments.
 #[test]
 fn nothing_reads_the_artifacts_variable_beside_the_reader_of_its_language() {
     let root = repository();
@@ -1332,7 +1695,10 @@ fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
             "\"KR_TEST_ARTIFACTS_DIR=$temporary\\x\" >> $env:GITHUB_ENV",
         ),
         (power, "$env:KR_TEST_ARTIFACTS_DIR = $directory"),
-        (flow, "  KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts"),
+        (
+            flow,
+            "  env:\n    KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts",
+        ),
         (
             "docs/x.md",
             "Set `KR_TEST_ARTIFACTS_DIR` to a folder under /tmp.",
@@ -1454,4 +1820,236 @@ fn the_source_case_fails_a_file_that_names_the_variable_in_utf_16() {
     for bytes in [little, big] {
         assert_eq!(findings("scripts/x.sh", &bytes).len(), 1);
     }
+}
+
+/// Asserts each sample, so that one wrong answer does not hide the others: a file's path, its text
+/// and the number of lines of it that the case reports.
+fn assert_findings(samples: &[(&str, &str, usize)]) {
+    let wrong: Vec<String> = samples
+        .iter()
+        .filter_map(|&(path, text, wanted)| {
+            let found = findings(path, text.as_bytes()).len();
+            (found != wanted)
+                .then(|| format!("{path}: {found} findings, not {wanted}, for:\n{text}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n---\n"));
+}
+
+/// A name inside a string is no comment's, and a comment opener inside a string opens none: JavaScript,
+/// TypeScript and Rust files are read by their strings and comments, not by their lines.
+#[test]
+fn the_source_case_reads_a_script_by_its_strings_and_comments() {
+    let script = "apps/companion/e2e/x.ts";
+    let module = "apps/companion/e2e/x.mjs";
+    let rust = "tests/e2e/x.rs";
+    assert_findings(&[
+        // A comment opener inside a template string exempts nothing.
+        (
+            module,
+            "import { mkdirSync } from 'node:fs';\n\nconsole.log(`\n/*\n`);\nconst dir = process.env.KR_TEST_ARTIFACTS_DIR;\nmkdirSync(dir);\n",
+            1,
+        ),
+        (
+            module,
+            "const a = `\n/*\n`;\nconst dir = process.env.KR_TEST_ARTIFACTS_DIR;\nconst b = `\n*/\n`;\n",
+            1,
+        ),
+        (
+            script,
+            "const marker = '/*'; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+            1,
+        ),
+        (
+            script,
+            "const url = \"http://x\"; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+            1,
+        ),
+        (
+            script,
+            "const text = 'it\\'s /*'; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+            1,
+        ),
+        (
+            script,
+            "const open = /\\/\\*/; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+            1,
+        ),
+        // A regular expression that holds a comment opener hides nothing, also after a word such
+        // as `return`.
+        (
+            script,
+            "const open = /\\/\\//; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+            1,
+        ),
+        (
+            script,
+            "function f() { return /\\/\\//.test(a) } const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+            1,
+        ),
+        // A read inside a template's substitution is a read.
+        (
+            script,
+            "const p = `${process.env.KR_TEST_ARTIFACTS_DIR}/x`\n",
+            1,
+        ),
+        (
+            script,
+            "const p = `a ${`b ${process.env.KR_TEST_ARTIFACTS_DIR}`}`\n",
+            1,
+        ),
+        // A destructure of the environment over several lines is a read, with a default or a new
+        // name, and as the parameter of a function.
+        (
+            script,
+            "const {\n  KR_TEST_ARTIFACTS_DIR = '/tmp/default'\n} = process.env;\n",
+            1,
+        ),
+        (
+            script,
+            "const {\n  KR_TEST_ARTIFACTS_DIR: evidence,\n} = process.env\n",
+            1,
+        ),
+        (
+            script,
+            "const dir = (({\n  KR_TEST_ARTIFACTS_DIR: dir,\n}) => dir)(process.env)\n",
+            1,
+        ),
+        // The same in Rust: a string that spans lines or is raw hides no read.
+        (
+            rust,
+            "let text = r#\"a\"b /*\"#;\nlet dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
+            1,
+        ),
+        (
+            rust,
+            "let text = \"\n/*\n\";\nlet dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
+            1,
+        ),
+        (
+            rust,
+            "let text = r#\"\n/*\n\"#;\nlet dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
+            1,
+        ),
+        (
+            rust,
+            "let url = \"http://x\"; let dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
+            1,
+        ),
+        // A comment is a comment, after code on its line too, and within a substitution. A quote
+        // that is never closed ends with its line.
+        (
+            script,
+            "const s = 'it\n// KR_TEST_ARTIFACTS_DIR is read by the reader\n",
+            0,
+        ),
+        (
+            script,
+            "const a = 1 // KR_TEST_ARTIFACTS_DIR is read by the reader\n",
+            0,
+        ),
+        (
+            script,
+            "const note = `see // here`; // KR_TEST_ARTIFACTS_DIR is read by the reader\n",
+            0,
+        ),
+        (script, "const a = `${/* KR_TEST_ARTIFACTS_DIR */ 1}`\n", 0),
+        (
+            rust,
+            "let q = '\"'; let r: &'static str = \"\"; // KR_TEST_ARTIFACTS_DIR is set by the build\n",
+            0,
+        ),
+        (
+            rust,
+            "/* a /* b */ KR_TEST_ARTIFACTS_DIR */\nfn f() {}\n",
+            0,
+        ),
+        // What the scan does not know fails closed. A slash after `)` may open a regular
+        // expression, which would hide a comment opener, so it is taken as one, and a comment after
+        // a division is code. A broken quote runs to its line's end. A file of JSX, whose text is
+        // not code, is a language the case does not know.
+        (
+            script,
+            "const half = (a + b) / 2 // KR_TEST_ARTIFACTS_DIR is not read here\n",
+            1,
+        ),
+        (
+            script,
+            "const s = 'it // KR_TEST_ARTIFACTS_DIR is not read here\n",
+            1,
+        ),
+        (
+            "apps/companion/src/x.tsx",
+            "// KR_TEST_ARTIFACTS_DIR is not read here\n",
+            1,
+        ),
+    ]);
+}
+
+/// A workflow is read by its structure: what stands under a `run:` scalar is that script's text,
+/// never a step or a mapping of the workflow.
+#[test]
+fn the_source_case_reads_a_workflow_by_its_structure() {
+    let flow = ".github/workflows/x.yml";
+    let upload = "actions/upload-artifact@v7";
+    assert_findings(&[
+        // An upload step spelled inside a script's heredoc is the script's text.
+        (
+            flow,
+            "jobs:\n  a:\n    steps:\n      - run: |\n          dir=\"$(sed -n 's/^ *path: //p' <<'EOF'\n          - uses: actions/upload-artifact@v7\n            with:\n              path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\n          EOF\n          )\"\n          mkdir -p \"$dir\"\n",
+            1,
+        ),
+        (
+            flow,
+            "jobs:\n  a:\n    steps:\n      - run: |\n          cat <<'EOF'\n          - uses: actions/upload-artifact@v7\n            with:\n              path: |\n                ${{ env.KR_TEST_ARTIFACTS_DIR }}\n          EOF\n",
+            1,
+        ),
+        (
+            flow,
+            "jobs:\n  a:\n    steps:\n      - run: \"echo\n          uses: actions/upload-artifact@v7\n          with:\n            path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\"\n",
+            1,
+        ),
+        // A step that is not an upload does not become one because an upload step follows.
+        (
+            flow,
+            "jobs:\n  a:\n    steps:\n      - uses: actions/cache@v4\n        with:\n          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\n      - uses: actions/upload-artifact@v7\n        with:\n          name: x\n",
+            1,
+        ),
+        // Only a block scalar's lines are the lines of the path list.
+        (
+            flow,
+            "jobs:\n  a:\n    steps:\n      - uses: actions/upload-artifact@v7\n        with:\n          path: a\n            ${{ env.KR_TEST_ARTIFACTS_DIR }}\n",
+            1,
+        ),
+        // A flow mapping is not a `with:` the scan reads.
+        (
+            flow,
+            "jobs:\n  a:\n    steps:\n      - uses: actions/upload-artifact@v7\n        with: { path: ${{ env.KR_TEST_ARTIFACTS_DIR }} }\n",
+            1,
+        ),
+        // The directory is a key of `env:` only, and nothing else of the line reads it.
+        (
+            flow,
+            "jobs:\n  a:\n    steps:\n      - uses: x/y@v1\n        with:\n          KR_TEST_ARTIFACTS_DIR: /tmp/x\n",
+            1,
+        ),
+        (
+            flow,
+            "jobs:\n  a:\n    env:\n      KR_TEST_ARTIFACTS_DIR: ${{ env.KR_TEST_ARTIFACTS_DIR }}/x\n",
+            1,
+        ),
+        (
+            flow,
+            "jobs:\n  a:\n    env:\n      KR_TEST_ARTIFACTS_DIR: /tmp/x\n",
+            0,
+        ),
+        // A real upload step after a script is an upload.
+        (
+            flow,
+            &format!(
+                "jobs:\n  a:\n    steps:\n      - run: |\n          echo hi\n      - uses: {upload}\n        with:\n          path: ${{{{ env.KR_TEST_ARTIFACTS_DIR }}}}\n"
+            ),
+            0,
+        ),
+    ]);
 }
