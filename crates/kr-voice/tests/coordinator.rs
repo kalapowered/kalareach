@@ -2152,6 +2152,9 @@ async fn exhausted_capacity_reports_what_still_works() {
 /// KR-REQ-23.51: a start the broker refuses on the account, because its managed allowance is spent
 /// or because the service does not accept it, reaches the device as that refusal with the paths that
 /// still work. The host holds no call, asks the broker once and has nothing to close.
+///
+/// Not shown here: the broker's own account and budget checks, which the service makes; the broker
+/// here is a fake that answers with each refusal.
 #[tokio::test]
 async fn a_start_the_broker_refuses_on_the_account_holds_no_call() {
     for (answer, said, own_alternatives) in [
@@ -2200,9 +2203,8 @@ async fn a_start_the_broker_refuses_on_the_account_holds_no_call() {
                 "{said}: the person is not left with no path"
             ),
         }
-        assert_eq!(
-            fixture.coordinator.live_sessions(),
-            0,
+        assert!(
+            !fixture.coordinator.calls_open(),
             "{said}: a refused start holds no call"
         );
         assert_eq!(

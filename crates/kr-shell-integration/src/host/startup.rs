@@ -3100,8 +3100,10 @@ mod tests {
     /// after `using`, a `using module` whose hashtable runs over several lines, and a here-string
     /// holding a parenthesis. A fresh install and an entry moved from the end land in the same place.
     ///
-    /// KR-REQ-07.86, the part about a PowerShell profile running exactly once: a real PowerShell
-    /// runs each statement of the profile once, in the order it had them, after the entry.
+    /// KR-REQ-07.86, the part about a PowerShell profile running exactly once: a real PowerShell,
+    /// started with the profile named once, runs each statement of the profile once, in the order it
+    /// had them, after the entry; the entry makes none run twice or not at all. How the packaged
+    /// PowerShell's own start loads the profile is the qualification corpus's.
     #[cfg(unix)]
     #[test]
     #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
