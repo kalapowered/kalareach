@@ -152,10 +152,6 @@ esac
 . "$root/scripts/lib/artifacts-dir.sh"
 kr_artifacts_dir
 artefacts="$kr_artifacts"
-case "$artefacts" in
-  /*) ;;
-  *) artefacts="$PWD/$artefacts" ;;
-esac
 mkdir -p "$artefacts"
 evidence="$(mktemp -d "$artefacts/m1b-XXXXXX")"
 

@@ -1497,6 +1497,10 @@ fn the_source_case_lets_the_evidence_upload_name_the_directory_and_nothing_else(
     }
     for (uses, with) in [
         ("actions/cache@v4", format!("          path: {expression}")),
+        (
+            "actions/cache@v4",
+            format!("          path: |\n            {expression}"),
+        ),
         (UPLOAD, format!("          name: {expression}")),
         (UPLOAD, format!("          path: {expression}/more")),
         (
