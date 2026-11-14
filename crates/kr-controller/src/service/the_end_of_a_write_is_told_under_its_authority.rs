@@ -329,7 +329,10 @@ async fn the_report_privacy_set_answers_is_not_shown_once_authority_has_moved_af
 }
 
 /// A `privacy.set` whose parameters do not decode: its service function refuses it with
-/// `INVALID_ARGUMENT` before it changes anything, a refusal that rests on the parameters alone.
+/// `INVALID_ARGUMENT` before it changes anything, a refusal that rests on the parameters alone. The
+/// envelope declines such parameters before any route, so only a direct call of `write_method`
+/// reaches this refusal; it stands for the refusals of the same service function that the door does
+/// tell, which are labelled in the same place.
 fn a_privacy_set_that_decodes_no_parameters(
     temp: &kr_ipc::testing::TempHost,
 ) -> (Method, MutationRequest) {
@@ -349,14 +352,27 @@ fn a_privacy_set_that_decodes_no_parameters(
 /// KR-REQ-09.09, 09.12: every answer `privacy.set`'s service function returns carries the label of
 /// the report, a refusal of its own included, also one that rests on the parameters alone, since
 /// the door cannot tell it from the report. While nothing has moved the refusal is told with its own
-/// code, and a definite refusal means nothing was done; once a restamp, a fence that is owed or a
-/// withdrawn connection has come after the route answered it is not shown, and the repeat under a
-/// check that passes gets the definite answer.
+/// code; once a restamp, a fence that is owed or a withdrawn connection has come after the route
+/// answered it is not shown. A fence owed from before the route is the refusal the door does tell:
+/// the check the service function asks inside the write refuses with `PERMISSION_DENIED`, and the
+/// door does not show that either. A request with other parameters, asked once nothing is owed,
+/// gets its own definite answer: the last leg asks a new action, not a repeat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_privacy_sets_service_function_raises_is_told_as_itself_and_is_not_shown_once_authority_has_moved()
  {
     let (temp, controller, _clock) = daemon().await;
     let refusing = || a_privacy_set_that_decodes_no_parameters(&temp);
+    let privacy_set = |enabled: bool| {
+        (
+            Method::PrivacySet,
+            mutation_of(
+                &temp,
+                Method::PrivacySet,
+                ParamsValue::from_typed(&kr_protocol::privacy::PrivacySetParams { enabled })
+                    .expect("encodes"),
+            ),
+        )
+    };
 
     let control = told_after_the_route_answers(&controller, refusing(), |_| {}).await;
     assert_eq!(
@@ -393,14 +409,23 @@ async fn a_refusal_privacy_sets_service_function_raises_is_told_as_itself_and_is
             .expect("the parameters are refused again")
             .code,
         ErrorCode::InvalidArgument,
-        "under a check that passes the repeat gets the definite answer: {again:?}"
+        "asked again under a check that passes, a new request gets its own answer: {again:?}"
     );
+    // The check inside the write is the refusal that the door does tell: a fence owed from before
+    // the route is refused by the service function with the fence's own `PERMISSION_DENIED`, and the
+    // door does not show that answer.
+    controller.hold_fence(true);
+    let owed = told_after_the_route_answers(&controller, privacy_set(true), |_| {}).await;
+    controller.hold_fence(false);
+    not_shown(&owed);
 }
 
-/// KR-REQ-09.09, 09.12: the refusal `write_method` makes for a `privacy.set` whose connection was
-/// withdrawn before the service was asked keeps its word, which says nothing was done: told
-/// as that refusal while the fence stands, and as the fence's own, which is also definite, while
-/// one is owed. It is not the report's label that it carries, so it is never "not shown".
+/// KR-REQ-09.09, 09.12: the refusal `write_method` makes for a `privacy.set` that carries no
+/// admission keeps its word, which says nothing was done: told as that refusal while no fence is
+/// owed, and as the fence's own, which is also definite, while one is owed. It carries a fresh
+/// label and not the report's, so it is never "not shown". The case keeps the connection
+/// registered and calls `write_method` with no admission, which is how `route_write` reads a
+/// connection that was withdrawn before the service was asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_made_before_privacy_sets_service_keeps_its_word_under_a_fence() {
     use kr_protocol::privacy::PrivacySetParams;
@@ -449,13 +474,83 @@ async fn a_refusal_made_before_privacy_sets_service_keeps_its_word_under_a_fence
     refused_for_a_fence(refusal(&fenced).expect("the request is still refused"));
 }
 
-/// KR-REQ-09.09, 09.12: every answer to `membership.present` is a copy, a refusal of the lease
-/// included, so once a fence is owed or the connection is withdrawn after the route answered, the
-/// refusal is not shown either. The request carries no lease the host can take, so the answer is
-/// the refusal of it, and with nothing moved it is told with its own code.
+/// KR-REQ-09.09, 09.12: the refusals `write_method` makes before the service of
+/// `privacy.retained.delete` keep their word, which says nothing was done: the admission gate, which
+/// stops the deletion while a fence is owed from before the route, and the window refusal of a
+/// deletion that carries no deadline. Both carry a fresh label and not the copy's, so under a failing
+/// check they are told as the check's own definite refusal and never as "not shown". The window
+/// refusal is told as it was made while nothing is owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refusal_of_a_lease_membership_present_raises_is_not_shown_under_a_fence_or_a_withdrawn_connection()
- {
+async fn the_refusals_made_before_a_deletions_service_keep_their_word_under_a_fence() {
+    use kr_protocol::privacy::PrivacyRetainedDeleteParams;
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let deleting = || {
+        mutation_of(
+            &temp,
+            Method::PrivacyRetainedDelete,
+            ParamsValue::from_typed(&PrivacyRetainedDeleteParams {
+                reference: "no such copy".to_owned(),
+            })
+            .expect("encodes"),
+        )
+    };
+    let told_with = |mutation: MutationRequest, window: bool| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        async move {
+            told_now(
+                &controller,
+                connection_id,
+                &mutation,
+                controller.write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::PrivacyRetainedDelete,
+                    connection_id,
+                    None,
+                    window.then(|| accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                ),
+            )
+            .await
+        }
+    };
+
+    // The admission gate: a fence owed from before the route stops the deletion at the entry.
+    controller.hold_fence(true);
+    let gated = told_with(deleting(), true).await;
+    controller.hold_fence(false);
+    refused_for_a_fence(refusal(&gated).expect("the gate refuses the deletion"));
+
+    // The window refusal, with nothing owed, and then with a fence that lands after the route has
+    // answered.
+    let control = told_with(deleting(), false).await;
+    let error = refusal(&control).expect("a deletion with no deadline is refused");
+    assert_ne!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
+    let (arrived, release) = controller.pause_after_a_route_answers();
+    let telling = tokio::spawn(told_with(deleting(), false));
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the route answers")
+        .expect("the pause is armed");
+    controller.hold_fence(true);
+    release.send(()).expect("the door goes on");
+    let fenced = telling.await.expect("the door tells it");
+    controller.hold_fence(false);
+    refused_for_a_fence(refusal(&fenced).expect("the refusal is still told"));
+}
+
+/// KR-REQ-09.09, 09.12: every answer to `membership.present` is a copy, so once a fence is owed or
+/// the connection is withdrawn after the route answered, a refusal is not shown either. The case
+/// calls `write_method` directly with empty parameters, which the envelope would decline before any
+/// route: the refusal is the `INVALID_ARGUMENT` that decoding them gives, and it stands for the
+/// route's other refusals (the rules of a lease refuse with `PERMISSION_DENIED`), which the route
+/// labels in the same place. With nothing moved it is told with its own code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_membership_present_raises_is_not_shown_under_a_fence_or_a_withdrawn_connection()
+{
     let (temp, controller, _clock) = daemon().await;
     let refusing = || {
         (

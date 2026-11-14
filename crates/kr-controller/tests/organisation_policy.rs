@@ -354,7 +354,7 @@ async fn the_adapter_lists_a_policy_apply_answers_are_not_shown_when_a_fence_or_
                     },
                 )
                 .await;
-                told
+                (client, told)
             }
         });
         tokio::time::timeout(Duration::from_secs(30), arrived)
@@ -362,15 +362,14 @@ async fn the_adapter_lists_a_policy_apply_answers_are_not_shown_when_a_fence_or_
             .expect("the route answers")
             .expect("the pause is armed");
         if another_devices_revocation {
-            restamp_support::another_devices_authority_is_revoked(&controller, environment).await;
+            restamp_support::another_devices_authority_is_revoked(controller, environment).await;
         } else {
             controller.hold_fence(true);
         }
         release.send(()).expect("the door goes on");
-        let refused = telling
-            .await
-            .expect("the door tells it")
-            .expect_err("lists made from the policies held are not shown once authority moved");
+        let (mut client, told) = telling.await.expect("the door tells it");
+        let refused =
+            told.expect_err("lists made from the policies held are not shown once authority moved");
         controller.hold_fence(false);
         assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
         assert!(
@@ -378,9 +377,20 @@ async fn the_adapter_lists_a_policy_apply_answers_are_not_shown_when_a_fence_or_
             "what is told is that what became of the action is not shown: {refused:?}"
         );
 
-        let again = apply(&fixture, policy.clone(), None)
-            .await
-            .expect("the same policy is answered once nothing is owed");
+        // The connection that was told "not shown" stands and is under the revision now in force,
+        // so the same policy asked on it is answered with the same lists.
+        let again: OrganisationPolicyApplyResult = calls::mutate_as(
+            environment,
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::OrganisationPolicyApply,
+            &OrganisationPolicyApplyParams {
+                policy: policy.clone(),
+                authority: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the same policy is answered on the connection that stood");
         assert_eq!(again, applied, "it is answered with the same lists");
     }
     fixture.host.stop().await;
