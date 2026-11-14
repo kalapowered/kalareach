@@ -116,7 +116,10 @@ unit's records in the profile directory's `.fingerprint`, or a link to a unit's 
 run once more. Before that the report removes the file, its build directory and Cargo's record of
 building it, and every other program the step wrote in those places that is empty or cut short.
 
-The removal is checked in full before any of it is made. A file goes only if the step wrote it,
+The removal is checked in full before any of it is made, and checked again right before, after the
+evidence below is read, which can take a minute and a half; each entry is also read again as the
+removal goes, and where any entry is no longer what the check found, nothing is removed and the step
+is not run again. A file goes only if the step wrote it,
 which the file's modification time says: a file older than the step is not one its build made. A
 directory goes because Cargo's record of the unit names it, and goes empty, after what is in it.
 The removal enters no directory that is on another device than the build's output, so a mount below
@@ -133,10 +136,14 @@ the epoch; each report step computes it from `REPORT_MINUTES`, which is the step
 `timeout-minutes`. Without the variable only the five minutes apply, and a value that is not a
 number allows no second run.
 
-The time left is the second run's deadline. When it passes, the step's process group is asked to
-end and, after five seconds, killed (on Windows `taskkill /T /F` ends the tree), the step ends red
-with "the second run passed its time", and the report goes on with the next step and writes its
-result. What the second run took is taken from the five minutes. A step that is not run again keeps
+The time left is the second run's deadline. When it passes, the step's processes are asked to
+end and, after five seconds, killed: the members of the group that the step's program leads and
+its descendants by the parent chain, which includes one that left the group, each read afresh from
+the system's table just before the signal (on Windows `taskkill /T /F` ends the tree). A process of
+the group that the program leaves behind when it ends by itself is killed too. The step ends red
+with "the second run passed its time", and the report goes on with the next step. The steps after it
+have no deadline of their own, so the report writes its result only if they end before the job's
+limit. What the second run took is taken from the five minutes. A step that is not run again keeps
 its failure, with the reason added.
 
 The result's step holds a `rerun` object with the first run's log and exit status, the files, the
@@ -147,7 +154,10 @@ beside it that ends in `.kernel.txt`. The kernel's log is read from three minute
 earliest of the files was written to three minutes after the latest, and no further than the time
 of the check. The free space is the lowest sample that `scripts/disk-report.sh` kept in that stretch
 (the file `kr-disk-report/samples` under `RUNNER_TEMP`, `TMPDIR` or `/tmp`) or the volume as `df`
-reads it at the check, whichever is lower. If the first run's evidence could not be kept, the step
+reads it at the check, whichever is lower. Both are needed: the samples have to cover the stretch
+with no gap of more than 30 seconds, because a volume with no room leaves a gap and not a low
+sample, and the volume has to read. Otherwise the free space is unknown and the cause is
+`unexplained`. If the first run's evidence could not be kept, the step
 has an error and the run fails. `summary.rerun_steps` lists the steps, and the run's last line
 counts the ones that passed with the runner's disk as the cause.
 
