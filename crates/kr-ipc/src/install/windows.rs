@@ -488,8 +488,8 @@ pub(super) enum Pointed {
     Done,
     /// Nothing is named `link`, or what is there is not a directory junction. Nothing was changed.
     NotAJunction,
-    /// The target was set and flushed on the junction that was looked at, and the name no longer
-    /// names it: something else was put in its place meanwhile.
+    /// The target was set and flushed on the junction that the change handle was open on, and the
+    /// name no longer names that object: the name is gone, or something else took it meanwhile.
     Moved,
 }
 
@@ -509,9 +509,9 @@ fn open_to_look(link: &Path) -> io::Result<File> {
 /// The name is looked at without a right to change it, so that what is not a junction, or is not
 /// there, is told apart from a junction that this account may not change. Then it is opened to be
 /// changed, and the object that handle is open on is checked to be a junction again before its
-/// target is set through that handle: what was put in the name's place between the look and the set
-/// is not changed. The change is flushed through the same handle, and the name is checked to still
-/// name that object before the answer is [`Pointed::Done`].
+/// target is set through that handle: the set is made on that object and on no other, whatever is
+/// put at the name afterwards. The change is flushed through the same handle, and the name is
+/// opened again and checked to still name that object before the answer is [`Pointed::Done`].
 ///
 /// The junction stays the one object it is and only its target changes, in one operation, so a
 /// program that reads `link` or walks a path through it meanwhile finds the old target or the new
@@ -523,8 +523,8 @@ fn open_to_look(link: &Path) -> io::Result<File> {
 /// # Errors
 ///
 /// Returns the operating system's error when `link` cannot be opened, its reparse data cannot be
-/// read or set, or the change cannot be flushed, and an invalid-input error when `target` cannot
-/// be named by a junction.
+/// read or set, the change cannot be flushed, or the identity of either object cannot be read, and
+/// an invalid-input error when `target` cannot be named by a junction.
 pub(super) fn point_junction(link: &Path, target: &Path) -> io::Result<Pointed> {
     let data = junction_data(target)?;
     let looked = match open_to_look(link) {
@@ -822,7 +822,7 @@ pub enum Moment {
     /// The name `current` was opened to be changed and found to be a junction, and its target is
     /// about to be set through that handle.
     JunctionChecked,
-    /// The target of `current` was set, and the change is about to be flushed.
+    /// The target of the junction that was checked was set, and the change is about to be flushed.
     JunctionPointed,
 }
 
