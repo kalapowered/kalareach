@@ -80,16 +80,28 @@ impl Rig {
     /// A rig whose lane begins with `frames` queue entries and `bytes` of credit.
     async fn start_with_credit(frames: u32, bytes: u64) -> Self {
         let adopted = Adopted::start(1).await;
-        let host = &adopted.host;
-        let worker: &Worker = &adopted.workers[0];
         let device = Device::create().await;
         let record = pair_with(
-            host,
+            &adopted.host,
             &device,
             &adopted.owner,
             proposal(&[ActionRight::SessionView, ActionRight::TerminalInput]),
         )
         .await;
+        Self::attached(adopted, device, record, frames, bytes).await
+    }
+
+    /// Connects the paired device to the daemon, attaches it to the worker's session, gives it the
+    /// input lease and starts a lane that begins with `frames` queue entries and `bytes` of credit.
+    async fn attached(
+        adopted: Adopted,
+        device: Device,
+        record: DeviceRecord,
+        frames: u32,
+        bytes: u64,
+    ) -> Self {
+        let host = &adopted.host;
+        let worker: &Worker = &adopted.workers[0];
         let connection = RawDevice::connect(host, &device, &record).await;
         connection.claim();
         let target = worker.target(host.environment_id);
@@ -183,6 +195,23 @@ impl Rig {
             sequence: InputSequence::new(sequence),
             bytes: Bytes::new(bytes.to_vec()),
         }
+    }
+
+    /// The rig after the daemon restarts: the device, paired as it was, connects again, attaches
+    /// again and takes the lease, and a lane stands for the new daemon's door.
+    async fn restarted(self) -> Self {
+        let Self {
+            adopted,
+            device,
+            _paired: (paired, record),
+            lane,
+            ..
+        } = self;
+        device.close();
+        drop(device);
+        drop(lane);
+        let adopted = adopted.restart().await;
+        Self::attached(adopted, paired, record, 64, 512 * 1024).await
     }
 
     async fn stop(self) {
@@ -505,8 +534,71 @@ async fn the_refusal_of_the_current_epoch_stands_against_a_late_answer_of_an_old
     }
     assert_eq!(refused_newer, 1, "the current epoch is refused once");
     assert_eq!(
-        refused_older, 0,
-        "the older epoch's late answer says nothing"
+        refused_older, 1,
+        "the older epoch's first refusal is told, though the newer epoch was refused before it"
+    );
+    rig.stop().await;
+}
+
+/// A frame of an older epoch that the device writes after the newest epoch was refused is not
+/// passed on, and the device is told that its epoch is refused, once: the cutoff for passing frames
+/// on is not the record of what the device has been told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_epochs_frame_written_after_the_newest_refusal_is_refused_once() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let newer = InputLeaseEpoch::new(rig.epoch.get() + 1);
+    rig.lane.send_window(LaneWindow {
+        epoch: newer,
+        holder: false,
+        frames: 0,
+        bytes: U64::new(0),
+        ended: Nullable::null(),
+    });
+    let newer_frame = InputFrame {
+        epoch: newer,
+        sequence: InputSequence::new(0),
+        bytes: Bytes::new(b"n".to_vec()),
+    };
+    stream
+        .write_message(&newer_frame)
+        .await
+        .expect("the frame is written");
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::Refused { epoch, .. }) if epoch == newer
+        ),
+        "the newer epoch is refused first"
+    );
+
+    let (mut reader, mut writer) = stream.split();
+    for sequence in 0..3 {
+        writer
+            .write_message(&rig.frame(sequence, b"o"))
+            .await
+            .expect("the frame is written");
+    }
+    drop(writer);
+    let mut refused_older = 0;
+    while let Some(ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the host answers in time")
+        .expect("the stream is not reset")
+    {
+        match ack {
+            InputAck::Refused { epoch, .. } if epoch == rig.epoch => refused_older += 1,
+            InputAck::Refused { .. } => panic!("the newer epoch is not refused again"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        refused_older, 1,
+        "the older epoch is refused once for all its frames"
+    );
+    assert!(
+        rig.lane.frames().is_empty(),
+        "no frame of either epoch was passed on"
     );
     rig.stop().await;
 }
@@ -514,6 +606,66 @@ async fn the_refusal_of_the_current_epoch_stands_against_a_late_answer_of_an_old
 /// How many acknowledgements the host keeps for a device that does not read them, as the door
 /// names it.
 const MAX_UNREAD_ACKS: usize = 64;
+
+/// How many epochs the host keeps a first refusal for on one stream, as the door names it.
+const MAX_REFUSED_EPOCHS: u64 = 64;
+
+/// A device whose frames carry more distinct stale epochs than the host keeps refusals for loses its
+/// stream, and its connection stands: each epoch is told refused once, and the host does not keep
+/// an unbounded record of what it has told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_frames_span_many_refused_epochs_loses_its_stream() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let current = InputLeaseEpoch::new(rig.epoch.get() + 1_000);
+    rig.lane.send_window(LaneWindow {
+        epoch: current,
+        holder: false,
+        frames: 0,
+        bytes: U64::new(0),
+        ended: Nullable::some(LaneEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+    });
+    assert!(
+        matches!(next(&mut stream).await, Some(InputAck::EpochEnded { .. })),
+        "the lane's window is applied"
+    );
+
+    let (mut reader, mut writer) = stream.split();
+    for epoch in 1..=MAX_REFUSED_EPOCHS + 2 {
+        let frame = InputFrame {
+            epoch: InputLeaseEpoch::new(epoch),
+            sequence: InputSequence::new(0),
+            bytes: Bytes::new(b"s".to_vec()),
+        };
+        if writer.write_message(&frame).await.is_err() {
+            break;
+        }
+    }
+    let mut refused = 0;
+    let ended = loop {
+        match tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+            .await
+            .expect("the host answers or ends the stream in time")
+        {
+            Ok(Some(InputAck::Refused { .. })) => refused += 1,
+            Ok(Some(_)) => {}
+            ended => break ended,
+        }
+    };
+    assert!(ended.is_err(), "the stream is reset: {ended:?}");
+    assert!(
+        refused <= MAX_REFUSED_EPOCHS,
+        "the device was told of no more epochs than the host keeps: {refused}"
+    );
+    assert!(
+        rig.lane.frames().is_empty(),
+        "no frame of a stale epoch was passed on"
+    );
+    rig.stop().await;
+}
 
 /// A device that does not read what it is told holds the host to a bounded number of
 /// acknowledgements: the worker's events would make the host hold more, so the stream is cut, and
@@ -544,28 +696,19 @@ async fn the_acknowledgements_owed_to_a_device_that_does_not_read_are_bounded() 
 }
 
 /// The authority feed withdraws what a frame stands on between the host's decision for it and the
-/// write to the worker: the worker is never given the frame. The withdrawal also takes the
-/// connection away, which may stop the writer before it asks the feed again, so this shows that the
-/// frame does not go, not which of the two stopped it.
+/// write to the worker, and the release of the connection's link, which a withdrawal starts and
+/// which revokes the connection's streams, is held until the writer has been let go. The writer
+/// asks the feed immediately before the write, so the worker is never given the frame, the device
+/// is told that the authority was withdrawn, and the stream ends cleanly: the check decides alone,
+/// with no teardown to stop the writer first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_withdrawal_between_the_decision_and_the_write_stops_the_frame() {
+async fn a_withdrawal_after_the_decision_is_caught_by_the_feed_check_before_the_write() {
     let rig = Rig::start().await;
     let mut stream = rig.open().await;
     let stages = rig.adopted.host.network().input_stages();
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
 
-    stream
-        .write_message(&rig.frame(0, b"a"))
-        .await
-        .expect("the frame is written");
-    assert_eq!(
-        next(&mut stream).await,
-        Some(InputAck::Accepted {
-            epoch: rig.epoch,
-            through: InputSequence::new(0),
-        }),
-        "the control: before the withdrawal the typing is accepted"
-    );
-
+    let (at_release, go_release) = stages.hold_before_a_release();
     let (at_write, go_write) = stages.hold_before_a_lane_write();
     stream
         .write_message(&rig.frame(1, b"b"))
@@ -578,16 +721,135 @@ async fn a_withdrawal_between_the_decision_and_the_write_stops_the_frame() {
         .controller()
         .raise_the_unverified_withdrawal_refusal()
         .await;
-    // The connection's end may have taken the writer already.
+    // The release has begun and stands before it ends anything.
+    arrived(at_release).await;
     let _ = go_write.send(());
-    until("the writer has done with the frame", || {
-        stages.counts().unanswered == 0
-    })
-    .await;
+
+    match next_or_reset(&mut stream).await {
+        Ok(Some(InputAck::Refused {
+            epoch,
+            sequence,
+            error,
+            ..
+        })) => {
+            assert_eq!(epoch, rig.epoch);
+            assert_eq!(sequence.get(), 1);
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the host was to refuse the frame, and the stream gave {other:?}"),
+    }
+    assert!(
+        matches!(next_or_reset(&mut stream).await, Ok(None)),
+        "the stream ends cleanly, by the check and not by the release"
+    );
     assert_eq!(
         rig.lane.frames().len(),
         1,
         "the worker never had the withdrawn frame"
+    );
+    drop(go_release);
+    rig.stop().await;
+}
+
+/// The stream task marks the state's version before it looks at whether the stream has ended, so an
+/// end that comes between the mark and the look is seen at the look, and one that comes after the
+/// look is seen as a change. The task is held between the two while a detach ends the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_end_that_comes_between_the_mark_and_the_look_is_not_missed() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let (at_mark, go) = stages.hold_after_the_version_mark();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    arrived(at_mark).await;
+
+    rig.lane.send_window(lease_ended(&rig));
+    detach(&rig).await;
+    assert_eq!(
+        next_or_reset(&mut stream).await.expect("not reset"),
+        Some(InputAck::EpochEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+        "the device is told while the stream task is held"
+    );
+    assert!(
+        matches!(next_or_reset(&mut stream).await, Ok(None)),
+        "the end is written by the acknowledgement writer, which is another task"
+    );
+
+    let _ = go.send(());
+    tokio::time::timeout(WAIT, ended.changed())
+        .await
+        .expect("the stream task ended in time once it was let go")
+        .expect("the count stands");
+    rig.stop().await;
+}
+
+/// A frame that waits in the lane writer's queue behind a frame that the worker then refuses is
+/// discarded by the writer, which leaves nothing in flight. The stream task, which waits for the
+/// stream to drain because the device has finished, is woken to see it. The writer is held at the
+/// queued frame until the stream task is waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_the_writer_discards_wakes_the_wait_for_the_stream_to_drain() {
+    let rig = Rig::start().await;
+    let stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    rig.lane.refuse_from(0);
+    let (at_first, go_first) = stages.hold_before_a_frame_is_judged();
+    let (mut reader, mut writer) = stream.split();
+    writer
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    arrived(at_first).await;
+    let (at_second, go_second) = stages.hold_before_a_frame_is_judged();
+    writer
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    until("both frames are passed on", || {
+        stages.counts().unanswered == 2
+    })
+    .await;
+    let _ = go_first.send(());
+    arrived(at_second).await;
+
+    // The worker's refusal of the first frame is recorded and told before the second is judged.
+    let told = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the host answers in time")
+        .expect("not reset");
+    assert!(
+        matches!(told, Some(InputAck::Refused { sequence, .. }) if sequence.get() == 0),
+        "the first frame is refused: {told:?}"
+    );
+    let mut waits = stages.drain_waits();
+    drop(writer);
+    tokio::time::timeout(WAIT, waits.changed())
+        .await
+        .expect("the stream task waits for the frame in flight")
+        .expect("the count stands");
+    let _ = go_second.send(());
+
+    while let Some(ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the stream ends in time once the frame is discarded")
+        .expect("the stream is not reset")
+    {
+        assert!(
+            !matches!(ack, InputAck::Accepted { .. }),
+            "nothing was accepted: {ack:?}"
+        );
+    }
+    assert_eq!(
+        rig.lane.frames().len(),
+        1,
+        "the discarded frame never reached the lane"
     );
     rig.stop().await;
 }
@@ -691,6 +953,42 @@ async fn a_detach_waits_for_the_notice_of_the_epoch_the_view_holds() {
         matches!(next_or_reset(&mut stream).await, Ok(None)),
         "the stream then ends cleanly"
     );
+    rig.stop().await;
+}
+
+/// A detach that the worker refuses before it acts, because the subject facts it expects have
+/// moved, took no attachment away: the attachment's stream is not told of a detach and goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_the_worker_refuses_before_it_acts_leaves_the_stream_standing() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+
+    let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    let refused = rig
+        .device
+        .mutate_expecting(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &std::collections::BTreeMap::from([("input_lease_epoch", rig.epoch.get() + 5)]),
+            &SessionDetachParams {
+                attachment_id: Nullable::some(rig.attachment),
+                line_token: Nullable::null(),
+                after_input: None,
+                fenced_report: false,
+            },
+        )
+        .await
+        .expect_err("the worker refuses the detach");
+    assert_eq!(refused.code, ErrorCode::DraftConflict, "{refused:?}");
+    assert_eq!(
+        stages.counts().detaches,
+        0,
+        "the stream was not told of a detach"
+    );
+    type_and_wait(&rig, &mut stream, 1, b"b").await;
     rig.stop().await;
 }
 
@@ -1254,10 +1552,23 @@ async fn a_control_flood_ends_the_connection_and_the_typing_before_it_was_delive
         Some(false),
         "the host ends the control stream, answering nothing more"
     );
-    let reason = next_or_reset(&mut stream)
+    next_or_reset(&mut stream)
         .await
         .expect_err("the input stream goes with the connection");
-    println!("the input stream's end: {reason:?}");
+    until("the device has been told why the connection closed", || {
+        rig.device.close_reason().is_some()
+    })
+    .await;
+    assert!(
+        matches!(
+            rig.device.close_reason(),
+            Some(iroh::endpoint::ConnectionError::ApplicationClosed(ref close))
+                if close.error_code == kr_transport::listener::CONTROL_LOST.into()
+                    && close.reason.as_ref() == b"the control queue overflowed"
+        ),
+        "the connection closed as a lost control stream, with the queue's words: {:?}",
+        rig.device.close_reason()
+    );
     assert_eq!(
         rig.lane.bytes(),
         frames.concat(),
@@ -1468,6 +1779,40 @@ async fn a_restriction_that_reaches_the_whole_host_ends_every_remote_stream() {
     );
     assert_eq!(rig.lane.frames().len(), 2, "nothing was passed on after it");
     drop(named);
+    rig.stop().await;
+}
+
+/// C16d, the host's half: a daemon that has restarted serves the device that comes back, and a
+/// restriction that reaches the whole host takes the new stream as it takes any remote stream. The
+/// stream the old daemon served ended with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restriction_that_reaches_the_whole_host_ends_a_stream_opened_after_a_restart() {
+    let rig = Rig::start().await;
+    let mut before = rig.open().await;
+    type_and_wait(&rig, &mut before, 0, b"a").await;
+    let rig = rig.restarted().await;
+    assert!(
+        !matches!(next_or_reset(&mut before).await, Ok(Some(_))),
+        "the old daemon's stream ended with it"
+    );
+
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"b").await;
+    rig.adopted
+        .host
+        .controller()
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+    let _ = stream.write_message(&rig.frame(1, b"c")).await;
+    assert!(
+        reads_to_the_end(&mut stream, 1).await.is_err(),
+        "the stream is reset by the restriction"
+    );
+    assert_eq!(
+        rig.lane.frames().len(),
+        1,
+        "nothing was passed on after it, and the first daemon's frame is not in this lane"
+    );
     rig.stop().await;
 }
 

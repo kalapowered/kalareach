@@ -22,13 +22,15 @@
 //! the worker's credit for one epoch (the window the worker states: 32 frames, 512 KiB of key bytes
 //! and about 1 KiB each for the envelope), and, when the lease moves to a new epoch while frames of
 //! the older one are still queued for the writer, the same again for each such epoch, which only
-//! the other views' takeovers cause; and the acknowledgements owed to the device, at most
-//! [`MAX_UNREAD_ACKS`] (those for accepted frames coalesce). A device that does not read what it is
-//! told loses the stream when more than that is owed. The host reads a frame only while fewer than
+//! the other views' takeovers cause; the acknowledgements owed to the device, at most
+//! [`MAX_UNREAD_ACKS`] (those for accepted frames coalesce); and the epochs whose first refusal has
+//! been told, at most [`MAX_REFUSED_EPOCHS`]. A device that does not read what it is told loses the
+//! stream when more than the first is owed, and one whose frames have had more epochs refused than
+//! the second loses it too. The host reads a frame only while fewer than
 //! [`READ_AHEAD_FRAMES`] wait, and a frame waits only for credit. A device's reset is heard in every
 //! one of these states; its finish is heard once the frames it wrote have been read.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -83,10 +85,17 @@ const FRAME_DEADLINE: Duration = CALL_TIMEOUT;
 const READ_AHEAD_FRAMES: usize = 2;
 
 /// How many acknowledgements the host keeps for a device that does not read them. A device that
-/// leaves more owed than this loses the stream, not its connection. The acknowledgements for
-/// accepted frames coalesce, a refusal is told once for each epoch, and the rest come from the
-/// worker's events, so a device that reads is never near the bound.
+/// leaves more owed than this loses the stream, not its connection. The number is a choice, not a
+/// consequence of the device's window: the acknowledgements for accepted frames coalesce and a
+/// refusal is told once for each epoch, but the worker's events (the end of a lease, a launch
+/// marker) are bounded by nothing the device does, so a device that reads more slowly than the
+/// worker writes them can reach the bound too.
 const MAX_UNREAD_ACKS: usize = 64;
+
+/// How many epochs the host keeps a first refusal for on one stream. A device whose frames have had
+/// more distinct epochs refused than this loses the stream: an honest device writes in the epoch it
+/// holds, so its frames span a few.
+const MAX_REFUSED_EPOCHS: usize = 64;
 
 /// How long a detach waits for the worker's notice that the view's lease ended, which comes on the
 /// lane's link while the detach's answer comes on another, before the stream ends.
@@ -228,6 +237,11 @@ impl InputStreams {
         }))
     }
 
+    /// Where a suite holds the release of a connection's link before its streams are revoked.
+    pub(super) async fn before_the_revoke(&self) {
+        self.stages.before_a_release().await;
+    }
+
     /// Revokes every stream of `connection`: its grant ended.
     pub(super) fn revoke_connection(&self, connection: ConnectionId) {
         let streams: Vec<Arc<Live>> = self
@@ -247,6 +261,7 @@ impl InputStreams {
     /// stream waits [`DETACH_NOTICE_WAIT`] for the worker's notice that the lease ended, if the view
     /// held it and none came yet, writes it to the device, and ends.
     pub(super) fn detached(&self, attachment: AttachmentId) {
+        self.stages.detach_told();
         let streams: Vec<Arc<Live>> = self
             .live()
             .iter()
@@ -383,11 +398,10 @@ struct Held {
 enum Routed {
     /// Within credit for the lane's epoch: the credit is taken, and the frame goes on.
     Forward(Instant),
-    /// Of an epoch that is not the lane's now: the host refuses it, and it costs the worker
-    /// nothing.
+    /// Of an epoch that is not the lane's now, or at or below the newest epoch that was refused:
+    /// the host does not pass it on, it costs the worker nothing, and the device is told once that
+    /// its epoch is refused.
     Stale,
-    /// Of an epoch whose first refusal has been recorded: no later frame of it is passed.
-    Dropped,
     /// Of a newer epoch than the lane has a window for, or without credit for it yet.
     Wait,
 }
@@ -419,10 +433,12 @@ struct State {
     outstanding: VecDeque<Outstanding>,
     /// What the device is to be told, in the order it is to be told it.
     acks: VecDeque<InputAck>,
-    /// The newest epoch whose first definite refusal has been recorded. An epoch older than it is
-    /// treated as refused too: its typing is dropped and its answers say nothing, so a late answer
-    /// of an older epoch never replaces what is known of the current one.
-    refused_epoch: Option<InputLeaseEpoch>,
+    /// The epochs, as numbers, whose first definite refusal has been told to the device: each epoch
+    /// is told once. The newest of them is also the cutoff for passing frames on: no frame of that
+    /// epoch or an older one goes to the worker, whether or not the older epoch's own refusal has
+    /// been told yet. An older epoch's refusal is told when it comes and never moves the cutoff
+    /// down, so a late answer of an older epoch does not replace what is known of the newer one.
+    refused: BTreeSet<u64>,
     ended: Option<End>,
     next_request: u64,
     /// The newest epoch of this lane's lease whose end the device has been told. The notice of an
@@ -442,10 +458,42 @@ impl State {
         }
     }
 
-    /// Whether `epoch` is the newest refused epoch, or older than it.
-    fn refused(&self, epoch: InputLeaseEpoch) -> bool {
-        self.refused_epoch
-            .is_some_and(|refused| epoch.get() <= refused.get())
+    /// Whether no frame of `epoch` is passed on: it is the newest refused epoch, or older than it.
+    fn cut_off(&self, epoch: InputLeaseEpoch) -> bool {
+        self.refused
+            .last()
+            .is_some_and(|newest| epoch.get() <= *newest)
+    }
+
+    /// Whether the device has been told that `epoch` is refused.
+    fn told_refused(&self, epoch: InputLeaseEpoch) -> bool {
+        self.refused.contains(&epoch.get())
+    }
+
+    /// Tells the device the first definite refusal of `epoch` when it has not been told one for that
+    /// epoch, and says whether it did. The stream is cut when the refusals told on it span more than
+    /// [`MAX_REFUSED_EPOCHS`] epochs. The caller wakes the tasks that wait on the state.
+    fn refuse(
+        &mut self,
+        live: &Live,
+        epoch: InputLeaseEpoch,
+        sequence: u64,
+        error: ProtocolError,
+    ) -> bool {
+        if !self.refused.insert(epoch.get()) {
+            return false;
+        }
+        let accepted_through = live.through(epoch).map(InputSequence::new);
+        self.tell(InputAck::Refused {
+            epoch,
+            sequence: InputSequence::new(sequence),
+            accepted_through: Nullable(accepted_through),
+            error,
+        });
+        if self.refused.len() > MAX_REFUSED_EPOCHS {
+            self.ended = Some(End::Cut);
+        }
+        true
     }
 }
 
@@ -474,7 +522,7 @@ impl Flow {
                 window,
                 outstanding: VecDeque::new(),
                 acks,
-                refused_epoch: None,
+                refused: BTreeSet::new(),
                 ended: None,
                 next_request: 1,
                 epoch_ended: None,
@@ -526,8 +574,8 @@ impl Flow {
     fn route(&self, epoch: InputLeaseEpoch, claim: InputClaim) -> Routed {
         let mut state = self.lock();
         {
-            if state.refused(epoch) {
-                Routed::Dropped
+            if state.cut_off(epoch) {
+                Routed::Stale
             } else {
                 match &mut state.window {
                     Window::Holder {
@@ -562,21 +610,10 @@ impl Flow {
     /// Records the first definite refusal of `epoch`, by the host, and queues the word for the
     /// device. A refusal of an epoch that has one is not recorded again.
     fn refuse(&self, epoch: InputLeaseEpoch, sequence: u64, error: ProtocolError) {
-        {
-            let mut state = self.lock();
-            if state.refused(epoch) {
-                return;
-            }
-            state.refused_epoch = Some(epoch);
-            let accepted_through = self.live.through(epoch).map(InputSequence::new);
-            state.tell(InputAck::Refused {
-                epoch,
-                sequence: InputSequence::new(sequence),
-                accepted_through: Nullable(accepted_through),
-                error,
-            });
+        let told = self.lock().refuse(&self.live, epoch, sequence, error);
+        if told {
+            self.changed();
         }
-        self.changed();
     }
 
     /// Takes back a frame that was entered as outstanding and was not written.
@@ -621,9 +658,10 @@ impl Flow {
             if front.request_id != response.request_id {
                 return false;
             }
-            // Once an epoch's first refusal is recorded the content of the answers still in flight
-            // for it is ignored.
-            if !state.refused(front.epoch) {
+            // Once an epoch's first refusal is told the content of the answers still in flight for
+            // it is ignored. An older epoch whose refusal has not been told is answered for as any
+            // epoch is.
+            if !state.told_refused(front.epoch) {
                 match &response.outcome {
                     Outcome::Ok(_) => {
                         // Recorded before the device is told.
@@ -644,15 +682,7 @@ impl Flow {
                         return false;
                     }
                     Outcome::Error(error) => {
-                        state.refused_epoch = Some(front.epoch);
-                        let accepted_through =
-                            self.live.through(front.epoch).map(InputSequence::new);
-                        state.tell(InputAck::Refused {
-                            epoch: front.epoch,
-                            sequence: InputSequence::new(front.sequence),
-                            accepted_through: Nullable(accepted_through),
-                            error: error.clone(),
-                        });
+                        state.refuse(&self.live, front.epoch, front.sequence, error.clone());
                     }
                 }
             }
@@ -950,6 +980,7 @@ async fn run(
         // Marked before the state is looked at, the end included, so a change after the look is
         // never missed.
         version.borrow_and_update();
+        flow.stages.after_the_version_mark().await;
         if flow.ended().is_some() || handle.is_revoked() {
             break;
         }
@@ -968,10 +999,6 @@ async fn run(
                     }
                     continue;
                 }
-                Routed::Dropped => {
-                    held.pop_front();
-                    continue;
-                }
                 Routed::Wait => {}
             }
         }
@@ -986,6 +1013,9 @@ async fn run(
             // The device is done and what it wrote is answered: the stream finishes.
             flow.end(End::Graceful);
             break;
+        }
+        if finished {
+            flow.stages.waits_to_drain();
         }
         room.send_replace(may_read);
         tokio::select! {
@@ -1121,11 +1151,14 @@ async fn write_lane(
         if flow.ended().is_some() {
             return;
         }
+        flow.stages.before_a_frame_is_judged().await;
         let discarded = {
             let mut state = flow.lock();
-            // Behind a refusal of its epoch: not passed on.
-            if state.refused(item.epoch) {
+            // Behind a refusal of its epoch or a newer one: not passed on, and its epoch is told
+            // refused if it has not been.
+            if state.cut_off(item.epoch) {
                 state.in_flight -= 1;
+                state.refuse(&flow.live, item.epoch, item.sequence, lease_lost());
                 true
             } else {
                 state.outstanding.push_back(Outstanding {
@@ -1269,6 +1302,9 @@ async fn write_acks(mut writer: DataWriter, flow: &Arc<Flow>) {
             flow.stages.before_an_ack_write().await;
             if ended == Some(End::Cut) || writer.write_message(&ack).await.is_err() {
                 flow.end(End::Cut);
+                // Revoked before the writer is dropped: a dropped writer finishes the stream, and a
+                // cut that the device read as a finish would tell it that nothing is owed.
+                writer.handle().revoke();
                 return;
             }
             continue;
@@ -1276,7 +1312,10 @@ async fn write_acks(mut writer: DataWriter, flow: &Arc<Flow>) {
         match ended {
             // Everything owed is written: finishing the stream is dropping its writer.
             Some(End::Graceful) => return,
-            Some(End::Cut) => return,
+            Some(End::Cut) => {
+                writer.handle().revoke();
+                return;
+            }
             None => {}
         }
         if version.changed().await.is_err() {
