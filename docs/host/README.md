@@ -7397,7 +7397,9 @@ a local caller's prompt says its session is unknown.
 
 A worker accepts its current generation again only after a fresh challenge, which fences that
 generation's previous connection; it refuses a lower generation and requires a strictly higher one
-from a replacement. The daemon's identity key is created once and loaded thereafter: a missing key
+from a replacement. Inside one generation the connection whose hello the worker answered last holds
+a role, so a connection whose hello came before one the worker already accepted for the same role
+is refused, whenever its presentation arrives. The daemon's identity key is created once and loaded thereafter: a missing key
 on a later start is a recovery condition, not an invitation to make a new one, because every live
 worker holds the public half and rotation is a procedure that closes them all.
 

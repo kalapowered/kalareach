@@ -162,7 +162,9 @@ pub const OUTPUT_STREAM: &str = "session.output";
 /// What this worker says to a controller connection that no longer holds the authority of its role
 /// because a connection the daemon opened after it holds it: one it replaced, and one whose
 /// presentation came after a later connection's was accepted. The control daemon reads it from the
-/// first answer a new link gets, and opens one more link for the request it is serving.
+/// answer a new link gets to its presentation or to its first statement, and opens one more link
+/// for the request it is serving. A daemon of a later build matches this text, and workers of
+/// earlier builds send it, so it must not change.
 pub const LATER_CONNECTION_HOLDS_AUTHORITY: &str =
     "a later controller connection holds this environment's authority";
 
@@ -245,8 +247,9 @@ struct Authority {
 /// The order of the newest connection accepted for each role that replaces its predecessor.
 ///
 /// The order of a connection is the number this worker drew when it answered the connection's
-/// hello, so it is the order in which the daemon opened them. The proxy role has no record: its
-/// connections form a set, and none replaces another.
+/// hello. For links the daemon opens one after another it is the order of its opens; for links it
+/// opens at the same time, the order in which this worker happened to answer the hellos decides.
+/// The proxy role has no record: its connections form a set, and none replaces another.
 #[derive(Clone, Copy, Debug, Default)]
 struct AcceptedOrders {
     authority: Option<u64>,
@@ -369,8 +372,8 @@ pub struct WorkerService {
     ///
     /// Only the order of two numbers is read, so it starts anywhere and is never reused. A
     /// connection that presents a generation is decided against the numbers of the connections
-    /// accepted before it, so the order in which the daemon opened its links decides which of them
-    /// holds a role, and the order in which their presentations happen to reach the dispatch
+    /// accepted before it, so the order in which the worker answered their hellos decides which of
+    /// them holds a role, and the order in which their presentations happen to reach the dispatch
     /// boundary does not.
     connection_order: std::sync::atomic::AtomicU64,
     /// The attachments whose caller's authority ran out on a keystroke. The lease of each is
@@ -4265,10 +4268,10 @@ impl WorkerService {
                 let superseded = authority
                     .accepted_generation
                     .is_none_or(|accepted| token.generation.get() > accepted.get());
-                // Inside one generation a role goes to the connection the daemon opened last, which
-                // is the one whose hello this worker answered last, and not to the one whose
-                // presentation was decided last: a connection the daemon gave up on can still be
-                // waiting for the boundary when a newer one has been accepted. A higher generation
+                // Inside one generation a role goes to the connection whose hello this worker
+                // answered last, and not to the one whose presentation was decided last: a
+                // connection the daemon gave up on can still be waiting for the boundary when a
+                // newer one has been accepted. A higher generation
                 // is not ordered by this: it takes every role at once, and the records begin again
                 // with it. Nothing is changed before this is decided, and the token has been
                 // authenticated by now, so a connection that proved nothing moves no record.
