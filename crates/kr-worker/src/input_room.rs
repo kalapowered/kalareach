@@ -561,8 +561,9 @@ impl Carried {
     }
 
     /// Takes the plain batch out. What it owed and its guard are dropped, which gives them back.
+    #[cfg(test)]
     #[must_use]
-    pub fn into_batch(self) -> InputBatch {
+    pub(crate) fn into_batch(self) -> InputBatch {
         self.batch
     }
 

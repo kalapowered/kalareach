@@ -179,8 +179,7 @@ impl Fixture {
 
     /// The replies queued for the application since the last call.
     fn replies(&mut self) -> Vec<Vec<u8>> {
-        self.session
-            .take_pending_input()
+        kr_worker::testing::take_pending_input(&mut self.session)
             .into_iter()
             .filter_map(|batch| match batch {
                 InputBatch::Reply { bytes, .. } => Some(bytes),
@@ -315,14 +314,16 @@ async fn answers_past_their_share_wait_in_the_lane_and_are_let_out_when_places_c
     let _ = fixture.session.ingest_output(&QUESTION.repeat(share));
     // The batches stay in hand, as they are while the writer holds them, so what they are charged
     // is still charged when the room is read.
-    let mut in_hand = fixture.session.take_pending_input();
+    let mut in_hand = kr_worker::testing::take_pending_input(&mut fixture.session);
     assert_eq!(answers(&in_hand), share, "the share is answered");
 
     // A second later, the rate allows more questions, and the share is spent.
     clock.advance(Duration::from_secs(1));
     let _ = fixture.session.ingest_output(&QUESTION.repeat(10));
     assert_eq!(
-        answers(&fixture.session.take_pending_input()),
+        answers(&kr_worker::testing::take_pending_input(
+            &mut fixture.session
+        )),
         0,
         "no answer is queued past the share"
     );
@@ -342,7 +343,9 @@ async fn answers_past_their_share_wait_in_the_lane_and_are_let_out_when_places_c
     in_hand.clear();
     fixture.session.pump_replies();
     assert_eq!(
-        answers(&fixture.session.take_pending_input()),
+        answers(&kr_worker::testing::take_pending_input(
+            &mut fixture.session
+        )),
         10,
         "what waited for room is answered"
     );
@@ -496,8 +499,7 @@ impl Fixture {
     /// host answers and what the person typed.
     #[cfg(not(windows))]
     fn queued(&mut self) -> Vec<(&'static str, Vec<u8>)> {
-        self.session
-            .take_pending_input()
+        kr_worker::testing::take_pending_input(&mut self.session)
             .into_iter()
             .filter_map(|batch| match batch {
                 InputBatch::Reply { bytes, .. } => Some(("reply", bytes)),

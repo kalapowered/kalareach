@@ -3310,7 +3310,10 @@ impl Session {
     /// The batches are handed out plain. Nothing here writes them, so the room stays charged for
     /// what is taken until [`crate::testing::settle_written_input`] gives it back, as the terminal's
     /// writer gives back what it has written; the guard of each write goes as the batch is taken.
-    pub fn take_pending_input(&mut self) -> Vec<InputBatch> {
+    ///
+    /// No program of the product calls this: a harness that drives a session by hand, with no
+    /// writer, takes the batches through [`crate::testing::take_pending_input`].
+    pub(crate) fn take_pending_input(&mut self) -> Vec<InputBatch> {
         self.input
             .lock()
             .take_pending()

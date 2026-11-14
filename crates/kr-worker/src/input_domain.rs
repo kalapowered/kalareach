@@ -1188,7 +1188,7 @@ impl InputDomain {
     ///
     /// When the writer reports the fence written, its connection ends and the loss has been
     /// recorded, or the machine drops the fence, the next flush takes what was waiting.
-    pub fn take_pending(&mut self) -> Vec<Carried> {
+    pub(crate) fn take_pending(&mut self) -> Vec<Carried> {
         let mut taken = Vec::new();
         while let Some(queued) = self.pending.pop_front() {
             match queued {
