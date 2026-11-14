@@ -852,6 +852,92 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
     );
 }
 
+/// The reference host's job builds the release profile in hours when its cargo cache is gone, and a
+/// run that ends without saving the cache starts cold again. So the save runs after a good build
+/// whatever a later step does (a failure, a limit, a cancelled run) and after no build that did not
+/// end well: it is the job's one save, its condition reads the outcome of the step that builds and
+/// of no other, and it comes after the measurements, because the save takes the workspace's own
+/// output out of the build directory and the measurements run that output.
+#[test]
+fn the_reference_host_job_saves_its_cargo_cache_after_a_good_build_whatever_follows() {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let text = job(&workflow, "macos-reference");
+    let saves = steps_holding(&text, "uses: ./.github/actions/cargo-cache-save");
+    assert_eq!(saves.len(), 1, "the job does not save its cargo cache once");
+    let save = &saves[0];
+    assert!(!is_disabled(save), "the save step is disabled");
+    let condition = step_condition(save)
+        .expect("the save step has no condition, so a failed step before it ends the job unsaved");
+    assert!(
+        condition.contains("always()") && !condition.contains("||"),
+        "the save step's condition does not hold after a failed or cut step and after nothing else"
+    );
+    let named = steps_named(&condition);
+    assert_eq!(
+        named.len(),
+        1,
+        "the save step's condition does not read the outcome of one step, the build"
+    );
+    let build_at = position_of_id(&text, &named[0])
+        .unwrap_or_else(|| panic!("no step of the job has the id {}", named[0]));
+    assert_eq!(
+        Some(build_at),
+        position_of_tool(&text, "cargo build"),
+        "the step whose outcome the save reads is not the step that builds"
+    );
+    assert!(
+        condition.contains(&format!("steps.{}.outcome=='success'", named[0])),
+        "the save step does not require the build to have ended well"
+    );
+    let measure_at = position_of_tool(&text, "scripts/performance.sh")
+        .expect("a step of the job runs the measurements");
+    let save_at = steps_of(&text)
+        .iter()
+        .position(|step| step == save)
+        .expect("the save is a step of the job");
+    assert!(
+        build_at < measure_at && measure_at < save_at,
+        "the save does not come after the build and the measurements: it would take out the \
+         output the measurements run"
+    );
+}
+
+/// What a cold build of the reference host's job needs: its runner took 120 minutes for the first
+/// of the build step's two commands, so the step has at least twice that. Every step has a limit of
+/// its own, the limits add up to less than the job's, and the job's is under the 360 minutes at which
+/// GitHub ends a hosted job, so that a step is ended by its own limit and the steps after it still
+/// report.
+#[test]
+fn the_reference_host_job_limits_give_a_cold_build_its_time_and_fit_inside_githubs() {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let text = job(&workflow, "macos-reference");
+    let minutes = |text: &str, indent: usize| {
+        value_at(text, indent, "timeout-minutes").and_then(|value| value.parse::<u32>().ok())
+    };
+    let job_limit = minutes(&header(&text), 4).expect("the job has no limit of its own");
+    let steps = steps_of(&text);
+    let mut total = 0;
+    for step in &steps {
+        total +=
+            minutes(step, 8).unwrap_or_else(|| panic!("a step has no limit of its own:\n{step}"));
+    }
+    let build = &steps_running(&text, "cargo build")[0];
+    assert!(
+        minutes(build, 8).is_some_and(|limit| limit >= 240),
+        "the build step has less than twice what a cold build's first command took on this runner"
+    );
+    assert!(
+        total < job_limit,
+        "the steps' limits add up to {total} minutes, which the job's {job_limit} does not exceed"
+    );
+    assert!(
+        job_limit < 360,
+        "the job's limit of {job_limit} minutes is not under the 360 GitHub ends a hosted job at"
+    );
+}
+
 /// The names of a workflow's jobs, in file order: the keys at two spaces in the `jobs:` block, which
 /// ends at the next line at the left margin. A key there that is not a name and a colon alone (an
 /// anchor or a mapping on the same line) is a layout this file's reading does not hold, and fails.
