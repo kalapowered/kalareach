@@ -278,12 +278,37 @@ for (const name of ['SODIUM_LIB_DIR', 'sodium_lib_dir', 'SODIUM_USE_PKG_CONFIG',
   held('with no name the directory is in the home directory and named by the key', 'C:/Users/a/key', archiveDirectory({}, 'C:\\Users\\a', 'key', 'win32'))
   held('an empty name is no name', 'C:/Users/a/key', archiveDirectory({ SODIUM_DIST_DIR: '' }, 'C:\\Users\\a', 'key', 'win32'))
   // The placing script reads a relative name from the repository's root and the crate's build script from
-  // its own directory: the name is made absolute, from where the command was started, before either reads it.
-  held('a relative name is made absolute on Windows', 'C:/work/app/archives', archiveDirectory({ SODIUM_DIST_DIR: 'archives' }, 'C:\\Users\\a', 'key', 'win32', 'C:\\work\\app'))
-  held('a name with a dot is made absolute too', 'C:/work/app/../cache', archiveDirectory({ SODIUM_DIST_DIR: '..\\cache' }, 'C:\\Users\\a', 'key', 'win32', 'C:\\work\\app'))
-  held('a name on a drive is kept', 'D:/c', archiveDirectory({ SODIUM_DIST_DIR: 'D:\\c' }, 'C:\\Users\\a', 'key', 'win32', 'C:\\work\\app'))
-  held('a name from the drive root is kept', '/c', archiveDirectory({ SODIUM_DIST_DIR: '/c' }, 'C:\\Users\\a', 'key', 'win32', 'C:\\work\\app'))
-  held('a relative name is made absolute elsewhere', '/work/app/archives', archiveDirectory({ SODIUM_DIST_DIR: 'archives' }, '/home/a', 'key', 'linux', '/work/app'))
+  // its own directory, and a name that starts with a separator but names no drive is read from the root of
+  // the current drive by a Windows program (the build script) and from Git's mount table by the bash of Git
+  // for Windows (`/c/cache` is `C:\cache` there, `C:\c\cache` for the build script). The name is therefore
+  // resolved by the rule of the platform that runs, from where the command was started, into a path with
+  // a drive or a server in it, which the bash and the build script read alike.
+  const windowsName = (name, cwd = 'C:\\work\\app') => archiveDirectory({ SODIUM_DIST_DIR: name }, 'C:\\Users\\a', 'key', 'win32', cwd)
+  const posixName = (name, cwd = '/work/app') => archiveDirectory({ SODIUM_DIST_DIR: name }, '/home/a', 'key', 'linux', cwd)
+  held('a relative name is made absolute on Windows', 'C:/work/app/archives', windowsName('archives'))
+  held('a name with a dot is resolved on Windows', 'C:/work/cache', windowsName('..\\cache'))
+  held('a name on a drive is kept', 'D:/c', windowsName('D:\\c'))
+  held(
+    'a Windows temporary path is kept',
+    'C:/Users/runneradmin/AppData/Local/Temp/desktop-archive-x/named',
+    windowsName('C:\\Users\\runneradmin\\AppData\\Local\\Temp\\desktop-archive-x\\named', 'D:\\a\\app\\apps\\companion')
+  )
+  held('a name from a server share is kept', '//server/share/cache', windowsName('\\\\server\\share\\cache'))
+  held('a name from the drive root is on the drive of the working directory', 'C:/c/cache', windowsName('/c/cache'))
+  held('a name from the drive root follows the drive of the working directory', 'D:/c/cache', windowsName('/c/cache', 'D:\\a\\app'))
+  held('a backslash name from the drive root is the same', 'C:/tmp', windowsName('\\tmp'))
+  held('a name with a drive and no separator is resolved', 'C:/work/app/cache', windowsName('C:cache'))
+  for (const name of ['/c/cache', '/tmp/x', '\\x', 'x', '..\\x', 'C:x', 'D:\\x', 'd:/x', '\\\\s\\sh\\x', '//s/sh/x']) {
+    held(
+      `the name \`${name}\` is given to both readers with a drive or a server`,
+      'true',
+      String(/^([A-Za-z]:\/|\/\/[^/])/.test(windowsName(name)))
+    )
+  }
+  held('a relative name is made absolute elsewhere', '/work/app/archives', posixName('archives'))
+  held('a name with a dot is resolved elsewhere', '/work/cache', posixName('../cache'))
+  held('a name from the root is kept elsewhere', '/c/cache', posixName('/c/cache'))
+  held('a Windows temporary path is a relative name elsewhere', '/work/app/C:/Users/a/named', posixName('C:\\Users\\a\\named'))
 
   // The script itself, run for real on directories that hold other bytes: it compares what is in a
   // directory before anything is fetched, and refuses, so no network is needed and nothing is placed.
@@ -299,12 +324,12 @@ for (const name of ['SODIUM_LIB_DIR', 'sodium_lib_dir', 'SODIUM_USE_PKG_CONFIG',
     }
     const named = join(root, 'named')
     wrong(named)
-    const byName = placeArchive({ SODIUM_DIST_DIR: named }, root, 'linux')
+    const byName = placeArchive({ SODIUM_DIST_DIR: named }, root, process.platform)
     held('a named directory that holds other bytes is refused', 'null', String(byName.directory))
     held('the refusal names the script and the variable', 'true', String(byName.problem?.includes(SCRIPT) && byName.problem?.includes('SODIUM_DIST_DIR')))
     held('the refusal carries the script\'s own words', 'true', String(byName.problem?.includes('refused libsodium-1.0.22-msvc.zip')))
     wrong(join(root, key))
-    const byDefault = placeArchive({}, root, 'linux')
+    const byDefault = placeArchive({}, root, process.platform)
     held('the default directory that holds other bytes is refused too', 'null', String(byDefault.directory))
     held('and it is the directory in the home directory that was compared', 'true', String(byDefault.problem?.includes(key)))
   } finally {
