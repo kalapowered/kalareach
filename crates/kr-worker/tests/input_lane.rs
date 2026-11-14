@@ -2619,6 +2619,152 @@ async fn the_fenced_count_includes_what_the_root_editors_machine_holds() {
     rig.finish().await;
 }
 
+/// Takes `attachment`'s next frame in the session's own hold: the first four bytes of a bracketed
+/// paste's opener, which the framer holds back as a delimiter prefix. The caller ends the lease in
+/// the same hold, so the prefix is discarded by that end and no timer has forwarded it first.
+fn hold_a_delimiter_prefix(
+    session: &mut Session,
+    attachment: AttachmentId,
+    epoch: InputLeaseEpoch,
+) {
+    let accepted = session
+        .write_input(
+            attachment,
+            epoch.get(),
+            0,
+            b"\x1b[20",
+            None,
+            std::time::Instant::now(),
+        )
+        .expect("the first four bytes of a delimiter");
+    assert_eq!(accepted.held_prefix_bytes, 4);
+}
+
+/// KR-REQ-23.36: the delimiter prefix that the framer holds and an end of the lease drops is part
+/// of the count the lane's notice carries, whether the lease ends by a release, a takeover or a
+/// detach; and the answer of each says the same number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fenced_count_includes_the_delimiter_prefix_the_framer_dropped_at_every_end() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let other = rig.attach().await;
+    let taker = ConnectionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+
+    // A release.
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let (_, fenced) = {
+        let mut session = rig.runtime.session();
+        hold_a_delimiter_prefix(&mut session, attachment, epoch);
+        session
+            .release_input(attachment, epoch.get(), None)
+            .expect("released")
+    };
+    assert_eq!(fenced, 4, "the answer counts the dropped prefix");
+    assert_eq!(
+        next_window(&mut lane)
+            .await
+            .ended
+            .0
+            .expect("an epoch ended")
+            .fenced_bytes
+            .get(),
+        4,
+        "the notice of a release counts the dropped prefix"
+    );
+
+    // A takeover.
+    let epoch = rig.acquire(attachment).await;
+    let _ = next_window(&mut lane).await;
+    let acquired = {
+        let mut session = rig.runtime.session();
+        hold_a_delimiter_prefix(&mut session, attachment, epoch);
+        session
+            .acquire_input(other, taker, None)
+            .expect("the other view takes the keys")
+    };
+    assert_eq!(acquired.discarded_bytes.get(), 4);
+    assert_eq!(
+        next_window(&mut lane)
+            .await
+            .ended
+            .0
+            .expect("an epoch ended")
+            .fenced_bytes
+            .get(),
+        4,
+        "the notice of a takeover counts the dropped prefix"
+    );
+
+    // A detach.
+    let epoch = rig.acquire(attachment).await;
+    let _ = next_window(&mut lane).await;
+    let detached = {
+        let mut session = rig.runtime.session();
+        hold_a_delimiter_prefix(&mut session, attachment, epoch);
+        session.detach(attachment, None).expect("detached")
+    };
+    assert_eq!(detached.fenced_bytes.map(U64::get), Some(4));
+    assert_eq!(
+        next_window(&mut lane)
+            .await
+            .ended
+            .0
+            .expect("an epoch ended")
+            .fenced_bytes
+            .get(),
+        4,
+        "the notice of a detach counts the dropped prefix"
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36, C21: the session refuses a position its live epoch has not reached in the hold of
+/// the action itself, for a release, a detach and a launch, so a caller that did not ask before
+/// the marker still changes nothing and starts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_refuses_an_unreached_position_in_the_hold_of_the_action() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    typed(&mut lane, &[b"a", b"b"]).await;
+    rig.received_exactly(b"ab").await;
+
+    {
+        let mut session = rig.runtime.session();
+        let beyond = barrier(attachment, epoch, 3, Some(1));
+        let release = session
+            .release_input(attachment, epoch.get(), Some(&beyond))
+            .err()
+            .expect("the position was not reached");
+        assert_eq!(release.code(), ErrorCode::DraftConflict);
+        let detach = session
+            .detach(attachment, Some(&beyond))
+            .err()
+            .expect("the position was not reached");
+        assert_eq!(detach.code(), ErrorCode::DraftConflict);
+        let launch = session
+            .stimulate_fence_after(&beyond, |_| panic!("the machine saw a refused launch"))
+            .err()
+            .expect("the position was not reached");
+        assert_eq!(launch.code(), ErrorCode::DraftConflict);
+    }
+
+    // Nothing was applied: the view still holds the keys and is still attached.
+    typed(&mut lane, &[b"c"]).await;
+    rig.received_exactly(b"abc").await;
+    rig.release_with(
+        attachment,
+        epoch,
+        Some(barrier(attachment, epoch, 3, None)),
+        true,
+    )
+    .await
+    .expect("the position is reached");
+    rig.finish().await;
+}
+
 /// KR-REQ-23.36: the hello states the lane's capability, which promises the window, the position
 /// checks, the fenced count and the launch marker together.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
