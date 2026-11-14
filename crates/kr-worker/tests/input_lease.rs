@@ -2577,6 +2577,7 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
         session
             .write_input(holder, epoch, 1, b"\x1b[201~", None, Instant::now())
             .expect("the paste ends");
+        runtime.flush_input();
     }
     tokio::time::timeout(Duration::from_secs(20), writer_stopped)
         .await
