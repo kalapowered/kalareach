@@ -2,13 +2,15 @@
 // Runs the desktop bundle build (`pnpm desktop build ...`): `tauri build` for the machine it runs on,
 // with the one setting that build needs on Windows.
 //
-// The application links the dynamic Visual C++ runtime. `.cargo/config.toml` leaves the static one out
-// of the x86-64 and ARM64 MSVC links, because the C library this workspace vendors asks for the static
-// runtime and the two must not both be linked. The command line tool sets `STATIC_VCRUNTIME=true` for a desktop build
-// unless the variable is already `false`, the Tauri build step reads it before the attribute this
-// package gives it, and the package's build script then refuses the build. So on Windows this gives
-// the build `STATIC_VCRUNTIME=false`, whatever the caller's environment holds, and says so when it
-// replaces another value. On the other platforms the build gets the caller's environment as it is.
+// The application links the static C runtime, through the `crt-static` target feature that
+// `.cargo/config.toml` gives the x86-64 and ARM64 MSVC targets. Tauri's own request for a static
+// runtime, `STATIC_VCRUNTIME=true`, makes a hybrid (the Visual C++ runtime static, the universal
+// runtime dynamic) and would put two runtimes in the link, so the variable stays `false`. The command
+// line tool sets it to `true` for a desktop build unless it is already `false`, the Tauri build step
+// reads it before the attribute this package gives it, and the package's build script then refuses
+// the build. So on Windows this gives the build `STATIC_VCRUNTIME=false`, whatever the caller's
+// environment holds, and says so when it replaces another value. On the other platforms the build
+// gets the caller's environment as it is.
 //
 // On Windows the build also starts only after libsodium's prebuilt archive is placed by
 // `scripts/place-libsodium-archive.sh`, which compares both files with the size and SHA-256 it holds
@@ -31,16 +33,17 @@
 // - `--no-bundle`, and `--bundles` with no value: they leave no bundle to read (a list of formats that
 //   the platform cannot make leaves none either, and is not read here);
 // - a Windows target on a machine that is not Windows, and on Windows an MSVC target that the
-//   link options of `.cargo/config.toml` do not name (x86-64 and ARM64): the setting is made for the
-//   machine this runs on, and those options are what keep the static runtime out of the link;
+//   configuration of `.cargo/config.toml` does not name (x86-64 and ARM64): the setting is made for the
+//   machine this runs on, and the target feature that makes the link static is given to those two;
 // - after a bare `--`, cargo's own `--config` and `--target`: either can set the environment, the
 //   flags or the target that this command holds;
 // - `CARGO_BUILD_TARGET`: the command line tool does not read it, so cargo would build for it into the
 //   directory of that target and the bundle would be made from the program of another build; a target
 //   is given as `--target`;
 // - on Windows, an environment that gives the compiler flags (`RUSTFLAGS` and the like):
-//   `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` replace the link options of `.cargo/config.toml`, after
-//   which the link only warns, and the others are a second source of flags that this build does not take;
+//   `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` replace the target feature and the link options of
+//   `.cargo/config.toml` with no message, and the others are a second source of flags that this build
+//   does not take;
 // - on Windows, `LINK` and `_LINK_`, which the linker reads before and after its options and which can
 //   add or leave out the runtime libraries of the link, and `SODIUM_LIB_DIR` and `SODIUM_USE_PKG_CONFIG`,
 //   with which libsodium's crate links the library they name and not the archive that was compared.
@@ -80,7 +83,7 @@ const LONG = new Map([
 /** The options that take any number of values, none included. */
 const MANY = new Set(['features', 'bundles'])
 
-/** The MSVC targets that the link options of `.cargo/config.toml` name. */
+/** The MSVC targets whose section of `.cargo/config.toml` gives the `crt-static` target feature. */
 const LINKED_MSVC = new Set(['x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc'])
 
 /** The short options that take a value (the rest of their bundle, or the next word), with their long names. */
@@ -172,7 +175,8 @@ function environmentValue(env, name, platform) {
 /**
  * Why a target cannot be built here, or null. A Windows target needs a Windows machine, since the
  * setting this gives the build is made for the machine it runs on; and on Windows an MSVC target is
- * one that the link options of `.cargo/config.toml` name, since those keep the static runtime out.
+ * one that `.cargo/config.toml` gives the `crt-static` target feature, since a build for another MSVC
+ * target would not link the static C runtime, which `kr-crypto`'s build script refuses.
  */
 function targetProblem(triple, platform) {
   if (platform !== WINDOWS) {
@@ -180,7 +184,7 @@ function targetProblem(triple, platform) {
   }
   if (/-windows-msvc$/.test(triple) && !LINKED_MSVC.has(triple)) {
     return (
-      'the link options that keep the static Visual C++ runtime out of the link are set for ' +
+      'the `crt-static` target feature that makes the link carry the C runtime is set in .cargo/config.toml for ' +
       `${[...LINKED_MSVC].join(' and ')} only`
     )
   }
@@ -256,10 +260,10 @@ export function refusal(argv, platform = process.platform, env = process.env) {
   const flags = Object.keys(env).find(givesCompilerFlags)
   if (flags !== undefined) {
     return (
-      `pnpm desktop does not run a build with ${flags.toUpperCase()} in the environment: the link options of ` +
-      '.cargo/config.toml keep the static Visual C++ runtime out of the link, and this build takes its ' +
-      'compiler flags from that file alone, as far as the environment reaches (RUSTFLAGS and ' +
-      'CARGO_ENCODED_RUSTFLAGS replace those options, and the link then only warns of two runtimes).'
+      `pnpm desktop does not run a build with ${flags.toUpperCase()} in the environment: the \`crt-static\` target ` +
+      'feature and the link options of .cargo/config.toml make the program link the static C runtime, and this ' +
+      'build takes its compiler flags from that file alone, as far as the environment reaches (RUSTFLAGS and ' +
+      'CARGO_ENCODED_RUSTFLAGS replace them with no message, and the build then links the dynamic runtime).'
     )
   }
   const linker = Object.keys(env).find(givesLinkerOptions)
@@ -351,7 +355,7 @@ export function childEnvironment(platform, env, archive = null) {
       replaced === undefined
         ? null
         : `pnpm desktop: ${RUNTIME_VARIABLE} was \`${replaced}\` in the environment, and this build gets \`false\`, ` +
-          'since the application links the dynamic Visual C++ runtime.'
+          "since Tauri's static runtime is a hybrid, and the application links the static C runtime through the workspace's target feature."
   }
 }
 
