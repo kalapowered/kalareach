@@ -32,11 +32,16 @@ Beside the log of a `cargo test` step is a directory named for it with `.records
 It holds `binaries.txt` and, for each test binary under the standard harness, what the harness wrote.
 
 The evidence directory is `KR_TEST_ARTIFACTS_DIR`, or a new directory under the platform's temporary
-directory when that is not set. The report refuses one outside the temporary directory (`/tmp` or
-`TMPDIR` on Unix, the user's temporary directory on Windows) before it creates anything, because
-section 21 keeps test artefacts there. It refuses a path with `..` in it as well, and resolves what
-it made to check it again. Every step runs with `KR_TEST_ARTIFACTS_DIR` naming the same directory,
-so what a test records beside its verdict, such as a performance figure, lands with the result.
+directory when that is not set. The report refuses a value that is not an absolute path inside one
+of the platform's temporary roots (`/tmp`, the folder `TMPDIR` or the user's temporary directory
+names, and the folder `RUNNER_TEMP` names) before it creates anything, because section 21 keeps test
+artefacts there. It refuses a relative path, an empty one, one with `..` in it and a root itself as
+well, and resolves what it made to check it again. Every language that reads the variable (Rust,
+shell, PowerShell and TypeScript) reads it through one reader that refuses the same values where
+the value is used. A Rust test program of a run that has not set it makes a directory of its own
+under the temporary directory and says where, so the programs of one run do not share one. Every
+step of the report runs with `KR_TEST_ARTIFACTS_DIR` naming the same directory, so what a test
+records beside its verdict, such as a performance figure, lands with the result.
 
 Each run takes an evidence directory of its own. The report makes `<evidence>/conformance/` new for
 the run, and refuses a directory that already holds one, so no log, test report or result of an
