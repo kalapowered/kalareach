@@ -17,11 +17,16 @@
 //! the order it was read; the lane reader matches the worker's answers to the frames outstanding,
 //! in order, and applies its events; and the acknowledgement writer writes what the device is told.
 //!
-//! The most the host holds for one stream: the frame being read (at most 64 KiB), the frames read
-//! and not yet routed ([`READ_AHEAD_FRAMES`]), the frames passed on within the worker's credit (the
-//! window the worker states: 32 frames, 512 KiB of key bytes and about 1 KiB each for the envelope),
-//! and the acknowledgements owed to the device, which coalesce. The host reads a frame only while
-//! fewer than [`READ_AHEAD_FRAMES`] wait, and a frame waits only for credit.
+//! The most the host holds for one stream: the frames read and not yet routed, the one being read
+//! included, which are at most [`READ_AHEAD_FRAMES`] of at most 64 KiB; the frames passed on within
+//! the worker's credit for one epoch (the window the worker states: 32 frames, 512 KiB of key bytes
+//! and about 1 KiB each for the envelope), and, when the lease moves to a new epoch while frames of
+//! the older one are still queued for the writer, the same again for each such epoch, which only
+//! the other views' takeovers cause; and the acknowledgements owed to the device, at most
+//! [`MAX_UNREAD_ACKS`] (those for accepted frames coalesce). A device that does not read what it is
+//! told loses the stream when more than that is owed. The host reads a frame only while fewer than
+//! [`READ_AHEAD_FRAMES`] wait, and a frame waits only for credit. A device's reset is heard in every
+//! one of these states; its finish is heard once the frames it wrote have been read.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -76,6 +81,12 @@ const FRAME_DEADLINE: Duration = CALL_TIMEOUT;
 /// is read, and from then on its deadline is not renewed while it waits for the lane's writer or
 /// for room in the socket: the decision a frame goes out on is the newest one.
 const READ_AHEAD_FRAMES: usize = 2;
+
+/// How many acknowledgements the host keeps for a device that does not read them. A device that
+/// leaves more owed than this loses the stream, not its connection. The acknowledgements for
+/// accepted frames coalesce, a refusal is told once for each epoch, and the rest come from the
+/// worker's events, so a device that reads is never near the bound.
+const MAX_UNREAD_ACKS: usize = 64;
 
 /// How long a detach waits for the worker's notice that the view's lease ended, which comes on the
 /// lane's link while the detach's answer comes on another, before the stream ends.
@@ -419,6 +430,15 @@ struct State {
 }
 
 impl State {
+    /// Queues what the device is to be told, and cuts the stream when more is owed than
+    /// [`MAX_UNREAD_ACKS`]. The caller wakes the tasks that wait on the state.
+    fn tell(&mut self, ack: InputAck) {
+        self.acks.push_back(ack);
+        if self.acks.len() > MAX_UNREAD_ACKS {
+            self.ended = Some(End::Cut);
+        }
+    }
+
     /// Whether `epoch` is the newest refused epoch, or older than it.
     fn refused(&self, epoch: InputLeaseEpoch) -> bool {
         self.refused_epoch
@@ -546,7 +566,7 @@ impl Flow {
             }
             state.refused_epoch = Some(epoch);
             let accepted_through = self.live.through(epoch).map(InputSequence::new);
-            state.acks.push_back(InputAck::Refused {
+            state.tell(InputAck::Refused {
                 epoch,
                 sequence: InputSequence::new(sequence),
                 accepted_through: Nullable(accepted_through),
@@ -611,7 +631,7 @@ impl Flow {
                             {
                                 *through = InputSequence::new(front.sequence);
                             }
-                            _ => state.acks.push_back(InputAck::Accepted {
+                            _ => state.tell(InputAck::Accepted {
                                 epoch: front.epoch,
                                 through: InputSequence::new(front.sequence),
                             }),
@@ -624,7 +644,7 @@ impl Flow {
                         state.refused_epoch = Some(front.epoch);
                         let accepted_through =
                             self.live.through(front.epoch).map(InputSequence::new);
-                        state.acks.push_back(InputAck::Refused {
+                        state.tell(InputAck::Refused {
                             epoch: front.epoch,
                             sequence: InputSequence::new(front.sequence),
                             accepted_through: Nullable(accepted_through),
@@ -660,7 +680,7 @@ impl Flow {
                     }
                     if let Some(ended) = window.ended.0 {
                         state.epoch_ended = true;
-                        state.acks.push_back(InputAck::EpochEnded {
+                        state.tell(InputAck::EpochEnded {
                             epoch: ended.epoch,
                             fenced_bytes: ended.fenced_bytes,
                         });
@@ -681,7 +701,7 @@ impl Flow {
                 ControlEvent::InputLaunchReserved(launch)
                     if launch.attachment_id == self.attachment =>
                 {
-                    state.acks.push_back(InputAck::LaunchReserved {
+                    state.tell(InputAck::LaunchReserved {
                         launch: launch.launch,
                     });
                 }
