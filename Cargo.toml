@@ -336,8 +336,8 @@ noq-udp = { git = "https://github.com/n0-computer/noq", rev = "04807b674cff617cb
 # sends no duplicate data, so a release could pass it without either. For the same reason as
 # `noq-udp`, `cargo audit` does not check `noq-proto` while the entry stands, and no workflow or
 # script in this repository reads advisories against the upstream repository. The `patched_crates`
-# test in `tests/conformance` fails when nothing uses an entry here, so that the registry crate
-# cannot replace it unseen.
+# test in `tests/conformance` fails when the lock records an entry here as unused, which is what
+# cargo writes when it takes the registry crate instead.
 noq-proto = { git = "https://github.com/kalapowered/noq", rev = "d8d5e9153f22f521bc5768c83fc4a50963d02bf3" }
 
 [workspace.lints.rust]
