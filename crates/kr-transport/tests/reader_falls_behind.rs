@@ -30,7 +30,7 @@ mod support;
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
-use kr_protocol::frame::StreamKind;
+use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, StreamKind};
 use kr_transport::ALPN;
 use kr_transport::codec::{FrameReader, FrameWriter};
 use kr_transport::endpoint::connect;
@@ -42,6 +42,22 @@ const DEADLINE: Duration = Duration::from_secs(120);
 /// A small frame's payload, in bytes. With its prefix it fills most of a packet that carries
 /// nothing else.
 const SMALL_FRAME: usize = 200;
+
+/// The payloads of a mix of frame sizes, in turn: one frame that stays a chunk of its own in the
+/// receiving connection's queue, and two small ones behind it. With the prefix they are chunks of
+/// 604, 104 and 104 bytes.
+const MIXED_FRAMES: [usize; 3] = [600, 100, 100];
+
+/// The most that a datagram holds beyond the bytes of the one frame it carries: the packet's
+/// header and authentication tag, the STREAM frame's header, and an acknowledgement. A datagram
+/// above this carries other frames too, which would make the chunk it holds look badly used to
+/// the library and hide the fault the case is about. The case lets a few in twenty exceed it, for
+/// the datagrams that carry a probe or a keep-alive.
+const DATAGRAM_OVERHEAD: u64 = 64;
+
+/// How many frames go out before the datagrams' sizes are checked: the first frames travel with
+/// the rest of the connection's setup.
+const SETUP_FRAMES: usize = 16;
 
 /// How many small frames the reader lets pile up before it reads again: past the limit on queued
 /// chunks that the library has, which no bytes-based window reaches at this size.
@@ -76,12 +92,20 @@ enum Behind {
 /// The frames of one case.
 #[derive(Clone, Copy)]
 struct Shape {
-    payload: usize,
+    /// The payloads of the frames, in turn.
+    payloads: &'static [usize],
     frames: usize,
     behind: Behind,
     /// Whether the sender holds each frame back until the receiving connection has it, so that
     /// each travels in a packet of its own.
     one_to_a_packet: bool,
+}
+
+impl Shape {
+    /// The payload length of frame `index`.
+    fn payload_len(&self, index: usize) -> usize {
+        self.payloads[index % self.payloads.len()]
+    }
 }
 
 /// The counts of a connection that the case compares before and after.
@@ -133,7 +157,7 @@ async fn until(connection: &Connection, condition: impl Fn() -> bool) -> bool {
 /// Reads frame `index` and checks it. Returns false at the clean end of the stream.
 async fn take(reader: &mut FrameReader, shape: Shape, index: usize) -> Result<bool, String> {
     match reader.read_payload().await {
-        Ok(Some(frame)) if frame == payload(index, shape.payload) => Ok(true),
+        Ok(Some(frame)) if frame == payload(index, shape.payload_len(index)) => Ok(true),
         Ok(Some(_)) => Err(format!(
             "frame {index} has the wrong content or is out of order"
         )),
@@ -142,8 +166,8 @@ async fn take(reader: &mut FrameReader, shape: Shape, index: usize) -> Result<bo
     }
 }
 
-/// Runs one case: a sender writes `shape.frames` frames of `shape.payload` bytes, a reader reads
-/// one and waits until it is `shape.behind`, reads to the end, and the connection then carries
+/// Runs one case: a sender writes `shape.frames` frames of the lengths in `shape.payloads`, a
+/// reader reads one and waits until it is `shape.behind`, reads to the end, and the connection then carries
 /// one more exchange.
 async fn a_reader_falls_behind(shape: Shape) {
     let (host, client) = paired_pair().await;
@@ -247,12 +271,15 @@ async fn a_reader_falls_behind(shape: Shape) {
     // the reader has finished.
     let paced_by = accepted.clone();
     let sender = tokio::spawn(async move {
-        let outcome: Result<(u64, u64), String> = async {
+        let outcome: Result<(u64, u64, u64, u64), String> = async {
             let (send, _recv) = dialled.open_bi().await.map_err(|error| error.to_string())?;
             let mut writer = FrameWriter::new(send, StreamKind::TerminalOutput);
+            let mut counted = Counts::of(&paced_by);
+            let (mut checked, mut crowded) = (0_u64, 0_u64);
             for index in 0..shape.frames {
+                let len = shape.payload_len(index);
                 writer
-                    .write_payload(&payload(index, shape.payload))
+                    .write_payload(&payload(index, len))
                     .await
                     .map_err(|error| format!("the write of frame {index} failed: {error}"))?;
                 if shape.one_to_a_packet {
@@ -264,6 +291,16 @@ async fn a_reader_falls_behind(shape: Shape) {
                     .await;
                     if !arrived {
                         return Err(format!("the connection ended after frame {index}"));
+                    }
+                    // The datagrams that brought it hold the frame and little else, once the
+                    // connection's setup is over.
+                    let now = Counts::of(&paced_by);
+                    let bytes = now.bytes_received - counted.bytes_received;
+                    counted = now;
+                    if index >= SETUP_FRAMES {
+                        checked += 1;
+                        let most = (len + FRAME_LENGTH_PREFIX_LEN) as u64 + DATAGRAM_OVERHEAD;
+                        crowded += u64::from(bytes > most);
                     }
                 }
             }
@@ -291,7 +328,7 @@ async fn a_reader_falls_behind(shape: Shape) {
             if answer != expected {
                 return Err("the answer is not the question reversed".to_owned());
             }
-            Ok((sent, taken))
+            Ok((sent, taken, crowded, checked))
         }
         .await
         .map_err(|error| {
@@ -318,10 +355,15 @@ async fn a_reader_falls_behind(shape: Shape) {
         // Each frame went out, and came in, as one STREAM frame; the end of the stream may add
         // one more.
         let frames = shape.frames as u64;
-        let (sent, taken) = *sender_end.as_ref().expect("the sender's counts");
+        let (sent, taken, crowded, checked) = *sender_end.as_ref().expect("the sender's counts");
         assert!(
             (frames..=frames + 1).contains(&sent) && (frames..=frames + 1).contains(&taken),
             "{frames} frames went out as {sent} STREAM frames and came in as {taken}: they were merged"
+        );
+        assert!(
+            crowded * 20 <= checked,
+            "{crowded} of {checked} frames came in datagrams that held more than the frame alone: \
+             other frames travelled with them, so the case would not hold the chunks it is meant to"
         );
     }
 }
@@ -333,7 +375,7 @@ async fn a_reader_behind_by_many_small_frames_keeps_its_connection() {
     tokio::time::timeout(
         DEADLINE,
         a_reader_falls_behind(Shape {
-            payload: SMALL_FRAME,
+            payloads: &[SMALL_FRAME],
             frames: SMALL_FRAMES,
             behind: Behind::Frames(SMALL_FRAMES_BEHIND as u64),
             one_to_a_packet: true,
@@ -350,10 +392,28 @@ async fn a_reader_behind_by_a_window_of_large_frames_keeps_its_connection() {
     tokio::time::timeout(
         DEADLINE,
         a_reader_falls_behind(Shape {
-            payload: LARGE_FRAME,
+            payloads: &[LARGE_FRAME],
             frames: LARGE_FRAMES,
             behind: Behind::Bytes(STREAM_WINDOW),
             one_to_a_packet: false,
+        }),
+    )
+    .await
+    .expect("the case finishes within its deadline");
+}
+
+/// Frames of two sizes in turn, one to a packet: the larger one stays a chunk of its own in the
+/// library's queue, and the small ones between them are copied, so the queue gets long inside the
+/// window without any data missing.
+#[tokio::test]
+async fn a_reader_behind_by_frames_of_mixed_sizes_keeps_its_connection() {
+    tokio::time::timeout(
+        DEADLINE,
+        a_reader_falls_behind(Shape {
+            payloads: &MIXED_FRAMES,
+            frames: SMALL_FRAMES,
+            behind: Behind::Frames(SMALL_FRAMES_BEHIND as u64),
+            one_to_a_packet: true,
         }),
     )
     .await
