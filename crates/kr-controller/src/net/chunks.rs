@@ -95,7 +95,7 @@ pub(super) struct ChunkStreams {
 /// there until the suite lets it go. Armed once, it fires once.
 #[cfg(feature = "testing")]
 #[derive(Debug, Default)]
-struct Hold(
+pub(super) struct Hold(
     Mutex<
         Option<(
             tokio::sync::oneshot::Sender<()>,
@@ -106,7 +106,7 @@ struct Hold(
 
 #[cfg(feature = "testing")]
 impl Hold {
-    fn arm(
+    pub(super) fn arm(
         &self,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
@@ -121,7 +121,7 @@ impl Hold {
         (arrival, go)
     }
 
-    async fn wait(&self) {
+    pub(super) async fn wait(&self) {
         let armed = self
             .0
             .lock()

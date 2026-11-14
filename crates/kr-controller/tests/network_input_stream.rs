@@ -15,12 +15,13 @@ use std::time::Duration;
 
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_protocol::attachment::{
-    AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult, SessionDetachParams,
 };
+use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::ids::{ActionId, AttachmentId, InputLeaseEpoch, InputSequence, SessionId};
 use kr_protocol::input::{InputAck, InputAcquireParams, InputAcquireResult, InputFrame};
-use kr_protocol::local::InputLaneReady;
+use kr_protocol::local::{InputLaneReady, LaneEnded, LaneWindow};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Nullable, U64};
@@ -182,6 +183,21 @@ async fn next(stream: &mut DataStream) -> Option<InputAck> {
         .unwrap_or(None)
 }
 
+/// The next acknowledgement, a clean end of the stream as `Ok(None)`, and a reset as an error.
+async fn next_or_reset(stream: &mut DataStream) -> kr_transport::Result<Option<InputAck>> {
+    tokio::time::timeout(WAIT, stream.read_message::<InputAck>())
+        .await
+        .expect("the host answers or ends the stream in time")
+}
+
+/// Waits for a hold to say that what it holds has arrived.
+async fn arrived(at: tokio::sync::oneshot::Receiver<()>) {
+    tokio::time::timeout(WAIT, at)
+        .await
+        .expect("the host reached the hold in time")
+        .expect("the hold is armed");
+}
+
 /// Writes `frames` as the epoch's frames 0 to `n - 1` within the client's window and returns every
 /// acknowledgement, up to the one that accepts the last.
 async fn send_all(rig: &Rig, stream: &mut DataStream, frames: &[Vec<u8>]) -> Vec<InputAck> {
@@ -325,5 +341,150 @@ async fn typing_continues_while_an_attach_that_claims_no_input_is_held_at_the_wo
         .expect("the attach is answered once it is let go")
         .expect("the attach task ends");
     assert!(answered.is_ok(), "the attach is answered: {answered:?}");
+    rig.stop().await;
+}
+
+/// Waits until `condition` holds, looking again at each change of the host's stages.
+async fn until(what: &str, condition: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !condition() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "it never came to be that {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The detach of the rig's attachment, sent on the device's control stream.
+async fn detach(rig: &Rig) {
+    let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    rig.device
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &SessionDetachParams {
+                attachment_id: Nullable::some(rig.attachment),
+                line_token: Nullable::null(),
+                after_input: None,
+                fenced_report: false,
+            },
+        )
+        .await
+        .expect("the device detaches");
+}
+
+/// What the worker writes on the lane when the attachment's lease ended.
+fn lease_ended(rig: &Rig) -> LaneWindow {
+    LaneWindow {
+        epoch: rig.epoch,
+        holder: false,
+        frames: 0,
+        bytes: U64::new(0),
+        ended: Nullable::some(LaneEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+    }
+}
+
+/// The authority feed withdraws what a frame stands on between the host's decision for it and the
+/// write to the worker: the worker is never given the frame. The withdrawal also takes the
+/// connection away, which may stop the writer before it asks the feed again, so this shows that the
+/// frame does not go, not which of the two stopped it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_between_the_decision_and_the_write_stops_the_frame() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    assert_eq!(
+        next(&mut stream).await,
+        Some(InputAck::Accepted {
+            epoch: rig.epoch,
+            through: InputSequence::new(0),
+        }),
+        "the control: before the withdrawal the typing is accepted"
+    );
+
+    let (at_write, go_write) = stages.hold_before_a_lane_write();
+    stream
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    arrived(at_write).await;
+    assert_eq!(stages.counts().unanswered, 1, "the frame is decided");
+    rig.adopted
+        .host
+        .controller()
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+    // The connection's end may have taken the writer already.
+    let _ = go_write.send(());
+    until("the writer has done with the frame", || {
+        stages.counts().unanswered == 0
+    })
+    .await;
+    assert_eq!(
+        rig.lane.frames().len(),
+        1,
+        "the worker never had the withdrawn frame"
+    );
+    rig.stop().await;
+}
+
+/// The host ends a stream by its own decision, and what the device is owed is written whole first.
+/// A detach ends the stream once the worker's notice that the lease ended is written. The
+/// acknowledgement writer is held at the notice until the stream's task has stopped reading, so a
+/// read let go before the notice is written would reset the stream under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_ends_the_stream_after_the_notice_of_the_lease_is_written_whole() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut ends = stages.reads_ended();
+    let (at_ack, go_ack) = stages.hold_before_an_ack_write();
+
+    detach(&rig).await;
+    rig.lane.send_window(lease_ended(&rig));
+    arrived(at_ack).await;
+    tokio::time::timeout(WAIT, ends.wait_for(|ended| *ended >= 1))
+        .await
+        .expect("the stream task stopped reading in time")
+        .expect("the count stands");
+    go_ack.send(()).expect("the acknowledgement is written");
+
+    assert_eq!(
+        next_or_reset(&mut stream).await.expect("not reset"),
+        Some(InputAck::EpochEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+        "the device is told its lease ended"
+    );
+    assert!(
+        matches!(next_or_reset(&mut stream).await, Ok(None)),
+        "the stream then ends cleanly, and is not reset"
+    );
+    rig.stop().await;
+}
+
+/// A detach whose worker sends no notice ends the stream when the wait for it is over, and the
+/// device is told nothing it was not told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_with_no_notice_ends_the_stream_when_the_wait_is_over() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    detach(&rig).await;
+    assert!(
+        matches!(next_or_reset(&mut stream).await, Ok(None)),
+        "the stream ends cleanly, with no notice"
+    );
+    rig.lane.until_ended().await;
     rig.stop().await;
 }
