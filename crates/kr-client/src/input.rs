@@ -158,6 +158,9 @@ impl InputTarget {
 }
 
 crate::debug_as_name!(InputTarget);
+crate::debug_as_name!(EndCause);
+crate::debug_as_name!(InputEvent);
+crate::debug_as_name!(InputEvents);
 
 /// A number of frames and the key bytes in them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -245,25 +248,6 @@ pub enum InputRefusal {
     NotLocal,
 }
 
-impl std::fmt::Display for InputRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Full => "the input lane is full",
-            Self::NotNow => "the paste fits an empty input lane but not the room that is free now",
-            Self::TooLarge => "the input does not fit the input lane",
-            Self::Empty => "there is no input to send",
-            Self::NoEpoch => "no input lease epoch has begun on this lane",
-            Self::Over(_) => "the input epoch is over",
-            Self::Ending => "the epoch is ending and takes no more input",
-            Self::LaunchWaiting => "a launch is already waiting",
-            Self::EpochNotNew => "an epoch must be higher than the one the lane has",
-            Self::NotLocal => "ordered requests are for a local lane",
-        })
-    }
-}
-
-impl std::error::Error for InputRefusal {}
-
 /// How an epoch ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Over {
@@ -293,7 +277,7 @@ pub enum NotReached {
 }
 
 /// Why the lane ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum EndCause {
     /// The stream was reset, or failed, while the connection stood.
     Reset,
@@ -314,7 +298,7 @@ pub enum EndCause {
 }
 
 /// What the lane tells its holder.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum InputEvent {
     /// The host accepted frames: every frame of `epoch` up to `through`. `frames` and `bytes` are
     /// what this notice added.
@@ -382,7 +366,6 @@ pub enum InputEvent {
 }
 
 /// The events of one lane, in the order they happened.
-#[derive(Debug)]
 pub struct InputEvents {
     receiver: mpsc::UnboundedReceiver<InputEvent>,
 }
