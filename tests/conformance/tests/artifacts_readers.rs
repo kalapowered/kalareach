@@ -14,6 +14,12 @@ use std::process::Command;
 
 const VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
 
+/// On Windows, Git Bash processes that run together have been seen to read `/tmp` as the top of a
+/// drive when one of them was given that top as its temporary folder, and a reader then takes the
+/// whole drive for a root. The cases therefore run one Git Bash at a time.
+#[cfg(windows)]
+static ONE_GIT_BASH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -222,6 +228,9 @@ impl Reader {
                 .env("TEMP", temporary)
                 .env("TMP", temporary);
         }
+        #[cfg(windows)]
+        let _alone = matches!(self, Reader::Shell)
+            .then(|| ONE_GIT_BASH.lock().unwrap_or_else(|held| held.into_inner()));
         let output = run.output().expect("runs the reader");
         let text = String::from_utf8_lossy(&output.stdout);
         let line = |name: &str| {
