@@ -489,6 +489,11 @@ pub struct WorkerService {
     /// preparation for as long as they need. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     preparation_stall: crate::testing::Stall,
+    /// A stop in a connection's withdrawal, after its latch is set and before its attachments are
+    /// detached, which this host's own tests arm to read what the withdrawal's first step did. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    withdrawal_stall: crate::testing::Stall,
     /// A stop in an input lane's bind, after the first of the two locks it takes and before the
     /// second, which this host's own tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -902,6 +907,8 @@ impl WorkerService {
             fence_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             preparation_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            withdrawal_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             bind_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -1621,6 +1628,23 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.preparation_stall.arm()
+    }
+
+    /// Stops the next withdrawal of a connection's registration right after the latch is set and
+    /// before any of its attachments is detached, for this host's own tests.
+    ///
+    /// Returns the end that says the withdrawal has arrived and the end that lets it go. The stop
+    /// fires once, and holds a thread of the runtime the worker runs on, which hands what it holds
+    /// to another before it waits.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_withdrawal_after_the_latch(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.withdrawal_stall.arm()
     }
 
     /// Makes every connection's loop take a finished preparation before it reads what its client
@@ -5157,6 +5181,8 @@ impl WorkerService {
                 .expect("the connection writer is not poisoned");
             registration.withdrawn.set();
         }
+        #[cfg(feature = "testing")]
+        self.withdrawal_stall.stand();
         let held = std::mem::take(
             &mut *registration
                 .attachments
