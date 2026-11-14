@@ -145,10 +145,6 @@ impl Rig {
         }
     }
 
-    fn header(&self) -> StreamHeader {
-        self.header_for(self.attachment)
-    }
-
     fn header_for(&self, attachment: AttachmentId) -> StreamHeader {
         StreamHeader {
             kind: StreamKind::TerminalInput,
