@@ -533,8 +533,10 @@ fn a_service_that_a_new_installation_refused_is_refused_at_the_first_look_and_ac
         .find("let broker_service = manager.open(SERVICE)?;")
         .expect("the first look at the broker's service");
     let refusal = lay
-        .find("if broker_service.is_some() && !existing {\n        return Err(refused_service());")
-        .expect("a new installation refuses the service that stands there");
+        .find("if broker_service.is_some() && (!existing || refused_before) {\n        run.record(ObjectKind::Service, SERVICE, None)?;\n        run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;\n        return Err(refused_service());")
+        .expect("a new installation, or a repair of a refused service, refuses the service that stands there and records it");
+    // A repair takes a standing service only where no run refused it.
+    assert!(lay.contains("Some(service) if existing && !refused_before => {"));
     let stop = lay
         .find("remedy::stop_broker(")
         .expect("a repair stops the broker");
