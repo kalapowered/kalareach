@@ -1487,13 +1487,14 @@ async fn read_is_served(client: &mut kr_ipc::client::LocalClient, session_id: Se
 /// KR-REQ-09.12, KR-ACC-022: a client that polls `session.list` while a restarted daemon's worker
 /// holds its dispatch boundary adds no presentation at that boundary.
 ///
-/// The start's own look at the worker meets the held boundary and gives up after its bound; the
-/// presentation stays at the boundary for the whole hold, on a thread of the worker's and with one
-/// of its connections; the start's own reading of the worker's published descriptor leaves one
-/// beside it. Each list looks again for the unlisted worker, so a look that presented
-/// anew would leave one more at each poll, and an hour of polling would take the connections of the
-/// worker, its owner's own included. The three lists run together; the worker's count of the
-/// presentations waiting is what shows how many the daemon made. The lists are answered within two
+/// A presentation stays at the boundary for the whole hold, on a thread of the worker's and with one
+/// of its connections. The start leaves two: the one of its reading of the worker's published
+/// descriptor, whose future is dropped after five seconds, and the one of its recovery's look at
+/// the worker, which is a task of the worker's opening. Each list looks again for the unlisted
+/// worker, so a look that presented anew would leave one more at each poll, and an hour of polling
+/// would take the connections of the worker, its owner's own included. The three lists run
+/// together; the worker's count of the presentations waiting is what shows how many the daemon
+/// made, and it is the same after the lists as after the start. The lists are answered within two
 /// of the bound, which is what a look that waits for the presentation under way, one list after the
 /// other, would not be.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1536,8 +1537,8 @@ async fn a_list_polled_while_a_boundary_is_held_leaves_one_presentation_at_it() 
 ///
 /// The worker decides the presentation when the hold ends, long after the start's look gave up on
 /// it. The next read finds that answer and adopts the worker on it, with no restart of the daemon.
-/// The worker's count of the connections the daemon made is what shows a second presentation: the
-/// read of the worker opens the daemon's one link, and nothing else is opened.
+/// The daemon's count of the challenges its recoveries presented is what shows a second one: the
+/// connections it opens to an adopted worker for its own purposes are not recoveries'.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_boundary_is_let_go() {
     let RestartedAtAHeldBoundary {
@@ -1560,15 +1561,19 @@ async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_bo
         || service.presentations_waiting_for_tests() == 0,
     )
     .await;
-    let connections = service.controller_connections_for_tests();
+    assert_eq!(
+        host.controller().challenges_presented_for_tests(),
+        1,
+        "the start's look presented the one challenge"
+    );
     assert!(
         read_is_served(&mut client, worker.session_id).await,
         "the next read of the session reaches the worker"
     );
     assert_eq!(
-        service.controller_connections_for_tests() - connections,
+        host.controller().challenges_presented_for_tests(),
         1,
-        "the read adopted the worker on the answer it had, and opened only the daemon's one link"
+        "the read adopted the worker on the answer that waited, and presented no second challenge"
     );
     host.stop().await;
     drop(workers);
