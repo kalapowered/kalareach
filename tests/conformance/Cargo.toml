@@ -32,6 +32,10 @@ kr-worker.workspace = true
 # its own.
 tempfile.workspace = true
 tokio.workspace = true
+# The patched-crates case reads Cargo.lock and Cargo.toml as TOML, and compares the Git sources
+# that they name as URLs.
+toml.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true
