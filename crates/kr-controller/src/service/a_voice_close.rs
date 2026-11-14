@@ -1001,7 +1001,6 @@ async fn a_stop_whose_worker_stays_silent_is_answered_with_that_worker_pending()
         .sharing()
         .grants()
         .hold_close(call.voice_grant_id());
-    let before = revision(&call.controller).await;
     let (_told, install) = call.script.hold_the_next_announcement();
 
     let answered: VoiceStopResult = call
@@ -1011,12 +1010,10 @@ async fn a_stop_whose_worker_stays_silent_is_answered_with_that_worker_pending()
         .to_typed()
         .expect("a stop result");
 
-    assert!(
-        call.script
-            .installed_revision()
-            .is_none_or(|held| held.get() <= before),
-        "the worker acknowledged nothing while the stop waited"
-    );
+    // What the stop reports is what its own announcement met: the worker held it. The daemon's own
+    // pass may ask the worker again once that announcement has timed out, and the worker, which
+    // holds only the next one, then installs the revision, so the case reads the stop's answer and
+    // not what the worker holds by the time it is read.
     let barrier = answered
         .barrier
         .0

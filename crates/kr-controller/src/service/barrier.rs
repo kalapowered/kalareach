@@ -508,6 +508,12 @@ const ASK_INTERVAL: std::time::Duration = DEBT_PASS_INTERVAL;
 /// asked at it.
 const PASS_JITTER: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How long one ask of a pending worker may take in all: the exchange, bounded by
+/// [`super::net::ACKNOWLEDGEMENT_TIMEOUT`], and the collection of the names an acknowledgement
+/// leaves, which an ask that is cut leaves to the pass's own collection.
+const PASS_ASK_BOUND: std::time::Duration =
+    super::net::ACKNOWLEDGEMENT_TIMEOUT.saturating_add(WORKER_EXCHANGE);
+
 /// The longest the interval between two asks of a worker that does not answer grows to.
 const ASK_INTERVAL_LONGEST: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1919,8 +1925,9 @@ impl Controller {
     /// Nothing else asks a worker again on a timer: an announcement asks each worker once, so a
     /// worker that was refused for the moment, or could not be reached, stays pending until a start,
     /// a restriction, a repeated change or a request that needs its lease asks it. The asks of one
-    /// pass are made together and each is bounded by [`crate::net::ACKNOWLEDGEMENT_TIMEOUT`], so
-    /// no worker is asked twice at once and one that does not answer does not hold the others.
+    /// pass are made together and the whole of each is bounded by [`PASS_ASK_BOUND`], so no
+    /// worker is asked twice at once and one that does not answer does not hold the others for
+    /// longer than that.
     /// A pending worker the directory does not list cannot be sent anything: what can be
     /// established for it is whether it has ended, which is asked here.
     pub(super) async fn ask_pending_workers(
@@ -1945,19 +1952,23 @@ impl Controller {
                 }
             }
             let asks = due.into_iter().map(|session_id| async move {
+                let began = tokio::time::Instant::now();
                 #[cfg(feature = "testing")]
                 self.pending_asks
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((session_id, tokio::time::Instant::now()));
-                let asked = self
-                    .ask_worker_revision(session_id)
-                    .await
-                    .unwrap_or(Asked::Failed);
-                (session_id, asked, tokio::time::Instant::now())
+                    .push((session_id, began));
+                // The whole ask is bounded, the exchange and what follows an answer: the names an
+                // acknowledgement leaves are asked for by the pass beside it when it is cut, so
+                // what is cut is never lost.
+                let asked =
+                    tokio::time::timeout(PASS_ASK_BOUND, self.ask_worker_revision(session_id))
+                        .await
+                        .map_or(Asked::Failed, |asked| asked.unwrap_or(Asked::Failed));
+                (session_id, asked, began, tokio::time::Instant::now())
             });
-            for (session_id, asked, ended) in all_at_once(asks).await {
-                pace.record(session_id, asked, tick, ended);
+            for (session_id, asked, began, ended) in all_at_once(asks).await {
+                pace.record(session_id, asked, began, ended);
             }
         }
         self.settle_the_fence_owed().await;
