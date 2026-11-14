@@ -222,9 +222,9 @@ fn runner_that(held: &Path, arm: &str, refusal: &str) -> PathBuf {
 }
 
 /// What the runner does, before it says so, when it could not start a program: it records that in
-/// its own directory, as the report's own runner does.
-const RECORD: &str = "mkdir -p \"$(dirname \"$0\")/refusals\"; \
-    printf '%s\\n' \"$2\" > \"$(dirname \"$0\")/refusals/$(basename \"$2\")\"; ";
+/// a numbered file of its own directory's folder for the step, as the report's own runner does.
+const RECORD: &str = "d=\"$(dirname \"$0\")/refusals/$KR_CONFORMANCE_STEP\"; mkdir -p \"$d\"; n=0; \
+    while [ -e \"$d/$n\" ]; do n=$((n+1)); done; printf '%s\\n' \"$2\" > \"$d/$n\"; ";
 
 /// The report over the `forms` tree's tests, run through `runner`.
 fn tests_through(evidence: &Path, runner: PathBuf) -> Document {
