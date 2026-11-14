@@ -18885,7 +18885,8 @@ export interface InputLeaseState1 {
  * One frame of typing on a terminal-input stream, from the client to the host.
  *
  * A frame is one batch: the worker accepts all of its bytes or none of them. The sequence counts
- * frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream.
+ * frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream. The debug
+ * form shows how many bytes the frame holds and never what they are: they are what a person typed.
  */
 export interface InputFrame {
   /**
