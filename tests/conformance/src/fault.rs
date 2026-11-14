@@ -81,14 +81,21 @@ const LOG_MINUTES: u64 = 90;
 /// is read, in seconds: a write that the disk loses is the storage's error of that minute.
 const LOG_PADDING: u64 = 180;
 
+/// The free space, in KiB, under which a volume is taken for full: 2 GiB. A hosted macOS runner's
+/// data volume had 36 GiB or more free on every night read, so the floor is far under what a
+/// healthy night leaves, and above what a link needs. A disk that a test of the suite filled
+/// damages programs the same way a failing disk does, and is not the runner's.
+pub const FREE_FLOOR_KIB: u64 = 2 * 1024 * 1024;
+
 /// What the evidence says about the cause of a file that could not be started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cause {
-    /// A file is empty, cut short or badly signed, or the kernel logged a storage error.
+    /// The kernel logged a storage error in the minutes the files were written, and the volume
+    /// had room: the free space never fell under [`FREE_FLOOR_KIB`].
     RunnerDisk,
-    /// The file is whole and validly signed and the kernel logged no storage error, or the
-    /// evidence could not be read.
+    /// Anything else: no kernel line, a kernel log that could not be read, a volume that was full
+    /// or whose free space could not be read. A file that is damaged is not enough.
     Unexplained,
 }
 
@@ -479,14 +486,122 @@ fn storage_log(_start: u64, _end: u64, _out: &Path) -> Result<(), String> {
     Err("the kernel's log is read on macOS only".to_owned())
 }
 
-/// What the evidence says: the runner's disk where a file is damaged or the kernel logged a
-/// storage error, and unexplained otherwise.
+/// Where the file of free-space samples that `scripts/disk-report.sh` keeps is: its `state`
+/// directory, named by the same variables in the same order.
+fn samples_path() -> PathBuf {
+    let base = std::env::var_os("RUNNER_TEMP")
+        .or_else(|| std::env::var_os("TMPDIR"))
+        .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    base.join("kr-disk-report").join("samples")
+}
+
+/// The lowest free space, in KiB, among the samples of `text` taken from `from` to `until`, in
+/// seconds since the epoch. A sample is a line `S <epoch> <KiB>`; the marks and anything else are
+/// passed over.
+fn lowest_sample(text: &str, from: u64, until: u64) -> Option<u64> {
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            if words.next()? != "S" {
+                return None;
+            }
+            let at: u64 = words.next()?.parse().ok()?;
+            let free: u64 = words.next()?.parse().ok()?;
+            (from..=until).contains(&at).then_some(free)
+        })
+        .min()
+}
+
+/// The free space of the volume that holds `path`, in KiB, as the system's `df` says now.
+#[cfg(unix)]
+fn free_now(path: &Path) -> Result<u64, String> {
+    let output = Command::new("/bin/df")
+        .arg("-Pk")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("df could not be run: {error}"))?;
+    if !output.status.success() {
+        return Err("df could not read the volume".to_owned());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|word| word.parse().ok())
+        .ok_or_else(|| "df's answer could not be read".to_owned())
+}
+
+#[cfg(not(unix))]
+fn free_now(_path: &Path) -> Result<u64, String> {
+    Err("the free space of a volume is read on Unix only".to_owned())
+}
+
+/// The lowest free space, in KiB, that the volume holding `target` had from `from` to `until`: the
+/// lowest sample the disk report took in that stretch, and the volume as it is now, whichever is
+/// lower.
+///
+/// # Errors
+///
+/// Returns why nothing could be read, when neither the samples nor the volume could.
+pub fn lowest_free_kib(target: &Path, from: u64, until: u64) -> Result<u64, String> {
+    let mut lowest: Option<u64> = None;
+    let mut why: Vec<String> = Vec::new();
+    match std::fs::read_to_string(samples_path()) {
+        Ok(text) => match lowest_sample(&text, from, until) {
+            Some(kib) => lowest = Some(kib),
+            None => why.push("no free-space sample was taken in the stretch".to_owned()),
+        },
+        Err(error) => why.push(format!("the free-space samples were not read: {error}")),
+    }
+    match free_now(target) {
+        Ok(kib) => lowest = Some(lowest.map_or(kib, |sampled| sampled.min(kib))),
+        Err(error) => why.push(error),
+    }
+    lowest.ok_or_else(|| why.join("; "))
+}
+
+/// Writes the kernel's storage lines from the first time to the second, in seconds since the
+/// epoch, to the file.
+pub type KernelLog = Box<dyn Fn(u64, u64, &Path) -> Result<(), String>>;
+
+/// The lowest free space, in KiB, of the volume that holds the path, from the first time to the
+/// second.
+pub type FreeSpace = Box<dyn Fn(&Path, u64, u64) -> Result<u64, String>>;
+
+/// Where the evidence of a cause is read from. [`Reads::system`] is this machine's own; a case
+/// gives others.
+pub struct Reads {
+    /// The kernel's log.
+    pub kernel_log: KernelLog,
+    /// The volume's free space.
+    pub free_space: FreeSpace,
+}
+
+impl Reads {
+    /// The kernel's log and the volume of this machine.
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            kernel_log: Box::new(storage_log),
+            free_space: Box::new(lowest_free_kib),
+        }
+    }
+}
+
+/// What the evidence says. The runner's disk needs the system's own word for it: the kernel
+/// logged a storage error in the window of the files' writing, and the volume was not so full
+/// that the suite's own writes could have filled it (its lowest free space is at
+/// [`FREE_FLOOR_KIB`] or over). A damaged file says what the file is, not why: a program of ours
+/// that wrote to a wrong path, or a test that filled the volume, damages one as well. Where the
+/// log could not be read, or the volume's free space could not, nothing shows it, and the cause is
+/// unexplained.
 #[must_use]
-pub fn cause_of(files: &[FileFacts], storage_errors: Option<usize>) -> Cause {
-    if files.iter().any(FileFacts::damaged) || storage_errors.is_some_and(|count| count > 0) {
-        Cause::RunnerDisk
-    } else {
-        Cause::Unexplained
+pub fn cause_of(storage: &Result<usize, String>, free: &Result<u64, String>) -> Cause {
+    match (storage, free) {
+        (Ok(lines), Ok(kib)) if *lines > 0 && *kib >= FREE_FLOOR_KIB => Cause::RunnerDisk,
+        _ => Cause::Unexplained,
     }
 }
 
@@ -495,6 +610,7 @@ fn reason_for(
     cause: Cause,
     files: &[FileFacts],
     storage: &Result<usize, String>,
+    free: &Result<u64, String>,
     root: &Path,
 ) -> String {
     let named = |file: &FileFacts| {
@@ -506,16 +622,23 @@ fn reason_for(
     };
     let mut parts: Vec<String> = Vec::new();
     for file in files {
-        if let Some(shape) = &file.shape {
-            parts.push(format!("{}: {shape}", named(file)));
+        parts.push(if let Some(shape) = &file.shape {
+            format!("{}: {shape}", named(file))
         } else if let Some(why) = &file.unread {
-            parts.push(format!("{}: {why}", named(file)));
+            format!("{}: {why}", named(file))
         } else if let Some(Err(why)) = &file.signature {
-            parts.push(format!(
-                "{}: its signature does not check ({why})",
-                named(file)
-            ));
-        }
+            format!("{}: its signature does not check ({why})", named(file))
+        } else {
+            format!(
+                "{}: no damage found, its signature is {}",
+                named(file),
+                if matches!(file.signature, Some(Ok(()))) {
+                    "valid"
+                } else {
+                    "not checked"
+                }
+            )
+        });
     }
     match storage {
         Ok(count) if *count > 0 => parts.push(format!(
@@ -524,20 +647,22 @@ fn reason_for(
         Ok(_) => parts.push("the kernel logged no storage error".to_owned()),
         Err(why) => parts.push(format!("the kernel's log was not read: {why}")),
     }
+    match free {
+        Ok(kib) if *kib >= FREE_FLOOR_KIB => {
+            parts.push(format!("the volume had {} MiB free or more", kib / 1024));
+        }
+        Ok(kib) => parts.push(format!(
+            "the volume was full: its free space fell to {} MiB, under the floor of {} MiB",
+            kib / 1024,
+            FREE_FLOOR_KIB / 1024
+        )),
+        Err(why) => parts.push(format!("the volume's free space was not read: {why}")),
+    }
     match cause {
         Cause::RunnerDisk => format!("the runner's disk: {}", parts.join("; ")),
-        Cause::Unexplained => format!(
-            "not shown to be the runner's disk: the file shows no damage and its signature is {}; {}",
-            if files
-                .iter()
-                .all(|file| matches!(file.signature, Some(Ok(()))))
-            {
-                "valid"
-            } else {
-                "not checked"
-            },
-            parts.join("; ")
-        ),
+        Cause::Unexplained => {
+            format!("not shown to be the runner's disk: {}", parts.join("; "))
+        }
     }
 }
 
@@ -995,6 +1120,7 @@ struct Account<'a> {
     files: &'a [FileFacts],
     swept: &'a [PathBuf],
     storage: &'a Result<usize, String>,
+    free: &'a Result<u64, String>,
     cause: Cause,
     reason: &'a str,
     removed: &'a [PathBuf],
@@ -1009,6 +1135,7 @@ fn facts_text(account: &Account<'_>) -> String {
         files,
         swept,
         storage,
+        free,
         cause,
         reason,
         removed,
@@ -1053,6 +1180,14 @@ fn facts_text(account: &Account<'_>) -> String {
         "\nstorage error lines in the kernel's log: {}\n",
         match storage {
             Ok(count) => count.to_string(),
+            Err(why) => format!("not read: {why}"),
+        }
+    ));
+    text.push_str(&format!(
+        "lowest free space of the volume (floor {} KiB): {}\n",
+        FREE_FLOOR_KIB,
+        match free {
+            Ok(kib) => format!("{kib} KiB"),
             Err(why) => format!("not read: {why}"),
         }
     ));
@@ -1104,6 +1239,7 @@ pub fn execute(
     place: &Place<'_>,
     packages: &[Package],
     budget: &mut Duration,
+    reads: &Reads,
     progress: &mut dyn FnMut(&str),
 ) -> Executed {
     let began = SystemTime::now();
@@ -1184,13 +1320,14 @@ pub fn execute(
     }
     let kernel = faults.join(format!("{stem}.kernel.txt"));
     let (from, until) = window_of(&files, now);
-    let storage = storage_log(from, until, &kernel).and_then(|()| {
+    let storage = (reads.kernel_log)(from, until, &kernel).and_then(|()| {
         std::fs::read_to_string(&kernel)
             .map(|text| count_storage_errors(&text))
             .map_err(|error| error.to_string())
     });
-    let cause = cause_of(&files, storage.as_ref().ok().copied());
-    let reason = reason_for(cause, &files, &storage, place.root);
+    let free = (reads.free_space)(&target, from, until);
+    let cause = cause_of(&storage, &free);
+    let reason = reason_for(cause, &files, &storage, &free, place.root);
     let removed = removal.carry_out();
     let facts = format!("conformance/faults/{stem}.txt");
     if let Err(error) = std::fs::write(
@@ -1202,6 +1339,7 @@ pub fn execute(
             files: &files,
             swept: &swept,
             storage: &storage,
+            free: &free,
             cause,
             reason: &reason,
             removed: &removed,
@@ -1452,42 +1590,65 @@ mod tests {
     }
 
     #[test]
-    fn the_cause_is_the_runners_disk_only_where_the_evidence_says_so() {
-        let whole = facts(None, Some(Ok(())));
+    fn the_cause_is_the_runners_disk_only_where_the_kernel_says_so_and_the_volume_had_room() {
+        let room = Ok(FREE_FLOOR_KIB);
+        assert_eq!(cause_of(&Ok(3), &room), Cause::RunnerDisk);
         assert_eq!(
-            cause_of(std::slice::from_ref(&whole), Some(0)),
-            Cause::Unexplained
-        );
-        assert_eq!(
-            cause_of(std::slice::from_ref(&whole), None),
-            Cause::Unexplained
-        );
-        assert_eq!(
-            cause_of(std::slice::from_ref(&whole), Some(3)),
-            Cause::RunnerDisk
-        );
-        assert_eq!(
-            cause_of(&[facts(Some("the file is empty"), None)], Some(0)),
-            Cause::RunnerDisk
-        );
-        assert_eq!(
-            cause_of(&[facts(None, Some(Err("invalid".to_owned())))], None),
-            Cause::RunnerDisk
-        );
-        assert_eq!(
-            cause_of(&[whole, facts(Some("cut"), None)], None),
-            Cause::RunnerDisk
-        );
-        let unread = FileFacts {
-            size: None,
-            unread: Some("the file could not be read: denied".to_owned()),
-            ..facts(None, None)
-        };
-        assert_eq!(
-            cause_of(&[unread], Some(0)),
+            cause_of(&Ok(0), &room),
             Cause::Unexplained,
-            "a file that could not be read is not shown to be damaged"
+            "no line of the kernel's log"
         );
+        assert_eq!(
+            cause_of(&Err("no sudo".to_owned()), &room),
+            Cause::Unexplained,
+            "the kernel's log could not be read"
+        );
+        assert_eq!(
+            cause_of(&Ok(3), &Ok(FREE_FLOOR_KIB - 1)),
+            Cause::Unexplained,
+            "a volume under the floor is full"
+        );
+        assert_eq!(
+            cause_of(&Ok(3), &Err("no df".to_owned())),
+            Cause::Unexplained,
+            "a volume whose free space was not read is not shown to have had room"
+        );
+    }
+
+    /// A file that is damaged says what the file is and not why, so the reason names the missing
+    /// evidence whatever the file looks like.
+    #[test]
+    fn the_reason_names_the_evidence_that_is_missing_whatever_the_file_looks_like() {
+        let root = Path::new("/r");
+        let damaged = [facts(Some("the file is empty"), None)];
+        let room = Ok(FREE_FLOOR_KIB);
+        let reason = reason_for(Cause::Unexplained, &damaged, &Ok(0), &room, root);
+        assert!(
+            reason.starts_with("not shown to be the runner's disk"),
+            "{reason}"
+        );
+        assert!(reason.contains("the file is empty"), "{reason}");
+        assert!(
+            reason.contains("the kernel logged no storage error"),
+            "{reason}"
+        );
+        let full = Ok(FREE_FLOOR_KIB - 1024);
+        let reason = reason_for(Cause::Unexplained, &damaged, &Ok(4), &full, root);
+        assert!(reason.contains("the volume was full"), "{reason}");
+        assert!(reason.contains("2047 MiB"), "{reason}");
+        let unread = Err("the kernel's log could not be read".to_owned());
+        let reason = reason_for(Cause::Unexplained, &damaged, &unread, &room, root);
+        assert!(reason.contains("the kernel's log was not read"), "{reason}");
+        let reason = reason_for(Cause::RunnerDisk, &damaged, &Ok(4), &room, root);
+        assert!(reason.starts_with("the runner's disk: "), "{reason}");
+    }
+
+    #[test]
+    fn the_free_space_is_the_lowest_sample_in_the_stretch_that_the_disk_report_kept() {
+        let text = "M 100 begin\nS 100 9000000\nS 110 1500000\nS 120 8000000\nS 200 10\nS x y\n";
+        assert_eq!(lowest_sample(text, 100, 130), Some(1_500_000));
+        assert_eq!(lowest_sample(text, 111, 119), None);
+        assert_eq!(lowest_sample("", 0, 10), None);
     }
 
     fn write(path: &Path, bytes: &[u8]) {

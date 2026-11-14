@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use kr_conformance::fault;
 #[cfg(unix)]
-use kr_conformance::fault::Cause;
+use kr_conformance::fault::{Cause, Reads};
 #[cfg(unix)]
 use kr_conformance::plan::Platform;
 use kr_conformance::plan::{Group, Reading, Step};
@@ -50,6 +50,58 @@ fn step(arguments: &[&Path]) -> Step {
         reading: Reading::Build,
         filter: None,
         skips: Vec::new(),
+    }
+}
+
+/// A line of the kernel's log that says a write to storage failed.
+#[cfg(unix)]
+const KERNEL_FAULT: &str =
+    "2026-11-14 01:02:03 E  kernel[0]: (IOStorageFamily) disk2s5: I/O error.\n";
+
+/// The free space, in KiB, of a volume with room: 40 GiB.
+#[cfg(unix)]
+const ROOM: u64 = 40 * 1024 * 1024;
+
+/// The free space, in KiB, of a volume that was full: 500 MiB.
+#[cfg(unix)]
+const ROOM_UNDER_FLOOR: u64 = 500 * 1024;
+
+/// What the system's evidence says in a case: the kernel's log (the lines it holds, or why it could
+/// not be read) and the lowest free space of the volume, in KiB (or why it could not be read).
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct Evidence {
+    kernel: Result<&'static str, &'static str>,
+    free: Result<u64, &'static str>,
+}
+
+#[cfg(unix)]
+impl Evidence {
+    /// The kernel logged a storage error, and the volume had room.
+    const SHOWN: Self = Self {
+        kernel: Ok(KERNEL_FAULT),
+        free: Ok(ROOM),
+    };
+
+    fn reads(self) -> Reads {
+        Reads {
+            kernel_log: Box::new(move |_, _, out| match self.kernel {
+                Ok(text) => std::fs::write(out, text).map_err(|error| error.to_string()),
+                Err(why) => Err(why.to_owned()),
+            }),
+            free_space: Box::new(move |_, _, _| self.free.map_err(str::to_owned)),
+        }
+    }
+}
+
+/// Evidence that a case that is not run again must never ask for.
+#[cfg(unix)]
+fn no_evidence() -> Reads {
+    Reads {
+        kernel_log: Box::new(|_, _, _| {
+            panic!("the kernel's log is read only for a step run again")
+        }),
+        free_space: Box::new(|_, _, _| panic!("the volume is read only for a step run again")),
     }
 }
 
@@ -116,6 +168,7 @@ fn a_step_that_linked_an_empty_program_is_run_again_and_the_result_names_the_run
         &tree.place(),
         &[],
         &mut Duration::from_secs(3600),
+        &Evidence::SHOWN.reads(),
         &mut |line| told.push(line.to_owned()),
     );
     assert_eq!(done.exit, Some(0), "the second run passed");
@@ -173,6 +226,7 @@ fn a_step_that_fails_in_another_way_is_not_run_again() {
         &place,
         &[],
         &mut std::time::Duration::from_secs(3600),
+        &no_evidence(),
         &mut |_| {},
     );
     assert_eq!(done.exit, Some(3));
@@ -202,6 +256,7 @@ fn a_file_that_no_build_wrote_is_not_a_reason_to_run_a_step_again() {
             &tree.place(),
             &[],
             &mut Duration::from_secs(3600),
+            &no_evidence(),
             &mut |_| {},
         );
         assert_eq!(done.exit, Some(101), "the step ran once");
@@ -223,7 +278,15 @@ fn a_step_whose_first_run_took_longer_than_the_time_left_is_not_run_again() {
     let mut slow = step(&[&tree.marker, &program]);
     slow.command[2] = format!("sleep 1; {SCRIPT}");
     let mut nothing_left = Duration::ZERO;
-    let done = fault::execute(&slow, 1, &tree.place(), &[], &mut nothing_left, &mut |_| {});
+    let done = fault::execute(
+        &slow,
+        1,
+        &tree.place(),
+        &[],
+        &mut nothing_left,
+        &no_evidence(),
+        &mut |_| {},
+    );
     assert_eq!(done.exit, Some(101), "the step ran once");
     assert!(done.rerun.is_none());
     let error = done.error.expect("the step has the reason");
@@ -244,7 +307,15 @@ fn the_time_a_second_run_takes_is_taken_from_the_time_left_for_second_runs() {
             .join("build/x-0123456789abcdef/build-script-build");
         let mut slow = step(&[&tree.marker, &program]);
         slow.command[2] = format!("sleep 1; {SCRIPT}");
-        fault::execute(&slow, 1, &tree.place(), &[], left, &mut |_| {})
+        fault::execute(
+            &slow,
+            1,
+            &tree.place(),
+            &[],
+            left,
+            &Evidence::SHOWN.reads(),
+            &mut |_| {},
+        )
     };
     let first = run(&mut left);
     assert!(first.rerun.is_some(), "the first step was run again");
@@ -278,6 +349,7 @@ fn a_step_run_again_whose_first_runs_evidence_was_not_kept_ends_red() {
         &tree.place(),
         &[],
         &mut Duration::from_secs(3600),
+        &Evidence::SHOWN.reads(),
         &mut |_| {},
     );
     assert_eq!(done.exit, Some(0), "the second run passed");
@@ -323,6 +395,7 @@ fn a_link_below_a_unit_ends_the_step_red_with_nothing_of_the_unit_removed_and_no
         &tree.place(),
         &[],
         &mut Duration::from_secs(3600),
+        &no_evidence(),
         &mut |_| {},
     );
     assert_run_once_with_reason(&done, "is a link");
@@ -354,6 +427,7 @@ fn a_file_of_a_unit_that_the_step_did_not_write_is_not_removed_and_the_step_is_n
         &tree.place(),
         &[],
         &mut Duration::from_secs(3600),
+        &no_evidence(),
         &mut |_| {},
     );
     assert_run_once_with_reason(&done, "was not written since the step began");
@@ -438,6 +512,7 @@ fn a_mount_below_a_unit_is_not_entered_and_the_step_is_not_run_again() {
         &tree.place(),
         &[],
         &mut Duration::from_secs(3600),
+        &no_evidence(),
         &mut |_| {},
     );
     assert_run_once_with_reason(&done, "is on another device");
@@ -445,9 +520,10 @@ fn a_mount_below_a_unit_is_not_entered_and_the_step_is_not_run_again() {
     assert!(program.exists());
 }
 
-/// The report over the `forms` tree with `step` as its only step, building into `target`.
+/// The report over the `forms` tree with `step` as its only step, building into `target`, with the
+/// cause of a rerun read from `evidence`.
 #[cfg(unix)]
-fn report_over(step: Step, target: &Path, evidence: &Path) -> Document {
+fn report_over(step: Step, target: &Path, evidence: &Path, reads: &Reads) -> Document {
     let options = Options {
         root: Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -470,15 +546,18 @@ fn report_over(step: Step, target: &Path, evidence: &Path) -> Document {
         )],
         part: None,
     };
-    report::run(&options, &mut |_| {}).unwrap_or_else(|stopped| panic!("{stopped:?}"))
+    report::run_with(&options, reads, &mut |_| {}).unwrap_or_else(|stopped| panic!("{stopped:?}"))
 }
 
 /// A report over a step that writes `source` (or an empty file) where a build script goes, in a
 /// target directory with a profile directory.
 #[cfg(unix)]
-fn rerun_report(source: Option<&Path>) -> (Document, tempfile::TempDir, PathBuf) {
+fn rerun_report(
+    source: Option<&Path>,
+    evidence: Evidence,
+) -> (Document, tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
-    let evidence = tempfile::Builder::new()
+    let kept = tempfile::Builder::new()
         .prefix("kr-conformance-evidence.")
         .tempdir()
         .expect("an evidence directory");
@@ -490,25 +569,17 @@ fn rerun_report(source: Option<&Path>) -> (Document, tempfile::TempDir, PathBuf)
     let marker = directory.path().join("ran-once");
     let mut arguments: Vec<&Path> = vec![&marker, &program];
     arguments.extend(source);
-    let document = report_over(step(&arguments), &target, evidence.path());
-    (document, evidence, program)
+    let document = report_over(step(&arguments), &target, kept.path(), &evidence.reads());
+    (document, kept, program)
 }
 
-/// Whether the cause is the kernel's own evidence. On a machine whose kernel log holds a storage
-/// error from the last minutes, the cause of a whole file is the runner's disk, with that evidence
-/// in the reason, and a case about the file has nothing to judge there.
-#[cfg(unix)]
-fn blamed_on_the_kernel_log(rerun: &fault::Rerun) -> bool {
-    rerun.cause == Cause::RunnerDisk && rerun.reason.contains("the kernel logged")
-}
-
-/// A run in which a step linked a program that was empty and the second run passed: the run
-/// passes, with one warning annotation naming the step and the program, and the count as its last
-/// line.
+/// A run in which a step linked a program that was empty, the kernel logged a storage error and
+/// the volume had room, and the second run passed: the run passes, with one warning annotation
+/// naming the step and the program, and the count as its last line.
 #[cfg(unix)]
 #[test]
 fn a_run_with_a_step_run_again_passes_where_the_runner_s_disk_is_shown_and_says_so() {
-    let (document, _evidence, program) = rerun_report(None);
+    let (document, _evidence, program) = rerun_report(None, Evidence::SHOWN);
     assert!(document.passed(), "{:?}", document.summary.failed_steps);
     assert_eq!(document.summary.rerun_steps, [1]);
     let annotations = document.rerun_annotations();
@@ -526,25 +597,70 @@ fn a_run_with_a_step_run_again_passes_where_the_runner_s_disk_is_shown_and_says_
     );
 }
 
-/// The same step linking a program that is whole, and no kernel storage error behind it: nothing
-/// shows the runner's disk, so the second run passes and the run still ends red, with no warning.
+/// A program of ours that is damaged is as empty as one the runner's disk damaged, and the same
+/// goes for a whole program the system refused: only the kernel's own line, with a volume that
+/// had room, shows the runner's disk. Without it the second run passes and the run still ends
+/// red, with no warning, and says what is missing.
 #[cfg(unix)]
 #[test]
-fn a_run_with_a_step_run_again_for_a_whole_program_ends_red_with_no_warning() {
+fn a_run_with_a_step_run_again_ends_red_with_no_warning_where_the_evidence_is_not_all_there() {
     let source = tempfile::tempdir().unwrap();
     let script = source.path().join("script");
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
-    let (document, _evidence, _) = rerun_report(Some(&script));
-    let rerun = document.steps[0].rerun.as_ref().expect("run again");
-    if blamed_on_the_kernel_log(rerun) {
-        return;
+    let full = ROOM_UNDER_FLOOR;
+    let cases: [(&str, Option<&Path>, Evidence, &str); 4] = [
+        (
+            "a damaged program and no line of the kernel's log",
+            None,
+            Evidence {
+                kernel: Ok(""),
+                free: Ok(ROOM),
+            },
+            "the kernel logged no storage error",
+        ),
+        (
+            "a damaged program and a kernel line, on a volume that was full",
+            None,
+            Evidence {
+                kernel: Ok(KERNEL_FAULT),
+                free: Ok(full),
+            },
+            "the volume was full",
+        ),
+        (
+            "a damaged program and a kernel log that could not be read",
+            None,
+            Evidence {
+                kernel: Err("no sudo"),
+                free: Ok(ROOM),
+            },
+            "the kernel's log was not read: no sudo",
+        ),
+        (
+            "a whole program and no line of the kernel's log",
+            Some(script.as_path()),
+            Evidence {
+                kernel: Ok(""),
+                free: Ok(ROOM),
+            },
+            "no damage found",
+        ),
+    ];
+    for (what, source, evidence, said) in cases {
+        let (document, _kept, _) = rerun_report(source, evidence);
+        let rerun = document.steps[0].rerun.as_ref().expect("run again");
+        assert_eq!(rerun.cause, Cause::Unexplained, "{what}: {}", rerun.reason);
+        assert!(rerun.reason.contains(said), "{what}: {}", rerun.reason);
+        assert_eq!(
+            document.steps[0].exit,
+            Some(0),
+            "{what}: the second run passed"
+        );
+        assert!(!document.passed(), "{what}");
+        assert_eq!(document.summary.failed_steps, [1], "{what}");
+        assert!(document.rerun_annotations().is_empty(), "{what}");
+        assert!(document.rerun_count_line().is_some(), "{what}");
     }
-    assert_eq!(rerun.cause, Cause::Unexplained, "{}", rerun.reason);
-    assert_eq!(document.steps[0].exit, Some(0), "the second run passed");
-    assert!(!document.passed());
-    assert_eq!(document.summary.failed_steps, [1]);
-    assert!(document.rerun_annotations().is_empty());
-    assert!(document.rerun_count_line().is_some());
 }
 
 /// A program the linker signed, copied whole, is accepted by the system's check of signatures, so
@@ -554,11 +670,12 @@ fn a_run_with_a_step_run_again_for_a_whole_program_ends_red_with_no_warning() {
 #[test]
 fn a_whole_program_the_linker_signed_is_not_taken_for_the_runner_s_disk() {
     let program = std::env::current_exe().unwrap();
-    let (document, _evidence, _) = rerun_report(Some(&program));
+    let nothing_logged = Evidence {
+        kernel: Ok(""),
+        free: Ok(ROOM),
+    };
+    let (document, _evidence, _) = rerun_report(Some(&program), nothing_logged);
     let rerun = document.steps[0].rerun.as_ref().expect("run again");
-    if blamed_on_the_kernel_log(rerun) {
-        return;
-    }
     assert_eq!(rerun.cause, Cause::Unexplained, "{}", rerun.reason);
     assert!(
         rerun.reason.contains("signature is valid"),
@@ -583,7 +700,12 @@ fn a_run_with_no_step_run_again_prints_no_warning_and_no_count() {
         .iter()
         .map(|word| (*word).to_owned())
         .collect();
-    let document = report_over(passing, &directory.path().join("target"), evidence.path());
+    let document = report_over(
+        passing,
+        &directory.path().join("target"),
+        evidence.path(),
+        &no_evidence(),
+    );
     assert!(document.passed());
     assert!(document.summary.rerun_steps.is_empty());
     assert!(document.rerun_annotations().is_empty());

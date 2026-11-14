@@ -446,6 +446,19 @@ pub fn map_for(options: &Options) -> Map {
 /// Returns why the run stopped before it ran anything: a mention the grammar refuses, or a map
 /// that cannot be trusted.
 pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document, Stopped> {
+    run_with(options, &fault::Reads::system(), progress)
+}
+
+/// Runs everything `options` asks for, with the evidence of a rerun's cause read from `reads`.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_with(
+    options: &Options,
+    reads: &fault::Reads,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Document, Stopped> {
     let started = timestamp();
     let map = map_for(options);
     if !map.refused.is_empty() {
@@ -539,6 +552,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             },
             &map.packages,
             &mut rerun_budget,
+            reads,
             &mut *progress,
         );
         progress(&format!(
