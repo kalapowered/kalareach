@@ -657,6 +657,20 @@ mod files {
         assert!(damage.unwrap().contains("first page"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_no_longer_leads_to_the_file_that_was_looked_at_is_not_read() {
+        let held = tempfile::tempdir().unwrap();
+        let looked_at = held.path().join("looked-at");
+        let now = held.path().join("now");
+        std::fs::write(&looked_at, vec![1_u8; 5000]).unwrap();
+        std::fs::write(&now, vec![0_u8; 9000]).unwrap();
+        let seen = std::fs::symlink_metadata(&looked_at).unwrap();
+        let reason = read_head(&now, &seen).unwrap_err();
+        assert!(reason.contains("no longer leads"), "{reason}");
+        assert!(read_head(&looked_at, &seen).is_ok());
+    }
+
     #[test]
     fn a_missing_path_is_not_read_and_says_why() {
         let held = tempfile::tempdir().unwrap();
