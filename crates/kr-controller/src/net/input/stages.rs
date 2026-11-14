@@ -37,6 +37,10 @@ mod with_seams {
             self.now.fetch_sub(1, Ordering::SeqCst);
         }
 
+        fn fall_by(&self, count: usize) {
+            self.now.fetch_sub(count as u64, Ordering::SeqCst);
+        }
+
         fn counts(&self) -> (u64, u64) {
             (
                 self.now.load(Ordering::SeqCst),
@@ -69,8 +73,20 @@ mod with_seams {
         pub unanswered: u64,
         /// The most frames passed on for the lane and not yet answered at one time.
         pub unanswered_peak: u64,
+        /// Frames the host holds for the device, from the moment each is read until it is answered,
+        /// refused or discarded, now.
+        pub host_holds: u64,
+        /// The most frames the host held at one time.
+        pub host_holds_peak: u64,
+        /// Epochs whose first refusal the host holds a record of, across the streams, now.
+        pub records: u64,
+        /// The most epochs the host held a record of at one time.
+        pub records_peak: u64,
         /// How many times a detach that took effect, or may have, told the streams of an attachment.
         pub detaches: u64,
+        /// How many times a stream was cut because its lane or its write failed or its worker did
+        /// not answer (the bound of acknowledgements the device has not read is not counted).
+        pub cuts: u64,
     }
 
     /// The stages of the terminal-input door that a suite can stop, and what it can count.
@@ -83,10 +99,14 @@ mod with_seams {
         after_the_version_mark: Hold,
         before_a_frame_is_judged: Hold,
         before_a_release: Hold,
+        after_a_graceful_look: Hold,
         held: Arc<Gauge>,
         unanswered: Arc<Gauge>,
+        host_holds: Gauge,
+        records: Gauge,
         read: AtomicU64,
         detaches: AtomicU64,
+        cuts: AtomicU64,
         reads_full: watch::Sender<u64>,
         reads_ended: watch::Sender<u64>,
         drain_waits: watch::Sender<u64>,
@@ -102,10 +122,14 @@ mod with_seams {
                 after_the_version_mark: Hold::default(),
                 before_a_frame_is_judged: Hold::default(),
                 before_a_release: Hold::default(),
+                after_a_graceful_look: Hold::default(),
                 held: Arc::default(),
                 unanswered: Arc::default(),
+                host_holds: Gauge::default(),
+                records: Gauge::default(),
                 read: AtomicU64::new(0),
                 detaches: AtomicU64::new(0),
+                cuts: AtomicU64::new(0),
                 reads_full: watch::channel(0).0,
                 reads_ended: watch::channel(0).0,
                 drain_waits: watch::channel(0).0,
@@ -168,18 +192,32 @@ mod with_seams {
             self.before_a_release.arm()
         }
 
+        /// Holds the acknowledgement writer at the next time it finds the stream's end graceful with
+        /// nothing left to write, before it decides to finish the stream. The hold fires once.
+        #[must_use]
+        pub fn hold_after_a_graceful_look(&self) -> Held {
+            self.after_a_graceful_look.arm()
+        }
+
         /// What the stages hold now and the most they have held, across the streams of the host.
         #[must_use]
         pub fn counts(&self) -> InputStageCounts {
             let (held, held_peak) = self.held.counts();
             let (unanswered, unanswered_peak) = self.unanswered.counts();
+            let (host_holds, host_holds_peak) = self.host_holds.counts();
+            let (records, records_peak) = self.records.counts();
             InputStageCounts {
+                host_holds,
+                host_holds_peak,
+                records,
+                records_peak,
                 read: self.read.load(Ordering::SeqCst),
                 held,
                 held_peak,
                 unanswered,
                 unanswered_peak,
                 detaches: self.detaches.load(Ordering::SeqCst),
+                cuts: self.cuts.load(Ordering::SeqCst),
             }
         }
 
@@ -233,6 +271,10 @@ mod with_seams {
             self.before_a_release.wait().await;
         }
 
+        pub(in crate::service::net) async fn after_a_graceful_look(&self) {
+            self.after_a_graceful_look.wait().await;
+        }
+
         pub(in crate::service::net) fn frame_read(&self) {
             self.read.fetch_add(1, Ordering::SeqCst);
         }
@@ -262,6 +304,26 @@ mod with_seams {
         pub(in crate::service::net) fn detach_told(&self) {
             self.detaches.fetch_add(1, Ordering::SeqCst);
         }
+
+        pub(in crate::service::net) fn stream_cut(&self) {
+            self.cuts.fetch_add(1, Ordering::SeqCst);
+        }
+
+        pub(in crate::service::net) fn frame_taken(&self) {
+            self.host_holds.rise();
+        }
+
+        pub(in crate::service::net) fn frame_let_go(&self) {
+            self.host_holds.fall();
+        }
+
+        pub(in crate::service::net) fn record_made(&self) {
+            self.records.rise();
+        }
+
+        pub(in crate::service::net) fn records_fell(&self, count: usize) {
+            self.records.fall_by(count);
+        }
     }
 }
 
@@ -289,6 +351,8 @@ mod without_seams {
 
         pub(in crate::service::net) async fn before_a_release(&self) {}
 
+        pub(in crate::service::net) async fn after_a_graceful_look(&self) {}
+
         pub(in crate::service::net) fn frame_read(&self) {}
 
         pub(in crate::service::net) fn held_frame(&self) -> Tally {
@@ -306,5 +370,15 @@ mod without_seams {
         pub(in crate::service::net) fn waits_to_drain(&self) {}
 
         pub(in crate::service::net) fn detach_told(&self) {}
+
+        pub(in crate::service::net) fn stream_cut(&self) {}
+
+        pub(in crate::service::net) fn frame_taken(&self) {}
+
+        pub(in crate::service::net) fn frame_let_go(&self) {}
+
+        pub(in crate::service::net) fn record_made(&self) {}
+
+        pub(in crate::service::net) fn records_fell(&self, _count: usize) {}
     }
 }
