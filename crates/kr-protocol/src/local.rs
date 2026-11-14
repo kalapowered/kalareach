@@ -576,10 +576,11 @@ pub enum ControllerConnectionRole {
     /// It is a second link for an attachment that a `Proxy` connection owns, and it borrows that
     /// connection's binding: it holds no attachment of its own, so closing it detaches nothing. It
     /// carries `input.write` for that attachment and nothing else, so a key never waits behind the
-    /// requests of the proxy connection, and the worker's answers on it are the lane's own frames
-    /// ([`InputLaneReady`] and the events [`LaneWindow`], [`LaneCredit`] and [`LaneLaunch`]). A
-    /// replacement generation fences it along with the authority itself. A worker that does not
-    /// state the input lane does not know the role, and the daemon never declares it to one.
+    /// requests of the proxy connection. The worker answers each write, and writes the lane's own
+    /// frames ([`InputLaneReady`] and the events [`LaneWindow`], [`LaneCredit`] and
+    /// [`LaneLaunch`]). A replacement generation fences it along with the authority itself. A
+    /// worker serves the role only once it binds input lanes and refuses it until then. The daemon
+    /// declares it only to a worker that states the input lane.
     ProxyInput,
 }
 
@@ -623,9 +624,11 @@ pub struct InputLaneReady {
     pub epoch: InputLeaseEpoch,
     /// True when the lane's attachment holds the lease at `epoch`, so the lane has a window.
     pub holder: bool,
-    /// The window's frames, in the worker's unit. Nought when the lane is not the holder's.
+    /// The window's frames, as queue entries: `InputClaim::frames` counts two for each frame.
+    /// Nought when the lane is not the holder's.
     pub frames: u32,
-    /// The window's bytes, in the worker's unit. Nought when the lane is not the holder's.
+    /// The window's bytes, as `InputClaim::bytes` counts them. Nought when the lane is not the
+    /// holder's.
     pub bytes: U64,
 }
 
@@ -642,9 +645,10 @@ pub struct LaneWindow {
     pub epoch: InputLeaseEpoch,
     /// True when the lane's attachment holds the lease at `epoch`.
     pub holder: bool,
-    /// The window's frames, in the worker's unit. Nought when `holder` is false.
+    /// The window's frames, as queue entries: `InputClaim::frames` counts two for each frame.
+    /// Nought when `holder` is false.
     pub frames: u32,
-    /// The window's bytes, in the worker's unit. Nought when `holder` is false.
+    /// The window's bytes, as `InputClaim::bytes` counts them. Nought when `holder` is false.
     pub bytes: U64,
     /// Set when the lane's attachment lost the lease: which epoch ended and how much it discarded.
     pub ended: Nullable<LaneEnded>,
@@ -669,9 +673,9 @@ pub struct LaneEnded {
 pub struct LaneCredit {
     /// The epoch the room belongs to.
     pub epoch: InputLeaseEpoch,
-    /// Frames given back, in the worker's unit.
+    /// Queue entries given back, as `InputClaim::frames` counts them: two for each frame.
     pub frames: u32,
-    /// Bytes given back, in the worker's unit.
+    /// Bytes given back, as `InputClaim::bytes` counts them.
     pub bytes: U64,
 }
 

@@ -162,8 +162,8 @@ fn a_request_without_the_members_is_the_old_wire() {
     assert!(read.after_input.is_none());
 }
 
-/// With the members, a request is written with them as the plan states them, and a member that is
-/// false or none is not written at all.
+/// With the members, a request is written with them, and a member that is false or none is not
+/// written at all.
 #[test]
 fn a_request_with_the_members_writes_them() {
     let [release, detach, launch]: [Request; 3] = requests().try_into().ok().expect("three");
@@ -506,9 +506,9 @@ fn the_lane_messages_refuse_an_unknown_member_in_json() {
     assert!(serde_json::from_value::<LaneEnded>(extra).is_err());
 }
 
-/// The messages that existed before the lane keep their bytes.
+/// The keepalive, the event that existed before the lane, keeps its bytes.
 #[test]
-fn the_events_before_the_lane_keep_their_bytes() {
+fn the_keepalive_keeps_its_bytes() {
     let keepalive =
         ParamsValue::from_typed(&ControlFrame::Event(ControlEvent::Keepalive)).expect("it writes");
     assert_eq!(

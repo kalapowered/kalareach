@@ -312,12 +312,13 @@ pub struct SessionDetachParams {
     /// Absent from the wire when the caller asks for no such order, and sent only to a worker that
     /// states the input lane, since a worker refuses a member it does not know. A request that
     /// uses none of the optional members is byte for byte what a worker built before them reads.
+    /// The `session.detached` notification, which carries these parameters, never has it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_input: Option<InputBarrier>,
     /// True when the caller wants the count of bytes this detach discarded in the answer.
     ///
     /// Absent from the wire when false, and sent only to a worker that states the input lane, for
-    /// the reason `after_input` gives.
+    /// the reason `after_input` gives. The `session.detached` notification never has it.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub fenced_report: bool,
 }
