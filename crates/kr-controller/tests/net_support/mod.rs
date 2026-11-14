@@ -2258,6 +2258,52 @@ impl RawDevice {
             .await
     }
 
+    /// Submits one mutation that names the subject facts it expects, and returns what the host
+    /// answered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host ends the control stream instead of answering.
+    pub async fn mutate_expecting<E: serde::Serialize + ?Sized, P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        expected: &E,
+        params: &P,
+    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+        use kr_client::transport::ControlTransport as _;
+        use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue};
+
+        let (request_id, mut frame) = self.mutation_frame(
+            None,
+            self.action_window_id(),
+            method,
+            action_id,
+            target,
+            params,
+        );
+        if let ControlFrame::Mutation(request) = &mut frame {
+            request.expected = ParamsValue::from_typed(expected).expect("the facts encode");
+        }
+        self.transport
+            .send(&frame)
+            .await
+            .expect("the frame is sent");
+        loop {
+            match self.heard_next().await {
+                Some(ControlFrame::Response(response)) if response.request_id == request_id => {
+                    return match response.outcome {
+                        Outcome::Ok(value) => Ok(value),
+                        Outcome::Error(error) => Err(error),
+                    };
+                }
+                Some(_) => {}
+                None => panic!("the host ended the control stream instead of answering"),
+            }
+        }
+    }
+
     /// The action window this connection holds: the one it was given, or the last one the host
     /// renewed it to.
     pub fn action_window_id(&self) -> kr_protocol::ids::ActionWindowId {
@@ -2699,6 +2745,11 @@ impl RawDevice {
     pub fn close(&self) {
         use kr_client::transport::ControlTransport as _;
         self.transport.close();
+    }
+
+    /// Why the host ended the connection: its close code and words, once it has.
+    pub fn close_reason(&self) -> Option<iroh::endpoint::ConnectionError> {
+        self.transport.close_reason()
     }
 
     /// Finishes the control stream's sending half and leaves the connection standing.
