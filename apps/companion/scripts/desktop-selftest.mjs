@@ -261,7 +261,9 @@ for (const name of ['SODIUM_LIB_DIR', 'sodium_lib_dir', 'SODIUM_USE_PKG_CONFIG',
   // directory before anything is fetched, and refuses, so no network is needed and nothing is placed.
   const root = mkdtempSync(join(tmpdir(), 'desktop-archive-'))
   try {
-    const key = spawnSync('bash', [join(REPOSITORY, SCRIPT), '--key'], { encoding: 'utf8' }).stdout.trim()
+    // The script is started by its path from the repository's root, as the entry starts it: it finds the
+    // repository from the way it was named.
+    const key = spawnSync('bash', [SCRIPT, '--key'], { cwd: REPOSITORY, encoding: 'utf8' }).stdout.trim()
     held('the script prints a key that holds digests', 'true', String(/^libsodium-archive-[0-9.]+-[0-9a-f]{12}-[0-9a-f]{12}$/.test(key)))
     const wrong = (directory) => {
       mkdirSync(directory, { recursive: true })
