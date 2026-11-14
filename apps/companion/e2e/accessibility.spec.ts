@@ -949,8 +949,14 @@ test.describe('a tap on the plain text near a link of a message', () => {
     test(`leaves a press on something outside the pane alone, though a link of the pane lies under it, on ${surface}`, async ({ page }) => {
       await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
       const after = await pointOnTextAfter(page, DOCS)
-      // A sheet over the pane, with plain words where the pane's link has its reach.
+      // A sheet over the pane, with plain words where the pane's link has its reach. It stands in the page's
+      // root, as the page's own sheets do. WebKit on Linux sends a click for a tap on plain text only where
+      // an element above the words listens for clicks, and a listener on the document is not enough there (it
+      // is on macOS); the page's own listeners sit on the root. A sheet appended to the body gets no click on
+      // Linux, and the case needs the click to see that the page adds none.
       await page.evaluate(({ x, y }) => {
+        const root = document.getElementById('root')
+        if (root === null) throw new Error('the page has no root')
         const sheet = document.createElement('div')
         sheet.id = 'case-sheet'
         sheet.style.cssText = 'position: fixed; inset: 0; z-index: 99999; background: white'
@@ -958,8 +964,12 @@ test.describe('a tap on the plain text near a link of a message', () => {
         words.textContent = 'plain words of the sheet'
         words.style.cssText = `position: absolute; left: ${String(x - 40)}px; top: ${String(y - 20)}px; width: 160px; height: 40px; margin: 0`
         sheet.append(words)
-        document.body.append(sheet)
+        root.append(sheet)
       }, after)
+      expect(
+        await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.textContent, after),
+        'what lies at the tap'
+      ).toBe('plain words of the sheet')
       const made = await tapAndRead(page, after.x, after.y)
       expect(handlers(made.clicks), 'clicks that the page added to a tap on the sheet').toEqual([])
       expect(await pressedLooks(page), 'the pressed look after the press on the sheet').toBe(0)
