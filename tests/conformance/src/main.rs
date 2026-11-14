@@ -290,12 +290,13 @@ fn run(
             "step {step} did not pass: {} (log {})",
             record.command, record.log
         );
-        for program in record
-            .observation
-            .iter()
-            .flat_map(|observed| &observed.programs)
-        {
-            println!("  could not run {}: {}", program.path, program.file);
+        if let Some(observed) = &record.observation {
+            if let Some(log) = &observed.log {
+                println!("  its log: {log}");
+            }
+            for program in &observed.programs {
+                println!("  could not run {}: {}", program.path, program.file);
+            }
         }
     }
     for failure in &document.failures_outside_identifiers {

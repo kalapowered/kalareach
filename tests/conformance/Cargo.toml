@@ -17,6 +17,10 @@ quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# The observation opens a program's file without following a link at its name.
+libc.workspace = true
+
 [dev-dependencies]
 # The application matrix runs each program as the root of a real session: a worker's own session,
 # pseudo-terminal and runtime, attached to over the worker's own endpoint with the product's client.
