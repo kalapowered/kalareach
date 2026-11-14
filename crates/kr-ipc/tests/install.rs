@@ -1530,15 +1530,50 @@ fn current_names_a_whole_release_at_every_moment_of_a_switch() {
 fn open_current_itself(test: &TestStore) -> std::fs::File {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     std::fs::OpenOptions::new()
-        .access_mode(0)
+        .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(test.store.current_link())
         .expect("current opens")
+}
+
+/// The volume and the number the volume gives the object a handle is open on.
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "a handle's identity is read through a call that has no safe interface"
+)]
+fn identity_of(held: &std::fs::File) -> std::io::Result<(u64, [u8; 16])> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = FILE_ID_INFO {
+        VolumeSerialNumber: 0,
+        FileId: Default::default(),
+    };
+    // SAFETY: the handle is the open file's own, and `information` is a live buffer of exactly the
+    // size of the structure the class asks for.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            held.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut information).cast(),
+            u32::try_from(size_of::<FILE_ID_INFO>()).expect("a size"),
+        )
+    };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
 }
 
 /// The target a junction names, as the system keeps it, read through a handle that is open on the
@@ -1585,8 +1620,8 @@ fn target_through(held: &std::fs::File) -> std::io::Result<String> {
 
 /// A program that opened `current` before a switch and reads it after reads the release that is
 /// current after it, whole. A switch changes where the junction points and does not put another
-/// junction in its place, which a reader that has the old one open would be refused or read as it
-/// was.
+/// junction in its place: the name still names the object the reader holds, which a reader that
+/// has the old one open would be refused or read as it was.
 #[cfg(windows)]
 #[test]
 fn a_reader_that_holds_current_open_across_a_switch_reads_the_release_switched_to() {
@@ -1614,6 +1649,11 @@ fn a_reader_that_holds_current_open_across_a_switch_reads_the_release_switched_t
     assert!(
         after.ends_with(&named(&two)),
         "it names the second: {after}"
+    );
+    assert_eq!(
+        identity_of(&held).expect("the held junction has an identity"),
+        identity_of(&open_current_itself(&test)).expect("the name has an identity"),
+        "the name still names the junction that was held, and is not another put in its place"
     );
     assert_eq!(test.store.current().expect("reads"), Some(two));
 }
@@ -1797,10 +1837,10 @@ fn a_name_that_stops_being_a_junction_between_the_look_and_the_change_is_not_mad
     );
 }
 
-/// What another process of the account puts in the place of `current` after the switch has looked
-/// at it and before it sets the target is left as it is, and the switch says that the name was
-/// replaced and does not say that the release is current: the target is set through the handle that
-/// was looked at, and not through the name, and the name is checked afterwards.
+/// What another process of the account puts in the place of `current` after the switch has opened
+/// it to change it and before it sets the target is left as it is, and the switch says that the
+/// name was replaced and does not say that the release is current: the target is set through the
+/// handle that was opened, and not through the name, and the name is checked afterwards.
 #[cfg(windows)]
 #[test]
 fn a_name_put_in_the_place_of_current_during_a_switch_is_not_pointed_at_the_release() {
