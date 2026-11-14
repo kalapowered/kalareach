@@ -559,12 +559,13 @@ jobs:
     # so setting it here would quietly undo them.
     steps:
       # Section 27 puts every test artefact in one platform-resolved directory, and on Windows that
-      # is the runner's temporary folder. The `runner` context is not available in a job's `env`, so
-      # the directory is named here, from the runner's own temporary folder, for every later step
-      # and for the upload of what the tests kept in it.
+      # is the account's temporary folder (the one the evidence check accepts). A job's `env` takes
+      # no value from the runner, so the directory is named here, for every later step and for the
+      # upload of what the tests kept in it.
       - name: Choose where the tests keep their artefacts
         run: |
-          "KR_TEST_ARTIFACTS_DIR=$env:RUNNER_TEMP\kr-test-artifacts" >> $env:GITHUB_ENV
+          $temporary = (Get-Item $env:TEMP).FullName
+          "KR_TEST_ARTIFACTS_DIR=$temporary\kr-test-artifacts" >> $env:GITHUB_ENV
 
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
