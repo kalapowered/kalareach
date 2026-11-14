@@ -1298,8 +1298,14 @@ impl Stage {
     }
 
     /// Everything queued for the program's input since the last call.
+    ///
+    /// The program reads what it is given whole, as the terminal's writer would have written it, so
+    /// what is taken is settled in the room at once: an application that is answered at the rate the
+    /// session allows is not held to a queue that nothing empties.
     pub(crate) fn pending_input(&mut self) -> Vec<InputBatch> {
-        self.session.take_pending_input()
+        let taken = self.session.take_pending_input();
+        kr_worker::testing::settle_written_input(&self.session, &taken);
+        taken
     }
 
     /// Where client `index` differs from the session's screen now; empty when it holds it.
