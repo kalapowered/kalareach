@@ -7976,3 +7976,81 @@ async fn a_repeat_the_feed_refuses_before_it_is_sent_is_told_the_outcome_is_unkn
         assert_eq!(error.code, expected, "routed {routed:?}: {error}");
     }
 }
+
+/// A detach ends the attachment's input streams when it took effect or may have: an answer that is
+/// an error counts, because the worker removes the attachment before a step that can fail, except
+/// a refusal that comes before it acts, and so does a call whose outcome is unknown. A call this
+/// host refused before it was sent did nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detach_is_taken_to_have_acted_unless_it_was_refused_before_it_could() {
+    use super::forwarding::a_detach_may_have_acted;
+    use crate::error::ControllerError;
+    use crate::service::net::proxy::Forwarded;
+    use kr_protocol::envelope::{Outcome, Response};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+
+    let answered = |outcome: Outcome| {
+        Ok(Ok(Forwarded {
+            response: Response {
+                request_id: RequestId::new(1),
+                outcome,
+            },
+            retained: false,
+        }))
+    };
+    let error = |code: ErrorCode| answered(Outcome::Error(ProtocolError::new(code, "the step")));
+
+    assert!(
+        a_detach_may_have_acted(&answered(Outcome::Ok(
+            ParamsValue::from_typed(&()).unwrap()
+        ))),
+        "an answer that says the detach was made"
+    );
+    assert!(
+        a_detach_may_have_acted(&error(ErrorCode::ResourceUnavailable)),
+        "a refused resize after the attachment was removed counts"
+    );
+    assert!(
+        a_detach_may_have_acted(&error(ErrorCode::OutcomeUnknown)),
+        "an answer that says the outcome is unknown counts"
+    );
+    assert!(
+        !a_detach_may_have_acted(&error(ErrorCode::PermissionDenied)),
+        "a refusal before the worker acts does not"
+    );
+    assert!(
+        !a_detach_may_have_acted(&error(ErrorCode::InvalidArgument)),
+        "nor does a refusal of the parameters"
+    );
+    assert!(
+        !a_detach_may_have_acted(&error(ErrorCode::DraftConflict)),
+        "nor does a precondition that no longer holds"
+    );
+    assert!(
+        !a_detach_may_have_acted(&error(ErrorCode::StorageUnavailable)),
+        "nor does a journal that refuses the intent before the worker dispatches it"
+    );
+    assert!(
+        !a_detach_may_have_acted(&Ok(Err(ControllerError::PermissionDenied {
+            detail: "refused before it was sent".to_owned(),
+        }))),
+        "a call this host refused before the send did nothing"
+    );
+    assert!(
+        !a_detach_may_have_acted(&Ok(Err(ControllerError::InvalidArgument(
+            "refused before it was sent".to_owned()
+        )))),
+        "nor did one it found malformed"
+    );
+    assert!(
+        a_detach_may_have_acted(&Ok(Err(ControllerError::NotConfigured(
+            "the link failed".to_owned()
+        )))),
+        "a call that failed after the send leaves the outcome unknown"
+    );
+    let lost = tokio::spawn(async { panic!("the task of the call ended") }).await;
+    assert!(
+        a_detach_may_have_acted(&lost.map(|()| unreachable!())),
+        "a call whose task was lost leaves the outcome unknown"
+    );
+}

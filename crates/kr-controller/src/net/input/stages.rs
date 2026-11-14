@@ -69,6 +69,8 @@ mod with_seams {
         pub unanswered: u64,
         /// The most frames passed on for the lane and not yet answered at one time.
         pub unanswered_peak: u64,
+        /// How many times a detach that took effect, or may have, told the streams of an attachment.
+        pub detaches: u64,
     }
 
     /// The stages of the terminal-input door that a suite can stop, and what it can count.
@@ -78,11 +80,16 @@ mod with_seams {
         before_a_lane_write: Hold,
         before_a_lane_answer: Hold,
         before_an_ack_write: Hold,
+        after_the_version_mark: Hold,
+        before_a_frame_is_judged: Hold,
+        before_a_release: Hold,
         held: Arc<Gauge>,
         unanswered: Arc<Gauge>,
         read: AtomicU64,
+        detaches: AtomicU64,
         reads_full: watch::Sender<u64>,
         reads_ended: watch::Sender<u64>,
+        drain_waits: watch::Sender<u64>,
     }
 
     impl Default for InputStages {
@@ -92,11 +99,16 @@ mod with_seams {
                 before_a_lane_write: Hold::default(),
                 before_a_lane_answer: Hold::default(),
                 before_an_ack_write: Hold::default(),
+                after_the_version_mark: Hold::default(),
+                before_a_frame_is_judged: Hold::default(),
+                before_a_release: Hold::default(),
                 held: Arc::default(),
                 unanswered: Arc::default(),
                 read: AtomicU64::new(0),
+                detaches: AtomicU64::new(0),
                 reads_full: watch::channel(0).0,
                 reads_ended: watch::channel(0).0,
+                drain_waits: watch::channel(0).0,
             }
         }
     }
@@ -135,6 +147,27 @@ mod with_seams {
             self.before_an_ack_write.arm()
         }
 
+        /// Holds the stream task at its next turn between the moment it marks the state's version
+        /// and the moment it looks at whether the stream has ended. The hold fires once.
+        #[must_use]
+        pub fn hold_after_the_version_mark(&self) -> Held {
+            self.after_the_version_mark.arm()
+        }
+
+        /// Holds the next frame the lane's writer has taken from its queue before the writer looks at
+        /// whether the frame's epoch has been refused, which would discard it. The hold fires once.
+        #[must_use]
+        pub fn hold_before_a_frame_is_judged(&self) -> Held {
+            self.before_a_frame_is_judged.arm()
+        }
+
+        /// Holds the next release of a connection's worker link before the release ends the
+        /// connection's streams. The hold fires once.
+        #[must_use]
+        pub fn hold_before_a_release(&self) -> Held {
+            self.before_a_release.arm()
+        }
+
         /// What the stages hold now and the most they have held, across the streams of the host.
         #[must_use]
         pub fn counts(&self) -> InputStageCounts {
@@ -146,6 +179,7 @@ mod with_seams {
                 held_peak,
                 unanswered,
                 unanswered_peak,
+                detaches: self.detaches.load(Ordering::SeqCst),
             }
         }
 
@@ -175,8 +209,28 @@ mod with_seams {
             self.before_a_lane_answer.wait().await;
         }
 
+        /// Counts the turns at which a stream task whose device has finished found frames still
+        /// passed on and not answered, and waited for them. A suite waits for the count to rise to
+        /// know the task is waiting for the stream to drain.
+        #[must_use]
+        pub fn drain_waits(&self) -> watch::Receiver<u64> {
+            self.drain_waits.subscribe()
+        }
+
         pub(in crate::service::net) async fn before_an_ack_write(&self) {
             self.before_an_ack_write.wait().await;
+        }
+
+        pub(in crate::service::net) async fn after_the_version_mark(&self) {
+            self.after_the_version_mark.wait().await;
+        }
+
+        pub(in crate::service::net) async fn before_a_frame_is_judged(&self) {
+            self.before_a_frame_is_judged.wait().await;
+        }
+
+        pub(in crate::service::net) async fn before_a_release(&self) {
+            self.before_a_release.wait().await;
         }
 
         pub(in crate::service::net) fn frame_read(&self) {
@@ -200,6 +254,14 @@ mod with_seams {
         pub(in crate::service::net) fn read_ends(&self) {
             self.reads_ended.send_modify(|ends| *ends += 1);
         }
+
+        pub(in crate::service::net) fn waits_to_drain(&self) {
+            self.drain_waits.send_modify(|turns| *turns += 1);
+        }
+
+        pub(in crate::service::net) fn detach_told(&self) {
+            self.detaches.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -221,6 +283,12 @@ mod without_seams {
 
         pub(in crate::service::net) async fn before_an_ack_write(&self) {}
 
+        pub(in crate::service::net) async fn after_the_version_mark(&self) {}
+
+        pub(in crate::service::net) async fn before_a_frame_is_judged(&self) {}
+
+        pub(in crate::service::net) async fn before_a_release(&self) {}
+
         pub(in crate::service::net) fn frame_read(&self) {}
 
         pub(in crate::service::net) fn held_frame(&self) -> Tally {
@@ -234,5 +302,9 @@ mod without_seams {
         pub(in crate::service::net) fn read_is_full(&self) {}
 
         pub(in crate::service::net) fn read_ends(&self) {}
+
+        pub(in crate::service::net) fn waits_to_drain(&self) {}
+
+        pub(in crate::service::net) fn detach_told(&self) {}
     }
 }
