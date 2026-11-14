@@ -1265,6 +1265,108 @@ async fn a_lease_for_the_local_owner_that_ends_sooner_is_told_while_its_own_barr
     fixture.host.stop().await;
 }
 
+/// KR-REQ-09.09, KR-REQ-17.54: a lease already in force, presented by the host's own local owner
+/// with a chain that drops another device's lease, changes the policy of its own and owes the whole
+/// host a fence: the presentation waits for the barrier that retires it and settles with the proof
+/// of it, so its answer is told while that revision is still the one in force. The dropped lease's
+/// connection ends with the host's. This is what `kr organisation present --chain` is told, and a
+/// hand-back that is limited to a lease that ends sooner would leave this answer to the debt pass's
+/// race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_in_force_presented_with_a_chain_that_drops_a_lease_is_told_while_its_own_barrier_stands()
+ {
+    let mut fixture = Fixture::start().await;
+    // Paired before the host is exclusive: afterwards no device of the owner's confirms a pairing.
+    let bea = fixture.member("bea", SERVED).await;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+    let host_key = fixture.listed().await.host_device.authorisation_key;
+    let owners = fixture.organisation.lease(
+        2,
+        &organisation_support::member("owner"),
+        host_key,
+        fixture.now(),
+        &[ActionRight::SessionView],
+    );
+    let environment = fixture.host.environment_id;
+    let mut client = fixture.host.client().await;
+    let _: kr_protocol::organisation::MembershipPresentResult = calls::mutate_as(
+        environment,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        Method::MembershipPresent,
+        &MembershipPresentParams {
+            lease: owners.clone(),
+            authority: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the host takes the owner's lease");
+    drop(client);
+
+    // Bea's lease is issued after the owner's, and revision 3 takes over between the two, so a
+    // chain that carries revision 3 drops bea's lease and leaves the owner's in force.
+    fixture.pass(Duration::from_secs(1));
+    let bea_raw = bea.connect(&fixture).await;
+    bea.present(&fixture, &bea_raw, fixture.lease(2, &bea, SERVED), None)
+        .await
+        .expect("bea's lease installs");
+    read_host_info(&bea_raw).await.expect("bea is served");
+    fixture
+        .organisation
+        .rotate(owners.payload.issued_at_ms.get() + 500);
+    let params = MembershipPresentParams {
+        lease: owners.clone(),
+        authority: Nullable::some(fixture.organisation.authority(fixture.now())),
+    };
+
+    let controller = fixture.host.controller();
+    let before = fixture.authority_revision();
+    let (arrived, release) = controller.pause_after_a_route_answers();
+    let mut client = fixture.host.client().await;
+    let telling = tokio::spawn({
+        let params = params.clone();
+        async move {
+            let told: Result<kr_protocol::organisation::MembershipPresentResult, _> =
+                calls::mutate_as(
+                    environment,
+                    &mut client,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    Method::MembershipPresent,
+                    &params,
+                )
+                .await;
+            told
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the route answers")
+        .expect("the pause is armed");
+    assert!(
+        fixture.authority_revision().get() > before.get(),
+        "the presentation's own barrier advanced the revision before the route answered"
+    );
+    release.send(()).expect("the door goes on");
+    let told = telling
+        .await
+        .expect("the door tells it")
+        .expect("the answer of the request whose chain dropped a lease is told");
+    assert_eq!(
+        told.expires_at_ms, owners.payload.expires_at_ms,
+        "the owner's lease is the one in force"
+    );
+    // The barrier withdrew every connection of the host, bea's included: its connection ends, and
+    // what it was served under is checked by the presentation suite's case of a chain that drops a
+    // lease.
+    drop(bea_raw);
+    fixture.host.stop().await;
+}
+
 /// KR-REQ-09.09, KR-REQ-17.54: the answer to a presentation of the lease for the host's own local
 /// owner derives from an older event, so the door does not show it when the authority it was
 /// admitted under has gone by the time it is told: a fence this host comes to owe after the route
