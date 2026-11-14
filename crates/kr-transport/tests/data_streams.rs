@@ -2106,3 +2106,37 @@ async fn a_failed_control_write_revokes_the_data_streams_before_it_returns() {
     connection.close(0u32.into(), b"done");
     listener.shutdown().await;
 }
+
+/// A reader that has no room for a frame still hears the device's reset, and the error it gives is
+/// the one a read of the reset stream gives: the device's own code in the stream's words, not the
+/// words of a stream that was already closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_heard_with_no_room_for_a_frame_carries_the_devices_code() {
+    let mut harness = Harness::start(&[StreamKind::TerminalInput], Taking::Forward).await;
+    let header = input_header(harness.authorised.connection_id, 1);
+    let (mut send, _recv) = harness.raw(&header).await;
+    let stream = harness.next().await;
+    let (mut reader, _writer) = stream.split();
+    let (_room, mut no_room) = tokio::sync::watch::channel(false);
+
+    let reading = tokio::spawn(async move {
+        let outcome = reader
+            .read_message_when::<kr_protocol::input::InputFrame>(&mut no_room)
+            .await;
+        (outcome, reader)
+    });
+    send.reset(iroh::endpoint::VarInt::from_u32(77))
+        .expect("the device resets its stream");
+    let (outcome, _reader) = awaited("the reset to be heard with no room", reading)
+        .await
+        .expect("the read task ended");
+    assert!(
+        matches!(
+            &outcome,
+            Err(TransportError::Stream(words)) if words == "stream reset by peer: error 77"
+        ),
+        "the reset was not given with the device's code and words: {outcome:?}"
+    );
+
+    harness.finish().await;
+}
