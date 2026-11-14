@@ -796,6 +796,33 @@ impl std::fmt::Debug for Round<'_> {
     }
 }
 
+/// What an ended worker's entry says when `pending_names` of the actions its fence named did not
+/// reach this daemon before it ended.
+fn ended_before_its_names(pending_names: u64) -> String {
+    format!(
+        "this worker's execution is confirmed ended, and {pending_names} of the actions its fence \
+         named did not reach this daemon before it did; nothing can ask for them now"
+    )
+}
+
+/// The entry of a worker that was pending in `given` and whose session has closed since: it is
+/// ended, which satisfies the barrier as it does for any worker whose execution has ended, and
+/// the entry keeps every name `given` held of it.
+#[must_use]
+pub(crate) fn ended_since(given: &WorkerBarrier) -> WorkerBarrier {
+    let pending_names = given.names_pending.get();
+    WorkerBarrier {
+        state: BarrierState::Ended,
+        detail: if pending_names > 0 {
+            ended_before_its_names(pending_names)
+        } else {
+            "this worker's execution is confirmed ended, so it can no longer dispatch anything"
+                .to_owned()
+        },
+        ..given.clone()
+    }
+}
+
 /// The daemon's half of the dispatch lease and the revocation barrier.
 ///
 /// Every operation that changes more than one thing takes `order` first. The lease issuer has its
@@ -1358,11 +1385,7 @@ impl AuthorityBarrier {
                  for them again, from where the last page ended"
             ),
             // A worker that ended cannot be asked, and its journal is not read for evidence.
-            BarrierState::Ended if pending_names > 0 => format!(
-                "this worker's execution is confirmed ended, and {pending_names} of the actions \
-                 its fence named did not reach this daemon before it did; nothing can ask for \
-                 them now"
-            ),
+            BarrierState::Ended if pending_names > 0 => ended_before_its_names(pending_names),
             // Names that went before they arrived. The worker says how many it no longer holds,
             // and a result missing that many actions is not the complete one section 9 asks for.
             BarrierState::Acknowledged | BarrierState::Ended if omitted_names > 0 => format!(
@@ -1397,10 +1420,12 @@ impl AuthorityBarrier {
             BarrierState::Pending => format!(
                 "this worker has not acknowledged revision {revision} and has not been confirmed \
                  ended, so the revocation is not complete for it. While the directory lists it, \
-                 this host asks it again on its own, and a later `kr doctor` shows when every \
-                 worker has acknowledged. Repeating the revocation asks it again and shows the \
-                 names of the actions that won the dispatch race at this worker, which keeps those \
-                 names for its newest {} revocations only",
+                 this host asks it again on its own, unless a presentation of this host to that \
+                 worker is still waiting at its dispatch boundary, and a later `kr doctor` shows \
+                 when every worker has acknowledged. Repeating the revocation asks it again on \
+                 the same terms and, once it has acknowledged, shows the names of the actions \
+                 that won the dispatch race at this worker, which keeps those names for its \
+                 newest {} revocations only",
                 kr_worker::journal::MAX_HELD_REVOCATIONS
             ),
         };
