@@ -50,15 +50,17 @@
 //! its own housekeeping and no keystrokes, and have no such task. Taking the domain is all it does,
 //! in the order above.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use kr_protocol::attachment::AttachmentCapability;
+use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::{AttachmentId, AuthorityRevision, ConnectionId, InputLeaseEpoch, SessionId};
 use kr_protocol::input::InputLeaseState;
-use kr_protocol::scalars::CanonicalSet;
+use kr_protocol::local::{InputLaneReady, LaneCredit, LaneEnded, LaneWindow};
+use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_protocol::session::SessionState;
 use kr_shell_integration::contract::fence::{LaunchStanding, LeaseView};
 use kr_shell_integration::contract::requests::LaunchTransactionId;
@@ -67,7 +69,10 @@ use kr_term::win32::{Fidelity, KeyRecord, Keyboard, Refused};
 use crate::error::{Result, WorkerError};
 use crate::fence::{Effects, FenceDriver, FenceFrame, Outbound, Step, TakeoverReceipt};
 use crate::input::{InputLease, LeaseRefusal, PasteFramer, TakeoverFraming};
-use crate::input_room::{Cost, InputRoom, admit};
+use crate::input_lane::{BoundLane, Lane, LaneId, LaneQueue, Window};
+use crate::input_room::{
+    Carried, ClaimGuard, Cost, InputRoom, LANE_WINDOW, Ledger, Outstanding, ROOM, admit,
+};
 use crate::session::{
     FenceOutcome, GrantedBy, InputAccepted, InputAuthority, InputBatch, Interrupted, LeaseEnded,
     MAX_PENDING_REPLY_BYTES, MAX_PENDING_REPLY_FRAMES, MAX_QUEUED_INPUT_BYTES,
@@ -78,8 +83,8 @@ use kr_term::lane::DrainBudget;
 /// One entry in a session's queue for the pseudo-terminal.
 #[derive(Debug)]
 pub(crate) enum Queued {
-    /// A batch for the writer.
-    Batch(InputBatch),
+    /// A batch for the writer, with what it owes and what guards it.
+    Batch(Carried),
     /// A fence published to the bridge at this point.
     ///
     /// What is queued behind it waits until the bridge's writer has written the fence, or until the
@@ -307,9 +312,15 @@ impl<'a> InputGuard<'a> {
     }
 }
 
-#[cfg(debug_assertions)]
 impl Drop for InputGuard<'_> {
+    /// The end of every hold tops the window up when a count fell since the last top-up: a guard
+    /// or a debt that dropped inside the hold took no lock, and this is where its request is
+    /// carried out.
     fn drop(&mut self) {
+        if self.guard.writer.room.topup().take() {
+            self.guard.top_up_taken();
+        }
+        #[cfg(debug_assertions)]
         HELD.with(|held| held.set(held.get() - 1));
     }
 }
@@ -554,6 +565,19 @@ pub struct InputDomain {
     pending: VecDeque<Queued>,
     /// Accepted bytes the root editor's machine is holding for a reader transition.
     held_input_bytes: usize,
+    /// The guard of the write that left the recogniser's held prefix: the prefix's later entry is
+    /// paid for by its claim. It moves into the batch the prefix becomes, and is dropped with the
+    /// prefix when nothing holds it any more.
+    held_guard: Option<Arc<ClaimGuard>>,
+    /// The input lanes bound to this session, by identity.
+    lanes: BTreeMap<LaneId, Lane>,
+    /// A mark for each parent connection whose withdrawal has begun and not ended, so a lane that
+    /// binds in the middle of it starts refused.
+    parents_closed: BTreeSet<ConnectionId>,
+    /// The next lane identity.
+    next_lane: u64,
+    /// The room kept for the lane of the view that holds the keys, when it has a lane.
+    window: Option<Window>,
     writer: WriterHandles,
     /// The root editor's fence and detach machine, for a managed session.
     ///
@@ -635,6 +659,11 @@ impl InputDomain {
             granted_attachments: BTreeMap::new(),
             pending: VecDeque::new(),
             held_input_bytes: 0,
+            held_guard: None,
+            lanes: BTreeMap::new(),
+            parents_closed: BTreeSet::new(),
+            next_lane: 0,
+            window: None,
             writer: WriterHandles::new(),
             fence: None,
             revision: None,
@@ -713,6 +742,43 @@ impl InputDomain {
             frames: self.fence.as_ref().map_or(0, FenceDriver::held_frames),
             bytes: self.held_input_bytes,
         })
+    }
+
+    /// Returns what admission reads: what is held, what the window keeps back for its lane, and
+    /// what accepted writes may still add.
+    #[must_use]
+    fn committed(&self) -> Cost {
+        self.held_for_the_terminal()
+            .plus(self.reserved())
+            .plus(self.writer.room.promised())
+    }
+
+    /// Returns the unused part of the window.
+    fn reserved(&self) -> Cost {
+        self.window
+            .as_ref()
+            .map_or_else(Cost::default, |window| window.reserved)
+    }
+
+    /// Returns the room's terms: `held + reserved + promised + free` is the room, and `free` is
+    /// what is left of it, never below nothing. A write that is waiting for its later entry is
+    /// counted in both `held` and `promised` until its guard drops, so the sum can read above the
+    /// room by that entry and no more; the worker's own storage never does.
+    #[must_use]
+    pub fn ledger(&self) -> Ledger {
+        let held = self.held_for_the_terminal();
+        let reserved = self.reserved();
+        let promised = self.writer.room.promised();
+        Ledger {
+            held,
+            reserved,
+            promised,
+            free: ROOM.minus(held.plus(reserved).plus(promised)),
+            outstanding: self
+                .window
+                .as_ref()
+                .map_or_else(Cost::default, |window| window.outstanding.get()),
+        }
     }
 
     /// Returns the counter holding the current lease's share of the queue.
@@ -820,6 +886,9 @@ impl InputDomain {
     pub(crate) fn close_framing_for_takeover(&mut self) -> TakeoverFraming {
         self.held_input_deadline = None;
         self.held_input_utc_deadline = None;
+        // The prefix goes, so the claim that paid for its later entry has nothing left to pay for.
+        // Dropping the guard takes no lock; the end of this hold carries out the top-up it asks for.
+        self.held_guard = None;
         self.framer.close_for_takeover()
     }
 
@@ -840,6 +909,9 @@ impl InputDomain {
         self.publish_lease();
         let left = self.writer.queued_lease_bytes.take(self.lease.epoch()) as u64;
         drop(boundary);
+        // The window moves with the lease, in this hold: the old epoch's window ends and the new
+        // holder's lane, if it has one, gets the next.
+        self.move_window(left);
         LeaseEnded {
             left,
             paste_open_for,
@@ -861,7 +933,7 @@ impl InputDomain {
         // the fence as it stands rather than the change that queued the notice.
         if !self.writer.lease_change_queued.swap(true, Ordering::AcqRel) {
             self.pending
-                .push_back(Queued::Batch(InputBatch::LeaseChanged));
+                .push_back(Queued::Batch(Carried::plain(InputBatch::LeaseChanged)));
         }
     }
 
@@ -1049,23 +1121,34 @@ impl InputDomain {
     /// the same counter: charging only some of them would make the count drift down until it
     /// stopped bounding anything.
     pub(crate) fn queue_input(&mut self, batch: InputBatch) {
-        self.queue_input_at(self.pending.len(), batch);
+        self.queue_carried_at(self.pending.len(), Carried::plain(batch));
     }
 
     /// Queues one batch at a place in the queue for the terminal, counted as [`Self::queue_input`]
-    /// counts it.
-    fn queue_input_at(&mut self, at: usize, batch: InputBatch) {
-        self.writer.room.charge(&batch);
-        if let InputBatch::Lease { epoch, .. } = batch {
-            self.writer.queued_lease_bytes.add(epoch, batch.len());
+    /// counts it. A batch that already owes the room, because the machine released it behind a
+    /// step of the session's, is not charged a second time.
+    fn queue_carried_at(&mut self, at: usize, mut carried: Carried) {
+        self.start_debt(&mut carried);
+        if let InputBatch::Lease { epoch, .. } = carried.batch {
+            self.writer
+                .queued_lease_bytes
+                .add(epoch, carried.batch.len());
             #[cfg(feature = "testing")]
             self.writer.terminal_writes.queued_a_lease_batch();
         }
-        self.pending.insert(at, Queued::Batch(batch));
+        self.pending.insert(at, Queued::Batch(carried));
+    }
+
+    /// Charges the room for a batch, once: from here on the batch owes it, wherever it waits.
+    fn start_debt(&self, carried: &mut Carried) {
+        if carried.debt.is_none() {
+            carried.debt = Some(self.writer.room.charge(&carried.batch));
+        }
     }
 
     /// Takes the batches that may be written to the pseudo-terminal now, in the order they were
-    /// queued.
+    /// queued. Each carries what it owes the room and the guard of its write, which stay owed until
+    /// the batch is dropped.
     ///
     /// It stops at a published fence the bridge's writer has not written yet, while the machine
     /// still holds that fence, and leaves it and everything behind it queued. A reader takes what is
@@ -1080,7 +1163,7 @@ impl InputDomain {
     ///
     /// When the writer reports the fence written, its connection ends and the loss has been
     /// recorded, or the machine drops the fence, the next flush takes what was waiting.
-    pub fn take_pending(&mut self) -> Vec<InputBatch> {
+    pub fn take_pending(&mut self) -> Vec<Carried> {
         let mut taken = Vec::new();
         while let Some(queued) = self.pending.pop_front() {
             match queued {
@@ -1144,13 +1227,14 @@ impl InputDomain {
     /// asks questions without reading the answers cannot fill the terminal by itself, and the whole
     /// room, in entries and in bytes, so its share cannot be spent on top of a full queue. What the
     /// root editor's machine is holding counts towards the second, because it is accepted input on
-    /// its way to the same terminal. The whole room also leaves what the recogniser can still
+    /// its way to the same terminal, as do the room the window keeps back for its lane and what
+    /// accepted writes may still add. The whole room also leaves what the recogniser can still
     /// release: one more place and the longest delimiter, as a person's keys do.
     ///
     /// The lane keeps every answer past the allowance, under its own deadline, and the pump gives it
     /// up when the writer has given room back.
     pub(crate) fn reply_allowance(&self) -> DrainBudget {
-        let held = self.held_for_the_terminal();
+        let held = self.committed();
         let kept = Cost::claimed_by(0);
         // The share's own count of bytes is what the answers hold, queued and neither written nor
         // dropped. The queue holds more than that: the keystrokes a takeover made stale stay in it
@@ -1208,7 +1292,15 @@ impl InputDomain {
                     .pending
                     .iter()
                     .rev()
-                    .take_while(|queued| matches!(queued, Queued::Batch(InputBatch::Reply { .. })))
+                    .take_while(|queued| {
+                        matches!(
+                            queued,
+                            Queued::Batch(Carried {
+                                batch: InputBatch::Reply { .. },
+                                ..
+                            })
+                        )
+                    })
                     .count();
                 (trailing > 0).then(|| self.pending.len() - trailing)
             })
@@ -1225,11 +1317,7 @@ impl InputDomain {
                     .saturating_add(reply.bytes.len())
                     <= MAX_PENDING_REPLY_BYTES
                     && self.writer.room.held_replies() < MAX_PENDING_REPLY_FRAMES
-                    && admit(
-                        self.held_for_the_terminal(),
-                        Cost::claimed_by(reply.bytes.len()),
-                    )
-                    .is_ok(),
+                    && admit(self.committed(), Cost::claimed_by(reply.bytes.len()),).is_ok(),
                 "the response lane gave up an answer that has no room"
             );
             queued_bytes = queued_bytes.saturating_add(reply.bytes.len() as u64);
@@ -1237,13 +1325,15 @@ impl InputDomain {
                 .unwritten_replies
                 .fetch_add(reply.bytes.len(), Ordering::AcqRel);
             let cursor_report = reply.cursor_report;
+            // A reply adds no promise: nothing is accepted after it that it could pay for, it goes
+            // through no recogniser, and it carries no guard. The room it needs is checked above.
             let batch = InputBatch::Reply {
                 bytes: reply.bytes,
                 expires_at_ms: reply.expires_at_ms,
             };
             match ahead_of_replies {
                 Some(at) if cursor_report => {
-                    self.queue_input_at(at, batch);
+                    self.queue_carried_at(at, Carried::plain(batch));
                     ahead_of_replies = Some(at + 1);
                 }
                 _ => self.queue_input(batch),
@@ -1386,6 +1476,7 @@ impl InputDomain {
             Entering::Bytes(bytes),
             authority,
             now,
+            None,
         )
     }
 
@@ -1397,6 +1488,10 @@ impl InputDomain {
     /// comes before the write takes its sequence number: a write refused for being too long, for an
     /// encoding that key records cannot express, for want of room or because the managed session is
     /// not yet taking input takes no number, and the same one is accepted when it is offered again.
+    ///
+    /// A frame of a lane (`lane` names it) is also refused when the lane or its parent has ended,
+    /// and its claim is paid by the lane's reservation alone: a claim above what is reserved is a
+    /// breach of the credit the worker gave, the lane ends, and nothing is accepted.
     ///
     /// # Errors
     ///
@@ -1414,6 +1509,7 @@ impl InputDomain {
         entering: Entering<'_>,
         authority: InputAuthority,
         now: Instant,
+        lane: Option<LaneId>,
     ) -> Result<Accepted> {
         let authority_deadline_boot_ms = authority.boot_ms;
         if !self.state.accepts_input() {
@@ -1446,8 +1542,21 @@ impl InputDomain {
         // claims is what the worker will hold for it, which is the bytes it spells and not the
         // size it came in, and a push can also release a prefix the recogniser was holding, which
         // is why the claim is a little longer than the frame.
-        admit(self.held_for_the_terminal(), Cost::claimed_by(bytes.len()))
-            .map_err(|bound| WorkerError::InputRoomFull { bound })?;
+        let claim = Cost::claimed_by(bytes.len());
+        let window = match lane {
+            // A frame of the window's lane is admitted by its claim against what is reserved and
+            // by nothing else: it spends the reservation, so running `admit` as well would count
+            // the claim twice, and at a full room it would refuse the frame the credit was given
+            // for.
+            Some(id) => Some(self.lane_admission(id, epoch, claim)?),
+            None => {
+                // Every other write, a local client's or a frame of an epoch the lease check
+                // would have refused, is admitted against everything the room has committed.
+                admit(self.committed(), claim)
+                    .map_err(|bound| WorkerError::InputRoomFull { bound })?;
+                None
+            }
+        };
         if !self.accepts_external_input() {
             // Section 7 paragraph 4: in managed mode nothing external reaches the terminal until
             // the private reader and pre-EOF bridge are authenticated and ABI-checked. The refusal
@@ -1463,6 +1572,25 @@ impl InputDomain {
         lease_refusal(self.lease.accept_write(attachment_id, epoch, sequence))?;
         let gate_was_open = self.gate_is_open();
         let outcome = self.framer.push(bytes, now);
+        // What this write is charged now is the one entry it forwards, whether the queue or the
+        // machine holds it; the rest of its claim is promised, for the later entry of a prefix the
+        // recogniser holds back. Every piece of the write carries the guard, and the claim returns
+        // when the last of them is done with.
+        let charged = if outcome.forward.is_empty() {
+            Cost::default()
+        } else {
+            Cost {
+                frames: 1,
+                bytes: outcome.forward.len(),
+            }
+        };
+        let window = window.map(|counter| {
+            if let Some(window) = self.window.as_mut() {
+                window.reserved = window.reserved.minus(claim);
+            }
+            counter
+        });
+        let guard = ClaimGuard::new(&self.writer.room, claim, charged, window);
         let mut owed = Vec::new();
         // The recogniser can hold bytes back, so what this push forwards may carry bytes an
         // earlier write handed over. Whichever authority ends first is the one that decides: an
@@ -1485,13 +1613,21 @@ impl InputDomain {
                 authority_deadline_boot_ms: admitted,
                 authority_utc_deadline_ms: admitted_utc,
             };
-            self.offer(attachment_id, epoch, batch, &mut owed)?;
+            self.offer(
+                attachment_id,
+                epoch,
+                Carried::guarded(batch, Some(Arc::clone(&guard))),
+                &mut owed,
+            )?;
         }
         // What is still held is a suffix of the prefix that was held and the bytes this write
         // added. Longer than this write means it still carries bytes an earlier one handed over,
         // and then the earlier authority is part of it; no longer than this write means every
         // byte in it is this write's, and an earlier deadline has nothing to do with it. Nothing
         // held means nothing to fence later.
+        // The prefix is paid for by this write's claim, which is longer than any prefix: the guard
+        // of an earlier write that left bytes in it is let go.
+        self.held_guard = (outcome.held > 0).then(|| Arc::clone(&guard));
         self.held_input_deadline = if outcome.held == 0 {
             None
         } else if outcome.held > bytes.len() {
@@ -1535,11 +1671,11 @@ impl InputDomain {
         &mut self,
         attachment_id: AttachmentId,
         epoch: u64,
-        batch: InputBatch,
+        batch: Carried,
         owed: &mut Vec<Step>,
     ) -> Result<()> {
         let Some(driver) = self.fence.as_mut() else {
-            self.queue_input(batch);
+            self.queue_carried_at(self.pending.len(), batch);
             return Ok(());
         };
         if !driver.phase().accepts_external_input() {
@@ -1573,17 +1709,23 @@ impl InputDomain {
                 // the recogniser promised, and it is at most one delimiter long. It still goes
                 // through the machine, because a reader transition that is holding what came before
                 // it must hold this too, and it still carries the authority it was accepted under.
+                // The prefix's guard goes with it into the batch, or is dropped with the prefix
+                // when nothing holds the keys.
+                let guard = self.held_guard.take();
                 if let Some(holder) = self.lease.holder() {
                     let _ = self.offer(
                         holder,
                         epoch,
-                        InputBatch::Lease {
-                            epoch,
-                            bytes,
-                            paste: PasteTransition::default(),
-                            authority_deadline_boot_ms: self.held_input_deadline,
-                            authority_utc_deadline_ms: self.held_input_utc_deadline,
-                        },
+                        Carried::guarded(
+                            InputBatch::Lease {
+                                epoch,
+                                bytes,
+                                paste: PasteTransition::default(),
+                                authority_deadline_boot_ms: self.held_input_deadline,
+                                authority_utc_deadline_ms: self.held_input_utc_deadline,
+                            },
+                            guard,
+                        ),
                         &mut owed,
                     );
                 }
@@ -1626,19 +1768,24 @@ impl InputDomain {
             // with it. Writing them now would put an ended actor's input in front of the next one.
             self.held_input_deadline = None;
             self.held_input_utc_deadline = None;
+            self.held_guard = None;
             return (owed, false);
         };
         let epoch = self.lease.epoch();
+        let guard = self.held_guard.take();
         let _ = self.offer(
             holder,
             epoch,
-            InputBatch::Lease {
-                epoch,
-                bytes: released,
-                paste: PasteTransition::default(),
-                authority_deadline_boot_ms: self.held_input_deadline,
-                authority_utc_deadline_ms: self.held_input_utc_deadline,
-            },
+            Carried::guarded(
+                InputBatch::Lease {
+                    epoch,
+                    bytes: released,
+                    paste: PasteTransition::default(),
+                    authority_deadline_boot_ms: self.held_input_deadline,
+                    authority_utc_deadline_ms: self.held_input_utc_deadline,
+                },
+                guard,
+            ),
             &mut owed,
         );
         self.held_input_deadline = None;
@@ -1815,7 +1962,7 @@ impl InputDomain {
         let mut behind_a_session_step = false;
         for step in effects.steps {
             if behind_a_session_step {
-                applied.owed.push(step);
+                applied.owed.push(self.counted(step));
             } else if let Err(step) = self.carry_out_step(step, &mut applied.outcome) {
                 behind_a_session_step = !matches!(step, Step::EditorBusy(_));
                 // An attachment that is going is not typed at from this moment, whoever else takes
@@ -1827,6 +1974,18 @@ impl InputDomain {
             }
         }
         applied
+    }
+
+    /// Counts what a step the session will carry out later holds, from now.
+    ///
+    /// A batch the machine released stops being counted in its hold in the same breath, so one
+    /// that waits behind a step of the session's is charged here, where it would otherwise be
+    /// counted nowhere until the session queues it.
+    fn counted(&self, mut step: Step) -> Step {
+        if let Step::Write(carried) = &mut step {
+            self.start_debt(carried);
+        }
+        step
     }
 
     /// Carries out one step of the machine's action list that the input domain can, and hands the
@@ -1843,7 +2002,7 @@ impl InputDomain {
         outcome: &mut FenceOutcome,
     ) -> std::result::Result<(), Step> {
         match step {
-            Step::Write(batch) => self.queue_input(batch),
+            Step::Write(batch) => self.queue_carried_at(self.pending.len(), batch),
             Step::Publish(fence) => {
                 if let Some(frame) = self
                     .fence
@@ -1871,6 +2030,266 @@ impl InputDomain {
     }
 }
 
+/// The input lane: its registry, its window and the top-up.
+impl InputDomain {
+    /// Binds a lane for an attachment under its parent connection, in one hold of the domain.
+    ///
+    /// The bind refuses when the parent's withdrawal has begun and not ended (the mark), and when
+    /// `parent_live` says the parent no longer owns the attachment or has been withdrawn. Both are
+    /// read inside this hold, so a lane bound between the first step of a withdrawal and its last
+    /// starts refused rather than live. Nothing here refuses a bind by closing it with a frame:
+    /// the worker closes the link.
+    ///
+    /// A lane that binds after its attachment holds the lease gets its window in this same hold,
+    /// for the current epoch, and the answer carries it. A newer lane of the same attachment
+    /// replaces the older, whose queue is closed, and takes over the window with its outstanding
+    /// claims, so the epoch is not reserved twice. The answer is the first frame in the lane's
+    /// queue, ahead of any credit that follows it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::PermissionDenied`] when the parent is being withdrawn, and what
+    /// `parent_live` returns when it refuses.
+    pub fn bind_lane(
+        &mut self,
+        attachment_id: AttachmentId,
+        parent: ConnectionId,
+        parent_live: impl FnOnce() -> Result<()>,
+    ) -> Result<BoundLane> {
+        if self.parents_closed.contains(&parent) {
+            return Err(WorkerError::PermissionDenied {
+                detail: "the connection this lane belongs to is being withdrawn".to_owned(),
+            });
+        }
+        parent_live()?;
+        let id = LaneId(self.next_lane);
+        self.next_lane += 1;
+        let older: Vec<LaneId> = self
+            .lanes
+            .iter()
+            .filter(|(_, lane)| lane.attachment_id == attachment_id)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut replaced = Vec::new();
+        for old in older {
+            if let Some(lane) = self.lanes.remove(&old) {
+                lane.queue.close();
+                replaced.push(lane.queue);
+            }
+            if let Some(window) = self.window.as_mut().filter(|window| window.lane == old) {
+                window.lane = id;
+            }
+        }
+        let queue = Arc::new(LaneQueue::default());
+        self.lanes.insert(
+            id,
+            Lane {
+                attachment_id,
+                parent,
+                parent_ok: true,
+                queue: Arc::clone(&queue),
+            },
+        );
+        let holder = self.lease.holder() == Some(attachment_id);
+        if holder && self.window.is_none() {
+            self.start_window(id);
+        }
+        let granted = self
+            .window
+            .as_ref()
+            .filter(|_| holder)
+            .map_or_else(Cost::default, |window| window.reserved);
+        let ready = InputLaneReady {
+            epoch: InputLeaseEpoch::new(self.lease.epoch()),
+            holder,
+            frames: u32::try_from(granted.frames).unwrap_or(u32::MAX),
+            bytes: U64::new(granted.bytes as u64),
+        };
+        queue.push_frame(ControlFrame::InputLaneReady(ready.clone()));
+        Ok(BoundLane {
+            id,
+            queue,
+            ready,
+            replaced,
+        })
+    }
+
+    /// The first step of a parent's withdrawal: marks it, refuses every frame of its lanes from
+    /// now, ends their windows and tells their links to close.
+    pub fn close_parent(&mut self, parent: ConnectionId) {
+        self.parents_closed.insert(parent);
+        let ended: Vec<LaneId> = self
+            .lanes
+            .iter_mut()
+            .filter(|(_, lane)| lane.parent == parent)
+            .map(|(id, lane)| {
+                lane.parent_ok = false;
+                lane.queue.close();
+                *id
+            })
+            .collect();
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|window| ended.contains(&window.lane))
+        {
+            self.window = None;
+        }
+    }
+
+    /// The last step of a parent's withdrawal, after its latch is set: the mark is gone, because
+    /// from here the latch alone refuses a bind.
+    pub fn parent_withdrawn(&mut self, parent: ConnectionId) {
+        self.parents_closed.remove(&parent);
+    }
+
+    /// Ends a lane: its frames are refused, its window returns to the room and its link closes.
+    /// The claims of frames already accepted stay with their guards until the writer is done.
+    pub fn end_lane(&mut self, id: LaneId) {
+        if let Some(lane) = self.lanes.remove(&id) {
+            lane.queue.close();
+        }
+        if self.window.as_ref().is_some_and(|window| window.lane == id) {
+            self.window = None;
+        }
+    }
+
+    /// Returns the attachment a lane carries the typing of.
+    #[must_use]
+    pub fn lane_attachment(&self, id: LaneId) -> Option<AttachmentId> {
+        self.lanes.get(&id).map(|lane| lane.attachment_id)
+    }
+
+    /// Returns how many lanes are bound.
+    #[must_use]
+    pub fn lane_count(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Queues a frame on a lane behind everything already queued there. The answer to a lane's
+    /// `input.write` goes through here, in the hold that accepted the frame, so that the notice
+    /// that an epoch ended cannot overtake the answers of that epoch.
+    pub fn lane_answer(&self, id: LaneId, frame: ControlFrame) {
+        if let Some(lane) = self.lanes.get(&id) {
+            lane.queue.push_frame(frame);
+        }
+    }
+
+    /// Admits a frame of a lane against the window, and returns the counter of that window.
+    fn lane_admission(&mut self, id: LaneId, epoch: u64, claim: Cost) -> Result<Arc<Outstanding>> {
+        if !self.lanes.get(&id).is_some_and(|lane| lane.parent_ok) {
+            return Err(WorkerError::PermissionDenied {
+                detail: "this input lane has ended".to_owned(),
+            });
+        }
+        let Some(window) = self
+            .window
+            .as_ref()
+            .filter(|window| window.lane == id && window.epoch == epoch)
+        else {
+            // The lease check has passed, so the lane's view holds the keys and has the window. A
+            // lane that does not is not the one the lease names.
+            return Err(WorkerError::LeaseLost);
+        };
+        if !claim.within(window.reserved) {
+            self.end_lane(id);
+            return Err(WorkerError::ResourceUnavailable {
+                detail: "lane credit breach: a frame claimed more than the worker's credit"
+                    .to_owned(),
+            });
+        }
+        Ok(Arc::clone(&window.outstanding))
+    }
+
+    /// Starts the window of a lane for the current epoch with what the room has free.
+    fn start_window(&mut self, lane: LaneId) {
+        let free = ROOM.minus(self.committed());
+        self.window = Some(Window {
+            lane,
+            epoch: self.lease.epoch(),
+            reserved: LANE_WINDOW.least(free),
+            outstanding: Arc::new(Outstanding::default()),
+        });
+    }
+
+    /// Moves the window with the lease, in the hold that ended the lease: the old epoch's window
+    /// ends, its lane is told so with what the lease left unwritten, and the new holder's lane, if
+    /// it has one, gets the window of the new epoch. Nothing of one epoch is charged to the other.
+    fn move_window(&mut self, left: u64) {
+        if let Some(old) = self.window.take()
+            && let Some(lane) = self.lanes.get(&old.lane)
+        {
+            let epoch = InputLeaseEpoch::new(old.epoch);
+            lane.queue.push_window(LaneWindow {
+                epoch,
+                holder: false,
+                frames: 0,
+                bytes: U64::new(0),
+                ended: Nullable::some(LaneEnded {
+                    epoch,
+                    fenced_bytes: U64::new(left),
+                }),
+            });
+        }
+        let Some(holder) = self.lease.holder() else {
+            return;
+        };
+        let Some(id) = self
+            .lanes
+            .iter()
+            .find(|(_, lane)| lane.attachment_id == holder && lane.parent_ok)
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        self.start_window(id);
+        if let (Some(window), Some(lane)) = (self.window.as_ref(), self.lanes.get(&id)) {
+            lane.queue.push_window(LaneWindow {
+                epoch: InputLeaseEpoch::new(window.epoch),
+                holder: true,
+                frames: u32::try_from(window.reserved.frames).unwrap_or(u32::MAX),
+                bytes: U64::new(window.reserved.bytes as u64),
+                ended: Nullable::null(),
+            });
+        }
+    }
+
+    /// Tops the window up: the request is taken before the counters are read, so a give-back that
+    /// lands after the read asks again.
+    pub fn top_up(&mut self) {
+        let _ = self.writer.room.topup().take();
+        self.top_up_taken();
+    }
+
+    /// Tops the window up once the request has been taken.
+    ///
+    /// The window is meant to hold `LANE_WINDOW` less the claims still outstanding. What is
+    /// reserved moves up to that, by as much as the room has free, and the difference is credit
+    /// for the host, queued in this hold behind everything queued before it. Nothing is added
+    /// except through here, so the reservation cannot pass the bound.
+    fn top_up_taken(&mut self) {
+        let free = ROOM.minus(self.committed());
+        let Some(window) = self.window.as_mut() else {
+            return;
+        };
+        let target = LANE_WINDOW.minus(window.outstanding.get());
+        let add = target.minus(window.reserved).least(free);
+        if add == Cost::default() {
+            return;
+        }
+        window.reserved = window.reserved.plus(add);
+        let epoch = InputLeaseEpoch::new(window.epoch);
+        let lane = window.lane;
+        if let Some(lane) = self.lanes.get(&lane) {
+            lane.queue.push_credit(LaneCredit {
+                epoch,
+                frames: u32::try_from(add.frames).unwrap_or(u32::MAX),
+                bytes: U64::new(add.bytes as u64),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1879,6 +2298,15 @@ mod tests {
 
     fn domain() -> InputDomain {
         InputDomain::new(SessionId::new(kr_ipc::new_uuid()))
+    }
+
+    /// What the domain would hand the writer, as plain batches.
+    fn taken(input: &mut InputDomain) -> Vec<InputBatch> {
+        input
+            .take_pending()
+            .into_iter()
+            .map(Carried::into_batch)
+            .collect()
     }
 
     fn batch(bytes: &[u8]) -> InputBatch {
@@ -1897,9 +2325,9 @@ mod tests {
         let removed = AttachmentId::new(kr_ipc::new_uuid());
         let effects = Effects {
             steps: vec![
-                Step::Write(batch(b"before")),
+                Step::Write(Carried::plain(batch(b"before"))),
                 Step::RemoveAttachment(removed),
-                Step::Write(batch(b"after")),
+                Step::Write(Carried::plain(batch(b"after"))),
                 Step::Interrupt(kr_protocol::input::InterruptAction::NativeInterrupt),
             ],
             ..Effects::default()
@@ -1908,7 +2336,7 @@ mod tests {
         let applied = input.apply_effects(effects);
 
         assert_eq!(
-            input.take_pending(),
+            taken(&mut input),
             vec![batch(b"before")],
             "only what the machine ordered before the session's step is queued here"
         );
@@ -1955,8 +2383,7 @@ mod tests {
             expires_at_ms: None,
         }]);
 
-        let queued: Vec<InputBatch> = input
-            .take_pending()
+        let queued: Vec<InputBatch> = taken(&mut input)
             .into_iter()
             .filter(|batch| matches!(batch, InputBatch::Reply { .. }))
             .collect();
@@ -2012,7 +2439,9 @@ mod tests {
         // Bytes: what is free is what a reply and one delimiter need, to the byte.
         let mut input = domain();
         input.queue_input(keys(MAX_QUEUED_INPUT_BYTES - delimiter - 4));
-        let _ = input.take_pending();
+        // With the writer: what a batch owes the room travels with it, so the room stays charged
+        // for as long as the batch is held.
+        let with_the_writer = input.take_pending();
         assert_eq!(
             input.reply_allowance().bytes,
             4,
@@ -2024,7 +2453,7 @@ mod tests {
         for _ in 0..MAX_QUEUED_INPUT_FRAMES - 2 {
             input.queue_input(keys(1));
         }
-        let _ = input.take_pending();
+        let still_with_the_writer = input.take_pending();
         assert_eq!(input.reply_allowance().replies, 1, "one more entry fits");
         let _ = input.queue_replies(vec![reply(1)]);
         assert_eq!(
@@ -2033,6 +2462,7 @@ mod tests {
             "the entry that is left is the one kept for the recogniser"
         );
         assert!(input.input_room().held().frames <= MAX_QUEUED_INPUT_FRAMES);
+        drop((with_the_writer, still_with_the_writer));
     }
 
     /// KR-REQ-08.48: a reply bypasses the paste recogniser. Bytes of a reply that the recogniser
@@ -2062,7 +2492,7 @@ mod tests {
                 "{text:?} is held in the recogniser as the start of a frame"
             );
             assert_eq!(
-                input.take_pending(),
+                taken(&mut input),
                 vec![batch(text)],
                 "{text:?} is queued whole and as the host's own"
             );
@@ -2135,9 +2565,9 @@ mod tests {
         let holder = AttachmentId::new(kr_ipc::new_uuid());
         let effects = Effects {
             steps: vec![
-                Step::Write(batch(b"released")),
+                Step::Write(Carried::plain(batch(b"released"))),
                 editor_busy(holder),
-                Step::Write(batch(b"typed")),
+                Step::Write(Carried::plain(batch(b"typed"))),
             ],
             ..Effects::default()
         };
@@ -2145,7 +2575,7 @@ mod tests {
         let applied = input.apply_effects(effects);
 
         assert_eq!(
-            input.take_pending(),
+            taken(&mut input),
             vec![batch(b"released"), batch(b"typed")],
             "every byte is queued in the machine's order"
         );
@@ -2210,7 +2640,7 @@ mod tests {
             steps: vec![
                 editor_busy(removed),
                 Step::RemoveAttachment(removed),
-                Step::Write(batch(b"after")),
+                Step::Write(Carried::plain(batch(b"after"))),
             ],
             ..Effects::default()
         };
@@ -2257,3 +2687,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lane_tests;

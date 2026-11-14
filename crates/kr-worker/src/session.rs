@@ -3193,8 +3193,17 @@ impl Session {
     ///
     /// When the writer reports the fence written, its connection ends and the loss has been
     /// recorded, or the machine drops the fence, the next flush takes what was waiting.
+    ///
+    /// The batches are handed out plain. Nothing here writes them, so the room stays charged for
+    /// what is taken until [`crate::testing::settle_written_input`] gives it back, as the terminal's
+    /// writer gives back what it has written; the guard of each write goes as the batch is taken.
     pub fn take_pending_input(&mut self) -> Vec<InputBatch> {
-        self.input.lock().take_pending()
+        self.input
+            .lock()
+            .take_pending()
+            .into_iter()
+            .map(crate::input_room::Carried::into_batch_still_charged)
+            .collect()
     }
 
     /// Returns how many batches wait in the queue for the terminal behind a published fence that

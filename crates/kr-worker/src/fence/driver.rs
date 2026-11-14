@@ -37,7 +37,7 @@ use kr_shell_integration::contract::transport::{
 use kr_shell_integration::host::phase::PhaseGate;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 
-use crate::session::InputBatch;
+use crate::input_room::Carried;
 
 /// How long a published fence may wait for the connection's writer before the connection is
 /// treated as lost.
@@ -162,7 +162,7 @@ pub enum LaunchAnswer {
 #[derive(Debug)]
 pub enum Step {
     /// Queue a batch for the pseudo-terminal.
-    Write(InputBatch),
+    Write(Carried),
     /// Publish a fence to the bridge.
     ///
     /// Everything the session queues for the terminal after it waits until the connection's writer
@@ -270,7 +270,9 @@ enum Context {
 /// One batch the worker is holding for a reader transition.
 #[derive(Debug)]
 struct Held {
-    batch: InputBatch,
+    /// The batch, with the guard of the write it came from: the claim stays promised while the
+    /// machine holds it, and returns if the machine discards it.
+    batch: Carried,
     bytes: u64,
     /// Whether these bytes are charged against the session's input budget.
     ///
@@ -748,7 +750,7 @@ impl FenceDriver {
         &mut self,
         attachment_id: AttachmentId,
         epoch: InputLeaseEpoch,
-        batch: InputBatch,
+        batch: Carried,
     ) -> Effects {
         let bytes = batch.len() as u64;
         let input = self.name_batch();
@@ -760,15 +762,20 @@ impl FenceDriver {
                 charged: false,
             },
         );
-        self.apply(
+        let effects = self.apply(
             &Stimulus::InputArrived(InputArrived {
-                input,
+                input: input.clone(),
                 attachment_id,
                 epoch,
                 bytes: U64::new(bytes),
             }),
             Context::Other,
-        )
+        );
+        // A batch the machine refuses is nobody's: it is not kept, and its guard goes with it.
+        if effects.input_refused.is_some() {
+            self.hold.remove(&input);
+        }
+        effects
     }
 
     /// Reports that the host queued its own answer to the application for the terminal.
@@ -1562,6 +1569,7 @@ mod tests {
     use kr_transport::clock::ManualClock;
 
     use super::*;
+    use crate::session::InputBatch;
 
     fn session() -> SessionId {
         SessionId::new(Uuid::from_bytes([0x37; 16]))
@@ -1904,13 +1912,13 @@ mod tests {
         let held = driver.input_arrived(
             lease().holder.expect("a holder"),
             InputLeaseEpoch::new(1),
-            InputBatch::Lease {
+            Carried::plain(InputBatch::Lease {
                 epoch: 1,
                 bytes: b"held".to_vec(),
                 paste: crate::session::PasteTransition::default(),
                 authority_deadline_boot_ms: None,
                 authority_utc_deadline_ms: None,
-            },
+            }),
         );
         assert_eq!(
             held.held_added, 4,

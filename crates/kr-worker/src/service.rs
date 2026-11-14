@@ -78,6 +78,7 @@ use crate::session::GrantedInput;
 use crate::session::Session;
 use crate::trace::Site;
 
+mod input_lane;
 mod overtake;
 
 /// How often the worker replaces a live connection's action window.
@@ -241,6 +242,10 @@ struct Authority {
     bound_connection: Option<ConnectionId>,
     /// The proxy connections of that same generation.
     proxy_connections: std::collections::BTreeSet<ConnectionId>,
+    /// The input lanes of that same generation. A lane has its own set, filled when it presents
+    /// its token and emptied with the proxies by a replacement generation, so that fencing a
+    /// generation fences every lane it opened.
+    input_connections: std::collections::BTreeSet<ConnectionId>,
     /// The connection the control daemon reads this session's attention sources over.
     ///
     /// There is one: a newer one replaces it, and a replacement generation fences it with the
@@ -1217,6 +1222,7 @@ impl WorkerService {
                 accepted_generation: Some(binding.controller_generation),
                 bound_connection: None,
                 proxy_connections: std::collections::BTreeSet::new(),
+                input_connections: std::collections::BTreeSet::new(),
                 attention_connection: None,
                 descriptions_connection: None,
                 checks_connection: None,
@@ -3316,7 +3322,11 @@ impl WorkerService {
                         // closed instead, so the daemon opens the next at once rather than waiting
                         // out a request this connection will never answer.
                         if state.facts.controller
-                            && state.facts.controller_role == ControllerConnectionRole::Attention
+                            && matches!(
+                                state.facts.controller_role,
+                                ControllerConnectionRole::Attention
+                                    | ControllerConnectionRole::ProxyInput
+                            )
                         {
                             break;
                         }
@@ -3607,6 +3617,18 @@ impl WorkerService {
                     }
                     sent
                 });
+            }
+            // A lane that has just been bound is written by a task of its own, which drains the
+            // lane's ordered queue: nothing else writes a frame on a lane but this loop's
+            // keepalive.
+            if let Some(queue) = state.pending_lane.take() {
+                tokio::spawn(Arc::clone(&self).write_lane(
+                    queue,
+                    writable.clone(),
+                    Arc::clone(&writer),
+                    Arc::clone(&withdrawn),
+                    connection_id,
+                ));
             }
             // An admitted operation the upstream has not answered is answered on its own task for
             // the same reason: the transport work is the upstream's, and this loop owes the same
@@ -4103,12 +4125,22 @@ impl WorkerService {
         if let Some(task) = state.page_task.take() {
             task.abort();
         }
+        // The first step, before the attachment list is taken: the lanes this connection is the
+        // parent of stop accepting, under the input domain's lock. The mark is removed after the
+        // latch below is set.
+        self.runtime.input().lock().close_parent(connection_id);
+        // A lane ends with its link and detaches nothing: its own list is empty.
+        if let Some(lane) = state.facts.lane.take() {
+            self.runtime.input().lock().end_lane(lane);
+        }
         self.detach_or_owe(state.facts.take_attachments());
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
         // registration.
         self.windows.retire_connection(connection_id);
         self.deregister(connection_id, state.facts.controller);
+        // The last step of this path, after the latch: the mark of the parent's withdrawal is gone.
+        self.runtime.input().lock().parent_withdrawn(connection_id);
         Ok(())
     }
 
@@ -4135,6 +4167,26 @@ impl WorkerService {
         peer: &PeerIdentity,
         message: ControlFrame,
     ) -> Option<ControlFrame> {
+        // An input lane carries its bind and the forwarded `input.write` of its attachment and
+        // nothing else once it speaks for a generation.
+        if state.facts.controller_role == ControllerConnectionRole::ProxyInput
+            && state.facts.controller
+            && !matches!(&message, ControlFrame::InputLane(_))
+            && !matches!(
+                &message,
+                ControlFrame::ForwardedRead(forwarded)
+                    if forwarded.request.method.method() == Some(Method::InputWrite)
+            )
+        {
+            return Some(failure(
+                request_id_of(&message),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "an input lane carries the forwarded input.write of its attachment and \
+                     nothing else",
+                ),
+            ));
+        }
         // The attention connection carries the attention requests and nothing else once it speaks
         // for a generation. It holds no authority to act and forwards no caller, so anything else
         // on it is refused rather than served.
@@ -4266,7 +4318,18 @@ impl WorkerService {
                 (state.pending_launch.is_none() && state.pending_upstream.is_none())
                     .then_some(reply)
             }
-            ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
+            ControlFrame::InputLane(lane)
+                if state.facts.controller_role == ControllerConnectionRole::ProxyInput =>
+            {
+                // Nothing is written here: the answer is the first frame in the lane's queue.
+                self.bind_input_lane(state, &lane);
+                None
+            }
+            ControlFrame::ForwardedRead(forwarded) => {
+                let reply = self.forwarded_read(state, &forwarded);
+                // Every answer on a lane goes through the lane's ordered queue.
+                state.facts.lane.is_none().then_some(reply)
+            }
             ControlFrame::AttentionSources(request) => self.attention_sources(state, request),
             ControlFrame::DescriptionFacts(request) => {
                 self.description_facts_request(state, request)
@@ -5161,17 +5224,6 @@ impl WorkerService {
                 ),
             );
         }
-        // This worker binds no input lane, so it refuses the role and the connection keeps the role
-        // it had.
-        if role == ControllerConnectionRole::ProxyInput {
-            return failure(
-                RequestId::new(0),
-                &ProtocolError::new(
-                    ErrorCode::UnsupportedCapability,
-                    "this worker does not serve an input lane",
-                ),
-            );
-        }
         state.facts.controller_role = role;
         ControlFrame::ControllerRole(role)
     }
@@ -5479,6 +5531,7 @@ impl WorkerService {
                     authority.acknowledged = None;
                     fenced.extend(authority.bound_connection.take());
                     fenced.extend(std::mem::take(&mut authority.proxy_connections));
+                    fenced.extend(std::mem::take(&mut authority.input_connections));
                     fenced.extend(authority.attention_connection.take());
                     fenced.extend(authority.descriptions_connection.take());
                     fenced.extend(authority.checks_connection.take());
@@ -5553,9 +5606,14 @@ impl WorkerService {
                             fenced.push(previous);
                         }
                     }
-                    // `declare_role` refuses this role, so no connection holds it and none can
-                    // present a token under it.
-                    ControllerConnectionRole::ProxyInput => {}
+                    // A lane takes no authority binding either. It is bound to an attachment by
+                    // its first frame, and its frames are fenced by the lease, not by this set
+                    // alone.
+                    ControllerConnectionRole::ProxyInput => {
+                        authority
+                            .input_connections
+                            .insert(state.facts.connection_id);
+                    }
                 }
                 drop(authority);
                 // Refusing a fenced connection's next request is not enough on its own: a
@@ -6191,6 +6249,17 @@ impl WorkerService {
     /// * the attachments are detached, so the connection owns nothing of the session;
     /// * the frozen copy of any recovery it was reading is ended, so its memory goes back.
     fn withdraw(&self, connection_id: ConnectionId) {
+        // The first step: every lane this connection is the parent of stops accepting, in the
+        // input domain, before anything else of the withdrawal. A frame that passed an earlier
+        // check and waited for the domain finds its lane cleared, so it is refused and never
+        // accepted after the withdrawal began. The mark stays until the last step, so a lane that
+        // binds in between starts refused as well.
+        self.runtime.input().lock().close_parent(connection_id);
+        self.withdraw_registration(connection_id);
+        self.runtime.input().lock().parent_withdrawn(connection_id);
+    }
+
+    fn withdraw_registration(&self, connection_id: ConnectionId) {
         // The authority binding goes with the registration. A connection whose registration has
         // been withdrawn must not still be one a generation speaks through.
         self.unbind(connection_id);
@@ -6280,6 +6349,7 @@ impl WorkerService {
             authority.bound_connection = None;
         }
         authority.proxy_connections.remove(&connection_id);
+        authority.input_connections.remove(&connection_id);
         if authority.attention_connection == Some(connection_id) {
             authority.attention_connection = None;
         }
@@ -6435,8 +6505,9 @@ impl WorkerService {
             ControllerConnectionRole::Checks => {
                 authority.checks_connection == Some(facts.connection_id)
             }
-            // No connection holds this role: `declare_role` refuses it.
-            ControllerConnectionRole::ProxyInput => false,
+            ControllerConnectionRole::ProxyInput => {
+                authority.input_connections.contains(&facts.connection_id)
+            }
         };
         if !bound {
             return Err(WorkerError::GenerationFenced {
@@ -6581,7 +6652,15 @@ impl WorkerService {
         // a read whose authority has been withdrawn. It matters most for raw input, which is a
         // write that travels as a request: bytes forwarded under the old revision can still be on
         // the socket when the new one is acknowledged.
-        if let Err(error) = self.check_validated_revision(caller) {
+        //
+        // The frames of an input lane are the one exception. A lane's `input.write` is fenced by
+        // the lease epoch it names: every revocation that uses a revision names the holder and ends
+        // its lease in the hold of the input domain that installs the revision, so a frame of a
+        // holder that a revision reached finds its lease gone and is refused for that. The check
+        // stays on every other path, `input.write` on a proxy link and every mutation among them.
+        if !Self::is_input_lane_write(facts, request)
+            && let Err(error) = self.check_validated_revision(caller)
+        {
             return (
                 held,
                 Err(failure(request.request_id, &error.to_protocol_error())),
@@ -6594,6 +6673,12 @@ impl WorkerService {
             return (held, Err(failure(request.request_id, &unlisted())));
         }
         (held, Ok(Prechecked { method, bounded }))
+    }
+
+    /// Whether a request is the `input.write` of a bound input lane.
+    fn is_input_lane_write(facts: &ConnectionFacts, request: &Request) -> bool {
+        facts.controller_role == ControllerConnectionRole::ProxyInput
+            && request.method.method() == Some(Method::InputWrite)
     }
 
     fn request(
@@ -6662,6 +6747,33 @@ impl WorkerService {
     /// that sets it, and a read served beside the keystroke clears its own when its check fails. A
     /// change that lets the check fail and pass again has to give a keystroke the same clearing.
     fn keystroke(&self, facts: &ConnectionFacts, request: &Request, caller: &Caller) -> Served {
+        let served = self.keystroke_served(facts, request, caller);
+        // Every answer on a lane goes through the lane's ordered queue. A success was queued in
+        // the hold of the input domain that accepted the frame, which is what keeps the notice of
+        // an ended epoch behind the answers of that epoch; a refusal is queued here.
+        if let Some(lane) = facts.lane
+            && !matches!(
+                &served.reply,
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Ok(_),
+                    ..
+                })
+            )
+        {
+            self.runtime
+                .input()
+                .lock()
+                .lane_answer(lane, served.reply.clone());
+        }
+        served
+    }
+
+    fn keystroke_served(
+        &self,
+        facts: &ConnectionFacts,
+        request: &Request,
+        caller: &Caller,
+    ) -> Served {
         // When the request reached this handler. A held prefix's deadline runs from here, so
         // nothing a request waits for on its way to the input domain, the checks of a local owner's
         // access among them, is outside the deadline.
@@ -6677,10 +6789,20 @@ impl WorkerService {
                 };
             }
         };
-        let outcome = self.input_write(facts, &request.params, prechecked.caller(caller), arrived);
+        let outcome = self.input_write(
+            facts,
+            request.request_id,
+            &request.params,
+            prechecked.caller(caller),
+            arrived,
+        );
         // Checked again, as a read's is: a keystroke that passed its check and then waited can
-        // finish after the authority behind it was withdrawn.
-        if let Err(error) = self.check_authority(facts) {
+        // finish after the authority behind it was withdrawn. On a lane an acceptance is never
+        // turned into a refusal: the answer stays `Accepted`, because the frame is in the queue
+        // and its guard is held, and the next frame's check ends the lane.
+        if facts.lane.is_none()
+            && let Err(error) = self.check_authority(facts)
+        {
             return Served {
                 reply: failure(request.request_id, &error.to_protocol_error()),
                 held,
@@ -10771,6 +10893,7 @@ impl WorkerService {
     fn input_write(
         &self,
         facts: &ConnectionFacts,
+        request_id: RequestId,
         params: &ParamsValue,
         caller: &Caller,
         arrived: std::time::Instant,
@@ -10780,7 +10903,11 @@ impl WorkerService {
         // for a moment when a lone Escape arrives, and the application's wait for it, which
         // section 27 puts at no more than the recogniser's deadline, began with the write.
         let params: InputWriteParams = parse(params)?;
-        Self::check_attachment(facts, params.attachment_id)?;
+        // A lane's binding is borrowed from its parent: its own list holds nothing, and the lane
+        // registry, read in the hold below, says which attachment it carries.
+        if facts.lane.is_none() {
+            Self::check_attachment(facts, params.attachment_id)?;
+        }
         // Raw input is its own stream with its own bound. Travelling inside a control frame does
         // not give a keystroke batch the control frame's allowance. Key records are held to the
         // same bound on the bytes they spell, which is checked as they are spelled, under the
@@ -10796,6 +10923,11 @@ impl WorkerService {
                 }
                 crate::input_domain::Entering::Bytes(bytes.as_slice())
             }
+            InputContent::ConsoleKeys { .. } if facts.lane.is_some() => {
+                return Err(WorkerError::InvalidArgument(
+                    "an input lane carries bytes, not console key records".to_owned(),
+                ));
+            }
             InputContent::ConsoleKeys { keys } => {
                 records = keys.iter().copied().map(Into::into).collect();
                 crate::input_domain::Entering::Keys(&records)
@@ -10808,7 +10940,7 @@ impl WorkerService {
         // depends on its order, and a restriction made since the request was admitted still
         // refuses the batch.
         self.check_local_dispatch(facts, Method::InputWrite, caller)?;
-        let (accepted, pump) = {
+        let (result, pump) = {
             let mut acquisition = self.runtime.trace().acquisition(Site::InputAcceptance);
             // The input domain and nothing else: whatever the session is busy with, this write
             // does not wait for it.
@@ -10818,7 +10950,19 @@ impl WorkerService {
             // forwarded batch can wait here while the controller installs a newer authority
             // revision or the grant behind it runs out, and what the domain decides is what
             // actually reaches the application.
-            input.check_validated_revision(caller.validated_revision)?;
+            //
+            // A lane's frame is not checked against the revision: the lease epoch is its fence,
+            // and every revocation that uses a revision ends the lease of the holder it names in
+            // the same hold that installs the revision.
+            if let Some(lane) = facts.lane {
+                if input.lane_attachment(lane) != Some(params.attachment_id) {
+                    return Err(WorkerError::UnknownAttachment {
+                        attachment: params.attachment_id.to_string(),
+                    });
+                }
+            } else {
+                input.check_validated_revision(caller.validated_revision)?;
+            }
             self.check_authority_deadline(caller, params.attachment_id, params.epoch.get())?;
             Self::check_owned_session(input.session_id(), params.session_id)?;
             Self::check_granted(
@@ -10843,6 +10987,7 @@ impl WorkerService {
                     utc_ms: caller.authority_utc_deadline_ms,
                 },
                 arrived,
+                facts.lane,
             )?;
             acquisition.deadline(input.paste_deadline());
             // Handed to the writer while the domain is still held, so two writers cannot
@@ -10855,16 +11000,22 @@ impl WorkerService {
             // those would otherwise wait for its answer until the next byte of output. So would
             // the replies one drain of the lane did not take. Letting them out needs the session,
             // which the pump takes.
-            (accepted, opened_the_gate || owes || input.replies_waiting())
+            let result = encode(&InputWriteResult {
+                sequence: params.sequence,
+                forwarded_bytes: U64::new(accepted.forwarded_bytes),
+                held_prefix_bytes: U64::new(accepted.held_prefix_bytes),
+            });
+            // The answer to a lane's frame is queued in this hold, in the order the ledger changed,
+            // so that the notice that an epoch ended, which a later hold queues, comes after it.
+            if let (Some(lane), Ok(value)) = (facts.lane, result.as_ref()) {
+                input.lane_answer(lane, respond(request_id, Ok(value.clone())));
+            }
+            (result, opened_the_gate || owes || input.replies_waiting())
         };
         if pump {
             self.runtime.input().wake_pump();
         }
-        encode(&InputWriteResult {
-            sequence: params.sequence,
-            forwarded_bytes: U64::new(accepted.forwarded_bytes),
-            held_prefix_bytes: U64::new(accepted.held_prefix_bytes),
-        })
+        result
     }
 
     /// Performs one mutation on the session boundary the caller is already holding.
@@ -11854,8 +12005,11 @@ pub struct ConnectionFacts {
     /// The attachments this connection owns.
     ///
     /// Shared with the connection's registration, so a withdrawal can take them back without
-    /// waiting for this connection's own loop to come back round.
+    /// waiting for this connection's own loop to come back round. An input lane's list stays
+    /// empty: its binding is borrowed from its parent, so its clean-up detaches nothing.
     pub attachments: Arc<Mutex<Vec<AttachmentId>>>,
+    /// The input lane this connection carries, once its first frame has bound it.
+    pub(crate) lane: Option<crate::input_lane::LaneId>,
     /// The host-issued principal this connection acts under.
     ///
     /// It is built from the authenticated operating-system caller. A local caller never asserts
@@ -11875,6 +12029,7 @@ impl ConnectionFacts {
                 ControllerConnectionRole::Attention
                     | ControllerConnectionRole::Descriptions
                     | ControllerConnectionRole::Checks
+                    | ControllerConnectionRole::ProxyInput
             ))
     }
 
@@ -11980,6 +12135,8 @@ pub struct ConnectionState {
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
     pub pending_challenge: Option<ControlFrame>,
+    /// The queue of a lane this connection has just bound, for the task that writes it.
+    pub(crate) pending_lane: Option<Arc<crate::input_lane::LaneQueue>>,
     /// The parts of a snapshot of plugin admissions received so far, applied once all have come.
     pub admissions_parts: Vec<kr_protocol::admission::PluginAdmissions>,
     /// The parts of a report on plugin admissions still to be sent after the current reply.
@@ -12038,6 +12195,7 @@ impl ConnectionState {
                 generation: None,
                 controller_role: ControllerConnectionRole::Authority,
                 attachments,
+                lane: None,
                 actor_id: ActorId::new(format!("local:{}", peer.uid))
                     .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
             },
@@ -12059,6 +12217,7 @@ impl ConnectionState {
             pending_preparation: None,
             pending_delivery: None,
             pending_challenge: None,
+            pending_lane: None,
             admissions_parts: Vec::new(),
             pending_report: Vec::new(),
             pending_statement: None,

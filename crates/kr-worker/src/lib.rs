@@ -73,6 +73,7 @@ pub mod history;
 pub mod history_filter;
 pub mod input;
 pub mod input_domain;
+pub mod input_lane;
 pub mod input_room;
 pub mod journal;
 pub mod launch_surface;
