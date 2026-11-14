@@ -1006,621 +1006,534 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
 /// The variable that names the one directory every test artefact of a run is kept in.
 const VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
 
-/// Each language's one reader of the variable, where its definition is, and the cases that run the
-/// readers with the variable set. They are the files that may read it as they like.
-const READERS: [&str; 7] = [
-    "tests/support/artifacts/src/lib.rs",
-    "scripts/lib/artifacts-dir.sh",
-    "scripts/artifacts-dir.ps1",
-    "apps/companion/e2e/evidence.ts",
-    "tests/conformance/tests/artifacts_readers.rs",
-    "apps/companion/test/artefacts-dir.test.ts",
-    "tests/conformance/tests/ci_evidence.rs",
+/// How a file that holds the name may hold it.
+enum Use {
+    /// A reader of the variable, or this case with its list and samples: the name may stand
+    /// anywhere in the file.
+    Reader,
+    /// A setter or a mention: only the lines listed, each as its text with the white space at both
+    /// ends taken off, with the number of lines that have exactly that text. A line that is not
+    /// listed fails, and so does a listed line that is gone or that stands another number of
+    /// times.
+    Lines(&'static [(&'static str, usize)]),
+}
+
+/// A file that may hold the name, and how.
+struct Listed {
+    path: &'static str,
+    uses: Use,
+}
+
+const fn reader(path: &'static str) -> Listed {
+    Listed {
+        path,
+        uses: Use::Reader,
+    }
+}
+
+const fn lines(path: &'static str, lines: &'static [(&'static str, usize)]) -> Listed {
+    Listed {
+        path,
+        uses: Use::Lines(lines),
+    }
+}
+
+/// Every file of the repository that holds the name, in the order of their paths, with one comment
+/// line for each that says why it may. This is the one place that decides it: a new use of the
+/// variable anywhere, or a changed line that holds the name, is a change to this list.
+const LIST: &[Listed] = &[
+    // Sets the folder in each job's `env:` (a Windows step in `GITHUB_ENV`) and uploads it as `path:`.
+    lines(
+        ".github/workflows/conformance.yml",
+        &[
+            ("KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence", 2),
+            ("path: ${{ env.KR_TEST_ARTIFACTS_DIR }}", 3),
+            (
+                r#""KR_TEST_ARTIFACTS_DIR=$temporary\kr-conformance-evidence" >> $env:GITHUB_ENV"#,
+                1,
+            ),
+        ],
+    ),
+    // Sets the folder in `env:` (Windows in `GITHUB_ENV`, one shell step by `export`), uploads it as `path:`.
+    lines(
+        ".github/workflows/core-ci.yml",
+        &[
+            ("KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts", 2),
+            (
+                r#"# `KR_TEST_ARTIFACTS_DIR`, which "Keep the deployment legs' logs" below uploads, with the"#,
+                1,
+            ),
+            (
+                r#""KR_TEST_ARTIFACTS_DIR=$temporary\kr-test-artifacts" >> $env:GITHUB_ENV"#,
+                1,
+            ),
+            ("path: ${{ env.KR_TEST_ARTIFACTS_DIR }}", 5),
+            ("KR_TEST_ARTIFACTS_DIR: /tmp/kr-shell-qualification", 1),
+            (
+                r#"export KR_TEST_ARTIFACTS_DIR="$RUNNER_TEMP/kr-shell-qualification-second""#,
+                1,
+            ),
+        ],
+    ),
+    // Sets the folder in `GITHUB_ENV` for the Windows steps and uploads it with the log.
+    lines(
+        ".github/workflows/wsl-acceptance.yml",
+        &[
+            (
+                r#""KR_TEST_ARTIFACTS_DIR=$directory" >> $env:GITHUB_ENV"#,
+                1,
+            ),
+            ("${{ env.KR_TEST_ARTIFACTS_DIR }}", 1),
+        ],
+    ),
+    // Reader: the one reader of the variable for TypeScript.
+    reader("apps/companion/e2e/evidence.ts"),
+    // The TypeScript reader's own cases: they set the variable and match its name in the refusal.
+    lines(
+        "apps/companion/test/artefacts-dir.test.ts",
+        &[
+            (
+                "// KR-REQ-27.03: the reader of `KR_TEST_ARTIFACTS_DIR` for TypeScript refuses a value outside this",
+                1,
+            ),
+            ("const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'", 1),
+            (
+                "expect(() => read(elsewhere)).toThrow(/KR_TEST_ARTIFACTS_DIR.*temporary roots/s)",
+                1,
+            ),
+            (
+                "expect(() => read(value)).toThrow(/KR_TEST_ARTIFACTS_DIR.*temporary roots/s)",
+                1,
+            ),
+        ],
+    ),
+    // A comment that says where the run's figures are kept.
+    lines(
+        "crates/kr-term/tests/perf.rs",
+        &[(
+            "/// release run's evidence to be kept. `KR_TEST_ARTIFACTS_DIR` is where this build puts that, and a",
+            1,
+        )],
+    ),
+    // A comment that says where the run's figures are kept.
+    lines(
+        "crates/kr-transport/tests/support/conditions.rs",
+        &[(
+            "/// release run's evidence to be kept. `KR_TEST_ARTIFACTS_DIR` is where this build puts that, and a",
+            1,
+        )],
+    ),
+    // A comment that says where the measurements' record is kept.
+    lines(
+        "crates/kr-worker/benches/input_latency.rs",
+        &[(
+            "/// The record these measurements' figures are kept in, under `KR_TEST_ARTIFACTS_DIR`.",
+            1,
+        )],
+    ),
+    // A comment that says where the suite's record is kept.
+    lines(
+        "crates/kr-worker/tests/performance.rs",
+        &[(
+            "/// The record this suite's figures are kept in, under `KR_TEST_ARTIFACTS_DIR`.",
+            1,
+        )],
+    ),
+    // A document that names the variable where the client suites keep their output.
+    lines(
+        "docs/client/README.md",
+        &[(
+            "under the directory `KR_TEST_ARTIFACTS_DIR` names, so a leg that failed keeps its whole output and",
+            1,
+        )],
+    ),
+    // A document that names the variable where the mobile suites keep their screenshots.
+    lines(
+        "docs/client/mobile.md",
+        &[
+            (
+                "`companion-screenshots` in the directory `KR_TEST_ARTIFACTS_DIR` names. `scripts/check-test-evidence.sh`",
+                1,
+            ),
+            (
+                "the directory `KR_TEST_ARTIFACTS_DIR` names. `KR_IOS_DEVICE` chooses the simulator.",
+                1,
+            ),
+        ],
+    ),
+    // A document that names the variable as the evidence directory of the report and of the workflow.
+    lines(
+        "docs/conformance/README.md",
+        &[
+            (
+                "The evidence directory is `KR_TEST_ARTIFACTS_DIR`, or a new directory under the platform's temporary",
+                1,
+            ),
+            (
+                "step of the report runs with `KR_TEST_ARTIFACTS_DIR` naming the same directory, so what a test",
+                1,
+            ),
+            (
+                "`KR_TEST_ARTIFACTS_DIR` and collected into the CI artifact store. The landing workflow",
+                1,
+            ),
+            (
+                "`KR_TEST_ARTIFACTS_DIR` and uploads that directory: `companion-evidence-<runner>` for the browser",
+                1,
+            ),
+            (
+                "A performance test that records its figure under `KR_TEST_ARTIFACTS_DIR`, as a Markdown section",
+                1,
+            ),
+        ],
+    ),
+    // A document that names the variable where the host suite keeps its evidence.
+    lines(
+        "docs/host/README.md",
+        &[(
+            "`KR_TEST_ARTIFACTS_DIR`, and it asks for no account of any kind. It needs macOS and a person",
+            1,
+        )],
+    ),
+    // A document that names the variable where the performance figures are kept.
+    lines(
+        "docs/performance/README.md",
+        &[
+            (
+                "`kr-controller-reconnect.md` in the directory `KR_TEST_ARTIFACTS_DIR` names, in the form the records below take: the build, the operating system",
+                1,
+            ),
+            (
+                "Every measurement of `scripts/bench-all.sh` writes each figure under `KR_TEST_ARTIFACTS_DIR` as a",
+                1,
+            ),
+        ],
+    ),
+    // A document that names the variable where the qualification keeps its evidence.
+    lines(
+        "docs/shell-integration/qualification.md",
+        &[
+            (
+                "every case. Its evidence goes to the directory `KR_TEST_ARTIFACTS_DIR` names, including",
+                1,
+            ),
+            (
+                "evidence to `KR_TEST_ARTIFACTS_DIR`, or, where that is unset, to a directory it makes for itself in",
+                1,
+            ),
+        ],
+    ),
+    // A document that names the variable where each run writes its figures and its verdict.
+    lines(
+        "docs/terminal/README.md",
+        &[(
+            "Each run writes its host, its figures and its verdict to the directory `KR_TEST_ARTIFACTS_DIR`",
+            1,
+        )],
+    ),
+    // Reader: the one reader of the variable for PowerShell.
+    reader("scripts/artifacts-dir.ps1"),
+    // Comments that say where every measurement writes its figures.
+    lines(
+        "scripts/bench-all.sh",
+        &[
+            (
+                "# Every measurement writes its figures under KR_TEST_ARTIFACTS_DIR as Markdown sections headed by",
+                1,
+            ),
+            (
+                "# KR_TEST_ARTIFACTS_DIR is not set, the run makes a directory of its own and says where it is.",
+                1,
+            ),
+        ],
+    ),
+    // A comment that says which directory holds the collected screenshots.
+    lines(
+        "scripts/check-test-evidence.sh",
+        &[(
+            "# Section 21 collects the screenshots of the tests into one directory, `KR_TEST_ARTIFACTS_DIR`,",
+            1,
+        )],
+    ),
+    // Starts a program with the variable set to the reader's own directory.
+    lines(
+        "scripts/e2e-fence.sh",
+        &[(r#"if ! KR_TEST_ARTIFACTS_DIR="$artifacts" \"#, 1)],
+    ),
+    // Starts the update suite with the variable set to a folder of its own under its work folder.
+    lines(
+        "scripts/e2e-update.sh",
+        &[(
+            r#"KR_E2E_PROGRAMS="$programs" KR_E2E_STATE="$work/state-permissions" KR_TEST_ARTIFACTS_DIR="$work/artifacts" \"#,
+            1,
+        )],
+    ),
+    // Starts the device script with the variable set to a folder under the reader's directory.
+    lines(
+        "scripts/e2e-voice-call-device.sh",
+        &[(
+            r#"KR_HARNESS_PLATFORM="$platform" KR_TEST_ARTIFACTS_DIR="$artefacts" \"#,
+            1,
+        )],
+    ),
+    // A comment that says where every artefact is written.
+    lines(
+        "scripts/e2e-wsl.sh",
+        &[(
+            "# Every artefact is written under the directory KR_TEST_ARTIFACTS_DIR names. The Windows",
+            1,
+        )],
+    ),
+    // Reader: the one reader of the variable for shell.
+    reader("scripts/lib/artifacts-dir.sh"),
+    // Starts the release check with the variable set to a temporary folder it made.
+    lines(
+        "scripts/lib/store-build.sh",
+        &[(
+            r#"KR_TEST_ARTIFACTS_DIR="$evidence" KR_RELEASE_APK="$package" bash "$repository/scripts/e2e-android-release.sh" \"#,
+            1,
+        )],
+    ),
+    // A comment that says where the evidence directory is.
+    lines(
+        "scripts/run-conformance.sh",
+        &[(
+            "# The evidence directory is KR_TEST_ARTIFACTS_DIR, or a new directory under the platform's",
+            1,
+        )],
+    ),
+    // Comments on where the performance figures are recorded and the rule that confines the folder.
+    lines(
+        "tests/conformance/src/evidence.rs",
+        &[
+            (
+                "//! The figures the performance tests record under `KR_TEST_ARTIFACTS_DIR`, and the rule for where",
+                1,
+            ),
+            (
+                "/// files. The rule is the one every reader of `KR_TEST_ARTIFACTS_DIR` applies, from",
+                1,
+            ),
+        ],
+    ),
+    // The report passes the checked evidence directory to each step it starts.
+    lines(
+        "tests/conformance/src/run.rs",
+        &[
+            (
+                "//! evidence directory, `KR_TEST_ARTIFACTS_DIR` naming that directory, so what a test records beside",
+                1,
+            ),
+            (r#".env("KR_TEST_ARTIFACTS_DIR", self.evidence)"#, 1),
+        ],
+    ),
+    // A comment on where a known difference is recorded.
+    lines(
+        "tests/conformance/tests/applications/harness.rs",
+        &[(
+            "/// a section of its own, never as a pass. Where `KR_TEST_ARTIFACTS_DIR` is not set the record is",
+            1,
+        )],
+    ),
+    // The shell and PowerShell readers' own cases: they set the variable and read it back from the child.
+    lines(
+        "tests/conformance/tests/artifacts_readers.rs",
+        &[
+            (
+                "//! KR-REQ-27.03: the readers of `KR_TEST_ARTIFACTS_DIR` for shell and for PowerShell.",
+                1,
+            ),
+            (r#"const VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";"#, 1),
+            (
+                "/// What `KR_TEST_ARTIFACTS_DIR` was once the reader had run.",
+                1,
+            ),
+            (
+                r##"printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)""#,"##,
+                1,
+            ),
+            (
+                r##""exported=$([System.Environment]::GetEnvironmentVariable('KR_TEST_ARTIFACTS_DIR'))""#,"##,
+                1,
+            ),
+        ],
+    ),
+    // Reader: this case: its list and its samples spell the name.
+    reader("tests/conformance/tests/ci_evidence.rs"),
+    // The case sets the variable for the device scripts it starts, under its own temporary folder.
+    lines(
+        "tests/conformance/tests/device_scripts.rs",
+        &[(
+            r#".env("KR_TEST_ARTIFACTS_DIR", root.join("scratch/artefacts"))"#,
+            1,
+        )],
+    ),
+    // The case sets the variable for the program it starts, under its own temporary folder.
+    lines(
+        "tests/conformance/tests/fetch.rs",
+        &[(
+            r#".env("KR_TEST_ARTIFACTS_DIR", self.path("tmp/evidence"))"#,
+            1,
+        )],
+    ),
+    // The case sets the variable for the program it starts, under the temporary folder.
+    lines(
+        "tests/e2e/m1b/tests/origin.rs",
+        &[(r#".env("KR_TEST_ARTIFACTS_DIR", &artefacts)"#, 1)],
+    ),
+    // A comment on where the measured figures are recorded.
+    lines(
+        "tests/perf/src/lib.rs",
+        &[(
+            "//! under `KR_TEST_ARTIFACTS_DIR`, headed by the identifier it measures. [`process`] reads what the",
+            1,
+        )],
+    ),
+    // Comments on where the figures are appended and on an unset run.
+    lines(
+        "tests/perf/src/record.rs",
+        &[
+            (
+                "//! [`report`] prints them and appends them under `KR_TEST_ARTIFACTS_DIR` as one Markdown section",
+                1,
+            ),
+            (
+                "/// A run that has not set `KR_TEST_ARTIFACTS_DIR` keeps the section in a directory of its own under",
+                1,
+            ),
+        ],
+    ),
+    // A comment on where the stress figures are recorded.
+    lines(
+        "tests/perf/tests/stress.rs",
+        &[(
+            "//! Each figure is recorded in `kr-perf-stress.md` under `KR_TEST_ARTIFACTS_DIR`, headed by the",
+            1,
+        )],
+    ),
+    // Reader: the one reader of the variable for Rust.
+    reader("tests/support/artifacts/src/lib.rs"),
 ];
 
-/// The languages whose files may name the variable, each with how its comments are told.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Language {
-    /// Rust: `//` comments and nested `/* */` comments, strings (raw ones too) and characters.
-    Rust,
-    /// JavaScript and TypeScript: `//` and `/* */` comments, strings, template strings and regular
-    /// expressions.
-    Script,
-    /// Code, a workflow or a manifest with `#` comments.
-    Hash,
-    /// Prose, where every line is a comment.
-    Prose,
-}
-
-fn language(path: &str) -> Option<Language> {
-    let extension = path.rsplit_once('.')?.1;
-    match extension {
-        "rs" => Some(Language::Rust),
-        // Not `tsx` or `jsx`: the text of JSX looks like code and is none, and the scan cannot tell
-        // the two apart, so a file of either that names the variable is one the case does not know.
-        "ts" | "js" | "mjs" => Some(Language::Script),
-        "sh" | "bash" | "ps1" | "psm1" | "yml" | "yaml" | "toml" => Some(Language::Hash),
-        "md" => Some(Language::Prose),
-        _ => None,
-    }
-}
-
-/// The characters of a file with the byte each starts at.
-type Chars = [(usize, char)];
-
-/// The character at `at`, or NUL past the end (a file that holds NUL is refused before it is read).
-fn char_at(chars: &Chars, at: usize) -> char {
-    chars.get(at).map_or('\0', |&(_, c)| c)
-}
-
-/// The index of the newline that ends the line `from` is on, or the end.
-fn line_end(chars: &Chars, from: usize) -> usize {
-    (from..chars.len())
-        .find(|&at| chars[at].1 == '\n')
-        .unwrap_or(chars.len())
-}
-
-/// The index after the string whose opening quote is at `from`. A backslash escapes the next
-/// character. A string that is not closed ends at its line's end, unless it may span lines.
-fn skip_quoted(chars: &Chars, from: usize, spans_lines: bool) -> usize {
-    let quote = chars[from].1;
-    let mut at = from + 1;
-    while at < chars.len() {
-        match chars[at].1 {
-            '\\' if char_at(chars, at + 1) == '\r' && char_at(chars, at + 2) == '\n' => at += 3,
-            '\\' => at += 2,
-            c if c == quote => return at + 1,
-            '\n' if !spans_lines => return at,
-            _ => at += 1,
-        }
-    }
-    chars.len()
-}
-
-/// Where the text of a template string that starts at `from` ends: after its closing backtick, or
-/// after a `${` (the second value) that opens code inside it.
-fn skip_template(chars: &Chars, from: usize) -> (usize, bool) {
-    let mut at = from;
-    while at < chars.len() {
-        match chars[at].1 {
-            '\\' => at += 2,
-            '`' => return (at + 1, false),
-            '$' if char_at(chars, at + 1) == '{' => return (at + 2, true),
-            _ => at += 1,
-        }
-    }
-    (chars.len(), false)
-}
-
-/// The index after the regular expression whose opening slash is at `from`, flags included. One
-/// that is not closed ends at its line's end.
-fn skip_regex(chars: &Chars, from: usize) -> usize {
-    let mut at = from + 1;
-    let mut class = false;
-    while at < chars.len() {
-        match chars[at].1 {
-            '\\' => at += 2,
-            '\n' => return at,
-            '[' => {
-                class = true;
-                at += 1;
-            }
-            ']' => {
-                class = false;
-                at += 1;
-            }
-            '/' if !class => {
-                at += 1;
-                while char_at(chars, at).is_alphanumeric() {
-                    at += 1;
-                }
-                return at;
-            }
-            _ => at += 1,
-        }
-    }
-    chars.len()
-}
-
-/// The index after the raw string whose `r` is at `from`, or `None` where none starts there.
-fn skip_raw_string(chars: &Chars, from: usize) -> Option<usize> {
-    let word = |c: char| c.is_alphanumeric() || c == '_';
-    if from > 0 {
-        let before = chars[from - 1].1;
-        let prefix = matches!(before, 'b' | 'c') && (from < 2 || !word(chars[from - 2].1));
-        if word(before) && !prefix {
-            return None;
-        }
-    }
-    let mut hashes = 0;
-    while char_at(chars, from + 1 + hashes) == '#' {
-        hashes += 1;
-    }
-    if char_at(chars, from + 1 + hashes) != '"' {
-        return None;
-    }
-    let mut at = from + 2 + hashes;
-    while at < chars.len() {
-        if chars[at].1 == '"' && (1..=hashes).all(|n| char_at(chars, at + n) == '#') {
-            return Some(at + 1 + hashes);
-        }
-        at += 1;
-    }
-    Some(chars.len())
-}
-
-/// The index after the character literal that opens at `from`, or after the quote of a lifetime.
-fn skip_character(chars: &Chars, from: usize) -> usize {
-    if char_at(chars, from + 1) == '\\' {
-        let close = (from + 3..chars.len()).find(|&at| matches!(chars[at].1, '\'' | '\n'));
-        return close.map_or(chars.len(), |at| at + usize::from(chars[at].1 == '\''));
-    }
-    if char_at(chars, from + 2) == '\'' {
-        from + 3
-    } else {
-        from + 1
-    }
-}
-
-/// Calls `comment(from, to)` for each comment of Rust code, as indexes of `chars`.
-fn rust_comments(chars: &Chars, comment: &mut impl FnMut(usize, usize)) {
-    let mut at = 0;
-    while at < chars.len() {
-        match chars[at].1 {
-            '/' if char_at(chars, at + 1) == '/' => {
-                let end = line_end(chars, at);
-                comment(at, end);
-                at = end;
-            }
-            '/' if char_at(chars, at + 1) == '*' => {
-                // Block comments nest.
-                let (mut depth, mut end) = (1, at + 2);
-                while end < chars.len() && depth > 0 {
-                    match (chars[end].1, char_at(chars, end + 1)) {
-                        ('/', '*') => (depth, end) = (depth + 1, end + 2),
-                        ('*', '/') => (depth, end) = (depth - 1, end + 2),
-                        _ => end += 1,
-                    }
-                }
-                let end = end.min(chars.len());
-                comment(at, end);
-                at = end;
-            }
-            '"' => at = skip_quoted(chars, at, true),
-            '\'' => at = skip_character(chars, at),
-            'r' => at = skip_raw_string(chars, at).unwrap_or(at + 1),
-            _ => at += 1,
-        }
-    }
-}
-
-/// Calls `comment(from, to)` for each comment of JavaScript or TypeScript code, as indexes of
-/// `chars`.
-///
-/// This is a scan and no parser. It knows strings (with their escapes), template strings (with the
-/// code of their `${}` parts, nested ones too), regular expressions and both kinds of comment. It
-/// does not know what a slash means, so after a name, a number, a string or `]` a slash divides,
-/// and after anything else, a `)` or `}` included, it opens a regular expression: a division there
-/// can hide a comment opener as the end of a regular expression, and then the comment is read as
-/// code. A quote that is never closed runs to the end of its line. JSX text is not told from code
-/// (the language of a `.tsx` file is not known to this case). Every one of these mistakes reads
-/// a comment as code, which is a finding, and none reads code as a comment.
-fn script_comments(chars: &Chars, comment: &mut impl FnMut(usize, usize)) {
-    // Words after which a slash opens a regular expression.
-    const OPERATORS: [&str; 14] = [
-        "return",
-        "typeof",
-        "instanceof",
-        "in",
-        "of",
-        "new",
-        "delete",
-        "void",
-        "throw",
-        "case",
-        "do",
-        "else",
-        "yield",
-        "await",
-    ];
-    let is_name = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
-    // The `{` still open in each code part, the last one's being the `${}` part the scan is in.
-    let mut braces = vec![0_usize];
-    let mut value = false;
-    let mut at = 0;
-    while at < chars.len() {
-        let c = chars[at].1;
-        match c {
-            '/' if char_at(chars, at + 1) == '/' => {
-                let end = line_end(chars, at);
-                comment(at, end);
-                at = end;
-            }
-            '/' if char_at(chars, at + 1) == '*' => {
-                let end = (at + 2..chars.len())
-                    .find(|&k| chars[k].1 == '*' && char_at(chars, k + 1) == '/')
-                    .map_or(chars.len(), |k| k + 2);
-                comment(at, end);
-                at = end;
-            }
-            '/' if !value => {
-                at = skip_regex(chars, at);
-                value = true;
-            }
-            '\'' | '"' => {
-                at = skip_quoted(chars, at, false);
-                value = true;
-            }
-            '`' | '}' if c == '`' || (braces.len() > 1 && braces.last() == Some(&0)) => {
-                if c == '}' {
-                    braces.pop();
-                }
-                let (next, code) = skip_template(chars, at + 1);
-                at = next;
-                if code {
-                    braces.push(0);
-                } else {
-                    value = true;
-                }
-            }
-            '{' | '}' => {
-                if let Some(open) = braces.last_mut() {
-                    *open = if c == '{' {
-                        *open + 1
-                    } else {
-                        open.saturating_sub(1)
-                    };
-                }
-                value = false;
-                at += 1;
-            }
-            ']' => {
-                value = true;
-                at += 1;
-            }
-            c if is_name(c) => {
-                let start = at;
-                while is_name(char_at(chars, at)) {
-                    at += 1;
-                }
-                let word: String = chars[start..at].iter().map(|&(_, c)| c).collect();
-                value = !OPERATORS.contains(&word.as_str());
-            }
-            c if c.is_whitespace() => at += 1,
-            _ => {
-                value = false;
-                at += 1;
-            }
-        }
-    }
-}
-
-/// For each byte of `text`, whether it is inside a comment, the comment's own marks included.
-fn comment_bytes(language: Language, text: &str) -> Vec<bool> {
-    let mut mask = vec![false; text.len()];
-    match language {
-        Language::Prose => mask.fill(true),
-        Language::Hash => {
-            let mut start = 0;
-            for line in text.split_inclusive('\n') {
-                if line.trim_start().starts_with('#') {
-                    mask[start..start + line.len()].fill(true);
-                }
-                start += line.len();
-            }
-        }
-        Language::Rust | Language::Script => {
-            let chars: Vec<(usize, char)> = text.char_indices().collect();
-            let mut comment = |from: usize, to: usize| {
-                let end = chars.get(to).map_or(text.len(), |&(byte, _)| byte);
-                mask[chars[from].0..end].fill(true);
-            };
-            if language == Language::Rust {
-                rust_comments(&chars, &mut comment);
-            } else {
-                script_comments(&chars, &mut comment);
-            }
-        }
-    }
-    mask
-}
-
-/// Whether the file names the variable, in any letter case (Windows and a workflow's expressions
-/// read a name without regard to case) and in any of the encodings a file may be written in.
-fn names_variable(bytes: &[u8]) -> bool {
+/// The encodings in which `bytes` hold the name, in any ASCII letter case (Windows and a
+/// workflow's expressions read a name without regard to case): UTF-8 (which is also every encoding
+/// that keeps ASCII as it is), and UTF-16 and UTF-32 in both byte orders. The bytes are searched
+/// as they are: nothing of the file's language is read.
+fn encodings_naming(bytes: &[u8]) -> Vec<&'static str> {
     let name = VARIABLE.as_bytes();
-    let letter = |found: u8, wanted: u8| found.eq_ignore_ascii_case(&wanted);
-    bytes.windows(name.len()).any(|w| {
-        w.iter()
-            .zip(name)
-            .all(|(&found, &wanted)| letter(found, wanted))
-    }) || bytes.windows(2 * name.len()).any(|w| {
-        w.chunks(2)
-            .zip(name)
-            .all(|(pair, &wanted)| pair[1] == 0 && letter(pair[0], wanted))
-    }) || bytes.windows(2 * name.len()).any(|w| {
-        w.chunks(2)
-            .zip(name)
-            .all(|(pair, &wanted)| pair[0] == 0 && letter(pair[1], wanted))
+    // Each encoding, the width of one character in it and the place of the letter in that width.
+    [
+        ("UTF-8", 1, 0),
+        ("UTF-16LE", 2, 0),
+        ("UTF-16BE", 2, 1),
+        ("UTF-32LE", 4, 0),
+        ("UTF-32BE", 4, 3),
+    ]
+    .into_iter()
+    .filter(|&(_, width, letter)| {
+        bytes.windows(width * name.len()).any(|window| {
+            window.chunks(width).zip(name).all(|(unit, wanted)| {
+                unit.iter().enumerate().all(|(place, byte)| {
+                    if place == letter {
+                        byte.eq_ignore_ascii_case(wanted)
+                    } else {
+                        *byte == 0
+                    }
+                })
+            })
+        })
     })
+    .map(|(encoding, ..)| encoding)
+    .collect()
 }
 
-/// What a line of a workflow is, as far as the name on it goes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Line {
-    /// Any other line: a script's text, a key, a value.
-    Plain,
-    /// The directory handed to the upload of a run's evidence.
-    Upload,
-    /// The key of an `env:` mapping that names the variable.
-    EnvKey,
-}
-
-/// One non-blank line of a workflow that is not a comment, with its indentation (a list item's dash
-/// counted as part of it, so that a step's keys all stand at one column).
-struct Row {
-    line: usize,
-    indent: usize,
-    /// The key of a mapping row (`key: value`, `key:`).
-    key: Option<String>,
-    /// What follows the key, or the whole row where it has no key, without a comment.
-    value: String,
-    /// Whether the row opens a list item.
-    item: bool,
-    /// The row whose value this row is the text of: a block scalar's line or the continuation of a
-    /// scalar that spans lines. Such a row is never a key, an item or a step.
-    owner: Option<usize>,
-}
-
-/// A mapping row's key and the rest of the row after the comment is taken off: `key: value`,
-/// `key:`, or a row without a key.
-fn key_and_value(content: &str) -> (Option<String>, String) {
-    let uncommented = |text: &str| {
-        let end = if text.starts_with('#') {
-            0
-        } else {
-            text.find(" #").unwrap_or(text.len())
-        };
-        text[..end].trim().to_owned()
-    };
-    let skip = match content.chars().next() {
-        Some(quote @ ('"' | '\'')) => content[1..]
-            .find(quote)
-            .map_or(content.len(), |end| end + 2),
-        _ => 0,
-    };
-    let colon = content[skip..]
-        .match_indices(':')
-        .map(|(at, _)| skip + at)
-        .find(|&at| matches!(content[at + 1..].chars().next(), None | Some(' ' | '\t')));
-    match colon {
-        Some(at) => (
-            Some(content[..at].trim().to_owned()),
-            uncommented(&content[at + 1..]),
-        ),
-        None => (None, uncommented(content)),
-    }
-}
-
-/// Whether a value is a block scalar's header: `|`, `>`, with a chomping or indentation mark.
-fn is_block_scalar(value: &str) -> bool {
-    value.starts_with(['|', '>'])
-        && value[1..]
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '+' || c == '-')
-}
-
-/// What each line of a workflow is. The workflow is read by its structure: a row with a value owns
-/// every deeper row after it as that value's text (a `run:` script, a quoted string over several
-/// lines), so what looks like a step or a key inside it is neither. The upload of a run's evidence
-/// is the `path:` of the `with:` of a step that uses `actions/upload-artifact`, as the value of
-/// `path:` or as a line of its list: that step reads files and writes none, and the same words
-/// anywhere else (a script, another action's input, a condition) are a read. A key of `env:` that
-/// names the variable gives it a value.
-fn workflow_lines(text: &str) -> Vec<Line> {
-    let expression = format!("${{{{ ENV.{VARIABLE} }}}}");
-    let mut rows: Vec<Row> = Vec::new();
-    // The indentation under which rows are the text of the row that owns them.
-    let mut scalar: Option<(usize, usize)> = None;
-    for (line, raw) in text.lines().enumerate() {
-        let trimmed = raw.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let mut indent = raw.len() - trimmed.len();
-        let (content, item) = match trimmed.strip_prefix("- ") {
-            Some(rest) => {
-                let rest = rest.trim_start();
-                indent += trimmed.len() - rest.len();
-                (rest, true)
-            }
-            None => (trimmed, trimmed == "-"),
-        };
-        if let Some((limit, owner)) = scalar {
-            if indent > limit {
-                rows.push(Row {
-                    line,
-                    indent,
-                    key: None,
-                    value: trimmed.trim_end().to_owned(),
-                    item: false,
-                    owner: Some(owner),
-                });
-                continue;
-            }
-            scalar = None;
-        }
-        let (key, value) = if content == "-" {
-            (None, String::new())
-        } else {
-            key_and_value(content.trim_end())
-        };
-        if !value.is_empty() {
-            scalar = Some((indent, rows.len()));
-        }
-        rows.push(Row {
-            line,
-            indent,
-            key,
-            value,
-            item,
-            owner: None,
-        });
-    }
-    // The mapping each row belongs to (the first row of it) and the row that holds it, by
-    // indentation: a list item starts a mapping of its own.
-    let mut levels: Vec<(usize, usize, usize)> = Vec::new();
-    let mut mapping = vec![0; rows.len()];
-    let mut parent: Vec<Option<usize>> = vec![None; rows.len()];
-    for at in 0..rows.len() {
-        if rows[at].owner.is_some() {
-            continue;
-        }
-        while levels.last().is_some_and(|level| level.0 > rows[at].indent) {
-            levels.pop();
-        }
-        match levels.last_mut() {
-            Some(level) if level.0 == rows[at].indent => {
-                if rows[at].item {
-                    level.1 = at;
-                }
-                level.2 = at;
-                mapping[at] = level.1;
-            }
-            _ => {
-                levels.push((rows[at].indent, at, at));
-                mapping[at] = at;
-            }
-        }
-        parent[at] = levels.len().checked_sub(2).map(|above| levels[above].2);
-    }
-    let holds = |at: usize, key: &str| {
-        rows[at].owner.is_none()
-            && rows[at].key.as_deref() == Some(key)
-            && rows[at].value.is_empty()
-    };
-    let is_upload_step = |with: usize| {
-        rows.iter().enumerate().any(|(other, row)| {
-            row.owner.is_none()
-                && mapping[other] == mapping[with]
-                && row.key.as_deref() == Some("uses")
-                && row.value.starts_with("actions/upload-artifact@")
-        })
-    };
-    let under_upload =
-        |at: usize| parent[at].is_some_and(|with| holds(with, "with") && is_upload_step(with));
-    let mut lines = vec![Line::Plain; text.lines().count()];
-    for (at, row) in rows.iter().enumerate() {
-        let names_directory = row.value.to_ascii_uppercase() == expression;
-        let upload = match row.owner {
-            None => row.key.as_deref() == Some("path") && names_directory && under_upload(at),
-            Some(owner) => {
-                names_directory
-                    && rows[owner].key.as_deref() == Some("path")
-                    && is_block_scalar(&rows[owner].value)
-                    && under_upload(owner)
-            }
-        };
-        let env_key = row.owner.is_none()
-            && row
-                .key
-                .as_deref()
-                .is_some_and(|key| key.eq_ignore_ascii_case(VARIABLE))
-            && parent[at].is_some_and(|above| holds(above, "env"));
-        if upload {
-            lines[row.line] = Line::Upload;
-        } else if env_key {
-            lines[row.line] = Line::EnvKey;
-        }
-    }
-    lines
-}
-
-/// Where the name stands in `line` as a whole name, in any letter case.
-fn occurrences(line: &str) -> Vec<usize> {
-    let word = |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric() || c == '_');
-    line.to_ascii_uppercase()
-        .match_indices(VARIABLE)
-        .map(|(at, _)| at)
-        .filter(|&at| {
-            !word(line[..at].chars().next_back())
-                && !word(line[at + VARIABLE.len()..].chars().next())
-        })
+/// The lines of the file, read as UTF-8, that hold the name: each with its number from 1 and its
+/// text with the white space at both ends taken off. A line ends at a line feed and nowhere else,
+/// so a line that is cut by another line terminator is one line whose text does not match.
+fn lines_naming(bytes: &[u8]) -> Vec<(usize, String)> {
+    String::from_utf8_lossy(bytes)
+        .split('\n')
+        .enumerate()
+        .filter(|(_, line)| line.to_ascii_uppercase().contains(VARIABLE))
+        .map(|(at, line)| (at + 1, line.trim().to_owned()))
         .collect()
 }
 
-/// Whether the name at `at` is being given a value, in the one form a write takes in the file's
-/// language: in Rust a program's environment (`.env("NAME", value)`); in a shell, PowerShell, a
-/// workflow's script or a manifest an assignment (`NAME=value`, also behind `export`, a quote or a
-/// PowerShell `$env:`). JavaScript and TypeScript have none: a script's evidence directory is the
-/// reader's. A workflow's own `env:` keys are told by its structure. A write needs no proof here:
-/// the reader refuses a wrong value where it is used. A name on the right of an assignment, or a
-/// second name on the line, is a read.
-fn is_write(language: Language, line: &str, at: usize) -> bool {
-    let before = &line[..at];
-    let after = &line[at + VARIABLE.len()..];
-    match language {
-        Language::Rust => before.ends_with(".env(\"") && after.starts_with("\","),
-        Language::Script | Language::Prose => false,
-        Language::Hash => {
-            let assigns = after
-                .trim_start()
-                .strip_prefix('=')
-                .is_some_and(|rest| !rest.starts_with(['=', '>']));
-            let target = before.is_empty()
-                || before.ends_with(char::is_whitespace)
-                || before.ends_with(['"', '\'', ';'])
-                || before.to_ascii_lowercase().ends_with("$env:");
-            assigns && target
-        }
+/// What is wrong with a file that holds the name and is on no list: one finding for each line, and
+/// one for each other encoding that holds it.
+fn unlisted(path: &str, bytes: &[u8], encodings: &[&str]) -> Vec<String> {
+    let mut found: Vec<String> = lines_naming(bytes)
+        .into_iter()
+        .map(|(number, text)| {
+            format!("{path}:{number}: holds {VARIABLE} and is on no list: {text}")
+        })
+        .collect();
+    for encoding in encodings.iter().filter(|&&encoding| encoding != "UTF-8") {
+        found.push(format!(
+            "{path}: holds {VARIABLE} in {encoding} and is on no list"
+        ));
     }
+    found
 }
 
-/// What is wrong with one file's naming of the variable, one finding for each line.
-fn findings(path: &str, bytes: &[u8]) -> Vec<String> {
-    if READERS.contains(&path) || !names_variable(bytes) {
-        return Vec::new();
-    }
-    let text = match std::str::from_utf8(bytes) {
-        Ok(text) if !text.contains('\0') => text,
-        _ => {
-            return vec![format!(
-                "{path}: names {VARIABLE} and is not text this case can read"
-            )];
-        }
-    };
-    let Some(language) = language(path) else {
-        return vec![format!(
-            "{path}: names {VARIABLE} in a language this case does not know"
-        )];
-    };
-    let comments = comment_bytes(language, text);
-    let kinds = if path.ends_with(".yml") || path.ends_with(".yaml") {
-        workflow_lines(text)
-    } else {
-        vec![Line::Plain; text.lines().count()]
-    };
+/// What is wrong with a file that holds the name and lists its lines.
+fn against(path: &str, bytes: &[u8], encodings: &[&str], listed: &[(&str, usize)]) -> Vec<String> {
     let mut found = Vec::new();
-    let mut start = 0;
-    for (number, piece) in text.split_inclusive('\n').enumerate() {
-        let line = piece.trim_end_matches(['\n', '\r']);
-        let reads = occurrences(line).into_iter().any(|at| {
-            let key = line[..at].trim().is_empty() && line[at + VARIABLE.len()..].starts_with(':');
-            !comments[start + at]
-                && match kinds[number] {
-                    Line::Upload => false,
-                    Line::EnvKey if key => false,
-                    _ => !is_write(language, line, at),
-                }
-        });
-        if reads {
+    for encoding in encodings.iter().filter(|&&encoding| encoding != "UTF-8") {
+        found.push(format!(
+            "{path}: holds {VARIABLE} in {encoding}, which no listed line can be"
+        ));
+    }
+    let held = lines_naming(bytes);
+    for (number, text) in &held {
+        if !listed.iter().any(|(line, _)| line == text) {
             found.push(format!(
-                "{path}:{}: reads {VARIABLE} outside its language's reader: {}",
-                number + 1,
-                line.trim()
+                "{path}:{number}: a line that holds {VARIABLE} and is not on the list: {text}"
             ));
         }
-        start += piece.len();
+    }
+    for (line, wanted) in listed {
+        let present = held.iter().filter(|(_, text)| text == line).count();
+        if present != *wanted {
+            found.push(format!(
+                "{path}: the list has {wanted} line(s) `{line}` and the file has {present}"
+            ));
+        }
+    }
+    found
+}
+
+/// What is wrong with the files' holding of the name, one finding for each file or line: `files`
+/// are files of the repository with their bytes, and `list` says which of them may hold the name
+/// and how. A listed file that no longer holds it is a finding too, so that the list cannot fall
+/// behind.
+fn judge(list: &[Listed], files: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut holding = std::collections::HashSet::new();
+    for (path, bytes) in files {
+        let encodings = encodings_naming(bytes);
+        if encodings.is_empty() {
+            continue;
+        }
+        holding.insert(path.as_str());
+        match list.iter().find(|entry| entry.path == path.as_str()) {
+            None => found.extend(unlisted(path, bytes, &encodings)),
+            Some(Listed {
+                uses: Use::Reader, ..
+            }) => {}
+            Some(Listed {
+                uses: Use::Lines(listed),
+                ..
+            }) => found.extend(against(path, bytes, &encodings, listed)),
+        }
+    }
+    for entry in list {
+        if !holding.contains(entry.path) {
+            found.push(format!(
+                "{}: is on the list and does not hold {VARIABLE}",
+                entry.path
+            ));
+        }
     }
     found
 }
@@ -1650,507 +1563,536 @@ fn repository_files(root: &Path) -> Vec<String> {
     files
 }
 
-/// KR-REQ-27.03, the part about the build's directory: every line of the repository that reads
-/// the artefacts variable is the definition of its language's reader or inside a file that tests
-/// one. The readers (`kr-test-artifacts` for Rust, `scripts/lib/artifacts-dir.sh`,
+/// KR-REQ-27.03, the part about the build's directory: the variable's name stands only in the files
+/// of the list above. Every file of the repository is searched for the name as plain bytes (UTF-8,
+/// UTF-16 and UTF-32, in any ASCII letter case), whatever its language and whether the name stands
+/// in code, a comment, a string or a document: no comment, string, heredoc or workflow structure is
+/// read. A file that holds it is a reader, where the name may stand anywhere, or lists each line
+/// that holds it as its trimmed text with the number of such lines. A file on no list fails with
+/// its path and line; so does a line that is not listed, a listed line that is gone or stands
+/// another number of times, and a listed file that no longer holds the name.
+///
+/// The readers (`kr-test-artifacts` for Rust, `scripts/lib/artifacts-dir.sh`,
 /// `scripts/artifacts-dir.ps1`, `apps/companion/e2e/evidence.ts`) refuse a value outside the
-/// platform's temporary roots where it is used, so the build fails there whatever way the value
-/// took; their own cases run them in `artifacts_readers.rs`, in the reader's crate and in the
-/// companion's tests.
+/// platform's temporary roots where it is used, so a build fails there whatever way a value took;
+/// their own cases run them in `artifacts_readers.rs`, in the reader's crate and in the
+/// companion's tests. This case holds what they cannot: that no other file reads the variable.
 ///
-/// So this case holds only what the readers cannot: that nothing else reads the variable. The name
-/// is matched in any letter case. A name passes when it stands in a comment (found by the
-/// language's own strings and comments, not by lines: a comment opener inside a string opens
-/// none), or is given a value by the one form a write takes in its language (a shell's or a
-/// workflow script's `NAME=value` whose value does not read it, a Rust program's
-/// `.env("NAME", value)`, a key of a workflow's `env:`), or is the directory handed to the
-/// `path:` of a real `actions/upload-artifact` step of a workflow as that run's evidence. Every
-/// other occurrence fails with its file and line, so does a file that names it in a language this
-/// case does not know or that is not text (UTF-16 included), and JavaScript and TypeScript have no
-/// write form at all. Writes are not listed: a wrong write fails at the reader. The readers do not
-/// export the name as a constant, which would let a file read the variable without writing the
-/// name.
-///
-/// Not seen: a name put together at run time (or spelled with an escape), and a value that
-/// reaches a program in an argument instead of the variable (the conformance runner's
-/// `--evidence` passes the same check). The scan of a script is no parser; its limits all read a
-/// comment as code, a finding, and each has a sample in the case that reads scripts by their
-/// strings and comments.
+/// Not seen: a name put together at run time or spelled with an escape (no file holds its bytes),
+/// and a value that reaches a program in an argument instead of the variable (the conformance
+/// runner's `--evidence` passes the same check).
 #[test]
-fn nothing_reads_the_artifacts_variable_beside_the_reader_of_its_language() {
+fn the_artifacts_variable_stands_only_in_the_files_the_list_names() {
     let root = repository();
-    let mut found = Vec::new();
-    let mut named = 0_usize;
+    let mut files = Vec::new();
     for path in repository_files(&root) {
         let file = root.join(&path);
         if !fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
             continue;
         }
         let bytes = fs::read(&file).unwrap_or_else(|error| panic!("{path} is read: {error}"));
-        if names_variable(&bytes) {
-            named += 1;
+        if !encodings_naming(&bytes).is_empty() {
+            files.push((path, bytes));
         }
-        found.extend(findings(&path, &bytes));
     }
-    for reader in READERS {
-        let text = fs::read_to_string(root.join(reader))
-            .unwrap_or_else(|error| panic!("the reader {reader} is read: {error}"));
-        assert!(text.contains(VARIABLE), "{reader} does not name {VARIABLE}");
-        assert!(
-            !(reader.ends_with("lib.rs") || reader.ends_with("evidence.ts"))
-                || !(text.contains("pub const VARIABLE") || text.contains("export const VARIABLE")),
-            "{reader} exports the variable's name"
-        );
-    }
-    assert!(
-        named > READERS.len(),
-        "the case found {named} files that name {VARIABLE}"
-    );
+    let found = judge(LIST, &files);
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
 
-/// The case fails closed: each shape of a read in each language fails, a file it cannot read or a
-/// language it does not know fails, and the shapes of a write and the reader's own file pass.
+/// The list is read by people and holds what it says: the paths are in order and each stands once,
+/// and every listed line is text with no white space at its ends that holds the name, with a
+/// number of lines that is at least one, once in its file's entry.
 #[test]
-fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
-    let rust = "tests/e2e/x.rs";
-    let shell = "scripts/x.sh";
-    let power = "scripts/x.ps1";
-    let script = "apps/companion/e2e/x.ts";
-    let flow = ".github/workflows/x.yml";
-    for (path, line) in [
-        (
-            rust,
-            "let dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");",
-        ),
-        (
-            rust,
-            "let dir = std::env::var(NAME).or(std::env::var(\"KR_TEST_ARTIFACTS_DIR\"));",
-        ),
-        (shell, "artefacts=\"${KR_TEST_ARTIFACTS_DIR:-/tmp/x}\""),
-        (shell, "artefacts=\"$KR_TEST_ARTIFACTS_DIR/x\""),
-        (
-            shell,
-            "KR_TEST_ARTIFACTS_DIR=\"${KR_TEST_ARTIFACTS_DIR:-/tmp/x}\"",
-        ),
-        (
-            shell,
-            "[ \"$KR_TEST_ARTIFACTS_DIR\" = x ] && echo yes # KR_TEST_ARTIFACTS_DIR",
-        ),
-        (power, "$evidence = $env:KR_TEST_ARTIFACTS_DIR"),
-        (
-            power,
-            "$env:KR_TEST_ARTIFACTS_DIR = \"$env:KR_TEST_ARTIFACTS_DIR\\x\"",
-        ),
-        (
-            script,
-            "const dir = env['KR_TEST_ARTIFACTS_DIR'] ?? '/tmp/x'",
-        ),
-        (script, "const dir = process.env.KR_TEST_ARTIFACTS_DIR"),
-        (script, "const same = KR_TEST_ARTIFACTS_DIR == other"),
-        (flow, "        run: ls \"$KR_TEST_ARTIFACTS_DIR\""),
-        (
-            flow,
-            "          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}/more",
-        ),
-        (
-            script,
-            "const { KR_TEST_ARTIFACTS_DIR = '/x' } = process.env",
-        ),
-        (power, "$evidence = $env:kr_test_artifacts_dir"),
-        (
-            rust,
-            "let dir = std::env::var_os(\"kr_test_artifacts_dir\");",
-        ),
-        (flow, "        run: ls ${{ env.kr_test_artifacts_dir }}"),
-        (
-            script,
-            "/* evidence */ const dir = process.env.KR_TEST_ARTIFACTS_DIR",
-        ),
-        (
-            rust,
-            "        .env(\"KR_TEST_ARTIFACTS_DIR\", std::env::var(\"KR_TEST_ARTIFACTS_DIR\").unwrap())",
-        ),
-        (rust, "        KR_TEST_ARTIFACTS_DIR => 1,"),
-    ] {
-        assert_eq!(
-            findings(path, line.as_bytes()).len(),
-            1,
-            "{path}: {line} is a read"
-        );
-    }
-    for (path, line) in [
-        (
-            rust,
-            "/// KR_TEST_ARTIFACTS_DIR is where this build keeps its figures.",
-        ),
-        (rust, "        .env(\"KR_TEST_ARTIFACTS_DIR\", &evidence)"),
-        (shell, "# KR_TEST_ARTIFACTS_DIR is not set here."),
-        (
-            shell,
-            "KR_TEST_ARTIFACTS_DIR=\"$leg/e2e\" bash scripts/x.sh",
-        ),
-        (shell, "export KR_TEST_ARTIFACTS_DIR=\"$RUNNER_TEMP/x\""),
-        (
-            power,
-            "\"KR_TEST_ARTIFACTS_DIR=$temporary\\x\" >> $env:GITHUB_ENV",
-        ),
-        (power, "$env:KR_TEST_ARTIFACTS_DIR = $directory"),
-        (
-            flow,
-            "  env:\n    KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts",
-        ),
-        (
-            "docs/x.md",
-            "Set `KR_TEST_ARTIFACTS_DIR` to a folder under /tmp.",
-        ),
-        (
-            rust,
-            "let other = std::env::var_os(\"MY_KR_TEST_ARTIFACTS_DIR_COPY\");",
-        ),
-        (
-            "tests/support/artifacts/src/lib.rs",
-            "std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\")",
-        ),
-    ] {
+fn the_list_names_each_file_once_and_each_line_as_its_trimmed_text() {
+    for pair in LIST.windows(2) {
         assert!(
-            findings(path, line.as_bytes()).is_empty(),
-            "{path}: {line} is not a read"
+            pair[0].path < pair[1].path,
+            "{} is not before {} in the list",
+            pair[0].path,
+            pair[1].path
         );
     }
-    assert_eq!(
-        findings("data/x.json", b"{\"a\": \"KR_TEST_ARTIFACTS_DIR\"}").len(),
-        1
-    );
-    assert_eq!(
-        findings("scripts/x", b"echo $KR_TEST_ARTIFACTS_DIR").len(),
-        1
-    );
-    assert_eq!(
-        findings("scripts/x.sh", b"\xff KR_TEST_ARTIFACTS_DIR").len(),
-        1
-    );
-    assert!(findings("scripts/x.sh", b"\xff\xfe").is_empty());
+    assert!(!LIST.is_empty());
+    for entry in LIST {
+        let Use::Lines(listed) = &entry.uses else {
+            continue;
+        };
+        assert!(!listed.is_empty(), "{} lists no line", entry.path);
+        for (at, (text, count)) in listed.iter().enumerate() {
+            assert_eq!(
+                *text,
+                text.trim(),
+                "{}: `{text}` is not trimmed",
+                entry.path
+            );
+            assert!(
+                text.to_ascii_uppercase().contains(VARIABLE) && !text.contains('\n'),
+                "{}: `{text}` is not one line that holds {VARIABLE}",
+                entry.path
+            );
+            assert!(*count >= 1, "{}: `{text}` is listed 0 times", entry.path);
+            assert!(
+                listed[..at].iter().all(|(earlier, _)| earlier != text),
+                "{}: `{text}` is listed twice",
+                entry.path
+            );
+        }
+    }
 }
 
-/// A workflow with one step: `uses` and the lines of its `with:`, then `after` as a later step.
-fn step(uses: &str, with: &str) -> String {
-    format!(
-        "jobs:\n  run:\n    steps:\n      - name: Keep\n        uses: {uses}\n        with:\n          name: kept\n{with}\n      - name: After\n        run: true\n"
-    )
+/// A file as the case reads it: its path and its bytes.
+fn file(path: &str, bytes: impl AsRef<[u8]>) -> (String, Vec<u8>) {
+    (path.to_owned(), bytes.as_ref().to_vec())
 }
 
-const UPLOAD: &str = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1";
-
-/// A line that is only the directory's expression is the upload of the run's evidence only in the
-/// `with: path:` of an upload step; anywhere else, in any letter case, it is a read. A block
-/// comment is a comment up to its end only.
-#[test]
-fn the_source_case_lets_the_evidence_upload_name_the_directory_and_nothing_else() {
-    let flow = ".github/workflows/x.yml";
-    let expression = "${{ env.KR_TEST_ARTIFACTS_DIR }}";
-    for with in [
-        format!("          path: {expression}"),
-        format!(
-            "          path: |\n            C:\\x.log\n            {expression}\n            !**/y/**"
-        ),
-        format!("          path: {}", expression.to_lowercase()),
-    ] {
-        assert!(
-            findings(flow, step(UPLOAD, &with).as_bytes()).is_empty(),
-            "an upload of the directory is no read: {with}"
-        );
-    }
-    for (uses, with) in [
-        ("actions/cache@v4", format!("          path: {expression}")),
-        (
-            "actions/cache@v4",
-            format!("          path: |\n            {expression}"),
-        ),
-        (UPLOAD, format!("          name: {expression}")),
-        (UPLOAD, format!("          path: {expression}/more")),
-        (
-            UPLOAD,
-            format!("          path: x\n          key: {expression}"),
-        ),
-        (
-            UPLOAD,
-            format!("          env:\n            path: {expression}"),
-        ),
-    ] {
-        assert_eq!(
-            findings(flow, step(uses, &with).as_bytes()).len(),
-            1,
-            "{uses}: {with} is a read"
-        );
-    }
-    let run = format!(
-        "jobs:\n  run:\n    steps:\n      - run: |\n          mkdir -p \\\n            {expression}\n          cd \\\n            {expression}\n          adb pull x \\\n            {expression}\n"
-    );
-    assert_eq!(
-        findings(flow, run.as_bytes()).len(),
-        3,
-        "a script's own line is a read"
-    );
-    let script = "apps/companion/e2e/x.ts";
+/// What the case says of one file that is not on the list: the findings that name its path. No
+/// other entry of the list is stale for this one file, so only its own findings are kept.
+fn findings_of(path: &str, bytes: impl AsRef<[u8]>) -> Vec<String> {
     assert!(
-        findings(
-            script,
-            b"/*\n * KR_TEST_ARTIFACTS_DIR is read by the reader.\n */\nconst a = 1\n"
-        )
-        .is_empty()
+        LIST.iter().all(|entry| entry.path != path),
+        "{path} is on the list, so it is no sample of a file that is not"
     );
-    assert_eq!(
-        findings(
-            script,
-            b"/*\n KR_TEST_ARTIFACTS_DIR\n */ const dir = process.env.KR_TEST_ARTIFACTS_DIR\n"
-        )
-        .len(),
-        1,
-        "the line that closes a block comment and goes on with code is code"
-    );
+    judge(LIST, &[file(path, bytes)])
+        .into_iter()
+        .filter(|finding| finding.starts_with(&format!("{path}:")))
+        .collect()
 }
 
-/// A file that is not UTF-8 text names the variable without a byte string that says so.
+/// Whole file texts that hold the name and are on no list, each spelled the way that once made a
+/// scan of the file's language read the name as something else: a comment, a string, a step of a
+/// workflow, a write. None has to be read as what it is: each fails because it is on no list.
+const SAMPLES: &[(&str, &str, &str)] = &[
+    (
+        "a read in Rust",
+        "tests/e2e/x.rs",
+        "let dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
+    ),
+    (
+        "a write for a child process in Rust",
+        "tests/e2e/x.rs",
+        "        .env(\"KR_TEST_ARTIFACTS_DIR\", &evidence)\n",
+    ),
+    (
+        "a default in a shell expansion",
+        "scripts/x.sh",
+        "artefacts=\"${KR_TEST_ARTIFACTS_DIR:-/tmp/x}\"\n",
+    ),
+    (
+        "a shell assignment whose value reads the variable",
+        "scripts/x.sh",
+        "KR_TEST_ARTIFACTS_DIR=\"${KR_TEST_ARTIFACTS_DIR:-/tmp/x}\"\n",
+    ),
+    (
+        "a shell assignment",
+        "scripts/x.sh",
+        "export KR_TEST_ARTIFACTS_DIR=\"$RUNNER_TEMP/x\"\n",
+    ),
+    (
+        "a read of a PowerShell variable",
+        "scripts/x.ps1",
+        "$evidence = $env:KR_TEST_ARTIFACTS_DIR\n",
+    ),
+    (
+        "a PowerShell assignment whose value becomes an unchecked path",
+        "scripts/x.ps1",
+        r#"$dir = ($env:KR_TEST_ARTIFACTS_DIR = (Join-Path $env:USERPROFILE 'kr-proof'))
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -LiteralPath "$dir/proof.txt" -Value proof
+"#,
+    ),
+    (
+        "a PowerShell here-string whose line starts with a number sign",
+        "scripts/x.ps1",
+        "$dir = @\"\n#$env:KR_TEST_ARTIFACTS_DIR\n\"@\nSet-Content -LiteralPath ($dir.Substring(1) + '/proof.txt') -Value proof\n",
+    ),
+    (
+        "a shell string whose line starts with a number sign",
+        "scripts/x.sh",
+        "dir=\"\n#$KR_TEST_ARTIFACTS_DIR\n\"\nmkdir -p \"${dir:1}\"\n",
+    ),
+    (
+        "an unquoted heredoc whose line starts with a number sign",
+        "scripts/x.sh",
+        "dir=\"$(cat <<EOF\n#$KR_TEST_ARTIFACTS_DIR\nEOF\n)\"\n",
+    ),
+    (
+        "a direct read in TypeScript",
+        "apps/companion/e2e/x.ts",
+        "const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+    ),
+    (
+        "a read by a template string whose line holds a comment opener",
+        "apps/companion/e2e/x.mjs",
+        "import { mkdirSync } from 'node:fs';\n\nconsole.log(`\n/*\n`);\nconst dir = process.env.KR_TEST_ARTIFACTS_DIR;\nmkdirSync(dir);\n",
+    ),
+    (
+        "a destructure of the environment over several lines, with a default",
+        "apps/companion/e2e/x.ts",
+        "const {\n  KR_TEST_ARTIFACTS_DIR = '/tmp/default'\n} = process.env;\n",
+    ),
+    (
+        "a destructure of the environment over several lines, with a new name",
+        "apps/companion/e2e/x.ts",
+        "const {\n  KR_TEST_ARTIFACTS_DIR: evidence,\n} = process.env\n",
+    ),
+    (
+        "a destructure of the environment as the parameter of a function",
+        "apps/companion/e2e/x.ts",
+        "const dir = (({\n  KR_TEST_ARTIFACTS_DIR: dir,\n}) => dir)(process.env)\n",
+    ),
+    (
+        "a read after a division that looks like the start of a regular expression",
+        "apps/companion/e2e/x.mjs",
+        "import { mkdirSync, writeFileSync } from 'node:fs';\nconst ratio = (1) / \"///\"; const dir = process.env.KR_TEST_ARTIFACTS_DIR;\nmkdirSync(dir, { recursive: true });\nwriteFileSync(`${dir}/proof.txt`, 'proof');\n",
+    ),
+    (
+        "a read inside a raw template after a regular expression",
+        "apps/companion/e2e/x.mjs",
+        "const dir = String.raw`${/a\\//.test('a/') && process.env.KR_TEST_ARTIFACTS_DIR}`;\n",
+    ),
+    (
+        "a read after a division in a template, then a comment opener in a later string",
+        "apps/companion/e2e/x.ts",
+        "console.log(`${(bytes * 8) / seconds} bit/s`)\nconst shots = `${root}/*.png`\nconst dir = process.env.KR_TEST_ARTIFACTS_DIR\n/** Lists the shots. */\n",
+    ),
+    (
+        "a read after a division and a line comment that holds a comment opener",
+        "apps/companion/e2e/x.ts",
+        "const mid = (lo + hi) / 2 // not /* here\nconst dir = process.env.KR_TEST_ARTIFACTS_DIR\n/* done */\n",
+    ),
+    (
+        "a read after a regular expression that holds a slash, behind return",
+        "apps/companion/e2e/x.ts",
+        "function f() { return /a\\//.test(a) } const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
+    ),
+    (
+        "a read after a carriage return that ends a line comment",
+        "apps/companion/e2e/x.mjs",
+        "const n = 0; // note\rconst dir = process.env.KR_TEST_ARTIFACTS_DIR;\n",
+    ),
+    (
+        "a read after a line separator that ends a line comment",
+        "apps/companion/e2e/x.mjs",
+        "const n = 0; // note\u{2028}const dir = process.env.KR_TEST_ARTIFACTS_DIR;\n",
+    ),
+    (
+        "a read after a paragraph separator that ends a line comment",
+        "apps/companion/e2e/x.mjs",
+        "const n = 0; // note\u{2029}const dir = process.env.KR_TEST_ARTIFACTS_DIR;\n",
+    ),
+    (
+        "a heredoc whose text looks like an upload step",
+        ".github/workflows/x.yml",
+        "jobs:\n  a:\n    steps:\n      - run: |\n          dir=\"$(sed -n 's/^ *path: //p' <<'EOF'\n          - uses: actions/upload-artifact@v7\n            with:\n              path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\n          EOF\n          )\"\n          mkdir -p \"$dir\"\n",
+    ),
+    (
+        "a scalar that starts on the line after its key",
+        ".github/workflows/x.yml",
+        r#"jobs:
+  a:
+    steps:
+      - run:
+          |
+          dir="$(sed -n 's/^ *path: //p' <<'EOF'
+          uses: actions/upload-artifact@v7
+          with:
+            path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          EOF
+          )"
+          mkdir -p "$dir"
+          printf proof > "$dir/proof.txt"
+"#,
+    ),
+    (
+        "a quoted scalar that starts on the line after its key",
+        ".github/workflows/x.yml",
+        r#"name: Evidence
+on: workflow_dispatch
+env:
+  KR_TEST_ARTIFACTS_DIR: /home/runner/kr-proof
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run:
+          "d=$(printf '%s\\n'
+          uses: actions/upload-artifact@v7
+          with:
+            path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          | tail -n 1); mkdir -p \"$d\"; printf proof > \"$d/proof.txt\""
+"#,
+    ),
+    (
+        "a quoted scalar whose lines look like an upload step",
+        ".github/workflows/x.yml",
+        "jobs:\n  a:\n    steps:\n      - run: \"echo\n          uses: actions/upload-artifact@v7\n          with:\n            path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\"\n",
+    ),
+    (
+        "a script line that starts with a number sign inside a block scalar",
+        ".github/workflows/x.yml",
+        "jobs:\n  a:\n    steps:\n      - run: |\n          # ${{ env.KR_TEST_ARTIFACTS_DIR }}\n          dir=\"$(sed -n '1s/^# //p' \"$0\")\"\n          mkdir -p \"$dir\"\n",
+    ),
+    (
+        "a script's own line in a workflow",
+        ".github/workflows/x.yml",
+        "        run: ls \"$KR_TEST_ARTIFACTS_DIR\"\n",
+    ),
+    (
+        "the upload of the directory in a workflow on no list",
+        ".github/workflows/x.yml",
+        "jobs:\n  a:\n    steps:\n      - uses: actions/upload-artifact@v7\n        with:\n          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\n",
+    ),
+    (
+        "a key of `env:` in a workflow on no list",
+        ".github/workflows/x.yml",
+        "env:\n  KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts\n",
+    ),
+    (
+        "a mention in a document on no list",
+        "docs/x.md",
+        "Set `KR_TEST_ARTIFACTS_DIR` to a folder under /tmp.\n",
+    ),
+    (
+        "a mention in a comment of a file in a language no table knows",
+        "scripts/x.py",
+        "# KR_TEST_ARTIFACTS_DIR is read by the reader\n",
+    ),
+    (
+        "a mention in a JSON file",
+        "data/x.json",
+        "{\"a\": \"KR_TEST_ARTIFACTS_DIR\"}\n",
+    ),
+    (
+        "a read in a file with no extension",
+        "scripts/x",
+        "echo $KR_TEST_ARTIFACTS_DIR\n",
+    ),
+    (
+        "a mention in a manifest",
+        "crates/x/Cargo.toml",
+        "# KR_TEST_ARTIFACTS_DIR is read by the reader\n",
+    ),
+    (
+        "a mention in a file of JSX",
+        "apps/companion/src/x.tsx",
+        "// KR_TEST_ARTIFACTS_DIR is not read here\n",
+    ),
+    (
+        "a read in lower case",
+        "scripts/x.ps1",
+        "$evidence = $env:kr_test_artifacts_dir\n",
+    ),
+    (
+        "a read in a name that holds the variable's name",
+        "tests/e2e/x.rs",
+        "let other = std::env::var_os(\"MY_KR_TEST_ARTIFACTS_DIR_COPY\");\n",
+    ),
+    (
+        "a name at the end of a file that has no line feed",
+        "scripts/x.sh",
+        "echo done; echo $KR_TEST_ARTIFACTS_DIR",
+    ),
+];
+
+/// A file that holds the name and is on no list fails, whatever its language and wherever the
+/// name stands in it: every text that once fooled a scan is a plain failure of the same rule.
 #[test]
-fn the_source_case_fails_a_file_that_names_the_variable_in_utf_16() {
-    // The file ends with the name, so that neither encoding is seen through the other's reading.
-    let name = "KR_TEST_ARTIFACTS_DIR";
-    let little: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let big: Vec<u8> = name.encode_utf16().flat_map(u16::to_be_bytes).collect();
-    for bytes in [little, big] {
-        assert_eq!(findings("scripts/x.sh", &bytes).len(), 1);
-    }
-}
-
-/// Asserts each sample, so that one wrong answer does not hide the others: a file's path, its text
-/// and the number of lines of it that the case reports.
-fn assert_findings(samples: &[(&str, &str, usize)]) {
-    let wrong: Vec<String> = samples
+fn a_file_that_holds_the_name_and_is_on_no_list_fails() {
+    let wrong: Vec<String> = SAMPLES
         .iter()
-        .filter_map(|&(path, text, wanted)| {
-            let found = findings(path, text.as_bytes()).len();
-            (found != wanted)
-                .then(|| format!("{path}: {found} findings, not {wanted}, for:\n{text}"))
+        .filter_map(|&(what, path, text)| {
+            let found = findings_of(path, text);
+            let holding = text
+                .split('\n')
+                .filter(|line| line.to_ascii_uppercase().contains(VARIABLE));
+            (found.len() != holding.count() || found.is_empty())
+                .then(|| format!("{what}: {path} gave {found:?} for:\n{text}"))
         })
         .collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n---\n"));
 }
 
-/// A name inside a string is no comment's, and a comment opener inside a string opens none: JavaScript,
-/// TypeScript and Rust files are read by their strings and comments, not by their lines.
+/// The name in a file that is not UTF-8 text is found: in UTF-16 and UTF-32, in both byte orders,
+/// also among other bytes, and in either letter case.
 #[test]
-fn the_source_case_reads_a_script_by_its_strings_and_comments() {
-    let script = "apps/companion/e2e/x.ts";
-    let module = "apps/companion/e2e/x.mjs";
-    let rust = "tests/e2e/x.rs";
-    assert_findings(&[
-        // A comment opener inside a template string exempts nothing.
-        (
-            module,
-            "import { mkdirSync } from 'node:fs';\n\nconsole.log(`\n/*\n`);\nconst dir = process.env.KR_TEST_ARTIFACTS_DIR;\nmkdirSync(dir);\n",
-            1,
-        ),
-        (
-            module,
-            "const a = `\n/*\n`;\nconst dir = process.env.KR_TEST_ARTIFACTS_DIR;\nconst b = `\n*/\n`;\n",
-            1,
-        ),
-        (
-            script,
-            "const marker = '/*'; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
-            1,
-        ),
-        (
-            script,
-            "const url = \"http://x\"; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
-            1,
-        ),
-        (
-            script,
-            "const text = 'it\\'s /*'; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
-            1,
-        ),
-        (
-            script,
-            "const open = /\\/\\*/; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
-            1,
-        ),
-        // A regular expression that holds a comment opener hides nothing, also after a word such
-        // as `return`.
-        (
-            script,
-            "const open = /\\/\\//; const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
-            1,
-        ),
-        (
-            script,
-            "function f() { return /a\\//.test(a) } const dir = process.env.KR_TEST_ARTIFACTS_DIR\n",
-            1,
-        ),
-        // A read inside a template's substitution is a read.
-        (
-            script,
-            "const p = `${process.env.KR_TEST_ARTIFACTS_DIR}/x`\n",
-            1,
-        ),
-        (
-            script,
-            "const p = `a ${`b ${process.env.KR_TEST_ARTIFACTS_DIR}`}`\n",
-            1,
-        ),
-        // A destructure of the environment over several lines is a read, with a default or a new
-        // name, and as the parameter of a function.
-        (
-            script,
-            "const {\n  KR_TEST_ARTIFACTS_DIR = '/tmp/default'\n} = process.env;\n",
-            1,
-        ),
-        (
-            script,
-            "const {\n  KR_TEST_ARTIFACTS_DIR: evidence,\n} = process.env\n",
-            1,
-        ),
-        (
-            script,
-            "const dir = (({\n  KR_TEST_ARTIFACTS_DIR: dir,\n}) => dir)(process.env)\n",
-            1,
-        ),
-        // The same in Rust: a string that spans lines or is raw hides no read.
-        (
-            rust,
-            "let text = r#\"a\"b /*\"#;\nlet dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
-            1,
-        ),
-        (
-            rust,
-            "let text = \"\n/*\n\";\nlet dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
-            1,
-        ),
-        (
-            rust,
-            "let text = r#\"\n/*\n\"#;\nlet dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
-            1,
-        ),
-        (
-            rust,
-            "let url = \"http://x\"; let dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");\n",
-            1,
-        ),
-        // A comment is a comment, after code on its line too, and within a substitution. A quote
-        // that is never closed ends with its line.
-        (
-            script,
-            "const s = 'it\n// KR_TEST_ARTIFACTS_DIR is read by the reader\n",
-            0,
-        ),
-        (
-            script,
-            "const a = 1 // KR_TEST_ARTIFACTS_DIR is read by the reader\n",
-            0,
-        ),
-        (
-            script,
-            "const note = `see // here`; // KR_TEST_ARTIFACTS_DIR is read by the reader\n",
-            0,
-        ),
-        (script, "const a = `${/* KR_TEST_ARTIFACTS_DIR */ 1}`\n", 0),
-        (
-            rust,
-            "let q = '\"'; let r: &'static str = \"\"; // KR_TEST_ARTIFACTS_DIR is set by the build\n",
-            0,
-        ),
-        (
-            rust,
-            "/* a /* b */ KR_TEST_ARTIFACTS_DIR */\nfn f() {}\n",
-            0,
-        ),
-        // What the scan does not know fails closed. A slash after `)` may open a regular
-        // expression, which would hide a comment opener, so it is taken as one, and a comment after
-        // a division is code. A broken quote runs to its line's end. A file of JSX, whose text is
-        // not code, is a language the case does not know.
-        (
-            script,
-            "const half = (a + b) / 2 // KR_TEST_ARTIFACTS_DIR is not read here\n",
-            1,
-        ),
-        (
-            script,
-            "const s = 'it // KR_TEST_ARTIFACTS_DIR is not read here\n",
-            1,
-        ),
-        (
-            "apps/companion/src/x.tsx",
-            "// KR_TEST_ARTIFACTS_DIR is not read here\n",
-            1,
-        ),
-    ]);
+fn a_file_that_holds_the_name_in_utf_16_or_utf_32_or_in_another_letter_case_fails() {
+    let name = VARIABLE;
+    let units = |text: &str| -> [(&'static str, Vec<u8>); 5] {
+        [
+            ("UTF-8", text.as_bytes().to_vec()),
+            (
+                "UTF-16LE",
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            ),
+            (
+                "UTF-16BE",
+                text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+            ),
+            (
+                "UTF-32LE",
+                text.chars()
+                    .flat_map(|c| u32::from(c).to_le_bytes())
+                    .collect(),
+            ),
+            (
+                "UTF-32BE",
+                text.chars()
+                    .flat_map(|c| u32::from(c).to_be_bytes())
+                    .collect(),
+            ),
+        ]
+    };
+    for spelling in [name, "kr_test_artifacts_dir", "Kr_Test_Artifacts_Dir"] {
+        for (encoding, bytes) in units(spelling) {
+            // The file ends with the name, so that no encoding is seen through another's reading.
+            let found = findings_of("scripts/x.sh", &bytes);
+            assert!(!found.is_empty(), "{spelling} in {encoding} is not found");
+            let mut among = b"\xff\xfe binary \x00\x01".to_vec();
+            among.extend_from_slice(&bytes);
+            among.extend_from_slice(b"\n\x00\xff");
+            assert!(
+                !findings_of("data/x.bin", &among).is_empty(),
+                "{spelling} in {encoding} among other bytes is not found"
+            );
+        }
+    }
+    // A near miss is no name, in UTF-8 or in UTF-16.
+    assert!(findings_of("scripts/x.sh", "KR_TEST_ARTIFACTS\n").is_empty());
+    assert!(
+        findings_of(
+            "scripts/x.sh",
+            "K\0R\0_\0T\0E\0S\0T\0_\0A\0R\0T\0I\0F\0A\0C\0T\0S\0\0\0"
+        )
+        .is_empty()
+    );
+    // A file of the list that holds a line and also holds the name in UTF-16 fails.
+    let list = [lines("scripts/y.sh", &[("echo $KR_TEST_ARTIFACTS_DIR", 1)])];
+    let mut text = b"echo $KR_TEST_ARTIFACTS_DIR\n".to_vec();
+    assert!(judge(&list, &[file("scripts/y.sh", &text)]).is_empty());
+    text.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+    assert!(!judge(&list, &[file("scripts/y.sh", &text)]).is_empty());
 }
 
-/// A workflow is read by its structure: what stands under a `run:` scalar is that script's text,
-/// never a step or a mapping of the workflow.
+/// The reader of a file is matched by its whole path.
 #[test]
-fn the_source_case_reads_a_workflow_by_its_structure() {
-    let flow = ".github/workflows/x.yml";
-    let upload = "actions/upload-artifact@v7";
-    assert_findings(&[
-        // An upload step spelled inside a script's heredoc is the script's text.
-        (
-            flow,
-            "jobs:\n  a:\n    steps:\n      - run: |\n          dir=\"$(sed -n 's/^ *path: //p' <<'EOF'\n          - uses: actions/upload-artifact@v7\n            with:\n              path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\n          EOF\n          )\"\n          mkdir -p \"$dir\"\n",
-            1,
+fn a_file_that_only_looks_like_a_reader_is_not_one() {
+    let list = [reader("scripts/lib/x.sh")];
+    let text = "const dir = process.env.KR_TEST_ARTIFACTS_DIR\n";
+    assert!(judge(&list, &[file("scripts/lib/x.sh", text)]).is_empty());
+    for path in [
+        "other/scripts/lib/x.sh",
+        "scripts/lib/x.sh.bak",
+        "scripts/lib/x.sh/y.sh",
+        "scripts/lib",
+        "Scripts/lib/x.sh",
+        "scripts/lib/X.sh",
+        "x.sh",
+    ] {
+        let found = judge(&list, &[file("scripts/lib/x.sh", text), file(path, text)]);
+        assert!(
+            found
+                .iter()
+                .any(|finding| finding.starts_with(&format!("{path}:"))),
+            "{path} passed as a reader: {found:?}"
+        );
+    }
+}
+
+/// A file that lists its lines holds those lines, each as often as listed, and no other line that
+/// holds the name; and one positive sample of each class passes.
+#[test]
+fn a_listed_file_holds_exactly_its_listed_lines() {
+    let list = [
+        reader("scripts/lib/x.sh"),
+        lines(
+            "scripts/y.sh",
+            &[
+                ("export KR_TEST_ARTIFACTS_DIR=\"$dir\"", 1),
+                ("# KR_TEST_ARTIFACTS_DIR is set above.", 2),
+            ],
         ),
-        (
-            flow,
-            "jobs:\n  a:\n    steps:\n      - run: |\n          cat <<'EOF'\n          - uses: actions/upload-artifact@v7\n            with:\n              path: |\n                ${{ env.KR_TEST_ARTIFACTS_DIR }}\n          EOF\n",
-            1,
-        ),
-        (
-            flow,
-            "jobs:\n  a:\n    steps:\n      - run: \"echo\n          uses: actions/upload-artifact@v7\n          with:\n            path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\"\n",
-            1,
-        ),
-        // A step that is not an upload does not become one because an upload step follows.
-        (
-            flow,
-            "jobs:\n  a:\n    steps:\n      - uses: actions/cache@v4\n        with:\n          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}\n      - uses: actions/upload-artifact@v7\n        with:\n          name: x\n",
-            1,
-        ),
-        // Only a block scalar's lines are the lines of the path list.
-        (
-            flow,
-            "jobs:\n  a:\n    steps:\n      - uses: actions/upload-artifact@v7\n        with:\n          path: a\n            ${{ env.KR_TEST_ARTIFACTS_DIR }}\n",
-            1,
-        ),
-        // A flow mapping is not a `with:` the scan reads.
-        (
-            flow,
-            "jobs:\n  a:\n    steps:\n      - uses: actions/upload-artifact@v7\n        with: { path: ${{ env.KR_TEST_ARTIFACTS_DIR }} }\n",
-            1,
-        ),
-        // The directory is a key of `env:` only, and nothing else of the line reads it.
-        (
-            flow,
-            "jobs:\n  a:\n    steps:\n      - uses: x/y@v1\n        with:\n          KR_TEST_ARTIFACTS_DIR: /tmp/x\n",
-            1,
-        ),
-        (
-            flow,
-            "jobs:\n  a:\n    env:\n      KR_TEST_ARTIFACTS_DIR: ${{ env.KR_TEST_ARTIFACTS_DIR }}/x\n",
-            1,
-        ),
-        (
-            flow,
-            "jobs:\n  a:\n    env:\n      KR_TEST_ARTIFACTS_DIR: /tmp/x\n",
-            0,
-        ),
-        // A real upload step after a script is an upload.
-        (
-            flow,
-            &format!(
-                "jobs:\n  a:\n    steps:\n      - run: |\n          echo hi\n      - uses: {upload}\n        with:\n          path: ${{{{ env.KR_TEST_ARTIFACTS_DIR }}}}\n"
-            ),
-            0,
-        ),
-    ]);
+    ];
+    let reader_text = "echo hi\nconst dir = process.env.KR_TEST_ARTIFACTS_DIR\n";
+    let listed = |extra: &str| {
+        format!(
+            "#!/bin/sh\n  export KR_TEST_ARTIFACTS_DIR=\"$dir\"\r\n# KR_TEST_ARTIFACTS_DIR is set above.\n\t# KR_TEST_ARTIFACTS_DIR is set above.   \n{extra}"
+        )
+    };
+    let run = |text: &str| {
+        judge(
+            &list,
+            &[
+                file("scripts/lib/x.sh", reader_text),
+                file("scripts/y.sh", text),
+            ],
+        )
+    };
+    // The positive sample of each class.
+    assert_eq!(run(&listed("")), Vec::<String>::new());
+    // A line that holds the name and is not listed fails with its file and line.
+    let added = run(&listed("echo $KR_TEST_ARTIFACTS_DIR\n"));
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert!(added[0].starts_with("scripts/y.sh:5:"), "{added:?}");
+    // A listed line that stands once more fails, whether it was listed once or twice.
+    for copy in [
+        "export KR_TEST_ARTIFACTS_DIR=\"$dir\"",
+        "# KR_TEST_ARTIFACTS_DIR is set above.",
+    ] {
+        assert!(!run(&listed(&format!("{copy}\n"))).is_empty(), "{copy}");
+    }
+    // A listed line that is gone fails, and so does the last of two of a line that is listed twice.
+    let text = listed("");
+    for gone in [
+        "  export KR_TEST_ARTIFACTS_DIR=\"$dir\"\r\n",
+        "\t# KR_TEST_ARTIFACTS_DIR is set above.   \n",
+    ] {
+        let found = run(&text.replace(gone, ""));
+        assert!(!found.is_empty(), "no finding when {gone:?} is gone");
+        assert!(
+            found.iter().any(|f| f.contains("the list has")),
+            "{found:?}"
+        );
+    }
+    // A listed file that no longer holds the name, or is not there, fails.
+    let found = run("#!/bin/sh\necho hi\n");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.starts_with("scripts/y.sh: is on the list")),
+        "{found:?}"
+    );
+    let found = judge(&list, &[file("scripts/lib/x.sh", reader_text)]);
+    assert!(
+        found
+            .iter()
+            .any(|f| f.starts_with("scripts/y.sh: is on the list")),
+        "{found:?}"
+    );
+    // The text of a listed line is matched as a whole line, in its letter case, and a line that
+    // another line terminator cuts is one line.
+    for other in [
+        "export KR_TEST_ARTIFACTS_DIR=\"$dir\"; rm -rf x\n",
+        "rm -rf x; export KR_TEST_ARTIFACTS_DIR=\"$dir\"\n",
+        "export KR_TEST_ARTIFACTS_DIR=\"$dir\"\u{2028}rm -rf x\n",
+        "rm -rf x\u{2028}export KR_TEST_ARTIFACTS_DIR=\"$dir\"\n",
+        "rm -rf x\rexport KR_TEST_ARTIFACTS_DIR=\"$dir\"\n",
+        "export kr_test_artifacts_dir=\"$dir\"\n",
+        "\u{feff}export KR_TEST_ARTIFACTS_DIR=\"$dir\"\n",
+    ] {
+        assert!(!run(&listed(other)).is_empty(), "{other:?} passed");
+    }
+    // A file on no list does not pass because its lines are another file's listed lines.
+    let elsewhere = judge(
+        &list,
+        &[
+            file("scripts/z.sh", listed("")),
+            file("scripts/y.sh", listed("")),
+            file("scripts/lib/x.sh", reader_text),
+        ],
+    );
+    assert!(
+        elsewhere.iter().any(|f| f.starts_with("scripts/z.sh:")),
+        "{elsewhere:?}"
+    );
 }
