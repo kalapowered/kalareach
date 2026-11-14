@@ -812,7 +812,7 @@ fn a_run_with_a_step_run_again_ends_red_with_no_warning_where_the_evidence_is_no
         assert!(!document.passed(), "{what}");
         assert_eq!(document.summary.failed_steps, [1], "{what}");
         assert!(document.rerun_annotations().is_empty(), "{what}");
-        assert!(document.rerun_count_line().is_some(), "{what}");
+        assert_eq!(document.rerun_count_line(), None, "{what}");
     }
 }
 

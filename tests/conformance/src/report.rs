@@ -330,14 +330,11 @@ impl Document {
     /// ends the run red.
     #[must_use]
     pub fn rerun_annotations(&self) -> Vec<String> {
-        self.summary
-            .rerun_steps
-            .iter()
-            .filter(|number| !self.summary.failed_steps.contains(number))
-            .filter_map(|number| {
+        self.settled_reruns()
+            .into_iter()
+            .map(|(number, rerun)| {
                 let record = &self.steps[number - 1];
-                let rerun = record.rerun.as_ref()?;
-                Some(format!(
+                format!(
                     "::warning title={}::{}",
                     escaped_property(&format!("Step {number} was run again")),
                     escaped_data(&format!(
@@ -346,17 +343,32 @@ impl Document {
                         rerun.files.join(", "),
                         rerun.reason
                     ))
-                ))
+                )
             })
             .collect()
     }
 
-    /// The count of steps that were run again, as the last line of a run that had any.
+    /// The count of steps that were run again and passed with the runner's disk as the cause, as
+    /// the last line of a run that had any. A step run again for a cause that is not shown ends
+    /// the run red, and the run prints no count for it.
     #[must_use]
     pub fn rerun_count_line(&self) -> Option<String> {
-        let count = self.summary.rerun_steps.len();
+        let count = self.settled_reruns().len();
         (count > 0)
             .then(|| format!("{count} steps were run again after a file that could not be started"))
+    }
+
+    /// The steps that were run again and passed, by number, with their second run: those whose
+    /// cause is the runner's disk. One whose cause is not shown carries an error and is among the
+    /// failed steps.
+    fn settled_reruns(&self) -> Vec<(usize, &Rerun)> {
+        self.summary
+            .rerun_steps
+            .iter()
+            .filter(|number| !self.summary.failed_steps.contains(number))
+            .filter_map(|number| Some((*number, self.steps[number - 1].rerun.as_ref()?)))
+            .filter(|(_, rerun)| rerun.cause == fault::Cause::RunnerDisk)
+            .collect()
     }
 }
 
