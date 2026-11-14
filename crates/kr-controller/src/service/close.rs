@@ -578,6 +578,9 @@ impl Controller {
 
     /// The body of [`Self::reconcile`].
     async fn reconcile_session(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
+        #[cfg(feature = "testing")]
+        self.reconciliations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (record, desktop) = {
             let registry = self.registry.lock().await;
             let record = registry
