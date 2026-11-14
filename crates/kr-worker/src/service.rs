@@ -1373,6 +1373,15 @@ impl WorkerService {
         self.fence_what_is_owed();
     }
 
+    /// How many controller connections this worker has answered the hello of so far, for this
+    /// host's own tests: each is a link the daemon opened.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn controller_connections_for_tests(&self) -> u64 {
+        self.connection_order
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// How many announcements of an authority revision have been refused so far because the
     /// dispatch boundary was held, for this host's own tests.
     #[cfg(feature = "testing")]

@@ -378,6 +378,20 @@ pub struct SentAnnouncement {
     pub evidence_from: u64,
 }
 
+/// A worker's connection, kept by a test so that whatever else asks the worker has to wait for it.
+#[cfg(feature = "testing")]
+pub struct HeldWorkerLink {
+    _link: workers::WorkerLink,
+}
+
+#[cfg(feature = "testing")]
+impl Drop for HeldWorkerLink {
+    /// The connection goes back to its slot as it was, a link whose exchanges all ended.
+    fn drop(&mut self) {
+        self._link.give_back();
+    }
+}
+
 /// The control daemon.
 pub struct Controller {
     /// This daemon, as something a task started from a method that has no counted reference can
@@ -641,6 +655,14 @@ pub struct Controller {
     /// it sent them, for this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     announcements_sent: std::sync::Mutex<Vec<SentAnnouncement>>,
+    /// Every ask the daemon's own pass has made of a pending worker, with the time it began, for
+    /// this host's own tests. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pending_asks: std::sync::Mutex<Vec<(SessionId, tokio::time::Instant)>>,
+    /// How many times this daemon has asked whether a worker has ended, for this host's own tests.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    reconciliations: std::sync::atomic::AtomicUsize,
     /// Where this host's own tests stop a barrier's first step once it has advanced the revision
     /// and withdrawn the registrations, before the lease issuer adopts the revision. The pause
     /// holds the thread, not the task: nothing the test asks from here awaits. Compiled away in
@@ -1244,6 +1266,60 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Returns every ask the daemon's own pass has made of a pending worker so far, in order, with
+    /// the time each began, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pending_asks_for_tests(&self) -> Vec<(SessionId, tokio::time::Instant)> {
+        self.pending_asks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many times this daemon has asked whether a worker has ended, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn reconciliations_for_tests(&self) -> usize {
+        self.reconciliations
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The revision whose fence this host still owes, if it owes one, for this host's own tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    #[cfg(feature = "testing")]
+    pub async fn fence_owed_for_tests(
+        &self,
+    ) -> Result<Option<kr_protocol::ids::AuthorityRevision>> {
+        self.registry.lock().await.fence_owed()
+    }
+
+    /// Takes a worker out of the directory without ending its session, as a start that could not
+    /// verify it leaves one, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub async fn forget_worker_for_tests(&self, session_id: SessionId) {
+        self.directory.lock().await.remove(session_id);
+    }
+
+    /// Takes the worker's one connection and keeps it until the returned value is dropped, so that
+    /// whatever else asks the worker waits for it, for this host's own tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker cannot be reached.
+    #[cfg(feature = "testing")]
+    pub async fn hold_a_worker_link_for_tests(
+        &self,
+        session_id: SessionId,
+    ) -> Result<HeldWorkerLink> {
+        self.worker_client_of(session_id)
+            .await
+            .map(|link| HeldWorkerLink { _link: link })
     }
 
     /// Waits until the task that read back what the workers an earlier run recorded still hold
