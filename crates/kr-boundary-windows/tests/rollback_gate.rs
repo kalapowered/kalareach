@@ -352,6 +352,14 @@ fn the_ending_after_a_failed_save_is_chosen_from_the_stage_at_which_the_save_fai
         .find("renamed: renamed.get(),")
         .expect("the ending is given the stage at which the save failed");
     assert!(begun < saved && saved < said);
+    // The ending is told whether the run holds an earlier write of its record, read before the
+    // save, so that the words about this write do not deny an earlier one.
+    let earlier = keep
+        .find("let earlier_write = {")
+        .expect("the run's earlier write is read");
+    assert!(earlier < begun);
+    assert!(keep.contains("laid.manifest.is_some()"));
+    assert!(keep.contains("earlier_write,"));
     // The stage is set in one place: where the hold is told that the replacement has the manifest's
     // path, and the plain save does not report it.
     let save = code_of(body_of(&source, "fn save_noting("));
