@@ -49,8 +49,9 @@
 //   does not take;
 // - on Windows, `LINK` and `_LINK_`, which the linker reads before and after its options and which can
 //   add or leave out the runtime libraries of the link, `CL` and `_CL_`, which the C compiler reads
-//   before and after its options and which can change the runtime its objects ask for, and
-//   `SODIUM_LIB_DIR` and `SODIUM_USE_PKG_CONFIG`,
+//   before and after its options and which can change the runtime its objects ask for, `CFLAGS` and
+//   `CXXFLAGS` (host, target and per-target spellings), which the `cc` crate adds to its C compiler's
+//   options last, and `SODIUM_LIB_DIR` and `SODIUM_USE_PKG_CONFIG`,
 //   with which libsodium's crate links the library they name and not the archive that was compared.
 import { spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
@@ -169,6 +170,17 @@ function givesLinkerOptions(name) {
 /** Whether a Windows environment variable name gives the C compiler's options (it reads both). */
 function givesCompilerDriverOptions(name) {
   return ['CL', '_CL_'].includes(name.toUpperCase())
+}
+
+/**
+ * Whether a Windows environment variable name gives the flags that the `cc` crate adds to every C object it
+ * compiles for an MSVC target: `CFLAGS` and `CXXFLAGS` with the host, target and per-target spellings, which
+ * it adds last, after its own runtime option.
+ */
+function givesCrateCompilerFlags(name) {
+  return /^((HOST|TARGET)_)?(CFLAGS|CXXFLAGS)$|^(CFLAGS|CXXFLAGS)_(X86_64|AARCH64)[-_]PC[-_]WINDOWS[-_]MSVC$/.test(
+    name.toUpperCase()
+  )
 }
 
 /** Whether a Windows environment variable name makes libsodium's crate link another library than the archive. */
@@ -295,6 +307,14 @@ export function refusal(argv, platform = process.platform, env = process.env) {
     return (
       `pnpm desktop does not run a build with ${driver.toUpperCase()} in the environment: the C compiler reads \`CL\` ` +
       'before the options it is given and `_CL_` after them, and either can change the runtime that the C objects of the build ask for.'
+    )
+  }
+  const crateFlags = Object.keys(env).find(givesCrateCompilerFlags)
+  if (crateFlags !== undefined) {
+    return (
+      `pnpm desktop does not run a build with ${crateFlags.toUpperCase()} in the environment: the \`cc\` crate, which ` +
+      'compiles the C of the dependencies, adds these flags last, after its own runtime option, and they can change ' +
+      'the runtime that the C objects of the build ask for.'
     )
   }
   const sodium = Object.keys(env).find(givesAnotherSodium)
