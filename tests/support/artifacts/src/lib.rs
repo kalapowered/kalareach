@@ -313,7 +313,19 @@ mod tests {
 
     /// As [`read_in_a_run`], with `directory` as the program's working directory.
     fn read_in_a_run_from(value: Option<&OsStr>, directory: Option<&Path>) -> std::process::Output {
+        read_in_a_run_with(value, directory, None)
+    }
+
+    /// As [`read_in_a_run_from`], with `runner_temp` as the runner's temporary folder.
+    fn read_in_a_run_with(
+        value: Option<&OsStr>,
+        directory: Option<&Path>,
+        runner_temp: Option<&str>,
+    ) -> std::process::Output {
         let mut run = Command::new(std::env::current_exe().expect("this program"));
+        if let Some(runner_temp) = runner_temp {
+            run.env("RUNNER_TEMP", runner_temp);
+        }
         if let Some(directory) = directory {
             run.current_dir(directory);
         }
@@ -364,6 +376,15 @@ mod tests {
             let output = read_in_a_run(Some(OsStr::new(refused)));
             assert!(!output.status.success(), "{refused:?}: {output:?}");
         }
+
+        // A relative name for the runner's temporary folder is no root, though it exists under the
+        // working directory: this crate's own `src` folder is not a place for evidence.
+        let source = std::env::current_dir()
+            .expect("a working directory")
+            .join("src");
+        let output =
+            read_in_a_run_with(Some(source.join("evidence").as_os_str()), None, Some("src"));
+        assert!(!output.status.success(), "{output:?}");
 
         // A relative value that names a folder under the working directory, which is inside a
         // root, is still refused: the value has to be absolute.

@@ -97,7 +97,7 @@ impl Reader {
                     "-c",
                     r#". "$1"
                     kr_artifacts_dir
-                    printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$KR_TEST_ARTIFACTS_DIR""#,
+                    printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)""#,
                     "bash",
                 ])
                 .arg(root.join("scripts").join("lib").join("artifacts-dir.sh"));
@@ -111,7 +111,7 @@ impl Reader {
                     r#"$ErrorView = 'NormalView'
                     $directory = & $env:KR_READER_SCRIPT
                     "directory=$directory"
-                    "exported=$env:KR_TEST_ARTIFACTS_DIR""#,
+                    "exported=$([System.Environment]::GetEnvironmentVariable('KR_TEST_ARTIFACTS_DIR'))""#,
                 ])
                 .env(
                     "KR_READER_SCRIPT",
@@ -239,6 +239,11 @@ fn a_run_without_the_variable_gets_a_directory_of_its_own_that_exists() {
         let directory = reading.directory.clone().expect("a directory");
         assert!(directory.is_dir(), "{reader:?}: {}", directory.display());
         assert!(
+            same(&real(&directory), &directory),
+            "{reader:?}: the directory is given resolved: {}",
+            directory.display()
+        );
+        assert!(
             reading
                 .exported
                 .as_deref()
@@ -307,6 +312,26 @@ fn a_relative_value_that_names_a_folder_under_the_working_directory_is_still_ref
             &reading,
             "a relative folder that exists",
             "not an absolute path",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_temporary_folder_is_no_root_though_it_exists_under_the_working_directory() {
+    // The repository's own `scripts` folder, named the way a relative TMPDIR names a folder.
+    for reader in readers() {
+        let value = repository().join("scripts").join("evidence");
+        let reading = reader.read_in(
+            Some(value.as_os_str()),
+            Some(Path::new("scripts")),
+            Some(&repository()),
+        );
+        assert_refused(
+            reader,
+            &reading,
+            "a folder under a relative temporary folder",
+            OUTSIDE,
         );
     }
 }

@@ -70,6 +70,11 @@ describe('the evidence directory reader', () => {
     expect(() => read(value)).toThrow(why)
   })
 
+  it('takes a relative runner folder for no root, though it exists under the working directory', () => {
+    vi.stubEnv('RUNNER_TEMP', 'src')
+    expect(() => read(join(cwd(), 'src', 'evidence'))).toThrow('not inside a temporary root')
+  })
+
   it('refuses a relative value that names a folder under the working directory', () => {
     const parent = folder(tmpdir())
     mkdirSync(join(parent, 'sub'), { recursive: true })
