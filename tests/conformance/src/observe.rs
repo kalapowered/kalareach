@@ -53,14 +53,24 @@ pub struct Observed {
     /// Whether the log also shows a test that ran and failed. Such a step failed for more than a
     /// program that could not be run, whatever the programs show.
     pub test_failed: bool,
+    /// Whether the log shows a failure that no program named accounts for: a program that ended
+    /// without being refused, a target with a harness of its own that exited with a failure, or a
+    /// build that did not compile.
+    pub unexplained_failure: bool,
+    /// Whether the log names more programs than the record holds.
+    pub incomplete: bool,
 }
 
 impl Observed {
-    /// Whether every program the step could not run shows damage, and no test ran and failed. A
-    /// step that also names a program that is whole is not one the fault fits.
+    /// Whether the step fits a program written damaged: its log was read whole, no test ran and
+    /// failed, no failure is left that a refused program does not account for, the record names
+    /// every program that was refused, and every one of them shows damage.
     #[must_use]
     pub fn damage_seen(&self) -> bool {
-        !self.test_failed
+        self.log.is_none()
+            && !self.test_failed
+            && !self.unexplained_failure
+            && !self.incomplete
             && !self.programs.is_empty()
             && self.programs.iter().all(|program| {
                 matches!(
@@ -81,8 +91,8 @@ pub struct Program {
     pub path: String,
     /// The log's own lines about it.
     pub lines: Vec<String>,
-    /// Whether the report's runner said it could not start the program, in its own words: the
-    /// shell's and Cargo's words do not say so.
+    /// Whether the runner recorded, in a file of its own that no program is told of, that it could
+    /// not start the program. The log's lines say the same for people and do not decide this.
     pub said_by_runner: bool,
     /// When the file was looked at, in seconds since the epoch.
     pub observed_at: u64,
@@ -139,7 +149,6 @@ impl std::fmt::Display for Found {
 struct Refusal {
     path: String,
     lines: Vec<String>,
-    said_by_runner: bool,
 }
 
 /// Whether a line opens or closes a test's captured output in the standard harness's summary.
@@ -147,31 +156,42 @@ fn opens_test_output(line: &str) -> bool {
     line.starts_with("---- ") && (line.ends_with(" stdout ----") || line.ends_with(" stderr ----"))
 }
 
+/// What a log shows besides the programs it names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Facts {
+    /// A test ran and failed.
+    test_failed: bool,
+    /// The log shows a failure that none of the programs named accounts for: a program that ended
+    /// without being refused, or a build that did not compile.
+    unexplained_failure: bool,
+    /// Another program was refused than the cap lets the record name.
+    incomplete: bool,
+}
+
+/// How many commands that a failed step names are kept to be matched with the programs.
+const MOST_FAILED_COMMANDS: usize = 64;
+
 /// The programs a log says could not be run, from the report's and Cargo's own lines and not from
 /// what a test printed: a test's captured output, which the harness prints between its
 /// `---- <name> stdout ----` line and the line `failures:` or `successes:`, is passed over. The
-/// second value says whether the log shows a test that failed.
-fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
+/// second value says what else the log shows.
+fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
     let mut found: Vec<Refusal> = Vec::new();
     // The shell's lines, as many distinct programs as a step can name: no more can be used.
     let mut shell: Vec<(String, String)> = Vec::new();
+    let mut facts = Facts::default();
     let mut saw_126 = false;
-    let mut test_failed = false;
+    let mut shell_left_out = false;
+    let mut compile_failed = false;
+    let mut failed_commands: Vec<String> = Vec::new();
     let mut in_test_output = false;
     let mut cause: Option<(usize, usize)> = None;
-    // Whether the program whose output is being read has shown that it started.
-    let mut started = false;
     for line in lines {
         let trimmed = line.trim();
-        if begins_a_program(trimmed) {
-            started = false;
-        } else if shows_a_program_started(trimmed) {
-            started = true;
-        }
         if trimmed.starts_with("test result: FAILED")
             || (trimmed.starts_with("test ") && trimmed.ends_with(" ... FAILED"))
         {
-            test_failed = true;
+            facts.test_failed = true;
         }
         if opens_test_output(trimmed) {
             in_test_output = true;
@@ -183,6 +203,16 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
                 in_test_output = false;
             }
             continue;
+        }
+        if trimmed.starts_with("error: could not compile") || trimmed.starts_with("error[") {
+            compile_failed = true;
+        }
+        if let Some((_, rest)) = trimmed.split_once("process didn't exit successfully: `") {
+            if failed_commands.len() < MOST_FAILED_COMMANDS {
+                failed_commands.push(rest.split('`').next().unwrap_or_default().to_owned());
+            } else {
+                facts.unexplained_failure = true;
+            }
         }
         if let Some((index, left)) = cause {
             let another = cargo_refusal(trimmed).is_some()
@@ -198,43 +228,48 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
         if trimmed.contains("exit status: 126") || trimmed.contains("(exit 126)") {
             saw_126 = true;
         }
-        if let Some(path) = cargo_refusal(trimmed) {
-            if found.len() < MOST_PROGRAMS && !found.iter().any(|known| known.path == path) {
-                found.push(Refusal {
-                    path,
-                    lines: vec![trimmed.to_owned()],
-                    said_by_runner: false,
-                });
+        let named = cargo_refusal(trimmed)
+            .map(|path| (path, true))
+            .or_else(|| runner_refusal(trimmed).map(|path| (path, false)));
+        if let Some((path, from_cargo)) = named {
+            if found.iter().any(|known| known.path == path) {
+                continue;
+            }
+            if found.len() >= MOST_PROGRAMS {
+                facts.incomplete = true;
+                continue;
+            }
+            found.push(Refusal {
+                path,
+                lines: vec![trimmed.to_owned()],
+            });
+            if from_cargo {
                 cause = Some((found.len() - 1, CAUSE_LINES));
             }
-        } else if let Some(path) = runner_refusal(trimmed) {
-            if started {
-                // Said by a program that was running, which is not the runner's refusal.
-            } else if let Some(known) = found.iter_mut().find(|known| known.path == path) {
-                known.said_by_runner = true;
-            } else if found.len() < MOST_PROGRAMS {
-                found.push(Refusal {
-                    path,
-                    lines: vec![trimmed.to_owned()],
-                    said_by_runner: true,
-                });
-            }
         } else if let Some(path) = shell_refusal(trimmed)
-            && shell.len() < MOST_PROGRAMS
             && !shell.iter().any(|(known, _)| *known == path)
         {
-            shell.push((path, trimmed.to_owned()));
+            if shell.len() < MOST_PROGRAMS {
+                shell.push((path, trimmed.to_owned()));
+            } else {
+                shell_left_out = true;
+            }
         }
     }
     if saw_126 {
+        facts.incomplete |= shell_left_out;
         for (path, line) in shell {
-            if found.len() < MOST_PROGRAMS && !found.iter().any(|known| known.path == path) {
-                found.push(Refusal {
-                    path,
-                    lines: vec![line],
-                    said_by_runner: false,
-                });
+            if found.iter().any(|known| known.path == path) {
+                continue;
             }
+            if found.len() >= MOST_PROGRAMS {
+                facts.incomplete = true;
+                continue;
+            }
+            found.push(Refusal {
+                path,
+                lines: vec![line],
+            });
         }
     }
     for refusal in &mut found {
@@ -242,7 +277,11 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
             refusal.lines.pop();
         }
     }
-    (found, test_failed)
+    facts.unexplained_failure |= compile_failed
+        || failed_commands
+            .iter()
+            .any(|command| !found.iter().any(|known| command.contains(&known.path)));
+    (found, facts)
 }
 
 /// The program in Cargo's "could not execute process `<program> <arguments>`".
@@ -250,21 +289,6 @@ fn cargo_refusal(line: &str) -> Option<String> {
     let (_, rest) = line.split_once("could not execute process `")?;
     let (command, _) = rest.split_once('`')?;
     command.split_whitespace().next().map(str::to_owned)
-}
-
-/// Whether a line of a log begins the output of one program: Cargo's announcement of a test
-/// binary or of documentation tests, or the lister's line before it runs a binary to list it.
-fn begins_a_program(line: &str) -> bool {
-    line.starts_with("Running ")
-        || line.starts_with("Doc-tests ")
-        || line.starts_with(crate::run::LISTING_BEGIN)
-}
-
-/// Whether a line is one a test harness prints once it has started: its count of tests, or a
-/// test's own line.
-fn shows_a_program_started(line: &str) -> bool {
-    (line.starts_with("running ") && (line.ends_with(" tests") || line.ends_with(" test")))
-        || line.starts_with("test ")
 }
 
 /// The program in the runner's "<runner>: <program> could not start: <error>".
@@ -284,10 +308,12 @@ fn shell_refusal(line: &str) -> Option<String> {
 }
 
 /// What a step's log, read at the moment the step ended, says of the programs it could not run.
-/// `None` when it names none, or when there is no log. A log that is a link or another object that is
-/// not a regular file, or that cannot be read in ten seconds, is recorded as such and not read.
+/// `records` is the directory in which the runner records a program that it could not start.
+/// `None` when the log names none and was read whole, or when there is no log. A log that is a link
+/// or another object that is not a regular file, or that cannot be read in ten seconds, or whose
+/// read failed part of the way, is recorded as such, and what it names before that is kept.
 #[must_use]
-pub fn observe_log(log: &Path, now: SystemTime) -> Option<Observed> {
+pub fn observe_log(log: &Path, records: &Path, now: SystemTime) -> Option<Observed> {
     if matches!(std::fs::symlink_metadata(log), Err(error) if error.kind() == ErrorKind::NotFound) {
         return None;
     }
@@ -296,6 +322,8 @@ pub fn observe_log(log: &Path, now: SystemTime) -> Option<Observed> {
             log: Some(found),
             programs: Vec::new(),
             test_failed: false,
+            unexplained_failure: false,
+            incomplete: false,
         })
     };
     let seen = match examine(log) {
@@ -303,41 +331,93 @@ pub fn observe_log(log: &Path, now: SystemTime) -> Option<Observed> {
         Err(found) => return unread(found),
     };
     let owned = log.to_path_buf();
-    let (refused, test_failed) = match bounded(READ_LIMIT, move || read_log(&owned, &seen)) {
+    let read = match bounded(READ_LIMIT, move || read_log(&owned, &seen)) {
         Ok(Ok(read)) => read,
         Ok(Err(found)) => return unread(found),
         Err(reason) => return unread(Found::NotRead { reason }),
     };
-    if refused.is_empty() {
+    observed(read, records, now)
+}
+
+/// The observation of what a log held, or `None` when it named no program and was read whole.
+fn observed(read: LogRead, records: &Path, now: SystemTime) -> Option<Observed> {
+    if read.refused.is_empty() && read.error.is_none() {
         return None;
     }
     Some(Observed {
-        log: None,
-        programs: refused
+        log: read.error.map(|error| Found::NotRead {
+            reason: format!("the log could not be read past its position: {error}"),
+        }),
+        programs: read
+            .refused
             .into_iter()
             .map(|refusal| Program {
                 file: observe_file(Path::new(&refusal.path)),
+                said_by_runner: recorded_by_runner(records, &refusal.path),
                 path: refusal.path,
                 lines: refusal.lines,
-                said_by_runner: refusal.said_by_runner,
                 observed_at: epoch(now).unwrap_or(0),
             })
             .collect(),
-        test_failed,
+        test_failed: read.facts.test_failed,
+        unexplained_failure: read.facts.unexplained_failure,
+        incomplete: read.facts.incomplete,
     })
 }
 
-/// The programs a log that was opened names, and whether it shows a test that failed.
-fn read_log(log: &Path, seen: &Metadata) -> Result<(Vec<Refusal>, bool), Found> {
+/// Whether the runner recorded in `records` that it could not start `program`: a file named for the
+/// program's last path part whose first line is the program's path.
+fn recorded_by_runner(records: &Path, program: &str) -> bool {
+    let name = crate::run::file_name(program);
+    if matches!(name.as_str(), "" | "." | "..") {
+        return false;
+    }
+    let path = records.join(name);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|seen| seen.is_file()) {
+        return false;
+    }
+    let mut text = String::new();
+    File::open(&path)
+        .and_then(|file| file.take(4096).read_to_string(&mut text))
+        .is_ok()
+        && text.lines().next() == Some(program)
+}
+
+/// What a log that was opened holds.
+#[derive(Debug)]
+struct LogRead {
+    refused: Vec<Refusal>,
+    facts: Facts,
+    /// Why the read stopped before the end of the log, when it did.
+    error: Option<String>,
+}
+
+/// The programs a log that was opened names, and what else it shows.
+fn read_log(log: &Path, seen: &Metadata) -> Result<LogRead, Found> {
     let (file, _) = open_looked(log, seen)?;
-    Ok(refusals(Lines {
-        reader: BufReader::new(file),
-    }))
+    Ok(read_lines(file))
+}
+
+/// The programs a log names, and what else it shows, read from `reader` to its end or its failure.
+fn read_lines(reader: impl Read) -> LogRead {
+    let mut lines = Lines {
+        reader: BufReader::new(reader),
+        error: None,
+    };
+    let (refused, facts) = refusals(&mut lines);
+    LogRead {
+        refused,
+        facts,
+        error: lines.error,
+    }
 }
 
 /// The lines of a log, none longer than [`LONGEST_LINE`] bytes, with invalid text replaced.
 struct Lines<R> {
     reader: BufReader<R>,
+    /// The error that stopped the read, when one did: the end of the lines is then not the end of
+    /// the log.
+    error: Option<String>,
 }
 
 impl<R: Read> Iterator for Lines<R> {
@@ -345,12 +425,18 @@ impl<R: Read> Iterator for Lines<R> {
 
     fn next(&mut self) -> Option<String> {
         let mut bytes = Vec::new();
-        let read = self
+        let read = match self
             .reader
             .by_ref()
             .take(LONGEST_LINE)
             .read_until(b'\n', &mut bytes)
-            .ok()?;
+        {
+            Ok(read) => read,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return None;
+            }
+        };
         (read > 0).then(|| String::from_utf8_lossy(&bytes).trim_end().to_owned())
     }
 }
@@ -640,7 +726,7 @@ mod tests {
 
     #[test]
     fn the_three_signatures_name_the_program_and_keep_the_errors_own_lines() {
-        let (found, failed) = refusals(text(&[
+        let (found, facts) = refusals(text(&[
             "error: failed to run custom build command for `x v0.1.0`",
             "Caused by:",
             "  could not execute process `/t/debug/build/x-1/build-script-build` (never executed)",
@@ -651,7 +737,7 @@ mod tests {
             "kr-conformance list-one: /t/debug/deps/b-0123 ended with exit status: 126",
             "/t/debug/deps/b-0123: /t/debug/deps/b-0123: cannot execute binary file",
         ]));
-        assert!(!failed);
+        assert!(!facts.test_failed);
         let paths: Vec<&str> = found.iter().map(|found| found.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -672,36 +758,6 @@ mod tests {
     }
 
     #[test]
-    fn the_runner_s_refusal_names_a_program_only_before_that_program_has_printed() {
-        let (found, _) = refusals(text(&[
-            "Running tests/a.rs (/t/a)",
-            "kr-conformance run-one: /t/a could not start: no",
-            "Running tests/b.rs (/t/b)",
-            "running 1 test",
-            "kr-conformance run-one: /t/b could not start: no",
-            "Running tests/c.rs (/t/c)",
-            "test c ... kr-conformance run-one: /t/c could not start: no",
-            "kr-conformance run-one: /t/c could not start: no",
-        ]));
-        let named: Vec<(&str, bool)> = found
-            .iter()
-            .map(|refusal| (refusal.path.as_str(), refusal.said_by_runner))
-            .collect();
-        assert_eq!(named, [("/t/a", true)]);
-    }
-
-    #[test]
-    fn a_program_that_cargo_and_the_runner_both_name_is_one_the_runner_said_it_could_not_start() {
-        let (found, _) = refusals(text(&[
-            "Running tests/a.rs (/t/a)",
-            "could not execute process `/t/a` (never executed)",
-            "kr-conformance run-one: /t/a could not start: no",
-        ]));
-        assert_eq!(found.len(), 1);
-        assert!(found[0].said_by_runner);
-    }
-
-    #[test]
     fn the_shell_s_words_count_only_where_the_log_holds_exit_126() {
         let (found, _) = refusals(text(&["/t/a: /t/a: cannot execute binary file"]));
         assert!(found.is_empty(), "{found:?}");
@@ -714,7 +770,7 @@ mod tests {
 
     #[test]
     fn what_a_test_prints_is_not_a_program_the_step_could_not_run() {
-        let (found, failed) = refusals(text(&[
+        let (found, facts) = refusals(text(&[
             "running 1 test",
             "test a ... FAILED",
             "failures:",
@@ -730,7 +786,7 @@ mod tests {
             "test result: FAILED. 0 passed; 1 failed",
         ]));
         assert!(found.is_empty(), "{found:?}");
-        assert!(failed);
+        assert!(facts.test_failed);
     }
 
     #[test]
@@ -753,6 +809,8 @@ mod tests {
             log: None,
             programs,
             test_failed,
+            unexplained_failure: false,
+            incomplete: false,
         };
         let damaged = || program(Some("the file is empty"));
         assert!(observed(vec![damaged()], false).damage_seen());
@@ -821,6 +879,120 @@ mod tests {
                 "{found:?}"
             );
         }
+    }
+
+    #[test]
+    fn damage_is_not_seen_where_a_member_was_not_read_or_the_record_is_not_whole() {
+        let program = |file: Found| Program {
+            path: "/t/a".to_owned(),
+            lines: Vec::new(),
+            said_by_runner: false,
+            observed_at: 0,
+            file,
+        };
+        let damaged = || Found::Read {
+            size: 0,
+            first_bytes: String::new(),
+            modified: None,
+            created: None,
+            damage: Some("the file is empty".to_owned()),
+        };
+        let observed = |programs: Vec<Program>| Observed {
+            log: None,
+            programs,
+            test_failed: false,
+            unexplained_failure: false,
+            incomplete: false,
+        };
+        assert!(observed(vec![program(damaged())]).damage_seen());
+        for other in [
+            Found::NotRead {
+                reason: "no".to_owned(),
+            },
+            Found::Other {
+                kind: "a link".to_owned(),
+            },
+        ] {
+            let mixed = observed(vec![program(damaged()), program(other)]);
+            assert!(!mixed.damage_seen(), "{mixed:?}");
+        }
+        let mut whole = observed(vec![program(damaged())]);
+        whole.unexplained_failure = true;
+        assert!(!whole.damage_seen());
+        whole.unexplained_failure = false;
+        whole.incomplete = true;
+        assert!(!whole.damage_seen());
+        whole.incomplete = false;
+        whole.log = Some(Found::NotRead {
+            reason: "no".to_owned(),
+        });
+        assert!(!whole.damage_seen());
+    }
+
+    #[test]
+    fn a_failure_that_no_refused_program_accounts_for_is_unexplained() {
+        let refused = "kr-conformance run-one: /t/a could not start: no";
+        let accounted = "  process didn't exit successfully: `/r run-one /t/a` (exit status: 1)";
+        let killed = "  process didn't exit successfully: `/r run-one /t/b` (signal: 6, SIGABRT)";
+        let facts = |lines: &[&str]| refusals(text(lines)).1;
+        assert!(!facts(&[refused, accounted]).unexplained_failure);
+        assert!(facts(&[refused, accounted, killed]).unexplained_failure);
+        assert!(
+            facts(&[refused, "error: could not compile `x` (lib) due to 1 error"])
+                .unexplained_failure
+        );
+        assert!(facts(&[refused, "error[E0308]: mismatched types"]).unexplained_failure);
+        assert!(facts(&[killed]).unexplained_failure);
+    }
+
+    #[test]
+    fn a_ninth_refused_program_makes_the_record_incomplete() {
+        let lines = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|n| format!("kr-conformance run-one: /t/p{n} could not start: no"))
+                .collect()
+        };
+        assert!(!refusals(lines(MOST_PROGRAMS).into_iter()).1.incomplete);
+        let (found, facts) = refusals(lines(MOST_PROGRAMS + 1).into_iter());
+        assert_eq!(found.len(), MOST_PROGRAMS);
+        assert!(facts.incomplete);
+        let mut shell: Vec<String> = (0..=MOST_PROGRAMS)
+            .map(|n| format!("/t/s{n}: /t/s{n}: cannot execute binary file"))
+            .collect();
+        shell.push("process didn't exit successfully: `/t/s0` (exit status: 126)".to_owned());
+        assert!(refusals(shell.into_iter()).1.incomplete);
+    }
+
+    /// A reader that gives its bytes and then fails.
+    struct FailsAfter(std::io::Cursor<Vec<u8>>);
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.0.read(buffer)? {
+                0 => Err(io::Error::other("the disk failed")),
+                read => Ok(read),
+            }
+        }
+    }
+
+    #[test]
+    fn a_log_that_fails_to_read_part_of_the_way_says_so_keeps_what_it_read_and_shows_no_damage() {
+        let first = "kr-conformance run-one: /t/a could not start: no\n";
+        let read = read_lines(FailsAfter(std::io::Cursor::new(first.as_bytes().to_vec())));
+        assert_eq!(read.refused.len(), 1);
+        let seen = observed(read, Path::new("/no-such-records"), SystemTime::now())
+            .expect("a log that failed is recorded");
+        let Some(Found::NotRead { reason }) = &seen.log else {
+            panic!("{seen:?}");
+        };
+        assert!(
+            reason.contains("past its position") && reason.contains("the disk failed"),
+            "{reason}"
+        );
+        assert_eq!(seen.programs.len(), 1);
+        assert!(!seen.damage_seen());
+        let whole = read_lines("running 1 test\n".as_bytes());
+        assert!(observed(whole, Path::new("/no-such-records"), SystemTime::now()).is_none());
     }
 
     #[test]
@@ -1017,7 +1189,8 @@ mod files {
         .unwrap();
         let log = held.path().join("step.log");
         std::os::unix::fs::symlink(&real, &log).unwrap();
-        let observed = observe_log(&log, SystemTime::now()).expect("the log is recorded");
+        let observed = observe_log(&log, Path::new("/no-such-records"), SystemTime::now())
+            .expect("the log is recorded");
         assert!(matches!(&observed.log, Some(Found::Other { kind }) if kind == "a link"));
         assert!(observed.programs.is_empty());
         assert!(!observed.damage_seen());
@@ -1031,7 +1204,7 @@ mod files {
         pipe(&log);
         // The call is given a generous wait only so that a regression ends this case.
         let read = bounded(Duration::from_secs(5), move || {
-            observe_log(&log, SystemTime::now())
+            observe_log(&log, Path::new("/no-such-records"), SystemTime::now())
         });
         let Ok(Some(observed)) = read else {
             panic!("the read of a pipe waited for a writer: {read:?}");
@@ -1077,8 +1250,15 @@ mod files {
         let held = tempfile::tempdir().unwrap();
         let log = held.path().join("step.log");
         std::fs::write(&log, "running 1 test\ntest a ... ok\n").unwrap();
-        assert!(observe_log(&log, SystemTime::now()).is_none());
-        assert!(observe_log(&held.path().join("gone.log"), SystemTime::now()).is_none());
+        assert!(observe_log(&log, Path::new("/no-such-records"), SystemTime::now()).is_none());
+        assert!(
+            observe_log(
+                &held.path().join("gone.log"),
+                Path::new("/no-such-records"),
+                SystemTime::now()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1095,7 +1275,8 @@ mod files {
             ),
         )
         .unwrap();
-        let observed = observe_log(&log, SystemTime::now()).expect("one program");
+        let observed = observe_log(&log, Path::new("/no-such-records"), SystemTime::now())
+            .expect("one program");
         assert!(observed.damage_seen());
         assert_eq!(observed.programs[0].path, program.to_string_lossy());
     }

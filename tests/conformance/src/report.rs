@@ -528,6 +528,9 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
         &build_directories(options),
     )
     .map_err(Stopped::PrivateCopy)?;
+    let runner_records = runner
+        .parent()
+        .map_or_else(PathBuf::new, |directory| directory.join(run::REFUSALS));
     let mut executed = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         progress(&format!(
@@ -549,8 +552,11 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             &map.packages,
         );
         if done.error.is_some() || done.exit != Some(0) {
-            done.observation =
-                observe::observe_log(&options.evidence.join(&done.log), SystemTime::now());
+            done.observation = observe::observe_log(
+                &options.evidence.join(&done.log),
+                &runner_records,
+                SystemTime::now(),
+            );
         }
         progress(&format!(
             "  exit {} in {} s{}",

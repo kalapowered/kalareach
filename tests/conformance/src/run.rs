@@ -335,6 +335,35 @@ pub const LISTING_BEGIN: &str = "\u{1}kr-conformance listing\t";
 /// `skipped` for a program with a harness of its own, which it does not run).
 pub const LISTING_END: &str = "\u{1}kr-conformance listed\t";
 
+/// The directory, beside the runner's own program in the report's private directory, where the
+/// runner records a program it could not start, one file for each, named for the program's last
+/// path part, with the program's path on its first line. No program that a step runs is told of it.
+pub const REFUSALS: &str = "refusals";
+
+/// Records that `executable` could not be started: the report reads this, and not the log, to know
+/// that a program never ran. A record that cannot be made is not made, and the program then counts
+/// as one that ran and failed.
+fn record_refusal(executable: &str, error: &std::io::Error) {
+    let Ok(program) = std::env::current_exe() else {
+        return;
+    };
+    if let Some(directory) = program.parent() {
+        record_refusal_in(&directory.join(REFUSALS), executable, error);
+    }
+}
+
+fn record_refusal_in(directory: &Path, executable: &str, error: &std::io::Error) {
+    let name = file_name(executable);
+    if matches!(name.as_str(), "" | "." | "..") || std::fs::create_dir_all(directory).is_err() {
+        return;
+    }
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(name))
+        .and_then(|mut record| writeln!(record, "{executable}\n{error}"));
+}
+
 /// The variable naming the test binaries with a harness of its own, by file name, comma separated.
 pub const OWN_HARNESS_VARIABLE: &str = "KR_CONFORMANCE_OWN_HARNESS";
 
@@ -365,6 +394,7 @@ pub fn list_one(arguments: &[String]) -> u8 {
                 (!ended.success()).then(|| format!("ended with {ended}")),
             ),
             Err(error) => {
+                record_refusal(executable, &error);
                 let failure = format!("could not start: {error}");
                 (failure.clone(), Some(failure))
             }
@@ -410,6 +440,7 @@ pub fn run_one(arguments: &[String]) -> u8 {
                 1
             }),
         Err(error) => {
+            record_refusal(executable, &error);
             eprintln!("kr-conformance run-one: {executable} could not start: {error}");
             1
         }

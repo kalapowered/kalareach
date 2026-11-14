@@ -112,3 +112,25 @@ fn a_build_directory_that_is_the_temporary_directory_ends_the_run_before_its_fir
         "nothing was made in the build directory"
     );
 }
+
+#[test]
+fn the_runner_records_a_program_it_could_not_start_beside_its_own_program_and_nowhere_else() {
+    let held = tempfile::tempdir().expect("a directory");
+    let program = Path::new(env!("CARGO_BIN_EXE_kr-conformance"));
+    let runner = held.path().join(program.file_name().expect("a file name"));
+    std::fs::copy(program, &runner).expect("a copy of the program");
+    let missing = held.path().join("no-such-dir").join("prog-0123");
+    for command in ["run-one", "list-one"] {
+        let status = std::process::Command::new(&runner)
+            .arg(command)
+            .arg(&missing)
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("the runner starts");
+        assert!(!status.success(), "{command}");
+        let record = std::fs::read_to_string(held.path().join("refusals").join("prog-0123"))
+            .expect("the runner recorded the refusal");
+        assert_eq!(record.lines().next(), missing.to_str(), "{command}");
+    }
+}

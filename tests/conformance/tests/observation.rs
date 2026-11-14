@@ -221,6 +221,11 @@ fn runner_that(held: &Path, arm: &str, refusal: &str) -> PathBuf {
     runner
 }
 
+/// What the runner does, before it says so, when it could not start a program: it records that in
+/// its own directory, as the report's own runner does.
+const RECORD: &str = "mkdir -p \"$(dirname \"$0\")/refusals\"; \
+    printf '%s\\n' \"$2\" > \"$(dirname \"$0\")/refusals/$(basename \"$2\")\"; ";
+
 /// The report over the `forms` tree's tests, run through `runner`.
 fn tests_through(evidence: &Path, runner: PathBuf) -> Document {
     run(
@@ -242,7 +247,9 @@ fn a_test_program_that_could_not_start_is_not_run_with_the_reason_and_not_passed
     let runner = runner_that(
         held.path(),
         "run-one",
-        "echo \"kr-conformance run-one: $2 could not start: Exec format error (os error 8)\" >&2; exit 1",
+        &format!(
+            "{RECORD}echo \"kr-conformance run-one: $2 could not start: Exec format error (os error 8)\" >&2; exit 1"
+        ),
     );
     let document = tests_through(evidence.path(), runner);
     assert!(!document.passed(), "a step that failed fails the run");
@@ -301,11 +308,13 @@ fn a_test_program_with_a_failed_test_is_not_run_whatever_line_the_runner_wrote_b
     let runner = runner_that(
         held.path(),
         "run-one",
-        "echo \"kr-conformance run-one: $2 could not start: Exec format error (os error 8)\" >&2; \
+        &format!(
+            "{RECORD}echo \"kr-conformance run-one: $2 could not start: Exec format error (os error 8)\" >&2; \
          echo \"running 1 test\"; echo \"test documented ... FAILED\"; echo; echo \"failures:\"; \
          echo \"    documented\"; echo; \
          echo \"test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\"; \
-         printf 'failed documented\\n' > \"$KR_CONFORMANCE_RECORDS/$(basename \"$2\")\"; exit 101",
+         printf 'failed documented\\n' > \"$KR_CONFORMANCE_RECORDS/$(basename \"$2\")\"; exit 101"
+        ),
     );
     let document = tests_through(evidence.path(), runner);
     let test = &document.identifiers["KR-REQ-03.02"].tests[0];
@@ -347,7 +356,9 @@ fn a_program_the_runner_refused_at_the_listing_is_observed_though_the_step_has_n
     let runner = runner_that(
         held.path(),
         "list-one",
-        "echo \"kr-conformance list-one: $2 could not start: Exec format error (os error 8)\" >&2; exit 1",
+        &format!(
+            "{RECORD}echo \"kr-conformance list-one: $2 could not start: Exec format error (os error 8)\" >&2; exit 1"
+        ),
     );
     let document = tests_through(evidence.path(), runner);
     let step = &document.steps[0];
@@ -357,4 +368,70 @@ fn a_program_the_runner_refused_at_the_listing_is_observed_though_the_step_has_n
     let observed = step.observation.as_ref().expect("observed");
     assert!(observed.programs[0].said_by_runner, "{observed:?}");
     assert!(observed.programs[0].lines[0].contains("list-one"));
+}
+
+#[test]
+fn a_test_that_printed_a_running_line_and_the_runner_s_form_with_its_own_path_and_aborted_stays_failed()
+ {
+    let held = tempfile::tempdir().unwrap();
+    let evidence = tempfile::tempdir().unwrap();
+    // No record: the runner started the program, and what it printed is the program's own.
+    let runner = runner_that(
+        held.path(),
+        "run-one",
+        "echo \"     Running diagnostics\"; \
+         echo \"kr-conformance run-one: $2 could not start: Exec format error (os error 8)\" >&2; exit 134",
+    );
+    let document = tests_through(evidence.path(), runner);
+    let test = &document.identifiers["KR-REQ-03.02"].tests[0];
+    assert_eq!(test.outcome, Outcome::Failed, "{test:?}");
+    assert_eq!(document.summary.tests.not_run, 0);
+}
+
+#[test]
+fn the_record_of_one_refused_program_does_not_mark_the_tests_of_another() {
+    let held = tempfile::tempdir().unwrap();
+    let evidence = tempfile::tempdir().unwrap();
+    // Only the binary of the `flow` test target is refused; the others end at once, with no record.
+    let runner = runner_that(
+        held.path(),
+        "run-one",
+        &format!(
+            "case \"$(basename \"$2\")\" in flow-*) {RECORD}echo \"kr-conformance run-one: $2 could not start: no\" >&2; exit 1;; \
+             *) exit 134;; esac"
+        ),
+    );
+    let document = tests_through(evidence.path(), runner);
+    let test = &document.identifiers["KR-REQ-03.02"].tests[0];
+    assert_eq!(test.outcome, Outcome::NotRun, "{test:?}");
+    assert!(
+        document.summary.tests.failed > 0,
+        "the other programs ended without a record and stay failed: {:?}",
+        document.summary.tests
+    );
+}
+
+#[test]
+fn a_step_that_also_has_a_program_that_was_killed_is_not_one_with_damage_seen() {
+    let held = tempfile::tempdir().unwrap();
+    let evidence = tempfile::tempdir().unwrap();
+    let refused = held.path().join("refused");
+    let killed = held.path().join("killed");
+    let script = "head -c 8192 /dev/zero > \"$1\"; \
+        echo \"process didn't exit successfully: \\`$1\\` (exit status: 126)\"; \
+        echo \"$1: $1: cannot execute binary file\"; \
+        echo \"process didn't exit successfully: \\`$2\\` (signal: 6, SIGABRT: process abort signal)\"; exit 101";
+    let document = run(
+        evidence.path(),
+        lister(),
+        vec![shell(
+            "a build with two failed programs",
+            script,
+            &[&refused, &killed],
+        )],
+    );
+    let observed = document.steps[0].observation.as_ref().expect("observed");
+    assert!(observed.unexplained_failure, "{observed:?}");
+    assert!(document.summary.failed_with_damage_seen.is_empty());
+    assert_eq!(document.summary.failed_otherwise, [1]);
 }
