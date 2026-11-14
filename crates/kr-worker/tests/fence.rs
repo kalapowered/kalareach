@@ -187,6 +187,13 @@ impl Wired {
 
     /// Closes the session and waits for it, so the reader on the terminal ends with it.
     async fn close(self) {
+        drop(self.end().await);
+    }
+
+    /// Closes the session, ends the tasks the fixture started and lets go of every handle it
+    /// holds, and returns the directory the session lived in, which is removed when that is
+    /// dropped.
+    async fn end(self) -> kr_ipc::testing::TempHost {
         self.runtime
             .close(ClosureReason::CloseRequested)
             .1
@@ -194,6 +201,8 @@ impl Wired {
         let _ = tokio::time::timeout(Duration::from_secs(30), self.runtime.wait_closed()).await;
         self._bridge_task.abort();
         self._serving.abort();
+        let Wired { _temp, .. } = self;
+        _temp
     }
 }
 
@@ -10245,4 +10254,90 @@ async fn kr_req_13_11_the_answers_recorded_for_the_page_are_the_ones_a_worker_gi
          them again:\n{}",
         serde_json::to_string_pretty(&recorded).expect("serialises")
     );
+}
+
+/// How many tasks are alive on the runtime this case runs on.
+#[cfg(windows)]
+fn tasks_alive() -> usize {
+    tokio::runtime::Handle::current().metrics().num_alive_tasks()
+}
+
+/// The files this process has open under `root`, read from `/proc/self/fd`.
+#[cfg(target_os = "linux")]
+fn files_open_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let root = std::fs::canonicalize(root).expect("the directory is there");
+    std::fs::read_dir("/proc/self/fd")
+        .expect("the process lists its descriptors")
+        .flatten()
+        .filter_map(|descriptor| std::fs::read_link(descriptor.path()).ok())
+        .filter(|target| target.starts_with(&root))
+        .collect()
+}
+
+/// A closed session lets go of its journal when its fixture is dropped, whatever is still
+/// connected to it: no file under the session's directory is open in this process once the
+/// runtime has had its next turns. It reads `/proc/self/fd`, so it runs where that exists.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_session_lets_go_of_its_files_when_its_fixture_is_dropped() {
+    let wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let _holder = holder_over(&mut client, &wired).await;
+    let temp = wired.end().await;
+    let root = temp.root().to_path_buf();
+    // The client is still connected. What is waited for is the condition, and the bound only
+    // says how long a failure takes.
+    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+        while !files_open_under(&root).is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        files_open_under(&root),
+        Vec::<std::path::PathBuf>::new(),
+        "the session's files are still open after its fixture ended"
+    );
+    drop(client);
+}
+
+/// The directory of a fixture whose session closed is removed at the first try, which a file
+/// held open by a task that outlived the fixture would refuse.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_directory_of_a_closed_session_is_removed_at_the_first_try() {
+    let baseline = tasks_alive();
+    let wired = wired().await;
+    let temp = wired.end().await;
+    let root = temp.root().to_path_buf();
+    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+        while tasks_alive() > baseline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    std::fs::remove_dir_all(&root).expect("the directory goes at the first try");
+    // The directory is gone already, and the drop of the handle has nothing left to remove.
+    drop(temp);
+}
+
+/// A session that refused a request goes on: the error answer ends nothing, and the same
+/// connection and the bridge are served after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_refused_a_request_goes_on_serving() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let _holder = holder_over(&mut client, &wired).await;
+    detach(&mut client, &wired, Nullable::null(), Nullable::null())
+        .await
+        .expect_err("a detach that names nothing, before any line has been accepted, is refused");
+    let _ = fenced(&mut wired, 1, 1).await;
+    detach(&mut client, &wired, Nullable::null(), Nullable::null())
+        .await
+        .expect_err("the connection answers again, and refuses again");
+    wired.close().await;
 }
