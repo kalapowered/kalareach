@@ -105,12 +105,10 @@ impl Counts {
     }
 }
 
-/// What the reader reports: the frames it took, how it ended, and the STREAM frames its
-/// connection had taken when the stream ended.
+/// What the reader reports: the frames it took, and how it ended.
 struct ReaderEnd {
     read: usize,
     end: String,
-    stream_frames_taken: u64,
 }
 
 /// The payload of frame `index`: its number first, then bytes that differ from frame to frame.
@@ -174,22 +172,11 @@ async fn a_reader_falls_behind(shape: Shape) {
         let (_send, recv) = reader_connection.accept_bi().await.expect("a stream");
         let mut reader = FrameReader::new(recv, StreamKind::TerminalOutput);
         let mut read = 0_usize;
-        let ended = |read: usize, end: String, connection: &Connection| ReaderEnd {
-            read,
-            end,
-            stream_frames_taken: Counts::of(connection).stream_frames_received
-                - start.stream_frames_received,
-        };
+        let ended = |read: usize, end: String| ReaderEnd { read, end };
         match take(&mut reader, shape, read).await {
             Ok(true) => read += 1,
-            Ok(false) => {
-                return ended(
-                    read,
-                    "the stream held no frame".to_owned(),
-                    &reader_connection,
-                );
-            }
-            Err(error) => return ended(read, error, &reader_connection),
+            Ok(false) => return ended(read, "the stream held no frame".to_owned()),
+            Err(error) => return ended(read, error),
         }
         // Behind: nothing is read until the count that the case waits for holds, or the
         // connection ends.
@@ -223,11 +210,9 @@ async fn a_reader_falls_behind(shape: Shape) {
             match take(&mut reader, shape, read).await {
                 Ok(true) => read += 1,
                 Ok(false) => break,
-                Err(error) => return ended(read, error, &reader_connection),
+                Err(error) => return ended(read, error),
             }
         }
-        let taken =
-            Counts::of(&reader_connection).stream_frames_received - start.stream_frames_received;
         // One more exchange on the same connection, now that the reader has caught up.
         let exchange = async {
             let (send, recv) = reader_connection
@@ -250,16 +235,11 @@ async fn a_reader_falls_behind(shape: Shape) {
         }
         .await;
         match exchange {
-            Ok(()) => ReaderEnd {
+            Ok(()) => ended(read, CLEAN.to_owned()),
+            Err(error) => ended(
                 read,
-                end: CLEAN.to_owned(),
-                stream_frames_taken: taken,
-            },
-            Err(error) => ReaderEnd {
-                read,
-                end: format!("the stream ended cleanly, but the further exchange failed: {error}"),
-                stream_frames_taken: taken,
-            },
+                format!("the stream ended cleanly, but the further exchange failed: {error}"),
+            ),
         }
     });
 
@@ -267,7 +247,7 @@ async fn a_reader_falls_behind(shape: Shape) {
     // the reader has finished.
     let paced_by = accepted.clone();
     let sender = tokio::spawn(async move {
-        let outcome: Result<u64, String> = async {
+        let outcome: Result<(u64, u64), String> = async {
             let (send, _recv) = dialled.open_bi().await.map_err(|error| error.to_string())?;
             let mut writer = FrameWriter::new(send, StreamKind::TerminalOutput);
             for index in 0..shape.frames {
@@ -288,7 +268,10 @@ async fn a_reader_falls_behind(shape: Shape) {
                 }
             }
             writer.finish().map_err(|error| error.to_string())?;
+            // The STREAM frames that the sender has sent and that the receiving connection has
+            // taken, counted before the second stream adds its own.
             let sent = Counts::of(&dialled).stream_frames_sent - sent_at_start;
+            let taken = Counts::of(&paced_by).stream_frames_received - start.stream_frames_received;
             // One more exchange on the same connection, on a new stream.
             let (send, recv) = dialled.open_bi().await.map_err(|error| error.to_string())?;
             let mut asking = FrameWriter::new(send, StreamKind::Control);
@@ -308,7 +291,7 @@ async fn a_reader_falls_behind(shape: Shape) {
             if answer != expected {
                 return Err("the answer is not the question reversed".to_owned());
             }
-            Ok(sent)
+            Ok((sent, taken))
         }
         .await
         .map_err(|error| {
@@ -335,12 +318,10 @@ async fn a_reader_falls_behind(shape: Shape) {
         // Each frame went out, and came in, as one STREAM frame; the end of the stream may add
         // one more.
         let frames = shape.frames as u64;
-        let sent = *sender_end.as_ref().expect("the sender's count");
+        let (sent, taken) = *sender_end.as_ref().expect("the sender's counts");
         assert!(
-            (frames..=frames + 1).contains(&sent)
-                && (frames..=frames + 1).contains(&reader_end.stream_frames_taken),
-            "{frames} frames went out as {sent} STREAM frames and came in as {}: they were merged",
-            reader_end.stream_frames_taken
+            (frames..=frames + 1).contains(&sent) && (frames..=frames + 1).contains(&taken),
+            "{frames} frames went out as {sent} STREAM frames and came in as {taken}: they were merged"
         );
     }
 }
