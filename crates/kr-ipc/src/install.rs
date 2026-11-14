@@ -91,18 +91,23 @@
 //! # Windows
 //!
 //! `current` is a directory junction, which any account can make. A switch points the junction
-//! that is there at the new release in place, in one operation, so a program that reads or opens
-//! `current` at any moment of it finds the old release or the new one whole and is never refused.
-//! Renaming a new junction over the name would replace the junction, and an open that meets the
-//! old one on its way out is answered with access denied. A new junction is renamed in only where
-//! no `current` is there yet, or where something else than a junction is. With none there, a reader
-//! finds no `current`, which is the answer for a store with no current release, and then the new
-//! junction: nothing is replaced for it to meet. Something else than a junction is refused by
-//! [`Store::current`] until the switch has replaced it, so a read that is refused meanwhile was
-//! refused before. A junction names an absolute path, so a store that is moved or copied has a
-//! `current` that names the place it was made for, and [`Store::current`] refuses it. A store is
-//! kept on an NTFS volume. A release is sealed by attribute and by an access-control list that
-//! lets its owner read it and nothing that writes it.
+//! that is there at the new release in place, in one operation, so a program that reads the link or
+//! walks a path through it at any moment of the switch finds the old release or the new one whole
+//! and is not refused. Renaming a new junction over the name would replace the junction, and an
+//! open that meets the old one on its way out is answered with access denied. A switch that cannot
+//! open the junction to change it fails and replaces nothing. A switch that finds the name
+//! replaced by something else while it points the junction fails and says so.
+//!
+//! A new junction is renamed in only where no `current` is there yet, which replaces nothing for a
+//! reader to meet, or where what is there is not a junction. The product makes no other kind of
+//! `current`: a directory or a file put there is refused by [`Store::current`] until the rename has
+//! replaced it, and a symbolic link a person put there is replaced as the rename always replaced
+//! it, so a program that reads it meanwhile can still be refused.
+//!
+//! A junction names an absolute path, so a store that is moved or copied has a `current` that names
+//! the place it was made for, and [`Store::current`] refuses it. A store is kept on an NTFS volume.
+//! A release is sealed by attribute and by an access-control list that lets its owner read it and
+//! nothing that writes it.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -118,16 +123,16 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{free_space, seal_directory, seal_file, unseal_directory, windows_version};
 
-/// What a test needs to meet a removal at the moment another process of the account changes
-/// something it works in.
+/// What a test needs to meet a removal, or a switch of `current`, at the moment another process of
+/// the account changes something it works in.
 #[cfg(all(windows, feature = "testing"))]
 pub mod removal_race {
     use std::path::Path;
 
     pub use super::windows::{Hook, Moment};
 
-    /// Sets what runs at each moment of a removal, with the path the removal is at; `None` takes it
-    /// away.
+    /// Sets what runs at each moment of a removal or a switch, with the path it is at; `None` takes
+    /// it away.
     pub fn hook(hook: Option<Hook>) {
         *super::windows::HOOK
             .lock()
@@ -1272,7 +1277,7 @@ impl Store {
     /// take away the link the read had looked up. A read held up three times in a row for as long
     /// as a switch takes still gives that answer. On Windows a switch points the junction that is
     /// there at the new release in place, so a read finds the old release or the new one whole at
-    /// every moment of it; a read that is refused is an error, and is not read again.
+    /// every moment of it, and a read that is refused is an error that is not read again.
     ///
     /// # Errors
     ///
@@ -2373,10 +2378,11 @@ impl Store {
     /// is there is not a junction, a new junction is renamed over the name in one step instead, and
     /// the store's directory is flushed so the rename survives a crash. Nothing else changes.
     ///
-    /// A program that reads or opens `current` meanwhile finds the old release or the new one whole:
-    /// the junction is never replaced while it is there, so no reader can meet it half gone. A
-    /// rename over it would replace the junction, and a reader whose open met the old one on its
-    /// way out would be answered with access denied.
+    /// A program that reads the link or walks a path through it meanwhile finds the old release or
+    /// the new one whole: the junction is not replaced while it is there, so no reader can meet it
+    /// half gone. A rename over it would replace the junction, and a reader whose open met the old
+    /// one on its way out would be answered with access denied. A junction that this account cannot
+    /// open to change is an error, and is not replaced by a rename.
     ///
     /// `update` is the update lock, so what `current` names stays what an install or an update
     /// found it to be for as long as that holds it. `install` is the install lock, taken
@@ -2387,8 +2393,8 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`InstallError::Io`] when the junction cannot be made, pointed, renamed or flushed, and
-    /// [`InstallError::Replaced`] when the release is not in this store or the store is not on an
-    /// NTFS volume.
+    /// [`InstallError::Replaced`] when the release is not in this store, the store is not on an
+    /// NTFS volume, or `current` was replaced by something else while it was pointed at the release.
     pub fn switch(
         &self,
         release: &ReleaseName,
@@ -2420,10 +2426,17 @@ impl Store {
         }
         let target = std::path::absolute(self.release_directory(release))
             .map_err(|error| InstallError::io("resolve", self.release_directory(release), error))?;
-        if windows::point_junction(&self.current_link(), &target)
+        match windows::point_junction(&self.current_link(), &target)
             .map_err(|error| InstallError::io("point the link", self.current_link(), error))?
         {
-            return Ok(());
+            windows::Pointed::Done => return Ok(()),
+            windows::Pointed::Moved => {
+                return Err(InstallError::Replaced {
+                    path: self.current_link(),
+                    reason: "was replaced by something else while the switch pointed it at the release",
+                });
+            }
+            windows::Pointed::NotAJunction => {}
         }
         let temporary = self.root.join(format!(".{CURRENT}-{}", crate::new_uuid()));
         windows::create_junction(&temporary, &target)
