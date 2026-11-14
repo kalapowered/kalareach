@@ -80,6 +80,13 @@ pub const INPUT_OPEN_WAIT: Duration = Duration::from_secs(10);
 /// barrier was not reached.
 pub const BARRIER_WAIT: Duration = Duration::from_secs(2);
 
+/// How long the send stage of an ordered request on a local lane may take: the wait for the
+/// connection's turn and the write of the frame, together. It is the figure that a network
+/// carrier's registry gives the write of one frame (`TimerDeadlines`' `write`), so that a request
+/// behind a worker that stopped reading holds the lane's writer for no longer than a write to a
+/// peer that stopped reading holds a stream.
+pub const LOCAL_SEND_BOUND: Duration = Duration::from_secs(30);
+
 /// The most frames the lane holds that the host has not accepted: queued, written and held.
 pub const MAX_LOCAL_INPUT_FRAMES: usize = 1_024;
 
@@ -296,7 +303,9 @@ pub enum EpochKnown {
 pub enum EndCause {
     /// The stream was reset, or failed, while the connection stood.
     Reset,
-    /// The host finished its side of the stream.
+    /// The lane finished its side after [`InputLane::finish`] and every admitted frame was
+    /// written. A network lane says so once the host has read the stream to its end and finished
+    /// its own side; a local lane says so when its writer has written the last frame.
     Finished,
     /// The connection ended. `refusal` is what the host refused the connection with when it was the
     /// host that ended it, which is how a host that withdrew the connection ends it.
@@ -316,7 +325,8 @@ pub enum EndCause {
 #[derive(Clone, PartialEq, Eq)]
 pub enum InputEvent {
     /// The host accepted frames: every frame of `epoch` up to `through`. `frames` and `bytes` are
-    /// what this notice added.
+    /// what the notices that this event stands for added: acceptances of one epoch that the holder
+    /// has not read yet join into one event, so the counts cover every notice joined.
     Accepted {
         /// The epoch.
         epoch: InputLeaseEpoch,
@@ -485,10 +495,35 @@ impl EventQueue {
     }
 }
 
-/// An ordered request's turn, queued behind the typing of a local lane: `turn` sends it, and
-/// `refuse` tells its caller that it was never sent.
+/// What bounds the send stage of one ordered request: the time its wait for the connection's turn
+/// and its write may take together, and whether the lane still wants it sent.
+///
+/// Only a lane makes one, and [`Session::send_written`] takes nothing else, so an ordered request
+/// cannot be sent without the bound. The wait for the connection's turn ends with the time. The
+/// connection looks at the time and at the lane once it holds the turn and before every write to
+/// the socket. A request that either stops before a byte went is not sent, and the connection
+/// stands. One that either stops after part of it went is cut off and the connection ends with it,
+/// so that its peer reads a frame that stops short and acts on none of it. In both the request's
+/// caller is told [`ClientError::Withheld`].
+pub struct SendLimit {
+    not_after: tokio::time::Instant,
+    wanted: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl SendLimit {
+    pub(crate) const fn not_after(&self) -> tokio::time::Instant {
+        self.not_after
+    }
+
+    pub(crate) fn wanted(&self) -> &(dyn Fn() -> bool + Send + Sync) {
+        &*self.wanted
+    }
+}
+
+/// An ordered request's turn, queued behind the typing of a local lane: `turn` sends it under the
+/// bound that the lane gives it, and `refuse` tells its caller that it was never sent.
 struct Work {
-    turn: Pin<Box<dyn Future<Output = ()> + Send>>,
+    turn: Box<dyn FnOnce(SendLimit) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
     refuse: Box<dyn FnOnce() + Send>,
 }
 
@@ -1652,7 +1687,9 @@ impl InputLane {
     /// the lane, which resets the stream, a finish leaves the host to read every frame written. A
     /// hold that stands is ended first and its frames are counted unsent, and a later release does
     /// nothing. The holder keeps the lane until [`InputEvent::Ended`] says
-    /// [`EndCause::Finished`]: dropping it sooner resets the stream.
+    /// [`EndCause::Finished`]: dropping it sooner resets the stream. A network lane says it once
+    /// the host has finished its side. A local lane says it once its writer has written the last
+    /// frame, and each of its writes waits for the host's answer to the frame.
     pub fn finish(&self) {
         self.shared.lock().finish();
         self.shared.wake.notify_one();
@@ -1683,17 +1720,24 @@ impl InputLane {
     /// connection's requests in the order it reads them, sees them in the order the view admitted
     /// them.
     ///
-    /// `send` is called when the request's turn comes, and returns the future of the call that
-    /// writes the request ([`Session::send_written`]): the lane's writer waits for that future,
-    /// which resolves once the request's frame is on the connection, and then writes the next key.
-    /// The host's answer is not waited for, so a launch holds no later typing; it comes back on the
-    /// returned channel.
+    /// `send` is called with the request's [`SendLimit`] when its turn comes, and returns the future
+    /// of the call that writes the request ([`Session::send_written`], which takes the limit): the
+    /// lane's writer waits for that future, which resolves once the request's frame is on the
+    /// connection, and then writes the next key. The host's answer is not waited for, so a launch
+    /// holds no later typing; it comes back on the returned channel.
+    ///
+    /// The send stage, the wait for the connection's turn and the write together, takes
+    /// [`LOCAL_SEND_BOUND`] at most, so a request cannot hold the lane's writer for longer behind a
+    /// worker that stopped reading. Past it, or once the lane has ended, the request is not sent
+    /// and its channel resolves with [`ClientError::Withheld`]. When that comes after part of the
+    /// frame went, the connection is ended with it, so the worker reads a frame that stops short
+    /// and acts on none of it, and the lane ends with the connection's cause.
     ///
     /// A request is not typing: it outlives an epoch that ends, and waits for its turn under the
     /// next one. When the lane ends before its turn, the request is never sent and the channel
     /// resolves at once with [`ClientError::Withheld`], so that its caller can send an ending
-    /// request itself. When the lane ends while the request is being written, the channel is
-    /// dropped: what became of the request is not known.
+    /// request itself. When the lane ends once the request's send stage has begun, the connection
+    /// stops the send at the next look, as above, and the channel resolves the same way.
     ///
     /// # Errors
     ///
@@ -1704,7 +1748,7 @@ impl InputLane {
         send: F,
     ) -> std::result::Result<oneshot::Receiver<Result<Settled>>, InputRefusal>
     where
-        F: FnOnce() -> Fut + Send + 'static,
+        F: FnOnce(SendLimit) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Answering>> + Send + 'static,
     {
         let mut core = self.shared.lock();
@@ -1726,22 +1770,25 @@ impl InputLane {
         let (answer, answered) = oneshot::channel();
         let answer = Arc::new(Mutex::new(Some(answer)));
         let refused = Arc::clone(&answer);
-        let turn = Box::pin(async move {
-            match send().await {
-                Ok(answering) => {
-                    tokio::spawn(async move {
-                        let settled = answering.await;
+        let turn = Box::new(move |limit: SendLimit| {
+            let sending = send(limit);
+            Box::pin(async move {
+                match sending.await {
+                    Ok(answering) => {
+                        tokio::spawn(async move {
+                            let settled = answering.await;
+                            if let Some(answer) = take_sender(&answer) {
+                                let _ = answer.send(settled);
+                            }
+                        });
+                    }
+                    Err(error) => {
                         if let Some(answer) = take_sender(&answer) {
-                            let _ = answer.send(settled);
+                            let _ = answer.send(Err(error));
                         }
-                    });
-                }
-                Err(error) => {
-                    if let Some(answer) = take_sender(&answer) {
-                        let _ = answer.send(Err(error));
                     }
                 }
-            }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
         let work = Work {
             turn,
@@ -2107,15 +2154,25 @@ async fn local_writer(
     attachment_id: AttachmentId,
 ) {
     let mut over = shared.over.subscribe();
+    // What the connection asks before it writes a request: whether the lane still wants it.
+    let wanted: Arc<dyn Fn() -> bool + Send + Sync> = {
+        let lane_over = over.clone();
+        Arc::new(move || !*lane_over.borrow())
+    };
     while let Some(next) = next_to_write(&shared, &mut over).await {
         match next {
             Next::Work(work) => {
                 // The request is written here, and the next key waits for that and not for the
-                // host's answer, which goes to its caller on the channel.
-                tokio::select! {
-                    () = work.turn => {}
-                    _ = over.wait_for(|over| *over) => return,
-                }
+                // host's answer, which goes to its caller on the channel. Its send stage is bound
+                // by time and by `wanted`, and the connection stops it at its next look at them
+                // and not by this task dropping the write part way: there is no await between
+                // taking the request from the queue and the first poll of its turn, and no arm
+                // that gives the turn up.
+                let limit = SendLimit {
+                    not_after: tokio::time::Instant::now() + LOCAL_SEND_BOUND,
+                    wanted: Arc::clone(&wanted),
+                };
+                (work.turn)(limit).await;
                 shared.wake.notify_one();
             }
             Next::Frame { epoch, sequence } => {
@@ -2156,13 +2213,22 @@ async fn local_writer(
                         shared.end(EndCause::Uncertain(error));
                         return;
                     }
-                    Err(_) => {
-                        shared.end_by_failure(true).await;
+                    // A worker's answer that does not decode says nothing of the connection, which
+                    // stands: the stream is reset. Any other failure is the connection's.
+                    Err(error) => {
+                        shared
+                            .end_by_failure(!matches!(error, ClientError::Cbor(_)))
+                            .await;
                         return;
                     }
                 }
             }
-            Next::Done => return,
+            // Every frame admitted is written: the lane is complete, as a network lane is when
+            // the host has read its stream to the end.
+            Next::Done => {
+                shared.end(EndCause::Finished);
+                return;
+            }
             Next::Idle | Next::Over => {}
         }
     }
