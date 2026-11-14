@@ -761,9 +761,13 @@ impl InputDomain {
     }
 
     /// Returns the room's terms: `held + reserved + promised + free` is the room, and `free` is
-    /// what is left of it, never below nothing. A write that is waiting for its later entry is
-    /// counted in both `held` and `promised` until its guard drops, so the sum can read above the
-    /// room by that entry and no more; the worker's own storage never does.
+    /// what is left of it, never below nothing. A write whose key the machine holds back promises
+    /// its whole claim, and when the timer releases the key, the entry it becomes is counted in
+    /// `held` beside that promise until the batch is done: one entry too many for each such write.
+    /// A local write is admitted against the sum, so only the last of them can leave the sum above
+    /// the room, by one entry; a lane's frames are admitted against the window alone, so each
+    /// frame the window holds can add one. The queue itself, and so the worker's own storage,
+    /// never passes the room.
     #[must_use]
     pub fn ledger(&self) -> Ledger {
         let held = self.held_for_the_terminal();
@@ -2170,6 +2174,13 @@ impl InputDomain {
     #[must_use]
     pub fn lane_count(&self) -> usize {
         self.lanes.len()
+    }
+
+    /// Returns how many frames wait in the queues of all lanes, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn queued_lane_frames(&self) -> usize {
+        self.lanes.values().map(|lane| lane.queue.queued()).sum()
     }
 
     /// Queues a frame on a lane behind everything already queued there. The answer to a lane's
