@@ -1269,25 +1269,9 @@ Screenshots from the end-to-end run go to `/tmp`, named for what they show.
 pnpm -C apps/companion desktop build
 ```
 
-This wraps `tauri build` to build for the current machine and make the bundles that `bundle.targets`
-in `tauri.conf.json` names, which is every format the platform supports. The macOS bundles are the
-app bundle and the `.dmg` disk image. On Linux it bundles the `.deb`, `.rpm` and AppImage bundles.
-On Windows it bundles the MSI and NSIS installers. All options are forwarded to `tauri build` as
-given. The command gives it cargo as its runner, and it refuses `--runner`, `--no-bundle`,
-`--bundles` with no value, a first word other than `build`, `--config` or `-c` and `TAURI_CONFIG`
-(a configuration merged over the repository's can switch the bundle off), and cargo's own `--config`
-and `--target` after a bare `--`. It also errors if `--target` names a Windows target triple on a
-non-Windows machine, or an MSVC target other than `x86_64-pc-windows-msvc` and
-`aarch64-pc-windows-msvc` on Windows, and if `CARGO_BUILD_TARGET` is set, since the Tauri command
-line does not read it and would bundle the program of another build. The package's build script
-refuses an MSVC build for any other architecture, however its target was chosen.
+Run `tauri build` with some defaults. Build for the target of the machine it's running on and bundle the all targets of `bundle.targets` from `tauri.conf.json`. This is all supported targets, on macOS that's the app bundle and `.dmg` disk image, on Linux that's `.deb`, `.rpm` and AppImage and on Windows that's the MSI and NSIS installers. All other options are passed to `tauri build` and it's always run with the cargo runner. The `--runner` option, `--no-bundle`, `--bundles` with no value, anything as the first word that's not `build` and `--config` / `-c` are not allowed. Also the `TAURI_CONFIG` environment variable is not allowed because it allows changing the config and potentially disabling the bundle. Also cargo's own `--config` and `--target` after a bare `--` are not allowed. Also `--target` with a Windows target triple is not allowed on a machine that's not Windows, and on Windows an MSVC target other than `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` is not allowed. Also the `CARGO_BUILD_TARGET` environment variable is not allowed because the Tauri command line doesn't read it and the bundle would be made from the program of another build.
 
-On Windows the command first runs `scripts/place-libsodium-archive.sh` on the directory
-`SODIUM_DIST_DIR` names, or on one in the home directory that is named by the archive's digests. The
-script refuses a file whose size and SHA-256 differ from the ones it holds. The build is given that
-directory, and the build of libsodium's crate that an earlier build left in the target directory is
-removed first, so the program links the archive that was compared. This needs `bash` from Git for
-Windows, `curl` and `cargo` on the path.
+On Windows the command first runs `scripts/place-libsodium-archive.sh` to place a prebuilt archive in `SODIUM_DIST_DIR` or a directory in the home directory whose name is based on the digests of the archive. The script will refuse any file that doesn't have the expected size and SHA-256 hash. The build is given that directory. The build script of libsodium won't run again if the directory changes so the command also removes the previous `libsodium-sys-stable` build from the target directory for the same profile and target. It will then link the checked archive. It requires `bash` from Git for Windows, `curl` and `cargo` to be on the path. Also the `SODIUM_LIB_DIR` and `SODIUM_USE_PKG_CONFIG` environment variables are not allowed because they allow linking a different library.
 
 What each platform needs:
 
@@ -1304,48 +1288,23 @@ What each platform needs:
 The `companion-bundle` workflow builds and reads the Windows bundle. No job builds a macOS or a
 Linux bundle.
 
-The application links the static C runtime. The workspace's `.cargo/config.toml` gives the
-`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` targets the `crt-static` target feature, and
-the C library the workspace vendors is built for that runtime too, so the program and the library
-share one heap and one copy of the runtime state. Tauri's own `STATIC_VCRUNTIME` is a different
-thing: it links the Visual C++ runtime statically and the universal runtime dynamically, and its link
-arguments would put a second runtime in the link. The Tauri command line sets `STATIC_VCRUNTIME=true`
-in the environment for the desktop build unless it's already `false`, and the build script refuses a
-build that asks for it. To avoid this error this command sets it to `false` on Windows, whatever the
-environment holds. If it was already set to something else it prints the previous value and that it's
-replacing it. Each build, on any platform, prints tauri-build's warning that `STATIC_VCRUNTIME` is
-deprecated, which is expected while the variable is set.
+This application links the C runtime statically. The `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` targets of the `.cargo/config.toml` of the workspace enable the `crt-static` target feature and the C libraries that it links to, the prebuilt libsodium and llama.cpp libraries, also use that runtime. This means that there's only one runtime, one heap and one copy of the runtime state. It also doesn't import any runtime library so the application can run on a machine that doesn't have the Microsoft Visual C++ redistributable installed and the installers only need to include the application. It does mean that when there's a security issue in the runtime that the only way to get it fixed is to build a new release. Tauri's `STATIC_VCRUNTIME` environment variable links the Microsoft Visual C++ runtime library statically but it links the universal C runtime dynamically and it also adds the link arguments for it which would add a second runtime. The Tauri command line sets it to `true` for the desktop build unless it's already set to `false`. The build script refuses a build that asks for it (set to anything but `false`), so this command sets it to `false` on Windows, whatever the environment holds. If it was set to another value it prints that it's replacing the value. Each build, on any platform, prints a warning from tauri-build that `STATIC_VCRUNTIME` is deprecated, that's expected while the variable is set. If `tauri build` is run directly on Windows without this command and `STATIC_VCRUNTIME` isn't already set to `false` then the build script will abort the build with a message that names this command.
 
-On Windows the build takes its rustflags from the repository's `.cargo/config.toml` file alone, as
-far as the environment and the command's arguments reach. If any of `RUSTFLAGS`,
-`CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` or `CARGO_TARGET_*_RUSTFLAGS` are set in the
-environment then it errors and explains why. The first two replace the `crt-static` target feature
-and the link options in the file with no message, and the other two are a second source of flags
-that the command does not take. `kr-crypto`'s build script refuses any MSVC build whose target
-features lack `crt-static`, whichever way the feature was lost. It also errors if `LINK`
-or `_LINK_`, which the linker reads before and after its options, or `SODIUM_LIB_DIR` or
-`SODIUM_USE_PKG_CONFIG`, which make libsodium's crate link another library than the archive, are set. Running `tauri build` on
-Windows without this command, with `STATIC_VCRUNTIME` not already `false`, causes the build to error
-in a build script with a message naming this command.
+On Windows the build takes its rustflags from the repo's `.cargo/config.toml` file alone, as far as the environment and the command's arguments reach. If `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` or `CARGO_TARGET_*_RUSTFLAGS` is set in the environment, the command errors and explains. The first two replace the `crt-static` target feature and link options from the config file without warning. The other two would be a second source of rustflags, which this command does not take. If `LINK` or `_LINK_` is set in the environment, the command errors and explains, because the linker reads `LINK` before and `_LINK_` after its own options. If the target feature has been removed by some other means, the `kr-crypto` build script will error out, refusing to build on MSVC without the `crt-static` target feature.
 
-The `companion-bundle` workflow runs when manually dispatched and when pushed to main and a file in
-the package's native code, this command or this workflow file is modified. It builds the application
-and installers with `STATIC_VCRUNTIME=true` set in the environment like Tauri sets it to verify that
-this command overrides it. It verifies that the build log does not contain the LNK4098 warning about
-multiple C runtimes being selected. It then uses `dumpbin /dependents` to list the libraries the
-built executable imports and verifies that the dynamic runtime's libraries are there and no other
-runtime's are. Then it installs the NSIS installer in a temporary directory with the `/S` flag to
-make it silent. After installing it lists all the files and uses `dumpbin` on the installed
-executable again. Then it uninstalls it. Then it extracts the MSI installer using the administrative
-install option which doesn't actually install or register anything. Then it lists the files and
-again runs `dumpbin` on the executable. In the last two `dumpbin` runs it also reports each import
-as beside the executable or a Windows system library, by a check for the file, as a Windows API set
-or the Visual C++ runtime, by its name, or as not found, and none of these fails the job. The Visual
-C++ runtime comes from the runner, because neither installer carries it. It never runs the
-application. It doesn't upload anything.
+The `companion-bundle` workflow will be executed on manual dispatch as well as on every push to main if a file in the package's native code, this command, the build settings, the lock files, the reading script or this workflow itself is modified.
 
-The program needs no runtime library on the machine: the installers bring it alone, and it imports
-Windows system libraries only.
+It first links three small programs on the runner. The first one contains its own copy of the runtime. The second imports the dynamic runtime. The third asks for both of them. It checks that the import read refuses the second, and that linking the third reports `LNK4098`, so that a clean result means something.
+
+It then runs all cases of this command and builds the application and the installers with the environment variable `STATIC_VCRUNTIME` set to `true` (as Tauri sets it) to verify this command overrides it. It verifies that there is no warning with code `LNK4098` (selecting multiple runtimes) in the build log.
+
+It uses `dumpbin /dependents` to get a list of libraries the built executable imports. If one of them is on the deny list (Visual C++ libraries, Universal Runtime, old runtimes, debug runtime, libsodium) or if it is neither a Windows API set nor a file in the system directory, the job fails.
+
+It installs the NSIS installer in a temporary directory (`/S` makes it silent), lists its files, reads the imports of the installed executable the same way, and uninstalls it.
+
+It extracts the MSI installer using the administrative installation option, which doesn't install or register anything, lists its files and reads the imports of the extracted executable the same way.
+
+It never runs the application. It doesn't upload anything.
 
 Building the macOS bundle currently doesn't work with Xcode 27.2 (`ld-27106.1`) and macOS 27.2.1.
 Tauri sets the `MACOSX_DEPLOYMENT_TARGET` environment variable to the value of the
