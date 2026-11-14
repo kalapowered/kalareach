@@ -406,7 +406,9 @@ struct State {
     outstanding: VecDeque<Outstanding>,
     /// What the device is to be told, in the order it is to be told it.
     acks: VecDeque<InputAck>,
-    /// The epoch whose first definite refusal has been recorded.
+    /// The newest epoch whose first definite refusal has been recorded. An epoch older than it is
+    /// treated as refused too: its typing is dropped and its answers say nothing, so a late answer
+    /// of an older epoch never replaces what is known of the current one.
     refused_epoch: Option<InputLeaseEpoch>,
     ended: Option<End>,
     next_request: u64,
@@ -414,6 +416,14 @@ struct State {
     epoch_ended: bool,
     /// Frames queued for the lane's writer or written and not yet answered.
     in_flight: usize,
+}
+
+impl State {
+    /// Whether `epoch` is the newest refused epoch, or older than it.
+    fn refused(&self, epoch: InputLeaseEpoch) -> bool {
+        self.refused_epoch
+            .is_some_and(|refused| epoch.get() <= refused.get())
+    }
 }
 
 impl Flow {
@@ -493,7 +503,7 @@ impl Flow {
     fn route(&self, epoch: InputLeaseEpoch, claim: InputClaim) -> Routed {
         let mut state = self.lock();
         {
-            if state.refused_epoch == Some(epoch) {
+            if state.refused(epoch) {
                 Routed::Dropped
             } else {
                 match &mut state.window {
@@ -531,7 +541,7 @@ impl Flow {
     fn refuse(&self, epoch: InputLeaseEpoch, sequence: u64, error: ProtocolError) {
         {
             let mut state = self.lock();
-            if state.refused_epoch == Some(epoch) {
+            if state.refused(epoch) {
                 return;
             }
             state.refused_epoch = Some(epoch);
@@ -590,7 +600,7 @@ impl Flow {
             }
             // Once an epoch's first refusal is recorded the content of the answers still in flight
             // for it is ignored.
-            if state.refused_epoch != Some(front.epoch) {
+            if !state.refused(front.epoch) {
                 match &response.outcome {
                     Outcome::Ok(_) => {
                         // Recorded before the device is told.
@@ -900,17 +910,21 @@ async fn run(
     let mut version = flow.subscribe();
     // Declared before the pending read, so it is dropped after it.
     let _let_go = ReadLetGo(&flow.stages);
-    let mut next = Box::pin(reader.read_message::<InputFrame>());
+    // Whether the host has room for another frame. The pending read takes data only while it
+    // does, and watches for the device's reset while it does not.
+    let (room, mut room_rx) = watch::channel(false);
+    let mut next = Box::pin(reader.read_message_when::<InputFrame>(&mut room_rx));
     // Frames read and not yet routed, at most [`READ_AHEAD_FRAMES`].
     let mut held: VecDeque<Held> = VecDeque::new();
     let mut reading = true;
     let mut finished = false;
     loop {
+        // Marked before the state is looked at, the end included, so a change after the look is
+        // never missed.
+        version.borrow_and_update();
         if flow.ended().is_some() || handle.is_revoked() {
             break;
         }
-        // Marked before the state is looked at, so a change after the look is never missed.
-        version.borrow_and_update();
         if let Some(front) = held.front() {
             let claim = input_claim(front.frame.bytes.len());
             match flow.route(front.frame.epoch, claim) {
@@ -945,9 +959,10 @@ async fn run(
             flow.end(End::Graceful);
             break;
         }
+        room.send_replace(may_read);
         tokio::select! {
             _ = version.changed() => {}
-            read = &mut next, if may_read && reading => {
+            read = &mut next, if reading => {
                 match read {
                     Ok(Some(frame)) => {
                         flow.stages.frame_read();
@@ -955,8 +970,11 @@ async fn run(
                             frame,
                             _held: flow.stages.held_frame(),
                         });
+                        // No room is said for the next read until the loop has looked at the
+                        // state again.
+                        room.send_replace(false);
                         drop(next);
-                        next = Box::pin(reader.read_message::<InputFrame>());
+                        next = Box::pin(reader.read_message_when::<InputFrame>(&mut room_rx));
                     }
                     Ok(None) => {
                         finished = true;
@@ -1057,6 +1075,9 @@ async fn write_lane(
     let mut version = flow.subscribe();
     loop {
         version.borrow_and_update();
+        if flow.ended().is_some() {
+            return;
+        }
         let item = tokio::select! {
             item = queued.recv() => match item {
                 Some(item) => item,
@@ -1072,22 +1093,29 @@ async fn write_lane(
         if flow.ended().is_some() {
             return;
         }
-        {
+        let discarded = {
             let mut state = flow.lock();
             // Behind a refusal of its epoch: not passed on.
-            if state.refused_epoch == Some(item.epoch) {
+            if state.refused(item.epoch) {
                 state.in_flight -= 1;
-                continue;
+                true
+            } else {
+                state.outstanding.push_back(Outstanding {
+                    request_id: item.request_id,
+                    epoch: item.epoch,
+                    sequence: item.sequence,
+                    deadline: item.deadline,
+                    _unanswered: item.unanswered,
+                });
+                false
             }
-            state.outstanding.push_back(Outstanding {
-                request_id: item.request_id,
-                epoch: item.epoch,
-                sequence: item.sequence,
-                deadline: item.deadline,
-                _unanswered: item.unanswered,
-            });
-        }
+        };
+        // A frame that is discarded leaves nothing in flight, which a stream task that waits for
+        // the stream to drain is woken to see.
         flow.changed();
+        if discarded {
+            continue;
+        }
         flow.stages.before_a_lane_write().await;
         let written = tokio::time::timeout_at(
             item.deadline,
@@ -1126,6 +1154,9 @@ async fn read_lane(mut reader: LinkReader, flow: Arc<Flow>) {
     let mut version = flow.subscribe();
     loop {
         version.borrow_and_update();
+        if flow.ended() == Some(End::Cut) {
+            return;
+        }
         let due = flow.oldest_deadline();
         let read = tokio::select! {
             read = reader.read() => read,
