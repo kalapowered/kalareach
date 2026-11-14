@@ -2861,6 +2861,90 @@ Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.
         .output();
 }
 
+/// The BITS way again, through the transfer service's own PowerShell cmdlets: one transfer whose
+/// notify program is the stand-in. The old case asks the service through `bitsadmin.exe`, a
+/// command line that the machine's malware protection can stop before the service is asked; this
+/// case asks through the documented cmdlets, so that its output says what the service does with
+/// the request. Each step writes down its own answer (the result, or the exception's type, code
+/// and text), so that the run's output says which party refused. A refusal by another party's
+/// protection is not a result of the boundary's own means: the case still asserts that nothing
+/// started outside the job, and it does not say that the boundary holds where another party acted
+/// first.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_bits_cmdlets_start_nothing_outside_the_job_from_a_launched_child() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut job = Job::new(Limits::INVOCATION).unwrap();
+    let program = fixture.stand_in.display().to_string();
+    let scratch = fixture.scratch.display().to_string();
+    let script = format!(
+        r#"$m = '{program}'; $d = '{scratch}'
+'ran' | Out-File -FilePath "$d\ran.txt"
+function Step($label, [scriptblock]$body) {{ try {{ $r = & $body; "$label ok: $(($r | Out-String).Trim() -replace '\s+', ' ')" }} catch {{ "$label failed: $($_.Exception.GetType().Name) 0x$($_.Exception.HResult.ToString('X8')) $($_.Exception.Message.Trim() -replace '\s+', ' ')" }} }}
+Step 'Get-Command' {{ (Get-Command Start-BitsTransfer -Syntax) }}
+Step 'Start-BitsTransfer' {{ $global:j = Start-BitsTransfer -Source 'C:\Windows\System32\drivers\etc\hosts' -Destination "$d\bits-ps-out.txt" -DisplayName 'KrLaunchPsJob' -NotifyCmdLine @($m, "x marker $d\bits-ps.txt") -Asynchronous -ErrorAction Stop; "state $($global:j.JobState)" }}
+Start-Sleep 10
+Step 'Get-BitsTransfer' {{ $s = Get-BitsTransfer -Name 'KrLaunchPsJob' -ErrorAction Stop; "state $($s.JobState)" }}
+Step 'Complete-BitsTransfer' {{ Get-BitsTransfer -Name 'KrLaunchPsJob' -ErrorAction Stop | Complete-BitsTransfer -ErrorAction Stop; 'completed' }}
+'done' | Out-File -FilePath "$d\done.txt""#
+    );
+    // The script crosses as an encoded command, as in the case of the four ways.
+    let units: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    let encoded = base64(&units);
+    let (read, write) = pipe().unwrap();
+    let (error_read, error_write) = pipe().unwrap();
+    let suspended = launch(fixture.spec(
+        &job,
+        &fixture.stand_in,
+        &["shell", &encoded],
+        Std::Pipe(write),
+        Std::Pipe(error_write),
+    ))
+    .unwrap();
+    let shell = resume(suspended);
+    let finished = shell.wait(Duration::from_secs(240)).unwrap();
+    let text = read_to_end(&read);
+    let errors = read_to_end(&error_read);
+    println!("PowerShell ended with {finished:?}\nstdout: {text}\nstderr: {errors}");
+    println!("scratch holds: [{}]", names_in(&scratch));
+    assert!(
+        fixture.scratch.join("ran.txt").exists(),
+        "the script ran, so the cmdlets were tried"
+    );
+    assert!(
+        fixture.scratch.join("done.txt").exists(),
+        "the script reached its end"
+    );
+    assert!(
+        !fixture.scratch.join("bits-ps.txt").exists(),
+        "bits-ps.txt: a program started outside the job"
+    );
+    let in_job: BTreeSet<u32> = job.process_ids().unwrap().into_iter().collect();
+    let outside: Vec<u32> = pids_named("kr-launch-stand-in")
+        .difference(&in_job)
+        .copied()
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "stand-in processes outside the job: {outside:?}"
+    );
+    job.end(&[&shell], Instant::now() + Duration::from_secs(10));
+    let _ = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-BitsTransfer -AllUsers | Where-Object { $_.DisplayName -eq 'KrLaunchPsJob' } | Remove-BitsTransfer",
+        ])
+        .output();
+}
+
 /// Standard base64, for the encoded command.
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
