@@ -56,7 +56,7 @@ fn step(arguments: &[&Path]) -> Step {
 /// A repository, an evidence directory and a target directory with a profile directory in it.
 #[cfg(unix)]
 struct Tree {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     root: PathBuf,
     evidence: PathBuf,
     profile: PathBuf,
@@ -79,7 +79,7 @@ impl Tree {
             root.join("target").to_string_lossy().into_owned(),
         )];
         Self {
-            _directory: directory,
+            directory,
             root,
             evidence,
             profile,
@@ -284,6 +284,153 @@ fn a_step_run_again_whose_first_runs_evidence_was_not_kept_ends_red() {
     assert!(done.rerun.is_some());
     let error = done.error.expect("the step has an error");
     assert!(error.contains("evidence was not kept"), "{error}");
+}
+
+/// A unit's build script of the tree, written by the step's first run, and the unit's directory and
+/// its records, which exist before the step runs.
+#[cfg(unix)]
+fn unit_of(tree: &Tree) -> (PathBuf, PathBuf) {
+    let unit = tree.profile.join("build/x-0123456789abcdef");
+    std::fs::create_dir_all(&unit).unwrap();
+    std::fs::create_dir_all(tree.profile.join(".fingerprint/x-0123456789abcdef")).unwrap();
+    (unit.join("build-script-build"), unit)
+}
+
+/// What a step that was refused its second run says, and that it ran once.
+#[cfg(unix)]
+fn assert_run_once_with_reason(done: &kr_conformance::run::Executed, reason: &str) {
+    assert_eq!(done.exit, Some(101), "the step ran once");
+    assert!(done.rerun.is_none(), "the step was run again");
+    let error = done.error.as_deref().expect("the step has the reason");
+    assert!(error.contains("is not run again"), "{error}");
+    assert!(error.contains(reason), "{error}");
+}
+
+/// A link below a unit is not followed, and the removal takes nothing of the unit: a removal that
+/// took the unit and left the link would be a removal of something else on another night.
+#[cfg(unix)]
+#[test]
+fn a_link_below_a_unit_ends_the_step_red_with_nothing_of_the_unit_removed_and_no_second_run() {
+    let tree = Tree::new();
+    let (program, unit) = unit_of(&tree);
+    let outside = tree.directory.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("kept"), "kept").unwrap();
+    std::os::unix::fs::symlink(&outside, unit.join("out")).unwrap();
+    let done = fault::execute(
+        &step(&[&tree.marker, &program]),
+        1,
+        &tree.place(),
+        &[],
+        &mut Duration::from_secs(3600),
+        &mut |_| {},
+    );
+    assert_run_once_with_reason(&done, "is a link");
+    assert!(program.exists(), "the program is left where it is");
+    assert!(unit.join("out").symlink_metadata().is_ok());
+    assert!(outside.join("kept").exists());
+}
+
+/// A file of the unit that was there before the step began is not one the step's build wrote: it
+/// is not removed, and the step is not run again.
+#[cfg(unix)]
+#[test]
+fn a_file_of_a_unit_that_the_step_did_not_write_is_not_removed_and_the_step_is_not_run_again() {
+    let tree = Tree::new();
+    let (program, _unit) = unit_of(&tree);
+    let old = tree
+        .profile
+        .join(".fingerprint/x-0123456789abcdef/invoked.timestamp");
+    std::fs::write(&old, "").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(24 * 60 * 60))
+        .unwrap();
+    let done = fault::execute(
+        &step(&[&tree.marker, &program]),
+        1,
+        &tree.place(),
+        &[],
+        &mut Duration::from_secs(3600),
+        &mut |_| {},
+    );
+    assert_run_once_with_reason(&done, "was not written since the step began");
+    assert!(old.exists(), "the old file is left where it is");
+    assert!(program.exists());
+}
+
+/// A disk image mounted below a unit, the case of a directory on another device. It is mounted
+/// for the case alone, and is ended with it.
+#[cfg(target_os = "macos")]
+struct Mounted(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Mounted {
+    fn at(directory: &Path, image: &Path) -> Self {
+        let succeeded = |command: &mut std::process::Command| {
+            command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        assert!(
+            succeeded(
+                std::process::Command::new("hdiutil")
+                    .args(["create", "-size", "4m", "-fs", "HFS+", "-ov"])
+                    .arg(image)
+            ),
+            "the image was not made"
+        );
+        assert!(
+            succeeded(
+                std::process::Command::new("hdiutil")
+                    .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
+                    .arg(directory)
+                    .arg(image)
+            ),
+            "the image was not mounted"
+        );
+        Self(directory.to_path_buf())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("hdiutil")
+            .arg("detach")
+            .arg(&self.0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// A directory below a unit that is a mount of another volume is not entered: a removal that
+/// entered it would empty it. The step is not run again, and what is on the mounted volume stays.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mount_below_a_unit_is_not_entered_and_the_step_is_not_run_again() {
+    let tree = Tree::new();
+    let (program, unit) = unit_of(&tree);
+    let point = unit.join("out");
+    std::fs::create_dir_all(&point).unwrap();
+    let _mounted = Mounted::at(&point, &tree.directory.path().join("volume.dmg"));
+    std::fs::write(point.join("kept"), "kept").unwrap();
+    let done = fault::execute(
+        &step(&[&tree.marker, &program]),
+        1,
+        &tree.place(),
+        &[],
+        &mut Duration::from_secs(3600),
+        &mut |_| {},
+    );
+    assert_run_once_with_reason(&done, "is on another device");
+    assert!(point.join("kept").exists(), "what the mount holds stays");
+    assert!(program.exists());
 }
 
 /// The report over the `forms` tree with `step` as its only step, building into `target`.

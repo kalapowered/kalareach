@@ -720,35 +720,27 @@ fn within(target: &Path, path: &Path) -> bool {
         .is_ok_and(|parent| parent.starts_with(real))
 }
 
-/// Removes the directory and what is in it. A link is removed, never what it leads to.
-fn remove_tree(target: &Path, path: &Path, removed: &mut Vec<PathBuf>) {
-    if within(target, path) && std::fs::remove_dir_all(path).is_ok() {
-        removed.push(path.to_path_buf());
-    }
+/// What a removal takes: a directory with all that is in it, or one file.
+enum Taken {
+    Tree(PathBuf),
+    File(PathBuf),
 }
 
-fn remove_one(target: &Path, path: &Path, removed: &mut Vec<PathBuf>) {
-    if within(target, path) && std::fs::remove_file(path).is_ok() {
-        removed.push(path.to_path_buf());
-    }
-}
-
-/// Removes every file of the unit with `hash` in the profile directory's `deps`, and the unit's
-/// records of having been built.
-fn remove_unit(target: &Path, profile: &Path, hash: &str, removed: &mut Vec<PathBuf>) {
+/// Adds the files of the unit with `hash` in the profile directory's `deps`, and the unit's records
+/// of having been built, to `taken`.
+fn takes_unit(profile: &Path, hash: &str, taken: &mut Vec<Taken>) {
     let suffix = format!("-{hash}");
     if let Ok(entries) = std::fs::read_dir(profile.join("deps")) {
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().contains(&suffix) {
-                remove_one(target, &entry.path(), removed);
+            if entry.file_name().to_string_lossy().contains(&suffix) {
+                taken.push(Taken::File(entry.path()));
             }
         }
     }
     if let Ok(entries) = std::fs::read_dir(profile.join(".fingerprint")) {
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().ends_with(&suffix) {
-                remove_tree(target, &entry.path(), removed);
+                taken.push(Taken::Tree(entry.path()));
             }
         }
     }
@@ -765,15 +757,15 @@ fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
     false
 }
 
-/// Removes a damaged program and what makes Cargo take it for built, so that the next build makes
-/// it again: for a build script, its directory and the unit's records; for a program or test
-/// binary with a hash in its name, every file of that unit and its records; for a program linked
-/// into the profile directory, the file in `deps` it is a link to, and that unit. A file that is
-/// not a program of Cargo's making, or that a link leads out of `target` to, is not removed.
-pub fn remove_damage(target: &Path, file: &Path) -> Vec<PathBuf> {
-    let mut removed = Vec::new();
+/// What it takes to make Cargo build a damaged program again: for a build script, its directory
+/// and the unit's records; for a program or test binary with a hash in its name, every file of
+/// that unit and its records; for a program linked into the profile directory, the file in `deps`
+/// it is a link to, that unit, and the program. A file that is not a program of Cargo's making is
+/// taken for nothing.
+fn takes_for(target: &Path, file: &Path) -> Vec<Taken> {
+    let mut taken = Vec::new();
     let Some(profile) = profile_of_output(target, file) else {
-        return removed;
+        return taken;
     };
     let unit_directory = file.parent().filter(|parent| {
         parent
@@ -782,21 +774,17 @@ pub fn remove_damage(target: &Path, file: &Path) -> Vec<PathBuf> {
     });
     if let Some(unit) = unit_directory {
         if let Some(name) = unit.file_name() {
-            remove_tree(
-                target,
-                &profile.join(".fingerprint").join(name),
-                &mut removed,
-            );
+            taken.push(Taken::Tree(profile.join(".fingerprint").join(name)));
         }
-        remove_tree(target, unit, &mut removed);
-        return removed;
+        taken.push(Taken::Tree(unit.to_path_buf()));
+        return taken;
     }
     let name = file
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     if let Some(hash) = hash_of(&name) {
-        remove_unit(target, &profile, hash, &mut removed);
+        takes_unit(&profile, hash, &mut taken);
     } else if let Ok(own) = std::fs::metadata(file)
         && let Ok(entries) = std::fs::read_dir(profile.join("deps"))
     {
@@ -810,11 +798,193 @@ pub fn remove_damage(target: &Path, file: &Path) -> Vec<PathBuf> {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         for hash in linked.iter().filter_map(|name| hash_of(name)) {
-            remove_unit(target, &profile, hash, &mut removed);
+            takes_unit(&profile, hash, &mut taken);
         }
     }
-    remove_one(target, file, &mut removed);
-    removed
+    taken.push(Taken::File(file.to_path_buf()));
+    taken
+}
+
+/// The device a path is on, where the system says one.
+#[cfg(unix)]
+#[must_use]
+pub fn volume_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|metadata| metadata.dev())
+}
+
+/// The device a path is on. Windows is held to no link or reparse point instead.
+#[cfg(not(unix))]
+#[must_use]
+pub fn volume_of(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Whether the entry is a link, or on Windows any reparse point (a link, a junction, a mount): a
+/// removal that entered it would take what it leads to.
+#[cfg(windows)]
+fn redirects(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink() || metadata.file_attributes() & REPARSE_POINT != 0
+}
+
+/// Whether the entry is a link, which a removal would follow to what it leads to.
+#[cfg(not(windows))]
+fn redirects(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+/// The device of an entry, where the system says one.
+#[cfg(unix)]
+fn device_of(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn device_of(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Walks `path`, adding what a removal of it takes to `entries` in the order it takes it (a
+/// directory after what is in it), or says why it may not. It enters a directory only where the
+/// directory is on `device`, the device of the build's output; it follows no link and enters no
+/// reparse point; and it takes a file only where the file was written at or after `began`, because
+/// a file older than the step is not one the step's build made. A directory is taken by the
+/// record that names it (the unit's), and so is not held to a time. A path that is not there is
+/// nothing to take. With `as_tree` false a directory is left alone, which is where a file was
+/// looked for.
+fn gather(
+    path: &Path,
+    as_tree: bool,
+    device: Option<u64>,
+    began: SystemTime,
+    entries: &mut Vec<(PathBuf, bool)>,
+) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{} could not be read: {error}", path.display())),
+    };
+    if redirects(&metadata) {
+        return Err(format!("{} is a link", path.display()));
+    }
+    if let (Some(want), Some(have)) = (device, device_of(&metadata))
+        && want != have
+    {
+        return Err(format!(
+            "{} is on another device than the build's output",
+            path.display()
+        ));
+    }
+    if metadata.is_dir() {
+        if as_tree {
+            let children = std::fs::read_dir(path)
+                .map_err(|error| format!("{} could not be read: {error}", path.display()))?;
+            for child in children {
+                let child = child
+                    .map_err(|error| format!("{} could not be read: {error}", path.display()))?;
+                gather(&child.path(), true, device, began, entries)?;
+            }
+            entries.push((path.to_path_buf(), true));
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "{} is neither a file nor a directory",
+            path.display()
+        ));
+    }
+    match metadata.modified() {
+        Ok(written) if written >= began => {
+            entries.push((path.to_path_buf(), false));
+            Ok(())
+        }
+        Ok(_) => Err(format!(
+            "{} was not written since the step began",
+            path.display()
+        )),
+        Err(error) => Err(format!(
+            "when {} was written could not be read: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// What the removal for some damaged programs takes, checked before any of it is taken.
+#[derive(Debug)]
+pub struct Removal {
+    /// Each thing taken, with the files and directories in it, in the order they go.
+    parts: Vec<(PathBuf, Vec<(PathBuf, bool)>)>,
+}
+
+impl Removal {
+    /// Takes what the removal holds, entry by entry, with no walk of its own: a directory goes
+    /// when it is empty. Returns what went whole: each directory or file the removal was for.
+    pub fn carry_out(self) -> Vec<PathBuf> {
+        let mut removed = Vec::new();
+        for (root, entries) in self.parts {
+            let mut whole = true;
+            for (path, directory) in entries {
+                let taken = if directory {
+                    std::fs::remove_dir(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                whole &= taken.is_ok();
+            }
+            if whole {
+                removed.push(root);
+            }
+        }
+        removed
+    }
+}
+
+/// What it takes to make Cargo build the damaged programs `files` again, or why that may not be
+/// taken. Nothing is taken here. The removal is for the files of Cargo's making that its records
+/// name, in `target`, and stops at the first thing it may not take: a link or reparse point below
+/// a unit, a directory that is on another device than `device` (the build's output, from
+/// [`volume_of`]), a path that is not inside `target` once every link on the way is followed, or
+/// a file that was written before `began`. Then nothing of any of the units is taken, so that a
+/// file the step did not write, and what is on another volume, stays where it is.
+///
+/// # Errors
+///
+/// Returns the first thing that may not be taken, with its path.
+pub fn removal_of(
+    target: &Path,
+    device: Option<u64>,
+    began: SystemTime,
+    files: &[PathBuf],
+) -> Result<Removal, String> {
+    let mut parts = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for file in files {
+        for taken in takes_for(target, file) {
+            let (root, as_tree) = match &taken {
+                Taken::Tree(path) => (path, true),
+                Taken::File(path) => (path, false),
+            };
+            if !seen.insert(root.clone()) {
+                continue;
+            }
+            if !within(target, root) {
+                return Err(format!(
+                    "{} is not inside the target directory",
+                    root.display()
+                ));
+            }
+            let mut entries = Vec::new();
+            gather(root, as_tree, device, began, &mut entries)?;
+            if !entries.is_empty() {
+                parts.push((root.clone(), entries));
+            }
+        }
+    }
+    Ok(Removal { parts })
 }
 
 /// What a rerun's facts file says.
@@ -924,7 +1094,9 @@ fn has_failed_test(done: &Executed) -> bool {
 /// and the report fails, and so it does where the first run's evidence could not be kept. The file
 /// has to be a program of Cargo's making that the step wrote. A step in which a test failed is not
 /// run again, and neither is one whose first run took longer than what `budget`, the time the
-/// report leaves for second runs, still holds; `budget` is what the second run takes from it.
+/// report leaves for second runs, still holds; `budget` is what the second run takes from it. Nor
+/// is a step run again when what its removal would take cannot all be taken (see [`removal_of`]):
+/// it ends red with the reason and nothing of its units is removed.
 #[must_use]
 pub fn execute(
     step: &Step,
@@ -956,6 +1128,20 @@ pub fn execute(
         return first;
     }
     let took = Duration::from_secs(first.seconds);
+    let swept: Vec<PathBuf> = damaged_since(&target, began)
+        .into_iter()
+        .filter(|path| !named.contains(path) && built_by_cargo(path))
+        .collect();
+    let removal = removal_of(
+        &target,
+        volume_of(&target),
+        began,
+        &named
+            .iter()
+            .chain(swept.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     let refusal = if has_failed_test(&first) {
         Some("a test of the step failed".to_owned())
     } else if budget.is_zero() || took > *budget {
@@ -965,7 +1151,10 @@ pub fn execute(
             budget.as_secs()
         ))
     } else {
-        None
+        removal
+            .as_ref()
+            .err()
+            .map(|why| format!("nothing of its units is removed, because {why}"))
     };
     if let Some(why) = refusal {
         let said = format!(
@@ -980,10 +1169,10 @@ pub fn execute(
     }
     let now = SystemTime::now();
     let files: Vec<FileFacts> = named.iter().map(|path| facts_of(path, now)).collect();
-    let swept: Vec<PathBuf> = damaged_since(&target, began)
-        .into_iter()
-        .filter(|path| !named.contains(path) && built_by_cargo(path))
-        .collect();
+    // The refusal above took a removal that may not be made.
+    let Ok(removal) = removal else {
+        return first;
+    };
     let stem = Path::new(&first.log)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -1002,10 +1191,7 @@ pub fn execute(
     });
     let cause = cause_of(&files, storage.as_ref().ok().copied());
     let reason = reason_for(cause, &files, &storage, place.root);
-    let mut removed = Vec::new();
-    for path in named.iter().chain(swept.iter()) {
-        removed.extend(remove_damage(&target, path));
-    }
+    let removed = removal.carry_out();
     let facts = format!("conformance/faults/{stem}.txt");
     if let Err(error) = std::fs::write(
         place.evidence.join(&facts),
@@ -1309,6 +1495,12 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// What the removal for `file` takes, with everything counted as written since the step began.
+    fn removal(target: &Path, file: &Path) -> Result<Vec<PathBuf>, String> {
+        removal_of(target, volume_of(target), UNIX_EPOCH, &[file.to_path_buf()])
+            .map(Removal::carry_out)
+    }
+
     #[test]
     fn a_build_script_is_removed_with_its_directory_and_its_records() {
         let directory = tempfile::tempdir().unwrap();
@@ -1332,7 +1524,7 @@ mod tests {
             &profile.join("build/serde_json-0000000000000000/output"),
             b"kept",
         );
-        let removed = remove_damage(&target, &script);
+        let removed = removal(&target, &script).unwrap();
         assert_eq!(removed.len(), 2);
         assert!(!profile.join("build/serde_json-1ad93a6e71728a74").exists());
         assert!(
@@ -1371,7 +1563,7 @@ mod tests {
                 .join(".fingerprint/kr-conformance-aaaaaaaaaaaaaaaa/test-integration-test-report"),
             b"",
         );
-        let removed = remove_damage(&target, &binary);
+        let removed = removal(&target, &binary).unwrap();
         assert_eq!(removed.len(), 3);
         assert!(profile.join("deps/report-aaaaaaaaaaaaaaaa").exists());
         assert!(
@@ -1395,7 +1587,7 @@ mod tests {
         );
         let linked = profile.join("kr-conformance");
         std::fs::hard_link(&real, &linked).unwrap();
-        let removed = remove_damage(&target, &linked);
+        let removed = removal(&target, &linked).unwrap();
         assert_eq!(removed.len(), 3);
         assert!(!linked.exists());
         assert!(!real.exists());
@@ -1495,13 +1687,13 @@ mod tests {
         std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
         let helper = profile.join("examples/helper");
         write(&helper, b"");
-        assert!(remove_damage(&target, &helper).is_empty());
+        assert!(removal(&target, &helper).unwrap().is_empty());
         assert!(helper.exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_link_that_leads_out_of_the_target_directory_is_not_followed_by_a_removal() {
+    fn a_link_below_a_unit_or_in_its_way_stops_the_removal_and_nothing_of_the_unit_is_taken() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("target");
         let profile = target.join("debug");
@@ -1510,34 +1702,131 @@ mod tests {
         write(&outside.join("victim-1111111111111111"), b"kept");
         write(&outside.join("unit-1111111111111111/records"), b"kept");
         write(&profile.join("deps/own-2222222222222222"), b"");
-        // The profile's `deps` is a link to a directory outside the target directory, and so is
-        // the directory of a unit under `build`.
+        // The profile's `deps` is a link to a directory outside the target directory.
         std::fs::remove_dir_all(profile.join("deps")).unwrap();
         std::os::unix::fs::symlink(&outside, profile.join("deps")).unwrap();
+        let why = removal(&target, &profile.join("deps/victim-1111111111111111")).unwrap_err();
+        assert!(why.contains("is not inside the target directory"), "{why}");
+        assert!(outside.join("victim-1111111111111111").exists());
+        // The directory of a unit under `build` is a link: the link stays too, and what it leads
+        // to.
         std::fs::create_dir_all(profile.join("build")).unwrap();
-        std::os::unix::fs::symlink(&outside, profile.join("build/linked-1111111111111111"))
-            .unwrap();
-        let removed = remove_damage(&target, &profile.join("deps/victim-1111111111111111"));
-        assert!(removed.is_empty(), "{removed:?}");
-        assert!(outside.join("victim-1111111111111111").exists());
-        // The unit's directory is the link: the link goes, and what it leads to stays.
         let linked = profile.join("build/linked-1111111111111111");
-        let removed = remove_damage(&target, &linked.join("script"));
-        assert_eq!(removed, vec![linked.clone()]);
-        assert!(!linked.exists());
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        let why = removal(&target, &linked.join("script")).unwrap_err();
+        assert!(why.contains("is a link"), "{why}");
+        assert!(linked.symlink_metadata().is_ok(), "the link is not removed");
         assert!(outside.join("unit-1111111111111111/records").exists());
-        assert!(outside.join("victim-1111111111111111").exists());
-        // The unit's records are in a directory that a link leads out to: the program is removed,
-        // the records are left.
+        // The unit's records are in a directory that a link leads out to: the program stays too.
         let release = target.join("release");
         std::fs::create_dir_all(&release).unwrap();
         write(&release.join("deps/own-3333333333333333"), b"");
         write(&outside.join("own-3333333333333333/records"), b"kept");
         std::os::unix::fs::symlink(&outside, release.join(".fingerprint")).unwrap();
-        let removed = remove_damage(&target, &release.join("deps/own-3333333333333333"));
-        assert_eq!(removed, vec![release.join("deps/own-3333333333333333")]);
+        let why = removal(&target, &release.join("deps/own-3333333333333333")).unwrap_err();
+        assert!(why.contains("is not inside the target directory"), "{why}");
+        assert!(release.join("deps/own-3333333333333333").exists());
         assert!(outside.join("own-3333333333333333/records").exists());
-        assert!(outside.join("victim-1111111111111111").exists());
+    }
+
+    /// A link inside a unit's own directory, which stays inside the target directory, is still a
+    /// link: the removal follows none, and takes nothing of the unit where it meets one.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_inside_a_units_directory_stops_the_removal_of_the_unit() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let profile = target.join("debug");
+        let unit = profile.join("build/x-0123456789abcdef");
+        let script = unit.join("build-script-build");
+        write(&script, b"");
+        write(
+            &profile.join(".fingerprint/x-0123456789abcdef/invoked.timestamp"),
+            b"",
+        );
+        std::os::unix::fs::symlink(&script, unit.join("alias")).unwrap();
+        let why = removal(&target, &script).unwrap_err();
+        assert!(why.contains("alias"), "{why}");
+        assert!(why.contains("is a link"), "{why}");
+        assert!(script.exists());
+        assert!(
+            profile
+                .join(".fingerprint/x-0123456789abcdef/invoked.timestamp")
+                .exists()
+        );
+    }
+
+    /// A directory below a unit that is on another device than the build's output is a mount of
+    /// something else: it is not entered, and nothing of the unit is taken. The device the build's
+    /// output is on is given, so that a device that is not the files' own stands for the mount; the
+    /// removal over a real mount is the macOS case in `tests/rerun.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_on_another_device_below_a_unit_stops_the_removal_of_the_unit() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let profile = target.join("debug");
+        let unit = profile.join("build/x-0123456789abcdef");
+        let script = unit.join("build-script-build");
+        write(&script, b"");
+        write(&unit.join("out/data"), b"kept");
+        write(
+            &profile.join(".fingerprint/x-0123456789abcdef/invoked.timestamp"),
+            b"",
+        );
+        let device = volume_of(&target).unwrap();
+        let removal_on = |device: u64| {
+            removal_of(
+                &target,
+                Some(device),
+                UNIX_EPOCH,
+                std::slice::from_ref(&script),
+            )
+        };
+        let why = removal_on(device + 1).unwrap_err();
+        assert!(why.contains("is on another device"), "{why}");
+        assert!(script.exists());
+        assert!(unit.join("out/data").exists());
+        // On the files' own device the same removal takes the unit.
+        let removed = removal_on(device).unwrap().carry_out();
+        assert_eq!(removed.len(), 2);
+        assert!(!unit.exists());
+    }
+
+    /// A file of a unit that is older than the step is not one the step's build made, so the
+    /// unit is left whole.
+    #[test]
+    fn a_file_of_a_unit_that_is_older_than_the_step_stops_the_removal_of_the_unit() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let profile = target.join("debug");
+        let unit = profile.join("build/x-0123456789abcdef");
+        let script = unit.join("build-script-build");
+        write(&script, b"");
+        let records = profile.join(".fingerprint/x-0123456789abcdef/invoked.timestamp");
+        write(&records, b"");
+        let day = Duration::from_secs(24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&records)
+            .unwrap()
+            .set_modified(SystemTime::now() - day)
+            .unwrap();
+        let began = SystemTime::now() - Duration::from_secs(60);
+        let why = removal_of(
+            &target,
+            volume_of(&target),
+            began,
+            std::slice::from_ref(&script),
+        )
+        .unwrap_err();
+        assert!(why.contains("invoked.timestamp"), "{why}");
+        assert!(
+            why.contains("was not written since the step began"),
+            "{why}"
+        );
+        assert!(script.exists());
+        assert!(records.exists());
     }
 
     #[test]
