@@ -3578,6 +3578,8 @@ impl Session {
         let replies = self
             .engine
             .drain_replies(input.lane_gate(), input.reply_allowance());
+        #[cfg(feature = "testing")]
+        input.writer().pump_hold.stand();
         let applied = input.queue_replies(replies);
         // One drain takes a bounded part of the lane, and no more than the queue for the terminal
         // has room for: an answer past that stays in the lane. What is left, and the gate lets out,
