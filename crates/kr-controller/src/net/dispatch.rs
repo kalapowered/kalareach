@@ -116,6 +116,8 @@ pub struct RemoteConnection {
     /// Notified when this connection's link to its worker ends, whichever way it ends.
     lost: Arc<tokio::sync::Notify>,
     windows: Arc<kr_transport::window::ActionWindowIssuer>,
+    /// The terminal-input streams of this host, which an attachment's detach is told to.
+    inputs: Arc<super::input::InputStreams>,
 }
 
 impl std::fmt::Debug for RemoteConnection {
@@ -179,7 +181,15 @@ impl RemoteConnection {
             )),
             lost: Arc::new(tokio::sync::Notify::new()),
             windows: Arc::clone(&session.windows),
+            inputs: Arc::default(),
         }
+    }
+
+    /// Has the detach of an attachment, which this connection forwards, told `inputs`.
+    #[must_use]
+    pub(super) fn with_inputs(mut self, inputs: Arc<super::input::InputStreams>) -> Self {
+        self.inputs = inputs;
+        self
     }
 
     /// A connection for `device` that writes nothing anywhere, registered at the revision in
@@ -267,6 +277,7 @@ impl RemoteConnection {
                     &controller.clock,
                 )),
             ),
+            inputs: Arc::default(),
         }
     }
 

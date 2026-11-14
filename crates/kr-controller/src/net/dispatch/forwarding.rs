@@ -571,6 +571,16 @@ impl RemoteConnection {
         // daemon's own effects do: the worker commits the intent before it answers, and a
         // cancellation here must not be what decides whether the outcome is recorded.
         let answering = mutation.method.method().unwrap_or(Method::ActionRead);
+        // The attachment a detach names, which the stream of typing it had is told about.
+        let detaching = (answering == Method::SessionDetach)
+            .then(|| {
+                mutation
+                    .params
+                    .to_typed::<kr_protocol::attachment::SessionDetachParams>()
+                    .ok()
+                    .and_then(|params| params.attachment_id.0)
+            })
+            .flatten();
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
         // The grant's history scope travels with it too, so what the worker shows of its answer,
@@ -609,7 +619,18 @@ impl RemoteConnection {
                 )
                 .await
         });
-        match effect.await {
+        let carried_out = effect.await;
+        // A detach that the worker answered, or whose outcome is not known, ends the attachment's
+        // stream of typing, whichever connection holds it.
+        if let Some(attachment) = detaching
+            && match &carried_out {
+                Ok(Ok(answered)) => matches!(answered.response.outcome, Outcome::Ok(_)),
+                Ok(Err(_)) | Err(_) => true,
+            }
+        {
+            self.inputs.detached(attachment);
+        }
+        match carried_out {
             Ok(Ok(answered)) => {
                 #[cfg(feature = "testing")]
                 self.controller.after_the_worker_answered.wait().await;
