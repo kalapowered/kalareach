@@ -189,6 +189,25 @@ async fn declared(host: &Host, role: ControllerConnectionRole) -> BoundLink {
     link
 }
 
+/// A signer whose token the worker cannot authenticate: another controller's key, for this
+/// environment or for another one.
+fn foreign(host: &Host, for_this_environment: bool) -> Signer {
+    let other = kr_ipc::testing::TempHost::create();
+    let environment_id = if for_this_environment {
+        host.environment_id
+    } else {
+        other.environment_id()
+    };
+    let store = kr_crypto::store::open_store_in(&other.environment().secrets_dir())
+        .expect("a secret store");
+    let identity = ControllerIdentity::initialise(store.store.as_ref(), environment_id)
+        .expect("a foreign controller identity");
+    Signer {
+        identity: Arc::new(identity),
+        boot: host.boot.clone(),
+    }
+}
+
 /// What a presentation that a later connection's acceptance refused came to.
 fn assert_refused_for_order(result: kr_ipc::Result<kr_protocol::worker::GenerationAccepted>) {
     match result {
@@ -402,6 +421,41 @@ async fn the_records_begin_again_with_a_higher_generation_that_a_proxy_presents_
     present(&mut waiting, host.signer(), 2)
         .await
         .expect("the earlier attention connection is accepted for the higher generation");
+}
+
+/// KR-REQ-02.05: a connection that proves nothing moves no record: one that said hello and never
+/// presented, one whose token another key signed, and one whose token is another environment's
+/// leave an earlier connection of the same role accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_proves_nothing_moves_no_record() {
+    for proof in ["nothing", "another key", "another environment"] {
+        let host = host(1).await;
+        let mut older = declared(&host, ControllerConnectionRole::Authority).await;
+        let mut unproved = declared(&host, ControllerConnectionRole::Authority).await;
+        match proof {
+            "another key" => assert!(
+                present(&mut unproved, foreign(&host, true), 1)
+                    .await
+                    .is_err(),
+                "a token another key signed is refused"
+            ),
+            "another environment" => assert!(
+                present(&mut unproved, foreign(&host, false), 1)
+                    .await
+                    .is_err(),
+                "another environment's token is refused"
+            ),
+            _ => {}
+        }
+        present(&mut older, host.signer(), 1)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("after {proof} the earlier connection is accepted: {error}")
+            });
+        read_session(&mut older, host.session_id)
+            .await
+            .expect("the earlier connection is served");
+    }
 }
 
 /// KR-REQ-02.05: a controller connection from a generation a newer daemon has replaced cannot
