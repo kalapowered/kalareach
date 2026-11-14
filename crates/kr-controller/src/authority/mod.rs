@@ -796,6 +796,17 @@ impl std::fmt::Debug for Round<'_> {
     }
 }
 
+/// How an entry says that its worker has not said what its fence named for some of the revisions
+/// announced to it with the one reported.
+const NOT_SAID: &str = "this worker has not said what its fence named for ";
+/// The same for a worker that cannot say.
+const CANNOT_SAY: &str = "this worker cannot say what its fence named for ";
+/// The same for revisions whose fences are not read.
+const NOT_READ: &str = "some of the revisions announced to this worker before revision ";
+/// What follows the first of those for a worker that can be asked, and for one that cannot.
+const NEXT_ANNOUNCEMENT_ASKS: &str = ", and the next announcement asks";
+const NO_LONGER_ASKED: &str = ", and it can no longer be asked";
+
 /// What an ended worker's entry says when `pending_names` of the actions its fence named did not
 /// reach this daemon before it ended.
 fn ended_before_its_names(pending_names: u64) -> String {
@@ -807,18 +818,29 @@ fn ended_before_its_names(pending_names: u64) -> String {
 
 /// The entry of a worker that was pending in `given` and whose session has closed since: it is
 /// ended, which satisfies the barrier as it does for any worker whose execution has ended, and
-/// the entry keeps every name `given` held of it.
+/// the entry keeps every name `given` held of it and what `given` said of the revisions the
+/// worker has not said what its fence named for, which it can no longer be asked.
 #[must_use]
 pub(crate) fn ended_since(given: &WorkerBarrier) -> WorkerBarrier {
     let pending_names = given.names_pending.get();
+    let mut detail = if pending_names > 0 {
+        ended_before_its_names(pending_names)
+    } else {
+        "this worker's execution is confirmed ended, so it can no longer dispatch anything"
+            .to_owned()
+    };
+    for sentence in given.detail.split("; ") {
+        if sentence.starts_with(NOT_SAID)
+            || sentence.starts_with(CANNOT_SAY)
+            || sentence.starts_with(NOT_READ)
+        {
+            detail.push_str("; ");
+            detail.push_str(&sentence.replace(NEXT_ANNOUNCEMENT_ASKS, NO_LONGER_ASKED));
+        }
+    }
     WorkerBarrier {
         state: BarrierState::Ended,
-        detail: if pending_names > 0 {
-            ended_before_its_names(pending_names)
-        } else {
-            "this worker's execution is confirmed ended, so it can no longer dispatch anything"
-                .to_owned()
-        },
+        detail,
         ..given.clone()
     }
 }
@@ -1422,10 +1444,11 @@ impl AuthorityBarrier {
                  ended, so the revocation is not complete for it. While the directory lists it, \
                  this host asks it again on its own, unless a presentation of this host to that \
                  worker is still waiting at its dispatch boundary, and a later `kr doctor` shows \
-                 when every worker has acknowledged. Repeating the revocation asks it again on \
-                 the same terms and, once it has acknowledged, shows the names of the actions \
-                 that won the dispatch race at this worker, which keeps those names for its \
-                 newest {} revocations only",
+                 when every worker has acknowledged. Repeating a revocation that listed this \
+                 worker as pending asks it again on the same terms and, once it has acknowledged, \
+                 shows the names of the actions that won the dispatch race at this worker under \
+                 this revision that the daemon holds, which keeps those names for its newest {} \
+                 revocations only",
                 kr_worker::journal::MAX_HELD_REVOCATIONS
             ),
         };
@@ -1440,25 +1463,24 @@ impl AuthorityBarrier {
         };
         if unasked > 0 {
             say(format!(
-                "this worker has not said what its fence named for {unasked} of the revisions \
-                 announced to it with revision {revision} or before it{}",
+                "{NOT_SAID}{unasked} of the revisions announced to it with revision {revision} or \
+                 before it{}",
                 if state == BarrierState::Ended {
-                    ", and it can no longer be asked"
+                    NO_LONGER_ASKED
                 } else {
-                    ", and the next announcement asks"
+                    NEXT_ANNOUNCEMENT_ASKS
                 }
             ));
         }
         if unanswerable > 0 {
             say(format!(
-                "this worker cannot say what its fence named for {unanswerable} of the revisions \
-                 announced to it with revision {revision} or before it"
+                "{CANNOT_SAY}{unanswerable} of the revisions announced to it with revision \
+                 {revision} or before it"
             ));
         }
         if unread {
             say(format!(
-                "some of the revisions announced to this worker before revision {revision} are not \
-                 read for what their fences named"
+                "{NOT_READ}{revision} are not read for what their fences named"
             ));
         }
         WorkerBarrier {
