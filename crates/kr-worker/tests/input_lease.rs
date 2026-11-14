@@ -2547,6 +2547,92 @@ async fn answers_held_behind_a_paste_are_all_written_when_it_ends_though_more_th
     });
 }
 
+/// KR-REQ-08.48 and KR-REQ-08.49: the room that the writer gives back between the pump's reading
+/// of it and its saying that answers wait still brings the answer out of the lane.
+///
+/// The share of the host's answers is full and the writer holds all of them; one more answer
+/// waits in the lane behind an open paste, and no pass of the pump has said that answers wait.
+/// The paste ends and the pump reads no room. Before the pump goes on, the writer writes every
+/// batch it holds, and each give-back finds nothing to wake. Nothing else happens afterwards: the
+/// application writes nothing and nobody types. The answer must reach the application all the
+/// same.
+#[tokio::test(flavor = "multi_thread")]
+async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_the_answer_out() {
+    let (_host, runtime, clock, _session_id, holder, epoch) = silent_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let room = runtime.input().lock().input_room();
+    let (writer_stopped, release_writer) = runtime.input().writer_hold().arm();
+
+    {
+        let mut session = runtime.session();
+        session.ingest_output(b"\x1b[?2004h");
+        session.ingest_output(&STATUS_QUESTION.repeat(256));
+        runtime.flush_input();
+        session
+            .write_input(holder, epoch, 0, b"\x1b[200~pasted", None, Instant::now())
+            .expect("the paste opens");
+        runtime.flush_input();
+        clock.advance(Duration::from_secs(1));
+        session.ingest_output(STATUS_QUESTION);
+        session
+            .write_input(holder, epoch, 1, b"\x1b[201~", None, Instant::now())
+            .expect("the paste ends");
+    }
+    tokio::time::timeout(Duration::from_secs(20), writer_stopped)
+        .await
+        .expect("the writer takes the first batch")
+        .expect("the writer's stop fires");
+    assert_eq!(
+        room.held_replies(),
+        256,
+        "the host's answers fill their share, and the 257th waits in the lane"
+    );
+
+    // The pump's pass that the paste's end asks for, stopped after it has read no room.
+    let (pump_stopped, release_pump) = runtime.input().pump_hold().arm_blocking();
+    let pump = {
+        let runtime = Arc::clone(&runtime);
+        tokio::task::spawn_blocking(move || runtime.session().pump_replies())
+    };
+    tokio::time::timeout(Duration::from_secs(20), pump_stopped)
+        .await
+        .expect("the pump reads the room")
+        .expect("the pump's stop fires");
+    drop(release_writer);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while room.held() != kr_worker::input_room::Cost::default() || room.held_replies() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the writer writes every batch it holds");
+    drop(release_pump);
+    pump.await.expect("the pump's pass ends");
+
+    // The last answer is written once something has brought it out of the lane: the pump's own
+    // pass cannot, because it read the room before the writer gave it back.
+    let written = || -> usize {
+        runtime
+            .input()
+            .terminal_writes()
+            .iter()
+            .map(|write| count(&write.bytes, STATUS_ANSWER))
+            .sum()
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while written() < 257 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the writer wrote {} of the 257 answers, and the room is free",
+            written()
+        )
+    });
+}
+
 /// A harness that plays the terminal's writer settles what it takes as the writer settles what it
 /// writes: the room, the answers' places, the unwritten answer bytes and the lease's queued bytes
 /// are all given back, so a long exchange is held to the bounds of the product and not to those of
