@@ -3574,12 +3574,15 @@ impl Session {
         // gate being read and the answers being queued behind it.
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
-        let replies = self.engine.drain_replies(input.lane_gate());
+        let replies = self
+            .engine
+            .drain_replies(input.lane_gate(), input.reply_allowance());
         let applied = input.queue_replies(replies);
-        // One drain takes a bounded part of the lane. What is left, and the gate lets out, is
-        // looked at again whenever a keystroke next passes: it cannot take this session, so it is
-        // told here that something waits. What a closed gate holds back is let out by the
-        // keystroke that opens the gate.
+        // One drain takes a bounded part of the lane, and no more than the queue for the terminal
+        // has room for: an answer past that stays in the lane. What is left, and the gate lets out,
+        // is looked at again whenever a keystroke next passes and whenever the writer gives room
+        // back: neither can take this session, so the pump is told here that something waits. What
+        // a closed gate holds back is let out by the keystroke that opens the gate.
         let waiting = self.engine.replies_pending() && input.lane_gate().allows_write();
         input.set_replies_waiting(waiting);
         drop(input);

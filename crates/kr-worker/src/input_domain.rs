@@ -70,8 +70,10 @@ use crate::input::{InputLease, LeaseRefusal, PasteFramer, TakeoverFraming};
 use crate::input_room::{Cost, InputRoom, admit};
 use crate::session::{
     FenceOutcome, GrantedBy, InputAccepted, InputAuthority, InputBatch, Interrupted, LeaseEnded,
-    MAX_PENDING_REPLY_BYTES, MAX_PENDING_REPLY_FRAMES, PasteTransition,
+    MAX_PENDING_REPLY_BYTES, MAX_PENDING_REPLY_FRAMES, MAX_QUEUED_INPUT_BYTES,
+    MAX_QUEUED_INPUT_FRAMES, PasteTransition,
 };
+use kr_term::lane::DrainBudget;
 
 /// One entry in a session's queue for the pseudo-terminal.
 #[derive(Debug)]
@@ -90,16 +92,17 @@ pub(crate) enum Queued {
 pub struct InputShared {
     domain: Mutex<InputDomain>,
     /// Woken when something is owed that only the session can do: a reply the gate now lets out,
-    /// or a step the root editor's machine asked for that needs the session.
-    pump: tokio::sync::Notify,
+    /// room that comes back for a reply that waits for it, or a step the root editor's machine
+    /// asked for that needs the session. The writer wakes it too, through the room.
+    pump: Arc<tokio::sync::Notify>,
 }
 
 impl InputShared {
     /// Wraps a domain.
     pub(crate) fn new(domain: InputDomain) -> Arc<Self> {
         Arc::new(Self {
+            pump: domain.writer.room.pump(),
             domain: Mutex::new(domain),
-            pump: tokio::sync::Notify::new(),
         })
     }
 
@@ -458,10 +461,6 @@ pub struct InputDomain {
     /// timer, which cannot take it: events, nothing else. The next stimulus the session applies
     /// hands them back in front of its own steps, or the pump carries them out.
     owed: Vec<Step>,
-    /// Whether the response lane held replies the gate allows out after the last time it was
-    /// drained. A keystroke that sees this asks the pump to look again, because the lane is the
-    /// session's and a keystroke does not take the session.
-    replies_waiting: bool,
     /// The last takeover receipt the machine completed.
     takeover_receipt: Option<TakeoverReceipt>,
     /// The callers waiting for a reader to say what it did with their launch.
@@ -529,7 +528,6 @@ impl InputDomain {
             fence: None,
             revision: None,
             owed: Vec::new(),
-            replies_waiting: false,
             takeover_receipt: None,
             launches: BTreeMap::new(),
             late_installations: Vec::new(),
@@ -853,15 +851,18 @@ impl InputDomain {
     }
 
     /// Records whether the response lane still holds replies after a drain.
-    pub(crate) const fn set_replies_waiting(&mut self, waiting: bool) {
-        self.replies_waiting = waiting;
+    ///
+    /// A keystroke that sees this asks the pump to look again, because the lane is the session's
+    /// and a keystroke does not take the session. So does the writer, when room comes back.
+    pub(crate) fn set_replies_waiting(&self, waiting: bool) {
+        self.writer.room.set_replies_waiting(waiting);
     }
 
     /// Returns whether the response lane held replies the gate allows out when it was last
     /// drained, which the next keystroke asks the pump to take.
     #[must_use]
-    pub const fn replies_waiting(&self) -> bool {
-        self.replies_waiting
+    pub fn replies_waiting(&self) -> bool {
+        self.writer.room.replies_waiting()
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1011,11 +1012,51 @@ impl InputDomain {
             .count()
     }
 
-    /// Queues the host's own answers for the application, up to what one may wait for.
+    /// Returns what the response lane may give up now: how many answers and how many bytes of them
+    /// the queue for the terminal can take.
     ///
-    /// The response lane bounds what it holds; this bounds what has left the lane and is waiting
-    /// for an application that has stopped reading its input. One that asks questions and never
-    /// reads the answers stops being answered here rather than growing this queue without limit.
+    /// Two bounds hold an answer, and both are this one's: its own share, so an application that
+    /// asks questions without reading the answers cannot fill the terminal by itself, and the whole
+    /// room, in entries and in bytes, so its share cannot be spent on top of a full queue. What the
+    /// root editor's machine is holding counts towards the second, because it is accepted input on
+    /// its way to the same terminal. The whole room also leaves what the recogniser can still
+    /// release: one more place and the longest delimiter, as a person's keys do.
+    ///
+    /// The lane keeps every answer past the allowance, under its own deadline, and the pump gives it
+    /// up when the writer has given room back.
+    pub(crate) fn reply_allowance(&self) -> DrainBudget {
+        let held = self.held_for_the_terminal();
+        let kept = Cost::claimed_by(0);
+        // The share's own count of bytes is what the answers hold, queued and neither written nor
+        // dropped. The queue holds more than that: the keystrokes a takeover made stale stay in it
+        // until the writer reaches them, and the count of the lease they were accepted under went
+        // with the takeover, so taking the lease's share off the queue would charge them to the
+        // answers.
+        let unwritten = self.writer.unwritten_replies.load(Ordering::Acquire);
+        DrainBudget {
+            bytes: MAX_PENDING_REPLY_BYTES.saturating_sub(unwritten).min(
+                MAX_QUEUED_INPUT_BYTES
+                    .saturating_sub(held.bytes)
+                    .saturating_sub(kept.bytes),
+            ),
+            replies: MAX_PENDING_REPLY_FRAMES
+                .saturating_sub(self.writer.room.held_replies())
+                .min(
+                    MAX_QUEUED_INPUT_FRAMES
+                        .saturating_sub(held.frames)
+                        .saturating_sub(kept.frames - 1),
+                ),
+        }
+    }
+
+    /// Queues the host's own answers for the application.
+    ///
+    /// The caller drained the lane within [`Self::reply_allowance`], so every answer given here
+    /// has its place. The lane bounds what it holds and this bounds what has left the lane and is
+    /// waiting for an application that has stopped reading its input: one that asks questions and
+    /// never reads the answers is answered no further than its share, and what it asked for past
+    /// that waits in the lane for room or for its deadline, rather than growing this queue
+    /// without limit or being lost.
     ///
     /// The root editor's machine hears of them once, after the whole batch is queued, in the order
     /// the terminal will get them: what the machine publishes because of them goes behind the bytes
@@ -1049,27 +1090,23 @@ impl InputDomain {
             .flatten();
         let mut cursor_reported = false;
         for reply in replies {
-            // What the replies themselves hold: queued and neither written nor dropped. The queue
-            // holds more than that. The keystrokes a takeover made stale stay in it until the
-            // writer reaches them, and the count of the lease they were accepted under went with
-            // the takeover, so taking the lease's share off the queue would charge them to the
-            // replies.
-            let held = self.writer.unwritten_replies.load(Ordering::Acquire);
-            // Two bounds, both of them this reply's: its own share, so an application that asks
-            // questions without reading the answers cannot fill the terminal by itself, and the
-            // whole room, in entries and in bytes, so its share cannot be spent on top of a full
-            // queue. What the root editor's machine is holding counts towards the second, because
-            // it is accepted input on its way to the same terminal.
-            if held.saturating_add(reply.bytes.len()) > MAX_PENDING_REPLY_BYTES
-                || self.writer.room.held_replies() >= MAX_PENDING_REPLY_FRAMES
-                || admit(
-                    self.held_for_the_terminal(),
-                    Cost::claimed_by(reply.bytes.len()),
-                )
-                .is_err()
-            {
-                break;
-            }
+            // The lane gave up no more than `reply_allowance` allows, so each of these has the room
+            // it needs. One that has not would be an answer taken from the lane and lost, and in a
+            // build that checks that is a panic that names the mistake.
+            debug_assert!(
+                self.writer
+                    .unwritten_replies
+                    .load(Ordering::Acquire)
+                    .saturating_add(reply.bytes.len())
+                    <= MAX_PENDING_REPLY_BYTES
+                    && self.writer.room.held_replies() < MAX_PENDING_REPLY_FRAMES
+                    && admit(
+                        self.held_for_the_terminal(),
+                        Cost::claimed_by(reply.bytes.len()),
+                    )
+                    .is_ok(),
+                "the response lane gave up an answer that has no room"
+            );
             queued_bytes = queued_bytes.saturating_add(reply.bytes.len() as u64);
             self.writer
                 .unwritten_replies
@@ -1713,9 +1750,6 @@ impl InputDomain {
 mod tests {
     use super::*;
     use crate::input::PASTE_END;
-    use crate::session::{
-        MAX_PENDING_REPLY_FRAMES, MAX_QUEUED_INPUT_BYTES, MAX_QUEUED_INPUT_FRAMES,
-    };
     use kr_protocol::ids::SessionId;
 
     fn domain() -> InputDomain {
@@ -1810,21 +1844,24 @@ mod tests {
             "the answer is queued, with the whole budget still far from spent"
         );
 
-        // The share is still a share: the replies themselves fill it, to the byte, and the next
-        // reply past it is refused.
+        // The share is still a share: it is what the answers have not spent, to the byte, and a
+        // reply that fills it leaves none for the next.
         let room = MAX_PENDING_REPLY_BYTES - b"\x1b[0n".len();
         let reply = |len: usize| crate::projection::LaneReply {
             cursor_report: false,
             bytes: vec![b'r'; len],
             expires_at_ms: None,
         };
-        let _ = input.queue_replies(vec![reply(room)]);
-        let _ = input.queue_replies(vec![reply(1)]);
-        let lengths: Vec<usize> = input.take_pending().iter().map(InputBatch::len).collect();
         assert_eq!(
-            lengths,
-            vec![room],
-            "a reply that fills the share is queued and the one past it is not"
+            input.reply_allowance().bytes,
+            room,
+            "the lane may give up what the share has left"
+        );
+        let _ = input.queue_replies(vec![reply(room)]);
+        assert_eq!(
+            input.reply_allowance().bytes,
+            0,
+            "a reply that fills the share leaves none for another"
         );
     }
 
@@ -1851,16 +1888,10 @@ mod tests {
         let mut input = domain();
         input.queue_input(keys(MAX_QUEUED_INPUT_BYTES - delimiter - 4));
         let _ = input.take_pending();
-        let _ = input.queue_replies(vec![reply(5)]);
-        assert!(
-            input.take_pending().is_empty(),
-            "five bytes and a delimiter do not fit"
-        );
-        let _ = input.queue_replies(vec![reply(4)]);
         assert_eq!(
-            input.take_pending().len(),
-            1,
-            "four bytes and a delimiter fit"
+            input.reply_allowance().bytes,
+            4,
+            "four bytes and a delimiter fit, and five do not"
         );
 
         // Entries: a reply and the place kept for a released prefix.
@@ -1869,45 +1900,14 @@ mod tests {
             input.queue_input(keys(1));
         }
         let _ = input.take_pending();
+        assert_eq!(input.reply_allowance().replies, 1, "one more entry fits");
         let _ = input.queue_replies(vec![reply(1)]);
-        assert_eq!(input.take_pending().len(), 1, "one more entry fits");
-        let _ = input.queue_replies(vec![reply(1)]);
-        assert!(
-            input.take_pending().is_empty(),
+        assert_eq!(
+            input.reply_allowance().replies,
+            0,
             "the entry that is left is the one kept for the recogniser"
         );
         assert!(input.input_room().held().frames <= MAX_QUEUED_INPUT_FRAMES);
-    }
-
-    /// The host's answers have a share of the entries as well as of the bytes: a burst of short
-    /// answers to an application that does not read stops at its share, and a person's keys still
-    /// have room.
-    #[test]
-    fn short_answers_stop_at_their_share_of_the_entries_and_leave_room_to_type() {
-        let mut input = domain();
-        let short = || crate::projection::LaneReply {
-            cursor_report: false,
-            bytes: b"\x1b[0n".to_vec(),
-            expires_at_ms: None,
-        };
-        // More short answers than the room has entries, as an application that asks questions and
-        // never reads the answers would send. The batches stay in hand, as they are while the
-        // writer holds them, so what they are charged is still charged when the room is read.
-        let mut taken = Vec::new();
-        for _ in 0..MAX_QUEUED_INPUT_FRAMES {
-            let _ = input.queue_replies(vec![short()]);
-            taken.extend(input.take_pending());
-        }
-        assert_eq!(
-            taken.len(),
-            MAX_PENDING_REPLY_FRAMES,
-            "the answers queued are the share and no more"
-        );
-        assert_eq!(input.input_room().held_replies(), MAX_PENDING_REPLY_FRAMES);
-        assert!(
-            admit(input.held_for_the_terminal(), Cost::claimed_by(1)).is_ok(),
-            "a keystroke still fits beside a full share of answers"
-        );
     }
 
     /// KR-REQ-08.48: a reply bypasses the paste recogniser. Bytes of a reply that the recogniser

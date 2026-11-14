@@ -2463,6 +2463,47 @@ async fn the_answers_a_writer_has_written_leave_their_share_free_for_the_next_se
     );
 }
 
+/// KR-REQ-08.48 and KR-REQ-08.49: answers held behind an open paste are all written when it ends,
+/// though more of them wait than the places the host's answers share in the room.
+///
+/// 256 questions are asked inside the paste, one more a second later, and the paste ends before
+/// two seconds have passed since the first. All 257 answers are inside the rate, the deadline and
+/// the byte bounds, so all 257 reach the application. The share is 256 places: the answer past it
+/// waits in the response lane for a place and is written when the writer has given one back, and
+/// nothing asks for it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_held_behind_a_paste_are_all_written_when_it_ends_though_more_than_the_share_waits()
+{
+    let (_host, runtime, clock, _session_id, holder, epoch) = echoing_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+
+    {
+        let mut session = runtime.session();
+        session.ingest_output(b"\x1b[?2004h");
+        session
+            .write_input(holder, epoch, 0, b"\x1b[200~pasted", None, Instant::now())
+            .expect("the paste opens");
+        runtime.flush_input();
+        session.ingest_output(&STATUS_QUESTION.repeat(256));
+        clock.advance(Duration::from_secs(1));
+        session.ingest_output(STATUS_QUESTION);
+        session
+            .write_input(holder, epoch, 1, b"\x1b[201~", None, Instant::now())
+            .expect("the paste ends");
+        session.pump_replies();
+        runtime.flush_input();
+    }
+    // The last answer is written once the writer has given back a place for it, a moment after
+    // the first 256 are written, so the wait is for all of them and not for a key behind them.
+    let seen =
+        common::retained_carrying(&runtime, STATUS_ANSWER, 257, Duration::from_secs(20)).await;
+    assert_eq!(
+        count(&seen, STATUS_ANSWER),
+        257,
+        "every answer the rate allowed was written"
+    );
+}
+
 /// A harness that plays the terminal's writer settles what it takes as the writer settles what it
 /// writes: the room, the answers' places, the unwritten answer bytes and the lease's queued bytes
 /// are all given back, so a long exchange is held to the bounds of the product and not to those of
