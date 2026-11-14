@@ -243,6 +243,24 @@ impl NetworkTransport {
         })
     }
 
+    /// Finishes the control stream's sending half while the connection stands, as a client that
+    /// ends its control stream and keeps its data streams does.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stream error when the stream was closed already.
+    #[cfg(feature = "testing")]
+    pub async fn finish_control(&self) -> Result<()> {
+        self.writer.lock().await.finish()?;
+        Ok(())
+    }
+
+    /// Resets the control stream's sending half while the connection stands.
+    #[cfg(feature = "testing")]
+    pub async fn reset_control(&self) {
+        self.writer.lock().await.reset();
+    }
+
     /// Returns a sender that can be held without the transport.
     #[must_use]
     pub fn sender(&self) -> ControlSender {
