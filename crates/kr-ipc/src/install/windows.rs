@@ -3,7 +3,7 @@
 //!
 //! | Unix | Windows |
 //! | --- | --- |
-//! | `current` is a relative symbolic link, replaced by renaming a new one over it | `current` is a directory junction, replaced by renaming a new junction over it in one step ([`replace_directory`]) |
+//! | `current` is a relative symbolic link, replaced by renaming a new one over it | `current` is a directory junction, pointed at a new release in place, in one operation ([`point_junction`]), and where there is none or it is no junction replaced by renaming a new junction over it in one step ([`replace_directory`]) |
 //! | a program holds a shared `flock` on its release's manifest | a program holds its release's manifest open for reading with a share mode that allows no write and no delete ([`open_for_hold`]), which keeps the release's directory from being renamed or removed |
 //! | whether a release is held is asked by trying an exclusive `flock` | by trying to open the manifest with a share mode that allows nothing ([`is_held`]) |
 //! | a sealed release is mode `0444`/`0555` | a sealed release is read-only by attribute and carries an access-control list that gives its owner read access and nothing that writes ([`seal_file`], [`seal_directory`]) |
@@ -35,9 +35,9 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION,
-    HANDLE, LocalFree, OBJ_DONT_REPARSE, RtlNtStatusToDosError, STATUS_DELETE_PENDING,
-    STATUS_SUCCESS, UNICODE_STRING,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, ERROR_NOT_A_REPARSE_POINT,
+    ERROR_SHARING_VIOLATION, HANDLE, LocalFree, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
+    STATUS_DELETE_PENDING, STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
@@ -60,7 +60,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
-use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
@@ -68,6 +68,9 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::WindowsProgramming::{
     FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
 };
+
+/// The most data a reparse point holds, in bytes.
+const REPARSE_DATA_MOST: usize = 16 * 1024;
 
 /// The tag of a directory junction, the reparse point `mklink /J` makes.
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
@@ -407,13 +410,24 @@ fn junction_data(target: &Path) -> io::Result<Vec<u8>> {
     Ok(buffer)
 }
 
-/// Makes the empty directory `link` a junction with the reparse data `data`.
-fn set_junction(link: &Path, data: &[u8]) -> io::Result<()> {
-    let directory = OpenOptions::new()
+/// Opens the directory or junction `link` itself, not what a junction names, with the right to
+/// change it.
+fn open_to_change(link: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .write(true)
         .share_mode(SHARE_ALL)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(link)?;
+        .open(link)
+}
+
+/// Makes the empty directory `link` a junction with the reparse data `data`.
+fn set_junction(link: &Path, data: &[u8]) -> io::Result<()> {
+    set_reparse_data(&open_to_change(link)?, data)
+}
+
+/// Sets the reparse data of the open directory `directory` to `data`: on a directory that has none
+/// the directory becomes a junction, and on a junction the target is replaced.
+fn set_reparse_data(directory: &File, data: &[u8]) -> io::Result<()> {
     let mut returned = 0_u32;
     // SAFETY: the handle is the open directory's own, `data` holds the reparse data it is told,
     // and no output buffer is asked for.
@@ -433,6 +447,68 @@ fn set_junction(link: &Path, data: &[u8]) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// The tag of the reparse point on the open file or directory `file`, where it has one.
+fn reparse_tag(file: &File) -> io::Result<Option<u32>> {
+    let mut buffer = vec![0_u8; REPARSE_DATA_MOST];
+    let mut returned = 0_u32;
+    // SAFETY: the handle is the open file's own, and the output buffer is as long as the length
+    // says; no input is given.
+    let done = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(buffer.len()).unwrap_or(0),
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if done == 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_NOT_A_REPARSE_POINT.cast_signed()) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(buffer
+        .first_chunk::<4>()
+        .map(|tag| u32::from_le_bytes(*tag)))
+}
+
+/// Points the junction `link` at the directory `target`, in place, and flushes the change. Returns
+/// whether it did: `false`, with nothing changed, where nothing is named `link` or what is there
+/// is not a directory junction.
+///
+/// The junction stays the one object it is and only its target changes, in one operation, so a
+/// program that opens or reads `link` meanwhile finds the old target or the new one whole.
+/// Renaming a new junction over it replaces the object instead, and an open of the name that meets
+/// the replaced one on its way out is answered with access denied; that is not a state a program
+/// can be asked to expect of a name that is there.
+///
+/// # Errors
+///
+/// Returns the operating system's error when `link` cannot be opened for a change, its reparse
+/// data cannot be read or set, or the change cannot be flushed.
+pub(super) fn point_junction(link: &Path, target: &Path) -> io::Result<bool> {
+    let data = junction_data(target)?;
+    let directory = match open_to_change(link) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if reparse_tag(&directory)? != Some(IO_REPARSE_TAG_MOUNT_POINT) {
+        return Ok(false);
+    }
+    at(Moment::JunctionChecked, link);
+    set_reparse_data(&directory, &data)?;
+    at(Moment::JunctionPointed, link);
+    directory.sync_all()?;
+    Ok(true)
 }
 
 /// Makes the existing empty directory `directory` a junction that names `target`, as another
@@ -678,8 +754,8 @@ impl Left {
     }
 }
 
-/// The moments of a removal at which another process of the account can act, and at which a test
-/// acts in its place.
+/// The moments of a removal, and of a switch of `current`, at which another process of the account
+/// can act, and at which a test acts in its place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Moment {
     /// The store's trash was checked to be a plain directory and is about to be opened.
@@ -690,6 +766,11 @@ pub enum Moment {
     Opened,
     /// The access list of a file is open and is about to be reset.
     AboutToGiveBack,
+    /// The name `current` was opened and found to be a junction, and its target is about to be set
+    /// through that handle.
+    JunctionChecked,
+    /// The target of `current` was set, and the change is about to be flushed.
+    JunctionPointed,
 }
 
 /// What a test runs at each moment, with the path of what the removal is at.
