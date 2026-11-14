@@ -1626,6 +1626,7 @@ async fn an_action_whose_admitted_deadline_passed_is_refused_before_it_writes() 
 }
 
 mod fence_support;
+mod restamp_support;
 mod teardown;
 
 /// KR-REQ-09.09, 09.12 and 26.16: a withdrawal whose fence could not be raised stops a transfer
@@ -3764,6 +3765,32 @@ async fn a_copy_that_found_no_claim_is_given_the_record_the_first_attempt_left_m
     host.stop().await;
 }
 
+/// What lands after a copy of a transfer action has looked for a claim and before it is told.
+#[derive(Clone, Copy)]
+enum AtThePause {
+    /// This host comes to owe a fence it could not raise.
+    AFence,
+    /// Another device's authority is revoked: the copy's connection stands with no fence owed and
+    /// its registration is stamped with the revision of the revocation.
+    AnotherDevicesRevocation,
+}
+
+impl AtThePause {
+    /// Brings it about.
+    async fn lands(self, host: &Host) {
+        match self {
+            Self::AFence => host.controller.hold_fence(true),
+            Self::AnotherDevicesRevocation => {
+                restamp_support::another_devices_authority_is_revoked(
+                    &host.controller,
+                    host.environment_id,
+                )
+                .await;
+            }
+        }
+    }
+}
+
 /// KR-REQ-09.09: the record a copy of a transfer action is given, read after it found no claim, is
 /// told under the strict check at the door. A fence this host comes to owe after the copy looked and
 /// before it is told keeps the record from the caller, who is told that what became of the action is
@@ -3772,6 +3799,23 @@ async fn a_copy_that_found_no_claim_is_given_the_record_the_first_attempt_left_m
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_record_a_copy_is_given_after_it_found_no_claim_is_not_shown_when_a_fence_lands_at_the_pause()
  {
+    the_record_a_copy_is_given_at_the_pause(AtThePause::AFence).await;
+}
+
+/// KR-REQ-09.09: the same copy and record, with another device's revocation landing at the pause in
+/// place of a fence. The copy's connection stands and no fence is owed, so only the revision the copy
+/// was admitted under has changed: a first answer is told, and a copy is not shown (a fence withholds
+/// a result whichever it is, so this is the case that tells the two apart). The same copy asked
+/// again on that connection is admitted under the new revision and given the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_a_copy_is_given_after_it_found_no_claim_is_not_shown_when_another_devices_authority_is_revoked_at_the_pause()
+ {
+    the_record_a_copy_is_given_at_the_pause(AtThePause::AnotherDevicesRevocation).await;
+}
+
+/// The case of the two above: a copy that found no claim, while the first attempt goes on and
+/// leaves its record, with `landing` happening before the copy is told.
+async fn the_record_a_copy_is_given_at_the_pause(landing: AtThePause) {
     let host = host().await;
     let mut first = client(&host).await;
     let bytes = pattern(64);
@@ -3811,7 +3855,7 @@ async fn a_record_a_copy_is_given_after_it_found_no_claim_is_not_shown_when_a_fe
         .expect("the first attempt ran")
         .expect("the call reaches the daemon")
         .expect("upload.begin succeeds");
-    host.controller.hold_fence(true);
+    landing.lands(&host).await;
     let_the_copy_go_on.send(()).expect("the copy is waiting");
     let (mut second, told) = copy.await.expect("the copy ran");
     let told = failure(told.expect("the call reaches the daemon"));
@@ -3840,6 +3884,24 @@ async fn a_record_a_copy_is_given_after_it_found_no_claim_is_not_shown_when_a_fe
 /// `a_copy_that_arrives_before_the_first_attempt_has_reached_the_service_is_told_the_outcome_is_unknown`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_attempt_a_copy_finds_still_running_is_not_shown_when_a_fence_lands_at_the_pause() {
+    the_attempt_a_copy_finds_still_running_at_the_pause(AtThePause::AFence).await;
+}
+
+/// KR-REQ-09.09: the same copy and attempt, with another device's revocation landing at the pause in
+/// place of a fence. The connection stands and no fence is owed, so the host's account of the
+/// attempt, which is a record of its claim, is withheld by the revision the copy was admitted under
+/// alone, and the word it is told is the one that says what became of the action is not shown. The
+/// host's own account says the attempt has not finished: the text is what tells the two apart,
+/// since both are `OUTCOME_UNKNOWN`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attempt_a_copy_finds_still_running_is_not_shown_when_another_devices_authority_is_revoked_at_the_pause()
+ {
+    the_attempt_a_copy_finds_still_running_at_the_pause(AtThePause::AnotherDevicesRevocation).await;
+}
+
+/// The case of the two above: a copy that finds the first attempt still carrying the action out,
+/// with `landing` happening before the copy is told.
+async fn the_attempt_a_copy_finds_still_running_at_the_pause(landing: AtThePause) {
     let host = host().await;
     let mut first = client(&host).await;
     let bytes = pattern(64);
@@ -3869,7 +3931,7 @@ async fn the_attempt_a_copy_finds_still_running_is_not_shown_when_a_fence_lands_
         .await
         .expect("the copy has looked for a claim and found none");
 
-    host.controller.hold_fence(true);
+    landing.lands(&host).await;
     let_the_copy_go_on.send(()).expect("the copy is waiting");
     let told = failure(
         copy.await
