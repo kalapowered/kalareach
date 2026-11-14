@@ -852,6 +852,8 @@ impl SessionRuntime {
         #[cfg(feature = "testing")]
         let terminal_writes = Arc::clone(&domain.lock().writer().terminal_writes);
         #[cfg(feature = "testing")]
+        let writer_hold = Arc::clone(&domain.lock().writer().writer_hold);
+        #[cfg(feature = "testing")]
         let writer: Box<dyn std::io::Write + Send> = Box::new(RecordingWriter {
             inner: writer,
             log: Arc::clone(&terminal_writes),
@@ -994,6 +996,8 @@ impl SessionRuntime {
             // a batch this writer never wrote never happened to the application.
             let mut last_fence = writer_fence.load(Ordering::Acquire);
             while let Some(batch) = input_receiver.blocking_recv() {
+                #[cfg(feature = "testing")]
+                writer_hold.stand();
                 #[cfg(feature = "testing")]
                 writer_log.of_a_lease(false);
                 if matches!(batch, InputBatch::LeaseChanged) {

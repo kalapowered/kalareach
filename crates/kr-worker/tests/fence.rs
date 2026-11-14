@@ -5647,20 +5647,11 @@ async fn a_managed_session_takes_no_input_before_its_bridge_has_authenticated() 
     let epoch = session.lease().epoch.get();
 
     // A whole frame is refused, and so is one that is only part of a delimiter: a refusal that let
-    // the recogniser keep the prefix would leave the session inside a paste nothing opened.
-    for (sequence, bytes) in [b"\x1b[200~".as_slice(), b"\x1b".as_slice()]
-        .into_iter()
-        .enumerate()
-    {
+    // the recogniser keep the prefix would leave the session inside a paste nothing opened. A
+    // refused frame takes no sequence number, so each is offered at the first one.
+    for bytes in [b"\x1b[200~".as_slice(), b"\x1b".as_slice()] {
         let error = session
-            .write_input(
-                holder,
-                epoch,
-                sequence as u64,
-                bytes,
-                None,
-                std::time::Instant::now(),
-            )
+            .write_input(holder, epoch, 0, bytes, None, std::time::Instant::now())
             .expect_err("refused before the bridge authenticated");
         assert!(
             matches!(
