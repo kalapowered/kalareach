@@ -419,6 +419,40 @@ fn assert_gone(started: &Started) {
     );
 }
 
+/// A process that the step's program started and that then left its group (a `setsid`) is still
+/// the step's own while the program's parent chain leads to it: it is ended with the run at its
+/// deadline. Perl makes the `setsid` call.
+#[cfg(unix)]
+#[test]
+fn a_second_run_ends_a_descendant_that_left_its_group_at_the_deadline() {
+    let tree = Tree::new();
+    let (program, _unit) = unit_of(&tree);
+    let pids = tree.directory.path().join("pids");
+    let mut leaving = step(&[&tree.marker, &program, Path::new(""), &pids]);
+    leaving.command[2] = SCRIPT.replacen(
+        "echo second-$((1 + 1)); exit 0",
+        "echo $$ > \"$4\"; perl -MPOSIX -e 'POSIX::setsid(); sleep 120' & echo $! >> \"$4\"; wait",
+        1,
+    );
+    let done = fault::execute(
+        &leaving,
+        1,
+        &tree.place(),
+        &[],
+        &mut Budget::of(Duration::from_secs(2)),
+        &Evidence::SHOWN.reads(),
+        &mut |_| {},
+    );
+    let started = Started(
+        std::fs::read_to_string(&pids)
+            .unwrap()
+            .lines()
+            .map(|line| line.trim().parse().unwrap())
+            .collect(),
+    );
+    assert_ended_at_its_deadline(&done, &started);
+}
+
 /// A second run whose program ends by itself, having started a process it did not wait for, leaves
 /// that process in the step's group: it is ended with the run, and the step's own exit is kept.
 #[cfg(unix)]

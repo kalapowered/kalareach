@@ -1458,10 +1458,12 @@ fn in_own_group(command: &mut Command) {
 fn in_own_group(_command: &mut Command) {}
 
 /// The processes that are the step's own right now, read afresh from the system's table: the
-/// members of the process group that the step's program `root` leads. A group number is not given
-/// to another process or group while a member of the group lives, so a member is the step's whatever
-/// became of its leader, and a process that is not one is never named here. The list is as old as
-/// the read, and a caller uses it at once.
+/// members of the process group that the step's program `root` leads, and the descendants of `root`
+/// by the parent chain, which takes in a process that left the group (a `setsid`) and whose parent
+/// still lives. A group number is not given to another process or group while a member of the group
+/// lives, so a member is the step's whatever became of its leader. A process whose parent chain no
+/// longer leads to `root` and that is in no such group is never named here, so a number that went
+/// to another program is not. The list is as old as the read, and a caller uses it at once.
 #[cfg(unix)]
 fn step_processes(root: u32) -> Vec<u32> {
     let Ok(output) = Command::new("ps")
@@ -1472,16 +1474,33 @@ fn step_processes(root: u32) -> Vec<u32> {
     else {
         return Vec::new();
     };
-    let mut members: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+    let table: Vec<(u32, u32, u32)> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let mut words = line.split_whitespace().map(|word| word.parse::<u32>().ok());
-            let (pid, _parent, group) = (words.next()??, words.next()??, words.next()??);
-            (group == root).then_some(pid)
+            Some((words.next()??, words.next()??, words.next()??))
         })
         .collect();
-    members.sort_unstable();
-    members
+    let mut own: std::collections::BTreeSet<u32> = table
+        .iter()
+        .filter(|(_, _, group)| *group == root)
+        .map(|(pid, _, _)| *pid)
+        .collect();
+    if table
+        .iter()
+        .any(|(pid, ppid, _)| *pid == root && *ppid == std::process::id())
+    {
+        own.insert(root);
+        let mut frontier = vec![root];
+        while let Some(parent) = frontier.pop() {
+            for (pid, _, _) in table.iter().filter(|(_, ppid, _)| *ppid == parent) {
+                if own.insert(*pid) {
+                    frontier.push(*pid);
+                }
+            }
+        }
+    }
+    own.into_iter().collect()
 }
 
 /// Sends the signal `name` to each of `pids`, which a caller read just before.
@@ -2259,5 +2278,41 @@ mod tests {
         // A file from before the build is not this build's.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         assert_eq!(dependency_file("kalareach_companion", &copied, later), None);
+    }
+
+    /// The step's own processes are the program's group and its descendants by the parent chain,
+    /// including one that left the group, and not a process that another parent started, even one
+    /// that was started beside them.
+    #[cfg(unix)]
+    #[test]
+    fn the_steps_own_processes_are_its_group_and_its_descendants_and_a_neighbour_is_not() {
+        use super::{signal_processes, step_processes};
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut leader = Command::new("sh")
+            .args([
+                "-c",
+                "sleep 120 & echo $!; perl -MPOSIX -e 'POSIX::setsid(); sleep 120' & echo $!; wait",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // Started by this test, so its parent is not the leader and its group is not the leader's.
+        let mut neighbour = Command::new("sleep").arg("120").spawn().unwrap();
+        let mut lines = std::io::BufReader::new(leader.stdout.take().unwrap()).lines();
+        let mut number = || -> u32 { lines.next().unwrap().unwrap().trim().parse().unwrap() };
+        let (in_group, left_group) = (number(), number());
+        let own = step_processes(leader.id());
+        let (hers, others) = (own.contains(&neighbour.id()), own.clone());
+        signal_processes("KILL", &[leader.id(), in_group, left_group, neighbour.id()]);
+        let _ = leader.wait();
+        let _ = neighbour.wait();
+        assert!(own.contains(&leader.id()), "{others:?}");
+        assert!(own.contains(&in_group), "in the group: {others:?}");
+        assert!(own.contains(&left_group), "left the group: {others:?}");
+        assert!(!hers, "the neighbour is not the step's: {others:?}");
     }
 }
