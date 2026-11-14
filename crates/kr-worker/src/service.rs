@@ -276,8 +276,27 @@ impl AskedPage {
     }
 }
 
+/// The task that follows what the session's application is doing, cancelled when its service is
+/// dropped.
+///
+/// The task holds the session's runtime until the session closes, so a service that is dropped
+/// with its session still running would otherwise leave the task, and with it the session's
+/// journal, in place until the program's own runtime ends. Dropping this asks the task to stop at
+/// its next wait and does nothing else: nothing is joined, locked or awaited.
+struct EvidenceTask(Option<tokio::task::AbortHandle>);
+
+impl Drop for EvidenceTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
 /// The worker's endpoint server.
 pub struct WorkerService {
+    /// What the session's application is doing, followed for as long as this service lives.
+    evidence: EvidenceTask,
     runtime: Arc<SessionRuntime>,
     /// The session's marks and its beat, which this service's idle clocks fall on.
     activity: Arc<crate::lifecycle::Activity>,
@@ -753,10 +772,11 @@ impl WorkerService {
         // runtime, which nothing can wake, follows nothing.
         let application = crate::application::Producer::new(Arc::downgrade(&runtime));
         let deadline_clock = crate::application::DeadlineClock::default();
+        let mut evidence = EvidenceTask(None);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let clock = Arc::clone(&shared_clock);
             let wall = deadline_clock.clone();
-            handle.spawn(crate::application::follow_evidence(
+            let following = handle.spawn(crate::application::follow_evidence(
                 Arc::clone(&application),
                 Arc::clone(&runtime),
                 Arc::clone(&broker),
@@ -768,9 +788,11 @@ impl WorkerService {
                 },
                 wall,
             ));
+            evidence.0 = Some(following.abort_handle());
         }
         let activity = runtime.session().activity();
         Ok(Self {
+            evidence,
             activity,
             runtime,
             identity,
