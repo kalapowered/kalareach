@@ -454,6 +454,15 @@ pub enum ControlEvent {
     /// 30. The transport's own keepalive covers a network connection; this one also covers a local
     /// socket, which carries the same typed frames and has no equivalent underneath it.
     Keepalive,
+    /// A worker's window for the typing of one lease epoch, on the connection of an input lane.
+    ///
+    /// It starts a window when the lane's attachment takes the lease, and ends one, with the bytes
+    /// the end discarded, when it loses the lease.
+    InputWindow(crate::local::LaneWindow),
+    /// Room that a worker gives back to a lane's window, on the connection of an input lane.
+    InputCredit(crate::local::LaneCredit),
+    /// A worker's statement that it has dealt with a launch, on the connection of an input lane.
+    InputLaunchReserved(crate::local::LaneLaunch),
 }
 
 /// One frame on an authorised control stream.
@@ -586,4 +595,9 @@ pub enum ControlFrame {
     DesktopChecks(crate::desktop::DesktopChecksRequest),
     /// The worker's findings: one record for each check it performed.
     DesktopChecksAnswer(Box<crate::desktop::DesktopChecksAnswer>),
+    /// Which attachment an input lane carries typing for, the first frame the control daemon sends
+    /// on a connection of role `proxy_input` after its generation token.
+    InputLane(crate::local::InputLane),
+    /// The worker's answer to that binding, and the first frame it writes on the lane.
+    InputLaneReady(crate::local::InputLaneReady),
 }

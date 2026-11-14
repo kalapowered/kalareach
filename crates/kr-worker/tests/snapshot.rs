@@ -1660,6 +1660,8 @@ async fn succession_draws_the_remaining_client_for_the_size_it_inherits() {
             &kr_protocol::attachment::SessionDetachParams {
                 attachment_id: kr_protocol::scalars::Nullable::some(owner.attachment_id),
                 line_token: Nullable::null(),
+                after_input: None,
+                fenced_report: false,
             },
         )
         .await

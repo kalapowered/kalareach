@@ -1571,6 +1571,8 @@ async fn the_attachment_methods_answer_with_the_geometry_and_the_epoch_they_prod
             &SessionDetachParams {
                 attachment_id: kr_protocol::scalars::Nullable::some(owner),
                 line_token: Nullable::null(),
+                after_input: None,
+                fenced_report: false,
             },
         )
         .await

@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::ProcessStartIdentity;
 use crate::ids::{AttachmentId, InputLeaseEpoch, PluginId, SessionId};
+use crate::input::InputBarrier;
 use crate::scalars::{Bytes, DurationMs, Nullable, TimestampMs, U64, Uuid};
 
 /// How long the worker holds new input while a reader transition resolves.
@@ -1142,6 +1143,13 @@ pub struct ShellLaunchParams {
     pub expected_prompt_generation: PromptGeneration,
     /// The buffer revision the caller expects an empty buffer to be at.
     pub expected_buffer_revision: EditorBufferRevision,
+    /// The typing that must have arrived before this launch is applied.
+    ///
+    /// Absent from the wire when the caller asks for no such order, so a launch that sends none is
+    /// byte for byte what a worker built before the member reads. A worker refuses a member it
+    /// does not know, so the member is sent only to a worker that states the input lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_input: Option<InputBarrier>,
 }
 
 /// The result of a `shell.launch` that was installed and submitted.
