@@ -2994,8 +2994,10 @@ impl Session {
     /// Returns [`WorkerError::LeaseLost`] for a stale epoch or a caller that does not hold the
     /// lease, an invalid-argument failure when the sequence does not follow,
     /// [`WorkerError::InputRoomFull`] when the application is not reading and what waits for it is
-    /// at a bound, and [`WorkerError::SessionClosed`] or an unavailable resource when the session
-    /// takes no input or its terminal has gone. A refused write takes no sequence number.
+    /// at a bound, [`WorkerError::PreconditionFailed`] while a managed session takes no external
+    /// input, and [`WorkerError::SessionClosed`] or an unavailable resource when the session takes
+    /// no input or its terminal has gone. A refused write takes no sequence number, except when the
+    /// session is closing and refuses after the recogniser has the bytes: it takes no more input.
     pub fn write_input(
         &mut self,
         attachment_id: AttachmentId,
@@ -5568,7 +5570,7 @@ pub const MAX_PENDING_REPLY_BYTES: usize = 64 * 1024;
 /// that a person's keystrokes are counted in. It is the same fraction of [`MAX_QUEUED_INPUT_FRAMES`]
 /// as the share in bytes is of [`MAX_QUEUED_INPUT_BYTES`], so a burst of answers cannot take every
 /// place and leave a person unable to type.
-pub const MAX_PENDING_REPLY_FRAMES: usize = 256;
+pub const MAX_PENDING_REPLY_FRAMES: usize = MAX_QUEUED_INPUT_FRAMES / 16;
 
 /// How much input may be waiting for the pseudo-terminal, across every producer at once.
 ///

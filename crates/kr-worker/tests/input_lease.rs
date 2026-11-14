@@ -2441,6 +2441,16 @@ async fn a_takeover_stops_the_keystrokes_waiting_for_the_terminal_and_not_the_ho
         "the keystrokes of the lease that was taken reached the application: {:?}",
         String::from_utf8_lossy(&seen)
     );
+    // The answer took one of the places that the host's own answers share, and the writer gives it
+    // back with the entry once it has written it.
+    let room = runtime.input().lock().input_room();
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while room.held_replies() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the writer gave back the answer's place in the room");
 
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
