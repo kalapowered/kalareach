@@ -263,6 +263,9 @@ tauri-plugin-opener = "=2.5.5"
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
 thread-priority = "=3.1.1"
+# A TOML parser. The conformance tests read Cargo.lock and Cargo.toml as data, the way cargo does,
+# and not as lines of text.
+toml = "=1.1.6"
 # A format-preserving TOML editor. Registering the tool server in an agent's configuration must
 # leave that file's other settings, its ordering and its comments exactly as they were.
 toml_edit = "=0.25.15"
