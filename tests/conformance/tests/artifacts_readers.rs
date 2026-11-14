@@ -36,6 +36,9 @@ struct Reading {
     directory: Option<PathBuf>,
     /// What `KR_TEST_ARTIFACTS_DIR` was once the reader had run.
     exported: Option<PathBuf>,
+    /// What the shell that ran the reader says `/tmp` is, as Windows writes it (`C:\`, `\\server\share`);
+    /// `None` for PowerShell and wherever the shell has no `cygpath`.
+    slash_tmp: Option<PathBuf>,
     /// Everything the reader said on its error stream.
     words: String,
 }
@@ -181,6 +184,7 @@ impl Reader {
                 run.args([
                     "-c",
                     r#". "$1"
+                    printf 'slash_tmp=%s\n' "$(cygpath -w /tmp 2>/dev/null)"
                     kr_artifacts_dir
                     printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)""#,
                     "bash",
@@ -245,6 +249,7 @@ impl Reader {
             succeeded: output.status.success(),
             directory: line("directory"),
             exported: line("exported"),
+            slash_tmp: line("slash_tmp").filter(|path| !path.as_os_str().is_empty()),
             words: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
     }
@@ -465,6 +470,39 @@ fn a_relative_value_that_names_a_folder_under_the_working_directory_is_still_ref
             &reading,
             "a relative folder that exists",
             "not an absolute path",
+        );
+    }
+}
+
+/// A temporary folder whose name holds line feeds is read as it is named, and a root that the shell
+/// reader would cut at a line feed (an empty root between two halves, or a folder that is not the
+/// temporary folder) admits nothing: no value outside the other roots is accepted.
+#[cfg(unix)]
+#[test]
+fn a_temporary_folder_whose_name_holds_line_feeds_admits_nothing_outside_the_roots() {
+    for reader in readers() {
+        let parent = beside_the_build();
+        let inside = parent.path().join("kr-root\n\nleaf");
+        std::fs::create_dir(&inside).expect("a folder with line feeds in its name");
+        let outside = elsewhere();
+        assert_refused(
+            reader,
+            &reader.read(Some(outside.as_os_str()), Some(&inside)),
+            "a folder outside the roots when the temporary folder's name holds line feeds",
+            OUTSIDE,
+        );
+        // The temporary folder ends with a line feed, and the folder named without it is another
+        // one that is no root.
+        let trailing = parent.path().join("kr-trailing\n");
+        let other = parent.path().join("kr-trailing");
+        std::fs::create_dir(&trailing).expect("a folder with a line feed at the end of its name");
+        std::fs::create_dir(&other).expect("the folder without it");
+        let value = other.join("evidence");
+        assert_refused(
+            reader,
+            &reader.read(Some(value.as_os_str()), Some(&trailing)),
+            "a folder beside a temporary folder whose name ends with a line feed",
+            OUTSIDE,
         );
     }
 }
@@ -748,6 +786,27 @@ mod windows_paths {
         }
     }
 
+    /// Asserts that the Git Bash that ran the reader read `/tmp` as `folder`, so that a case about
+    /// what the reader does with that `/tmp` is never about another Git Bash's.
+    fn assert_own_slash_tmp(reading: &Reading, folder: &Path) {
+        let fold = |path: &Path| {
+            path.to_string_lossy()
+                .to_lowercase()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_owned()
+        };
+        let seen = reading
+            .slash_tmp
+            .as_deref()
+            .expect("the shell printed what /tmp is");
+        assert!(
+            fold(seen) == fold(folder),
+            "this Git Bash reads /tmp as {seen:?}, not {folder:?}, so the case says nothing about \
+             the reader: {reading:?}"
+        );
+    }
+
     /// With the temporary folder at the top of a drive, Git Bash writes the whole drive under
     /// `/tmp`, so a value written there is inside a root that is a drive's top by another name.
     #[test]
@@ -762,10 +821,36 @@ mod windows_paths {
             Some(top.as_path()),
             &[("RUNNER_TEMP", top.as_os_str())],
         );
+        assert_own_slash_tmp(&reading, &top);
         assert_refused(
             Reader::Shell,
             &reading,
             "a folder under /tmp when /tmp is a drive's top",
+            OUTSIDE,
+        );
+    }
+
+    /// The same where the temporary folder is the top of a share (`\\server\share`), which Git
+    /// Bash writes under `/tmp` as the whole share.
+    #[test]
+    fn a_shares_top_is_no_root_whatever_name_git_bash_gives_it() {
+        if shell().is_none() {
+            return;
+        }
+        let Some(share) = by_unc(&drive_root()) else {
+            return;
+        };
+        let value = Path::new("/tmp/Windows/kr-evidence");
+        let reading = Reader::Shell.read_with(
+            Some(value.as_os_str()),
+            Some(share.as_path()),
+            &[("RUNNER_TEMP", share.as_os_str())],
+        );
+        assert_own_slash_tmp(&reading, &share);
+        assert_refused(
+            Reader::Shell,
+            &reading,
+            "a folder under /tmp when /tmp is a share's top",
             OUTSIDE,
         );
     }
@@ -777,6 +862,38 @@ mod windows_paths {
         }
         let reading = Reader::Shell.read(Some(OsStr::new("/tmp/kr-evidence")), None);
         assert!(reading.succeeded, "{reading:?}");
+    }
+
+    /// Git Bash makes `/tmp` from the `TMP` of the process that starts it (and, with several
+    /// running, of the first), so it can be a folder that the reader's own `TEMP` does not name.
+    /// Then it is no root of the reader.
+    #[test]
+    fn git_bashs_slash_tmp_is_a_root_only_where_it_is_the_readers_temporary_folder() {
+        if shell().is_none() {
+            return;
+        }
+        let there = tempfile::tempdir().expect("a folder that /tmp is");
+        let here = tempfile::tempdir().expect("the reader's temporary folder");
+        let named = [
+            ("TMP", there.path().as_os_str()),
+            ("TEMP", here.path().as_os_str()),
+        ];
+        let reading = Reader::Shell.read_with(Some(OsStr::new("/tmp/kr-evidence")), None, &named);
+        assert_own_slash_tmp(&reading, &real(there.path()));
+        assert_refused(
+            Reader::Shell,
+            &reading,
+            "a folder under /tmp when /tmp is not the reader's temporary folder",
+            OUTSIDE,
+        );
+        let value = spelled_for(Reader::Shell, &real(here.path()).join("evidence"));
+        let reading = Reader::Shell.read_with(Some(value.as_os_str()), None, &named);
+        assert!(reading.succeeded, "{reading:?}");
+        let directory = reading.directory.as_deref().expect("a directory");
+        assert!(
+            same(directory, &real(here.path()).join("evidence")),
+            "{directory:?}"
+        );
     }
 
     const POWER: Reader = Reader::PowerShell;
