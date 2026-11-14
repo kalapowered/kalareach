@@ -53,11 +53,11 @@ fn attributes() -> tauri_build::Attributes {
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
     // The Tauri build's default is a hybrid: the Visual C++ runtime static and the universal runtime
-    // dynamic, with link arguments that name `libvcruntime.lib` and `ucrt.lib` beside the `libcmt`
-    // of the workspace's `crt-static` target feature (see `.cargo/config.toml`), which would put two
-    // runtimes in the link. The static C runtime comes from the target feature alone, so the
-    // hybrid stays off. An environment that asks for it is refused before this point, since the
-    // Tauri build step reads the environment first.
+    // dynamic (its link arguments name `ucrt.lib`), so the program would import the universal
+    // runtime's `api-ms-win-crt-*` libraries, which a machine without Microsoft's redistributable may
+    // lack. The static C runtime comes from the workspace's `crt-static` target feature alone (see
+    // `.cargo/config.toml`), so the hybrid stays off. An environment that asks for it is refused
+    // before this point, since the Tauri build step reads the environment first.
     attributes.windows_attributes(
         tauri_build::WindowsAttributes::new_without_app_manifest().static_vc_runtime(false),
     )
