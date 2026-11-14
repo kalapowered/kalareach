@@ -336,27 +336,7 @@ impl Controller {
             .await
             .ok()?;
         let live = self.barrier_for(audience, named, live).ok()?;
-        let mut barrier = given.barrier.clone();
-        for worker in &mut barrier.workers {
-            if !worker.state.holds() {
-                if let Some(now) = live.workers.iter().find(|now| {
-                    now.session_id == worker.session_id
-                        && (now.state.holds() || now.acknowledged_revision.0.is_some())
-                }) {
-                    *worker = now.clone();
-                }
-                continue;
-            }
-            if worker.names_pending.get() == 0 {
-                continue;
-            }
-            if let Some(now) = live.workers.iter().find(|now| {
-                now.session_id == worker.session_id && carries_what_was_given(now, worker)
-            }) {
-                *worker = now.clone();
-            }
-        }
-        Some(barrier)
+        Some(barrier_read_again(&given.barrier, &live))
     }
 
     /// Asks each of `sessions` for its acknowledgement of the revision in force, together, each
@@ -3514,6 +3494,36 @@ fn open_number(
         .reservation_for_session(session_id)?
         .filter(reservation_is_open)
         .map(|reservation| reservation.display_number))
+}
+
+/// The barrier of a kept answer as it reads now, given the barrier as it stands.
+fn barrier_read_again(
+    given: &kr_protocol::action::RevocationBarrier,
+    live: &kr_protocol::action::RevocationBarrier,
+) -> kr_protocol::action::RevocationBarrier {
+    let mut barrier = given.clone();
+    for worker in &mut barrier.workers {
+        if !worker.state.holds() {
+            if let Some(now) = live.workers.iter().find(|now| {
+                now.session_id == worker.session_id
+                    && (now.state.holds() || now.acknowledged_revision.0.is_some())
+            }) {
+                *worker = now.clone();
+            }
+            continue;
+        }
+        if worker.names_pending.get() == 0 {
+            continue;
+        }
+        if let Some(now) = live
+            .workers
+            .iter()
+            .find(|now| now.session_id == worker.session_id && carries_what_was_given(now, worker))
+        {
+            *worker = now.clone();
+        }
+    }
+    barrier
 }
 
 /// Whether the daemon's entry for a worker now can stand in for the one an answer was given with:
