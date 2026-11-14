@@ -460,14 +460,29 @@ async fn the_names_other_workers_owe_are_collected_while_one_ask_is_stuck() {
         .hold_a_worker_link_for_tests(stuck.session_id)
         .await
         .expect("the worker is reached");
-    host.controller().limit_evidence_pages_for_tests(usize::MAX);
-
+    // The first ask of the pass begins, waits for the connection and gives up after ten seconds;
+    // the second is due ten seconds after that, and the passes come five seconds apart. The limit
+    // is lifted after the last pass before the second ask, so that the names are first asked for at
+    // the pass that begins it: before that ask when the pass collects names first, and only after
+    // the ask has given up, ten seconds later, when it asks first.
     until(
-        DEBT_PASS_INTERVAL * 3 + Duration::from_secs(10),
-        "the names the first worker owed were collected",
-        || host.controller().names_owed_for_tests().is_empty(),
+        DEBT_PASS_INTERVAL * 2 + SLACK,
+        "the first ask of the pass",
+        || !asks_of(host.controller(), stuck.session_id).is_empty(),
     )
     .await;
+    let first_ask = asks_of(host.controller(), stuck.session_id)[0];
+    tokio::time::sleep_until(first_ask + Duration::from_secs(17)).await;
+    host.controller().limit_evidence_pages_for_tests(usize::MAX);
+    let by = first_ask + Duration::from_secs(25);
+    while !host.controller().names_owed_for_tests().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the names the first worker owed were not collected at the pass that began the second \
+             ask of the other worker, whose connection is held"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(
         host.controller()
             .revision_pending()
