@@ -1281,7 +1281,12 @@ pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &s
 /// nothing in them tells a person to move, remove or correct anything.
 #[must_use]
 // text: rollback_laid_stays
-pub fn rollback_laid_stays(stayed: &[String], folder: &[String], marked: &[String]) -> String {
+pub fn rollback_laid_stays(
+    stayed: &[String],
+    folder: &[String],
+    unconfirmed: &[String],
+    marked: &[String],
+) -> String {
     let marked_words = if marked.is_empty() {
         String::new()
     } else {
@@ -1291,18 +1296,32 @@ pub fn rollback_laid_stays(stayed: &[String], folder: &[String], marked: &[Strin
         )
     };
     const OPENING: &str = "The rollback's steps that undo the policy, the service, the accounts and the program directory ended without a failure";
+    // What was marked and could not be read afterwards is neither kept nor gone: its own sentence
+    // says that the mark was set and the read failed.
+    let unconfirmed_words = if unconfirmed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " It marked for removal, and a read of its name afterwards failed, so it is not known whether it is gone: {}.",
+            unconfirmed.join("; ")
+        )
+    };
     match (stayed.is_empty(), folder.is_empty()) {
+        (true, true) if !unconfirmed.is_empty() => format!(
+            "{OPENING}, but a read of the name of what this run marked for removal failed, so it is not known whether it is gone: {}.{marked_words}",
+            unconfirmed.join("; ")
+        ),
         (false, true) | (true, true) => format!(
-            "{OPENING}, but this run could not take away all that it laid in the data directory's place: {}.{marked_words}",
+            "{OPENING}, but this run could not take away all that it laid in the data directory's place: {}.{unconfirmed_words}{marked_words}",
             stayed.join("; ")
         ),
         (false, false) => format!(
-            "{OPENING}, but this run could not take away all that it laid in the data directory's place: {}. It could not take away the folder above the program directory that it made either: {}.{marked_words}",
+            "{OPENING}, but this run could not take away all that it laid in the data directory's place: {}. It could not take away the folder above the program directory that it made either: {}.{unconfirmed_words}{marked_words}",
             stayed.join("; "),
             folder.join("; ")
         ),
         (true, false) => format!(
-            "{OPENING}, but this run could not take away the folder above the program directory that it made: {}.{marked_words}",
+            "{OPENING}, but this run could not take away the folder above the program directory that it made: {}.{unconfirmed_words}{marked_words}",
             folder.join("; ")
         ),
     }

@@ -368,10 +368,22 @@ fn the_folder_above_the_program_directory_is_made_and_removed_only_as_the_run_th
     // place, with a clause of its own in the ending.
     assert!(take.contains("match object(program_folder) {"));
     assert!(take.contains("rolled.folder.extend(remedy::rollback_entry(&taken, &path));"));
+    // What was marked and whose name could not be read afterwards has a list of its own on every
+    // path: the objects of the run, the folder above the program directory and the directory tail.
+    let compact: String = take.split_whitespace().collect();
+    assert_eq!(compact.matches("rolled.unconfirmed.extend(").count(), 3);
+    assert!(
+        source
+            .contains("\"not tried: the removal of the data directory was not confirmed ({why})\"")
+    );
     assert!(!take.contains("take(object(program_folder)"));
     let steps_end = steps.find("remedy::rollback_laid_stays(").unwrap();
-    assert!(steps[..steps_end].contains("rolled.stayed.is_empty() && rolled.folder.is_empty()"));
-    assert!(steps[steps_end..].contains("&rolled.folder,"));
+    let before: String = steps[..steps_end].split_whitespace().collect();
+    assert!(before.contains(
+        "rolled.stayed.is_empty()&&rolled.folder.is_empty()&&rolled.unconfirmed.is_empty()"
+    ));
+    let after: String = steps[steps_end..].split_whitespace().collect();
+    assert!(after.contains("&rolled.folder,&rolled.unconfirmed,&rolled.marked,"));
     let removal = code_of(body_of(&source, "fn remove_program_folder("));
     assert!(removal.contains("remedy::FolderRecord::of(object.outcome, object.detail.is_some())"));
     assert!(
@@ -448,7 +460,7 @@ fn a_read_of_a_name_that_failed_after_a_mark_is_said_as_unknown_and_never_as_sta
     let steps = code_of(body_of(&source, "fn undo_recorded("));
     assert!(steps.contains("Taken::Unconfirmed(why) => {"));
     // The data directory's folder is not tried while the directory's removal is not confirmed.
-    assert!(source.contains("Taken::Stays(_) | Taken::Unconfirmed(_)"));
+    assert!(source.contains("Some(_) if matches!(directory, Taken::Unconfirmed(_)) => {"));
 }
 
 /// An error of the tree removal's own calls is not said to be a listing: the removal opens each
