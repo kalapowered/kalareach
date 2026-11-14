@@ -2063,7 +2063,6 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
         )
         .expect("starts"),
     );
-    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     let named = collect(&mut stream, b"kr-waiting").await;
     let job = marked_number(&named, b"kr-job ").unwrap_or_else(|| {
@@ -2099,6 +2098,7 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
         "the shell is still there"
     );
 
+    runtime.close(ClosureReason::CloseRequested).1.release();
     let record = closure_record(&runtime, "the closure finishes").await;
 
     assert_eq!(record.reason, ClosureReason::CloseRequested);
@@ -2672,7 +2672,6 @@ async fn a_runtime_gives_up_waiting_for_a_shell_that_is_still_running_at_the_bou
         )
         .expect("starts"),
     );
-    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     let ended = tokio::time::timeout(
         Duration::from_secs(60),
@@ -2682,6 +2681,7 @@ async fn a_runtime_gives_up_waiting_for_a_shell_that_is_still_running_at_the_bou
     .expect("the wait gave up at its bound");
     assert!(!ended, "the shell is still running");
 
+    runtime.close(ClosureReason::CloseRequested).1.release();
     assert!(
         runtime.root_ended_within(LIVENESS_DEADLINE).await,
         "the shell ended once the session was closed"
