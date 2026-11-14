@@ -412,6 +412,8 @@ struct State {
     next_request: u64,
     /// Whether the device has been told that an epoch of this lane's lease ended.
     epoch_ended: bool,
+    /// Frames queued for the lane's writer or written and not yet answered.
+    in_flight: usize,
 }
 
 impl Flow {
@@ -443,6 +445,7 @@ impl Flow {
                 ended: None,
                 next_request: 1,
                 epoch_ended: false,
+                in_flight: 0,
             }),
             version: watch::channel(0).0,
             live,
@@ -552,7 +555,14 @@ impl Flow {
             .is_some_and(|last| last.request_id == request_id)
         {
             state.outstanding.pop_back();
+            state.in_flight -= 1;
         }
+    }
+
+    /// Counts a frame queued for the lane's writer as in flight, until it is answered or taken
+    /// back.
+    fn queued(&self) {
+        self.lock().in_flight += 1;
     }
 
     /// The deadline of the oldest frame the worker has not answered.
@@ -560,8 +570,10 @@ impl Flow {
         self.lock().outstanding.front().map(|front| front.deadline)
     }
 
+    /// Whether every frame passed on has been answered, those still queued for the writer
+    /// included.
     fn drained(&self) -> bool {
-        self.lock().outstanding.is_empty()
+        self.lock().in_flight == 0
     }
 
     /// Matches one answer from the worker to the oldest frame outstanding. The worker answers a
@@ -572,6 +584,7 @@ impl Flow {
             let Some(front) = state.outstanding.pop_front() else {
                 return false;
             };
+            state.in_flight -= 1;
             if front.request_id != response.request_id {
                 return false;
             }
@@ -1020,6 +1033,7 @@ async fn forward(
         authority_deadline_boot_ms: decision.authority_deadline,
         history: None,
     }));
+    flow.queued();
     let _ = queue.send(LaneFrame {
         request_id,
         epoch,
@@ -1062,6 +1076,7 @@ async fn write_lane(
             let mut state = flow.lock();
             // Behind a refusal of its epoch: not passed on.
             if state.refused_epoch == Some(item.epoch) {
+                state.in_flight -= 1;
                 continue;
             }
             state.outstanding.push_back(Outstanding {
