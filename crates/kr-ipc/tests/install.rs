@@ -95,6 +95,11 @@ impl TestStore {
 
     /// Makes a release current, under the locks every switch is made under.
     fn switch(&self, release: &ReleaseName) {
+        self.try_switch(release).expect("the release is current");
+    }
+
+    /// [`TestStore::switch`], with the store's answer.
+    fn try_switch(&self, release: &ReleaseName) -> Result<(), kr_ipc::install::InstallError> {
         let update = self
             .store
             .try_lock_update()
@@ -110,9 +115,7 @@ impl TestStore {
             .try_lock_writers()
             .expect("the writers' lock")
             .expect("no command is writing");
-        self.store
-            .switch(release, &update, &install, &writers)
-            .expect("the release is current");
+        self.store.switch(release, &update, &install, &writers)
     }
 }
 
@@ -1482,8 +1485,9 @@ fn current_names_a_whole_release_at_every_moment_of_a_switch() {
         .clamp(3, 8);
 
     let test = TestStore::create();
-    let one = release("0.1.0+aaaaaaaaaaaa");
-    let two = release("0.2.0+bbbbbbbbbbbb");
+    let one = release("0.9.0+aaaaaaaaaaaa");
+    // A name of another length: the junction's data changes size at every switch.
+    let two = release("0.10.0+bbbbbbbbbbbb");
     test.install(&one);
     test.install(&two);
     test.switch(&one);
@@ -1587,8 +1591,9 @@ fn target_through(held: &std::fs::File) -> std::io::Result<String> {
 #[test]
 fn a_reader_that_holds_current_open_across_a_switch_reads_the_release_switched_to() {
     let test = TestStore::create();
-    let one = release("0.1.0+aaaaaaaaaaaa");
-    let two = release("0.2.0+bbbbbbbbbbbb");
+    let one = release("0.9.0+aaaaaaaaaaaa");
+    // A name of another length: the junction's data is a different size after the switch.
+    let two = release("0.10.0+bbbbbbbbbbbb");
     test.install(&one);
     test.install(&two);
     test.switch(&one);
@@ -1613,10 +1618,12 @@ fn a_reader_that_holds_current_open_across_a_switch_reads_the_release_switched_t
     assert_eq!(test.store.current().expect("reads"), Some(two));
 }
 
-/// A switch that ends at any moment of the change leaves `current` naming a whole release, the one
-/// it was or the one it goes to, and never none or a mixture: before the target is set it names the
-/// old one, and after it the new one, with the change not yet flushed. A panic in the seam stands
-/// for the end of the process there, and a store opened afresh for what a restart finds.
+/// A switch whose process ends at either moment of the change leaves `current` naming a whole
+/// release, the one it was or the one it goes to, and never none or a mixture: before the target is
+/// set it names the old one, and after it the new one, with the change not yet flushed. A panic in
+/// the seam stands for the end of the process there, which closes its handles and locks; a store
+/// opened afresh reads what a later process reads. What a machine that stops there finds is the
+/// file system's to restore, and is not tried here.
 #[cfg(windows)]
 #[test]
 fn a_switch_that_ends_at_any_moment_leaves_current_naming_a_whole_release() {
@@ -1661,7 +1668,7 @@ fn a_switch_that_ends_at_any_moment_leaves_current_naming_a_whole_release() {
 }
 
 /// A `current` that is a plain directory is not made a junction where it is: the directory that was
-/// there stays what it is, whether the switch then replaces it or refuses.
+/// there stays what it is, and a switch that says it made the release current has.
 #[cfg(windows)]
 #[test]
 fn a_current_that_is_a_plain_directory_is_not_turned_into_a_junction_in_place() {
@@ -1673,7 +1680,7 @@ fn a_current_that_is_a_plain_directory_is_not_turned_into_a_junction_in_place() 
     test.install(&one);
     std::fs::create_dir(test.store.current_link()).expect("a directory in the place of current");
     let held = open_current_itself(&test);
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test.switch(&one)));
+    let switched = test.try_switch(&one);
     assert!(
         !matches!(
             held.metadata(),
@@ -1681,16 +1688,123 @@ fn a_current_that_is_a_plain_directory_is_not_turned_into_a_junction_in_place() 
         ),
         "the directory that was there is not a junction now"
     );
+    if switched.is_ok() {
+        assert_eq!(
+            test.store
+                .current()
+                .expect("a switch that succeeded left a link"),
+            Some(one),
+            "a switch that succeeds makes the release current"
+        );
+    }
+}
+
+/// A junction that this account cannot open to change is an error, and is not replaced by a rename:
+/// that replacement is the one a reader can meet on its way out. The release `current` names stays
+/// what it was.
+#[cfg(windows)]
+#[test]
+fn a_junction_that_cannot_be_opened_to_change_is_an_error_and_is_not_replaced() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ,
+    };
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    test.install(&one);
+    test.install(&two);
+    test.switch(&one);
+    // A handle that reads `current` itself and lets no other handle write it: the open that a
+    // change needs is refused while this one lives.
+    let reading = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(test.store.current_link())
+        .expect("current opens for reading");
+    assert!(
+        matches!(
+            test.try_switch(&two),
+            Err(kr_ipc::install::InstallError::Io {
+                operation: "point the link",
+                ..
+            })
+        ),
+        "the switch says it could not point the link"
+    );
+    drop(reading);
+    assert_eq!(
+        test.store.current().expect("reads"),
+        Some(one),
+        "and current names what it did"
+    );
+}
+
+/// A name that stops being a junction after the switch has looked at it and before it opens it to
+/// change it is not made one: the object that handle is open on is checked again, so a directory put
+/// there is left as it is and the switch goes on as it does for a `current` that is no junction.
+#[cfg(windows)]
+#[test]
+fn a_name_that_stops_being_a_junction_between_the_look_and_the_change_is_not_made_one() {
+    use kr_ipc::install::removal_race::{Moment, hook};
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let _hooked = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    test.install(&one);
+    test.install(&two);
+    test.switch(&one);
+    let link = test.store.current_link();
+    let moved = test.store.root().join("moved-current");
+    let at_link = link.clone();
+    hook(Some(std::sync::Arc::new(move |at, path: &Path| {
+        if at == Moment::JunctionLooked && path == at_link {
+            std::fs::rename(&at_link, &moved).expect("the junction that was looked at moves away");
+            std::fs::create_dir(&at_link).expect("a directory takes the name");
+            std::fs::write(at_link.join("kept"), b"kept").expect("with something in it");
+        }
+    })));
+    let switched = test.try_switch(&two);
+    hook(None);
+    // A directory with something in it is not replaced, and is not made a junction: the switch is
+    // the one for a `current` that is no junction, and it is refused at the rename.
+    assert!(
+        matches!(
+            switched,
+            Err(kr_ipc::install::InstallError::Io {
+                operation: "rename",
+                ..
+            })
+        ),
+        "the switch went on as for a name that is no junction: {switched:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .is_ok_and(|kept| kept.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0),
+        "the directory put there is not a junction"
+    );
+    assert_eq!(
+        std::fs::read(link.join("kept")).ok().as_deref(),
+        Some(&b"kept"[..])
+    );
 }
 
 /// What another process of the account puts in the place of `current` after the switch has looked
-/// at it and before it sets the target is left as it is: the target is set through the handle that
-/// was looked at, and not through the name.
+/// at it and before it sets the target is left as it is, and the switch says that the name was
+/// replaced and does not say that the release is current: the target is set through the handle that
+/// was looked at, and not through the name, and the name is checked afterwards.
 #[cfg(windows)]
 #[test]
 fn a_name_put_in_the_place_of_current_during_a_switch_is_not_pointed_at_the_release() {
     use kr_ipc::install::removal_race::{Moment, hook, make_junction_in_place};
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     let _hooked = HOOKED
         .lock()
@@ -1713,8 +1827,15 @@ fn a_name_put_in_the_place_of_current_during_a_switch_is_not_pointed_at_the_rele
             make_junction_in_place(&at_link, &to_name).expect("which is a junction");
         }
     })));
-    let _ = catch_unwind(AssertUnwindSafe(|| test.switch(&two)));
+    let switched = test.try_switch(&two);
     hook(None);
+    assert!(
+        matches!(
+            switched,
+            Err(kr_ipc::install::InstallError::Replaced { .. })
+        ),
+        "the switch says the name was replaced: {switched:?}"
+    );
     assert_eq!(
         std::fs::read_link(&link).expect("the name is still a junction"),
         elsewhere,
