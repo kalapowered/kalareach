@@ -33,6 +33,24 @@ pub fn private_copy(original: &Path, base: &Path, outside: &[PathBuf]) -> Result
     private_copy_with(original, base, outside, &copy_bytes)
 }
 
+/// Why Cargo cannot take `copy` as its runner, which it reads as one word of text, or none.
+fn unusable_as_runner(copy: &Path) -> Option<String> {
+    let Some(text) = copy.to_str() else {
+        return Some(format!(
+            "{} cannot be Cargo's runner: its path is not valid text, so the temporary directory's \
+             path must be: set TMPDIR (TMP on Windows) to a directory whose path is plain text",
+            copy.display()
+        ));
+    };
+    text.chars().any(char::is_whitespace).then(|| {
+        format!(
+            "{} cannot be Cargo's runner: its path has a space in it, so the temporary directory's path \
+             must hold none: set TMPDIR (TMP on Windows) to a directory whose path has no space",
+            copy.display()
+        )
+    })
+}
+
 fn private_copy_with(
     original: &Path,
     base: &Path,
@@ -66,15 +84,8 @@ fn private_copy_with(
         std::process::id()
     ));
     let copy = directory.join(name);
-    if copy
-        .to_str()
-        .is_none_or(|path| path.chars().any(char::is_whitespace))
-    {
-        return Err(format!(
-            "{} cannot be Cargo's runner: its path has a space in it, so the temporary directory's path \
-             must hold none: set TMPDIR (TMP on Windows) to a directory whose path has no space",
-            copy.display()
-        ));
+    if let Some(problem) = unusable_as_runner(&copy) {
+        return Err(problem);
     }
     std::fs::create_dir(&directory)
         .map_err(|error| format!("{} could not be made: {error}", directory.display()))?;
@@ -262,6 +273,19 @@ mod tests {
         assert!(problem.contains("has a space in it"), "{problem}");
         assert!(problem.contains("TMPDIR"), "{problem}");
         assert!(std::fs::read_dir(&spaced).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_text_is_said_so_and_not_said_to_hold_a_space() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/kr \xff/runner"));
+        let problem = unusable_as_runner(path).unwrap();
+        assert!(problem.contains("not valid text"), "{problem}");
+        assert!(!problem.contains("has a space"), "{problem}");
+        let spaced = unusable_as_runner(Path::new("/tmp/with space/runner")).unwrap();
+        assert!(spaced.contains("has a space in it"), "{spaced}");
+        assert_eq!(unusable_as_runner(Path::new("/tmp/plain/runner")), None);
     }
 
     #[cfg(unix)]
