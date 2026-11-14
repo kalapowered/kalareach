@@ -1034,6 +1034,7 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     // The protocol's own frame limit, written again and again by a lease holder that is within its
     // rights on every single frame. The lines are what make the terminal stop taking them: a line
@@ -1098,7 +1099,6 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
         "and nothing beyond the budget was ever queued"
     );
     let runtime = std::sync::Arc::clone(&runtime);
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1165,6 +1165,7 @@ async fn takeover_mid_paste(one_frame: bool) {
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     // Nothing is written until the application has set those modes. Bracketed paste is the
     // application's own, read from the canonical grid rather than asserted here, because that is
     // where the framer reads it from in production.
@@ -1311,7 +1312,6 @@ async fn takeover_mid_paste(one_frame: bool) {
          the takeover discarded were never among them"
     );
     let runtime = std::sync::Arc::clone(&runtime);
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1346,6 +1346,7 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     // More than the terminal of an application that never reads will take, so the writer is still
     // holding some of it when the lease changes.
@@ -1402,7 +1403,6 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
         "the takeover reports what it did not deliver: {taken:?}"
     );
     let runtime = std::sync::Arc::clone(&runtime);
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1451,7 +1451,7 @@ async fn a_geometry_the_session_budget_cannot_admit_is_refused_before_anything_m
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1496,6 +1496,7 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     // Nothing in this test's own markers is an `a`, because `a` is what the counting is about.
     let ready = retained_within(&runtime, b"kr-up", LIVENESS_DEADLINE).await;
     assert!(
@@ -1575,7 +1576,6 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
          {received} received, {discarded} discarded, {SENT} sent"
     );
     let runtime = std::sync::Arc::clone(&runtime);
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1640,7 +1640,7 @@ async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_wit
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1725,7 +1725,7 @@ async fn a_withdrawn_claim_the_budget_refuses_leaves_the_size_unowned_rather_tha
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1794,7 +1794,7 @@ async fn input_for_a_terminal_that_has_gone_is_refused_rather_than_acknowledged(
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// An attachment that never declared what terminal it is, which is what `--no-probe` chooses.
@@ -1874,7 +1874,7 @@ async fn a_controller_whose_keys_cannot_be_established_is_refused_the_keys() {
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// Returns the number a marker line carries, from bytes an attachment received.
@@ -2063,6 +2063,7 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     let named = collect(&mut stream, b"kr-waiting").await;
     let job = marked_number(&named, b"kr-job ").unwrap_or_else(|| {
@@ -2098,7 +2099,6 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
         "the shell is still there"
     );
 
-    runtime.close(ClosureReason::CloseRequested).1.release();
     let record = closure_record(&runtime, "the closure finishes").await;
 
     assert_eq!(record.reason, ClosureReason::CloseRequested);
@@ -2672,6 +2672,7 @@ async fn a_runtime_gives_up_waiting_for_a_shell_that_is_still_running_at_the_bou
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     let ended = tokio::time::timeout(
         Duration::from_secs(60),
@@ -2681,7 +2682,6 @@ async fn a_runtime_gives_up_waiting_for_a_shell_that_is_still_running_at_the_bou
     .expect("the wait gave up at its bound");
     assert!(!ended, "the shell is still running");
 
-    runtime.close(ClosureReason::CloseRequested).1.release();
     assert!(
         runtime.root_ended_within(LIVENESS_DEADLINE).await,
         "the shell ended once the session was closed"
