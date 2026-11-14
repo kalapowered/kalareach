@@ -77,6 +77,13 @@ pub trait StreamOpener: Send + Sync + std::fmt::Debug {
     /// that holds no stream of its own, and so cannot see its stream revoked, waits on this to
     /// learn that the connection is gone.
     fn revoked(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// The connection's send budget, which a writer whose write the budget refused for room waits on
+    /// ([`StreamBudget::released`]) and then tries again. An opener that cannot say has none, and a
+    /// writer that meets the refusal then ends its stream.
+    fn budget(&self) -> Option<Arc<StreamBudget>> {
+        None
+    }
 }
 
 /// A connection this device ended itself, and why: the error the connection's calls are answered
@@ -306,6 +313,10 @@ impl StreamOpener for NetworkStreams {
 
     fn revoked(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(self.streams.revoked())
+    }
+
+    fn budget(&self) -> Option<Arc<StreamBudget>> {
+        Some(Arc::clone(self.streams.budget()))
     }
 }
 
