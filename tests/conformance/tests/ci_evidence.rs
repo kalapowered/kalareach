@@ -1613,7 +1613,8 @@ fn helpers_of(entry: &Held) -> Vec<(String, bool)> {
         }
     }
     helpers.retain(|(name, _)| !name.eq_ignore_ascii_case(VARIABLE));
-    helpers.sort();
+    // A name that one line gives in PowerShell's spelling is PowerShell's.
+    helpers.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     helpers.dedup_by(|a, b| a.0 == b.0);
     helpers
 }
@@ -1675,11 +1676,11 @@ fn proof_problem(entry: &Held) -> Option<String> {
     }
 }
 
+/// The lines of an entry's file and the first and last-plus-one line of each block of the entry.
+type Located<'a> = (Vec<&'a str>, Vec<(usize, usize)>);
+
 /// The lines of an entry's file and where each block of the entry stands, or what is wrong.
-fn located<'a>(
-    files: &'a [(String, Vec<u8>)],
-    entry: &Held,
-) -> Result<(Vec<&'a str>, Vec<(usize, usize)>), String> {
+fn located<'a>(files: &'a [(String, Vec<u8>)], entry: &Held) -> Result<Located<'a>, String> {
     let Some((_, bytes)) = files.iter().find(|(path, _)| *path == entry.file) else {
         return Err("the file is not tracked".to_owned());
     };
@@ -1946,13 +1947,14 @@ fn tracked_files(root: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
 /// It reads every tracked file of every type: the checkout's own list, from `git ls-files`, and the
 /// bytes of each file that the checkout holds (a link or a submodule holds a path or a commit and is
 /// not read). The name is searched in any letter case, since Windows takes it in any, and in UTF-16.
-/// A file that names the variable and is not text, or holds a zero byte, fails the case. Each line that names the variable is exactly
-/// one of these, and a line that is none of them fails the case with the lines to add:
+/// A file that names the variable and is not text, or holds a zero byte, fails the case. Each line
+/// that names the variable is exactly one of these, and a line that is none of them fails the case
+/// with what to add:
 ///
 /// 1. A held write. The held list holds each line that gives the variable a value (a workflow's
 ///    `env` entry, an assignment, the default of `${NAME:-default}`, a program's environment call)
 ///    whole by its text: the file, the line, the value that stands right after the name, and, for
-///    each variable that the value names, the line that defines it, in the order they stand. Every
+///    each variable that the value names, the lines that define it, in the order they stand. Every
 ///    block of lines of an entry must stand in exactly one place of its file, so an entry that
 ///    matches no line, or more than one, fails the case, and so does a value that is only the start
 ///    of the line's value or a line that gives the variable a second value. The case shows from
@@ -1960,33 +1962,48 @@ fn tracked_files(root: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
 ///    expressions it does not follow, the entry names its line that makes a temporary directory.
 ///    A value that lies elsewhere, or is the caller's, carries its reason. A held argument is a
 ///    line that hands the variable's value to a program, held the same way.
-/// 2. A known read, and only these: `${{ env.NAME }}` in a workflow, `$env:NAME` in PowerShell, a
-///    shell's `$NAME`, `${NAME}`, `${NAME:?...}`, `${NAME:+...}` and `${NAME:-}` with an empty
-///    default, a call of Rust's `env::var` or `env::var_os`, and a bare `export NAME`. A default
-///    with text (`${NAME:-default}`) gives a value, and is a held write. A constant that holds the
-///    name (`const X: &str = "..."`) is allowed when every use of `X` in a file of its type is
-///    such a call.
-/// 3. A line that cannot run, by these rules only: a line that starts with `#` in a `.sh`,
+/// 2. A held helper. A variable that an entry's definition lines give a value, or that its value
+///    names and those lines mention, is the entry's helper. Every line of the entry's file outside
+///    the blocks of the file's entries holds the helper's name only as a plain use of its value:
+///    `$name`, `"$name"` or `${name}` with no operator after the name, and, in PowerShell text
+///    (where the entry's definition is `$name = ...`), a `$name` that no assignment follows. Any
+///    other whole-word mention of the name fails, wherever the line stands (above, between or below
+///    the blocks, in a function the script calls later): `name=`, `read name`, `mapfile name`,
+///    `for name`, `printf -v name`, `unset name`, `${name:=x}`, `${name%/}` and a bare word in a
+///    message. The case lists no assignment form; it knows plain uses and refuses the rest. This
+///    refuses some lines that change nothing (a log line that prints `name=$name`, a trailing
+///    comment or quoted text that names the helper, an assignment for one child command). A person
+///    then writes the line another way, or holds it as a `mention` entry with its reason.
+/// 3. A held read with a fallback. A read of the variable that is not a `let ... else {` statement
+///    (whose `else` has to leave, so that it falls back on nothing) is a held read: its entry
+///    holds the lines that follow it, and shows by a folder line that what it falls back on is a
+///    temporary directory, or states that it falls back on no value. A shell read with an empty
+///    default (`${NAME:-}`) is allowed only inside a block of an entry, which holds the lines that
+///    give the script's own default. A default with text (`${NAME:-default}`) is a held write.
+/// 4. A known read, and only these: `${{ env.NAME }}` in a workflow, `$env:NAME` in PowerShell, a
+///    shell's `$NAME`, `${NAME}`, `${NAME:?...}` and `${NAME:+...}`, a call of Rust's `env::var` or
+///    `env::var_os` in a `let ... else {` statement, and a bare `export NAME`. A constant that
+///    holds the name (`const X: &str = "..."`) is allowed when every use of `X` in a file of its
+///    type is such a call.
+/// 5. A line that cannot run, by these rules only: a line that starts with `#` in a `.sh`,
 ///    `.bash`, `.yml`, `.yaml`, `.py` or `.ps1` file, but not one that starts with `#>` (which ends
-///    a PowerShell block comment and may go on) or `#!`; a line that starts with `//` (so `///` and
-///    `//!`) in a `.rs`, `.ts`, `.tsx`, `.js` or `.mjs` file, except the lines of a code block in a
-///    doc comment (fenced with three backticks or `~~~`, or indented), which the Rust
-///    documentation tests run; a line of a `.md` file outside a fenced
-///    code block and not indented as code; and a line of this file between the two lines that open
-///    and close its held list, which equal the list the program holds, so that every line let
-///    through is data. A line that has anything before its comment marker, a line that ends a
-///    block comment, and a line inside a block comment are not let through: the one such line that
-///    names the variable is held as a comment with its reason.
+///    a PowerShell block comment and may go on) or `#!`; a line that starts with `//` (so `///`
+///    and `//!`) in a `.rs`, `.ts`, `.tsx`, `.js` or `.mjs` file, except the lines of a code block
+///    in a doc comment (fenced with three backticks or `~~~`, or indented), which the Rust
+///    documentation tests run; a line of a `.md` file outside a fenced code block and not
+///    indented as code; and a line of this file between the two lines that open and close its held
+///    list, which equal the list the program holds, so that every line let through is data. A line
+///    that has anything before its comment marker, a line that ends a block comment, and a line
+///    inside a block comment are not let through: the one such line that names the variable is
+///    held as a comment with its reason.
 ///
-/// A text hold detects a change to the lines it holds, and not a wrong change. A line between two
-/// blocks of an entry that gives a variable of the earlier block another value fails the case, in
-/// the ordinary shell and PowerShell forms of an assignment; any other way to change a variable
-/// that a held line names is not read, and nor is what an `env` entry does to `TEMP`. A held Rust
-/// value is shown only by a line of the entry that makes a temporary directory, not by following
-/// the expressions between that line and the value. A name made at run time (`${!name}`, a
-/// joined string, a use of this file's own constant for the name) is out of reach of any case that
-/// reads text, and so is a file that is not yet added to the index. A comment marker that stands
-/// first on a line inside a string or a template literal is let through as a comment.
+/// What a text reader cannot follow, and the case therefore does not see: a value that goes
+/// through `eval`, a sourced file or a command's output, a name made at run time (`${!name}`, a
+/// joined string, a use of this file's own constant for the name), what an `env` entry does to
+/// `TEMP`, and a file that is not yet added to the index. A text hold detects a change to the lines
+/// it holds, and not a wrong change: it does not show that a held Rust value uses the directory its
+/// folder line makes, and a Rust helper is not guarded by name. A comment marker that stands first
+/// on a line inside a string or a template literal is let through as a comment.
 ///
 /// Not shown here: that each run gets a directory of its own (the scripts' fixed default is shared
 /// by successive runs on one machine) and that on macOS the default is the OS-resolved `$TMPDIR`
@@ -2118,6 +2135,8 @@ fn this_file(outside: &str, held: &str) -> String {
 #[test]
 fn the_source_case_fails_on_what_it_does_not_know() {
     let held_a = "file: scripts/a.sh\n| d=\"${@V@:-/tmp/kr-a}\"\nvalue: /tmp/kr-a";
+    let held_b = "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e";
+    let held_w = "file: .github/workflows/w.yml\n| $t = (Get-Item $env:TEMP).FullName\n| \"@V@=$t\\e\" >> $env:GITHUB_ENV\nvalue: $t\\e";
     let a_sh = "d=\"${@V@:-/tmp/kr-a}\"\necho \"$@V@/x\" \"${@V@:?}\"\n# @V@ is a directory\n";
     let unknown = "neither a known read nor a held write";
     let outside = "does not lie in a temporary folder";
@@ -2563,6 +2582,233 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             "file: crates/x/tests/t.rs\n| cmd.env(\"@V@\", \"/tmp/x\").current_dir(\"..\");\nvalue: /tmp/x",
             None,
         ),
+        (
+            "a helper read into with a redirect, below the write",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\nexport @V@=\"$d/e\"\nIFS= read -r d <<<\"$PWD\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper read into above its definition",
+            vec![(
+                "scripts/b.sh",
+                "IFS= read -r d <<<\"$PWD\"\nd=/tmp/x\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper that mapfile fills",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\nmapfile -t d <<<\"$PWD\"\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper that a for loop sets",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\nfor d; do :; done\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper that getopts sets",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\ngetopts e: d\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper that printf -v sets",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\nprintf -v d %s \"$PWD\"\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper that is unset",
+            vec![("scripts/b.sh", "d=/tmp/x\nunset d\nexport @V@=\"$d/e\"\n")],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper given a new value in a function that the script calls later",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\nexport @V@=\"$d/e\"\nf() {\n  d=\"$PWD/e\"\n}\nf\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper with an expansion that gives a default",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\necho \"${d:=/home/y}\"\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a helper with an operator after its name",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\necho \"${d%/}\"\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "a bare word of a message",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\necho the d is set\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            Some("names the helper"),
+        ),
+        (
+            "plain uses of a helper and a shell test",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\necho \"$d\" \"${d}\"\n[ $d = x ]\nexport @V@=\"$d/e\"\n",
+            )],
+            held_b,
+            None,
+        ),
+        (
+            "a helper named in a held mention",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\nexport @V@=\"$d/e\"\necho the d is set\n",
+            )],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e\n\n\
+             file: scripts/b.sh\nkind: mention\n| echo the d is set\nwhy: a message",
+            None,
+        ),
+        (
+            "a held mention whose line is gone",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\nexport @V@=\"$d/e\"\necho the e is set\n",
+            )],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e\n\n\
+             file: scripts/b.sh\nkind: mention\n| echo the d is set\nwhy: a message",
+            Some("no line stands"),
+        ),
+        (
+            "a PowerShell helper that a plain use follows",
+            vec![(
+                ".github/workflows/w.yml",
+                "$t = (Get-Item $env:TEMP).FullName\n\"@V@=$t\\e\" >> $env:GITHUB_ENV\necho $t\n",
+            )],
+            held_w,
+            None,
+        ),
+        (
+            "a PowerShell helper given another value below",
+            vec![(
+                ".github/workflows/w.yml",
+                "$t = (Get-Item $env:TEMP).FullName\n\"@V@=$t\\e\" >> $env:GITHUB_ENV\n$t = 'C:\\y'\n",
+            )],
+            held_w,
+            Some("names the helper"),
+        ),
+        (
+            "a PowerShell helper that an operator extends",
+            vec![(
+                ".github/workflows/w.yml",
+                "$t = (Get-Item $env:TEMP).FullName\n\"@V@=$t\\e\" >> $env:GITHUB_ENV\n$t += 'x'\n",
+            )],
+            held_w,
+            Some("names the helper"),
+        ),
+        (
+            "a Rust read that is a let-else statement",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    let Some(x) = std::env::var_os(\"@V@\") else {\n        return;\n    };\n}\n",
+            )],
+            "",
+            None,
+        ),
+        (
+            "a Rust read with a fallback that no entry holds",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    if let Some(x) = std::env::var_os(\"@V@\") {\n        return x;\n    }\n}\n",
+            )],
+            "",
+            Some(unknown),
+        ),
+        (
+            "a Rust read with a fallback that an entry holds",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    if let Some(x) = std::env::var_os(\"@V@\") {\n        return x;\n    }\n    let d = tempfile::tempdir().unwrap();\n}\n",
+            )],
+            "file: crates/x/src/lib.rs\nkind: read\n| if let Some(x) = std::env::var_os(\"@V@\") {\n| return x;\n| }\n\
+             | let d = tempfile::tempdir().unwrap();\nfolder: let d = tempfile::tempdir().unwrap();",
+            None,
+        ),
+        (
+            "a Rust read whose held fallback was changed",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    if let Some(x) = std::env::var_os(\"@V@\") {\n        return x;\n    }\n    let d = PathBuf::from(\"target/e\");\n}\n",
+            )],
+            "file: crates/x/src/lib.rs\nkind: read\n| if let Some(x) = std::env::var_os(\"@V@\") {\n| return x;\n| }\n\
+             | let d = tempfile::tempdir().unwrap();\nfolder: let d = tempfile::tempdir().unwrap();",
+            Some("no line stands"),
+        ),
+        (
+            "a Rust read whose folder line makes no directory",
+            vec![(
+                "crates/x/src/lib.rs",
+                "fn f() {\n    if let Some(x) = std::env::var_os(\"@V@\") {\n        return x;\n    }\n    let d = make();\n}\n",
+            )],
+            "file: crates/x/src/lib.rs\nkind: read\n| if let Some(x) = std::env::var_os(\"@V@\") {\n| return x;\n| }\n\
+             | let d = make();\nfolder: let d = make();",
+            Some("makes a temporary directory"),
+        ),
+        (
+            "a shell read with an empty default outside any entry",
+            vec![("scripts/d.sh", "e=\"${@V@:-}\"\n")],
+            "",
+            Some(unknown),
+        ),
+        (
+            "a shell read with an empty default inside the block that holds its fallback",
+            vec![(
+                "scripts/d.sh",
+                "e=\"${@V@:-}\"\nif [ -z \"$e\" ]; then\n  e=/tmp/x\nfi\nexport @V@=\"$e\"\n",
+            )],
+            "file: scripts/d.sh\n| e=\"${@V@:-}\"\n| if [ -z \"$e\" ]; then\n| e=/tmp/x\n| fi\n| export @V@=\"$e\"\nvalue: $e",
+            None,
+        ),
+        (
+            "a documentation test after an inner attribute",
+            vec![
+                a,
+                (
+                    "crates/x/src/lib.rs",
+                    "//! ```\n#![allow(unused)]\n//! cmd.env(\"@V@\", \"/home/x\");\n//! ```\n",
+                ),
+            ],
+            held_a,
+            Some(unknown),
+        ),
     ];
     for (name, files, held, fails_with) in cases {
         let problems = findings(&tree(&files), &format!("\n{}\n", named(held)));
@@ -2607,11 +2853,13 @@ fn the_source_case_fails_on_what_it_does_not_know() {
 /// The held list: one entry for each place that gives the variable a value, set apart by blank
 /// lines. `file:` names the file. A line that starts `| ` is a line of the file, compared without
 /// its indentation; the lines of a block stand together, a line `...` sets apart blocks that stand
-/// further from each other, and the last line is the held one. `value:` is the text that stands
-/// right after the name in that line. `folder:` names the line that makes the temporary directory a
-/// Rust value lies in, and `why:` gives the reason a value lies elsewhere. `kind:` is `argument`
-/// for a line that hands the value to a program, or `comment` for a line that cannot run and that
-/// no line rule lets through.
+/// further from each other, and the last line is the held one (the first, for a `read`). `value:`
+/// is the text that stands right after the name in that line. `folder:` names the line that makes
+/// the temporary directory a Rust value or a fallback lies in, and `why:` gives the reason a value
+/// lies elsewhere. `kind:` is `argument` for a line that hands the value to a program, `comment`
+/// for a line that cannot run and that no line rule lets through, `read` for a read that may fall
+/// back on a value of its own, or `mention` for lines that name a helper variable and give it no
+/// value.
 const HELD: &str = r##"
 file: .github/workflows/conformance.yml
 | # The evidence directory: inside the platform's temporary directory, new for the run.
