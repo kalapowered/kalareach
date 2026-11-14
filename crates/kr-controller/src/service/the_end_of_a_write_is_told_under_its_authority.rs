@@ -279,8 +279,9 @@ async fn the_four_modules_first_admissions_are_told_under_the_authority_they_end
 /// KR-REQ-09.09, 09.12: the report `privacy.set` answers with states what earlier exports left, so
 /// it is a record even when the change is the request's own: the door tells it while the
 /// registration stands under the revision the request was admitted under and no fence is owed, and
-/// does not show it once another device's withdrawal has restamped the registration, a fence is
-/// owed, or the connection is withdrawn.
+/// does not show it once the registration has been restamped (the case stamps it with a newer
+/// revision by hand, as a revocation of another device does), a fence is owed, or the connection is
+/// withdrawn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_report_privacy_set_answers_is_not_shown_once_authority_has_moved_after_the_route_answers()
  {
@@ -327,6 +328,161 @@ async fn the_report_privacy_set_answers_is_not_shown_once_authority_has_moved_af
     not_shown(&gone);
 }
 
+/// A `privacy.set` whose parameters do not decode: its service function refuses it with
+/// `INVALID_ARGUMENT` before it changes anything, a refusal that rests on the parameters alone.
+fn a_privacy_set_that_decodes_no_parameters(
+    temp: &kr_ipc::testing::TempHost,
+) -> (Method, MutationRequest) {
+    (
+        Method::PrivacySet,
+        mutation_of(
+            temp,
+            Method::PrivacySet,
+            ParamsValue::from_typed(&GrantRevokeParams {
+                grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+            })
+            .expect("encodes"),
+        ),
+    )
+}
+
+/// KR-REQ-09.09, 09.12: every answer `privacy.set`'s service function returns carries the label of
+/// the report, a refusal of its own included, also one that rests on the parameters alone, since
+/// the door cannot tell it from the report. While nothing has moved the refusal is told with its own
+/// code, and a definite refusal means nothing was done; once a restamp, a fence that is owed or a
+/// withdrawn connection has come after the route answered it is not shown, and the repeat under a
+/// check that passes gets the definite answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_privacy_sets_service_function_raises_is_told_as_itself_and_is_not_shown_once_authority_has_moved()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let refusing = || a_privacy_set_that_decodes_no_parameters(&temp);
+
+    let control = told_after_the_route_answers(&controller, refusing(), |_| {}).await;
+    assert_eq!(
+        refusal(&control).expect("the parameters are refused").code,
+        ErrorCode::InvalidArgument,
+        "with nothing moved the refusal is told with its own code: {control:?}"
+    );
+    let restamped = told_after_the_route_answers(&controller, refusing(), |_| {
+        controller
+            .admitted_write()
+            .values_mut()
+            .for_each(|connection| {
+                connection.admitted_revision = kr_protocol::ids::AuthorityRevision::new(
+                    connection.admitted_revision.get() + 1,
+                );
+            });
+    })
+    .await;
+    not_shown(&restamped);
+    let fenced = told_after_the_route_answers(&controller, refusing(), |_| {
+        controller.hold_fence(true);
+    })
+    .await;
+    not_shown(&fenced);
+    controller.hold_fence(false);
+    let gone = told_after_the_route_answers(&controller, refusing(), |connection_id| {
+        controller.deregister(connection_id);
+    })
+    .await;
+    not_shown(&gone);
+    let again = told_after_the_route_answers(&controller, refusing(), |_| {}).await;
+    assert_eq!(
+        refusal(&again)
+            .expect("the parameters are refused again")
+            .code,
+        ErrorCode::InvalidArgument,
+        "under a check that passes the repeat gets the definite answer: {again:?}"
+    );
+}
+
+/// KR-REQ-09.09, 09.12: the refusal `write_method` makes for a `privacy.set` whose connection was
+/// withdrawn before the service was asked keeps its word, which says nothing was done: told
+/// as that refusal while the fence stands, and as the fence's own, which is also definite, while
+/// one is owed. It is not the report's label that it carries, so it is never "not shown".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_made_before_privacy_sets_service_keeps_its_word_under_a_fence() {
+    use kr_protocol::privacy::PrivacySetParams;
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let told_without_an_admission = |mutation: MutationRequest| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        async move {
+            told_now(
+                &controller,
+                connection_id,
+                &mutation,
+                controller.write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::PrivacySet,
+                    connection_id,
+                    None,
+                    Some(accepted(&controller)),
+                    None,
+                ),
+            )
+            .await
+        }
+    };
+    let request = || {
+        mutation_of(
+            &temp,
+            Method::PrivacySet,
+            ParamsValue::from_typed(&PrivacySetParams { enabled: true }).expect("encodes"),
+        )
+    };
+
+    let control = told_without_an_admission(request()).await;
+    let error = refusal(&control).expect("a request that carries no admission is refused");
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(
+        error.message.contains("withdrawn"),
+        "with no fence the refusal is told as it was made: {error:?}"
+    );
+    controller.hold_fence(true);
+    let fenced = told_without_an_admission(request()).await;
+    controller.hold_fence(false);
+    refused_for_a_fence(refusal(&fenced).expect("the request is still refused"));
+}
+
+/// KR-REQ-09.09, 09.12: every answer to `membership.present` is a copy, a refusal of the lease
+/// included, so once a fence is owed or the connection is withdrawn after the route answered, the
+/// refusal is not shown either. The request carries no lease the host can take, so the answer is
+/// the refusal of it, and with nothing moved it is told with its own code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_of_a_lease_membership_present_raises_is_not_shown_under_a_fence_or_a_withdrawn_connection()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let refusing = || {
+        (
+            Method::MembershipPresent,
+            mutation_of(&temp, Method::MembershipPresent, ParamsValue::empty()),
+        )
+    };
+
+    let control = told_after_the_route_answers(&controller, refusing(), |_| {}).await;
+    assert_eq!(
+        refusal(&control).expect("a lease that is no lease").code,
+        ErrorCode::InvalidArgument,
+        "with nothing moved the refusal is told with its own code: {control:?}"
+    );
+    let fenced = told_after_the_route_answers(&controller, refusing(), |_| {
+        controller.hold_fence(true);
+    })
+    .await;
+    not_shown(&fenced);
+    controller.hold_fence(false);
+    let gone = told_after_the_route_answers(&controller, refusing(), |connection_id| {
+        controller.deregister(connection_id);
+    })
+    .await;
+    not_shown(&gone);
+}
+
 /// What the door tells of the revocation of a device that holds a delegation tree at the most it
 /// may hold, which with the device names more than one notice carries, so that the request's own
 /// barrier withdraws the whole host. With `another_withdrawal_follows` another device's withdrawal
@@ -359,7 +515,11 @@ async fn told_a_device_revocation_at_the_most_a_notice_names(
         &controller,
         revoking,
         Duration::from_secs(30 * 60),
-        async |_| {
+        async |connection_id| {
+            assert!(
+                controller.admitted_revision(connection_id).is_err(),
+                "the revocation's own barrier withdrew the connection the request arrived on"
+            );
             if another_withdrawal_follows {
                 another_devices_withdrawal(&controller).await;
             }
