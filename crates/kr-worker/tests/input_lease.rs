@@ -2311,13 +2311,9 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
     // otherwise be blamed for bytes nothing is going to write.
     let session = runtime.session();
     assert_eq!(
-        session
-            .input()
-            .lock()
-            .queued_input_bytes()
-            .load(std::sync::atomic::Ordering::Acquire),
-        0,
-        "the budget the dropped batch held is given back"
+        session.input().lock().input_room().held(),
+        kr_worker::input_room::Cost::default(),
+        "the room the dropped batch held is given back, its entry as well as its bytes"
     );
     assert_eq!(
         session.input().lock().queued_lease_bytes().load(),
@@ -6229,6 +6225,266 @@ async fn a_frame_refused_for_room_keeps_its_sequence_and_arrives_once_and_in_ord
         &written_for_the_lease(&typing),
         &expected,
         "the terminal was given every accepted frame once and in order, and the refused ones not at all",
+    );
+    typing
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// The queue for the terminal is bounded in frames beside bytes: a program that does not read is
+/// refused for room after a bounded number of one-byte frames, in the same words as for bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and is the other backend; the real pseudo-console case is in windows.rs"
+)]
+async fn the_queue_for_the_terminal_is_bounded_in_frames_as_well_as_in_bytes() {
+    let limit = kr_worker::session::MAX_QUEUED_INPUT_FRAMES;
+    let mut typing = Typing::start(None).await;
+    let release = hold_the_writer(&mut typing, b"k".to_vec()).await;
+
+    let mut accepted = 1_usize;
+    let refusal = loop {
+        match typing.write(bytes_content(b"k".to_vec())).await {
+            Ok(_) => accepted += 1,
+            Err(error) => break error,
+        }
+        assert!(
+            accepted <= limit + 8,
+            "{accepted} one-byte frames are waiting for a writer that takes nothing, and the \
+             frame bound is {limit}"
+        );
+    };
+    assert_eq!(refusal.code, ErrorCode::ResourceUnavailable);
+    assert!(
+        refusal
+            .message
+            .contains("writes are already waiting for it, so these bytes were not accepted"),
+        "{refusal:?}"
+    );
+    // One place is kept back for the prefix of a paste delimiter that the recogniser can still
+    // hold and release by itself, so the queue never holds more frames than the bound.
+    assert_eq!(accepted, limit - 1, "frames accepted before the refusal");
+
+    release.send(()).expect("the writer is waiting");
+    until_there_is_room(&mut typing, bytes_content(b"kr-end.".to_vec())).await;
+    retained_within(&typing.wired.runtime, b"kr-end.", LIVENESS_DEADLINE).await;
+    let mut expected = vec![b'k'; accepted];
+    expected.extend_from_slice(b"kr-end.");
+    assert_same_bytes(
+        &written_for_the_lease(&typing),
+        &expected,
+        "every accepted frame reached the terminal once",
+    );
+    typing
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// A frame is charged what the worker stores for it. A key record of a few bytes on the wire spells
+/// thousands, and the room is spent by the spelling: a window sized in encoded bytes would let a
+/// thousand of them through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and is the other backend; the real pseudo-console case is in windows.rs"
+)]
+async fn a_key_record_is_charged_the_bytes_it_spells_and_not_the_bytes_it_takes_on_the_wire() {
+    const REPEAT: u16 = 10_000;
+    const SPELLED: usize = 3 * REPEAT as usize;
+    let mut typing = Typing::start(None).await;
+    let release = hold_the_writer(&mut typing, b"k".to_vec()).await;
+    let held = || InputContent::ConsoleKeys {
+        keys: vec![kr_protocol::input::ConsoleKey {
+            repeat: REPEAT,
+            ..console_key(0x26, 0, true)
+        }],
+    };
+
+    let mut accepted = 0_usize;
+    let refusal = loop {
+        match typing.write(held()).await {
+            Ok(_) => accepted += 1,
+            Err(error) => break error,
+        }
+        assert!(accepted <= 64, "the room is bounded");
+    };
+    assert_eq!(refusal.code, ErrorCode::ResourceUnavailable);
+    let paste_end = 6;
+    assert_eq!(
+        accepted,
+        (kr_worker::session::MAX_QUEUED_INPUT_BYTES - 1 - paste_end) / SPELLED,
+        "the room is spent by what each record spells, however little it takes on the wire"
+    );
+
+    release.send(()).expect("the writer is waiting");
+    typing
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// Waits until the room holds `cost`, which the writer reaches by itself once it is let go.
+///
+/// The count is given back by the writer's own thread, a moment after the terminal has the bytes,
+/// so a reader that has just seen the application's echo can still find an entry charged. This
+/// yields to the other tasks between reads and waits on no clock.
+async fn until_the_room_holds(
+    room: &kr_worker::input_room::InputRoom,
+    cost: kr_worker::input_room::Cost,
+) {
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while room.held() != cost {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the room holds {:?} and not {cost:?}", room.held()));
+}
+
+/// The room is charged by what the worker holds, entry and bytes, from the moment a write is
+/// accepted: while it waits behind the writer, and while the writer has it in hand. The writer
+/// gives it back, and it is whole again once the terminal has everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and is the other backend; the real pseudo-console case is in windows.rs"
+)]
+async fn the_room_is_charged_while_the_worker_holds_a_write_and_whole_when_it_is_done() {
+    use kr_worker::input_room::Cost;
+
+    let mut typing = Typing::start(None).await;
+    let room = typing.wired.runtime.input().lock().input_room();
+    assert_eq!(room.held(), Cost::default());
+
+    // The writer has taken the first write and stands in it: it is in hand, and still charged.
+    let release = hold_the_writer(&mut typing, counted_frame(0, 8)).await;
+    assert_eq!(
+        room.held(),
+        Cost {
+            frames: 1,
+            bytes: 8
+        }
+    );
+    // Three more wait behind it, each charged one entry and its own bytes.
+    let mut expected = counted_frame(0, 8);
+    for (n, len) in [(1, 10), (2, 20), (3, 30)] {
+        let frame = counted_frame(n, len);
+        typing
+            .write(bytes_content(frame.clone()))
+            .await
+            .expect("accepted");
+        expected.extend_from_slice(&frame);
+    }
+    assert_eq!(
+        room.held(),
+        Cost {
+            frames: 4,
+            bytes: 68
+        }
+    );
+
+    release.send(()).expect("the writer is waiting");
+    until_the_room_holds(&room, Cost::default()).await;
+    typing.bytes(b"kr-end.").await;
+    expected.extend_from_slice(b"kr-end.");
+    retained_within(&typing.wired.runtime, b"kr-end.", LIVENESS_DEADLINE).await;
+    until_the_room_holds(&room, Cost::default()).await;
+    assert_same_bytes(
+        &written_for_the_lease(&typing),
+        &expected,
+        "the terminal was given every write once and in order",
+    );
+    typing
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// A lease that ends does not give its room back at once, because the worker still holds what the
+/// lease queued: the writer drops it when it reaches it, never writes it, and only then is the room
+/// whole. The next holder's writes take their place in a sequence of their own and are written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and is the other backend; the real pseudo-console case is in windows.rs"
+)]
+async fn the_room_of_an_ended_lease_comes_back_when_the_writer_drops_what_it_queued() {
+    use kr_worker::input_room::Cost;
+
+    let mut typing = Typing::start(None).await;
+    let room = typing.wired.runtime.input().lock().input_room();
+    let release = hold_the_writer(&mut typing, counted_frame(0, 8)).await;
+    for (n, len) in [(1, 100), (2, 200)] {
+        typing
+            .write(bytes_content(counted_frame(n, len)))
+            .await
+            .expect("accepted");
+    }
+    let before = room.held();
+    assert_eq!(
+        before,
+        Cost {
+            frames: 3,
+            bytes: 308
+        }
+    );
+
+    // Another attachment takes the keys.
+    let mut other = LocalClient::connect(&typing.wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let attachment = attach_over(&mut other, &typing.wired, Some("kalareach-companion")).await;
+    let taken = acquire_over(&mut other, &typing.wired, attachment)
+        .await
+        .expect("takes the keys");
+    assert_eq!(
+        room.held(),
+        before,
+        "the takeover discards the old lease's input, and the worker still holds it"
+    );
+
+    release.send(()).expect("the writer is waiting");
+    until_the_room_holds(&room, Cost::default()).await;
+    let new_frame = counted_frame(9, 40);
+    write_content_over(
+        &mut other,
+        &typing.wired,
+        attachment,
+        taken.lease.epoch,
+        0,
+        bytes_content(new_frame.clone()),
+    )
+    .await
+    .expect("the new holder's first write is accepted at sequence zero");
+    let mut expected = new_frame;
+    write_over(
+        &mut other,
+        &typing.wired,
+        attachment,
+        taken.lease.epoch,
+        1,
+        b"kr-end.",
+    )
+    .await
+    .expect("accepted");
+    expected.extend_from_slice(b"kr-end.");
+    retained_within(&typing.wired.runtime, b"kr-end.", LIVENESS_DEADLINE).await;
+    until_the_room_holds(&room, Cost::default()).await;
+    assert_same_bytes(
+        &written_for_the_lease(&typing),
+        &expected,
+        "nothing the ended lease queued was written, and the new holder's writes were",
     );
     typing
         .wired
