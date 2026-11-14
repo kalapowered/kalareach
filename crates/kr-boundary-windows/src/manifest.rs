@@ -247,15 +247,21 @@ impl Manifest {
     }
 
     /// Writes the result of a step on the object that the run recorded before it (or records the
-    /// object with the result where none was recorded). A result of `made` is never replaced by
-    /// `found`: a repair that finds what an earlier run made leaves it made.
+    /// object with the result where none was recorded). A result of `made` is never replaced: a
+    /// repair that finds what an earlier run made leaves it made. A result of `refused` is never
+    /// replaced by `found`, so that a repair does not take over what a new installation refused;
+    /// only the repair's own `made` replaces it, where it makes the object after none stood there.
     pub fn conclude(&mut self, kind: ObjectKind, id: &str, outcome: Outcome) {
         if let Some(object) = self
             .objects
             .iter_mut()
             .find(|object| object.kind == kind && object.id.eq_ignore_ascii_case(id))
         {
-            if object.outcome != Some(Outcome::Made) {
+            let kept = matches!(
+                (object.outcome, outcome),
+                (Some(Outcome::Made), _) | (Some(Outcome::Refused), Outcome::Found)
+            );
+            if !kept {
                 object.outcome = Some(outcome);
             }
         } else {
