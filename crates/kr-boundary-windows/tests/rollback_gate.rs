@@ -305,6 +305,12 @@ fn a_rollback_that_ends_with_a_failed_step_leaves_a_record_before_it_ends() {
     assert!(steps.contains("match &mut tree {"));
     // The read of the manifest's name is not said to have failed where none was made.
     let on_disk = code_of(body_of(&source, "fn manifest_on_disk("));
+    // A published replacement is the run's own record: the read takes it as the manifest.
+    let compact: String = on_disk.split_whitespace().collect();
+    assert!(
+        compact
+            .contains("(None,Some(file))iffile.path==self.paths.manifest=>{file_key(&file.handle)")
+    );
     assert!(on_disk.contains("return Err(remedy::NotProved::NotRead);"));
     // What stays names the folder above the program directory where the run holds it.
     let held = code_of(body_of(&source, "fn held_paths("));
