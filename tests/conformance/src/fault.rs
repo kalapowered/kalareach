@@ -17,7 +17,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
