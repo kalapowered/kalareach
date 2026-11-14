@@ -1162,7 +1162,8 @@ impl<'a> Resolver<'a> {
         let mut runs = Vec::new();
         for (index, binary) in self.ran.get(target).into_iter().flatten() {
             let step = &self.executed[*index].step;
-            // The runner said, in its own words, that it could not start this test program.
+            // The runner recorded, in a file no program is told of, that it could not start this test
+            // program.
             let refused = self.executed[*index]
                 .observation
                 .as_ref()
