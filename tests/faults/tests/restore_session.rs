@@ -345,6 +345,8 @@ impl Live {
                 &kr_protocol::attachment::SessionDetachParams {
                     attachment_id: Nullable::some(probe.attachment_id),
                     line_token: Nullable::null(),
+                    after_input: None,
+                    fenced_report: false,
                 },
             )
             .await

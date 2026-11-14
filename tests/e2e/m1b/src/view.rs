@@ -466,6 +466,8 @@ impl View {
                 &SessionDetachParams {
                     attachment_id: Nullable::some(self.attachment_id),
                     line_token: Nullable::null(),
+                    after_input: None,
+                    fenced_report: false,
                 },
             )
             .await

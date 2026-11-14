@@ -59,6 +59,7 @@ impl Press {
             command: self.command,
             expected_prompt_generation: self.expected_prompt_generation,
             expected_buffer_revision: self.expected_buffer_revision,
+            after_input: None,
         }
     }
 }

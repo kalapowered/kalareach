@@ -167,6 +167,31 @@ pub const fn params_root(method: Method) -> Option<&'static str> {
     }
 }
 
+/// Takes out of the parameters of a request the members that only a worker stating the input lane
+/// reads, and returns the parameters as a worker without it reads them.
+///
+/// `after_input` of `input.release`, `session.detach` and `shell.launch`, and `fenced_report` of
+/// the first two, are absent from the wire unless they are used, and a worker refuses a member it
+/// does not know. A host that forwards such a request to a worker that does not state the input
+/// lane writes it through this function. The parameters of every other method are returned as
+/// they are. A worker that states the lane is sent the members as they were given.
+///
+/// This code goes once no supported live worker lacks the capability, which is from the cut that
+/// retains the level that first states the input lane: every worker then reads the members.
+#[must_use]
+pub fn strip_input_lane_members(method: Method, params: &ParamsValue) -> ParamsValue {
+    let members: &[&str] = match method {
+        Method::InputRelease | Method::SessionDetach => &["after_input", "fenced_report"],
+        Method::ShellLaunch => &["after_input"],
+        _ => return params.clone(),
+    };
+    let mut value = params.as_value().clone();
+    for member in members {
+        remove_member(&mut value, member);
+    }
+    ParamsValue::new(value)
+}
+
 /// A rewrite of the value of one definition on its way to or from a retained level.
 pub type Rewrite = fn(&mut CanonicalValue) -> Result<(), String>;
 
@@ -313,7 +338,48 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     include_str!("../retained/0.78/RELEASE"),
     include_str!("../retained/0.78/PLUGIN_HOST"),
     &[],
-    &[],
+    &[
+    Compatible {
+        at: "ControlEvent#key:input_credit",
+        reason: "An event that a worker sends only on a connection of the role `proxy_input`, which the \
+                 daemon declares only to a worker that states the input lane. A worker of the \
+                 retained level does not state it, so it sends none of these events, and this \
+                 build's worker sends none on any other connection.",
+    },
+    Compatible {
+        at: "ControlEvent#key:input_launch_reserved",
+        reason: "An event that a worker sends only on a connection of the role `proxy_input`, which the \
+                 daemon declares only to a worker that states the input lane. A worker of the \
+                 retained level does not state it, so it sends none of these events, and this \
+                 build's worker sends none on any other connection.",
+    },
+    Compatible {
+        at: "ControlEvent#key:input_window",
+        reason: "An event that a worker sends only on a connection of the role `proxy_input`, which the \
+                 daemon declares only to a worker that states the input lane. A worker of the \
+                 retained level does not state it, so it sends none of these events, and this \
+                 build's worker sends none on any other connection.",
+    },
+    Compatible {
+        at: "ControlFrame#key:input_lane",
+        reason: "A frame written only on a connection of the role `proxy_input`, which the daemon declares \
+                 only to a worker that states the input lane. A worker of the retained level does \
+                 not state it, so neither side of that link ever meets the frame at this level.",
+    },
+    Compatible {
+        at: "ControlFrame#key:input_lane_ready",
+        reason: "A frame written only on a connection of the role `proxy_input`, which the daemon declares \
+                 only to a worker that states the input lane. A worker of the retained level does \
+                 not state it, so neither side of that link ever meets the frame at this level.",
+    },
+    Compatible {
+        at: "ControllerConnectionRole#const:proxy_input",
+        reason: "A value of the role union that the daemon declares only on a connection it opens for an \
+                 attachment's typing, and only to a worker that states the input lane. A worker \
+                 of the retained level does not state it, so the daemon never declares the role \
+                 to one. Nothing at this level sends it.",
+    },
+    ],
 )
 .with_public_majors(include_str!("../retained/0.78/PUBLIC_MAJORS"))];
 

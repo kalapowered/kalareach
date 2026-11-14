@@ -305,7 +305,9 @@ impl RemoteConnection {
             | ControlFrame::DescriptionFacts(_)
             | ControlFrame::DescriptionFactsPage(_)
             | ControlFrame::DesktopChecks(_)
-            | ControlFrame::DesktopChecksAnswer(_) => return None,
+            | ControlFrame::DesktopChecksAnswer(_)
+            | ControlFrame::InputLane(_)
+            | ControlFrame::InputLaneReady(_) => return None,
         };
         Some(Answered { frame, asked })
     }
