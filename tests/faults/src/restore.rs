@@ -1303,7 +1303,7 @@ impl Stage {
     /// what is taken is settled in the room at once: an application that is answered at the rate the
     /// session allows is not held to a queue that nothing empties.
     pub(crate) fn pending_input(&mut self) -> Vec<InputBatch> {
-        let taken = self.session.take_pending_input();
+        let taken = kr_worker::testing::take_pending_input(&mut self.session);
         kr_worker::testing::settle_written_input(&self.session, &taken);
         taken
     }

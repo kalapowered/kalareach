@@ -3440,7 +3440,7 @@ async fn what_a_harness_takes_and_settles_is_given_back_as_a_written_batch_is() 
     let room = session.input().lock().input_room();
     let unwritten = session.input().lock().unwritten_replies();
 
-    let taken = session.take_pending_input();
+    let taken = kr_worker::testing::take_pending_input(&mut session);
     assert!(
         taken
             .iter()
