@@ -601,18 +601,24 @@ impl TerminalWrites {
 
 /// A session that is closed when this is dropped.
 ///
-/// A session that is only dropped is not ended: the worker service and the tasks it started hold
-/// its runtime, and with it the session's journal, until the test's runtime ends. A fixture keeps
-/// this as a field declared before its directory, so that the close is asked for before the
-/// directory is removed. The close is asked for and not waited for: the journal is let go of a
-/// moment later, which is what the removal of the directory is tried again for.
-pub struct ClosedOnDrop(std::sync::Arc<crate::runtime::SessionRuntime>);
+/// A session that is only dropped is not ended in the way a close ends it: the shell and the
+/// controller's link to the worker go on until the runtime is dropped. A fixture keeps this as a
+/// field declared before its directory, so that the close is asked for before the directory is
+/// removed. The close is asked for and not waited for: its own steps end the session's work, and
+/// the journal is let go of when the last handle to the runtime goes, which is what the removal of
+/// the directory is tried again for.
+pub struct ClosedOnDrop(Option<std::sync::Arc<crate::runtime::SessionRuntime>>);
 
 impl ClosedOnDrop {
     /// Closes `runtime`'s session when this is dropped.
     #[must_use]
     pub fn of(runtime: &std::sync::Arc<crate::runtime::SessionRuntime>) -> Self {
-        Self(std::sync::Arc::clone(runtime))
+        Self(Some(std::sync::Arc::clone(runtime)))
+    }
+
+    /// Lets the session go on after this is dropped, for a fixture that hands it to another.
+    pub fn disarm(&mut self) {
+        self.0 = None;
     }
 }
 
@@ -623,9 +629,11 @@ impl Drop for ClosedOnDrop {
         if std::thread::panicking() {
             return;
         }
-        self.0
-            .close(kr_protocol::session::ClosureReason::CloseRequested)
-            .1
-            .release();
+        if let Some(runtime) = self.0.take() {
+            runtime
+                .close(kr_protocol::session::ClosureReason::CloseRequested)
+                .1
+                .release();
+        }
     }
 }
