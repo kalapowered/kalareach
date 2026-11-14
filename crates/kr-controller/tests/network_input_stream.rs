@@ -843,6 +843,99 @@ async fn a_frame_of_a_newer_epoch_waits_for_its_window_and_is_not_refused() {
     rig.stop().await;
 }
 
+/// An answer of the worker for a frame of an epoch whose refusal the device was already told is not
+/// told as an acceptance: the epoch stands refused. The frame goes to the lane, the lease moves on,
+/// a later frame of the epoch is refused by the host, and only then does the worker answer the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_after_the_epochs_refusal_is_not_told_as_an_acceptance() {
+    let rig = Rig::start().await;
+    let stream = rig.open().await;
+    rig.lane.hold_answers();
+    let (mut reader, mut writer) = stream.split();
+    writer
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    rig.lane
+        .until("the first frame is at the lane", |frames| frames.len() == 1)
+        .await;
+    rig.lane.send_window(moved_on(rig.epoch.get()));
+    loop {
+        let ack = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+            .await
+            .expect("the host answers in time")
+            .expect("the stream is not reset")
+            .expect("the stream stays open");
+        if matches!(ack, InputAck::EpochEnded { .. }) {
+            break;
+        }
+    }
+    writer
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    loop {
+        let ack = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+            .await
+            .expect("the host answers in time")
+            .expect("the stream is not reset")
+            .expect("the stream stays open");
+        if matches!(ack, InputAck::Refused { epoch, .. } if epoch == rig.epoch) {
+            break;
+        }
+    }
+    rig.lane.release_answers();
+    drop(writer);
+    while let Some(ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the stream ends in time")
+        .expect("the stream is not reset")
+    {
+        assert!(
+            !matches!(ack, InputAck::Accepted { .. }),
+            "the answer after the refusal was told as an acceptance: {ack:?}"
+        );
+    }
+    rig.stop().await;
+}
+
+/// A refusal names what was accepted in its own epoch and nothing from another: a frame of a newer
+/// epoch that is refused after the older epoch accepted one carries no accepted count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_of_a_newer_epoch_names_no_count_of_an_older_one() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    let newer = rig.epoch.get() + 1;
+    rig.lane.send_window(moved_on(rig.epoch.get()));
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::EpochEnded { epoch, .. }) if epoch == rig.epoch
+        ),
+        "the older epoch's end is told"
+    );
+    stream
+        .write_message(&frame_of(newer, 0, b"n"))
+        .await
+        .expect("the frame is written");
+    match next(&mut stream).await {
+        Some(InputAck::Refused {
+            epoch,
+            accepted_through,
+            ..
+        }) => {
+            assert_eq!(epoch.get(), newer);
+            assert!(
+                accepted_through.0.is_none(),
+                "no count of the older epoch is named: {accepted_through:?}"
+            );
+        }
+        other => panic!("the newer epoch's frame was to be refused: {other:?}"),
+    }
+    rig.stop().await;
+}
+
 /// Opens a stream with `header` and says the host ended it without serving it: the device is not
 /// told `Ready`, and no lane was bound for it at the worker.
 async fn is_not_served(rig: &Rig, header: StreamHeader) {
@@ -1172,6 +1265,11 @@ async fn a_frame_the_writer_discards_wakes_the_wait_for_the_stream_to_drain() {
         rig.lane.frames().len(),
         1,
         "the discarded frame never reached the lane"
+    );
+    assert_eq!(
+        stages.counts().host_holds,
+        0,
+        "the discarded frame is let go with the others"
     );
     rig.stop().await;
 }
