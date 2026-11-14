@@ -1644,8 +1644,9 @@ struct Wired {
     controller: Arc<ControllerIdentity>,
     /// The boot identity a generation token is signed over.
     boot: kr_protocol::identity::BootIdentity,
-    // These end the serving task and ask for the session's close when the fixture is dropped,
-    // whether or not a case closed it.
+    // These end the serving task when the fixture is dropped and, on Unix alone, ask for the
+    // session's close then, whether or not a case closed it. On Windows the shell ends with the
+    // session's job and the guard asks for no close.
     _serving: kr_ipc::testing::Serving,
     _closing: kr_worker::testing::ClosedOnDrop,
     // Declared last: the directory is removed after every field above has let go of its files.

@@ -248,11 +248,12 @@ async fn close(client: &mut LocalClient, host: &Host) -> kr_protocol::session::S
 /// which would otherwise be refused the journal they hold.
 async fn closed(client: &mut LocalClient, host: &Host) -> kr_protocol::session::SessionCloseResult {
     let result = close(client, host).await;
-    let _ = tokio::time::timeout(
+    tokio::time::timeout(
         std::time::Duration::from_secs(30),
         host.runtime.wait_closed(),
     )
-    .await;
+    .await
+    .expect("the session's closure finishes after the stop was answered");
     result
 }
 
@@ -451,9 +452,18 @@ async fn a_sessions_output_has_times_that_are_written_by_maintenance_and_finishe
     );
     assert!(first.at_ms >= before && first.at_ms <= kr_ipc::now_ms().get());
 
-    // Output after the pass is in the file by the time the closure is recorded.
-    host.runtime.session().ingest_output(b"last\r\n");
+    // Output after the pass is in the file by the time the closure is recorded. The connection is
+    // made first: this runtime runs the maintenance pass at an await, so nothing may await between
+    // the output and the look at the file that shows the pass has not written it.
     let mut client = cli(&host).await;
+    host.runtime.session().ingest_output(b"last\r\n");
+    let unfinished = kr_worker::output_times::read(&index, 0, 64, 16).expect("reads");
+    assert_eq!(
+        unfinished.marks.last().map(|mark| mark.to),
+        Some(7),
+        "only the closure writes the output after the pass: {:?}",
+        unfinished.marks
+    );
     closed(&mut client, &host).await;
     let finished = kr_worker::output_times::read(&index, 0, 64, 16).expect("reads");
     assert_eq!(
@@ -3825,11 +3835,12 @@ async fn a_store_that_cannot_be_read_still_takes_the_interrupt_and_the_close() {
     assert_eq!(again.durability, kr_protocol::session::Durability::Volatile);
     // The close was asked for above: its own steps, the drain among them, end before the
     // fixture's directory is removed.
-    let _ = tokio::time::timeout(
+    tokio::time::timeout(
         std::time::Duration::from_secs(30),
         host.runtime.wait_closed(),
     )
-    .await;
+    .await
+    .expect("the session's closure finishes after the stops were answered");
 }
 
 /// KR-REQ-07.57: a condition the store has already reported fences typed mutations before the
