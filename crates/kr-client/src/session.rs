@@ -1430,14 +1430,25 @@ impl Session {
     /// before this returns, so a frame written after the return is read by the host after it. The
     /// answer's future holds the mutation's place among the outstanding ones until it resolves.
     ///
+    /// The send is bound by `limit`, which only an input lane gives: the time and the lane's wish
+    /// are looked at as [`Session::send_before`] looks at its own, so that waiting for the
+    /// connection's turn and writing the frame take the limit's time together.
+    ///
     /// # Errors
     ///
-    /// As [`Session::send`], for everything that happens before the frame is written.
-    pub async fn send_written(&self, composed: &ComposedMutation) -> Result<Answering> {
+    /// Returns [`ClientError::Withheld`] when the limit stopped the send before the frame was
+    /// taken whole, and otherwise as [`Session::send`], for everything that happens before the frame
+    /// is written.
+    pub async fn send_written(
+        &self,
+        composed: &ComposedMutation,
+        limit: &crate::input::SendLimit,
+    ) -> Result<Answering> {
         if composed.composed_on != Some(self.id) {
             return Err(ClientError::Misdirected { repeating: false });
         }
-        self.submit_written(composed, None).await
+        self.submit_written(composed, Some((limit.not_after(), limit.wanted())))
+            .await
     }
 
     /// Sends a composed mutation for the first time as [`Session::send`] does, and writes nothing
