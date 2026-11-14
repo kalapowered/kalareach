@@ -343,8 +343,8 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     &[],
     &[
         Compatible {
-        at: "AttentionHostRecord.session_event",
-        reason: "A member that is absent from the wire unless this build's worker recorded an \
+            at: "AttentionHostRecord.session_event",
+            reason: "A member that is absent from the wire unless this build's worker recorded an \
                  agent turn that ended or a command that finished with a status other than \
                  nought, and a worker of the retained level never writes it, so this build's \
                  daemon reads a page of that level as one that records no such work, which is \
@@ -360,47 +360,49 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                  client was released, so there is no shim: the public contract may change with a \
                  level move until public 1.0 freezes at the first client release \
                  (`docs/releases/packages.md`).",
-    },
-    Compatible {
-        at: "ControlEvent#key:input_credit",
-        reason: "An event that a worker sends only on a connection of the role `proxy_input`, which the \
+        },
+        Compatible {
+            at: "ControlEvent#key:input_credit",
+            reason: "An event that a worker sends only on a connection of the role `proxy_input`, \
+                 which the daemon declares only to a worker that states the input lane. A worker \
+                 of the retained level does not state it, so it sends none of these events, and \
+                 this build's worker sends none on any other connection.",
+        },
+        Compatible {
+            at: "ControlEvent#key:input_launch_reserved",
+            reason: "An event that a worker sends only on a connection of the role `proxy_input`, \
+                 which the daemon declares only to a worker that states the input lane. A worker \
+                 of the retained level does not state it, so it sends none of these events, and \
+                 this build's worker sends none on any other connection.",
+        },
+        Compatible {
+            at: "ControlEvent#key:input_window",
+            reason: "An event that a worker sends only on a connection of the role `proxy_input`, \
+                 which the daemon declares only to a worker that states the input lane. A worker \
+                 of the retained level does not state it, so it sends none of these events, and \
+                 this build's worker sends none on any other connection.",
+        },
+        Compatible {
+            at: "ControlFrame#key:input_lane",
+            reason: "A frame written only on a connection of the role `proxy_input`, which the \
                  daemon declares only to a worker that states the input lane. A worker of the \
-                 retained level does not state it, so it sends none of these events, and this \
-                 build's worker sends none on any other connection.",
-    },
-    Compatible {
-        at: "ControlEvent#key:input_launch_reserved",
-        reason: "An event that a worker sends only on a connection of the role `proxy_input`, which the \
+                 retained level does not state it, so neither side of that link ever meets the \
+                 frame at this level.",
+        },
+        Compatible {
+            at: "ControlFrame#key:input_lane_ready",
+            reason: "A frame written only on a connection of the role `proxy_input`, which the \
                  daemon declares only to a worker that states the input lane. A worker of the \
-                 retained level does not state it, so it sends none of these events, and this \
-                 build's worker sends none on any other connection.",
-    },
-    Compatible {
-        at: "ControlEvent#key:input_window",
-        reason: "An event that a worker sends only on a connection of the role `proxy_input`, which the \
-                 daemon declares only to a worker that states the input lane. A worker of the \
-                 retained level does not state it, so it sends none of these events, and this \
-                 build's worker sends none on any other connection.",
-    },
-    Compatible {
-        at: "ControlFrame#key:input_lane",
-        reason: "A frame written only on a connection of the role `proxy_input`, which the daemon declares \
-                 only to a worker that states the input lane. A worker of the retained level does \
-                 not state it, so neither side of that link ever meets the frame at this level.",
-    },
-    Compatible {
-        at: "ControlFrame#key:input_lane_ready",
-        reason: "A frame written only on a connection of the role `proxy_input`, which the daemon declares \
-                 only to a worker that states the input lane. A worker of the retained level does \
-                 not state it, so neither side of that link ever meets the frame at this level.",
-    },
-    Compatible {
-        at: "ControllerConnectionRole#const:proxy_input",
-        reason: "A value of the role union that the daemon declares only on a connection it opens for an \
-                 attachment's typing, and only to a worker that states the input lane. A worker \
-                 of the retained level does not state it, so the daemon never declares the role \
-                 to one. Nothing at this level sends it.",
-    },
+                 retained level does not state it, so neither side of that link ever meets the \
+                 frame at this level.",
+        },
+        Compatible {
+            at: "ControllerConnectionRole#const:proxy_input",
+            reason: "A value of the role union that the daemon declares only on a connection it \
+                 opens for an attachment's typing, and only to a worker that states the input \
+                 lane. A worker of the retained level does not state it, so the daemon never \
+                 declares the role to one. Nothing at this level sends it.",
+        },
     ],
 )
 .with_public_majors(include_str!("../retained/0.77/PUBLIC_MAJORS"))];

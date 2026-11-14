@@ -3163,7 +3163,9 @@ async fn drive(
                                             let params = kr_protocol::input::InputReleaseParams {
                                                 session_id,
                                                 attachment_id,
-                                                epoch: held, after_input: None, fenced_report: false,
+                                                epoch: held,
+                                                after_input: None,
+                                                fenced_report: false,
                                             };
                                             if !send_mutation(
                                                 client,
