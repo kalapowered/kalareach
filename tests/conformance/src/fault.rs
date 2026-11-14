@@ -2267,6 +2267,15 @@ mod tests {
         let why = removal.carry_out().unwrap_err();
         assert!(why.contains("no longer what the plan found"), "{why}");
         assert!(script.exists() && outside.join("kept").exists());
+        // A link where a file was: the link is not a file the plan found, whatever it leads to.
+        let (directory, target, _unit, script) = make();
+        let removal = plan(&target, &script);
+        let outside = directory.path().join("outside");
+        write(&outside.join("kept"), b"kept");
+        std::fs::remove_file(&script).unwrap();
+        std::os::unix::fs::symlink(outside.join("kept"), &script).unwrap();
+        assert!(removal.carry_out().is_err());
+        assert!(outside.join("kept").exists());
         // Another device than the plan's.
         let (_directory, target, unit, script) = make();
         let mut removal = plan(&target, &script);

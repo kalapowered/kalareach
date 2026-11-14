@@ -2306,6 +2306,9 @@ mod tests {
         let mut number = || -> u32 { lines.next().unwrap().unwrap().trim().parse().unwrap() };
         let (in_group, left_group) = (number(), number());
         let own = step_processes(leader.id());
+        // A program that is not this process's own child leads nothing of the step's: a number that
+        // another program was given is never taken for the step's program.
+        let not_ours = step_processes(in_group);
         let (hers, others) = (own.contains(&neighbour.id()), own.clone());
         signal_processes("KILL", &[leader.id(), in_group, left_group, neighbour.id()]);
         let _ = leader.wait();
@@ -2314,5 +2317,9 @@ mod tests {
         assert!(own.contains(&in_group), "in the group: {others:?}");
         assert!(own.contains(&left_group), "left the group: {others:?}");
         assert!(!hers, "the neighbour is not the step's: {others:?}");
+        assert!(
+            not_ours.is_empty(),
+            "a program that is not ours: {not_ours:?}"
+        );
     }
 }
