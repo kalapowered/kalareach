@@ -640,6 +640,14 @@ fn a_refusal_is_dropped_to_an_intent_before_a_repair_makes_the_service() {
         manifest.find(ObjectKind::Service, SERVICE).unwrap().outcome,
         Some(Outcome::Made)
     );
+    // A repair whose creation failed puts the refusal back: the result of an intent is `refused`
+    // again, and a made service is not touched by it.
+    let mut again = Manifest::parse(&intent.to_bytes().unwrap()).unwrap();
+    again.conclude(ObjectKind::Service, SERVICE, Outcome::Refused);
+    assert_eq!(
+        again.find(ObjectKind::Service, SERVICE).unwrap().outcome,
+        Some(Outcome::Refused)
+    );
     // Nothing else is dropped: not a made service, not a found one, not an object with no entry.
     assert!(!manifest.drop_refusal(ObjectKind::Service, SERVICE));
     let mut found = Manifest::begin();

@@ -696,6 +696,47 @@ fn a_repair_that_makes_the_service_over_a_refusal_writes_an_intent_before_the_cr
     assert_eq!(code_of(&source).matches(".drop_refusal(").count(), 1);
 }
 
+/// A repair whose creation of the service fails after it turned a refusal into an intent puts the
+/// refusal back and saves it before it returns, so that a service that another party made between
+/// the open and the creation is not left behind an intent that a removal decides by the service's
+/// program; the run made nothing, so the refusal is still the true record. Where that save fails
+/// too, the error says both. The test build can make that service between the open and the creation
+/// (a value of the seam that makes objects), and no line of it stands in the product build.
+#[test]
+fn a_repair_whose_creation_of_the_service_fails_puts_the_refusal_back() {
+    let source = install_source();
+    let lay = code_of(body_of(&source, "fn lay_down("));
+    let step = lay
+        .find("    let broker_service = match manager.open(SERVICE)? {")
+        .expect("the service step reads the service manager");
+    let step = &lay[step..];
+    let at = |needle: &str| {
+        step.find(needle)
+            .unwrap_or_else(|| panic!("the service step has no {needle}"))
+    };
+    let dropped = at("let dropped = run");
+    let saved = at("if dropped {\n                run.save()?;\n            }");
+    let seam = at("#[cfg(feature = \"testing\")]\n            make_after(run, \"service-open\")?;");
+    let create = at("manager.create(");
+    let restore = at("restore_refusal(run,");
+    assert!(dropped < saved && saved < seam && seam < create && create < restore);
+    // Only an entry that this step changed is put back, and a creation that fails with nothing
+    // changed returns its own error.
+    assert!(step[create..restore].contains("dropped"));
+    // The refusal is put back with one save, and a failed save is said beside the creation's error.
+    let helper = code_of(body_of(&source, "fn restore_refusal("));
+    assert_eq!(helper.matches("run.").count(), 1);
+    assert!(helper.contains("run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)"));
+    assert!(helper.contains("Ok(()) => creation,"));
+    assert!(helper.contains(
+        "\"{creation}; putting the refusal back in the record also failed ({failure})\""
+    ));
+    // The seam stands under the test gate, once, and the function that makes objects is unchanged
+    // by it: the step's name is a value of the variable that it already reads.
+    assert_eq!(count(&source, "\"service-open\""), 1);
+    assert!(!code_of(body_of(&source, "fn make_after(")).contains("service-open"));
+}
+
 /// A service that a new installation refused (its result `refused`) is left alone by the ordinary
 /// removal's steps, and the check after them names it where a read of the service manager finds it
 /// standing; the manifest's word alone does not make the check say that it is gone or that it
