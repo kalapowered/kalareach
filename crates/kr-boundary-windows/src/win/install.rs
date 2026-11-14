@@ -16,6 +16,7 @@
 
 #![allow(unsafe_code)]
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
@@ -3878,6 +3879,14 @@ impl Run {
     /// Writes the manifest, replacing the file whole, beside the held handle of the data directory,
     /// and holds the identity of the object that the write proved to be at the manifest's name.
     fn save(&self) -> Result<(), Error> {
+        self.save_noting(&Cell::new(false))
+    }
+
+    /// `save`, and says where it stopped: `renamed` is set once the write's rename has put an
+    /// object at the manifest's name. A write that fails with it still unset (before it created
+    /// anything, or before the rename) changed nothing at that name; one that fails with it set may
+    /// have published the record before its proof failed.
+    fn save_noting(&self, renamed: &Cell<bool>) -> Result<(), Error> {
         let Some(directory) = &self.directory else {
             // text: run_save-1
             return Err(Error::Failed(
@@ -3896,6 +3905,9 @@ impl Run {
         // the only steps are the move of the handle into a shared pointer and the call itself), and
         // the run's rollback marks the file through it wherever the file is.
         let hold = |made: Option<(&Arc<ffi::Handle>, &Path)>| {
+            if made.is_some_and(|(_, path)| path == self.paths.manifest.as_path()) {
+                renamed.set(true);
+            }
             ffi::locked(&self.laid).replacement = made.map(|(handle, path)| MadeFile {
                 handle: Arc::clone(handle),
                 path: path.to_path_buf(),
@@ -4018,15 +4030,16 @@ impl Run {
             Ok(()) => return remedy::RecordLeft::Proved { manifest },
             Err(found) => found,
         };
-        // A write begins only where the run holds a handle of the data directory.
-        let write_began = self.directory.is_some();
-        match self.save() {
+        // Where the save failed decides what the ending may say: only a write whose rename put an
+        // object at the manifest's name can have published the record.
+        let renamed = Cell::new(false);
+        match self.save_noting(&renamed) {
             Ok(()) => remedy::RecordLeft::Saved { manifest, found },
             Err(error) => remedy::RecordLeft::NotSaved {
                 found,
                 why: error.to_string(),
                 stays: self.held_paths(),
-                write_began,
+                renamed: renamed.get(),
             },
         }
     }
@@ -6870,6 +6883,36 @@ mod tests {
         }
     }
 
+    /// The paths of a run whose data directory is `data`, under `top`.
+    fn paths_in(top: &Path, data: &Path) -> Paths {
+        Paths {
+            program: top.join("program"),
+            program_top: top.to_path_buf(),
+            data: data.to_path_buf(),
+            journal: data.join("journal"),
+            run: data.join("run"),
+            git: top.join("git"),
+            staging: data.join("staging"),
+            manifest: data.join("manifest.json"),
+            prior: data.join("prior.json"),
+        }
+    }
+
+    /// A run before its first write: the data directory is there and, where `held_directory`,
+    /// the run holds a handle of it; no record is on disk and the run holds nothing that it made.
+    #[cfg(feature = "testing")]
+    fn unwritten_run(top: &Path, held_directory: bool) -> Run {
+        let data = top.join("data");
+        std::fs::create_dir(&data).unwrap();
+        Run {
+            paths: paths_in(top, &data),
+            manifest: Manifest::begin(),
+            directory: held_directory.then(|| held(&data)),
+            laid: Arc::new(Mutex::new(Laid::default())),
+            prior: None,
+        }
+    }
+
     /// A run that has laid the folder above, the data directory, its three directories, the
     /// earlier-state record and the manifest, each held with its own directory's handle.
     fn laid_run(top: &Path) -> Run {
@@ -6888,17 +6931,7 @@ mod tests {
         let prior = identity_of_name(&directory, "prior.json");
         let manifest = identity_of_name(&directory, "manifest.json");
         Run {
-            paths: Paths {
-                program: top.join("program"),
-                program_top: top.to_path_buf(),
-                data: data_path.clone(),
-                journal: data_path.join("journal"),
-                run: data_path.join("run"),
-                git: top.join("git"),
-                staging: data_path.join("staging"),
-                manifest: data_path.join("manifest.json"),
-                prior: data_path.join("prior.json"),
-            },
+            paths: paths_in(top, &data_path),
             manifest: Manifest::begin(),
             directory: Some(directory),
             laid: Arc::new(Mutex::new(Laid {
@@ -7009,7 +7042,7 @@ mod tests {
         crate::manifest::forced::fail_the_next("manager");
         let error = roll_back(&mut run).unwrap_err().to_string();
         assert!(
-            error.contains("and no write of this run's record was made"),
+            error.contains("and no write of this run's record reached the manifest's name"),
             "{error}"
         );
         assert!(!error.contains("may have published it"), "{error}");
@@ -7023,10 +7056,7 @@ mod tests {
             !error.contains("A read of the manifest's name afterwards failed"),
             "{error}"
         );
-        assert!(
-            error.contains("this run left no record of its own on disk"),
-            "{error}"
-        );
+        assert!(error.contains("so this run wrote no manifest"), "{error}");
         assert!(
             !error.contains("no record of this run is on disk"),
             "{error}"
@@ -7041,6 +7071,70 @@ mod tests {
         );
         assert!(!error.contains("records are kept"), "{error}");
         assert!(!error.contains("stays where it is"), "{error}");
+    }
+
+    /// A save that fails before its rename changed nothing at the manifest's name, and the ending
+    /// says so: a run before its first write, whose write is forced to fail after its replacement
+    /// was made and before the rename, leaves no manifest and no replacement on the disk, and the
+    /// words say that no write reached the name and that no manifest of this run stands there.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_save_that_fails_before_its_rename_is_not_said_to_have_published_the_record() {
+        let _one = ffi::locked(&FORCED);
+        let top = tempfile::tempdir().unwrap();
+        let mut run = unwritten_run(top.path(), true);
+        assert!(!run.paths.manifest.try_exists().unwrap());
+        crate::manifest::forced::fail_the_next("replacement");
+        let left = run.keep_record();
+        let remedy::RecordLeft::NotSaved {
+            found,
+            why,
+            renamed,
+            ..
+        } = &left
+        else {
+            panic!("{left:?}");
+        };
+        assert!(!renamed, "{left:?}");
+        assert_eq!(*found, remedy::NotProved::Absent, "{left:?}");
+        assert!(why.contains("a failure forced for a case"), "{why}");
+        // The disk after the ending: no manifest, and no replacement that the write made.
+        assert!(!run.paths.manifest.try_exists().unwrap());
+        assert_eq!(std::fs::read_dir(&run.paths.data).unwrap().count(), 0);
+        let words = remedy::rollback_failed(&["a step failed".to_owned()], &left, "");
+        assert!(
+            words.contains("and no write of this run's record reached the manifest's name"),
+            "{words}"
+        );
+        assert!(
+            words.contains("so no manifest of this run stands there"),
+            "{words}"
+        );
+        assert!(!words.contains("may have published"), "{words}");
+    }
+
+    /// A save whose rename put an object at the manifest's name and whose proof then failed may
+    /// have published the record, and the ending says so: the record that this run held is at the
+    /// manifest's name after it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_save_that_fails_after_its_rename_may_have_published_the_record() {
+        let _one = ffi::locked(&FORCED);
+        let top = tempfile::tempdir().unwrap();
+        let mut run = laid_run(top.path());
+        crate::manifest::forced::fail_the_next("proof");
+        let left = run.keep_record();
+        let remedy::RecordLeft::NotSaved { renamed, .. } = &left else {
+            panic!("{left:?}");
+        };
+        assert!(renamed, "{left:?}");
+        assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), run.manifest);
+        let words = remedy::rollback_failed(&["a step failed".to_owned()], &left, "");
+        assert!(
+            words.contains("the write may have published it before its proof failed"),
+            "{words}"
+        );
+        assert!(!words.contains("reached the manifest's name"), "{words}");
     }
 
     /// A new installation that fails before its first directory record and whose rollback then has a

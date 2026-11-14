@@ -1669,8 +1669,9 @@ pub enum RecordLeft {
         found: NotProved,
     },
     /// The read did not find it, and the write failed too: that a record of this run is on disk is
-    /// not confirmed (the write may have published it before its proof failed, and a record that an
-    /// earlier write left may stand).
+    /// not confirmed where the write's rename had put an object at the manifest's name (the write
+    /// may have published it before its proof failed, and a record that an earlier write left may
+    /// stand); where the write failed before that, it changed nothing at the name.
     NotSaved {
         /// What the read found.
         found: NotProved,
@@ -1678,9 +1679,10 @@ pub enum RecordLeft {
         why: String,
         /// Each object that this run made and that stays, by path.
         stays: Vec<String>,
-        /// Whether a write of the record began: where the run held no handle of the data
-        /// directory no write was made, so nothing says that a write published a record.
-        write_began: bool,
+        /// Whether the write's rename had put an object at the manifest's name when it failed: a
+        /// write that failed before that (before it created anything, or before the rename) changed
+        /// nothing there, so nothing says that it published a record.
+        renamed: bool,
     },
 }
 
@@ -1706,21 +1708,29 @@ pub fn rollback_failed(failures: &[String], record: &RecordLeft, unread_prior: &
             found,
             why,
             stays,
-            write_began,
+            renamed,
         } => {
             let left = if stays.is_empty() {
                 "this run held no object that it had made".to_owned()
             } else {
                 stays.join("; ")
             };
-            if *write_began {
+            if *renamed {
                 format!(
                     "the removal did not finish: {failed}. {}, and writing this run's record failed ({why}), so a record of this run could not be confirmed on disk: the write may have published it before its proof failed, and a record that an earlier write left may stand. What this run made and the rollback did not take away: {left}{unread_prior}",
                     found.words()
                 )
             } else {
+                // The write put nothing at the manifest's name. What stands there is what the read
+                // found: where it found nothing, or no read was made because the run never held a
+                // handle of the data directory (so it never wrote), no manifest of this run does.
+                let nothing = match found {
+                    NotProved::Absent => ", so no manifest of this run stands there",
+                    NotProved::NotRead => ", so this run wrote no manifest",
+                    NotProved::Differs | NotProved::Unread(_) => "",
+                };
                 format!(
-                    "the removal did not finish: {failed}. {}, and no write of this run's record was made ({why}), so this run left no record of its own on disk, and a record that an earlier run left may stand. What this run made and the rollback did not take away: {left}{unread_prior}",
+                    "the removal did not finish: {failed}. {}, and no write of this run's record reached the manifest's name ({why}){nothing}. What this run made and the rollback did not take away: {left}{unread_prior}",
                     found.words()
                 )
             }

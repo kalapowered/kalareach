@@ -899,7 +899,7 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
                 found: found.clone(),
                 why: "Windows error 112".to_owned(),
                 stays: vec!["D".to_owned(), "F".to_owned()],
-                write_began: true,
+                renamed: true,
             },
             ". The earlier-state record was not read",
         );
@@ -922,7 +922,12 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
             "{unsaved}"
         );
         assert!(!unsaved.contains("again"), "{unsaved}");
-        // Where no write began, the words do not say that a write may have published a record.
+        // Where the write failed before its rename (before it created anything, or before the
+        // rename), the words say that no write reached the manifest's name and do not say that it
+        // may have published a record. They say that no manifest of this run stands there only
+        // where the read found nothing, or no read was made because the run never held a handle of
+        // the data directory; where the read found an object or failed, they add nothing to what
+        // the read says.
         let no_write = rollback_failed(
             &failures,
             &RecordLeft::NotSaved {
@@ -931,27 +936,43 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
                     "the manifest was to be written before a handle of the data directory was held"
                         .to_owned(),
                 stays: vec!["D".to_owned()],
-                write_began: false,
+                renamed: false,
             },
             "",
         );
+        assert!(no_write.contains(&found.words()), "{no_write}");
         assert!(
             no_write.contains(
-                "and no write of this run's record was made (the manifest was to be written"
+                "and no write of this run's record reached the manifest's name (the manifest was to be written"
             ),
-            "{no_write}"
-        );
-        assert!(
-            no_write.contains("so this run left no record of its own on disk, and a record that an earlier run left may stand"),
             "{no_write}"
         );
         for wrong in [
             "may have published",
             "could not be confirmed on disk",
             "writing this run's record failed",
+            "an earlier run left",
+            "an earlier write left",
+            "left no record of its own",
         ] {
             assert!(!no_write.contains(wrong), "{wrong} in {no_write}");
         }
+        let nothing_there = "so no manifest of this run stands there";
+        let never_wrote = "so this run wrote no manifest";
+        assert_eq!(
+            no_write.contains(nothing_there),
+            found == NotProved::Absent,
+            "{no_write}"
+        );
+        assert_eq!(
+            no_write.contains(never_wrote),
+            found == NotProved::NotRead,
+            "{no_write}"
+        );
+        assert!(
+            no_write.contains("What this run made and the rollback did not take away: D"),
+            "{no_write}"
+        );
         // Where no read was made, the words do not say that one failed.
         if found == NotProved::NotRead {
             assert!(
@@ -992,7 +1013,7 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
             found: NotProved::Absent,
             why: "w".to_owned(),
             stays: Vec::new(),
-            write_began: true,
+            renamed: true,
         },
         "",
     );
