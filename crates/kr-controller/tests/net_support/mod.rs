@@ -184,16 +184,19 @@ const BIND_TRIES: u32 = 5;
 ///
 /// Panics when the daemon is still held ten seconds later.
 async fn let_go(controller: Arc<Controller>) {
+    // This handle is let go first: a task that holds the daemon only while something else does
+    // ends when this is the only thing besides such tasks that holds it.
+    let daemon = Arc::downgrade(&controller);
+    drop(controller);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while Arc::strong_count(&controller) > 1 {
+    while daemon.strong_count() > 0 {
         assert!(
             std::time::Instant::now() < deadline,
             "the stopped daemon is still held in {} places",
-            Arc::strong_count(&controller) - 1
+            daemon.strong_count()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    drop(controller);
 }
 
 /// What the transport says when the sockets of its endpoint cannot be bound, which is the one way a

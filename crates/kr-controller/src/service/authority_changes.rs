@@ -313,10 +313,10 @@ impl Controller {
     /// stands, with the sessions whose closure the registry holds. `None` when the barrier as it
     /// stands cannot be read.
     ///
-    /// A worker that was pending is asked again first. Its entry is replaced by what it says when
-    /// that is an answer (the revision acknowledged, or installed with no names held for it) and
-    /// the replacement carries every name `given` held of it, and by the worker's ending when the
-    /// registry holds its closure.
+    /// A worker that was pending is asked again first. Its entry takes the state of what it says
+    /// when that is an answer (the revision acknowledged, or installed with no names held for it),
+    /// with the names of `given` kept, and the worker's ending when the registry holds its
+    /// closure.
     async fn with_the_names_since(
         &self,
         audience: Audience,
@@ -3532,13 +3532,15 @@ fn open_number(
 /// The barrier of a kept answer as it reads now, given the barrier as it stands and the workers
 /// of the answer whose session has since closed.
 ///
-/// A worker that was pending takes the daemon's entry for it when that is an answer and carries
-/// every name the kept answer gave, and a worker that has ended takes an ending that keeps what
-/// the answer held of it. A worker that owed names takes the daemon's entry when
-/// [`carries_what_was_given`]. A kept answer is cut when a host has more workers than a frame
-/// carries, and it keeps the workers that have not held before any that has, so the workers it
-/// left out that the barrier as it stands counts pending are added: what the repeated answer says
-/// of whether the barrier holds is what the whole barrier says.
+/// A worker that was pending takes the daemon's state, acknowledged revision and detail for it when
+/// that is an answer, and keeps the names of both entries ([`with_the_names_of`]); a worker that
+/// has ended takes an ending that keeps what the answer held of it. A worker that owed names takes
+/// the daemon's entry when [`carries_what_was_given`]. Then every worker that is pending in the
+/// barrier as it stands and not in the answer is added: an answer is cut when a host has more
+/// workers than a frame carries, and it keeps the workers that have not held before any that has,
+/// and a worker made since is pending until it acknowledges. A worker the kept answer shows as
+/// holding is not taken for pending, so after a restart the repeat can hold where the barrier as
+/// it stands does not yet.
 fn barrier_read_again(
     given: &kr_protocol::action::RevocationBarrier,
     live: &kr_protocol::action::RevocationBarrier,
@@ -3552,11 +3554,8 @@ fn barrier_read_again(
             .find(|now| now.session_id == worker.session_id);
         if !worker.state.holds() {
             match now {
-                Some(now)
-                    if (now.state.holds() || now.acknowledged_revision.0.is_some())
-                        && keeps_the_names(now, worker) =>
-                {
-                    *worker = now.clone();
+                Some(now) if now.state.holds() || now.acknowledged_revision.0.is_some() => {
+                    *worker = with_the_names_of(now, worker);
                 }
                 None if closed.contains(&worker.session_id) => {
                     *worker = crate::authority::ended_since(worker);
@@ -3584,6 +3583,40 @@ fn barrier_read_again(
     barrier.workers_total =
         kr_protocol::scalars::U64::new(given.workers_total.get().max(live.workers_total.get()));
     barrier
+}
+
+/// The daemon's entry for a worker with every name `given` held of it that the entry lacks, so that
+/// no name of either is dropped and the state is the daemon's.
+fn with_the_names_of(
+    now: &kr_protocol::action::WorkerBarrier,
+    given: &kr_protocol::action::WorkerBarrier,
+) -> kr_protocol::action::WorkerBarrier {
+    let mut merged = now.clone();
+    for name in &given.rejected_actions {
+        if !merged.rejected_actions.contains(name) {
+            merged.rejected_actions.push(name.clone());
+        }
+    }
+    for name in &given.possibly_executed {
+        if !merged
+            .possibly_executed
+            .iter()
+            .any(|held| held.action_id == name.action_id && held.actor_id == name.actor_id)
+        {
+            merged.possibly_executed.push(name.clone());
+        }
+    }
+    merged.rejected_actions_total = kr_protocol::scalars::U64::new(
+        now.rejected_actions_total
+            .get()
+            .max(merged.rejected_actions.len() as u64),
+    );
+    merged.possibly_executed_total = kr_protocol::scalars::U64::new(
+        now.possibly_executed_total
+            .get()
+            .max(merged.possibly_executed.len() as u64),
+    );
+    merged
 }
 
 /// Whether the daemon's entry for a worker has every name an answer gave of it.
@@ -4243,6 +4276,11 @@ mod tests {
             !read.holds(),
             "the worker the kept answer left out is still pending: {read:?}"
         );
+        assert_eq!(
+            read.pending(),
+            vec![kr_protocol::ids::SessionId::new(uuid(2))],
+            "the pending set holds the worker that was left out, and that worker alone"
+        );
         assert_eq!(read.workers_total.get(), 2, "{read:?}");
         let cut =
             kr_protocol::sharing::RevocationResult::bounded(revision, std::iter::empty(), read);
@@ -4254,14 +4292,15 @@ mod tests {
         assert_eq!(cut.barrier.workers_total.get(), 2);
     }
 
-    /// KR-REQ-09.13: the entry that replaces a pending one keeps every name the kept answer gave it.
+    /// KR-REQ-09.13: the entry that replaces a pending one takes the daemon's state for the worker
+    /// and keeps every name the kept answer gave it.
     ///
     /// A pending entry can carry names from the earlier notices of its announcement. When the
     /// daemon's own entry has lost some of them, as it does once a later revision's report has gone,
-    /// it is not the same answer with the worker's acknowledgement added: the repeat keeps the
-    /// entry it was given.
+    /// the worker has still acknowledged: the repeat takes its state, acknowledged revision and
+    /// detail, and keeps the names of both entries.
     #[test]
-    fn a_pending_entry_is_replaced_only_by_one_that_carries_the_names_it_gave() {
+    fn a_pending_entry_is_replaced_by_the_live_one_with_every_name_the_kept_answer_gave() {
         use kr_protocol::action::{BarrierState, RevocationBarrier};
 
         let revision = AuthorityRevision::new(5);
@@ -4286,13 +4325,66 @@ mod tests {
 
         let read = barrier_read_again(&given, &lost_one, &nobody);
         assert_eq!(
-            read.workers[0], given.workers[0],
-            "an entry that lost a name the answer gave does not replace it"
+            read.workers[0].state,
+            BarrierState::Acknowledged,
+            "the worker acknowledged: {read:?}"
         );
+        let mut names: Vec<_> = read.workers[0]
+            .rejected_actions
+            .iter()
+            .map(|name| name.action_id)
+            .collect();
+        names.sort();
+        let mut every: Vec<_> = [10, 11, 12]
+            .iter()
+            .map(|byte| ActionId::new(uuid(*byte)))
+            .collect();
+        every.sort();
+        assert_eq!(names, every, "no name of either entry is dropped: {read:?}");
+        assert_eq!(read.workers[0].rejected_actions_total.get(), 3);
+        assert!(read.holds(), "{read:?}");
         let read = barrier_read_again(&given, &kept_all, &nobody);
         assert_eq!(
             read.workers[0], kept_all.workers[0],
-            "an entry that carries every name it gave does"
+            "an entry that carries every name it gave is taken as it is"
+        );
+    }
+
+    /// KR-REQ-09.13: after a restart the daemon holds no report of an earlier notice of the
+    /// announcement, and a repeat still reads the worker that acknowledged as holding, with the
+    /// names the kept answer carried.
+    ///
+    /// The worker answered an earlier notice, whose names the kept answer carries, and failed the
+    /// last. The new daemon's entry for it has no such names, and a repeat that kept the pending
+    /// entry for that reason would read it pending for as long as the daemon runs.
+    #[test]
+    fn after_a_restart_a_repeat_reads_an_acknowledging_worker_as_holding_with_the_names_it_gave() {
+        use kr_protocol::action::{BarrierState, RevocationBarrier};
+
+        let revision = AuthorityRevision::new(5);
+        let given = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(1, BarrierState::Pending, &[10], 0)],
+        );
+        let live = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(1, BarrierState::Acknowledged, &[], 0)],
+        );
+
+        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new());
+        assert!(read.holds(), "{read:?}");
+        assert_eq!(
+            read.workers[0].rejected_actions,
+            given.workers[0].rejected_actions
+        );
+        let pending_live = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(1, BarrierState::Pending, &[], 0)],
+        );
+        let read = barrier_read_again(&given, &pending_live, &std::collections::BTreeSet::new());
+        assert!(
+            !read.holds(),
+            "a worker that has not acknowledged is never read as holding: {read:?}"
         );
     }
 

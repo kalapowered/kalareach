@@ -930,15 +930,17 @@ impl Controller {
             (!pending.is_empty()).then_some(
                 "A revocation is complete for a worker once it acknowledges the revision or is \
                  confirmed ended. While the directory lists a pending worker, this host asks it \
-                 again on its own: at the first pass at least five seconds after an ask that was \
-                 answered, and at the first pass after a wait, growing from five seconds to a \
-                 minute at most, after an ask that failed. It does not ask a worker while an \
-                 earlier presentation of this host to it is still waiting at its dispatch \
-                 boundary. This check shows when every worker has acknowledged. The first answer \
-                 to the revocation is not rewritten then; repeating the revocation asks a worker \
-                 that was pending in it again on the same terms and, once that worker has \
-                 acknowledged, names the actions that won the dispatch race at that worker, which \
-                 keeps those names for its newest eight revocations only.",
+                 again on its own: at the pass that comes about five seconds after an ask that \
+                 was answered, and after an ask that failed at the first pass after a wait of \
+                 10 seconds, which doubles for each further failure to 60 seconds at most. It \
+                 does not ask a worker while an earlier presentation of this host to it is still \
+                 under way. This check shows when every worker has acknowledged. The first \
+                 answer to the revocation is not rewritten then; repeating a revocation asks \
+                 the workers that were pending in its answer again on the same terms and, once \
+                 one has acknowledged, names the actions that won the dispatch race at it under \
+                 that revision, as far as the daemon holds them: a worker that acknowledged a \
+                 later revision has none under the revoked one, and a worker keeps the names of \
+                 its newest eight revocations only.",
             ),
         ));
         checks.push(self.descriptions.doctor_check(
