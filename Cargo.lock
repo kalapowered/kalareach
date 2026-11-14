@@ -6241,7 +6241,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.4.0"
-source = "git+https://github.com/kalapowered/noq?rev=9c56f81afad3defdeec7d36a4ba9d0b02d5d9e7a#9c56f81afad3defdeec7d36a4ba9d0b02d5d9e7a"
+source = "git+https://github.com/kalapowered/noq?rev=d8d5e9153f22f521bc5768c83fc4a50963d02bf3#d8d5e9153f22f521bc5768c83fc4a50963d02bf3"
 dependencies = [
  "aes-gcm",
  "bytes",

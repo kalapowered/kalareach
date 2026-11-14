@@ -322,12 +322,13 @@ noq-udp = { git = "https://github.com/n0-computer/noq", rev = "04807b674cff617cb
 # `noq-proto` 1.4.0, the QUIC library under every endpoint, closes a whole connection ("too many
 # gaps in stream buffer") when the reader of a stream falls behind a long run of small or mixed
 # frames: its stream assembler counts chunks that touch as if they were gaps. This source is the
-# published release of that version with three changes to the stream assembler: two of the
-# library's own fixes that no release holds yet, and one that joins chunks that touch before the
-# chunk bound is applied. Remove this entry, and the git source it gives `noq-proto` in the lock,
-# when the lock can take a released `noq-proto` at which the case `reader_falls_behind` in
-# `crates/kr-transport/tests` passes without it.
-noq-proto = { git = "https://github.com/kalapowered/noq", rev = "9c56f81afad3defdeec7d36a4ba9d0b02d5d9e7a" }
+# published release of that version with four changes to the stream assembler: two of the
+# library's own fixes that no release holds yet, one that joins chunks that touch before the chunk
+# bound is applied, and one that starts the compaction of an ordered stream at the read position,
+# so that data already read is dropped at a compaction. Remove this entry, and the git source it
+# gives `noq-proto` in the lock, when the lock can take a released `noq-proto` at which the case
+# `reader_falls_behind` in `crates/kr-transport/tests` passes without it.
+noq-proto = { git = "https://github.com/kalapowered/noq", rev = "d8d5e9153f22f521bc5768c83fc4a50963d02bf3" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
