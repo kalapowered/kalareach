@@ -111,6 +111,29 @@ impl Worker {
             script,
             TimeSources::system(),
             dimensions,
+            None,
+        )
+        .await
+    }
+
+    /// As [`Self::start_running`], for a session that keeps no spool and retains only the last
+    /// `window` bytes of its output. A device whose position falls behind them is behind the
+    /// session's bounded history, which the session's own spool, at its host-wide size, would
+    /// take far more output to reach.
+    pub async fn start_running_with_a_window(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        script: &str,
+        window: usize,
+    ) -> Self {
+        Self::start_with(
+            tree,
+            display,
+            true,
+            script,
+            TimeSources::system(),
+            Dimensions::new(80, 24),
+            Some(window),
         )
         .await
     }
@@ -145,7 +168,16 @@ impl Worker {
             adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(kept)),
             ..TimeSources::system()
         };
-        Self::start_with(tree, display, true, script, time, Dimensions::new(80, 24)).await
+        Self::start_with(
+            tree,
+            display,
+            true,
+            script,
+            time,
+            Dimensions::new(80, 24),
+            None,
+        )
+        .await
     }
 
     async fn start_as(
@@ -161,10 +193,13 @@ impl Worker {
             script,
             TimeSources::system(),
             Dimensions::new(80, 24),
+            None,
         )
         .await
     }
 
+    /// `window` is the size of a session that keeps no spool; `None` is the session every other
+    /// constructor starts, with its spool and its 64 KiB window.
     async fn start_with(
         tree: &kr_ipc::testing::TempHost,
         display: u64,
@@ -172,6 +207,7 @@ impl Worker {
         script: &str,
         time: TimeSources,
         dimensions: Dimensions,
+        window: Option<usize>,
     ) -> Self {
         let environment = tree.environment();
         let environment_id = tree.environment_id();
@@ -239,10 +275,13 @@ impl Worker {
             desktop: DesktopBinding::none(),
             dimensions,
             journal_path: Some(journal_path.clone()),
-            spool_directory: Some(environment.session_spool(session_id)),
+            spool_directory: match window {
+                Some(_) => None,
+                None => Some(environment.session_spool(session_id)),
+            },
             worker_endpoint: None,
             send_queue_bytes: 1024 * 1024,
-            resident_bytes: 64 * 1024,
+            resident_bytes: window.unwrap_or(64 * 1024),
             time,
             launch_profile: kr_protocol::session::LaunchProfile::default(),
         };
