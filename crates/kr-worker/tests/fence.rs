@@ -10267,12 +10267,25 @@ async fn kr_req_13_11_the_answers_recorded_for_the_page_are_the_ones_a_worker_gi
     );
 }
 
-/// How many tasks are alive on the runtime this case runs on.
+/// Whether anything holds a file under `root` open: a file that is open without sharing cannot be
+/// opened without sharing, and that is also what refuses the removal of the folder it is in.
 #[cfg(windows)]
-fn tasks_alive() -> usize {
-    tokio::runtime::Handle::current()
-        .metrics()
-        .num_alive_tasks()
+fn a_file_under_is_held(root: &std::path::Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            return a_file_under_is_held(&path);
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .is_err()
+    })
 }
 
 /// The files this process has open under `root`, read from `/proc/self/fd`.
@@ -10321,12 +10334,13 @@ async fn a_closed_session_lets_go_of_its_files_when_its_fixture_is_dropped() {
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_directory_of_a_closed_session_is_removed_at_the_first_try() {
-    let baseline = tasks_alive();
     let wired = wired().await;
     let temp = wired.end().await;
     let root = temp.root().to_path_buf();
+    // Tasks and a thread of the session let go of its files after the fixture is dropped. What is
+    // waited for is the condition, and the bound only says how long a failure takes.
     let _ = tokio::time::timeout(Duration::from_secs(30), async {
-        while tasks_alive() > baseline {
+        while a_file_under_is_held(&root) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
