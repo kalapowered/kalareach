@@ -333,6 +333,7 @@ impl RemoteConnection {
         // whichever path it is released: the connection's end, a grant's end, a refusal that the
         // authority feed puts on the connection (which leaves the connection standing), or the
         // relay's end.
+        self.inputs.before_the_revoke().await;
         self.inputs.revoke_connection(self.connection_id());
         if let Some(proxy) = self.proxy.lock().await.take() {
             proxy.close();

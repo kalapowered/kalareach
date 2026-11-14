@@ -255,6 +255,13 @@ impl NetworkTransport {
         Ok(())
     }
 
+    /// Why the host ended the connection, once it has: the close's code and words.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn close_reason(&self) -> Option<iroh::endpoint::ConnectionError> {
+        self.connection.close_reason()
+    }
+
     /// Resets the control stream's sending half while the connection stands.
     #[cfg(feature = "testing")]
     pub async fn reset_control(&self) {

@@ -16,7 +16,7 @@ use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_transport::window::AcceptedDeadline;
 
 use super::super::arrivals::{Arrival, Arrivals, Carried, request_of};
-use super::super::proxy::{Vouched, WorkerProxy};
+use super::super::proxy::{Forwarded, Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::given::Recorded;
 use crate::grants::policy::HeldBound;
@@ -170,6 +170,34 @@ fn input_write_refusal(error: &CodecError) -> ProtocolError {
             ErrorCode::InvalidArgument,
             "the parameters of input.write are not the current ones",
         ),
+    }
+}
+
+/// Whether a detach whose call to the worker ended as `carried_out` took effect, or may have.
+///
+/// The worker removes the attachment before the geometry step that follows, so an answer that is an
+/// error counts only when it is one the worker gives after the removal: a refused resize
+/// (`RESOURCE_UNAVAILABLE`) or an outcome that is unknown. Every refusal that comes before the
+/// effect leaves the attachment and its stream as they were: the grant's (`PERMISSION_DENIED`), the
+/// parameters' (`INVALID_ARGUMENT`), a subject precondition that no longer holds
+/// (`DRAFT_CONFLICT`), a journal that refuses the intent (`STORAGE_UNAVAILABLE`). A call this host
+/// refused before it was sent did nothing either; any other failure of the call leaves its outcome
+/// unknown, and so counts.
+pub(super) fn a_detach_may_have_acted(
+    carried_out: &std::result::Result<Result<Forwarded>, tokio::task::JoinError>,
+) -> bool {
+    match carried_out {
+        Ok(Ok(answered)) => match &answered.response.outcome {
+            Outcome::Ok(_) => true,
+            Outcome::Error(error) => matches!(
+                error.code,
+                ErrorCode::ResourceUnavailable | ErrorCode::OutcomeUnknown
+            ),
+        },
+        Ok(Err(ControllerError::PermissionDenied { .. } | ControllerError::InvalidArgument(_))) => {
+            false
+        }
+        Ok(Err(_)) | Err(_) => true,
     }
 }
 
@@ -621,25 +649,9 @@ impl RemoteConnection {
         });
         let carried_out = effect.await;
         // A detach that took effect, or may have, ends the attachment's stream of typing, whichever
-        // connection holds it: the attachment is gone for all of them. The worker removes the
-        // attachment before a step of the detach that can fail, so an answer that is an error
-        // counts, except a refusal that comes before it acts (`PERMISSION_DENIED`,
-        // `INVALID_ARGUMENT`). A call this host refused before it was sent did nothing either; any
-        // other failure of the call leaves its outcome unknown.
+        // connection holds it: the attachment is gone for all of them.
         if let Some(attachment) = detaching
-            && match &carried_out {
-                Ok(Ok(answered)) => match &answered.response.outcome {
-                    Outcome::Ok(_) => true,
-                    Outcome::Error(error) => !matches!(
-                        error.code,
-                        ErrorCode::PermissionDenied | ErrorCode::InvalidArgument
-                    ),
-                },
-                Ok(Err(
-                    ControllerError::PermissionDenied { .. } | ControllerError::InvalidArgument(_),
-                )) => false,
-                Ok(Err(_)) | Err(_) => true,
-            }
+            && a_detach_may_have_acted(&carried_out)
         {
             self.inputs.detached(attachment);
         }
