@@ -10,7 +10,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::known_answers::{fixtures_dir, hex_vec, read_json};
+use super::known_answers::{hex_vec, read_json};
 use super::*;
 
 /// The upstream commit the three files come from.
@@ -23,25 +23,40 @@ const XCHACHA20_POLY1305_SHA256: &str =
 /// The Apache License 2.0 text the project publishes beside its vectors.
 const LICENSE_SHA256: &str = "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd";
 
+/// The licence text the set travels with, as the program holds it.
+const LICENSE: &[u8] = include_bytes!("../../../../fixtures/crypto/wycheproof/LICENSE");
+
+/// The file `name` of the vendored set, as the program holds it.
+fn vendored(name: &str) -> &'static [u8] {
+    match name {
+        "x25519_test.json" => {
+            include_bytes!("../../../../fixtures/crypto/wycheproof/x25519_test.json")
+        }
+        "ed25519_test.json" => {
+            include_bytes!("../../../../fixtures/crypto/wycheproof/ed25519_test.json")
+        }
+        "xchacha20_poly1305_test.json" => {
+            include_bytes!("../../../../fixtures/crypto/wycheproof/xchacha20_poly1305_test.json")
+        }
+        other => panic!("{other} is not a file of the vendored set"),
+    }
+}
+
 /// The file `name` of the vendored set, after its digest has been checked against `sha256`, and
 /// after the licence that travels with the set has been checked to be there, whole.
 fn wycheproof(name: &str, sha256: &str) -> Value {
-    let licence = fixtures_dir().join("wycheproof/LICENSE");
-    let text =
-        std::fs::read(&licence).unwrap_or_else(|error| panic!("{}: {error}", licence.display()));
     assert_eq!(
-        hex::encode(Sha256::digest(&text)),
+        hex::encode(Sha256::digest(LICENSE)),
         LICENSE_SHA256,
         "the licence beside the vectors is not the one the upstream project publishes"
     );
-    let path = fixtures_dir().join("wycheproof").join(name);
-    let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let bytes = vendored(name);
     assert_eq!(
-        hex::encode(Sha256::digest(&bytes)),
+        hex::encode(Sha256::digest(bytes)),
         sha256,
         "{name} is not the file that {UPSTREAM_COMMIT} holds"
     );
-    let file: Value = serde_json::from_slice(&bytes).expect("a JSON file");
+    let file: Value = serde_json::from_slice(bytes).expect("a JSON file");
     let counted: usize = file["testGroups"]
         .as_array()
         .expect("groups")
