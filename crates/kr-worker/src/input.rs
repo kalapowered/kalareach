@@ -663,6 +663,13 @@ impl InputLease {
         self.queued_bytes
     }
 
+    /// Returns the sequence the lease's next frame must carry, which is also how many frames of
+    /// this epoch have been accepted.
+    #[must_use]
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
     /// Renders the lease for the wire.
     #[must_use]
     pub fn to_wire(&self) -> InputLeaseState {

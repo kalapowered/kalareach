@@ -14,7 +14,7 @@ use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, AttachmentViewportParams, SessionAttachParams,
-    SessionAttachResult,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult,
 };
 use kr_protocol::envelope::{
     ActionTarget, ControlEvent, ControlFrame, Outcome, ParamsValue, Request,
@@ -28,10 +28,15 @@ use kr_protocol::ids::{
     SessionEpoch, SessionId,
 };
 use kr_protocol::input::{
-    InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams, input_claim,
+    InputAcquireParams, InputAcquireResult, InputBarrier, InputContent, InputLeaseResult,
+    InputReleaseParams, InputWriteParams, input_claim,
 };
 use kr_protocol::local::{
-    ControllerConnectionRole, ForwardedRequest, InputLane, InputLaneReady, LaneCredit, LaneWindow,
+    ControllerConnectionRole, ForwardedRequest, InputLane, InputLaneReady, LaneCredit, LaneLaunch,
+    LaneWindow,
+};
+use kr_protocol::root::{
+    EditorBufferRevision, LaunchCommand, PromptGeneration, ShellLaunchParams,
 };
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, U64};
@@ -63,6 +68,7 @@ enum Seen {
     Answer(RequestId, Outcome),
     Window(LaneWindow),
     Credit(LaneCredit),
+    Launch(LaneLaunch),
 }
 
 /// The control daemon's side of one input lane.
@@ -166,6 +172,9 @@ impl Lane {
             }
             ControlFrame::Event(ControlEvent::InputWindow(window)) => Some(Seen::Window(window)),
             ControlFrame::Event(ControlEvent::InputCredit(credit)) => Some(Seen::Credit(credit)),
+            ControlFrame::Event(ControlEvent::InputLaunchReserved(launch)) => {
+                Some(Seen::Launch(launch))
+            }
             other => panic!("the lane carried {other:?}"),
         }
     }
@@ -277,6 +286,16 @@ impl Rig {
     /// A rig whose worker ends the link of a closed lane queue after `close_bound`, where one is
     /// given, rather than after the five seconds of the shipped worker.
     async fn start_with(close_bound: Option<Duration>) -> Self {
+        Self::start_built(close_bound, false).await
+    }
+
+    /// A rig whose session has the root editor's fence machine, not qualified: a launch asked of
+    /// it is refused by the machine at once.
+    async fn start_fenced() -> Self {
+        Self::start_built(None, true).await
+    }
+
+    async fn start_built(close_bound: Option<Duration>, fenced: bool) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -325,6 +344,13 @@ impl Rig {
         );
         let mut session = Session::open(config).expect("opens the session");
         session.launch().expect("launches the shell");
+        if fenced {
+            session.install_fence(kr_worker::fence::FenceDriver::new(
+                session_id,
+                kr_shell_integration::contract::fence::LeaseView::unheld(InputLeaseEpoch::new(0)),
+                Arc::new(kr_transport::clock::ManualClock::new()),
+            ));
+        }
         let runtime = Arc::new(
             SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
                 .expect("starts the runtime"),
@@ -569,6 +595,59 @@ impl Rig {
         }
     }
 
+    /// Releases the keys as the daemon forwards a release that names a position.
+    async fn release_with(
+        &mut self,
+        attachment: AttachmentId,
+        epoch: InputLeaseEpoch,
+        after: Option<InputBarrier>,
+        report: bool,
+    ) -> Result<InputLeaseResult, ProtocolError> {
+        let params = InputReleaseParams {
+            session_id: self.session_id,
+            attachment_id: attachment,
+            epoch,
+            after_input: after,
+            fenced_report: report,
+        };
+        self.forward_at(Method::InputRelease, &params, 1)
+            .await
+            .map(|answer| answer.to_typed().expect("a lease result"))
+    }
+
+    /// Detaches as the daemon forwards a detach that names a position.
+    async fn detach_with(
+        &mut self,
+        attachment: AttachmentId,
+        after: Option<InputBarrier>,
+        report: bool,
+    ) -> Result<SessionDetachResult, ProtocolError> {
+        let params = SessionDetachParams {
+            attachment_id: Nullable::some(attachment),
+            line_token: Nullable::null(),
+            after_input: after,
+            fenced_report: report,
+        };
+        self.forward_at(Method::SessionDetach, &params, 1)
+            .await
+            .map(|answer| answer.to_typed().expect("a detach result"))
+    }
+
+    /// Asks for a launch that names a position, as the daemon forwards it.
+    async fn launch_with(
+        &mut self,
+        after: Option<InputBarrier>,
+    ) -> Result<ParamsValue, ProtocolError> {
+        let params = ShellLaunchParams {
+            session_id: self.session_id,
+            command: LaunchCommand::QuotedCommand("true".to_owned()),
+            expected_prompt_generation: PromptGeneration::new(1),
+            expected_buffer_revision: EditorBufferRevision::new(1),
+            after_input: after,
+        };
+        self.forward_at(Method::ShellLaunch, &params, 1).await
+    }
+
     /// What the application has received so far.
     fn received(&self) -> Vec<u8> {
         std::fs::read(&self.received).unwrap_or_default()
@@ -803,6 +882,7 @@ async fn a_takeover_with_the_credit_in_flight_refuses_every_frame_and_the_next_w
     let window = match lane.next().await.expect("the lane stays open") {
         Seen::Window(window) => window,
         Seen::Credit(credit) => panic!("credit was owed for an epoch that ended: {credit:?}"),
+        Seen::Launch(launch) => panic!("a launch marker with no launch: {launch:?}"),
         Seen::Answer(..) => panic!("an answer with nothing sent"),
     };
     assert!(window.holder && window.ended.0.is_none());
@@ -877,6 +957,7 @@ async fn the_ended_notice_follows_every_answer_of_its_epoch_on_the_wire() {
                             let _ = trigger.send(());
                         }
                     }
+                    Seen::Launch(launch) => panic!("a launch marker with no launch: {launch:?}"),
                 }
             }
         };
@@ -892,7 +973,7 @@ async fn the_ended_notice_follows_every_answer_of_its_epoch_on_the_wire() {
         let window = loop {
             match lane.next().await.expect("the lane stays open") {
                 Seen::Window(window) if window.holder => break window,
-                Seen::Window(_) | Seen::Credit(_) => {}
+                Seen::Window(_) | Seen::Credit(_) | Seen::Launch(_) => {}
                 Seen::Answer(..) => panic!("an answer with nothing waiting"),
             }
         };
@@ -1380,7 +1461,7 @@ async fn a_holder_the_revision_does_not_reach_keeps_typing_on_its_lane_and_nothi
                 assert!(refusal(&outcome).is_none(), "{outcome:?}");
                 break;
             }
-            Seen::Credit(_) => {}
+            Seen::Credit(_) | Seen::Launch(_) => {}
             Seen::Window(window) => panic!("the epoch ended: {window:?}"),
         }
     }
@@ -1722,7 +1803,7 @@ async fn five_replacements_in_a_row_leave_no_lane_behind_but_the_last() {
                 refusal(&outcome).is_some(),
                 "a frame of the flood, {id:?}, was accepted"
             ),
-            Some(Seen::Window(_) | Seen::Credit(_)) => {}
+            Some(Seen::Window(_) | Seen::Credit(_) | Seen::Launch(_)) => {}
             None => panic!("the last lane ended before its key was answered"),
         }
     }
@@ -1778,7 +1859,7 @@ async fn next_window(lane: &mut Lane) -> LaneWindow {
     loop {
         match lane.next().await.expect("the lane stays open") {
             Seen::Window(window) => return window,
-            Seen::Credit(_) => {}
+            Seen::Credit(_) | Seen::Launch(_) => {}
             Seen::Answer(id, outcome) => panic!("an answer, {id:?}: {outcome:?}, with nothing sent"),
         }
     }
@@ -1826,5 +1907,248 @@ async fn a_batch_the_writer_drops_at_its_deadline_ends_the_epoch_and_the_notice_
     }
     tokio::time::sleep(SETTLE).await;
     assert!(rig.received().is_empty(), "no piece of the batch reached the application");
+    rig.finish().await;
+}
+
+/// The position of the first `count` frames of `epoch` for `attachment`, for a launch numbered
+/// `launch` when one is given.
+fn barrier(
+    attachment: AttachmentId,
+    epoch: InputLeaseEpoch,
+    count: u64,
+    launch: Option<u32>,
+) -> InputBarrier {
+    InputBarrier {
+        attachment_id: attachment,
+        epoch,
+        count: U64::new(count),
+        launch: Nullable(launch),
+    }
+}
+
+/// Sends the bytes as frames of the lane and reads each acceptance.
+async fn typed(lane: &mut Lane, frames: &[&[u8]]) {
+    for frame in frames {
+        lane.send(frame).await;
+    }
+    for _ in frames {
+        lane.accepted().await;
+    }
+}
+
+/// KR-REQ-23.36, C21: a release or a detach that names a position the live epoch has not reached
+/// is a definite refusal with nothing applied, and both go through once the position is reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_or_a_detach_beyond_the_position_of_a_live_epoch_applies_nothing() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    typed(&mut lane, &[b"a", b"b", b"c"]).await;
+    rig.received_exactly(b"abc").await;
+
+    let release = rig
+        .release_with(attachment, epoch, Some(barrier(attachment, epoch, 4, None)), true)
+        .await
+        .expect_err("the position was not reached");
+    assert_eq!(release.code, ErrorCode::DraftConflict);
+    let detach = rig
+        .detach_with(attachment, Some(barrier(attachment, epoch, 4, None)), true)
+        .await
+        .expect_err("the position was not reached");
+    assert_eq!(detach.code, ErrorCode::DraftConflict);
+
+    // Nothing was applied: the view still holds the keys and is still attached.
+    typed(&mut lane, &[b"d"]).await;
+    rig.received_exactly(b"abcd").await;
+    let released = rig
+        .release_with(attachment, epoch, Some(barrier(attachment, epoch, 3, None)), true)
+        .await
+        .expect("the position is reached");
+    assert_eq!(released.fenced_bytes.map(U64::get), Some(0));
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36, C21: after a takeover the old epoch accepts no more frames, so there is no
+/// position to wait for. The old view's release is a lost lease, as it is today, and its detach
+/// succeeds whatever position it names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_takeover_the_old_view_releases_lease_lost_and_detaches_with_no_position() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let other = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    typed(&mut lane, &[b"a", b"b"]).await;
+    rig.acquire(other).await;
+
+    let unreached = barrier(attachment, epoch, 9, None);
+    let release = rig
+        .release_with(attachment, epoch, Some(unreached.clone()), true)
+        .await
+        .expect_err("the old view no longer holds the keys");
+    assert_eq!(release.code, ErrorCode::LeaseLost);
+    let detached = rig
+        .detach_with(attachment, Some(unreached), true)
+        .await
+        .expect("a detach does not depend on the lease");
+    assert_eq!(detached.attachment_id, attachment);
+    assert_eq!(
+        detached.fenced_bytes.map(U64::get),
+        Some(0),
+        "the takeover had already counted what the old view left"
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: the count a release or a detach answers is the count the lane's notice carries,
+/// and both are the bytes the session accepted and the terminal did not take. The count is in the
+/// answer only when the request asked for it. A takeover's notice carries the count too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fenced_count_is_exact_in_the_answer_and_in_the_notice() {
+    let mut rig = Rig::start().await;
+
+    // A release that asks: the writer holds the first batch, so all five bytes are fenced.
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let (stopped, go) = rig.runtime.input().writer_hold().arm();
+    typed(&mut lane, &[b"abc"]).await;
+    stopped.await.expect("the writer took the batch");
+    typed(&mut lane, &[b"de"]).await;
+    let released = rig
+        .release_with(attachment, epoch, None, true)
+        .await
+        .expect("released");
+    assert_eq!(released.fenced_bytes.map(U64::get), Some(5));
+    let notice = next_window(&mut lane).await;
+    assert_eq!(notice.ended.0.expect("an epoch ended").fenced_bytes.get(), 5);
+    go.send(()).expect("lets the writer go");
+    rig.drained().await;
+
+    // A release that does not ask is answered as an older worker answers.
+    let epoch = rig.acquire(attachment).await;
+    let window = next_window(&mut lane).await;
+    assert!(window.holder && window.epoch == epoch);
+    lane.at(epoch);
+    let (stopped, go) = rig.runtime.input().writer_hold().arm();
+    typed(&mut lane, &[b"xy"]).await;
+    stopped.await.expect("the writer took the batch");
+    let released = rig
+        .release_with(attachment, epoch, None, false)
+        .await
+        .expect("released");
+    assert_eq!(released.fenced_bytes, None);
+    assert_eq!(
+        next_window(&mut lane).await.ended.0.expect("an epoch ended").fenced_bytes.get(),
+        2
+    );
+    go.send(()).expect("lets the writer go");
+    rig.drained().await;
+
+    // A takeover.
+    let other = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let _ = next_window(&mut lane).await;
+    lane.at(epoch);
+    let (stopped, go) = rig.runtime.input().writer_hold().arm();
+    typed(&mut lane, &[b"pqr"]).await;
+    stopped.await.expect("the writer took the batch");
+    rig.acquire(other).await;
+    let notice = next_window(&mut lane).await;
+    assert_eq!(notice.ended.0.expect("an epoch ended").fenced_bytes.get(), 3);
+    go.send(()).expect("lets the writer go");
+    rig.drained().await;
+
+    // A detach that asks.
+    let epoch = rig.acquire(attachment).await;
+    let _ = next_window(&mut lane).await;
+    lane.at(epoch);
+    let (stopped, go) = rig.runtime.input().writer_hold().arm();
+    typed(&mut lane, &[b"mn"]).await;
+    stopped.await.expect("the writer took the batch");
+    typed(&mut lane, &[b"o"]).await;
+    let detached = rig
+        .detach_with(attachment, None, true)
+        .await
+        .expect("detached");
+    assert_eq!(detached.fenced_bytes.map(U64::get), Some(3));
+    assert_eq!(
+        next_window(&mut lane).await.ended.0.expect("an epoch ended").fenced_bytes.get(),
+        3
+    );
+    go.send(()).expect("lets the writer go");
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36, C21: a launch whose barrier names an epoch the attachment no longer holds, or an
+/// attachment that is not the holder, is a lost lease with nothing reserved, and a position the
+/// live epoch has not reached is a definite refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_is_checked_against_the_holder_the_epoch_and_the_position() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let other = rig.attach().await;
+    let first = rig.acquire(attachment).await;
+    rig.acquire(other).await;
+    let second = rig.acquire(attachment).await;
+    assert_ne!(first, second);
+
+    let stale = rig
+        .launch_with(Some(barrier(attachment, first, 0, Some(1))))
+        .await
+        .expect_err("the barrier marked an epoch that ended");
+    assert_eq!(stale.code, ErrorCode::LeaseLost);
+    let not_the_holder = rig
+        .launch_with(Some(barrier(other, second, 0, Some(2))))
+        .await
+        .expect_err("another attachment than the holder");
+    assert_eq!(not_the_holder.code, ErrorCode::LeaseLost);
+    let early = rig
+        .launch_with(Some(barrier(attachment, second, 2, Some(3))))
+        .await
+        .expect_err("the position was not reached");
+    assert_eq!(early.code, ErrorCode::DraftConflict);
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36, C26: the worker writes the launch marker when it has dealt with the launch, also
+/// when the machine refused the launch at once. A session with a fence machine takes no external
+/// typing until its shell is authenticated, so this case types nothing: the marker's place behind
+/// acceptances is not shown here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_immediate_refusal_of_a_launch_writes_the_marker() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+
+    let refused = rig
+        .launch_with(Some(barrier(attachment, epoch, 0, Some(7))))
+        .await
+        .expect_err("the machine refuses a launch of a session that is not qualified");
+    assert_ne!(refused.code, ErrorCode::LeaseLost);
+    match lane.next_event().await {
+        Some(Seen::Launch(marker)) => {
+            assert_eq!((marker.attachment_id, marker.launch), (attachment, 7));
+        }
+        other => panic!("the launch's marker did not come: {other:?}"),
+    }
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: the hello states the lane's capability, which promises the window, the position
+/// checks, the fenced count and the launch marker together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_worker_states_the_input_lane() {
+    let rig = Rig::start().await;
+    let link = rig.connect(1, Some(ControllerConnectionRole::Proxy)).await;
+    assert!(
+        link.acknowledgement()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "input.lane/1"),
+        "the worker does not state the input lane"
+    );
     rig.finish().await;
 }
