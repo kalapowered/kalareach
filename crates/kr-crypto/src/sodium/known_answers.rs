@@ -1,9 +1,11 @@
 //! Known answers for the cipher and curve code behind this boundary.
 //!
 //! libsodium picks its ChaCha20 and Salsa20 code by the processor and then by the length of the
-//! call. The release's widest loop takes 512 bytes at a time, and the AVX-512 code in the stable
-//! branch's snapshot, which upstream's Windows prebuilt holds, takes 1,024. A test that stops below
-//! those lengths never reaches the code a long message uses. A round trip cannot find a wrong keystream either: the
+//! call. The release's widest loop takes 512 bytes at a time. The stable branch's snapshot also has
+//! AVX-512 code, which takes 1,024, and the release tag's Windows archive that the jobs link holds
+//! none of it: only an MSVC build that links the snapshot, which is one whose environment names no
+//! placed archive directory, reaches it. A test that stops below those lengths never reaches the
+//! code a long message uses. A round trip cannot find a wrong keystream either: the
 //! same keystream takes off what it put on. The cases here seal fixed inputs at every length that
 //! matters and compare the whole sealed output with answers frozen from libsodium's 1.0.22 release
 //! build, where a wrong byte anywhere in the keystream or the authenticator changes the answer.
