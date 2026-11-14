@@ -1332,8 +1332,7 @@ or the Visual C++ runtime, by its name, or as not found, and none of these fails
 C++ runtime comes from the runner, because neither installer carries it. It never runs the
 application. It doesn't upload anything.
 
-The installers bring the program alone, so the Visual C++ runtime must already be on the machine. No
-Windows bundle is released until that is settled.
+The installers bring the program alone, so the Visual C++ runtime must already be on the machine.
 
 Building the macOS bundle currently doesn't work with Xcode 27.2 (`ld-27106.1`) and macOS 27.2.1.
 Tauri sets the `MACOSX_DEPLOYMENT_TARGET` environment variable to the value of the
@@ -1344,7 +1343,7 @@ system loader when the compiler tries to load it. Running `tauri build` fails wi
 fileOffset=0x002CE88C)`. A local build passes with `RUSTFLAGS='-Clink-arg=-Wl,-no_fixup_chains'` in
 the environment, but that leaves chained fixups out of all executables the build links and is not a
 good idea for a release bundle. A macOS bundle for release needs a workflow job with a pinned
-toolchain, and there is none.
+toolchain.
 
 On Windows, with Microsoft's linker, the build links the application manifest into every binary it
 makes, the test binaries included. The native dialogs need version 6 of the common controls, and a
