@@ -492,7 +492,7 @@ fn the_rollbacks_entry_for_an_object_says_what_the_cleanup_came_to_and_no_more()
         rollback_entry(&Taken::Unconfirmed("u".to_owned()), DATA),
         Some(format!("{DATA} (u)"))
     );
-    let ending = rollback_laid_stays(&[lost], &[], &[]);
+    let ending = rollback_laid_stays(&[lost], &[], &[], &[]);
     assert!(ending.ends_with("did nothing with it)."), "{ending}");
 }
 
@@ -598,6 +598,7 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
         ],
         &[],
         &[],
+        &[],
     );
     assert_eq!(
         one,
@@ -608,6 +609,7 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
             "C:\\Data (another object stands at its name, so nothing was marked)".to_owned(),
             "C:\\Above (the data directory in it stays)".to_owned(),
         ],
+        &[],
         &[],
         &["C:\\Data\\run".to_owned(), "C:\\Data\\journal".to_owned()],
     );
@@ -626,7 +628,7 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
         "C:\\Above\\Folder (the platform refused to mark it for removal: Windows error 145)"
             .to_owned(),
     ];
-    let with_data = rollback_laid_stays(&["C:\\Data (w)".to_owned()], &folder, &[]);
+    let with_data = rollback_laid_stays(&["C:\\Data (w)".to_owned()], &folder, &[], &[]);
     assert!(
         with_data.contains("in the data directory's place: C:\\Data (w)."),
         "{with_data}"
@@ -637,7 +639,7 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
         ),
         "{with_data}"
     );
-    let alone = rollback_laid_stays(&[], &folder, &[]);
+    let alone = rollback_laid_stays(&[], &folder, &[], &[]);
     assert!(!alone.contains("data directory's place"), "{alone}");
     assert!(
         alone.ends_with(
@@ -648,6 +650,48 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
     for text in [&with_data, &alone] {
         assert!(!text.contains("deleted"), "{text}");
     }
+    // An object that was marked and whose name could not be read afterwards is neither kept nor
+    // gone: the words say that the mark was set and the read failed, and "could not take away" is
+    // said only of what a read or a refusal kept.
+    let read_failed = "C:\\Above\\Folder (it was marked for removal, but a read of its name afterwards failed (Windows error 5), so whether it is gone is not known)".to_owned();
+    let only = rollback_laid_stays(&[], &[], std::slice::from_ref(&read_failed), &[]);
+    assert!(!only.contains("could not take away"), "{only}");
+    assert!(!only.contains("stays"), "{only}");
+    assert!(
+        only.ends_with(&format!(
+            "but a read of the name of what this run marked for removal failed, so it is not known whether it is gone: {read_failed}."
+        )),
+        "{only}"
+    );
+    // Beside what a read kept, it has a sentence of its own after the kept objects.
+    let beside = rollback_laid_stays(
+        &["C:\\Data (w)".to_owned()],
+        &[],
+        std::slice::from_ref(&read_failed),
+        &[],
+    );
+    assert!(
+        beside.contains(
+            "could not take away all that it laid in the data directory's place: C:\\Data (w)."
+        ),
+        "{beside}"
+    );
+    assert!(
+        beside.ends_with(&format!(
+            " It marked for removal, and a read of its name afterwards failed, so it is not known whether it is gone: {read_failed}."
+        )),
+        "{beside}"
+    );
+    assert!(
+        !beside.contains(&format!("made either: {read_failed}")),
+        "{beside}"
+    );
+    let with_folder = rollback_laid_stays(&[], &folder, std::slice::from_ref(&read_failed), &[]);
+    assert!(with_folder.contains("could not take away the folder above the program directory that it made: C:\\Above\\Folder (the platform refused"), "{with_folder}");
+    assert!(
+        with_folder.contains("It marked for removal, and a read of its name afterwards failed"),
+        "{with_folder}"
+    );
     for text in [&one, &two] {
         for step in [
             "Remove",
