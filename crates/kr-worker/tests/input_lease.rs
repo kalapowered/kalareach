@@ -5887,3 +5887,158 @@ async fn bytes_and_key_records_share_one_stream_and_a_refused_write_spends_no_nu
         "nothing of the refused write reached the terminal"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The room for input that waits for the terminal: a refused frame keeps its sequence number, the
+// queue is bounded in frames as well as in bytes, and a frame is charged what the worker stores.
+// ---------------------------------------------------------------------------------------------
+
+/// A frame of `len` bytes that names itself: a counter first, then filler, so that a frame that
+/// arrives twice, out of order or not at all shows in what the terminal was given.
+fn counted_frame(n: usize, len: usize) -> Vec<u8> {
+    let mut frame = format!("<{n:05}>").into_bytes();
+    frame.resize(len.max(frame.len()), b'.');
+    frame
+}
+
+fn bytes_content(bytes: Vec<u8>) -> InputContent {
+    InputContent::Bytes {
+        bytes: Bytes::new(bytes),
+    }
+}
+
+/// What the writer gave the terminal for the lease, in the order it gave it.
+fn written_for_the_lease(typing: &Typing) -> Vec<u8> {
+    typing
+        .wired
+        .runtime
+        .input()
+        .terminal_writes()
+        .into_iter()
+        .filter(|write| write.of_a_lease)
+        .flat_map(|write| write.bytes)
+        .collect()
+}
+
+/// Says where two byte strings first differ, without printing a megabyte.
+fn assert_same_bytes(got: &[u8], want: &[u8], what: &str) {
+    let first_difference = got.iter().zip(want).position(|(got, want)| got != want);
+    assert!(
+        got == want,
+        "{what}: {} bytes where {} were expected, first difference at {first_difference:?}",
+        got.len(),
+        want.len()
+    );
+}
+
+/// Holds the writer at the first frame it takes, which this offers, and returns what lets it go.
+///
+/// The first frame is accepted and the writer stands in it, so everything accepted after it waits
+/// behind a writer that takes nothing.
+async fn hold_the_writer(typing: &mut Typing, first: Vec<u8>) -> std::sync::mpsc::Sender<()> {
+    let (arrived, release) = typing.wired.runtime.input().writer_hold().arm();
+    typing
+        .write(bytes_content(first))
+        .await
+        .expect("the first frame is accepted");
+    arrived.await.expect("the writer took the first frame");
+    release
+}
+
+/// Offers `input` at the sequence number the rig is at until the room has come back for it, and
+/// returns how many times it was refused for room first.
+///
+/// Every try is a request of its own, so this waits on the worker's answers and not on a clock.
+/// What it refuses to wait through is any refusal that is not for room.
+async fn until_there_is_room(typing: &mut Typing, input: InputContent) -> usize {
+    let mut refused = 0;
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            match typing.write(input.clone()).await {
+                Ok(_) => return refused,
+                Err(error) => {
+                    assert_eq!(
+                        error.code,
+                        ErrorCode::ResourceUnavailable,
+                        "only room is lacking: {error:?}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the room came back once the writer was let go")
+}
+
+/// A frame the room refuses takes no place in the sequence: offered again at the same number, it is
+/// refused for room again while there is none, accepted when there is, and the terminal then has
+/// every accepted byte once and in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and is the other backend; the real pseudo-console case is in windows.rs"
+)]
+async fn a_frame_refused_for_room_keeps_its_sequence_and_arrives_once_and_in_order() {
+    const FRAME: usize = 32 * 1024;
+    let mut typing = Typing::start(None).await;
+    let first = counted_frame(0, 64);
+    let mut expected = first.clone();
+    let release = hold_the_writer(&mut typing, first).await;
+
+    let mut n = 1;
+    let (refused_frame, refusal) = loop {
+        let frame = counted_frame(n, FRAME);
+        match typing.write(bytes_content(frame.clone())).await {
+            Ok(_) => {
+                expected.extend_from_slice(&frame);
+                n += 1;
+            }
+            Err(error) => break (frame, error),
+        }
+        assert!(
+            n <= 64,
+            "the room is bounded, so a writer that is held fills it"
+        );
+    };
+    assert_eq!(refusal.code, ErrorCode::ResourceUnavailable);
+    let its_sequence = typing.sequence;
+
+    // Offered again while the room has not changed, it is refused for room again. Had the first
+    // refusal taken its place in the sequence, this would be refused for being out of order.
+    for _ in 0..2 {
+        let again = typing
+            .write(bytes_content(refused_frame.clone()))
+            .await
+            .expect_err("there is still no room");
+        assert_eq!(
+            again.code,
+            ErrorCode::ResourceUnavailable,
+            "a refused frame keeps its place, so it is refused for room and not for its number: {again:?}"
+        );
+    }
+
+    release.send(()).expect("the writer is waiting");
+    until_there_is_room(&mut typing, bytes_content(refused_frame.clone())).await;
+    assert_eq!(
+        typing.sequence,
+        its_sequence + 1,
+        "the frame was accepted at the number it was refused at"
+    );
+    expected.extend_from_slice(&refused_frame);
+    until_there_is_room(&mut typing, bytes_content(b"kr-end.".to_vec())).await;
+    expected.extend_from_slice(b"kr-end.");
+    retained_within(&typing.wired.runtime, b"kr-end.", LIVENESS_DEADLINE).await;
+
+    assert_same_bytes(
+        &written_for_the_lease(&typing),
+        &expected,
+        "the terminal was given every accepted frame once and in order, and the refused ones not at all",
+    );
+    typing
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
