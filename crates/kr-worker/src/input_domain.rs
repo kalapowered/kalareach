@@ -56,7 +56,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use kr_protocol::attachment::AttachmentCapability;
-use kr_protocol::envelope::ControlFrame;
+use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 use kr_protocol::ids::{AttachmentId, AuthorityRevision, ConnectionId, InputLeaseEpoch, SessionId};
 use kr_protocol::input::InputLeaseState;
 use kr_protocol::local::{InputLaneReady, LaneCredit, LaneEnded, LaneWindow};
@@ -69,7 +69,7 @@ use kr_term::win32::{Fidelity, KeyRecord, Keyboard, Refused};
 use crate::error::{Result, WorkerError};
 use crate::fence::{Effects, FenceDriver, FenceFrame, Outbound, Step, TakeoverReceipt};
 use crate::input::{InputLease, LeaseRefusal, PasteFramer, TakeoverFraming};
-use crate::input_lane::{BoundLane, Lane, LaneId, LaneQueue, Window};
+use crate::input_lane::{BoundLane, Lane, LaneFrame, LaneId, LaneQueue, Window};
 use crate::input_room::{
     Carried, ClaimGuard, Cost, InputRoom, LANE_WINDOW, Ledger, Outstanding, ROOM, admit,
 };
@@ -1308,9 +1308,10 @@ impl InputDomain {
     /// encoding that key records cannot express, for want of room or because the managed session is
     /// not yet taking input takes no number, and the same one is accepted when it is offered again.
     ///
-    /// A frame of a lane (`lane` names it) is also refused when the lane or its parent has ended,
-    /// and its claim is paid by the lane's reservation alone: a claim above what is reserved is a
-    /// breach of the credit the worker gave, the lane ends, and nothing is accepted.
+    /// A frame of a lane (`lane` names it and the request it answers) is also refused when the
+    /// lane or its parent has ended, and its claim is paid by the lane's reservation alone: a claim
+    /// above what is reserved is a breach of the credit the worker gave, nothing is accepted, the
+    /// refusal is queued on the lane and the lane ends behind it, all in this hold.
     ///
     /// # Errors
     ///
@@ -1329,7 +1330,7 @@ impl InputDomain {
         entering: Entering<'_>,
         authority: InputAuthority,
         now: Instant,
-        lane: Option<LaneId>,
+        lane: Option<LaneFrame>,
     ) -> Result<Accepted> {
         let authority_deadline_boot_ms = authority.boot_ms;
         if !self.state.accepts_input() {
@@ -1368,7 +1369,7 @@ impl InputDomain {
             // by nothing else: it spends the reservation, so running `admit` as well would count
             // the claim twice, and at a full room it would refuse the frame the credit was given
             // for.
-            Some(id) => Some(self.lane_admission(id, epoch, claim)?),
+            Some(frame) => Some(self.lane_admission(frame, epoch, claim)?),
             None => {
                 // Every other write, a local client's or a frame of an epoch the lease check
                 // would have refused, is admitted against everything the room has committed.
@@ -1446,6 +1447,10 @@ impl InputDomain {
         // held means nothing to fence later.
         // The prefix is paid for by this write's claim, which is longer than any prefix: the guard
         // of an earlier write that left bytes in it is let go.
+        // Set after the offer. The offer can refuse here only with the root editor's machine saying
+        // the session is closing, which takes no more input from anybody: a prefix left in the
+        // recogniser meets the same refusal when its timer releases it, and its claim goes back
+        // with it.
         self.held_guard = (outcome.held > 0).then(|| Arc::clone(&guard));
         self.held_input_deadline = if outcome.held == 0 {
             None
@@ -1996,7 +2001,17 @@ impl InputDomain {
     }
 
     /// Admits a frame of a lane against the window, and returns the counter of that window.
-    fn lane_admission(&mut self, id: LaneId, epoch: u64, claim: Cost) -> Result<Arc<Outstanding>> {
+    ///
+    /// A frame whose claim is beyond the window's credit is a breach: its refusal is queued on the
+    /// lane first and the lane's removal closes the queue behind it, so the host reads why its link
+    /// ended.
+    fn lane_admission(
+        &mut self,
+        frame: LaneFrame,
+        epoch: u64,
+        claim: Cost,
+    ) -> Result<Arc<Outstanding>> {
+        let id = frame.lane;
         if !self.lanes.get(&id).is_some_and(|lane| lane.parent_ok) {
             return Err(WorkerError::PermissionDenied {
                 detail: "this input lane has ended".to_owned(),
@@ -2012,11 +2027,19 @@ impl InputDomain {
             return Err(WorkerError::LeaseLost);
         };
         if !claim.within(window.reserved) {
-            self.end_lane(id);
-            return Err(WorkerError::ResourceUnavailable {
+            let breach = WorkerError::ResourceUnavailable {
                 detail: "lane credit breach: a frame claimed more than the worker's credit"
                     .to_owned(),
-            });
+            };
+            self.lane_answer(
+                id,
+                ControlFrame::Response(Response {
+                    request_id: frame.request_id,
+                    outcome: Outcome::Error(breach.to_protocol_error()),
+                }),
+            );
+            self.end_lane(id);
+            return Err(breach);
         }
         Ok(Arc::clone(&window.outstanding))
     }
