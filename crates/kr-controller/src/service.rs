@@ -1328,6 +1328,14 @@ impl Controller {
             .count()
     }
 
+    /// Whether a presentation this daemon made to the worker of `session_id` has not been decided
+    /// yet, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn presentation_in_flight_for_tests(&self, session_id: SessionId) -> bool {
+        self.presentation_in_flight(session_id)
+    }
+
     /// The barrier of the revision in force as the daemon holds it now, for this host's own tests.
     ///
     /// # Errors
