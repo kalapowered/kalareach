@@ -332,7 +332,7 @@ def self_test():
         for name in (
             "api-ms-win-x/../helper.dll", "api-ms-win-core-x-l1-1-0.dll\\..\\helper.dll", "ext-ms-win-x/y.dll", "api-ms-win-core-x-l1-1-0.dll.exe",
             "api-ms-win-core_x-l1-1-0.dll", "api-ms-win-core-x-l1-1-0", "ext-ms-win-c:x.dll", "api-ms-win-.dll", "api-ms-win-core-x-l1-1-0.dll\n",
-            "C:\\Windows\\System32\\kernel32.dll", "..\\kernel32.dll", "sub/kernel32.dll", "..", ".",
+            "C:\\Windows\\System32\\kernel32.dll", "C:kernel32.dll", "..\\kernel32.dll", "sub/kernel32.dll", "..", ".",
         ):
             check(f"the name {name!r} is refused as no plain name", classify(name, system, listening), "NOT A PLAIN NAME")
         check("no such name is asked of the loader", asked, [])
