@@ -717,7 +717,22 @@ async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_present
         .forget_the_worker_link_for_tests(worker.session_id)
         .await;
 
-    tokio::time::sleep(DEBT_PASS_INTERVAL * 20).await;
+    // Twenty passes. Between them, something other than the pass needs the link: whoever does waits
+    // for the presentation that is under way, and begins none of its own.
+    let until = tokio::time::Instant::now() + DEBT_PASS_INTERVAL * 20;
+    while tokio::time::Instant::now() < until {
+        let another = tokio::time::timeout(
+            Duration::from_secs(3),
+            host.controller()
+                .hold_a_worker_link_for_tests(worker.session_id),
+        )
+        .await;
+        assert!(
+            another.is_err(),
+            "nothing else gets a link while the boundary is held"
+        );
+        tokio::time::sleep(DEBT_PASS_INTERVAL * 3).await;
+    }
     assert_eq!(
         service.presentations_waiting_for_tests(),
         1,
