@@ -649,6 +649,13 @@ impl FrameReader {
             .map_err(|error| TransportError::Stream(error.to_string()))
     }
 
+    /// Completes with `true` when the peer has reset the stream, and with `false` when no reset can
+    /// come any more because the stream was finished and all of it received, or was stopped here.
+    /// It takes no data from the stream, and is safe to cancel.
+    pub async fn peer_reset(&mut self) -> bool {
+        matches!(self.stream.received_reset().await, Ok(Some(_)))
+    }
+
     /// Stops the stream, telling the peer this side will read nothing more.
     pub fn stop(&mut self) {
         let _ = self
