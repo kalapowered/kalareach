@@ -21,6 +21,10 @@ Linux or Windows one may need less than its baseline, and never more.
 
 The companion's desktop build declares macOS 14.0 as well, in the same configuration.
 
+Every Windows program, the host's and the companion's, links the static C runtime and imports no
+runtime library, so a Windows machine needs no Visual C++ redistributable to start it. The runtime
+is part of the program, and a security fix of it reaches a user only in a rebuilt release.
+
 A WSL2 distribution uses the Linux build, inside the distribution, like any other Linux host. The
 hosted `windows-2025` runner starts WSL2 distributions: `wsl-probe.yml` imports a root file system
 as WSL 2 and runs a command in it, and can be run again by hand when the runner image changes. That
