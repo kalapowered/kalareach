@@ -669,6 +669,10 @@ pub struct Controller {
     /// this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     reconciliations: std::sync::Mutex<Vec<SessionId>>,
+    /// How many challenges this daemon's recoveries have presented to workers, for this host's own
+    /// tests. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    challenges_presented: std::sync::atomic::AtomicUsize,
     /// Where this host's own tests stop a barrier's first step once it has advanced the revision
     /// and withdrawn the registrations, before the lease issuer adopts the revision. The pause
     /// holds the thread, not the task: nothing the test asks from here awaits. Compiled away in
@@ -1275,6 +1279,15 @@ impl Controller {
             .iter()
             .filter(|asked| **asked == session_id)
             .count()
+    }
+
+    /// How many challenges this daemon's recoveries have presented to workers so far, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn challenges_presented_for_tests(&self) -> usize {
+        self.challenges_presented
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether a presentation this daemon made to the worker of `session_id` has not been decided
