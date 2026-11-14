@@ -882,7 +882,7 @@ async fn frames_of_an_old_epoch_are_not_written_under_a_new_one() {
         rig.lane.try_send(&key(number)).expect("admitted");
     }
     rig.script
-        .until("the first frame", |seen| seen.frames.len() >= 1)
+        .until("the first frame", |seen| !seen.frames.is_empty())
         .await;
     let ended = rig.lane.begin_epoch(epoch(6)).expect("a new epoch");
     let ended = ended.expect("the old epoch ended");
@@ -1027,7 +1027,7 @@ async fn a_refusal_of_the_first_frame_has_no_prefix() {
     rig.lane.begin_epoch(epoch(5)).expect("an epoch");
     rig.lane.try_send(&key(0)).expect("admitted");
     rig.script
-        .until("the frame", |seen| seen.frames.len() >= 1)
+        .until("the frame", |seen| !seen.frames.is_empty())
         .await;
     rig.script.refuse(5, 0, None, ErrorCode::LeaseLost);
     let refused = rig
@@ -1125,7 +1125,7 @@ async fn the_notice_for_an_epoch_the_view_marked_to_end_is_told_with_what_the_la
     rig.lane.try_send(&key(0)).expect("admitted");
     let barrier = rig.lane.mark(None).expect("a barrier");
     rig.script
-        .until("the frame", |seen| seen.frames.len() >= 1)
+        .until("the frame", |seen| !seen.frames.is_empty())
         .await;
     rig.script.accept(5, 0);
     rig.script.epoch_ended(5, 40);
@@ -1397,7 +1397,7 @@ async fn words_that_break_the_contract_end_the_lane_and_are_not_counted() {
     rig.lane.begin_epoch(epoch(5)).expect("an epoch");
     rig.lane.try_send(&key(0)).expect("admitted");
     rig.script
-        .until("the frame", |seen| seen.frames.len() >= 1)
+        .until("the frame", |seen| !seen.frames.is_empty())
         .await;
     rig.script
         .refuse(5, 0, Some(u64::MAX), ErrorCode::LeaseLost);
@@ -1621,7 +1621,7 @@ async fn the_window_outlives_the_epoch(answer: impl FnOnce(&Script)) {
     rig.lane.begin_epoch(epoch(5)).expect("an epoch");
     rig.lane.try_send(&key(0)).expect("admitted");
     rig.script
-        .until("the frame", |seen| seen.frames.len() >= 1)
+        .until("the frame", |seen| !seen.frames.is_empty())
         .await;
     let ended = rig
         .lane
@@ -1901,7 +1901,7 @@ async fn a_connection_that_ends_with_no_refusal_ends_the_lane_as_a_connection() 
 /// stream ends as a finish the host reads, not as a reset that discards what it has not read.
 #[tokio::test]
 async fn finishing_the_lane_writes_every_frame_and_finishes_the_stream() {
-    let mut rig = rig(2).await;
+    let rig = rig(2).await;
     rig.lane.begin_epoch(epoch(5)).expect("an epoch");
     for number in 0..5 {
         rig.lane.try_send(&key(number)).expect("admitted");
@@ -2051,7 +2051,9 @@ async fn a_launch_holds_later_typing_until_its_own_marker() {
     let pasted = rig.lane.try_send_paste(&bracketed(b"hi")).expect("held");
     assert!(pasted.iter().all(|writing| writing.sequence.is_none()));
     rig.script
-        .until("the frame before the launch", |seen| seen.frames.len() >= 1)
+        .until("the frame before the launch", |seen| {
+            !seen.frames.is_empty()
+        })
         .await;
     rig.script.accept(5, 0);
     rig.script.marker(6);
@@ -2126,7 +2128,9 @@ async fn a_discard_counts_its_bytes_once_and_leaves_no_gap() {
     rig.lane.try_send(&key(0)).expect("admitted");
     rig.lane.mark(Some(1)).expect("a barrier");
     rig.script
-        .until("the frame before the launch", |seen| seen.frames.len() >= 1)
+        .until("the frame before the launch", |seen| {
+            !seen.frames.is_empty()
+        })
         .await;
     for number in 1..4 {
         rig.lane.try_send(&key(number)).expect("held");
@@ -2202,7 +2206,7 @@ async fn a_barrier_that_times_out_leaves_the_hold_in_place() {
     let barrier = rig.lane.mark(Some(7)).expect("a barrier");
     rig.lane.try_send(&key(1)).expect("held");
     rig.script
-        .until("the frame", |seen| seen.frames.len() >= 1)
+        .until("the frame", |seen| !seen.frames.is_empty())
         .await;
     rig.deadlines.fire(DeadlineKind::Admission);
     assert_eq!(
@@ -2300,7 +2304,7 @@ mod the_hold_ends {
         rig.lane.try_send(&key(1)).expect("held");
         rig.lane.try_send(&key(2)).expect("held");
         rig.script
-            .until("the key before the launch", |seen| seen.frames.len() >= 1)
+            .until("the key before the launch", |seen| !seen.frames.is_empty())
             .await;
         rig.settled().await;
         rig
