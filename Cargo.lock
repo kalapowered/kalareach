@@ -4602,6 +4602,7 @@ dependencies = [
  "kr-ipc",
  "kr-protocol",
  "kr-worker",
+ "libc",
  "quick-xml 0.42.0",
  "serde",
  "serde_json",

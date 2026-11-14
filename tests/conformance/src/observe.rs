@@ -7,10 +7,10 @@
 //! person can tell a file the linker left empty or cut short from one that is whole. It decides
 //! nothing, removes nothing, and starts no program.
 
-use std::fs::{File, Metadata};
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -44,6 +44,10 @@ const SEGMENT_64: u32 = 0x19;
 /// What a step's log says about programs the system would not start.
 #[derive(Clone, Debug, Serialize)]
 pub struct Observed {
+    /// Why the log was not read, when it was not: what was found at its path in place of a regular
+    /// file, or why it could not be read. No program is then named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<Found>,
     /// Each program, in the order the log names them.
     pub programs: Vec<Program>,
     /// Whether the log also shows a test that ran and failed. Such a step failed for more than a
@@ -143,7 +147,8 @@ fn opens_test_output(line: &str) -> bool {
 /// second value says whether the log shows a test that failed.
 fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
     let mut found: Vec<Refusal> = Vec::new();
-    let mut shell: Vec<String> = Vec::new();
+    // The shell's lines, as many distinct programs as a step can name: no more can be used.
+    let mut shell: Vec<(String, String)> = Vec::new();
     let mut saw_126 = false;
     let mut test_failed = false;
     let mut in_test_output = false;
@@ -195,16 +200,16 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
                     lines: vec![trimmed.to_owned()],
                 });
             }
-        } else if shell_refusal(trimmed).is_some() {
-            shell.push(trimmed.to_owned());
+        } else if let Some(path) = shell_refusal(trimmed)
+            && shell.len() < MOST_PROGRAMS
+            && !shell.iter().any(|(known, _)| *known == path)
+        {
+            shell.push((path, trimmed.to_owned()));
         }
     }
     if saw_126 {
-        for line in shell {
-            if let Some(path) = shell_refusal(&line)
-                && found.len() < MOST_PROGRAMS
-                && !found.iter().any(|known| known.path == path)
-            {
+        for (path, line) in shell {
+            if found.len() < MOST_PROGRAMS && !found.iter().any(|known| known.path == path) {
                 found.push(Refusal {
                     path,
                     lines: vec![line],
@@ -244,15 +249,35 @@ fn shell_refusal(line: &str) -> Option<String> {
 }
 
 /// What a step's log, read at the moment the step ended, says of the programs it could not run.
-/// `None` when it names none, or when the log cannot be read.
+/// `None` when it names none, or when there is no log. A log that is a link or another object that is
+/// not a regular file, or that cannot be read in [`READ_LIMIT`], is recorded as such and not read.
 #[must_use]
 pub fn observe_log(log: &Path, now: SystemTime) -> Option<Observed> {
-    let reader = BufReader::new(File::open(log).ok()?);
-    let (refused, test_failed) = refusals(Lines { reader });
+    if matches!(std::fs::symlink_metadata(log), Err(error) if error.kind() == ErrorKind::NotFound) {
+        return None;
+    }
+    let unread = |found| {
+        Some(Observed {
+            log: Some(found),
+            programs: Vec::new(),
+            test_failed: false,
+        })
+    };
+    let seen = match examine(log) {
+        Ok(seen) => seen,
+        Err(found) => return unread(found),
+    };
+    let owned = log.to_path_buf();
+    let (refused, test_failed) = match bounded(READ_LIMIT, move || read_log(&owned, &seen)) {
+        Ok(Ok(read)) => read,
+        Ok(Err(found)) => return unread(found),
+        Err(reason) => return unread(Found::NotRead { reason }),
+    };
     if refused.is_empty() {
         return None;
     }
     Some(Observed {
+        log: None,
         programs: refused
             .into_iter()
             .map(|refusal| Program {
@@ -264,6 +289,14 @@ pub fn observe_log(log: &Path, now: SystemTime) -> Option<Observed> {
             .collect(),
         test_failed,
     })
+}
+
+/// The programs a log that was opened names, and whether it shows a test that failed.
+fn read_log(log: &Path, seen: &Metadata) -> Result<(Vec<Refusal>, bool), Found> {
+    let (file, _) = open_looked(log, seen)?;
+    Ok(refusals(Lines {
+        reader: BufReader::new(file),
+    }))
 }
 
 /// The lines of a log, none longer than [`LONGEST_LINE`] bytes, with invalid text replaced.
@@ -292,6 +325,28 @@ fn epoch(time: SystemTime) -> Option<u64> {
         .map(|since| since.as_secs())
 }
 
+/// Runs `work` on a thread of its own and waits `limit` for what it returns. A thread that cannot
+/// be made, or work that does not end in time, is an error that says so; the caller is not held,
+/// and the thread is left to end by itself.
+fn bounded<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("observation".to_owned())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|error| format!("a thread to read it could not be made: {error}"))?;
+    receiver.recv_timeout(limit).map_err(|error| match error {
+        RecvTimeoutError::Timeout => {
+            format!("the read did not end in {} seconds", limit.as_secs_f64())
+        }
+        RecvTimeoutError::Disconnected => "the read ended with no result".to_owned(),
+    })
+}
+
 /// Whether two descriptions are of one file object.
 #[cfg(unix)]
 fn same_object(a: &Metadata, b: &Metadata) -> bool {
@@ -299,16 +354,26 @@ fn same_object(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
 }
 
+/// Windows offers no stable identity of an open file, so a regular file that replaced the one
+/// that was examined is not told apart here: only a link is.
 #[cfg(not(unix))]
 fn same_object(_a: &Metadata, _b: &Metadata) -> bool {
     true
 }
 
+/// Windows' attribute of a link, a junction or a mount point.
+#[cfg(windows)]
+const REPARSE_POINT: u32 = 0x400;
+
+/// Windows' flag that opens a link itself and not the object it leads to.
+#[cfg(windows)]
+const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
 /// Whether the system marks the object as a link that the path leads through.
 #[cfg(windows)]
 fn redirects(metadata: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
-    metadata.file_attributes() & 0x400 != 0
+    metadata.file_attributes() & REPARSE_POINT != 0
 }
 
 #[cfg(not(windows))]
@@ -316,78 +381,124 @@ fn redirects(_metadata: &Metadata) -> bool {
     false
 }
 
-/// What is at `path`: looked at with `lstat` first, and read only when it is a regular file.
-#[must_use]
-pub fn observe_file(path: &Path) -> Found {
-    let seen = match std::fs::symlink_metadata(path) {
-        Ok(seen) => seen,
+/// What an object is when it is not a regular file, or none when it is one.
+fn irregular(metadata: &Metadata) -> Option<&'static str> {
+    let kind = metadata.file_type();
+    if kind.is_symlink() || redirects(metadata) {
+        Some("a link")
+    } else if kind.is_dir() {
+        Some("a directory")
+    } else if kind.is_file() {
+        None
+    } else {
+        Some("an object that is not a regular file")
+    }
+}
+
+/// Opens the file at `path` for reading without following a link at its last part, and without
+/// waiting for a writer when it is a pipe.
+#[cfg(unix)]
+fn open_without_following(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_without_following(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Looks at `path` without following a link: its description when it is a regular file, or what
+/// was found, to be recorded in place of a read.
+fn examine(path: &Path) -> Result<Metadata, Found> {
+    let seen = std::fs::symlink_metadata(path).map_err(|error| Found::NotRead {
+        reason: format!("the path could not be examined: {error}"),
+    })?;
+    match irregular(&seen) {
+        Some(kind) => Err(Found::Other {
+            kind: kind.to_owned(),
+        }),
+        None => Ok(seen),
+    }
+}
+
+/// Opens the regular file that [`examine`] described, and takes it only if the object opened is
+/// that file: a link put at the name since, or any other object, is what is found instead.
+fn open_looked(path: &Path, seen: &Metadata) -> Result<(File, Metadata), Found> {
+    let file = match open_without_following(path) {
+        Ok(file) => file,
         Err(error) => {
-            return Found::NotRead {
-                reason: format!("the path could not be examined: {error}"),
-            };
+            return Err(match std::fs::symlink_metadata(path) {
+                Ok(now) if irregular(&now) == Some("a link") => Found::Other {
+                    kind: "a link".to_owned(),
+                },
+                _ => Found::NotRead {
+                    reason: format!("the file could not be opened: {error}"),
+                },
+            });
         }
     };
-    let kind = seen.file_type();
-    if kind.is_symlink() || redirects(&seen) {
-        return Found::Other {
-            kind: "a link".to_owned(),
-        };
+    let opened = file.metadata().map_err(|error| Found::NotRead {
+        reason: format!("the file could not be described: {error}"),
+    })?;
+    if let Some(kind) = irregular(&opened) {
+        return Err(Found::Other {
+            kind: kind.to_owned(),
+        });
     }
-    if kind.is_dir() {
-        return Found::Other {
-            kind: "a directory".to_owned(),
-        };
+    if !same_object(seen, &opened) {
+        return Err(Found::NotRead {
+            reason: "the path no longer leads to the file that was looked at".to_owned(),
+        });
     }
-    if !kind.is_file() {
-        return Found::Other {
-            kind: "an object that is not a regular file".to_owned(),
-        };
-    }
-    let (modified, created) = (
-        seen.modified().ok().and_then(epoch),
-        seen.created().ok().and_then(epoch),
-    );
+    Ok((file, opened))
+}
+
+/// What is at `path`: looked at with `lstat` first, opened without following a link, and read only
+/// when it is a regular file.
+#[must_use]
+pub fn observe_file(path: &Path) -> Found {
+    let seen = match examine(path) {
+        Ok(seen) => seen,
+        Err(found) => return found,
+    };
     let owned = path.to_path_buf();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(read_head(&owned, &seen));
-    });
-    match receiver.recv_timeout(READ_LIMIT) {
-        Ok(Ok((head, length))) => Found::Read {
-            size: length,
+    match bounded(READ_LIMIT, move || read_head(&owned, &seen)) {
+        Ok(Ok((head, opened))) => Found::Read {
+            size: opened.len(),
             first_bytes: head
                 .iter()
                 .take(32)
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<Vec<_>>()
                 .join(" "),
-            modified,
-            created,
-            damage: damage_of(&head, length),
+            modified: opened.modified().ok().and_then(epoch),
+            created: opened.created().ok().and_then(epoch),
+            damage: damage_of(&head, opened.len()),
         },
-        Ok(Err(reason)) => Found::NotRead { reason },
-        Err(_) => Found::NotRead {
-            reason: format!("the read did not end in {} seconds", READ_LIMIT.as_secs()),
-        },
+        Ok(Err(found)) => found,
+        Err(reason) => Found::NotRead { reason },
     }
 }
 
-/// The first bytes of the file `seen` described, and its length, when the path still leads to that
-/// regular file.
-fn read_head(path: &Path, seen: &Metadata) -> Result<(Vec<u8>, u64), String> {
-    let file =
-        File::open(path).map_err(|error| format!("the file could not be opened: {error}"))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| format!("the file could not be described: {error}"))?;
-    if !opened.is_file() || !same_object(seen, &opened) {
-        return Err("the path no longer leads to the file that was looked at".to_owned());
-    }
+/// The first bytes of the file `seen` described, and what the opened file is, when the path still
+/// leads to that regular file.
+fn read_head(path: &Path, seen: &Metadata) -> Result<(Vec<u8>, Metadata), Found> {
+    let (file, opened) = open_looked(path, seen)?;
     let mut head = Vec::new();
     file.take(HEAD_BYTES as u64)
         .read_to_end(&mut head)
-        .map_err(|error| format!("the file could not be read: {error}"))?;
-    Ok((head, opened.len()))
+        .map_err(|error| Found::NotRead {
+            reason: format!("the file could not be read: {error}"),
+        })?;
+    Ok((head, opened))
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
@@ -570,6 +681,7 @@ mod tests {
             },
         };
         let mut observed = Observed {
+            log: None,
             programs: vec![damaged],
             test_failed: false,
         };
@@ -624,6 +736,22 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_s_lines_are_kept_for_eight_programs_and_still_name_those_the_other_lines_did_not()
+    {
+        let mut lines = vec![
+            "kr-conformance run-one: /t/p could not start: no".to_owned(),
+            "process didn't exit successfully: `/t/p` (exit status: 126)".to_owned(),
+        ];
+        lines.extend((0..40).map(|_| "/t/p: /t/p: cannot execute binary file".to_owned()));
+        lines.extend(
+            ["q", "r"].map(|name| format!("/t/{name}: /t/{name}: cannot execute binary file")),
+        );
+        let (found, _) = refusals(lines.into_iter());
+        let paths: Vec<&str> = found.iter().map(|refusal| refusal.path.as_str()).collect();
+        assert_eq!(paths, ["/t/p", "/t/q", "/t/r"]);
+    }
+
+    #[test]
     fn a_log_names_at_most_eight_programs() {
         let lines: Vec<String> = (0..20)
             .map(|n| format!("kr-conformance run-one: /t/p{n} could not start: no"))
@@ -666,7 +794,9 @@ mod files {
         std::fs::write(&looked_at, vec![1_u8; 5000]).unwrap();
         std::fs::write(&now, vec![0_u8; 9000]).unwrap();
         let seen = std::fs::symlink_metadata(&looked_at).unwrap();
-        let reason = read_head(&now, &seen).unwrap_err();
+        let Found::NotRead { reason } = read_head(&now, &seen).unwrap_err() else {
+            panic!("another file is not read");
+        };
         assert!(reason.contains("no longer leads"), "{reason}");
         assert!(read_head(&looked_at, &seen).is_ok());
     }
@@ -719,6 +849,131 @@ mod files {
         };
         assert!(kind.contains("not a regular file"), "{kind}");
         assert!(began.elapsed() < READ_LIMIT);
+    }
+
+    /// Makes a pipe at `path`.
+    #[cfg(unix)]
+    fn pipe(path: &Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    }
+
+    /// Moves the file at `name` to `moved` and puts a link at `name` to it. Windows lets an account
+    /// make a link only with a privilege, so this says whether the link was made.
+    fn replaced_by_a_link(name: &Path, moved: &Path) -> bool {
+        std::fs::rename(name, moved).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(moved, name).unwrap();
+            true
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(moved, name).is_ok()
+        }
+    }
+
+    #[test]
+    fn a_link_put_at_the_name_after_the_look_is_named_and_the_bytes_it_leads_to_are_not_read() {
+        let held = tempfile::tempdir().unwrap();
+        let name = held.path().join("program");
+        std::fs::write(&name, vec![7_u8; 9000]).unwrap();
+        let seen = examine(&name).unwrap();
+        if !replaced_by_a_link(&name, &held.path().join("moved")) {
+            eprintln!("this account cannot make a link, so the case did not run");
+            return;
+        }
+        let Err(Found::Other { kind }) = read_head(&name, &seen) else {
+            panic!("a link is not read");
+        };
+        assert_eq!(kind, "a link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_put_at_the_name_after_the_look_is_named_and_not_waited_for() {
+        let held = tempfile::tempdir().unwrap();
+        let name = held.path().join("program");
+        std::fs::write(&name, vec![7_u8; 9000]).unwrap();
+        let seen = examine(&name).unwrap();
+        std::fs::remove_file(&name).unwrap();
+        pipe(&name);
+        // The read is given a generous wait only so that a regression ends this case.
+        let read = bounded(Duration::from_secs(5), move || read_head(&name, &seen));
+        let Ok(Err(Found::Other { kind })) = read else {
+            panic!("the open of a pipe waited for a writer: {read:?}");
+        };
+        assert!(kind.contains("not a regular file"), "{kind}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_is_a_link_is_named_and_its_lines_are_not_read() {
+        let held = tempfile::tempdir().unwrap();
+        let real = held.path().join("real.log");
+        std::fs::write(
+            &real,
+            "kr-conformance run-one: /t/p could not start: Exec format error (os error 8)\n",
+        )
+        .unwrap();
+        let log = held.path().join("step.log");
+        std::os::unix::fs::symlink(&real, &log).unwrap();
+        let observed = observe_log(&log, SystemTime::now()).expect("the log is recorded");
+        assert!(matches!(&observed.log, Some(Found::Other { kind }) if kind == "a link"));
+        assert!(observed.programs.is_empty());
+        assert!(!observed.damage_seen());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_is_a_pipe_is_named_and_not_waited_for() {
+        let held = tempfile::tempdir().unwrap();
+        let log = held.path().join("step.log");
+        pipe(&log);
+        // The call is given a generous wait only so that a regression ends this case.
+        let read = bounded(Duration::from_secs(5), move || {
+            observe_log(&log, SystemTime::now())
+        });
+        let Ok(Some(observed)) = read else {
+            panic!("the read of a pipe waited for a writer: {read:?}");
+        };
+        assert!(
+            matches!(&observed.log, Some(Found::Other { kind }) if kind.contains("not a regular file")),
+            "{observed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_or_a_pipe_put_at_the_log_s_name_after_the_look_is_not_read() {
+        let held = tempfile::tempdir().unwrap();
+        let log = held.path().join("step.log");
+        std::fs::write(&log, "kr-conformance run-one: /t/p could not start: no\n").unwrap();
+        let seen = examine(&log).unwrap();
+        assert!(replaced_by_a_link(&log, &held.path().join("moved.log")));
+        let Err(Found::Other { kind }) = read_log(&log, &seen) else {
+            panic!("a link is not read");
+        };
+        assert_eq!(kind, "a link");
+        std::fs::remove_file(&log).unwrap();
+        pipe(&log);
+        let read = bounded(Duration::from_secs(5), move || read_log(&log, &seen));
+        let Ok(Err(Found::Other { kind })) = read else {
+            panic!("the open of a pipe waited for a writer: {read:?}");
+        };
+        assert!(kind.contains("not a regular file"), "{kind}");
+    }
+
+    #[test]
+    fn work_that_does_not_end_gives_the_caller_an_error_and_does_not_hold_it() {
+        let (_keep, wait) = mpsc::channel::<()>();
+        let (_unused, never) = mpsc::channel::<()>();
+        drop(wait);
+        let error = bounded(Duration::from_millis(100), move || never.recv()).unwrap_err();
+        assert!(error.contains("did not end"), "{error}");
     }
 
     #[test]
