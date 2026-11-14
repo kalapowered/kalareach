@@ -2993,7 +2993,10 @@ impl Session {
     /// # Errors
     ///
     /// Returns [`WorkerError::LeaseLost`] for a stale epoch or a caller that does not hold the
-    /// lease, and an invalid-argument failure when the sequence does not follow.
+    /// lease, an invalid-argument failure when the sequence does not follow,
+    /// [`WorkerError::InputRoomFull`] when the application is not reading and what waits for it is
+    /// at a bound, and [`WorkerError::SessionClosed`] or an unavailable resource when the session
+    /// takes no input or its terminal has gone. A refused write takes no sequence number.
     pub fn write_input(
         &mut self,
         attachment_id: AttachmentId,
@@ -5559,6 +5562,15 @@ pub struct InputAccepted {
 /// of answers cannot take the whole budget and leave a person unable to type.
 pub const MAX_PENDING_REPLY_BYTES: usize = 64 * 1024;
 
+/// How many of the host's own answers may wait for an application that is not reading, as entries.
+///
+/// The share in bytes does not bound them as entries: answers to the common questions are a few
+/// bytes each, so the share holds thousands of them, and that many entries would fill the room
+/// that a person's keystrokes are counted in. It is the same fraction of [`MAX_QUEUED_INPUT_FRAMES`]
+/// as the share in bytes is of [`MAX_QUEUED_INPUT_BYTES`], so a burst of answers cannot take every
+/// place and leave a person unable to type.
+pub const MAX_PENDING_REPLY_FRAMES: usize = 256;
+
 /// How much input may be waiting for the pseudo-terminal, across every producer at once.
 ///
 /// One budget, because there is one pseudo-terminal and one application behind it. A lease holder's
@@ -5578,7 +5590,9 @@ pub const MAX_QUEUED_INPUT_BYTES: usize = 1024 * 1024;
 /// that sends one byte at a time to an application that does not read would hold about a million
 /// entries inside the same megabyte. This is counted beside [`MAX_QUEUED_INPUT_BYTES`], from the
 /// moment a write is accepted until the writer has given the terminal its last byte or has dropped
-/// it, and a write beyond either bound is refused with the same named result.
+/// it. A write is refused, with the same named result as for bytes, when it would leave less than
+/// one entry free beside its own, because the last place belongs to the prefix of a paste delimiter
+/// that the recogniser may still release by itself: at most one fewer write than this waits.
 pub const MAX_QUEUED_INPUT_FRAMES: usize = 4096;
 
 /// A cursor on the output stream.

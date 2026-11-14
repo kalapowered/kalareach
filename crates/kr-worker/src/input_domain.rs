@@ -70,7 +70,7 @@ use crate::input::{InputLease, LeaseRefusal, PasteFramer, TakeoverFraming};
 use crate::input_room::{Cost, InputRoom, admit};
 use crate::session::{
     FenceOutcome, GrantedBy, InputAccepted, InputAuthority, InputBatch, Interrupted, LeaseEnded,
-    MAX_PENDING_REPLY_BYTES, PasteTransition,
+    MAX_PENDING_REPLY_BYTES, MAX_PENDING_REPLY_FRAMES, PasteTransition,
 };
 
 /// One entry in a session's queue for the pseudo-terminal.
@@ -931,7 +931,7 @@ impl InputDomain {
     /// Queues one batch at a place in the queue for the terminal, counted as [`Self::queue_input`]
     /// counts it.
     fn queue_input_at(&mut self, at: usize, batch: InputBatch) {
-        self.writer.room.charge(Cost::of(&batch));
+        self.writer.room.charge(&batch);
         if let InputBatch::Lease { epoch, .. } = batch {
             self.writer.queued_lease_bytes.add(epoch, batch.len());
         }
@@ -1043,6 +1043,7 @@ impl InputDomain {
             // queue. What the root editor's machine is holding counts towards the second, because
             // it is accepted input on its way to the same terminal.
             if held.saturating_add(reply.bytes.len()) > MAX_PENDING_REPLY_BYTES
+                || self.writer.room.held_replies() >= MAX_PENDING_REPLY_FRAMES
                 || admit(
                     self.held_for_the_terminal(),
                     Cost::claimed_by(reply.bytes.len()),
@@ -1220,8 +1221,11 @@ impl InputDomain {
     /// # Errors
     ///
     /// Returns what [`Self::accept`] returns, [`WorkerError::InvalidArgument`] when the spelling is
-    /// longer than one input frame may carry, and [`WorkerError::InputIncompatible`] while the
-    /// application has negotiated an encoding that legacy input cannot express.
+    /// longer than one input frame may carry, [`WorkerError::InputIncompatible`] while the
+    /// application has negotiated an encoding that legacy input cannot express,
+    /// [`WorkerError::InputRoomFull`] when what waits for the terminal leaves no room for the write,
+    /// and [`WorkerError::PreconditionFailed`] while a managed session takes no external input.
+    /// None of them takes the write's sequence number.
     pub(crate) fn accept_entering(
         &mut self,
         attachment_id: AttachmentId,
@@ -1691,7 +1695,9 @@ impl InputDomain {
 mod tests {
     use super::*;
     use crate::input::PASTE_END;
-    use crate::session::{MAX_QUEUED_INPUT_BYTES, MAX_QUEUED_INPUT_FRAMES};
+    use crate::session::{
+        MAX_PENDING_REPLY_FRAMES, MAX_QUEUED_INPUT_BYTES, MAX_QUEUED_INPUT_FRAMES,
+    };
     use kr_protocol::ids::SessionId;
 
     fn domain() -> InputDomain {
@@ -1853,6 +1859,32 @@ mod tests {
             "the entry that is left is the one kept for the recogniser"
         );
         assert!(input.input_room().held().frames <= MAX_QUEUED_INPUT_FRAMES);
+    }
+
+    /// The host's answers have a share of the entries as well as of the bytes: a burst of short
+    /// answers to an application that does not read stops at its share, and a person's keys still
+    /// have room.
+    #[test]
+    fn short_answers_stop_at_their_share_of_the_entries_and_leave_room_to_type() {
+        let mut input = domain();
+        let short = || crate::projection::LaneReply {
+            cursor_report: false,
+            bytes: b"\x1b[0n".to_vec(),
+            expires_at_ms: None,
+        };
+        for _ in 0..MAX_PENDING_REPLY_FRAMES + 5 {
+            let _ = input.queue_replies(vec![short()]);
+        }
+        assert_eq!(
+            input.take_pending().len(),
+            MAX_PENDING_REPLY_FRAMES,
+            "the answers queued are the share and no more"
+        );
+        assert_eq!(input.input_room().held_replies(), MAX_PENDING_REPLY_FRAMES);
+        assert!(
+            admit(input.held_for_the_terminal(), Cost::claimed_by(1)).is_ok(),
+            "a keystroke still fits beside a full share of answers"
+        );
     }
 
     /// KR-REQ-08.48: a reply bypasses the paste recogniser. Bytes of a reply that the recogniser
