@@ -5161,7 +5161,8 @@ impl WorkerService {
                 ),
             );
         }
-        // This worker binds no input lane, so it refuses the role and the connection keeps none.
+        // This worker binds no input lane, so it refuses the role and the connection keeps the role
+        // it had.
         if role == ControllerConnectionRole::ProxyInput {
             return failure(
                 RequestId::new(0),

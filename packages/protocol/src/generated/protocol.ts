@@ -1041,11 +1041,13 @@ export type CapabilityId = string
  */
 export type SessionEpoch = string
 /**
- * What the host sends on an authorised control stream outside a response.
+ * What a peer sends on an authorised control stream outside a response.
  *
  * The control stream carries ordinary [`Notification`] events once the connection is authorised.
- * These two messages are the connection's own, not an application event: the freshness resource
- * and the transport's liveness belong to the connection rather than to any session.
+ * These messages are the connection's own, not an application event. The host sends the first two:
+ * the freshness resource and the transport's liveness belong to the connection rather than to any
+ * session. A worker sends the other three, on the connection of an input lane to the control
+ * daemon, and the host never forwards them to a device.
  */
 export type ControlEvent =
   | {
@@ -8321,7 +8323,8 @@ export interface LaneWindow {
    */
   epoch: string
   /**
-   * The window's frames, in the worker's unit. Nought when `holder` is false.
+   * The window's frames, as queue entries: `InputClaim::frames` counts two for each frame.
+   * Nought when `holder` is false.
    */
   frames: number
   /**
@@ -8358,7 +8361,7 @@ export interface LaneCredit {
    */
   epoch: string
   /**
-   * Frames given back, in the worker's unit.
+   * Queue entries given back, as `InputClaim::frames` counts them: two for each frame.
    */
   frames: number
 }
@@ -10655,7 +10658,8 @@ export interface InputLaneReady {
    */
   epoch: string
   /**
-   * The window's frames, in the worker's unit. Nought when the lane is not the holder's.
+   * The window's frames, as queue entries: `InputClaim::frames` counts two for each frame.
+   * Nought when the lane is not the holder's.
    */
   frames: number
   /**
@@ -18885,8 +18889,7 @@ export interface InputLeaseState1 {
  * One frame of typing on a terminal-input stream, from the client to the host.
  *
  * A frame is one batch: the worker accepts all of its bytes or none of them. The sequence counts
- * frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream. The debug
- * form shows how many bytes the frame holds and never what they are: they are what a person typed.
+ * frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream.
  */
 export interface InputFrame {
   /**
@@ -19020,8 +19023,11 @@ export interface InputReleaseParams {
  * against its requests on the control stream. A request that must come after some typing names
  * the first `count` frames of one lease epoch for one attachment, sequences 0 to `count - 1`,
  * counted over every frame the client has admitted, including frames it has not yet written. The
- * worker applies the request only when it has accepted that many frames of the epoch, and
- * refuses it otherwise. It checks the position and never waits for it.
+ * worker applies the request, while that epoch is the attachment's current one, only when it has
+ * accepted that many frames of it, and refuses it otherwise. It checks the position and never
+ * waits for it. Once the epoch is no longer current there is nothing left to order: the position
+ * is not consulted, a release or a launch of a stale epoch is refused as a lost lease, and a
+ * detach goes ahead.
  */
 export interface InputBarrier {
   /**
@@ -29666,6 +29672,7 @@ export interface SessionDetachParams {
    * Absent from the wire when the caller asks for no such order, and sent only to a worker that
    * states the input lane, since a worker refuses a member it does not know. A request that
    * uses none of the optional members is byte for byte what a worker built before them reads.
+   * The `session.detached` notification, which carries these parameters, never has it.
    */
   after_input?: InputBarrier | null
   /**
@@ -29682,7 +29689,7 @@ export interface SessionDetachParams {
    * True when the caller wants the count of bytes this detach discarded in the answer.
    *
    * Absent from the wire when false, and sent only to a worker that states the input lane, for
-   * the reason `after_input` gives.
+   * the reason `after_input` gives. The `session.detached` notification never has it.
    */
   fenced_report?: boolean
   /**

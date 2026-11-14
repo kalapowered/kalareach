@@ -14,6 +14,7 @@ use kr_protocol::input::{
     INPUT_FRAME_OVERHEAD, InputAck, InputClaim, InputFrame, InputWindow, PASTE_END_LEN,
     input_claim, max_input_bytes,
 };
+use kr_protocol::limits::MAX_INPUT_FRAME_LEN;
 use kr_protocol::scalars::{Bytes, Nullable, U64};
 use kr_protocol::wire::WireMessage;
 use serde_json::json;
@@ -144,7 +145,7 @@ fn the_most_a_frame_holds_is_exact_at_the_floor_and_at_the_ceiling() {
         INPUT_FRAME_OVERHEAD,
         "the overhead is what the widest frame adds to its bytes"
     );
-    for limit in [1024, 4096, 64 * 1024] {
+    for limit in [1024, 4096, MAX_INPUT_FRAME_LEN] {
         let most = max_input_bytes(limit);
         assert_eq!(
             encoded_len(most) + 4,
@@ -179,6 +180,12 @@ fn a_frames_claim_is_two_entries_and_its_bytes_with_the_delimiter() {
         }
     );
     assert_eq!(input_claim(usize::MAX).bytes, usize::MAX, "it saturates");
+}
+
+fn error_wire() -> CanonicalValue {
+    ParamsValue::from_typed(&error())
+        .expect("it writes")
+        .into_value()
 }
 
 fn error() -> ProtocolError {
@@ -242,23 +249,28 @@ fn a_refusal_carries_the_accepted_prefix_or_null() {
         (Nullable::some(InputSequence::new(4)), number(4)),
         (Nullable::null(), CanonicalValue::Null),
     ] {
-        let refused = InputAck::Refused {
-            epoch: InputLeaseEpoch::new(3),
-            sequence: InputSequence::new(5),
-            accepted_through,
-            error: error(),
-        };
-        let value = ParamsValue::from_typed(&refused).expect("it writes");
-        let CanonicalValue::Map(members) = value.as_value() else {
-            panic!("a map");
-        };
-        assert_eq!(members.get("kind"), Some(&text("refused")));
-        assert_eq!(members.get("epoch"), Some(&number(3)));
-        assert_eq!(members.get("sequence"), Some(&number(5)));
-        assert_eq!(members.get("accepted_through"), Some(&wire));
-        let read: InputAck = value.to_typed().expect("it reads back");
-        assert_eq!(read, refused);
+        let expected = map(vec![
+            ("kind", text("refused")),
+            ("epoch", number(3)),
+            ("sequence", number(5)),
+            ("accepted_through", wire),
+            ("error", error_wire()),
+        ]);
+        reads_and_writes_back(
+            &expected,
+            &InputAck::Refused {
+                epoch: InputLeaseEpoch::new(3),
+                sequence: InputSequence::new(5),
+                accepted_through,
+                error: error(),
+            },
+        );
     }
+    // The error is the protocol's own, under the name `error`: its code is the stable word.
+    let CanonicalValue::Map(members) = error_wire() else {
+        panic!("a map");
+    };
+    assert_eq!(members.get("code"), Some(&text("LEASE_LOST")));
 }
 
 /// An answer is closed: a member it has no place for, a tag it does not know, and a null where the
@@ -272,6 +284,15 @@ fn an_answer_refuses_what_it_has_no_place_for() {
             vec![("epoch", number(3)), ("through", number(4))],
         ),
         ("launch_reserved", vec![("launch", number(9))]),
+        (
+            "refused",
+            vec![
+                ("epoch", number(3)),
+                ("sequence", number(5)),
+                ("accepted_through", CanonicalValue::Null),
+                ("error", error_wire()),
+            ],
+        ),
         (
             "epoch_ended",
             vec![("epoch", number(3)), ("fenced_bytes", number(0))],

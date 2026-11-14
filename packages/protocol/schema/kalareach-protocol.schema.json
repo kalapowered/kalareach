@@ -10700,7 +10700,7 @@
       ]
     },
     "ControlEvent": {
-      "description": "What the host sends on an authorised control stream outside a response.\n\nThe control stream carries ordinary [`Notification`] events once the connection is authorised.\nThese two messages are the connection's own, not an application event: the freshness resource\nand the transport's liveness belong to the connection rather than to any session.",
+      "description": "What a peer sends on an authorised control stream outside a response.\n\nThe control stream carries ordinary [`Notification`] events once the connection is authorised.\nThese messages are the connection's own, not an application event. The host sends the first two:\nthe freshness resource and the transport's liveness belong to the connection rather than to any\nsession. A worker sends the other three, on the connection of an input lane to the control\ndaemon, and the host never forwards them to a device.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -11394,7 +11394,7 @@
         },
         {
           "const": "proxy_input",
-          "description": "The connection the daemon carries one attachment's typing to the worker over.\n\nIt is a second link for an attachment that a `Proxy` connection owns, and it borrows that\nconnection's binding: it holds no attachment of its own, so closing it detaches nothing. It\ncarries `input.write` for that attachment and nothing else, so a key never waits behind the\nrequests of the proxy connection, and the worker's answers on it are the lane's own frames\n([`InputLaneReady`] and the events [`LaneWindow`], [`LaneCredit`] and [`LaneLaunch`]). A\nreplacement generation fences it along with the authority itself. A worker that does not\nstate the input lane does not know the role, and the daemon never declares it to one.",
+          "description": "The connection the daemon carries one attachment's typing to the worker over.\n\nIt is a second link for an attachment that a `Proxy` connection owns, and it borrows that\nconnection's binding: it holds no attachment of its own, so closing it detaches nothing. It\ncarries `input.write` for that attachment and nothing else, so a key never waits behind the\nrequests of the proxy connection. The worker answers each write, and writes the lane's own\nframes ([`InputLaneReady`] and the events [`LaneWindow`], [`LaneCredit`] and\n[`LaneLaunch`]). A replacement generation fences it along with the authority itself. A\nworker serves the role only once it binds input lanes and refuses it until then. The daemon\ndeclares it only to a worker that states the input lane.",
           "type": "string"
         }
       ]
@@ -19907,7 +19907,7 @@
     },
     "InputBarrier": {
       "additionalProperties": false,
-      "description": "The typing that must have arrived at the worker before a request is applied.\n\nA client that sends its typing on a stream of its own cannot rely on the order of that stream\nagainst its requests on the control stream. A request that must come after some typing names\nthe first `count` frames of one lease epoch for one attachment, sequences 0 to `count - 1`,\ncounted over every frame the client has admitted, including frames it has not yet written. The\nworker applies the request only when it has accepted that many frames of the epoch, and\nrefuses it otherwise. It checks the position and never waits for it.",
+      "description": "The typing that must have arrived at the worker before a request is applied.\n\nA client that sends its typing on a stream of its own cannot rely on the order of that stream\nagainst its requests on the control stream. A request that must come after some typing names\nthe first `count` frames of one lease epoch for one attachment, sequences 0 to `count - 1`,\ncounted over every frame the client has admitted, including frames it has not yet written. The\nworker applies the request, while that epoch is the attachment's current one, only when it has\naccepted that many frames of it, and refuses it otherwise. It checks the position and never\nwaits for it. Once the epoch is no longer current there is nothing left to order: the position\nis not consulted, a release or a launch of a stale epoch is refused as a lost lease, and a\ndetach goes ahead.",
       "properties": {
         "attachment_id": {
           "$ref": "#/$defs/AttachmentId",
@@ -19991,7 +19991,7 @@
     },
     "InputFrame": {
       "additionalProperties": false,
-      "description": "One frame of typing on a terminal-input stream, from the client to the host.\n\nA frame is one batch: the worker accepts all of its bytes or none of them. The sequence counts\nframes from 0 within an epoch, and a new epoch starts again at 0 on the same stream. The debug\nform shows how many bytes the frame holds and never what they are: they are what a person typed.",
+      "description": "One frame of typing on a terminal-input stream, from the client to the host.\n\nA frame is one batch: the worker accepts all of its bytes or none of them. The sequence counts\nframes from 0 within an epoch, and a new epoch starts again at 0 on the same stream.",
       "properties": {
         "bytes": {
           "$ref": "#/$defs/Bytes",
@@ -20067,14 +20067,14 @@
       "properties": {
         "bytes": {
           "$ref": "#/$defs/U64",
-          "description": "The window's bytes, in the worker's unit. Nought when the lane is not the holder's."
+          "description": "The window's bytes, as `InputClaim::bytes` counts them. Nought when the lane is not the\nholder's."
         },
         "epoch": {
           "$ref": "#/$defs/InputLeaseEpoch",
           "description": "The lease epoch at the moment of the bind."
         },
         "frames": {
-          "description": "The window's frames, in the worker's unit. Nought when the lane is not the holder's.",
+          "description": "The window's frames, as queue entries: `InputClaim::frames` counts two for each frame.\nNought when the lane is not the holder's.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -21234,14 +21234,14 @@
       "properties": {
         "bytes": {
           "$ref": "#/$defs/U64",
-          "description": "Bytes given back, in the worker's unit."
+          "description": "Bytes given back, as `InputClaim::bytes` counts them."
         },
         "epoch": {
           "$ref": "#/$defs/InputLeaseEpoch",
           "description": "The epoch the room belongs to."
         },
         "frames": {
-          "description": "Frames given back, in the worker's unit.",
+          "description": "Queue entries given back, as `InputClaim::frames` counts them: two for each frame.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -21300,7 +21300,7 @@
       "properties": {
         "bytes": {
           "$ref": "#/$defs/U64",
-          "description": "The window's bytes, in the worker's unit. Nought when `holder` is false."
+          "description": "The window's bytes, as `InputClaim::bytes` counts them. Nought when `holder` is false."
         },
         "ended": {
           "anyOf": [
@@ -21318,7 +21318,7 @@
           "description": "The epoch this event speaks of."
         },
         "frames": {
-          "description": "The window's frames, in the worker's unit. Nought when `holder` is false.",
+          "description": "The window's frames, as queue entries: `InputClaim::frames` counts two for each frame.\nNought when `holder` is false.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -37981,7 +37981,7 @@
               "type": "null"
             }
           ],
-          "description": "The typing that must have arrived before this detach is applied.\n\nAbsent from the wire when the caller asks for no such order, and sent only to a worker that\nstates the input lane, since a worker refuses a member it does not know. A request that\nuses none of the optional members is byte for byte what a worker built before them reads."
+          "description": "The typing that must have arrived before this detach is applied.\n\nAbsent from the wire when the caller asks for no such order, and sent only to a worker that\nstates the input lane, since a worker refuses a member it does not know. A request that\nuses none of the optional members is byte for byte what a worker built before them reads.\nThe `session.detached` notification, which carries these parameters, never has it."
         },
         "attachment_id": {
           "anyOf": [
@@ -37995,7 +37995,7 @@
           "description": "The attachment to remove. Null asks the host for the originating attachment.\n\nSection 7's `kr detach` takes no identifier inside its own context, and the host is the\nonly place that knows what that context is: the attachment whose input the root editor\naccepted the line under, recorded through the fence at acceptance. A caller that names\nnothing gets that attachment or `AMBIGUOUS_ATTACHMENT`, never a guess and never whichever\nclient happens to hold the input lease when the command runs."
         },
         "fenced_report": {
-          "description": "True when the caller wants the count of bytes this detach discarded in the answer.\n\nAbsent from the wire when false, and sent only to a worker that states the input lane, for\nthe reason `after_input` gives.",
+          "description": "True when the caller wants the count of bytes this detach discarded in the answer.\n\nAbsent from the wire when false, and sent only to a worker that states the input lane, for\nthe reason `after_input` gives. The `session.detached` notification never has it.",
           "type": "boolean"
         },
         "line_token": {
