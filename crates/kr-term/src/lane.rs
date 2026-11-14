@@ -264,6 +264,29 @@ impl Default for LaneLimits {
     }
 }
 
+/// What one drain of the lane may take: bytes and replies, whichever is spent first.
+///
+/// A caller that can hold only so much says so here, and the replies it cannot hold stay in the
+/// lane, where their deadline and the lane's own bounds keep applying to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainBudget {
+    /// The most bytes that may be taken.
+    pub bytes: usize,
+    /// The most replies that may be taken.
+    pub replies: usize,
+}
+
+impl DrainBudget {
+    /// A budget of bytes alone.
+    #[must_use]
+    pub const fn bytes(bytes: usize) -> Self {
+        Self {
+            bytes,
+            replies: usize::MAX,
+        }
+    }
+}
+
 /// The trusted response lane.
 #[derive(Debug, Clone)]
 pub struct ResponseLane {
@@ -378,6 +401,20 @@ impl ResponseLane {
     /// waited past its deadline is dropped as it would be behind a paste, because an answer that
     /// old would reach whatever reads next, which did not ask.
     pub fn drain(&mut self, gate: LaneGate, max_bytes: usize, now_ms: u64) -> Vec<Response> {
+        self.drain_within(gate, DrainBudget::bytes(max_bytes), now_ms)
+    }
+
+    /// Takes replies to write, up to `budget`, as [`Self::drain`] does for bytes alone.
+    ///
+    /// A reply that would pass either figure stays where it is, in its place and with its deadline,
+    /// and so does everything behind it. A reply that has waited past its deadline is dropped
+    /// whatever the budget, because the deadline is not the caller's to extend.
+    pub fn drain_within(
+        &mut self,
+        gate: LaneGate,
+        budget: DrainBudget,
+        now_ms: u64,
+    ) -> Vec<Response> {
         if !gate.allows_write() {
             return Vec::new();
         }
@@ -385,7 +422,7 @@ impl ResponseLane {
         let mut taken = 0usize;
         if gate.cursor_report_first {
             self.hold_behind_cursor_report(now_ms);
-            self.take_cursor_reports(max_bytes, now_ms, &mut taken, &mut out);
+            self.take_cursor_reports(budget, now_ms, &mut taken, &mut out);
             if out.is_empty() {
                 return out;
             }
@@ -400,7 +437,7 @@ impl ResponseLane {
                 self.degradation.expired += 1;
                 continue;
             }
-            if taken + front.bytes.len() > max_bytes {
+            if taken + front.bytes.len() > budget.bytes || out.len() >= budget.replies {
                 break;
             }
             let Some(response) = self.queue.pop_front() else {
@@ -438,7 +475,7 @@ impl ResponseLane {
     /// Takes the cursor reports in the order they were offered.
     fn take_cursor_reports(
         &mut self,
-        max_bytes: usize,
+        budget: DrainBudget,
         now_ms: u64,
         taken: &mut usize,
         out: &mut Vec<Response>,
@@ -453,7 +490,7 @@ impl ResponseLane {
                     self.queued_bytes -= expired.bytes.len();
                     self.degradation.expired += 1;
                 }
-            } else if *taken + reply.bytes.len() > max_bytes {
+            } else if *taken + reply.bytes.len() > budget.bytes || out.len() >= budget.replies {
                 break;
             } else if let Some(report) = self.queue.remove(index) {
                 self.queued_bytes -= report.bytes.len();
