@@ -2053,6 +2053,25 @@ impl Registry {
         Ok(())
     }
 
+    /// Makes writing that a worker acknowledged a revision fail, or stops doing so, for this
+    /// host's own tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the registry cannot be changed.
+    #[cfg(feature = "testing")]
+    pub fn refuse_acknowledged_rows_for_tests(&mut self, refusing: bool) -> Result<()> {
+        self.connection
+            .execute_batch(if refusing {
+                "CREATE TRIGGER IF NOT EXISTS refuse_the_acknowledged_row
+                 BEFORE UPDATE OF acknowledged_revision ON workers
+                 BEGIN SELECT RAISE(ABORT, 'the row is refused'); END;"
+            } else {
+                "DROP TRIGGER IF EXISTS refuse_the_acknowledged_row;"
+            })
+            .map_err(ControllerError::registry)
+    }
+
     /// Returns the configured admission limit.
     ///
     /// # Errors

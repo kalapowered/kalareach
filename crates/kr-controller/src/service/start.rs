@@ -1149,6 +1149,7 @@ impl Controller {
             directory: Mutex::new(Directory::default()),
             connections: Mutex::new(BTreeMap::new()),
             openings: std::sync::Mutex::new(BTreeMap::new()),
+            task_holds: Arc::new(super::barrier::TaskHolds::default()),
             proxies: std::sync::Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
             unwritten_failures: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -1238,7 +1239,7 @@ impl Controller {
             #[cfg(feature = "testing")]
             pending_asks: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
-            reconciliations: std::sync::atomic::AtomicUsize::new(0),
+            reconciliations: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             before_the_leases_adopt: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
