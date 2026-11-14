@@ -535,7 +535,10 @@ fn a_replacement_that_became_the_manifest_is_taken_as_the_manifest() {
 }
 
 /// A service that stands at the broker's name when a new installation looks is refused at the first
-/// look, before any call that changes it, with a result that neither tree acts on.
+/// look, before any call that changes it, with a result that neither tree acts on. The refusal is
+/// recorded by one write of the manifest that holds the object with its result, so that a death
+/// between two writes cannot leave an intent for a service that this run refused; where that write
+/// fails, the error says the refusal and the failed write.
 #[test]
 fn a_service_that_a_new_installation_refused_is_refused_at_the_first_look_and_acted_on_by_no_tree()
 {
@@ -544,26 +547,38 @@ fn a_service_that_a_new_installation_refused_is_refused_at_the_first_look_and_ac
     let first_look = lay
         .find("let broker_service = manager.open(SERVICE)?;")
         .expect("the first look at the broker's service");
+    let guard = "if broker_service.is_some() && (!existing || refused_before) {\n        return Err(refuse_service(run));\n    }";
     let refusal = lay
-        .find("if broker_service.is_some() && (!existing || refused_before) {\n        run.record(ObjectKind::Service, SERVICE, None)?;\n        run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;\n        return Err(refused_service());")
+        .find(guard)
         .expect("a new installation, or a repair of a refused service, refuses the service that stands there and records it");
+    // The first look writes no intent of its own: the refusal's one write is `refuse_service`'s.
+    assert!(!guard.contains("run.record(") && !guard.contains("run.conclude("));
+    assert!(!lay[first_look..refusal].contains("run.record("));
+    assert!(!lay[first_look..refusal].contains("run.conclude("));
     // A repair takes a standing service only where no run refused it.
     assert!(lay.contains("Some(service) if existing && !refused_before => {"));
     let stop = lay
         .find("remedy::stop_broker(")
         .expect("a repair stops the broker");
     assert!(first_look < refusal && refusal < stop);
-    // The service step refuses with the result that no tree acts on, and says the same words.
+    // The service step refuses with the same call, with no result of `found` before it.
     let step = lay
-        .find("Some(_) => {\n            run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;")
+        .find("Some(_) => {\n            return Err(refuse_service(run));")
         .expect("the service step's refusal");
-    let refused = lay[step..]
-        .find("run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;")
-        .expect("the result is refused");
-    let words = lay[step..].find("return Err(refused_service());").unwrap();
-    assert!(refused < words);
-    assert_eq!(source.matches("refused_service()").count(), 3);
-    assert!(!lay[step..step + words].contains("Outcome::Found"));
+    let arm = &lay[step..step + lay[step..].find("\n        }").unwrap()];
+    assert!(!arm.contains("Outcome::Found") && !arm.contains("run.record("));
+    assert_eq!(code_of(&source).matches("refuse_service(run)").count(), 2);
+    // The refusal's record is one write with the result, and a failed write is said beside the
+    // refusal, not in its place.
+    let helper = code_of(body_of(&source, "fn refuse_service("));
+    assert_eq!(helper.matches("run.").count(), 1);
+    assert!(helper.contains("run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)"));
+    assert!(helper.contains("Ok(()) => refusal,"));
+    assert!(
+        helper
+            .contains("\"{refusal}; writing the record of this refusal also failed ({failure})\"")
+    );
+    assert_eq!(source.matches("refused_service()").count(), 2);
 }
 
 /// A service that a new installation refused (its result `refused`) is left alone by the ordinary
