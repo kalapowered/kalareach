@@ -142,6 +142,36 @@ async fn controller_client(host: &Host, generation: u64) -> BoundLink {
     client
 }
 
+/// What a test needs to sign a controller's generation token on a task of its own.
+struct Signer {
+    identity: Arc<ControllerIdentity>,
+    boot: kr_protocol::identity::BootIdentity,
+}
+
+impl Host {
+    fn signer(&self) -> Signer {
+        Signer {
+            identity: Arc::clone(&self.controller),
+            boot: self.boot.clone(),
+        }
+    }
+}
+
+/// Answers the challenge `link` was given with a token for `generation`.
+async fn present(
+    link: &mut BoundLink,
+    signer: Signer,
+    generation: u64,
+) -> kr_ipc::Result<kr_protocol::worker::GenerationAccepted> {
+    link.present_generation(move |nonce| {
+        signer
+            .identity
+            .generation_token(ControllerGeneration::new(generation), &signer.boot, nonce)
+            .map_err(kr_ipc::IpcError::from)
+    })
+    .await
+}
+
 /// What a refused read came to.
 #[derive(Debug, PartialEq, Eq)]
 enum Refused {
@@ -189,6 +219,59 @@ async fn a_replaced_controller_connection_stops_being_served() {
         Err(Refused::Link(ErrorCode::PermissionDenied)),
         "the fenced connection is refused at dispatch, not merely recorded as fenced"
     );
+}
+
+/// How long a test waits for a worker to reach a state it waits for by condition, and fails after.
+/// Nothing is decided by it: a worker that never gets there is the one thing that runs it out.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// KR-REQ-02.05: a connection whose presentation reaches the worker after a newer connection's
+/// does not take the authority from it, even when the daemon gave up on the older one before the
+/// newer one was opened.
+///
+/// The older presentation is held where it waits for the dispatch boundary, and its client task is
+/// ended. The newer connection is opened, presents, and is served. The older presentation is then
+/// let go and its decision awaited, and the newer connection is served again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_presentation_that_is_decided_late_does_not_fence_a_newer_connection() {
+    let host = host(1).await;
+    let kr_worker::service::PresentationPause {
+        arrived,
+        release,
+        decided,
+    } = host.service.pause_before_presentation();
+
+    let mut older = BoundLink::connect(&host.endpoint, build())
+        .await
+        .expect("connects");
+    let signer = host.signer();
+    let presenting = tokio::spawn(async move { present(&mut older, signer, 1).await });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT))
+        .await
+        .expect("the wait ends")
+        .expect("the older presentation reaches the worker's pause");
+    presenting.abort();
+    assert!(
+        presenting
+            .await
+            .expect_err("the task did not finish")
+            .is_cancelled(),
+        "the older connection's client is gone"
+    );
+
+    let mut newer = controller_client(&host, 1).await;
+    read_session(&mut newer, host.session_id)
+        .await
+        .expect("the newer connection is served");
+
+    release.send(()).expect("the older presentation goes on");
+    tokio::task::spawn_blocking(move || decided.recv_timeout(WAIT))
+        .await
+        .expect("the wait ends")
+        .expect("the older presentation is decided");
+    read_session(&mut newer, host.session_id)
+        .await
+        .expect("the newer connection is still served once the older presentation is decided");
 }
 
 /// KR-REQ-02.05: a controller connection from a generation a newer daemon has replaced cannot

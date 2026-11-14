@@ -404,6 +404,11 @@ pub struct WorkerService {
     /// away in every shipped build.
     #[cfg(feature = "testing")]
     replacement_pause: Mutex<Option<ArmedReplacement>>,
+    /// A pause before the next controller presentation takes the dispatch boundary, which this
+    /// host's own tests arm to hold one connection's presentation back while a later connection's
+    /// is decided. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    presentation_pause: Mutex<Option<ArmedPresentation>>,
     /// Whether the next delivery a connection starts is held back until a newer subscription
     /// replaces it, which this host's own tests arm to have a delivery that has written nothing
     /// replaced. It is compiled away in every shipped build.
@@ -832,6 +837,8 @@ impl WorkerService {
             #[cfg(feature = "testing")]
             replacement_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
+            presentation_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
             hold_next_delivery: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             received: Mutex::new(Vec::new()),
@@ -1211,6 +1218,49 @@ impl WorkerService {
         reason = "it is the shipped form of a method that reads this service's own pause"
     )]
     const fn wait_before_admission(&self) {}
+
+    /// Stops the next controller presentation before it takes the dispatch boundary, for this
+    /// host's own tests.
+    ///
+    /// The presentation has answered its challenge and holds no lock, which is where one waits
+    /// whose connection the daemon has since given up on: its frame is in the worker, and the
+    /// connection's task reads nothing more until the frame is decided. The pause fires once, for
+    /// the first presentation that reaches it.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_presentation(&self) -> PresentationPause {
+        let (arrived, arrival) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        let (decided, decision) = std::sync::mpsc::sync_channel(1);
+        *self
+            .presentation_pause
+            .lock()
+            .expect("the pause is not poisoned") = Some(ArmedPresentation {
+            arrived,
+            go,
+            decided,
+        });
+        PresentationPause {
+            arrived: arrival,
+            release,
+            decided: decision,
+        }
+    }
+
+    /// Waits at the pause above, where one is armed, and returns what says the presentation has
+    /// been decided once it is dropped. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_before_presentation(&self) -> PresentationDecided {
+        let armed = self
+            .presentation_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        PresentationDecided(armed.map(|armed| {
+            let _ = armed.arrived.send(());
+            let _ = armed.go.recv();
+            armed.decided
+        }))
+    }
 
     /// Takes the dispatch boundary and holds it until the returned guard is dropped, for this
     /// host's own tests: what an announcement of an authority revision meets while a mutation, a
@@ -4119,6 +4169,8 @@ impl WorkerService {
                 ),
             );
         };
+        #[cfg(feature = "testing")]
+        let _decided = self.wait_before_presentation();
         // Taken before the authority lock, and held for the whole decision. A generation that
         // arrives while a mutation is between its authority check and its effect waits here, so no
         // request is ever fenced half way through.
@@ -10764,6 +10816,43 @@ struct ArmedReplacement {
     arrived: tokio::sync::oneshot::Sender<()>,
     go: tokio::sync::oneshot::Receiver<()>,
     replaced: tokio::sync::oneshot::Sender<()>,
+}
+
+/// A test's hold on the next controller presentation.
+///
+/// Returned by [`WorkerService::pause_before_presentation`], for this host's own tests.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct PresentationPause {
+    /// Says a presentation has answered its challenge and stands before the dispatch boundary.
+    pub arrived: std::sync::mpsc::Receiver<()>,
+    /// Lets the presentation go on; dropping it does too.
+    pub release: std::sync::mpsc::SyncSender<()>,
+    /// Says the presentation has been decided: accepted, and whatever it fenced withdrawn, or
+    /// refused.
+    pub decided: std::sync::mpsc::Receiver<()>,
+}
+
+/// The presentation's ends of a [`PresentationPause`].
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+struct ArmedPresentation {
+    arrived: std::sync::mpsc::SyncSender<()>,
+    go: std::sync::mpsc::Receiver<()>,
+    decided: std::sync::mpsc::SyncSender<()>,
+}
+
+/// Says a paused presentation was decided, when dropped.
+#[cfg(feature = "testing")]
+struct PresentationDecided(Option<std::sync::mpsc::SyncSender<()>>);
+
+#[cfg(feature = "testing")]
+impl Drop for PresentationDecided {
+    fn drop(&mut self) {
+        if let Some(decided) = self.0.take() {
+            let _ = decided.send(());
+        }
+    }
 }
 
 /// One question subscription a long poll holds, counted in [`WorkerService::subscriptions_held`]
