@@ -511,7 +511,7 @@ const PASS_JITTER: std::time::Duration = std::time::Duration::from_millis(250);
 /// How long one ask of a pending worker may take in all: the exchange, bounded by
 /// [`super::net::ACKNOWLEDGEMENT_TIMEOUT`], and the collection of the names an acknowledgement
 /// leaves, which an ask that is cut leaves to the pass's own collection.
-const PASS_ASK_BOUND: std::time::Duration =
+pub(super) const PASS_ASK_BOUND: std::time::Duration =
     super::net::ACKNOWLEDGEMENT_TIMEOUT.saturating_add(WORKER_EXCHANGE);
 
 /// The longest the interval between two asks of a worker that does not answer grows to.
@@ -616,7 +616,7 @@ async fn evidence_pass(daemon: std::sync::Weak<Controller>, mut passes: PassSche
 /// Runs `futures` together on the task that awaits this, and answers what each returned, in order.
 ///
 /// Nothing is spawned, so what is still running when this is dropped is dropped with it.
-async fn all_at_once<T>(
+pub(super) async fn all_at_once<T>(
     futures: impl IntoIterator<Item = impl std::future::Future<Output = T>>,
 ) -> Vec<T> {
     let mut running: Vec<_> = futures
@@ -664,7 +664,7 @@ async fn until_told(telling: &mut Option<tokio::task::JoinHandle<()>>) {
 /// it cannot bound itself, as a barrier waits for its workers, holds it through this: every
 /// [`LAST_HOLDER_LOOK`] it looks at whether it has become the daemon's last holder, and once it
 /// has, it abandons the work and lets the daemon go.
-async fn while_held<T>(
+pub(super) async fn while_held<T>(
     daemon: &std::sync::Weak<Controller>,
     work: impl AsyncFnOnce(&Arc<Controller>) -> T,
 ) -> Option<T> {
@@ -1919,6 +1919,39 @@ impl Controller {
         }
     }
 
+    /// The workers the pass asks for an acknowledgement: those the registry holds as not having
+    /// acknowledged the revision in force and, while the fence is owed, those the barrier as it
+    /// stands counts pending.
+    ///
+    /// The two differ after a restart: a worker's row can say that it acknowledged the revision
+    /// before the daemon stopped, while the start's announcement to it was refused and this
+    /// daemon's barrier counts it pending. The fence is settled only when the barrier holds, so a
+    /// worker that only the barrier counts is asked all the same.
+    async fn workers_to_ask(&self) -> Result<Vec<SessionId>> {
+        let (mut pending, owed_at) = {
+            let registry = self.registry.lock().await;
+            let revision = registry.authority_revision()?;
+            let pending: Vec<SessionId> = registry
+                .workers()?
+                .into_iter()
+                .filter(|worker| worker.acknowledged_revision.get() < revision.get())
+                .map(|worker| worker.session_id)
+                .collect();
+            let owed_at = registry.fence_owed()?.map(|_| revision);
+            (pending, owed_at)
+        };
+        if let Some(revision) = owed_at
+            && let Ok(barrier) = self.barrier_as_it_stands(revision).await
+        {
+            for session_id in barrier.pending() {
+                if !pending.contains(&session_id) {
+                    pending.push(session_id);
+                }
+            }
+        }
+        Ok(pending)
+    }
+
     /// Asks the workers that have not acknowledged the revision in force, those whose pace
     /// ([`AskPace`]) allows it at `tick`, and settles the fence this host owes once none is pending.
     ///
@@ -1935,12 +1968,17 @@ impl Controller {
         pace: &mut AskPace,
         tick: tokio::time::Instant,
     ) {
-        if let Ok(pending) = self.revision_pending().await {
+        if let Ok(pending) = self.workers_to_ask().await {
             pace.keep_only(&pending);
             let mut due = Vec::new();
             for session_id in pending {
                 let listed = self.directory.lock().await.get(session_id).is_some();
-                if !listed {
+                // A worker the directory does not list cannot be sent anything, and one whose
+                // earlier presentation has not been decided must not be sent another: what can be
+                // established for either is whether it has ended, and that is asked here. The
+                // presentation is decided when the worker answers it, refuses it or ends, and the
+                // ask follows at the pass after.
+                if !listed || self.presentation_in_flight(session_id) {
                     if let Err(error) = self.reconcile(session_id).await {
                         eprintln!(
                             "kr-controller: whether the worker of session {session_id} has ended \

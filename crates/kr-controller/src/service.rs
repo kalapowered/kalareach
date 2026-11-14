@@ -412,6 +412,10 @@ pub struct Controller {
     /// a status read would invalidate a close that had already been authorised. One connection per
     /// worker, used in order, is what stops that.
     connections: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<Option<BoundLink>>>>>,
+    /// The opening of a link to each worker that is under way or has ended with a link that nobody
+    /// has taken yet ([`workers::Opening`]): the one presentation of this daemon that a worker may
+    /// be holding at its dispatch boundary.
+    openings: std::sync::Mutex<BTreeMap<SessionId, Arc<workers::Opening>>>,
     /// The links remote connections hold to each session's worker, which the session's closure
     /// ends. Weakly, because a link belongs to the connection that opened it.
     ///
@@ -1305,6 +1309,16 @@ impl Controller {
     #[cfg(feature = "testing")]
     pub async fn forget_worker_for_tests(&self, session_id: SessionId) {
         self.directory.lock().await.remove(session_id);
+    }
+
+    /// Closes the worker's one connection and leaves its slot empty, as an exchange that failed
+    /// leaves it, so that the next ask opens a link, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub async fn forget_the_worker_link_for_tests(&self, session_id: SessionId) {
+        let slot = self.connections.lock().await.get(&session_id).cloned();
+        if let Some(slot) = slot {
+            slot.lock().await.take();
+        }
     }
 
     /// Takes the worker's one connection and keeps it until the returned value is dropped, so that

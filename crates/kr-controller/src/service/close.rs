@@ -1201,6 +1201,7 @@ impl Controller {
         // the worker is out of the directory, so a link opened since is refused rather than missed.
         self.end_proxies_of(record.session_id);
         self.connections.lock().await.remove(&record.session_id);
+        self.forget_opening(record.session_id);
         // The invitations still waiting over the session can never be redeemed, so they are
         // withdrawn with it and its issuer is told so. A withdrawal that fails does not hold up
         // the rest of the tidying: the next start withdraws what is left.

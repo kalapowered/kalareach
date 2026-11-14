@@ -933,8 +933,8 @@ impl Controller {
                  again on its own: at the next pass after an answer, and after a longer wait, \
                  growing to a minute, after an ask that failed. This check shows when every \
                  worker has acknowledged. The first answer to the revocation is not rewritten \
-                 then, and a repeat of the revocation does not name the actions that won the \
-                 dispatch race at a worker that was pending in that answer; a worker keeps those \
+                 then; repeating the revocation asks a worker that was pending in it again and \
+                 names the actions that won the dispatch race at that worker, which keeps those \
                  names for its newest eight revocations only.",
             ),
         ));

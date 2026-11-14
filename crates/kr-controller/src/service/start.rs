@@ -1148,6 +1148,7 @@ impl Controller {
             registry: Mutex::new(registry),
             directory: Mutex::new(Directory::default()),
             connections: Mutex::new(BTreeMap::new()),
+            openings: std::sync::Mutex::new(BTreeMap::new()),
             proxies: std::sync::Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
             unwritten_failures: std::sync::Mutex::new(std::collections::BTreeSet::new()),
