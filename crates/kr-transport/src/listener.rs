@@ -410,8 +410,10 @@ impl ControlChannel {
     ///
     /// The stream is read by the connection itself, not by this call: a handler that is waiting on
     /// a worker must not be what decides whether the control stream is still alive. Frames are
-    /// queued for the handler up to [`CONTROL_QUEUE_DEPTH`]; a handler that falls that far behind
-    /// loses the connection rather than holding the transport open. A frame is stamped when it is
+    /// queued for the handler up to [`CONTROL_QUEUE_DEPTH`], which bounds how far a control handler
+    /// may fall behind. A request is never dropped in silence: a device that passes the bound loses
+    /// the connection, with the words `the control queue overflowed`. Typing travels on a
+    /// terminal-input stream of its own and does not wait in this queue. A frame is stamped when it is
     /// read, whatever the handler is doing then.
     pub async fn recv(&mut self) -> Option<ReceivedFrame> {
         self.frames.recv().await
@@ -1571,8 +1573,10 @@ impl ControlLoss {
 
 /// How many control frames the connection holds for a handler that has not read them yet.
 ///
-/// Section 9's rule for a slow peer applies to a slow handler too: it is told, rather than allowed
-/// to hold the read loop. A handler this far behind loses its connection.
+/// The bound on how far a control handler may fall behind the control stream. A request is never
+/// dropped in silence, and a device that passes the bound is cut with a word rather than allowed to
+/// hold the read loop. Section 9's rule for a slow peer (`RESYNC_REQUIRED`) is about output and
+/// does not apply here; typing does not use this queue.
 pub const CONTROL_QUEUE_DEPTH: usize = 64;
 
 /// Reads the control stream for one connection, whatever its handler is doing.
