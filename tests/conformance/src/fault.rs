@@ -575,11 +575,19 @@ fn samples_path() -> PathBuf {
     base.join("kr-disk-report").join("samples")
 }
 
+/// The longest stretch, in seconds, that may pass without a sample before the samples are taken for
+/// not covering the time. The disk report samples every two seconds and skips a sample it cannot
+/// write, so a gap is what a volume with no room leaves.
+const MAX_SAMPLE_GAP: u64 = 30;
+
 /// The lowest free space, in KiB, among the samples of `text` taken from `from` to `until`, in
 /// seconds since the epoch. A sample is a line `S <epoch> <KiB>`; the marks and anything else are
-/// passed over.
-fn lowest_sample(text: &str, from: u64, until: u64) -> Option<u64> {
-    text.lines()
+/// passed over. The samples have to cover the whole stretch: a stretch with none, or one with a gap
+/// of more than [`MAX_SAMPLE_GAP`] seconds, including before the first and after the last, is an
+/// error, because what the volume held in the gap is not known.
+fn lowest_sample(text: &str, from: u64, until: u64) -> Result<u64, String> {
+    let mut samples: Vec<(u64, u64)> = text
+        .lines()
         .filter_map(|line| {
             let mut words = line.split_whitespace();
             if words.next()? != "S" {
@@ -587,9 +595,27 @@ fn lowest_sample(text: &str, from: u64, until: u64) -> Option<u64> {
             }
             let at: u64 = words.next()?.parse().ok()?;
             let free: u64 = words.next()?.parse().ok()?;
-            (from..=until).contains(&at).then_some(free)
+            (from..=until).contains(&at).then_some((at, free))
         })
-        .min()
+        .collect();
+    samples.sort_unstable();
+    let Some(lowest) = samples.iter().map(|(_, free)| *free).min() else {
+        return Err("no free-space sample was taken in the stretch".to_owned());
+    };
+    let times: Vec<u64> = std::iter::once(from)
+        .chain(samples.iter().map(|(at, _)| *at))
+        .chain(std::iter::once(until))
+        .collect();
+    if let Some(gap) = times
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .find(|gap| *gap > MAX_SAMPLE_GAP)
+    {
+        return Err(format!(
+            "the free-space samples have a gap of {gap} s in the stretch"
+        ));
+    }
+    Ok(lowest)
 }
 
 /// The free space of the volume that holds `path`, in KiB, as the system's `df` says now.
@@ -620,26 +646,27 @@ fn free_now(_path: &Path) -> Result<u64, String> {
 
 /// The lowest free space, in KiB, that the volume holding `target` had from `from` to `until`: the
 /// lowest sample the disk report took in that stretch, and the volume as it is now, whichever is
-/// lower.
+/// lower. Both have to be read: the samples have to cover the stretch, and the volume has to be
+/// readable now.
 ///
 /// # Errors
 ///
-/// Returns why nothing could be read, when neither the samples nor the volume could.
+/// Returns why either could not be read.
 pub fn lowest_free_kib(target: &Path, from: u64, until: u64) -> Result<u64, String> {
-    let mut lowest: Option<u64> = None;
-    let mut why: Vec<String> = Vec::new();
-    match std::fs::read_to_string(samples_path()) {
-        Ok(text) => match lowest_sample(&text, from, until) {
-            Some(kib) => lowest = Some(kib),
-            None => why.push("no free-space sample was taken in the stretch".to_owned()),
-        },
-        Err(error) => why.push(format!("the free-space samples were not read: {error}")),
-    }
-    match free_now(target) {
-        Ok(kib) => lowest = Some(lowest.map_or(kib, |sampled| sampled.min(kib))),
-        Err(error) => why.push(error),
-    }
-    lowest.ok_or_else(|| why.join("; "))
+    let samples = std::fs::read_to_string(samples_path())
+        .map_err(|error| format!("the free-space samples were not read: {error}"));
+    lowest_free_of(samples, free_now(target), from, until)
+}
+
+/// [`lowest_free_kib`] over what was read: the text of the samples and the volume's free space now.
+fn lowest_free_of(
+    samples: Result<String, String>,
+    now: Result<u64, String>,
+    from: u64,
+    until: u64,
+) -> Result<u64, String> {
+    let sampled = lowest_sample(&samples?, from, until)?;
+    Ok(sampled.min(now?))
 }
 
 /// Writes the kernel's storage lines from the first time to the second, in seconds since the
@@ -1736,11 +1763,61 @@ mod tests {
     }
 
     #[test]
-    fn the_free_space_is_the_lowest_sample_in_the_stretch_that_the_disk_report_kept() {
-        let text = "M 100 begin\nS 100 9000000\nS 110 1500000\nS 120 8000000\nS 200 10\nS x y\n";
-        assert_eq!(lowest_sample(text, 100, 130), Some(1_500_000));
-        assert_eq!(lowest_sample(text, 111, 119), None);
-        assert_eq!(lowest_sample("", 0, 10), None);
+    fn the_free_space_is_the_lowest_sample_in_a_stretch_that_the_samples_cover() {
+        let text = "M 100 begin\nS 100 9000000\nS 110 1500000\nS 120 8000000\nS 130 7000000\nS 200 10\nS x y\n";
+        assert_eq!(lowest_sample(text, 100, 130), Ok(1_500_000));
+        assert_eq!(
+            lowest_sample(text, 105, 125),
+            Ok(1_500_000),
+            "a few seconds of slack at each end"
+        );
+    }
+
+    /// A volume with no room leaves a gap in the samples, not a low one: the disk report skips a
+    /// sample it cannot write. A stretch the samples do not cover has no free space known.
+    #[test]
+    fn the_samples_that_do_not_cover_the_stretch_say_nothing_of_the_free_space() {
+        let text = "S 100 9000000\nS 110 9000000\nS 200 9000000\nS 210 9000000\n";
+        let why = lowest_sample(text, 100, 210).unwrap_err();
+        assert!(why.contains("gap of 90 s"), "{why}");
+        let why = lowest_sample(text, 60, 110).unwrap_err();
+        assert!(
+            why.contains("gap of 40 s"),
+            "before the first sample: {why}"
+        );
+        let why = lowest_sample(text, 100, 150).unwrap_err();
+        assert!(why.contains("gap of 40 s"), "after the last sample: {why}");
+        let why = lowest_sample(text, 111, 119).unwrap_err();
+        assert!(why.contains("no free-space sample"), "{why}");
+        assert!(lowest_sample("", 0, 10).is_err());
+    }
+
+    /// The free space is known only where the samples cover the stretch and the volume can be read
+    /// now: a high sample does not stand for a volume that cannot be read, and a volume that reads
+    /// well now does not stand for samples that are missing or have a gap.
+    #[test]
+    fn the_free_space_needs_the_samples_and_the_volume_both() {
+        let covering = || Ok("S 100 9000000\nS 110 1500000\nS 120 8000000\n".to_owned());
+        let room = || Ok(30 * 1024 * 1024_u64);
+        assert_eq!(lowest_free_of(covering(), room(), 100, 120), Ok(1_500_000));
+        assert_eq!(
+            lowest_free_of(covering(), Ok(1_000_000), 100, 120),
+            Ok(1_000_000),
+            "the volume now, where it is the lower"
+        );
+        let why = lowest_free_of(covering(), Err("no df".to_owned()), 100, 120).unwrap_err();
+        assert_eq!(
+            why, "no df",
+            "a high sample does not stand for an unread volume"
+        );
+        let why = lowest_free_of(Err("no samples".to_owned()), room(), 100, 120).unwrap_err();
+        assert_eq!(
+            why, "no samples",
+            "the volume now does not stand for absent samples"
+        );
+        let gap = Ok("S 100 9000000\nS 200 9000000\n".to_owned());
+        let why = lowest_free_of(gap, room(), 100, 200).unwrap_err();
+        assert!(why.contains("gap of 100 s"), "{why}");
     }
 
     #[test]
