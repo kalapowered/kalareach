@@ -722,6 +722,42 @@ async fn an_older_epoch_with_two_frames_at_the_lane_is_told_refused_once() {
     rig.stop().await;
 }
 
+/// Opens a stream with `header` and says the host ended it without serving it: the device is not
+/// told `Ready`, and no lane was bound for it at the worker.
+async fn is_not_served(rig: &Rig, header: StreamHeader) {
+    let mut stream = rig.device.open_stream(header).await;
+    let read = tokio::time::timeout(WAIT, stream.read_message::<InputAck>())
+        .await
+        .expect("the host ends the stream in time");
+    assert!(
+        !matches!(read, Ok(Some(InputAck::Ready { .. }))),
+        "the host served a stream it was to refuse: {read:?}"
+    );
+    assert!(rig.lane.binds().is_empty(), "no lane was bound for it");
+}
+
+/// A stream whose header names another environment than the host's is not served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_for_another_environment_is_not_served() {
+    let rig = Rig::start().await;
+    let mut header = rig.header_for(rig.attachment);
+    header.resource.environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+    is_not_served(&rig, header).await;
+    rig.stop().await;
+}
+
+/// A stream whose header names a session other than the one this connection is attached to is not
+/// served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_for_another_session_is_not_served() {
+    let rig = Rig::start().await;
+    let mut header = rig.header_for(rig.attachment);
+    header.resource.session_id =
+        Nullable::some(kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()));
+    is_not_served(&rig, header).await;
+    rig.stop().await;
+}
+
 /// The window of the lane's epoch: the view holds the lease, with credit for what the cases write.
 fn holding(epoch: u64) -> LaneWindow {
     LaneWindow {
