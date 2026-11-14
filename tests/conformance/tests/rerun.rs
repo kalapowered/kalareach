@@ -4,12 +4,11 @@
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
-#[cfg(unix)]
 use std::time::Duration;
 
-use kr_conformance::fault;
 #[cfg(unix)]
-use kr_conformance::fault::{Budget, Cause, Reads};
+use kr_conformance::fault::Cause;
+use kr_conformance::fault::{self, Budget, Reads};
 #[cfg(unix)]
 use kr_conformance::plan::Platform;
 use kr_conformance::plan::{Group, Reading, Step};
@@ -95,7 +94,6 @@ impl Evidence {
 }
 
 /// Evidence that a case that is not run again must never ask for.
-#[cfg(unix)]
 fn no_evidence() -> Reads {
     Reads {
         kernel_log: Box::new(|_, _, _| {

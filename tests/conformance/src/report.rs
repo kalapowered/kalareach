@@ -471,7 +471,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
 ///
 /// # Errors
 ///
-/// As [`run`].
+/// As [`run()`].
 pub fn run_with(
     options: &Options,
     reads: &fault::Reads,
