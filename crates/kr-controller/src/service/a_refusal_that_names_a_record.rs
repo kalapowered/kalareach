@@ -902,6 +902,11 @@ async fn a_confirmation_request_that_meets_another_requests_identifier_is_not_to
 
 /// `mutation` as the local door performs it once its own look for a record has found none, which is
 /// what a copy that is admitted before another copy records reaches.
+///
+/// The route's future is large, and a case polls it on the test thread, so it is boxed: held by
+/// value, the case's future, the helpers that wait on it and the runtime's `block_on` each keep a copy
+/// on that thread's stack, which a debug build on Windows does not have room for. The daemon spawns
+/// the route as a task, so its future is on the heap there.
 async fn at_the_local_door(
     controller: &Arc<Controller>,
     connection_id: kr_protocol::ids::ConnectionId,
@@ -909,7 +914,7 @@ async fn at_the_local_door(
     mutation: &MutationRequest,
     method: Method,
 ) -> kr_protocol::envelope::ControlFrame {
-    told_now(
+    Box::pin(told_now(
         controller,
         connection_id,
         mutation,
@@ -922,7 +927,7 @@ async fn at_the_local_door(
             Some(super::the_fence_at_every_effect::accepted(controller)),
             controller.admitted_revision(connection_id).ok(),
         ),
-    )
+    ))
     .await
 }
 
