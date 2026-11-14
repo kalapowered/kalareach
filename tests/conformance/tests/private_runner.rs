@@ -16,8 +16,8 @@ fn tree(name: &str) -> PathBuf {
 }
 
 /// The report over the `forms` tree's tests, run through `lister`, with `target` as the directory
-/// its steps build in.
-fn options(evidence: &Path, lister: PathBuf, target: &Path) -> Options {
+/// its steps build in and `base` as the directory the copy's own directory is made in.
+fn options(evidence: &Path, base: &Path, lister: PathBuf, target: &Path) -> Options {
     Options {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence)
@@ -40,6 +40,7 @@ fn options(evidence: &Path, lister: PathBuf, target: &Path) -> Options {
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.to_path_buf(),
     }
 }
 
@@ -50,8 +51,9 @@ fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged
     let shared = held.path().join(program.file_name().expect("a file name"));
     std::fs::copy(program, &shared).expect("a program to damage");
     let evidence = tempfile::tempdir().expect("an evidence directory");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-private-runner");
-    let options = options(evidence.path(), shared.clone(), &target);
+    let options = options(evidence.path(), base.path(), shared.clone(), &target);
     let mut damaged = false;
     let document = report::run(&options, &mut |line| {
         if line.starts_with("step 1 of 1") {
@@ -63,6 +65,15 @@ fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged
     assert!(
         damaged,
         "the program was damaged once the report had copied it"
+    );
+    let copies: Vec<_> = std::fs::read_dir(base.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        copies.len(),
+        1,
+        "the copy's directory is made in the base: {copies:?}"
     );
     let step = &document.steps[0];
     assert_eq!(step.exit, Some(0), "{step:?}");
@@ -82,8 +93,10 @@ fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged
 #[test]
 fn a_build_directory_that_is_the_temporary_directory_ends_the_run_before_its_first_step() {
     let evidence = tempfile::tempdir().expect("an evidence directory");
+    let held = tempfile::tempdir()
+        .expect("a directory that is both the copy's place and a build directory");
     let lister = PathBuf::from(env!("CARGO_BIN_EXE_kr-conformance"));
-    let options = options(evidence.path(), lister, &std::env::temp_dir());
+    let options = options(evidence.path(), held.path(), lister, held.path());
     let mut announced = 0;
     let result = report::run(&options, &mut |_| announced += 1);
     match result {
@@ -94,4 +107,8 @@ fn a_build_directory_that_is_the_temporary_directory_ends_the_run_before_its_fir
         Ok(_) => panic!("the run went on with the copy in a build directory"),
     }
     assert_eq!(announced, 0, "a step was announced");
+    assert!(
+        std::fs::read_dir(held.path()).unwrap().next().is_none(),
+        "nothing was made in the build directory"
+    );
 }

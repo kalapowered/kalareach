@@ -119,6 +119,7 @@ fn map(root: PathBuf, typescript: bool) -> ExitCode {
         environment: Vec::new(),
         lister: PathBuf::new(),
         part: None,
+        runner_base: PathBuf::new(),
     };
     let map = report::map_for(&options);
     let tests: usize = map.keys.values().map(std::collections::BTreeMap::len).sum();
@@ -211,6 +212,7 @@ fn run(
         environment: Vec::new(),
         lister,
         part,
+        runner_base: std::env::temp_dir(),
     };
     let document = match report::run(&options, &mut |line| eprintln!("{line}")) {
         Ok(document) => document,

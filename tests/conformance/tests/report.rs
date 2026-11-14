@@ -100,6 +100,7 @@ fn run_step_through(
         .tempdir()
         .expect("an evidence directory");
     let target = std::env::temp_dir().join(format!("kr-conformance-fixture-target-{name}"));
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree(name),
         evidence: kr_conformance::evidence::check_directory(evidence.path())
@@ -122,6 +123,7 @@ fn run_step_through(
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     report::run(&options, &mut |_| {}).map(|document| (document, evidence))
 }
@@ -658,6 +660,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         lister: PathBuf::from("/tmp/l"),
         environment: Vec::new(),
         part: None,
+        runner_base: PathBuf::new(),
     };
     let document = report::assemble(
         &options,
@@ -1496,6 +1499,7 @@ fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_
     let evidence = tempfile::tempdir().expect("an evidence directory");
     // A target directory of its own, so that the macro runs in this test's build.
     let target = tempfile::tempdir().expect("a target directory");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("late"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1517,6 +1521,7 @@ fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_
             target.path().to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let step = &document.steps[0];
@@ -1549,6 +1554,7 @@ fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_
 fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let target = tempfile::tempdir().expect("a target directory");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("late"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1570,6 +1576,7 @@ fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
             target.path().to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let step = &document.steps[0];
@@ -1589,6 +1596,7 @@ fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
 fn a_file_a_library_wrote_and_two_test_programs_read_leaves_the_listing_nothing_to_build() {
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let target = tempfile::tempdir().expect("a target directory");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("late"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1610,6 +1618,7 @@ fn a_file_a_library_wrote_and_two_test_programs_read_leaves_the_listing_nothing_
             target.path().to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let step = &document.steps[0];
@@ -1731,6 +1740,7 @@ fn the_result_names_every_command_and_no_path_of_the_checkout() {
 fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
     let (_, evidence) = run("forms").unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let again = Options {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1752,6 +1762,7 @@ fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     match report::run(&again, &mut |_| {}) {
         Err(Stopped::Evidence(problem)) => assert!(problem.contains("earlier run"), "{problem}"),
@@ -1765,6 +1776,7 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
     // nothing ran them.
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms-lib");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1786,6 +1798,7 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let unrun = &document.identifiers["KR-REQ-03.02"];
@@ -1821,6 +1834,7 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
     std::fs::write(&failing, "#!/bin/sh\nexit 1\n").expect("a runner");
     std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).expect("runnable");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms-lib");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1842,6 +1856,7 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     assert!(document.steps[0].error.is_some(), "{:?}", document.steps[0]);
@@ -1863,6 +1878,7 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
     // integration test it built after it.
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-outcomes-stops");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("outcomes"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1884,6 +1900,7 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let error = document.steps[0].error.as_deref().unwrap_or_default();
@@ -1910,6 +1927,7 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
 fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_runs_exist() {
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms-lib");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1931,6 +1949,7 @@ fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let terminals = document.terminals.as_ref().expect("the matrix");
@@ -1968,6 +1987,7 @@ fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_
 fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-outcomes-ignored");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("outcomes"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
@@ -1989,6 +2009,7 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     let passes = &document.identifiers["KR-REQ-04.01"].tests[0];

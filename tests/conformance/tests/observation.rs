@@ -41,6 +41,7 @@ fn shell(what: &str, script: &str, arguments: &[&Path]) -> Step {
 
 fn run(evidence: &Path, lister: PathBuf, steps: Vec<Step>) -> Document {
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-observation");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let options = Options {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence)
@@ -59,6 +60,7 @@ fn run(evidence: &Path, lister: PathBuf, steps: Vec<Step>) -> Document {
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.path().to_path_buf(),
     };
     report::run(&options, &mut |_| {}).unwrap_or_else(|stopped| panic!("{stopped:?}"))
 }
