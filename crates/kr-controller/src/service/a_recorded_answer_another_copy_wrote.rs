@@ -1029,7 +1029,7 @@ async fn a_reused_catalogue_identifier_is_refused_for_a_fence_and_is_no_copy_of_
     };
     attempt(&first, false)
         .await
-        .into_answer()
+        .into_answer_for_test()
         .expect_err("a catalogue nobody enrolled is refused");
 
     let control = attempt(&reused, false).await;
@@ -1039,7 +1039,7 @@ async fn a_reused_catalogue_identifier_is_refused_for_a_fence_and_is_no_copy_of_
     );
     assert_eq!(
         control
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("the identifier is reused")
             .code,
         ErrorCode::IdConflict
@@ -1052,7 +1052,7 @@ async fn a_reused_catalogue_identifier_is_refused_for_a_fence_and_is_no_copy_of_
     );
     refused_for_a_fence(
         &fenced
-            .into_answer()
+            .into_answer_for_test()
             .expect_err("a fence that landed stops it"),
     );
     controller.hold_fence(false);
