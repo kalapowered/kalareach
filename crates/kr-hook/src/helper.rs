@@ -179,13 +179,23 @@ pub const CLAIM_WAIT: Duration = Duration::from_millis(100);
 /// replacement that is being started to start or to fail. A replacement that starts takes the
 /// process with it, so the answer is written only by the hook that is left.
 pub fn claim_answer() {
-    claim(&ANSWERED, CLAIM_WAIT);
+    claim(&ANSWERED, CLAIM_WAIT, Instant::now, || {
+        std::thread::sleep(Duration::from_millis(1));
+    });
 }
 
-fn claim(answered: &std::sync::Mutex<bool>, within: Duration) {
+/// [`claim_answer`] given its clock and its pause between looks at the claim, and how long it
+/// waits for a replacement that holds it: `claim_answer` passes the system's clock and a pause of
+/// a millisecond.
+fn claim(
+    answered: &std::sync::Mutex<bool>,
+    within: Duration,
+    now: impl Fn() -> Instant,
+    pause: impl Fn(),
+) {
     use std::sync::TryLockError;
 
-    let until = Instant::now() + within;
+    let until = now() + within;
     loop {
         match answered.try_lock() {
             Ok(mut answered) => {
@@ -197,10 +207,10 @@ fn claim(answered: &std::sync::Mutex<bool>, within: Duration) {
                 return;
             }
             Err(TryLockError::WouldBlock) => {
-                if Instant::now() >= until {
+                if now() >= until {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                pause();
             }
         }
     }
@@ -289,7 +299,9 @@ mod tests {
             });
             inside.recv().expect("the replacement is being started");
             scope.spawn(move || {
-                claim(answered, Duration::from_secs(60));
+                claim(answered, Duration::from_secs(60), Instant::now, || {
+                    std::thread::sleep(Duration::from_millis(1));
+                });
                 events.lock().unwrap().push("answered");
             });
             go.send(()).expect("let go");
@@ -323,12 +335,78 @@ mod tests {
             });
             inside.recv().expect("the replacement is being started");
             // The replacement is still in `exec`; this returns once its time is up.
-            claim(answered, Duration::from_millis(20));
+            claim(answered, Duration::from_millis(20), Instant::now, || {
+                std::thread::sleep(Duration::from_millis(1));
+            });
             go.send(()).expect("let go");
         });
         assert!(
             !*answered.lock().expect("the claim"),
             "the claim was not taken while the replacement held it"
         );
+    }
+
+    /// On a clock that a case moves: a claim that finds a replacement holding it waits for the time
+    /// it is given and no longer, a pause at a time, and leaves the claim to the replacement.
+    #[test]
+    fn a_claim_held_by_a_replacement_waits_for_the_time_it_is_given_and_no_longer() {
+        let made = crate::made::Made::new([]);
+        let answered = std::sync::Mutex::new(false);
+        let held = answered.lock().expect("the claim");
+        let within = Duration::from_millis(100);
+        let pause = Duration::from_millis(1);
+        claim(&answered, within, || made.now(), || made.pass(pause));
+        assert!(
+            made.passed() >= within && made.passed() <= within + pause,
+            "the claim waited {:?} for {within:?}",
+            made.passed()
+        );
+        drop(held);
+        assert!(
+            !*answered.lock().expect("the claim"),
+            "the claim was left to the replacement"
+        );
+    }
+
+    /// A claim goes on the moment a replacement lets it go, and takes it: the answer waits for the
+    /// replacement to start or to fail, and for nothing else.
+    #[test]
+    fn a_claim_is_taken_the_moment_a_replacement_lets_it_go() {
+        let made = crate::made::Made::new([]);
+        let answered = std::sync::Mutex::new(false);
+        let held = std::cell::RefCell::new(Some(answered.lock().expect("the claim")));
+        let pause = Duration::from_millis(1);
+        claim(
+            &answered,
+            Duration::from_secs(60),
+            || made.now(),
+            || {
+                made.pass(pause);
+                if made.passed() >= Duration::from_millis(30) {
+                    held.borrow_mut().take();
+                }
+            },
+        );
+        assert_eq!(
+            made.passed(),
+            Duration::from_millis(30),
+            "it went on at once"
+        );
+        assert!(*answered.lock().expect("the claim"), "the claim was taken");
+    }
+
+    /// A claim nobody holds is taken at once, with no wait.
+    #[test]
+    fn a_claim_nobody_holds_is_taken_with_no_wait() {
+        let made = crate::made::Made::new([]);
+        let answered = std::sync::Mutex::new(false);
+        claim(
+            &answered,
+            CLAIM_WAIT,
+            || made.now(),
+            || made.pass(Duration::from_millis(1)),
+        );
+        assert_eq!(made.passed(), Duration::ZERO);
+        assert!(*answered.lock().expect("the claim"));
     }
 }
