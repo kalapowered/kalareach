@@ -511,10 +511,13 @@ impl Controller {
     /// connection of this daemon holds its authority.
     ///
     /// A worker of an earlier build gives a role to the connection whose presentation it decides
-    /// last, and a worker of this build refuses a connection whose hello it answered before one it
-    /// accepted: either way a link this daemon opened and gave up on can end the new link's life
-    /// before its first exchange. The request that wanted the link is not refused for that. One
-    /// further link is opened inside the time the request has, and a second refusal is the answer.
+    /// last, so a link this daemon opened and gave up on can take the authority from the new link
+    /// before its first exchange. A worker of this build refuses the older link instead. It refuses
+    /// a new link only when it answered that link's hello before the hello of a link it had already
+    /// accepted, which needs two openers of the same role at the same time, or when a higher
+    /// generation has replaced this daemon. A request whose link is displaced is not refused for
+    /// that: one further link is opened inside the time the request has, and a second refusal is
+    /// the answer, which is how a replaced daemon's request ends.
     async fn open_worker(&self, worker: &KnownWorker) -> Result<BoundLink> {
         match self.open_worker_once(worker).await {
             Err(error) if is_displaced_by_a_later_connection(&error) => {
