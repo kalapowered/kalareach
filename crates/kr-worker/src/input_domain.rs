@@ -1490,6 +1490,7 @@ impl InputDomain {
     /// [`WorkerError::InputRoomFull`] when what waits for the terminal leaves no room for the write,
     /// and [`WorkerError::PreconditionFailed`] while a managed session takes no external input.
     /// None of them takes the write's sequence number.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_entering(
         &mut self,
         attachment_id: AttachmentId,
@@ -1573,11 +1574,10 @@ impl InputDomain {
                 bytes: outcome.forward.len(),
             }
         };
-        let window = window.map(|counter| {
+        let window = window.inspect(|_| {
             if let Some(window) = self.window.as_mut() {
                 window.reserved = window.reserved.minus(claim);
             }
-            counter
         });
         let guard = ClaimGuard::new(&self.writer.room, claim, charged, window);
         let mut owed = Vec::new();
@@ -1985,6 +1985,7 @@ impl InputDomain {
     /// Returns the step itself when it is an `editor_busy` event, the removal of an attachment, an
     /// interrupt of the foreground process group or the answer to a command hook, which need the
     /// session.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn carry_out_step(
         &mut self,
         step: Step,

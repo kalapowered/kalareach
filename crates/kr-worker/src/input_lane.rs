@@ -120,7 +120,7 @@ impl LaneQueue {
     /// epoch and comes after that epoch's window state: the nearest window state or credit behind
     /// it is the only thing it may join, so credit never passes ahead of the window it follows.
     pub fn push_credit(&self, credit: LaneCredit) {
-        let frame = ControlFrame::Event(ControlEvent::InputCredit(credit.clone()));
+        let frame = ControlFrame::Event(ControlEvent::InputCredit(credit));
         self.push(
             |frames| {
                 for queued in frames.iter_mut().rev() {
