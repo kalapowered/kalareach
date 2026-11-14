@@ -1638,9 +1638,13 @@ impl SessionRuntime {
         let pump_session = Arc::clone(&session);
         let pump_domain = Arc::clone(&domain);
         let pump_sink = sink.clone();
+        let pump_clock = Arc::clone(&shared_clock);
         let task = tokio::spawn(async move {
+            let mut tried = None;
             loop {
-                pump_domain.pump_asked().await;
+                pump_domain
+                    .pump_asked(pump_clock.as_ref(), &mut tried)
+                    .await;
                 // Waited for off the executor: the session may be held by a commit.
                 off_the_executor(|| {
                     if let Ok(mut session) = pump_session.lock() {

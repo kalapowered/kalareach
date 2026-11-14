@@ -95,6 +95,8 @@ pub struct InputShared {
     /// room that comes back for a reply that waits for it, or a step the root editor's machine
     /// asked for that needs the session. The writer wakes it too, through the room.
     pump: Arc<tokio::sync::Notify>,
+    /// What the worker holds for the terminal, which the pump reads without the domain's lock.
+    room: Arc<InputRoom>,
 }
 
 impl InputShared {
@@ -102,6 +104,7 @@ impl InputShared {
     pub(crate) fn new(domain: InputDomain) -> Arc<Self> {
         Arc::new(Self {
             pump: domain.writer.room.pump(),
+            room: Arc::clone(&domain.writer.room),
             domain: Mutex::new(domain),
         })
     }
@@ -184,9 +187,34 @@ impl InputShared {
         self.pump.notify_one();
     }
 
-    /// Waits until the pump is asked for.
-    pub(crate) async fn pump_asked(&self) {
-        self.pump.notified().await;
+    /// Waits until the pump is asked for, or until the first answer that waits in the lane lapses.
+    ///
+    /// An answer that waits for room is dropped when the pump next drains the lane, and when no
+    /// room comes back and nothing else happens that is never, so the pump asks itself at the
+    /// answer's deadline. `tried` is the deadline it last woke at: one that a pass did not end is
+    /// not waited for again, which keeps a lane that cannot drop it from waking the pump over and
+    /// over.
+    pub(crate) async fn pump_asked(
+        &self,
+        clock: &dyn kr_ipc::clock::SharedClock,
+        tried: &mut Option<u64>,
+    ) {
+        let expiry = self
+            .room
+            .reply_expiry()
+            .filter(|at_ms| *tried != Some(*at_ms));
+        let Some(at_ms) = expiry else {
+            self.pump.notified().await;
+            return;
+        };
+        // One millisecond past it: a reply lapses when the reading is later than its deadline.
+        let wait = at_ms
+            .saturating_sub(clock.boot_elapsed_ms())
+            .saturating_add(1);
+        tokio::select! {
+            () = self.pump.notified() => {}
+            () = tokio::time::sleep(std::time::Duration::from_millis(wait)) => *tried = Some(at_ms),
+        }
     }
 }
 
@@ -887,6 +915,12 @@ impl InputDomain {
     /// and a keystroke does not take the session. So does the writer, when room comes back.
     pub(crate) fn set_replies_waiting(&self, waiting: bool) {
         self.writer.room.set_replies_waiting(waiting);
+    }
+
+    /// Records when the first answer that waits in the lane lapses, so that the pump looks again
+    /// then, and returns whether that is a change.
+    pub(crate) fn set_reply_expiry(&self, at_ms: Option<u64>) -> bool {
+        self.writer.room.set_reply_expiry(at_ms)
     }
 
     /// Says that answers wait in the lane, before the room is read for them, so that room the
