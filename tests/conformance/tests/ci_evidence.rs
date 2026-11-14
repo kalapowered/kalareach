@@ -953,6 +953,21 @@ const SCREENSHOT_TOOLS: [&str; 12] = [
     "playwright",
 ];
 
+/// Whether `value` begins with the folder `folder`, as a whole name and not as the start of a longer
+/// one (`$env:TEMP` is not `$env:TEMPLATES`).
+fn begins_with_folder(value: &str, folder: &str) -> bool {
+    value.strip_prefix(folder).is_some_and(|rest| {
+        folder.ends_with('/') || rest.is_empty() || rest.starts_with(['/', '\\'])
+    })
+}
+
+/// The name and the default of a value that begins with `${NAME:-default}`.
+fn expansion_default(value: &str) -> Option<(&str, String)> {
+    let (name, after) = value.strip_prefix("${")?.split_once(":-")?;
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| (name, after.chars().take_while(|c| *c != '}').collect()))
+}
+
 /// `value` with the quotes around it taken off.
 fn unquoted(value: &str) -> &str {
     value.trim().trim_matches(['"', '\''])
@@ -1000,8 +1015,10 @@ fn artifacts_assignment(line: &str) -> Option<String> {
 }
 
 /// Whether a line writes the variable in a way `artifacts_assignment` does not read: PowerShell's
-/// `$env:NAME = value`, a script's `os.environ["NAME"] = value`, an object key in a script, or any
-/// other `NAME` followed by an equals sign or a colon that is not a comparison or a default.
+/// `$env:NAME = value`, a script's `os.environ["NAME"] = value` or `NAME += value`, a setter that
+/// takes the name and a value (`SetEnvironmentVariable('NAME', value)`), an object key in a script,
+/// or an expansion with a form of default or alternate other than `${NAME:-default}`, `${NAME:?}` and
+/// `${NAME:+word}`. A comparison, a plain read and an expansion with a default are not writes.
 fn writes_unread(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.starts_with('#') || trimmed.starts_with("//") || artifacts_assignment(line).is_some()
@@ -1009,11 +1026,27 @@ fn writes_unread(line: &str) -> bool {
         return false;
     }
     line.match_indices(ARTIFACTS_VARIABLE).any(|(at, _)| {
+        let head = &line[..at];
         let after = line[at + ARTIFACTS_VARIABLE.len()..]
             .trim_start_matches(['"', '\'', ']', ')'])
             .trim_start();
-        (after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=~"))
-            || (after.starts_with(':') && !after.starts_with(":-"))
+        if head.ends_with("${") {
+            return !(after.starts_with(":-")
+                || after.starts_with(":?")
+                || after.starts_with(":+")
+                || after.starts_with('}'));
+        }
+        let call_or_key = head.trim_end_matches(['"', '\'', ' ', '\t']);
+        let comparison = head.contains('[') || head.contains("test ");
+        (after.starts_with('=')
+            && !after.starts_with("==")
+            && !after.starts_with("=~")
+            && !comparison)
+            || after.starts_with("+=")
+            || (after.starts_with(',') && call_or_key.ends_with('('))
+            || (after.starts_with(':')
+                && !after.starts_with(":-")
+                && call_or_key.ends_with(['{', ',']))
     })
 }
 
@@ -1097,19 +1130,27 @@ fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
     {
         return true;
     }
-    if let Some(rest) = value.strip_prefix("${")
-        && let Some((name, after)) = rest.split_once(":-")
-        && !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        let default: String = after.chars().take_while(|c| *c != '}').collect();
-        return (default.is_empty() && name == ARTIFACTS_VARIABLE)
-            || default == "/tmp"
-            || lies_in_a_temporary_folder(&default, text, depth - 1);
+    if let Some((name, default)) = expansion_default(value) {
+        // The variable's own default is the one to check; a folder variable's default may be `/tmp`
+        // itself, which a path under it then extends; any other name is also read where this text
+        // gives it a value, since that value is what the expansion yields when it is set.
+        let in_a_folder = lies_in_a_temporary_folder(&default, text, depth - 1);
+        return if name == ARTIFACTS_VARIABLE {
+            default.is_empty() || in_a_folder
+        } else if ["TMPDIR", "RUNNER_TEMP", "TEMP", "TMP"].contains(&name) {
+            default == "/tmp" || in_a_folder
+        } else {
+            let values = values_of(text, name);
+            in_a_folder
+                && !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| lies_in_a_temporary_folder(value, text, depth - 1))
+        };
     }
     if TEMPORARY_FOLDERS
         .iter()
-        .any(|folder| value.starts_with(folder))
+        .any(|folder| begins_with_folder(value, folder))
     {
         return true;
     }
@@ -1151,6 +1192,18 @@ fn files_ending(directory: &Path, endings: &[&str], found: &mut Vec<PathBuf>) {
             found.push(path);
         }
     }
+}
+
+/// Whether a step's own `if` is the constant false, so that the step never runs. A step that may
+/// fail without stopping the job (`continue-on-error`) still runs.
+fn never_runs(step: &str) -> bool {
+    step.lines().any(|line| {
+        let Some((_, key, value)) = key_value(line) else {
+            return false;
+        };
+        let value = compact(value.split(" #").next().unwrap_or_default());
+        key == "if" && (value == "false" || value == "${{false}}")
+    })
 }
 
 /// KR-REQ-27.03, the part about the build's directory: every workflow and script of the repository
@@ -1227,10 +1280,14 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
     let shots = values_of(&check, "shots");
     assert!(
         !shots.is_empty()
-            && shots
-                .iter()
-                .all(|value| lies_in_a_temporary_folder(value, &check, 6)),
+            && shots.iter().all(|value| expansion_default(value)
+                .is_some_and(|(_, default)| lies_in_a_temporary_folder(&default, &check, 6))),
         "the store build's release check keeps its screenshots outside a temporary folder: {shots:?}"
+    );
+    let store = fs::read_to_string(root.join("scripts/store-android.sh")).expect("the store build");
+    assert!(
+        !store.contains("KR_PAIRING_SHOTS"),
+        "the store build gives its release check another folder for its screenshots"
     );
 
     // The companion's browser tests keep their screenshots under the variable, and under `/tmp`
@@ -1268,20 +1325,29 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
                     .take_while(|line| !line.starts_with("    steps:"))
                     .any(|line| artifacts_assignment(line).is_some());
             for step in steps_of(&body) {
-                if is_disabled(&step) {
+                if never_runs(&step) {
                     continue;
                 }
                 let lines: Vec<&str> = step.lines().collect();
-                let tool = lines
+                // The tool is named in a command, not in the step's name; the step's own `env`
+                // gives the variable wherever it stands in the step; an assignment in a command
+                // counts only ahead of the tool, and a write to the environment file counts for the
+                // steps after this one, not for this one.
+                let tool = lines.iter().position(|line| {
+                    let text = line.trim_start().trim_start_matches("- ");
+                    !text.starts_with("name:")
+                        && SCREENSHOT_TOOLS.iter().any(|tool| line.contains(tool))
+                });
+                let in_env = lines
                     .iter()
-                    .position(|line| SCREENSHOT_TOOLS.iter().any(|tool| line.contains(tool)));
-                let own = lines
-                    .iter()
-                    .position(|line| artifacts_assignment(line).is_some());
+                    .any(|line| line.trim().starts_with(&format!("{ARTIFACTS_VARIABLE}:")));
+                let own = lines.iter().position(|line| {
+                    !line.contains("GITHUB_ENV") && artifacts_assignment(line).is_some()
+                });
                 if let Some(tool) = tool {
                     steps_with_a_tool += 1;
                     assert!(
-                        set || own.is_some_and(|own| own <= tool),
+                        set || in_env || own.is_some_and(|own| own <= tool),
                         "{name}: the job {job_name} runs a screenshot tool in a step that has no \
                          {ARTIFACTS_VARIABLE} yet:\n{step}"
                     );
