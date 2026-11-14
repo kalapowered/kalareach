@@ -513,16 +513,43 @@ fn a_temporary_folder_whose_name_holds_line_feeds_admits_nothing_outside_the_roo
         let to_trailing = parent.path().join("kr-link-trailing");
         std::os::unix::fs::symlink(&inside, &to_inside).expect("a link");
         std::os::unix::fs::symlink(&trailing, &to_trailing).expect("a link");
-        assert_refused(
-            reader,
-            &reader.read(Some(outside.as_os_str()), Some(&to_inside)),
-            "a folder outside the roots when the temporary folder is a link to a name with line feeds",
-            OUTSIDE,
-        );
+        let cut = parent.path().join("kr-root");
+        std::fs::create_dir(&cut).expect("the folder that the name is cut to");
+        let beside = cut.join("evidence");
+        for value in [&outside, &beside] {
+            assert_refused(
+                reader,
+                &reader.read(Some(value.as_os_str()), Some(&to_inside)),
+                "a folder outside a temporary folder link to a name with line feeds",
+                OUTSIDE,
+            );
+        }
         assert_refused(
             reader,
             &reader.read(Some(value.as_os_str()), Some(&to_trailing)),
             "a folder beside the target of a temporary folder link whose name ends with a line feed",
+            OUTSIDE,
+        );
+    }
+}
+
+/// A runner folder written with a line feed at its end names no folder, so it is no root, though the
+/// same name without the line feed is a folder (a shell that drops the line feed would take it).
+#[test]
+fn a_runner_folder_with_a_line_feed_at_its_end_names_no_folder_and_so_no_root() {
+    for reader in readers() {
+        let runner = beside_the_build();
+        let mut named = runner.path().as_os_str().to_owned();
+        named.push("\n");
+        let value = spelled_for(reader, &runner.path().join("evidence"));
+        assert_refused(
+            reader,
+            &reader.read_with(
+                Some(value.as_os_str()),
+                None,
+                &[("RUNNER_TEMP", named.as_os_str())],
+            ),
+            "a folder under a runner folder written with a line feed at its end",
             OUTSIDE,
         );
     }
