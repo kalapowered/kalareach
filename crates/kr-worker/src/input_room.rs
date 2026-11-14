@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 use crate::session::{InputBatch, MAX_QUEUED_INPUT_BYTES, MAX_QUEUED_INPUT_FRAMES};
 
@@ -110,8 +110,10 @@ pub struct InputRoom {
     bytes: AtomicUsize,
     /// How many of the entries are the host's own answers, which have a share of their own.
     replies: AtomicUsize,
-    /// Whether the response lane still holds answers that the gate lets out, after the last time
-    /// it was drained. Room that comes back while this is set is room for them.
+    /// Whether the response lane holds answers that the pump has not yet found room for, from
+    /// before the pump reads the room until a pass of it has found the lane empty or its gate
+    /// shut. Room that comes back while this is set is room for them, and the writer says so to
+    /// the pump.
     replies_waiting: AtomicBool,
     /// Woken when something is owed that only the session can do, among it the answers that wait
     /// in the lane for room.
@@ -134,15 +136,39 @@ impl InputRoom {
         self.replies.load(Ordering::Acquire)
     }
 
-    /// Records whether the response lane still holds answers after a drain.
-    pub(crate) fn set_replies_waiting(&self, waiting: bool) {
-        self.replies_waiting.store(waiting, Ordering::Release);
+    /// Says that answers wait in the lane, before the room is read for them.
+    ///
+    /// The writer gives room back without the input domain, so room can come back at any moment
+    /// of a pass of the pump. The two sides agree through this flag and the counts, and each does
+    /// its write before its read: the pump says that answers wait and then reads the room, and the
+    /// writer gives the room back and then reads whether answers wait. A fence between each
+    /// pair puts them in one order for both, so at least one of them sees the other: either the
+    /// pump reads the room that came back, or the writer finds the flag set and wakes the pump.
+    /// Neither takes a lock.
+    pub(crate) fn publish_waiting_replies(&self) {
+        self.replies_waiting.store(true, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
     }
 
-    /// Returns whether the response lane held answers the gate allows out when it was last drained.
+    /// Records whether the response lane still holds answers after a drain.
+    pub(crate) fn set_replies_waiting(&self, waiting: bool) {
+        self.replies_waiting.store(waiting, Ordering::SeqCst);
+    }
+
+    /// Returns whether the response lane holds answers that the gate allows out, as the pump last
+    /// found it.
     #[must_use]
     pub(crate) fn replies_waiting(&self) -> bool {
-        self.replies_waiting.load(Ordering::Acquire)
+        self.replies_waiting.load(Ordering::SeqCst)
+    }
+
+    /// Wakes the pump if answers wait in the lane, once room has come back. The fence pairs with
+    /// the one in [`Self::publish_waiting_replies`].
+    fn wake_pump_if_replies_wait(&self) {
+        fence(Ordering::SeqCst);
+        if self.replies_waiting() {
+            self.pump.notify_one();
+        }
     }
 
     /// Returns what wakes the pump that serves the session.
@@ -223,8 +249,6 @@ impl Drop for Owed {
             .give_back_counts(self.left, usize::from(self.reply));
         // What has come back may be the room that an answer in the lane waits for, and the lane is
         // the session's, which the writer does not take: the pump looks again.
-        if self.room.replies_waiting() {
-            self.room.pump.notify_one();
-        }
+        self.room.wake_pump_if_replies_wait();
     }
 }
