@@ -93,7 +93,8 @@ pub struct ListenerConfig {
     /// any other kind is reset before it takes a bulk slot or a place in the registry. A host that
     /// names none takes none, and a device can open no stream but the control stream on its
     /// connections: a connection starts with room for that one stream, and is raised to the room
-    /// the bulk streams need when this names a kind and the host first calls
+    /// the bulk streams need, and the input streams when this names
+    /// [`StreamKind::TerminalInput`], when this names a kind and the host first calls
     /// [`DataStreams::recv`], so a device that tries to open a second stream before that waits for
     /// credit that does not come.
     pub accepted_kinds: Vec<StreamKind>,
@@ -529,8 +530,8 @@ pub struct AuthorisedSession {
     /// stream; a stream of any other kind holds none, so a host that accepts one can hold more
     /// streams than the queue's depth: at most as many as the connection's stream limit allows
     /// beside its control stream, 9 with the defaults, or 13 when it also takes input streams, of
-    /// which at most `max_bulk_streams` are attachment streams. The receiver ends when the connection does, and a stream still queued
-    /// when it is dropped is reset.
+    /// which at most `max_bulk_streams` are attachment streams. The receiver ends when the
+    /// connection does, and a stream still queued when it is dropped is reset.
     pub data_streams: DataStreams,
     /// The deadlines a data stream is held to ([`ListenerConfig::deadlines`]), for the waits a
     /// host makes on a stream's behalf: the lookup that admits it runs under

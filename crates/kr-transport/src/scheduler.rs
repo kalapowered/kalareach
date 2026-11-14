@@ -402,7 +402,9 @@ impl StreamBudget {
     /// so room given back between the refusal and the await is not missed. Every writer that is
     /// waiting is woken, because each tries again and not each will fit. The wait can end when
     /// the room that came back is not the room this writer needs, so a writer whose attempt is
-    /// refused again makes a new wait and waits again.
+    /// refused again makes a new wait and waits again. A write larger than
+    /// [`SendLimits::ceiling_for`] its class is refused for good: no room given back admits it, and
+    /// its writer must not wait.
     pub fn released(&self) -> impl Future<Output = ()> + '_ {
         self.released.notified()
     }
@@ -468,6 +470,8 @@ impl Drop for QueueReservation {
         if self.class == StreamClass::Bulk {
             state.bulk_queued_bytes = state.bulk_queued_bytes.saturating_sub(self.bytes);
         }
+        // The room is given back before anyone is told: a writer that wakes and tries again has to
+        // find it, or its new wait would not see this release.
         drop(state);
         self.budget.released.notify_waiters();
     }
