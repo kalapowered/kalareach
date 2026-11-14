@@ -51,7 +51,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 companion="$here/apps/companion"
 app_id=to.kala.reach
 device="${KR_IOS_DEVICE:-iPhone 17 Pro}"
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/device-records-ios"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/device-records-ios"
 mkdir -p "${artefacts:?}"
 run="$(uuidgen)"
 item="$(uuidgen)"

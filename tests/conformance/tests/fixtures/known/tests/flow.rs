@@ -3,10 +3,8 @@
 /// Records a known difference the way the application matrix does.
 fn record(test: &str) {
     use std::io::Write;
-    let Some(directory) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
-        return;
-    };
-    let path = std::path::Path::new(&directory).join("known-differences.jsonl");
+    let directory = kr_test_artifacts::directory();
+    let path = directory.join("known-differences.jsonl");
     let line = format!(
         "{{\"package\":\"known\",\"target\":\"flow\",\"test\":\"{test}\",\"subject\":\"a sequence\",\
          \"application\":\"two cells\",\"grid\":\"four cells\",\"observed\":\"a row\"}}\n"

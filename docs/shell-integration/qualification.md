@@ -14,7 +14,7 @@ bash scripts/e2e-fence.sh
 
 That builds or verifies the packages from their pinned upstream releases, fetches the pinned
 customisations by digest, starts a real control daemon and a real managed session, and then drives
-every case. Its evidence goes to `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}`, including
+every case. Its evidence goes to the directory `KR_TEST_ARTIFACTS_DIR` names, including
 `qualification-cases.tsv`, which is one line per case: what it qualified, which package identity,
 and which version of each customisation. A case with a drive that could not read the state it
 names says so on that line, as `qualified, narrowed to what the reader reported:` followed by the

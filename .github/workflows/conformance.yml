@@ -555,12 +555,13 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $evidence = & ./scripts/artifacts-dir.ps1
           $arguments = @()
           foreach ($name in ($env:REPORT_GROUPS -split '\s+' | Where-Object { $_ })) {
             $arguments += '--group'
             $arguments += $name
           }
-          cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR @arguments
+          cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $evidence @arguments
 
       # The drives as the report left them; the change in used space since the first reading is what
       # the job took.

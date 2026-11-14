@@ -23,7 +23,10 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 project="$here/apps/companion/src-tauri/gen/android"
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/push-android-receiver"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/push-android-receiver"
 mkdir -p "${artefacts:?}"
 app_id=to.kala.reach
 log="$artefacts/run.log"

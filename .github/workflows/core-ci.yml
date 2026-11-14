@@ -1893,7 +1893,9 @@ jobs:
           export PATH="$KR_SECOND_POWERSHELL:$PATH"
           test "$(command -v pwsh)" = "$KR_SECOND_POWERSHELL/pwsh"
           export KR_TEST_ARTIFACTS_DIR="$RUNNER_TEMP/kr-shell-qualification-second"
-          mkdir -p "$KR_TEST_ARTIFACTS_DIR"
+          . scripts/lib/artifacts-dir.sh
+          kr_artifacts_dir
+          mkdir -p "$kr_artifacts"
           pwsh -NoProfile -Command '
             Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
             Publish-KalaReachQualification | Format-List'
@@ -2099,7 +2101,9 @@ jobs:
         run: |
           set -uo pipefail
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
-          mkdir -p "$KR_TEST_ARTIFACTS_DIR/android-app"
+          . scripts/lib/artifacts-dir.sh
+          kr_artifacts_dir
+          mkdir -p "$kr_artifacts/android-app"
           avd=kalareach-ci
           # The device is made where the emulator looks for it: the tools take their own place for
           # it from the SDK's settings unless it is named.
@@ -2122,7 +2126,7 @@ jobs:
           # The hosted runner has 16 GB, which the next line prints.
           free -m
           "$ANDROID_HOME/emulator/emulator" -avd "$avd" -no-window -no-audio -no-boot-anim -no-snapshot \
-            -memory 4096 -gpu swiftshader_indirect -accel on > "$KR_TEST_ARTIFACTS_DIR/android-app/emulator.log" 2>&1 &
+            -memory 4096 -gpu swiftshader_indirect -accel on > "$kr_artifacts/android-app/emulator.log" 2>&1 &
           emulator=$!
           trap 'kill "$emulator" 2> /dev/null || true' EXIT
           serial="emulator-5554"
@@ -2130,7 +2134,7 @@ jobs:
           until [ "$(adb -s "$serial" shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')" = 1 ]; do
             if ! kill -0 "$emulator" 2> /dev/null; then
               echo "::error::the emulator ended before it finished starting"
-              tail -n 40 "$KR_TEST_ARTIFACTS_DIR/android-app/emulator.log"
+              tail -n 40 "$kr_artifacts/android-app/emulator.log"
               exit 1
             fi
             if [ $((SECONDS - started)) -gt 600 ]; then
@@ -2144,8 +2148,8 @@ jobs:
           bash scripts/native-library-tests.sh android --serial "$serial" || failed=1
           bash scripts/android-app-launch.sh \
             apps/companion/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk \
-            "$KR_TEST_ARTIFACTS_DIR/android-app/launch.png" --serial "$serial" || failed=1
-          adb -s "$serial" logcat -d -b all > "$KR_TEST_ARTIFACTS_DIR/android-app/logcat.txt" || true
+            "$kr_artifacts/android-app/launch.png" --serial "$serial" || failed=1
+          adb -s "$serial" logcat -d -b all > "$kr_artifacts/android-app/logcat.txt" || true
           exit "$failed"
 
       # The application a store ships is the minified release, and a debug build is not minified, so
@@ -2321,7 +2325,10 @@ jobs:
         run: bash scripts/native-library-tests.sh ios --udid "$KR_SIMULATOR"
 
       - name: Start the application in the simulator
-        run: bash scripts/ios-app-launch.sh "$KR_IOS_APP" "$KR_SIMULATOR" "$KR_TEST_ARTIFACTS_DIR/ios-app/launch.png"
+        run: |
+          . scripts/lib/artifacts-dir.sh
+          kr_artifacts_dir
+          bash scripts/ios-app-launch.sh "$KR_IOS_APP" "$KR_SIMULATOR" "$kr_artifacts/ios-app/launch.png"
 
       - name: Shut the simulator down
         if: ${{ always() && env.KR_SIMULATOR != '' }}
@@ -2475,7 +2482,10 @@ jobs:
       # interface and kept no picture of it, or whose pictures went to the runner's temporary
       # directory and were lost with it, is a failure here and not an empty upload.
       - name: The screenshots are in the evidence directory
-        run: bash scripts/check-test-evidence.sh "$KR_TEST_ARTIFACTS_DIR" companion-screenshots
+        run: |
+          . scripts/lib/artifacts-dir.sh
+          kr_artifacts_dir
+          bash scripts/check-test-evidence.sh "$kr_artifacts" companion-screenshots
 
       - name: What the disk holds after the browsers' run
         if: ${{ !cancelled() && runner.os == 'macOS' }}
@@ -2500,7 +2510,10 @@ jobs:
       - name: Operate the desktop application's native window controls
         if: ${{ !cancelled() && runner.os == 'macOS' && steps.desktop-build.outcome == 'success' }}
         timeout-minutes: 10
-        run: bash scripts/desktop-controls-macos.sh target/release/kalareach-companion "$KR_TEST_ARTIFACTS_DIR/desktop-controls/window.png"
+        run: |
+          . scripts/lib/artifacts-dir.sh
+          kr_artifacts_dir
+          bash scripts/desktop-controls-macos.sh target/release/kalareach-companion "$kr_artifacts/desktop-controls/window.png"
 
       # The figures, the traces and the screenshots the run produced, kept whether it passed or not.
       # A run that kept nothing fails: the guard above names the pictures a browser run must leave.

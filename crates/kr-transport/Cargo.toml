@@ -45,6 +45,8 @@ testing = []
 [dev-dependencies]
 # This crate's own tests, with the name-server choice above compiled in.
 kr-transport = { path = ".", features = ["testing"] }
+# Where the scheduling case keeps its figures.
+kr-test-artifacts.workspace = true
 iroh = { workspace = true, features = ["test-utils"] }
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 # Certificates from an authority a test makes, for the relay front and the intercepting proxy.

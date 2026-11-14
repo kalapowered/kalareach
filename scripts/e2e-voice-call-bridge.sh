@@ -56,7 +56,10 @@ esac
 # shellcheck source=scripts/lib/android-avd.sh
 . "$here/scripts/lib/android-avd.sh"
 
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-call-bridge-$platform"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/voice-call-bridge-$platform"
 mkdir -p "${artefacts:?}"
 run="$(uuidgen)"
 app_id=to.kala.reach

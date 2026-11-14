@@ -36,6 +36,8 @@ wezterm-surface.workspace = true
 wezterm-term.workspace = true
 
 [dev-dependencies]
+# Where the performance case keeps its figures.
+kr-test-artifacts.workspace = true
 serde_json.workspace = true
 # Copies of the committed fixtures that a test may change.
 tempfile.workspace = true

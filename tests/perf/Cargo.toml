@@ -20,6 +20,10 @@ path = "src/bin/kr-perf-writer.rs"
 name = "kr-perf-watch"
 path = "src/bin/kr-perf-watch.rs"
 
+[dependencies]
+# The directory a run keeps its figures in.
+kr-test-artifacts.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux keeps a process's processor time in clock ticks, and this is where their rate is read. The
 # memory reader's checks make a process refuse its page map to every reader, which is a process

@@ -1821,8 +1821,9 @@ without one. Those readings are the engine's own accounting sampled between read
 nothing about what a single read held while it was inside one, and nothing about what an allocator
 was holding around it.
 
-Where `KR_TEST_ARTIFACTS_DIR` is set, each run writes its host, its figures and its verdict there
-before it asserts anything, so a run that fell short keeps the number it measured and the processor
+Each run writes its host, its figures and its verdict to the directory `KR_TEST_ARTIFACTS_DIR`
+names, or to a directory of its own under the temporary folder where it is unset, before it asserts
+anything, so a run that fell short keeps the number it measured and the processor
 it measured it on rather than only the failure. A run that cannot write it fails rather than
 carrying on with nothing kept. The command above sets nothing, so a local run prints its record and
 keeps no file; continuous integration sets it and retains the directory.

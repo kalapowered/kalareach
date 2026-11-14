@@ -49,7 +49,10 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 companion="$here/apps/companion"
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-device"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/voice-device"
 shots="${KR_MOBILE_SCREENSHOT_DIR:-/tmp}"
 port="${KR_VOICE_TEST_PORT:-4188}"
 want="${1:-all}"

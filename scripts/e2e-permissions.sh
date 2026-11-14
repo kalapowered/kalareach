@@ -39,7 +39,10 @@ if [ -n "$log" ]; then
   exec > >(tee "$log") 2>&1
 fi
 
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/permissions"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$root/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/permissions"
 mkdir -p "$artefacts"
 # Absolute, because the session this script starts runs in another directory.
 artefacts="$(cd "$artefacts" && pwd)"

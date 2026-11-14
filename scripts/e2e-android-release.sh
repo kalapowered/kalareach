@@ -62,7 +62,10 @@ esac
 # shellcheck source=scripts/lib/android-avd.sh
 . "$here/scripts/lib/android-avd.sh"
 
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/release-tls-android"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/release-tls-android"
 # The packages (about 95 MB each) are kept on the internal disk, not with the run's records.
 cache="${HOME}/Library/Caches/kalareach-tests/release-tls"
 mkdir -p "${cache:?}"

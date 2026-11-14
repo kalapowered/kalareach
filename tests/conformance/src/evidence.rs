@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -191,113 +191,32 @@ pub fn known_differences(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused(pub String);
 
-/// Checks that `directory` is inside this platform's temporary directory, and only then creates
+/// Checks that `directory` is inside one of this platform's temporary roots, and only then creates
 /// it. Returns its real path.
 ///
-/// Section 21 keeps every test artefact in an operating-system-resolved temporary directory, and a
+/// Section 27 keeps every test artefact in an operating-system-resolved temporary directory, and a
 /// report that wrote its evidence anywhere else could put it inside a checkout or a person's own
-/// files. On Unix, `/tmp` and `TMPDIR` are both this platform's temporary directory; on Windows it
-/// is the one the system names for the user.
-///
-/// The path is resolved before anything is created, so a refused directory is never made: the part
-/// that exists is resolved by the system, links and all, and the rest is new names under it. A
-/// `..` is refused outright, because after a name that does not exist yet it could step back into
-/// a link the resolution never saw. What was made is resolved again and judged again.
+/// files. The rule is the one every reader of `KR_TEST_ARTIFACTS_DIR` applies, from
+/// `kr-test-artifacts`: an absolute path, resolved through its links before anything is created,
+/// inside a root, with no `..` in it. What was made is resolved again and judged again.
 ///
 /// # Errors
 ///
 /// Returns why the directory is refused.
 pub fn check_directory(directory: &Path) -> Result<PathBuf, Refused> {
-    if directory
-        .components()
-        .any(|component| component == Component::ParentDir)
-    {
-        return Err(Refused(format!(
-            "{} steps up a directory with `..`; name the evidence directory without one",
-            directory.display()
-        )));
-    }
-    let real = resolve(directory).map_err(|error| {
-        Refused(format!(
-            "{} could not be resolved: {error}",
-            directory.display()
-        ))
-    })?;
-    let outside = || {
-        Refused(format!(
-            "{} is outside this platform's temporary directory; the evidence directory has to be \
-             inside it",
-            directory.display()
-        ))
-    };
-    if !inside_temporary(&real) {
-        return Err(outside());
-    }
+    let refused = |refused: kr_test_artifacts::Refused| Refused(refused.to_string());
+    let real = kr_test_artifacts::confine(directory).map_err(refused)?;
     std::fs::create_dir_all(&real)
         .map_err(|error| Refused(format!("{} could not be created: {error}", real.display())))?;
-    let made = real_path(&real)
-        .map_err(|error| Refused(format!("{} could not be resolved: {error}", real.display())))?;
-    if made != real || !inside_temporary(&made) {
-        return Err(outside());
+    let made = kr_test_artifacts::confine(&real).map_err(refused)?;
+    if made != real {
+        return Err(Refused(format!(
+            "{} resolved to {} once it was made, which is not where it was checked",
+            real.display(),
+            made.display()
+        )));
     }
     Ok(made)
-}
-
-/// The path the system resolves `path` to, links and all. On Windows, a path on a drive is given in
-/// its ordinary form rather than the extended one the system answers with (`\\?\C:\...`), which the
-/// tests are handed and which not every program they start reads.
-fn real_path(path: &Path) -> std::io::Result<PathBuf> {
-    let real = std::fs::canonicalize(path)?;
-    if cfg!(windows)
-        && let Some(rest) = real.to_str().and_then(|text| text.strip_prefix(r"\\?\"))
-        && rest.as_bytes().get(1) == Some(&b':')
-    {
-        return Ok(PathBuf::from(rest));
-    }
-    Ok(real)
-}
-
-/// Whether `real`, a resolved path, is inside this platform's temporary directory.
-fn inside_temporary(real: &Path) -> bool {
-    let mut temporary = vec![std::env::temp_dir()];
-    if cfg!(unix) {
-        temporary.push(PathBuf::from("/tmp"));
-    }
-    temporary
-        .iter()
-        .filter_map(|candidate| real_path(candidate).ok())
-        .any(|base| real != base && real.starts_with(&base))
-}
-
-/// The real path `path` names, whether or not it exists yet: its longest existing ancestor
-/// resolved through every link, and the rest of it after that.
-fn resolve(path: &Path) -> std::io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    // The part that exists is resolved by the system, links and all; from the first component
-    // that does not exist, the rest is applied as written.
-    let mut existing = PathBuf::new();
-    let mut rest: Vec<Component<'_>> = Vec::new();
-    for component in absolute.components() {
-        if rest.is_empty() {
-            let candidate = existing.join(component);
-            if candidate.exists() {
-                existing = candidate;
-                continue;
-            }
-        }
-        rest.push(component);
-    }
-    let mut real = real_path(&existing)?;
-    for component in rest {
-        if let Component::Normal(name) = component {
-            real.push(name);
-        }
-    }
-    Ok(real)
 }
 
 #[cfg(test)]

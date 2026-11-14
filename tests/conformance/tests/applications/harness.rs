@@ -69,7 +69,7 @@ const TYPING_TERMINAL: &str = "ghostty";
 /// A case records one when the difference is a documented property of the profile rather than a
 /// fault, and it asserts what the profile defines. The report shows it as a known difference, in
 /// a section of its own, never as a pass. Where `KR_TEST_ARTIFACTS_DIR` is not set the record is
-/// printed and kept nowhere.
+/// kept in a directory of this run's own under the temporary folder.
 ///
 /// # Panics
 ///
@@ -86,10 +86,8 @@ pub fn known_difference(test: &str, subject: &str, application: &str, grid: &str
         "observed": observed,
     });
     println!("known difference: {record}");
-    let Some(directory) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
-        return;
-    };
-    let path = Path::new(&directory).join("known-differences.jsonl");
+    let directory = kr_test_artifacts::directory();
+    let path = directory.join("known-differences.jsonl");
     let write = || -> std::io::Result<()> {
         use std::io::Write;
         std::fs::create_dir_all(&directory)?;

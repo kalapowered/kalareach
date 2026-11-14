@@ -92,7 +92,14 @@ report() {
     size_of "the simulators' caches" /Library/Developer/CoreSimulator/Caches
     size_of "the temporary directory" "${TMPDIR:-/tmp}"
     size_of "/private/tmp" /private/tmp
-    size_of "the test evidence" "${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+    # The evidence directory is measured where the run names one. A value the reader refuses is
+    # said on the error stream and left out, since this report exits 0 whatever it could not read.
+    # shellcheck source=scripts/lib/artifacts-dir.sh
+    . "$(dirname "${BASH_SOURCE[0]}")/lib/artifacts-dir.sh"
+    evidence="$(kr_artifacts_dir_if_set && printf '%s' "$kr_artifacts")" || evidence=""
+    if [ -n "$evidence" ]; then
+        size_of "the test evidence" "$evidence"
+    fi
     if [ "$mode" = begin ]; then
         echo "  the preinstalled software that takes the most room:"
         size_of "  the Xcodes" /Applications/Xcode_*.app

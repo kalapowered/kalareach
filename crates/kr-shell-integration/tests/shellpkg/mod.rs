@@ -3516,21 +3516,11 @@ pub fn next_revision(revision: EditorBufferRevision) -> EditorBufferRevision {
 ///
 /// # Panics
 ///
-/// Panics when no directory of this run's own can be made.
+/// Panics when the variable names a place outside the system's temporary directories, or when no
+/// directory of this run's own can be made.
 #[must_use]
 pub fn artifact_directory() -> PathBuf {
-    if let Some(named) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") {
-        return PathBuf::from(named);
-    }
-    static OWN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    OWN.get_or_init(|| {
-        tempfile::Builder::new()
-            .prefix("kr-test-artifacts-")
-            .tempdir()
-            .expect("a directory of this run's own in the system's temporary directory")
-            .keep()
-    })
-    .clone()
+    kr_test_artifacts::directory()
 }
 
 /// Writes one record of evidence.

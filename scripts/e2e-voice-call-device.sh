@@ -149,7 +149,10 @@ fi
 # shellcheck source=scripts/lib/android-avd.sh
 . "$here/scripts/lib/android-avd.sh"
 
-artefacts_base="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-call-device-$platform-$mode${KR_RUN_TAG:+-$KR_RUN_TAG}"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts_base="$kr_artifacts/voice-call-device-$platform-$mode${KR_RUN_TAG:+-$KR_RUN_TAG}"
 app_id=to.kala.reach
 # What belongs to one run (one call): set by `begin_run`, ended by `end_run`.
 leg=""

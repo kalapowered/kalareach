@@ -35,7 +35,10 @@ if [ -n "$log" ]; then
   exec > >(tee "$log") 2>&1
 fi
 
-artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$root/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artifacts="$kr_artifacts"
 mkdir -p "$artifacts"
 
 # This run is about every case. A filter left in the environment would qualify one of them and

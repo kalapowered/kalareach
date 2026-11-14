@@ -68,7 +68,10 @@ web="${KR_WEB_TREE:-}"
 # shellcheck source=scripts/lib/xcode.sh
 . "$here/scripts/lib/xcode.sh"
 
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/push-device-$platform"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/push-device-$platform"
 shots="${KR_PUSH_SHOTS:-/tmp/kr-push-phone}"
 cache="${HOME}/Library/Caches/kalareach-tests/push-device"
 mkdir -p "${artefacts:?}" "${shots:?}" "${cache:?}"

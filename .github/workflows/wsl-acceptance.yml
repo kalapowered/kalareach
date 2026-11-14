@@ -183,8 +183,8 @@ jobs:
           KR_WSL_NETWORK_MODES: nat
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          KR_TEST_ARTIFACTS_DIR="$(cygpath -u "$KR_TEST_ARTIFACTS_DIR")"
-          export KR_TEST_ARTIFACTS_DIR
+          . scripts/lib/artifacts-dir.sh
+          kr_artifacts_dir
           bash scripts/e2e-wsl.sh /c/wsl-acceptance.log
 
       - name: Keep the acceptance's own record

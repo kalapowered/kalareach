@@ -7,3 +7,8 @@ edition = "2024"
 publish = false
 
 [workspace]
+
+[dev-dependencies]
+# Where the tests keep what they record: the same rule every reader of the evidence directory
+# applies.
+kr-test-artifacts = { path = "../../../../support/artifacts" }

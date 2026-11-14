@@ -1,0 +1,16 @@
+[package]
+name = "kr-test-artifacts"
+description = "Where a test run keeps its evidence: the one reader of the evidence directory's variable for Rust, which refuses a directory outside this platform's temporary roots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+# The directories the cases make their values in.
+tempfile.workspace = true
+
+[lints]
+workspace = true

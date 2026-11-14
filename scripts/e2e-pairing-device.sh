@@ -94,7 +94,10 @@ esac
 # shellcheck source=scripts/lib/xcode.sh
 . "$here/scripts/lib/xcode.sh"
 
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/pairing-device-$platform"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/pairing-device-$platform"
 shots="${KR_PAIRING_SHOTS:-/tmp/kr-pair-phone}"
 cache="${HOME}/Library/Caches/kalareach-tests/pairing-device"
 # The output may hold a phone's log with an invitation's secret in it, so its folders are made for this
