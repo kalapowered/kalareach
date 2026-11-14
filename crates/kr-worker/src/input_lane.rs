@@ -26,6 +26,14 @@ use crate::input_room::{Cost, Outstanding};
 /// longer reads, and it is closed.
 const MAX_LANE_FRAMES: usize = 4096;
 
+/// A frame of a lane as the domain admits it: the lane it came on and the request it is, so that
+/// the domain can queue the refusal of a frame that breaches the credit before it ends the lane.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaneFrame {
+    pub(crate) lane: LaneId,
+    pub(crate) request_id: kr_protocol::ids::RequestId,
+}
+
 /// The identity the domain gives a lane when it is bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LaneId(pub(crate) u64);
@@ -80,6 +88,8 @@ pub struct BoundLane {
 pub struct LaneQueue {
     items: Mutex<LaneItems>,
     wake: tokio::sync::Notify,
+    /// Woken once, for the one task that waits for the close, when the queue closes.
+    closed_wake: tokio::sync::Notify,
     closed: AtomicBool,
 }
 
@@ -156,6 +166,7 @@ impl LaneQueue {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.wake.notify_one();
+        self.closed_wake.notify_one();
     }
 
     /// Returns whether the queue has been closed.
@@ -167,5 +178,12 @@ impl LaneQueue {
     /// Waits until something is queued or the queue is closed.
     pub async fn wait(&self) {
         self.wake.notified().await;
+    }
+
+    /// Waits until the queue is closed. One task waits for it: a close that came first is kept.
+    pub async fn closed(&self) {
+        if !self.is_closed() {
+            self.closed_wake.notified().await;
+        }
     }
 }

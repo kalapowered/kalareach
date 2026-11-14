@@ -6,8 +6,9 @@
 
 use std::time::{Duration, Instant};
 
-use kr_protocol::envelope::{ControlEvent, ControlFrame};
+use kr_protocol::envelope::{ControlEvent, ControlFrame, Outcome, ParamsValue, Response};
 use kr_protocol::ids::{AttachmentId, ConnectionId, InputLeaseEpoch};
+use kr_protocol::input::InputWriteResult;
 use kr_protocol::local::{LaneCredit, LaneWindow};
 use kr_protocol::scalars::U64;
 use kr_protocol::session::SessionState;
@@ -93,7 +94,10 @@ impl Rig {
                 utc_ms: None,
             },
             self.now,
-            lane,
+            lane.map(|lane| crate::input_lane::LaneFrame {
+                lane,
+                request_id: kr_protocol::ids::RequestId::new(1),
+            }),
         )?;
         view.sequence += 1;
         Ok(accepted)
@@ -286,6 +290,63 @@ fn a_lane_frame_beyond_the_credit_is_a_breach_and_ends_the_lane() {
         Cost::default(),
         "its window ended with it"
     );
+}
+
+/// The sum of held, reserved and promised, which admission reads, can pass the room, and the queue
+/// never does. A write whose Escape is held back promises its whole claim, and when the timer
+/// releases the Escape the entry it becomes is held beside that promise until the batch is done:
+/// one entry too many for each such write. A local write is admitted against the sum, so only the
+/// last of them can leave the sum above the room, by one entry; a lane's frames are admitted against
+/// the window alone, so each of the thirty-two that the window holds adds one. Held, reserved and
+/// promised then read 4,128 against a room of 4,096, and the queue holds 2,048 entries.
+#[test]
+fn the_sum_the_ledger_reads_passes_the_room_by_one_entry_for_each_expired_prefix_and_the_queue_never_does()
+ {
+    let mut rig = Rig::new();
+    let mut holder = View::new();
+    rig.take(&mut holder);
+    let _ = rig.input.set_bracketed_paste(true);
+    // 2,016 ordinary writes that the writer has not taken: two entries each against the room.
+    for index in 0..2_016_u32 {
+        rig.write(&mut holder, None, b"k")
+            .unwrap_or_else(|error| panic!("write {index} was refused: {error:?}"));
+    }
+    let lane = rig.bind(&holder);
+    assert_eq!(rig.input.ledger().reserved.frames, 64, "the room left");
+    // Thirty-two Escapes on the lane, each released by its timer while the writer stands.
+    for _ in 0..32 {
+        rig.write(&mut holder, Some(lane.id), b"\x1b")
+            .expect("the window pays for the Escape");
+        rig.now += Duration::from_millis(30);
+        let (expired, _) = rig.input.expire_paste_prefix(rig.now);
+        assert_eq!(expired, 1, "the timer releases the Escape");
+    }
+    let ledger = rig.input.ledger();
+    // Entries are what runs out here: the bytes of one-byte writes leave most of the room's bytes.
+    assert_eq!(ledger.reserved.frames, 0, "{ledger:?}");
+    assert_eq!(ledger.free.frames, 0, "{ledger:?}");
+    assert_eq!(
+        (ledger.held.frames, ledger.promised.frames),
+        (2_048, 2_080),
+        "{ledger:?}"
+    );
+    let sum = ledger.held.frames + ledger.reserved.frames + ledger.promised.frames;
+    assert_eq!(
+        sum,
+        ROOM.frames + 32,
+        "the sum is over the room by the expired prefixes of the window's frames"
+    );
+    // What is really queued is what the writer will write, and it is inside the room.
+    let queued = rig
+        .input
+        .pending
+        .iter()
+        .filter(|entry| {
+            matches!(entry, Queued::Batch(carried) if !matches!(carried.batch, InputBatch::LeaseChanged))
+        })
+        .count();
+    assert_eq!(queued, 2_048, "one entry for each write and each Escape");
+    assert!(queued <= ROOM.frames);
 }
 
 /// A sequence in claim units: after a takeover the old entries stay charged, the new window
@@ -571,17 +632,28 @@ fn the_ended_notice_follows_a_late_answer_of_the_same_epoch() {
         .expect("accepted");
     rig.input.lane_answer(
         lane.id,
-        ControlFrame::InputLaneReady(kr_protocol::local::InputLaneReady {
-            epoch: InputLeaseEpoch::new(first.epoch),
-            holder: true,
-            frames: 0,
-            bytes: U64::new(0),
+        ControlFrame::Response(Response {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            outcome: Outcome::Ok(
+                ParamsValue::from_typed(&InputWriteResult {
+                    sequence: kr_protocol::ids::InputSequence::new(0),
+                    forwarded_bytes: U64::new(1),
+                    held_prefix_bytes: U64::new(0),
+                })
+                .expect("encodes"),
+            ),
         }),
     );
     rig.take(&mut second);
     let frames = lane.queue.drain();
     assert!(
-        matches!(frames[0], ControlFrame::InputLaneReady(_)),
+        matches!(
+            &frames[0],
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
         "the answer first: {frames:?}"
     );
     let ended = window_of(&frames[1]);
