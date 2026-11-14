@@ -598,8 +598,9 @@ fn a_repair_whose_creation_of_the_service_fails_puts_the_refusal_back_in_the_rec
         service_outcome(&paths)
     ));
     assert_ne!(code, Some(0), "the repair did not fail: {text}");
+    // The setup program says a Windows error by its number: 1073 is ERROR_SERVICE_EXISTS.
     assert!(
-        text.to_lowercase().contains("already exist"),
+        text.contains("making the service KalaReachBoundary: Windows error 1073"),
         "the repair does not end with the creation's own error: {text}"
     );
     assert_eq!(
