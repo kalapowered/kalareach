@@ -894,6 +894,7 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
                 found: found.clone(),
                 why: "Windows error 112".to_owned(),
                 stays: vec!["D".to_owned(), "F".to_owned()],
+                write_began: true,
             },
             ". The earlier-state record was not read",
         );
@@ -916,6 +917,36 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
             "{unsaved}"
         );
         assert!(!unsaved.contains("again"), "{unsaved}");
+        // Where no write began, the words do not say that a write may have published a record.
+        let no_write = rollback_failed(
+            &failures,
+            &RecordLeft::NotSaved {
+                found: found.clone(),
+                why:
+                    "the manifest was to be written before a handle of the data directory was held"
+                        .to_owned(),
+                stays: vec!["D".to_owned()],
+                write_began: false,
+            },
+            "",
+        );
+        assert!(
+            no_write.contains(
+                "and no write of this run's record was made (the manifest was to be written"
+            ),
+            "{no_write}"
+        );
+        assert!(
+            no_write.contains("so this run left no record of its own on disk, and a record that an earlier run left may stand"),
+            "{no_write}"
+        );
+        for wrong in [
+            "may have published",
+            "could not be confirmed on disk",
+            "writing this run's record failed",
+        ] {
+            assert!(!no_write.contains(wrong), "{wrong} in {no_write}");
+        }
         // Where no read was made, the words do not say that one failed.
         if found == NotProved::NotRead {
             assert!(
@@ -956,6 +987,7 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
             found: NotProved::Absent,
             why: "w".to_owned(),
             stays: Vec::new(),
+            write_began: true,
         },
         "",
     );
