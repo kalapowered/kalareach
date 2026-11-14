@@ -131,11 +131,11 @@ impl WorkerService {
     /// the connection withdrawn, which ends the lane's task, its registration and its window. The
     /// bound is five seconds, the one a closing session's acceptance is given, and it starts at
     /// the close, never earlier: a queue that is open is never cut. What is left to write at the
-    /// close is the closed queue, at most 4,097 frames of a few hundred bytes, and any batch the
-    /// writer took before it; a host that reads at an ordinary pace takes that from a local
-    /// socket in far less. A host that reads more slowly than the bound allows loses its link
-    /// too: the bound is a timeout on the close, and it does not tell a host that reads nothing
-    /// from one that reads slowly.
+    /// close is the closed queue, at most 4,097 frames of a few hundred bytes, and the batch of up
+    /// to 4,096 frames that the writer took before it; a host that reads at an ordinary pace takes
+    /// that from a local socket in far less. A host that reads more slowly than the bound allows
+    /// loses its link too: the bound is a timeout on the close, and it does not tell a host that
+    /// reads nothing from one that reads slowly.
     pub(super) async fn write_lane(
         self: Arc<Self>,
         queue: Arc<LaneQueue>,
