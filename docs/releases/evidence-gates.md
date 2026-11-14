@@ -32,6 +32,14 @@ test came to; it does not decide whether a release may be made. The gates are re
 result and against the other commands in the table, one gate at a time, because no gate's evidence
 stands in for another's.
 
+The legs of the managed services gate that run a client against a deployment,
+`scripts/e2e-deployment.sh` and the pairing leg of `scripts/e2e-m1b.sh`, run in the landing
+workflow's `rust` job at a push to main and at a manual run that sets the `deployment_legs` input.
+Their evidence is main's push run at the commit, or such a manual run. A pull request's run and any
+other manual run skip them, because each run of the legs leaves mailboxes, ledgers, sync
+collections and authority feeds on the production service, with their billing rows, and nothing
+removes them.
+
 ## The pairing review exception
 
 The first gate asks for an external review of the pairing profile and of the build it runs in. This

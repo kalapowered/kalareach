@@ -14,6 +14,10 @@ on:
         description: "Run the ios job, which builds the application for the iOS Simulator and starts it. It is part of the macOS jobs, so a run with them on has it; this switch runs it alone, in a manual run with the macOS jobs turned off. A push or a pull request always runs it."
         type: boolean
         default: false
+      deployment_legs:
+        description: "Run the deployment legs in the rust job: the legs that check the client against the production deployment, the checkpoint's pairing leg, and the step that keeps their logs. Each run leaves mailboxes, ledgers, sync collections and authority feeds in the production service's directory, with their billing rows, and nothing removes them, so turn this on only when the run must show the legs. A push to main always runs them; a pull request and every other manual run skip them."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,9 +38,12 @@ env:
   KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
   # The deployment the checkpoint step reports on. It is an address and not a credential, so it is
   # named here in the open rather than kept as a secret: the legs sign with keys they make for the
-  # run, spend nothing and take back what they published, so an address is the whole of what that
-  # step needs. It is deliberately not KR_DEPLOYED_ORIGIN, which would turn the offline legs in
-  # every other job's test run into calls on this deployment as well.
+  # run and spend nothing, so an address is the whole of what that step needs. They take back what
+  # they published, but not what each key's principal made in the service's directory: mailboxes,
+  # ledgers, sync collections and authority feeds stay, with their billing rows, and nothing
+  # removes them. So the legs run only at a push to main and at a manual run that sets
+  # `deployment_legs`. It is deliberately not KR_DEPLOYED_ORIGIN, which would turn the offline
+  # legs in every other job's test run into calls on this deployment as well.
   KR_CHECKPOINT_ORIGIN: "https://reach.kala.to"
   # This workspace's test build is large: a debug build of every crate's test targets, and for the
   # timed measurements an optimised one, in one directory. Debug information is the greater part of
@@ -387,13 +394,17 @@ jobs:
       # The legs that check a client against a live deployment rather than against something this
       # repository wrote. The workspace test above ran them with no deployment named, where each one
       # prints why it did nothing; this one names one, so a leg that did not run is a failure here.
-      # Every principal is made when a leg starts and discarded when it ends, no account is created
-      # and nothing is bought, and each leg gives back what it published before it reports.
+      # Every key is made when a leg starts and dropped when it ends, no account is created and
+      # nothing is bought, and each leg gives back what it published before it reports. What each
+      # key's principal made in the service's directory stays, with its billing rows, so the legs
+      # run only where their evidence is needed: at a push to main, and at a manual run that sets
+      # `deployment_legs`. A pull request and every other manual run skip them, and the job's
+      # result does not depend on them.
       #
       # It sits after every check that reads only this repository, so all of those have reported by
       # the time anything here contacts a service, and a deployment that is unreachable fails this
       # job without taking their answers with it. Every check after it states `!cancelled()`, except
-      # the step that keeps the legs' logs, which runs whatever happened.
+      # the step that keeps the legs' logs, which runs whatever happened when the legs run.
       #
       # Each leg writes its whole output to a log of its own in a `deployment-*` directory under
       # `KR_TEST_ARTIFACTS_DIR`, which "Keep the deployment legs' logs" below uploads, with the
@@ -403,7 +414,7 @@ jobs:
       # path and the fault. It never prints a request, a token or a key, and the keys it holds print
       # as redacted.
       - name: The deployment answers every leg
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.deployment_legs)) }}
         run: bash scripts/e2e-deployment.sh "$KR_CHECKPOINT_ORIGIN"
 
       # The cross-boundary checkpoint's pairing leg, against the same deployment: a device pairs by
@@ -413,7 +424,7 @@ jobs:
       # one wrong code on it. The checkpoint's other legs need managed shell packages and a published
       # catalogue release that this job does not build, so the selection names this one.
       - name: The checkpoint's pairing leg
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.deployment_legs)) }}
         timeout-minutes: 30
         env:
           KR_M1B_LEGS: pairing
@@ -423,9 +434,10 @@ jobs:
       # stopped before the legs and a step that was cancelled all leave what they wrote. It is an
       # artifact of its own, named for what it holds, so a run's legs are found by name and not among
       # the performance figures. A step that stopped before it made its directory leaves nothing,
-      # which the upload says and does not count as a second failure.
+      # which the upload says and does not count as a second failure. It runs where the two steps
+      # above run, and nowhere else.
       - name: Keep the deployment legs' logs
-        if: always()
+        if: ${{ always() && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.deployment_legs)) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: deployment-legs
@@ -2763,7 +2775,8 @@ jobs:
       # The workspace's tests, less what this runner cannot run, each left out by name here:
       #
       # - kr-sync-integration, every test of which is a leg against a live deployment and does
-      #   nothing without one. The rust job runs each leg against the deployment it names.
+      #   nothing without one. The rust job runs each leg against the deployment it names, at a
+      #   push to main and at a manual run that sets `deployment_legs`.
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
       # - The cases that need another filesystem, which the step after this one runs.
