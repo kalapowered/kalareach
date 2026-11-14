@@ -376,6 +376,31 @@ async fn the_record_of_one_role_refuses_no_connection_of_another() {
         .expect("the authority connection is served");
 }
 
+/// KR-REQ-02.05: proxy connections of one generation are a set and are not ordered: the one that
+/// said hello first may present last, after a proxy and an authority connection that said hello
+/// after it, and every one of them is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_connections_of_one_generation_coexist_whatever_the_order_of_their_hellos() {
+    let host = host(1).await;
+    let mut first = declared(&host, ControllerConnectionRole::Proxy).await;
+    let mut second = declared(&host, ControllerConnectionRole::Proxy).await;
+    let mut authority = declared(&host, ControllerConnectionRole::Authority).await;
+    present(&mut authority, host.signer(), 1)
+        .await
+        .expect("the authority connection is accepted");
+    present(&mut second, host.signer(), 1)
+        .await
+        .expect("the later proxy is accepted");
+    present(&mut first, host.signer(), 1)
+        .await
+        .expect("the earlier proxy is accepted after the later one");
+    for link in [&mut first, &mut second, &mut authority] {
+        read_session(link, host.session_id)
+            .await
+            .expect("the connection is served");
+    }
+}
+
 /// KR-REQ-02.05: a higher generation takes every role at once, whatever the order of its
 /// connection: it fences the connection of the lower generation even though that one said hello
 /// after it.
