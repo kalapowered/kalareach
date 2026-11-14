@@ -91,7 +91,7 @@ fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged
 }
 
 #[test]
-fn a_build_directory_that_is_the_temporary_directory_ends_the_run_before_its_first_step() {
+fn a_build_directory_that_holds_the_copy_s_base_ends_the_run_before_its_first_step() {
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let held = tempfile::tempdir()
         .expect("a directory that is both the copy's place and a build directory");

@@ -1004,19 +1004,25 @@ mod tests {
     }
 
     #[test]
-    fn the_shell_s_lines_are_kept_for_eight_programs_and_still_name_those_the_other_lines_did_not()
-    {
+    fn the_shell_s_lines_name_the_programs_the_other_lines_did_not_up_to_the_cap_of_eight() {
         let mut lines = vec![
             "kr-conformance run-one: /t/p could not start: no".to_owned(),
             "process didn't exit successfully: `/t/p` (exit status: 126)".to_owned(),
         ];
         lines.extend((0..40).map(|_| "/t/p: /t/p: cannot execute binary file".to_owned()));
-        lines.extend(
-            ["q", "r"].map(|name| format!("/t/{name}: /t/{name}: cannot execute binary file")),
-        );
-        let (found, _) = refusals(lines.into_iter());
+        lines.extend((0..12).map(|n| format!("/t/s{n}: /t/s{n}: cannot execute binary file")));
+        let (found, facts) = refusals(lines.into_iter());
         let paths: Vec<&str> = found.iter().map(|refusal| refusal.path.as_str()).collect();
-        assert_eq!(paths, ["/t/p", "/t/q", "/t/r"]);
+        assert_eq!(
+            paths,
+            [
+                "/t/p", "/t/s0", "/t/s1", "/t/s2", "/t/s3", "/t/s4", "/t/s5", "/t/s6"
+            ]
+        );
+        assert!(
+            facts.incomplete,
+            "more programs were refused than the record holds"
+        );
     }
 
     #[test]
@@ -1151,7 +1157,10 @@ mod files {
         std::fs::write(&name, vec![7_u8; 9000]).unwrap();
         let seen = examine(&name).unwrap();
         if !replaced_by_a_link(&name, &held.path().join("moved")) {
-            eprintln!("this account cannot make a link, so the case did not run");
+            // The form a case uses to say that it returned early, which the report counts as not run.
+            println!(
+                "skipped: this account cannot make a link, so a link put at the name after the look was not tried"
+            );
             return;
         }
         let Err(Found::Other { kind }) = read_head(&name, &seen) else {

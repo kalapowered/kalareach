@@ -435,3 +435,34 @@ fn a_step_that_also_has_a_program_that_was_killed_is_not_one_with_damage_seen() 
     assert!(document.summary.failed_with_damage_seen.is_empty());
     assert_eq!(document.summary.failed_otherwise, [1]);
 }
+
+#[test]
+fn a_step_that_exited_zero_but_whose_log_could_not_be_read_is_failed_and_observed() {
+    use std::os::unix::fs::PermissionsExt;
+    let evidence = tempfile::tempdir().unwrap();
+    // The step shuts its own log: it exits 0, and the report cannot read what it said.
+    let script = "chmod 000 \"$1\"/conformance/logs/*.log; exit 0";
+    let document = run(
+        evidence.path(),
+        lister(),
+        vec![shell(
+            "a step that shuts its log",
+            script,
+            &[evidence.path()],
+        )],
+    );
+    let step = &document.steps[0];
+    let log = evidence.path().join(&step.log);
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(step.exit, Some(0), "{step:?}");
+    assert!(step.error.is_some(), "{step:?}");
+    assert_eq!(document.summary.failed_steps, [1]);
+    let observed = step
+        .observation
+        .as_ref()
+        .expect("the unread log is recorded");
+    assert!(
+        matches!(&observed.log, Some(Found::NotRead { .. })),
+        "{observed:?}"
+    );
+}
