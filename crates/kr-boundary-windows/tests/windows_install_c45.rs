@@ -106,9 +106,11 @@ fn bin_directory() -> PathBuf {
 fn run_setup(arguments: &[&str], environment: &[(&str, &str)]) -> (Option<i32>, String) {
     let bin = bin_directory();
     let mut command = Command::new(bin.join("kr-boundary-setup.exe"));
-    if let Some(("install", rest)) = arguments.split_first().map(|(first, rest)| (*first, rest)) {
+    if let Some((first @ ("install" | "repair"), rest)) =
+        arguments.split_first().map(|(first, rest)| (*first, rest))
+    {
         command
-            .arg("install")
+            .arg(first)
             .arg("--payload")
             .arg(bin.join("payload"))
             .args(rest);
@@ -168,6 +170,14 @@ fn require_elevated() {
 fn install_with(person: &Person, environment: &[(&str, &str)]) -> (Option<i32>, String) {
     let (code, text) = run_setup(&["install", "--person", &person.sid], environment);
     println!("--- kr-boundary-setup install {environment:?} -> {code:?}\n{text}");
+    (code, text)
+}
+
+/// A repair of the installation that the manifest records, for `person`, with the given test
+/// variables.
+fn repair_with(person: &Person, environment: &[(&str, &str)]) -> (Option<i32>, String) {
+    let (code, text) = run_setup(&["repair", "--person", &person.sid], environment);
+    println!("--- kr-boundary-setup repair {environment:?} -> {code:?}\n{text}");
     (code, text)
 }
 
@@ -451,7 +461,7 @@ fn a_repair_of_a_refused_service_that_stands_is_refused_at_its_first_look() {
     let made = StrangersService::made_by_the_seam();
     let paths = Paths::system().unwrap();
     // The repair of that record, with the service still standing and stopped.
-    let (code, text) = install_with(&person, &[]);
+    let (code, text) = repair_with(&person, &[]);
     observed(&format!(
         "after the repair the service stands {:?}; the record holds it as {}; exit {code:?}",
         the_service_at_the_brokers_name(),
@@ -507,7 +517,8 @@ fn a_repair_of_a_refused_service_that_is_gone_makes_the_service_and_the_record_s
     // The service that the seam made is deleted before the repair.
     drop(StrangersService::made_by_the_seam());
     assert!(!snapshot().service, "the case did not delete its service");
-    let text = a_good_installation(&person);
+    let (repair_code, text) = repair_with(&person, &[]);
+    assert_eq!(repair_code, Some(0), "the repair succeeds: {text}");
     let paths = Paths::system().unwrap();
     assert_eq!(
         service_outcome(&paths),
@@ -536,7 +547,7 @@ fn a_repair_over_a_refused_record_that_dies_after_the_creation_leaves_an_intent(
     drop(StrangersService::made_by_the_seam());
     assert!(!snapshot().service, "the case did not delete its service");
     // A repair that is aborted right after the call that made the service returned.
-    let (code, text) = install_with(&person, &[("KR_BOUNDARY_DIE_AT", "service")]);
+    let (code, text) = repair_with(&person, &[("KR_BOUNDARY_DIE_AT", "service")]);
     assert_ne!(code, Some(0), "the repair did not die: {text}");
     let paths = Paths::system().unwrap();
     let manifest = Manifest::load(&paths.manifest).expect("a manifest that the removal can read");
@@ -576,7 +587,7 @@ fn a_repair_whose_creation_of_the_service_fails_puts_the_refusal_back_in_the_rec
     assert!(!snapshot().service, "the case did not delete its service");
     // A repair over the record of that refusal, with a service made at the broker's name between
     // the service step's open and its creation: the creation fails.
-    let (code, text) = install_with(
+    let (code, text) = repair_with(
         &person,
         &[("KR_BOUNDARY_MAKE_AFTER", "service-open:service")],
     );
@@ -597,7 +608,7 @@ fn a_repair_whose_creation_of_the_service_fails_puts_the_refusal_back_in_the_rec
         "the record does not hold the refusal after the failed creation: {text}"
     );
     // A later repair refuses at its first look and does not touch the service.
-    let (later_code, later) = install_with(&person, &[]);
+    let (later_code, later) = repair_with(&person, &[]);
     assert_ne!(
         later_code,
         Some(0),
@@ -704,7 +715,8 @@ fn a_repair_keeps_the_result_of_the_folder_that_an_earlier_run_made_and_the_remo
         "after the installation the record holds the folder as: {first}"
     ));
     // A repair: the folder stands, and the run writes no result for it.
-    let text = a_good_installation(&person);
+    let (repair_code, text) = repair_with(&person, &[]);
+    assert_eq!(repair_code, Some(0), "the repair succeeds: {text}");
     let second = recorded(&paths);
     observed(&format!(
         "after the repair the record holds the folder as: {second}"
