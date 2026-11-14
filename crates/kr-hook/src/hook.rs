@@ -972,7 +972,8 @@ mod tests {
     /// What takes time on the made clock besides the waits of a run.
     #[derive(Clone, Copy, Default)]
     struct Takes {
-        /// How far the clock has moved when the run begins to wait: its thread started late.
+        /// How far the clock has moved before the run begins to wait, as when the arguments are
+        /// parsed or the deadline of a hook that was replaced is read.
         before: Duration,
         /// The claim.
         claim: Duration,
@@ -993,8 +994,9 @@ mod tests {
     /// Runs `run_with` once on a clock that stands still until a wait runs out or something in
     /// `takes` passes time, with `work` and `write` going as given. A wait that is not given a
     /// message moves the clock to the moment it was asked to wait until, so what a run waits is
-    /// read off the clock; a stalled thread waits for the case to let it go, which is after the run,
-    /// and the guard that ends a thread of a case with a fault is the only real wait.
+    /// read off the clock; a stalled thread waits for the case to let it go, which is after the run.
+    /// The real waits are the receive of a wait that is given a message, which ends when the message
+    /// comes, and the guards that end a stalled thread of a case that has a fault.
     fn on_made_clock(work: Work, write: Write, takes: Takes) -> OnMade {
         use crate::made::{Made, Wait};
         use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
