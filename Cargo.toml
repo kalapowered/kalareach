@@ -314,7 +314,9 @@ zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate
 # fixed it on its main branch after that release, in the commit named here, whose `noq-udp` states
 # version 1.5.0 and differs from the 1.4.0 release in that one receive function and its two cases.
 # Remove this entry, and the git source it gives `noq-udp` in the lock, when the lock can take a
-# released `noq-udp` that holds the fix.
+# released `noq-udp` that holds the fix. The web repository's end-to-end program and discovery
+# harness are Cargo roots of their own and carry their own entry for the same commit; they go
+# together with this one.
 [patch.crates-io]
 noq-udp = { git = "https://github.com/n0-computer/noq", rev = "04807b674cff617cbac323256416dc4779ccf7c2" }
 
