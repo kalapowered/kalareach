@@ -672,7 +672,7 @@ async fn receipt(
 
 /// KR-REQ-12.06: a mutation with no upstream to reach is refused with a receipt that says it was
 /// refused, not one that says nobody can tell.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kr_req_12_06_a_mutation_with_no_upstream_is_refused_before_its_marker() {
     let host = host().await;
     register(&host, None);
@@ -696,7 +696,7 @@ async fn kr_req_12_06_a_mutation_with_no_upstream_is_refused_before_its_marker()
 /// KR-REQ-14.11: a prompt that names a draft is refused on the worker's own socket and is taken only
 /// from the control daemon, which records where the draft's attachments go before it forwards the
 /// prompt. A prompt that carries its text inline is not held to that.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kr_req_14_11_a_prompt_naming_a_draft_is_refused_on_the_workers_own_socket() {
     let host = host().await;
     register(&host, None);
@@ -810,7 +810,7 @@ async fn kr_req_12_06_a_prompt_naming_a_draft_is_held_to_the_instances_binding()
 /// the prompt names was recorded for an earlier attempt: the receipt as it stands for the same
 /// payload, `ID_CONFLICT` for the action identifier used with another, and a refusal that keeps
 /// nothing where the worker holds none.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kr_req_14_11_a_prompt_with_no_lifetime_is_answered_only_from_a_receipt() {
     let host = host().await;
     register(&host, None);
