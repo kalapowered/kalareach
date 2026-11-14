@@ -95,6 +95,18 @@ fn observed(line: &str) {
     println!("OBSERVED {line}");
 }
 
+/// Gives the Administrators group the ownership of a file or a folder tree that a case put into
+/// the data directory. A token whose default owner is its own account makes entries that the
+/// removal refuses at its inspection, which is not what these cases observe.
+fn administrators_own(path: &std::path::Path) {
+    let owned = Command::new("icacls")
+        .arg(path)
+        .args(["/setowner", "*S-1-5-32-544", "/T", "/C"])
+        .output()
+        .unwrap();
+    assert!(owned.status.success(), "{owned:?}");
+}
+
 fn bin_directory() -> PathBuf {
     PathBuf::from(
         std::env::var_os("KR_BOUNDARY_BIN")
@@ -534,6 +546,8 @@ fn a_removal_sweeps_the_entries_of_staging_that_stand_under_the_layouts_names() 
     std::fs::write(&policy, b"<AppLockerPolicy/>").unwrap();
     std::fs::create_dir(&proof).unwrap();
     std::fs::write(proof.join("unlisted.exe"), b"x").unwrap();
+    administrators_own(&policy);
+    administrators_own(&proof);
 
     let (code, text) = ordinary_removal();
     observed(&format!(
@@ -817,7 +831,10 @@ fn a_removal_sweeps_the_brokers_journal_names_after_the_stop() {
     let paths = Paths::system().unwrap();
     let hex = uuid::Uuid::new_v4().simple().to_string();
     let brokers = paths.journal.join(format!("{hex}.journal"));
-    std::fs::write(&brokers, b"journal of a run").unwrap();
+    // A file with no first row describes an invocation that made nothing: the removal's inspection
+    // does not count it as work that is not proved done, and the sweep takes its name.
+    std::fs::write(&brokers, b"").unwrap();
+    administrators_own(&brokers);
     let (code, removal) = ordinary_removal();
     let stands = brokers.exists();
     observed(&format!(
