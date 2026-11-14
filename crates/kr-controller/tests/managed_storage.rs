@@ -190,6 +190,12 @@ impl ServiceSigner for Owner {
     }
 }
 
+/// The requests whose answers the service loses while the daemon is asked to delete a copy
+/// ([`Rig::delete_retained_while_answers_are_lost`]): more than the passes the carrier can make
+/// before the call is answered, which are the pass already under way, the passes its stored
+/// wake-ups start, and the first one that begins after the call.
+const ANSWERS_LOST: u32 = 16;
+
 /// A daemon on a host tree, the service it selects, and the keys a test seals with.
 struct Rig {
     host: kr_ipc::testing::TempHost,
@@ -558,6 +564,27 @@ impl Rig {
         reference: &str,
     ) -> Result<PrivacyRetainedDeleteResult, ProtocolError> {
         delete_retained_at(&self.client_endpoint, self.host.environment_id(), reference).await
+    }
+
+    /// Asks the daemon to delete the copy `privacy.status` lists under `reference`, as
+    /// [`Self::delete_retained`] does, while the service loses the answer to each of the first
+    /// [`ANSWERS_LOST`] requests it is sent, and mends the service once the call is answered.
+    ///
+    /// The carrier sends a request for each pass it makes, and a call waits for the first pass
+    /// that begins after it is made, which is the second when one was already under way. So the
+    /// deletion is asked and not confirmed when the call answers whichever passes there were, and
+    /// not only when the call's own pass is the first to send.
+    async fn delete_retained_while_answers_are_lost(
+        &self,
+        reference: &str,
+    ) -> Result<PrivacyRetainedDeleteResult, ProtocolError> {
+        let web = self.served.web();
+        for nth in 1..=ANSWERS_LOST {
+            web.fail(DELETE, nth, Moment::After);
+        }
+        let answered = self.delete_retained(reference).await;
+        web.mend();
+        answered
     }
 
     /// Where privacy mode stands, as `privacy.status` says.
@@ -9331,13 +9358,11 @@ async fn a_deletion_the_host_cannot_make_is_refused_and_sends_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_asked_again() {
     let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
-    let web = Arc::clone(rig.served.web());
     rig.set_up_after(2);
     rig.fence().await;
-    web.fail(DELETE, 1, Moment::After);
 
     let first = rig
-        .delete_retained(&reference_of(1))
+        .delete_retained_while_answers_are_lost(&reference_of(1))
         .await
         .expect("the call is answered");
     assert!(!first.deleted, "the service has not confirmed");
@@ -9381,9 +9406,8 @@ async fn a_deletion_asked_under_privacy_mode_is_sent_after_a_restart_once_privac
     let web = Arc::clone(rig.served.web());
     rig.set_up_after(2);
     rig.fence().await;
-    web.fail(DELETE, 1, Moment::After);
     assert!(
-        !rig.delete_retained(&reference_of(1))
+        !rig.delete_retained_while_answers_are_lost(&reference_of(1))
             .await
             .expect("the call is answered")
             .deleted
@@ -9452,12 +9476,11 @@ async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_p
         .await;
     let before = opened_members(&rig, 1);
 
-    // The answer to the first request is lost, so the deletion is only partly confirmed when
+    // The answers to the first requests are lost, so the deletion is only partly confirmed when
     // privacy mode goes off.
     rig.fence().await;
-    web.fail(DELETE, 1, Moment::After);
     assert!(
-        !rig.delete_retained(&reference_of(1))
+        !rig.delete_retained_while_answers_are_lost(&reference_of(1))
             .await
             .expect("the call is answered")
             .deleted
