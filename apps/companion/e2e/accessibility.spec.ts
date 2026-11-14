@@ -1734,20 +1734,29 @@ const BOXED = `${'w'.repeat(60)} [a boxed link](https://example.org/boxed) and p
 const BOXED_HREF = 'https://example.org/boxed'
 
 /**
+ * The room under the line of a box, in px. A box that scrolls sideways has a scroll bar along its lower edge: a
+ * system that lays the bar over the content (it shows when the box scrolls, and a press on its track scrolls the
+ * box by a page and sends no click) puts it in the lowest rows of the box, and a system that gives the bar room
+ * of its own puts it below the box's client area. With this room under the line, a tap on the line lies above
+ * the bar of either kind, and the box shows no bar of its own besides.
+ */
+const BOX_ROOM = 40
+
+/**
  * Puts the paragraph of a link in a box that clips it sideways and scrolls the box until the words end
  * `outside` px before its left client edge, or until that edge cuts through their middle when `outside` is
- * 0. Returns the edge and the words where they are now.
+ * 0. Returns the edge, the words where they are now and where the box is scrolled to.
  */
-async function wordsInBox(page: Page, href: string, outside: number): Promise<{ edge: number; words: Words }> {
+async function wordsInBox(page: Page, href: string, outside: number): Promise<{ edge: number; words: Words; scroll: number }> {
   await wordsOf(page, href)
   const edge = await page.evaluate(
-    ({ target, beyond }) => {
+    ({ target, beyond, room }) => {
       const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
       const paragraph = link?.closest('p')
       if (!link || !paragraph?.parentElement) throw new Error('the page shows no such link')
       const box = document.createElement('div')
       // The box lies 60 px inside the pane, so that its edge clips the words where the pane's own edge does not.
-      box.style.cssText = 'overflow-x: auto; overflow-y: hidden; width: 200px; margin-left: 60px;'
+      box.style.cssText = `overflow-x: auto; overflow-y: hidden; width: 200px; margin-left: 60px; padding-bottom: ${String(room)}px; scrollbar-width: none;`
       paragraph.parentElement.insertBefore(box, paragraph)
       box.append(paragraph)
       // The room after the words lets the box scroll them past its left edge.
@@ -1760,12 +1769,40 @@ async function wordsInBox(page: Page, href: string, outside: number): Promise<{ 
       box.scrollLeft += first.left - (beyond === 0 ? left - first.width / 2 : left - beyond - first.width)
       return { left, scrolled: box.scrollLeft, scrollWidth: box.scrollWidth, first: first.left }
     },
-    { target: href, beyond: outside }
+    { target: href, beyond: outside, room: BOX_ROOM }
   )
   const words = await wordsNow(page, href)
   const gap = outside === 0 ? (words.left + words.right) / 2 - edge.left : edge.left - words.right
   expect(Math.abs(gap - outside), `where the scroll left the words of the link against the box’s left edge (${JSON.stringify({ edge, words })})`).toBeLessThan(1.5)
-  return { edge: edge.left, words }
+  return { edge: edge.left, words, scroll: edge.scrolled }
+}
+
+/**
+ * Asserts that the element at a point inside the box lies in the paragraph of the link. A scroll bar that the
+ * box shows over the line, or any other element at the point, fails here with its name, where a tap on it
+ * would only show as a tap that got no click.
+ */
+async function expectParagraphAt(page: Page, href: string, x: number, y: number): Promise<void> {
+  const at = await page.evaluate(
+    ({ target, px, py }) => {
+      const paragraph = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)?.closest('p')
+      const hit = document.elementFromPoint(px, py)
+      const box = paragraph?.parentElement?.getBoundingClientRect()
+      return {
+        inside: paragraph !== null && paragraph !== undefined && hit !== null && paragraph.contains(hit),
+        named: `${hit?.tagName ?? '-'}.${hit?.className ?? ''}`,
+        box: box === undefined ? '-' : `${String(box.left)}..${String(box.right)} x ${String(box.top)}..${String(box.bottom)}`
+      }
+    },
+    { target: href, px: x, py: y }
+  )
+  expect(at.inside, `the element at ${String(x)}, ${String(y)} in the box (${at.box}) lies in the paragraph of the link, and it is ${at.named}`).toBe(true)
+}
+
+/** Asserts that the box has not scrolled since `wordsInBox` left it at `placed`: a press that scrolled it was not a tap on the words. */
+async function expectBoxStill(page: Page, href: string, placed: number): Promise<void> {
+  const now = await page.evaluate((target) => document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)?.closest('p')?.parentElement?.scrollLeft ?? Number.NaN, href)
+  expect(Math.abs(now - placed), `how far the box scrolled, in px, since the words were placed (it was left at ${String(placed)} and stands at ${String(now)})`).toBeLessThan(0.5)
 }
 
 test.describe('a link in a box inside a message that clips it', () => {
@@ -1775,24 +1812,27 @@ test.describe('a link in a box inside a message that clips it', () => {
       for (const outside of [10, 20]) {
         test(`has no area when its words are ${String(outside)} px beyond the box’s left edge on ${surface} at ${size} text size`, async ({ page }) => {
           await pressPage(page, surface, { scale: ratio, only: [PLAIN, BOXED, PLAIN] })
-          const { edge, words } = await wordsInBox(page, BOXED_HREF, outside)
+          const { edge, words, scroll } = await wordsInBox(page, BOXED_HREF, outside)
           const wrong: string[] = []
           // Inside the box, and outside it between its edge and the words that it hides.
           for (const inward of [-12, -6, -3, 1, 3, 6, 12, 24, 36, 44, 52]) {
+            if (inward > 0) await expectParagraphAt(page, BOXED_HREF, edge + inward, words.y)
             const made = await tapAndRead(page, edge + inward, words.y)
             const lit = made.lit.find((look) => look !== null) ?? null
             if (lit !== null || made.opened.length > 0) wrong.push(`${String(inward)} px inside the box: lit ${String(lit)}, opened ${made.opened.join(',') || 'nothing'}`)
           }
+          await expectBoxStill(page, BOXED_HREF, scroll)
           expect(wrong, 'taps near the box’s edge that lit or opened the link whose words the box hides').toEqual([])
         })
       }
 
       test(`keeps what the box leaves of a link that it cuts through, and gives nothing back past the edge, on ${surface} at ${size} text size`, async ({ page }) => {
         await pressPage(page, surface, { scale: ratio, only: [PLAIN, BOXED, PLAIN] })
-        const { edge, words } = await wordsInBox(page, BOXED_HREF, 0)
+        const { edge, words, scroll } = await wordsInBox(page, BOXED_HREF, 0)
         const width = words.right - words.left
         const reach = (width + FINGER[surface]) / 2
         for (const inward of [1, Math.min(width / 2 - 1, reach - 1)]) {
+          await expectParagraphAt(page, BOXED_HREF, edge + inward, words.y)
           expect((await tapAndRead(page, edge + inward, words.y)).opened, `links opened by a tap ${String(inward)} px inside the box`).toEqual([BOXED_HREF])
         }
         // Outside the box, left of its edge: the words that the box hides take no part, and the target of the part in
@@ -1810,7 +1850,9 @@ test.describe('a link in a box inside a message that clips it', () => {
           }
         }
         const inside = Math.max(reach, (await boxOf(page, BOXED_HREF)).right - edge)
+        await expectParagraphAt(page, BOXED_HREF, edge + inside + 14, words.y)
         const made = await tapAndRead(page, edge + inside + 14, words.y)
+        await expectBoxStill(page, BOXED_HREF, scroll)
         expect(made.lit, `the pressed look ${String(inside + 14)} px inside the box`).toEqual([null])
         expect(made.opened, 'links opened past the reach').toEqual([])
       })
