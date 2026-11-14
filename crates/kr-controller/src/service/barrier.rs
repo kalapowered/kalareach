@@ -716,7 +716,12 @@ pub(super) async fn while_held<T>(
         tokio::select! {
             done = &mut working => return Some(done),
             _ = looks.tick() => {
-                if Arc::strong_count(&controller) <= *controller.task_holds.count() {
+                // The count is taken first and kept while the daemon's own is read, so that a task
+                // that begins in between waits for this look to end.
+                let tasks = controller.task_holds.count();
+                #[cfg(any(test, feature = "testing"))]
+                controller.between_the_task_counts.wait();
+                if Arc::strong_count(&controller) <= *tasks {
                     return None;
                 }
             }
