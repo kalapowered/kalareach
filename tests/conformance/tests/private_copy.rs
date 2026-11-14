@@ -2,6 +2,8 @@
 //! every run, so a step that writes a damaged file at the program's path in the shared build
 //! directory does not break the report's own machinery.
 
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 
 use kr_conformance::plan::{Group, Platform, Reading, Step};
@@ -16,7 +18,6 @@ fn tree(name: &str) -> PathBuf {
 
 /// A step that writes zeros over `path`, as a program the linker wrote in a burst of failed disk
 /// writes reads.
-#[cfg(unix)]
 fn zeroing(path: &Path) -> Step {
     Step {
         group: Group::Rust,
@@ -58,7 +59,6 @@ fn options(evidence: &Path, lister: PathBuf, steps: Vec<Step>) -> Options {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_step_that_writes_zeros_at_the_programs_shared_path_does_not_break_a_later_listing() {
     let held = tempfile::tempdir().expect("a directory");
@@ -98,7 +98,6 @@ fn a_step_that_writes_zeros_at_the_programs_shared_path_does_not_break_a_later_l
 }
 
 /// A step that makes `path`, to show that it ran.
-#[cfg(unix)]
 fn marking(path: &Path) -> Step {
     let mut step = zeroing(path);
     step.what = "a step that leaves a mark".to_owned();
@@ -106,7 +105,6 @@ fn marking(path: &Path) -> Step {
     step
 }
 
-#[cfg(unix)]
 #[test]
 fn a_program_that_cannot_be_copied_ends_the_run_with_a_failure_before_its_first_step() {
     let held = tempfile::tempdir().expect("a directory");
