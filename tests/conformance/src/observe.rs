@@ -184,6 +184,8 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
     let mut shell_left_out = false;
     let mut compile_failed = false;
     let mut failed_commands: Vec<String> = Vec::new();
+    // Whether a target's failure line was read and no cause has followed it yet.
+    let mut target_without_cause = false;
     let mut in_test_output = false;
     let mut cause: Option<(usize, usize)> = None;
     for line in lines {
@@ -207,7 +209,18 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
         if trimmed.starts_with("error: could not compile") || trimmed.starts_with("error[") {
             compile_failed = true;
         }
+        if opens_a_failed_target(trimmed) {
+            // Cargo says no more of a target that exited with status 101 than this line, so a target
+            // that has no cause after it failed in a way that no refused program accounts for.
+            facts.unexplained_failure |= target_without_cause;
+            target_without_cause = true;
+        }
+        if cargo_refusal(trimmed).is_some() {
+            // Cargo's own account of a program it could not start is the cause of the target.
+            target_without_cause = false;
+        }
         if let Some((_, rest)) = trimmed.split_once("process didn't exit successfully: `") {
+            target_without_cause = false;
             if failed_commands.len() < MOST_FAILED_COMMANDS {
                 failed_commands.push(rest.split('`').next().unwrap_or_default().to_owned());
             } else {
@@ -278,10 +291,30 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
         }
     }
     facts.unexplained_failure |= compile_failed
-        || failed_commands
-            .iter()
-            .any(|command| !found.iter().any(|known| command.contains(&known.path)));
+        || target_without_cause
+        || failed_commands.iter().any(|command| {
+            !program_of(command)
+                .is_some_and(|program| found.iter().any(|known| known.path == program))
+        });
     (found, facts)
+}
+
+/// Whether `line` is Cargo's first line about a target that failed.
+fn opens_a_failed_target(line: &str) -> bool {
+    ["test", "doctest", "bench"]
+        .iter()
+        .any(|kind| line.starts_with(&format!("error: {kind} failed, to rerun pass")))
+}
+
+/// The program a failed command ran: the word after the runner's `run-one` or `list-one`, which
+/// the report's program is given as Cargo's runner, and otherwise the command's first word.
+fn program_of(command: &str) -> Option<&str> {
+    let mut words = command.split_whitespace();
+    let first = words.next()?;
+    match words.next() {
+        Some("run-one" | "list-one") => words.next(),
+        _ => Some(first),
+    }
 }
 
 /// The program in Cargo's "could not execute process `<program> <arguments>`".
@@ -943,6 +976,86 @@ mod tests {
         );
         assert!(facts(&[refused, "error[E0308]: mismatched types"]).unexplained_failure);
         assert!(facts(&[killed]).unexplained_failure);
+    }
+
+    #[test]
+    fn a_target_that_exits_with_status_101_is_a_failure_that_no_refused_program_accounts_for() {
+        // Cargo says no more of a target that exits with status 101 than its first line.
+        let refused = "kr-conformance run-one: /t/a could not start: no";
+        let failed = "error: test failed, to rerun pass `-p t --test b`";
+        let accounted = "  process didn't exit successfully: `/r run-one /t/a` (exit status: 1)";
+        let facts = |lines: &[&str]| refusals(text(lines)).1;
+        assert!(facts(&[refused, failed]).unexplained_failure);
+        assert!(facts(&[failed]).unexplained_failure);
+        assert!(
+            facts(&[refused, "error: doctest failed, to rerun pass `-p t --doc`"])
+                .unexplained_failure
+        );
+        assert!(
+            facts(&[
+                refused,
+                "error: bench failed, to rerun pass `-p t --bench c`"
+            ])
+            .unexplained_failure
+        );
+        // A target whose cause names the refused program is accounted for, and one without a cause
+        // beside it is not.
+        let cause = ["", "Caused by:", accounted];
+        let account = |extra: &[&str]| {
+            let mut lines = vec![refused, "error: test failed, to rerun pass `-p t --test a`"];
+            lines.extend(cause);
+            lines.extend(extra);
+            facts(&lines)
+        };
+        assert!(!account(&[]).unexplained_failure);
+        assert!(account(&[failed]).unexplained_failure);
+        let mut before = vec![
+            refused,
+            failed,
+            "error: test failed, to rerun pass `-p t --test a`",
+        ];
+        before.extend(cause);
+        assert!(facts(&before).unexplained_failure);
+        // Cargo's own account of a program it could not start is a cause as well.
+        assert!(
+            !facts(&[
+                "error: test failed, to rerun pass `-p t --test a`",
+                "",
+                "Caused by:",
+                "  could not execute process `/t/a` (never executed)",
+            ])
+            .unexplained_failure
+        );
+        // What a test printed is not a target's failure.
+        assert!(
+            !facts(&[
+                refused,
+                "---- t stdout ----",
+                "error: test failed, to rerun pass `-p t --test b`",
+                "failures:",
+            ])
+            .unexplained_failure
+        );
+    }
+
+    #[test]
+    fn a_failed_command_is_accounted_for_only_when_its_program_is_the_refused_one() {
+        let refused = "kr-conformance run-one: /t/a could not start: no";
+        let facts = |command: &str| {
+            let failed =
+                format!("  process didn't exit successfully: `{command}` (exit status: 1)");
+            refusals(text(&[refused, &failed])).1
+        };
+        assert!(!facts("/r run-one /t/a").unexplained_failure);
+        assert!(!facts("/r list-one /t/a --list").unexplained_failure);
+        assert!(!facts("/t/a --list").unexplained_failure);
+        // Another program whose path begins with the refused one's, one named in the arguments, and
+        // the runner itself are not the refused program.
+        assert!(facts("/r run-one /t/a-0123").unexplained_failure);
+        assert!(facts("/r run-one /t/b /t/a").unexplained_failure);
+        assert!(facts("/r run-one /t/ab").unexplained_failure);
+        assert!(facts("/t/a/runner run-one /t/b").unexplained_failure);
+        assert!(facts("/r run-one").unexplained_failure);
     }
 
     #[test]
