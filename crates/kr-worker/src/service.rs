@@ -81,6 +81,12 @@ use crate::trace::Site;
 mod input_lane;
 mod overtake;
 
+/// The capability this worker states when it serves the input lane: the window and its credit, the
+/// position checks of a release, a detach and a launch, the count of what an end discarded, and
+/// the launch marker. A control daemon sends a lane request, a position or a count member only to
+/// a worker that states this, because a worker built before them refuses what it does not know.
+pub const INPUT_LANE_CAPABILITY: &str = "input.lane/1";
+
 /// How often the worker replaces a live connection's action window.
 ///
 /// Half the window's validity, which is the schedule the transport uses: an attached terminal that
@@ -3293,7 +3299,7 @@ impl WorkerService {
         }
         for attachment_id in state.facts.take_attachments() {
             let mut session = self.runtime.session();
-            let _ = session.detach(attachment_id);
+            let _ = session.detach(attachment_id, None);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_input();
         }
@@ -3742,6 +3748,7 @@ impl WorkerService {
                     kr_protocol::local::LOCAL_ACCESS,
                     kr_protocol::local::AGENT_INSTANCES_READ,
                     kr_protocol::local::SHELL_LAUNCH_SURFACE_READ,
+                    INPUT_LANE_CAPABILITY,
                 ]
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
@@ -5158,7 +5165,7 @@ impl WorkerService {
         );
         for attachment_id in held {
             let mut session = self.runtime.session();
-            let _ = session.detach(attachment_id);
+            let _ = session.detach(attachment_id, None);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_input();
         }
@@ -9877,7 +9884,16 @@ impl WorkerService {
                 // Whose attachment this caller may detach was decided by the validation, on this
                 // same held session, before the dispatch marker.
                 let attachment_id = Self::detach_subject(session, &params)?;
-                let outcome = session.detach(attachment_id);
+                let outcome = session.detach(attachment_id, params.after_input.as_ref());
+                // A position that was not reached refuses the detach before anything was
+                // removed: the attachment is still the session's, the connection keeps naming
+                // it, and the caller may send the detach again without a position.
+                let outcome = match outcome {
+                    Err(refused) if session.attachment_capabilities(attachment_id).is_some() => {
+                        return Err(refused);
+                    }
+                    other => other,
+                };
                 // Detaching releases the lease, which moves the input fence, and can produce the
                 // terminator of a paste the attachment had open. Both are published here, *before*
                 // the result is looked at: the lease has already moved whether or not the geometry
@@ -9950,8 +9966,11 @@ impl WorkerService {
             }
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(params)?;
-                let (lease, fenced) =
-                    session.release_input(params.attachment_id, params.epoch.get())?;
+                let (lease, fenced) = session.release_input(
+                    params.attachment_id,
+                    params.epoch.get(),
+                    params.after_input.as_ref(),
+                )?;
                 self.runtime.flush_input();
                 Ok((
                     encode(&InputLeaseResult {
@@ -9997,14 +10016,31 @@ impl WorkerService {
                 // goes on the session this call already holds: reaching for the lock again here
                 // would be this thread waiting for itself.
                 let receiver = session.register_launch(transaction);
-                let outcome = session
-                    .stimulate_fence(|driver| {
-                        driver.launch_requested(params, attachment_id, transaction)
-                    })
-                    .ok_or_else(|| WorkerError::ShellIntegrationUnsupported {
-                        detail: "this session has no managed root editor to install into"
-                            .to_owned(),
-                    })?;
+                let barrier = params.after_input.clone();
+                let stimulus = |driver: &mut crate::fence::FenceDriver| {
+                    driver.launch_requested(params, attachment_id, transaction)
+                };
+                // A launch that carries a position is checked against the holder, the epoch and
+                // the position in the hold that starts it; one that carries none keeps the check
+                // of the holder alone.
+                let started = match &barrier {
+                    Some(barrier) => session.stimulate_fence_after(barrier, stimulus),
+                    None => Ok(session.stimulate_fence(stimulus)),
+                };
+                let outcome = match started {
+                    Ok(Some(outcome)) => outcome,
+                    Ok(None) => {
+                        session.forget_launch(transaction);
+                        return Err(WorkerError::ShellIntegrationUnsupported {
+                            detail: "this session has no managed root editor to install into"
+                                .to_owned(),
+                        });
+                    }
+                    Err(refused) => {
+                        session.forget_launch(transaction);
+                        return Err(refused);
+                    }
+                };
                 // The same sweep, and the same reason: a launch request can expire a hold that
                 // arrived before it, and what the machine released belongs to the application now.
                 self.runtime.flush_input();

@@ -1070,7 +1070,7 @@ impl Stage {
                 let _ = projection.apply(self.mutated(*event));
             }
         }
-        let _ = self.session.detach(probe);
+        let _ = self.session.detach(probe, None);
         projection
             .screen()
             .map(View::of)
@@ -1134,7 +1134,7 @@ impl Stage {
         // live side effects.
         for client in &mut clients {
             if client.until <= at && !client.ended {
-                let _ = self.session.detach(client.attachment);
+                let _ = self.session.detach(client.attachment, None);
                 client.stream = None;
                 client.ended = true;
                 client.left_at = Some(at);
@@ -1289,7 +1289,7 @@ impl Stage {
     pub(crate) fn detach(&mut self, index: usize) -> Result<(), String> {
         let client = &mut self.clients[index];
         self.session
-            .detach(client.attachment)
+            .detach(client.attachment, None)
             .map_err(|error| format!("client {index} did not detach: {error}"))?;
         client.stream = None;
         client.ended = true;

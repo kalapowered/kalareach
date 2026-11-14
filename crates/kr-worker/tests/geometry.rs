@@ -204,7 +204,7 @@ async fn the_first_eligible_claim_owns_the_size_and_a_conversation_view_never_cl
         .expect("attaches, and watches");
     assert_eq!(session.geometry().owner.as_ref(), Some(&first));
     // Even once the owner has gone, an ineligible claim does not inherit.
-    session.detach(first).expect("detaches");
+    session.detach(first, None).expect("detaches");
     assert_eq!(
         session.geometry().owner.as_ref(),
         Some(&second),
@@ -549,7 +549,7 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
 
     {
         let mut session = runtime.session();
-        let succeeded = session.detach(first).expect("detaches").geometry;
+        let succeeded = session.detach(first, None).expect("detaches").geometry;
         assert_eq!(
             succeeded.owner.as_ref(),
             Some(&middle),
@@ -564,8 +564,8 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
     // With every eligible claim gone the last geometry is retained rather than reset.
     {
         let mut session = runtime.session();
-        session.detach(middle).expect("detaches");
-        let retained_geometry = session.detach(last).expect("detaches").geometry;
+        session.detach(middle, None).expect("detaches");
+        let retained_geometry = session.detach(last, None).expect("detaches").geometry;
         assert!(!retained_geometry.owner.is_present());
         assert_eq!(
             retained_geometry.dimensions,

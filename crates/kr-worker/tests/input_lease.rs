@@ -1418,7 +1418,7 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
             )
             .expect("the first four bytes of a delimiter");
         assert_eq!(accepted.held_prefix_bytes, 4);
-        session.detach(leaving).expect("detaches");
+        session.detach(leaving, None).expect("detaches");
         let interrupted = session.interrupted_input();
         assert_eq!(
             interrupted.bytes, 4,
