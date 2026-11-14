@@ -1135,19 +1135,19 @@ async fn a_lease_presented_across_another_devices_revocation_is_not_shown_and_it
 }
 
 /// KR-REQ-09.09, KR-REQ-17.54: a lease for the host's own local owner that ends sooner than the one
-/// before it owes the host a fence of its own, and the debt pass retires that fence with a barrier
-/// that withdraws every connection of the host, the one the presentation arrived on included. The
-/// presentation does not wait for that barrier and carries no proof of it, so a door that is told
-/// the answer after the pass has run does not show it: that what became of the action is not shown.
-/// The lease stands, and the same lease presented again, on a new connection, is answered. This is
-/// what `kr organisation present` meets today when it presents a shorter lease and the pass wins
-/// the race to the answer: the command fails with the host's "not shown" words, and running it
-/// again, which opens a new connection, is answered. The case holds that path deterministically: it
-/// waits, after the route has answered, for the revision that the action's own barrier advances.
+/// before it owes the host a fence of its own, and the barrier that retires it withdraws every
+/// connection of the host, the one the presentation arrived on included. The presentation waits for
+/// that barrier and settles with the proof of it, so the answer of the request that installed the
+/// lease is told while that revision is still the one in force: this is what `kr organisation
+/// present` is told when it presents a shorter lease. The lease stands, and the same lease
+/// presented again on a new connection is a repeat and is answered. Another withdrawal that
+/// completes between the barrier and the reply moves the revision, and the answer is then not shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_lease_for_the_local_owner_that_ends_sooner_is_not_shown_once_its_own_fence_is_retired_and_is_answered_again()
+async fn a_lease_for_the_local_owner_that_ends_sooner_is_told_while_its_own_barrier_stands_and_not_after_another_withdrawal()
  {
     let fixture = Fixture::start().await;
+    // Paired before the host is exclusive: afterwards no device of the owner's confirms a pairing.
+    let bea = fixture.member("bea", SERVED).await;
     let mut client = fixture.host.client().await;
     fixture
         .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
@@ -1155,29 +1155,32 @@ async fn a_lease_for_the_local_owner_that_ends_sooner_is_not_shown_once_its_own_
         .expect("the owner makes the host exclusive");
     drop(client);
     fixture.lease_the_local_owner().await;
-    let shorter = fixture.organisation.sign(
-        2,
-        fixture.organisation.payload(
+    let host_key = fixture.listed().await.host_device.authorisation_key;
+    let owner = organisation_support::member("owner");
+    let lease_of = |lifetime_ms: u64| MembershipPresentParams {
+        lease: fixture.organisation.sign(
             2,
-            &organisation_support::member("owner"),
-            fixture.listed().await.host_device.authorisation_key,
-            fixture.now(),
-            organisation_support::LEASE_MS / 2,
-            &[ActionRight::SessionView],
+            fixture.organisation.payload(
+                2,
+                &owner,
+                host_key,
+                fixture.now(),
+                lifetime_ms,
+                &[ActionRight::SessionView],
+            ),
         ),
-    );
-    let params = MembershipPresentParams {
-        lease: shorter,
         authority: Nullable::null(),
     };
-    let shorter_expires_at_ms = params.lease.payload.expires_at_ms;
     let environment = fixture.host.environment_id;
     let controller = fixture.host.controller();
-    let mut client = fixture.host.client().await;
+
+    // A shorter lease: its own barrier has run when the route answers, and the answer is told.
+    let shorter = lease_of(organisation_support::LEASE_MS / 2);
     let before = fixture.authority_revision();
     let (arrived, release) = controller.pause_after_a_route_answers();
+    let mut client = fixture.host.client().await;
     let telling = tokio::spawn({
-        let params = params.clone();
+        let params = shorter.clone();
         async move {
             let told: Result<kr_protocol::organisation::MembershipPresentResult, _> =
                 calls::mutate_as(
@@ -1195,36 +1198,70 @@ async fn a_lease_for_the_local_owner_that_ends_sooner_is_not_shown_once_its_own_
         .await
         .expect("the route answers")
         .expect("the pause is armed");
-    fixture.until_the_fence_is_retired().await;
     assert!(
         fixture.authority_revision().get() > before.get(),
-        "the action's own barrier advanced the revision"
+        "the presentation's own barrier advanced the revision before the route answered"
     );
     release.send(()).expect("the door goes on");
-    let refused = telling
+    let told = telling
         .await
         .expect("the door tells it")
-        .expect_err("a lease that ends sooner is not shown once its own fence is retired");
-    assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
-    assert!(
-        refused.message.contains("may have been carried out"),
-        "what is told is that what became of the action is not shown: {refused:?}"
+        .expect("the answer of the request that installed the lease is told");
+    assert_eq!(
+        told.expires_at_ms, shorter.lease.payload.expires_at_ms,
+        "the lease that stands is the shorter one"
     );
 
-    let mut again_client = fixture.host.client().await;
-    let again: kr_protocol::organisation::MembershipPresentResult = calls::mutate_as(
+    // The same lease again, on a new connection, is a repeat and is answered.
+    let mut again = fixture.host.client().await;
+    let repeated: kr_protocol::organisation::MembershipPresentResult = calls::mutate_as(
         environment,
-        &mut again_client,
+        &mut again,
         ActionId::new(kr_ipc::new_uuid()),
         Method::MembershipPresent,
-        &params,
+        &shorter,
     )
     .await
     .expect("the lease that stands is answered when it is presented again");
     assert_eq!(
-        again.expires_at_ms, shorter_expires_at_ms,
-        "the lease that stands is the shorter one the refused presentation took"
+        repeated, told,
+        "it is answered as the first presentation was"
     );
+
+    // A shorter lease still, with another device's revocation completing after the route answered:
+    // the revision its own barrier set has moved, and the answer is not shown.
+    let shortest = lease_of(organisation_support::LEASE_MS / 4);
+    let (arrived, release) = controller.pause_after_a_route_answers();
+    let mut client = fixture.host.client().await;
+    let telling = tokio::spawn({
+        let params = shortest.clone();
+        async move {
+            let told: Result<kr_protocol::organisation::MembershipPresentResult, _> =
+                calls::mutate_as(
+                    environment,
+                    &mut client,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    Method::MembershipPresent,
+                    &params,
+                )
+                .await;
+            told
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the route answers")
+        .expect("the pause is armed");
+    controller
+        .revoke_device_authority(bea.record.device_id, None, None)
+        .await
+        .expect("another device's authority is revoked");
+    release.send(()).expect("the door goes on");
+    let refused = telling
+        .await
+        .expect("the door tells it")
+        .expect_err("a later withdrawal withholds the answer");
+    assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
     fixture.host.stop().await;
 }
 
