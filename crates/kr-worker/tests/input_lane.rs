@@ -1675,10 +1675,12 @@ async fn a_host_that_stops_reading_loses_its_lane_when_the_queue_overflows() {
 
 /// KR-REQ-23.36: five lanes of one attachment in a row, each replaced while its host reads
 /// nothing and the worker waits to write to it, leave no task and no registration behind but the
-/// live lane's, which has the window.
+/// live lane's, which has the window. The last lane types before the older lanes are cut, so the
+/// window has to be with it and not with a lane that is still on its way out; the bound is long
+/// enough that no older lane is cut before then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_replacements_in_a_row_leave_no_lane_behind_but_the_last() {
-    let mut rig = Rig::start_with(Some(Duration::from_millis(300))).await;
+    let mut rig = Rig::start_with(Some(Duration::from_secs(3))).await;
     let attachment = rig.attach().await;
     rig.acquire(attachment).await;
     let served = rig.service.served_connections();
@@ -1691,29 +1693,10 @@ async fn five_replacements_in_a_row_leave_no_lane_behind_but_the_last() {
         lane.flood(3_000).await;
         hosts.push(lane);
     }
-    until("one lane's task is left", GONE, || {
-        rig.service.lane_writers() == 1
-    })
-    .await;
-    until(
-        "one lane's connection and registration are left",
-        GONE,
-        || {
-            rig.service.served_connections() == served + 1
-                && rig.service.admitted_connections() == admitted + 1
-        },
-    )
-    .await;
-    assert_eq!(rig.runtime.input().lock().lane_count(), 1);
     let mut last = hosts.pop().expect("the last lane");
-    // Its window is whole, and it types: the flood's refusals stand ahead of the answer to the new
-    // frame, which has to be an acceptance, and the terminal gets the key.
+    // It types at once. The flood's refusals stand ahead of the answer to the new frame, which has
+    // to be an acceptance.
     last.sequence = 0;
-    assert_ne!(
-        rig.runtime.input().lock().ledger().reserved,
-        Cost::default(),
-        "the window is with the last lane"
-    );
     let typed = last.send(b"k").await;
     loop {
         match last.next_event().await {
@@ -1732,6 +1715,25 @@ async fn five_replacements_in_a_row_leave_no_lane_behind_but_the_last() {
             None => panic!("the last lane ended before its key was answered"),
         }
     }
+    until("one lane's task is left", GONE, || {
+        rig.service.lane_writers() == 1
+    })
+    .await;
+    until(
+        "one lane's connection and registration are left",
+        GONE,
+        || {
+            rig.service.served_connections() == served + 1
+                && rig.service.admitted_connections() == admitted + 1
+        },
+    )
+    .await;
+    assert_eq!(rig.runtime.input().lock().lane_count(), 1);
+    assert_ne!(
+        rig.runtime.input().lock().ledger().reserved,
+        Cost::default(),
+        "the window is with the last lane"
+    );
     rig.received_exactly(b"k").await;
     rig.finish().await;
 }
