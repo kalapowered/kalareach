@@ -74,7 +74,7 @@ impl Controller {
     /// written before the policy, and published once the policy is in force or the write was
     /// refused. A renewal's debt reaches the presenting device alone; a dropped lease may be
     /// anyone's, and its debt reaches the host. The barrier that retires the debt is the debt
-    /// pass's, so the answer does not wait for it: except that [`Self::present_lease`] hands the
+    /// pass's, so the answer does not wait for it: except that `present_lease` hands the
     /// barrier of a debt that reaches the host to its caller, which may wait for it as a request
     /// that withdraws the host does (the local door's presentation does; the paired door drops it).
     ///
