@@ -618,6 +618,40 @@ fn a_service_that_a_new_installation_refused_is_acted_on_by_neither_tree() {
     );
 }
 
+/// A repair that makes the service after an earlier refusal turns the entry back into an intent
+/// before the call that makes it: the saved record then holds an entry with no result, which a
+/// removal decides from the service's own mark, and the repair's `made` replaces the intent after
+/// the call. Only a refusal is dropped: a service that an earlier run made stays made.
+#[test]
+fn a_refusal_is_dropped_to_an_intent_before_a_repair_makes_the_service() {
+    const SERVICE: &str = "KalaReachBoundary";
+    let mut manifest = Manifest::begin();
+    manifest.conclude(ObjectKind::Service, SERVICE, Outcome::Refused);
+    // The state that must not be left after the call: the entry still says `refused`.
+    assert!(manifest.drop_refusal(ObjectKind::Service, SERVICE));
+    let intent = Manifest::parse(&manifest.to_bytes().unwrap()).unwrap();
+    let service = intent.find(ObjectKind::Service, SERVICE).unwrap();
+    assert_eq!(service.outcome, None);
+    // An intent is neither a refusal nor a result that a removal acts on without reading the service.
+    assert!(!service.acted_on_by(true));
+    assert!(!service.acted_on_by(false));
+    manifest.conclude(ObjectKind::Service, SERVICE, Outcome::Made);
+    assert_eq!(
+        manifest.find(ObjectKind::Service, SERVICE).unwrap().outcome,
+        Some(Outcome::Made)
+    );
+    // Nothing else is dropped: not a made service, not a found one, not an object with no entry.
+    assert!(!manifest.drop_refusal(ObjectKind::Service, SERVICE));
+    let mut found = Manifest::begin();
+    found.conclude(ObjectKind::Service, SERVICE, Outcome::Found);
+    assert!(!found.drop_refusal(ObjectKind::Service, SERVICE));
+    assert_eq!(
+        found.find(ObjectKind::Service, SERVICE).unwrap().outcome,
+        Some(Outcome::Found)
+    );
+    assert!(!Manifest::begin().drop_refusal(ObjectKind::Service, SERVICE));
+}
+
 #[test]
 fn the_manifest_is_a_store_that_refuses_what_it_does_not_know() {
     let dir = tempfile::tempdir().unwrap();

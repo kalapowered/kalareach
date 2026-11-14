@@ -4865,6 +4865,13 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             return Err(refuse_service(run));
         }
         None => {
+            // A repair over a refusal makes the service itself. The step is written as an intent
+            // with no result before the call, so that a death after the call leaves a record by
+            // which a removal decides from the service's own mark, and never a service that the
+            // record still calls refused.
+            if run.manifest.drop_refusal(ObjectKind::Service, SERVICE) {
+                run.save()?;
+            }
             let made = manager.create(
                 SERVICE,
                 DISPLAY,
