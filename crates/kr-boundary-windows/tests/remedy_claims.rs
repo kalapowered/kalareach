@@ -961,10 +961,10 @@ fn the_ending_of_a_rollback_with_a_failed_step_says_what_became_of_the_run_s_rec
         // Where the write failed before its rename (before it created anything, or before the
         // rename), the words say that this write did not reach the manifest's name and do not say
         // that it may have published a record, nor that no write of the run reached the name. They
-        // say that no manifest of this run stands there only
-        // where the read found nothing, or no read was made because the run never held a handle of
-        // the data directory; where the read found an object or failed, they add nothing to what
-        // the read says.
+        // say that no manifest of this run stands there only where the read found nothing, or no
+        // read was made because the run never held a handle of the data directory; where the read
+        // found an object or failed they add nothing to what the read says, except that, where the
+        // run holds an earlier write of its record, that record may stand there.
         for earlier_write in [false, true] {
             let no_write = rollback_failed(
             &failures,
