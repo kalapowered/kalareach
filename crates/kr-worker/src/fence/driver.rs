@@ -634,6 +634,15 @@ impl FenceDriver {
         Effects::default()
     }
 
+    /// Returns how many writes the machine is holding for a reader transition.
+    ///
+    /// These are the writes whose bytes [`Effects::held_added`] counted, and they are counted for
+    /// the same reason: they are accepted and not delivered, so they take room beside the queue.
+    #[must_use]
+    pub fn held_frames(&self) -> usize {
+        self.hold.values().filter(|held| held.charged).count()
+    }
+
     /// Returns whether what the session queued behind `frame` still waits for it.
     ///
     /// It does while the frame is unwritten and its fence is still the machine's; once the writer
