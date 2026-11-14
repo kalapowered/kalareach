@@ -325,7 +325,8 @@ jobs:
       - name: Refuse a build whose link reported conflicting C runtimes
         shell: bash
         run: |
-          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          # Python is a Windows program: it is given paths as Windows writes them.
+          logs="$(cygpath -m "$RUNNER_TEMP")/build"
           files=()
           for build in $KR_BUILDS; do
             files+=("$logs/${build#*/}.log")

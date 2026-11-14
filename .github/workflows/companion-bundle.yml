@@ -143,7 +143,8 @@ jobs:
           fi
 
           # Read one: the linker did not report objects that ask for two C runtimes.
-          python scripts/read-windows-imports.py messages "$log"
+          # Python is a Windows program: it is given the log's path as Windows writes it.
+          python scripts/read-windows-imports.py messages "$(cygpath -m "$log")"
 
           # Read two: the libraries the executable imports. No runtime library is among them, and
           # every one is a Windows API set or a library of the system directory.
