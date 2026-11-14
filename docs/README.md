@@ -293,6 +293,19 @@ Core and the catalogue check their locks against the RustSec advisory database o
 main and every pull request, and the `advisories` workflow in each repeats the check daily on main.
 A finding fails the run.
 
+The check does not cover a crate that the lock takes from Git, because `cargo audit` matches an
+advisory only to a crate from the advisory's own source, which is crates.io unless the advisory
+names another. Core's lock takes 17 crates that way: 14 packages of the project's WezTerm fork
+(`filedescriptor`, `termwiz`, `vtparse` and eleven `wezterm-*` packages), `finl_unicode` from the
+`no_std` branch of the `wez/finl_unicode` repository, which the WezTerm crates take, `noq-udp` from
+the upstream noq repository and `noq-proto` from the project's noq fork. The last two replace the
+registry crates through `[patch.crates-io]` in the root `Cargo.toml`. An advisory filed against a
+crate's crates.io release does not reach its Git copy, and no workflow or script in this repository
+reads advisories against the upstream repositories of these crates. The `patched_crates` test in `tests/conformance` covers one further
+case: when nothing in the graph can use a `[patch.crates-io]` entry, cargo takes the registry crate,
+warns and writes a `[[patch.unused]]` table into the lock, and the test fails on that table and
+names the entry.
+
 There is no second specification hierarchy. The protocol reference, its generated method index and
 glossary, and the generated schemas and vectors live beside the code they describe, in
 `docs/protocol/`, `packages/protocol/` and `fixtures/`, and each part's reference lives under

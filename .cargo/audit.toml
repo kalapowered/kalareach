@@ -1,10 +1,12 @@
 # How continuous integration checks Cargo.lock against the RustSec advisory database. `cargo audit`
 # reads this file when it runs at the root of the workspace, so a local run applies the same rules.
 #
-# Every advisory against a crate in the lock fails the check, whether it reports a vulnerability,
-# unsound code or an unmaintained crate. One is let through only by naming it below, with the
-# reason it is accepted and the condition for taking it out again. An informational notice is
-# printed and does not fail the check, because `cargo audit` has no setting that would make it. A
+# Every advisory against a crate that the lock takes from crates.io fails the check, whether it
+# reports a vulnerability, unsound code or an unmaintained crate. A crate that the lock takes from
+# Git is not checked, because `cargo audit` matches an advisory only to a crate from the advisory's
+# own source; docs/README.md lists those crates. An advisory is let through only by naming it below,
+# with the reason it is accepted and the condition for taking it out again. An informational notice
+# is printed and does not fail the check, because `cargo audit` has no setting that would make it. A
 # yanked release is not an advisory, and the check does not look for one.
 
 [advisories]
