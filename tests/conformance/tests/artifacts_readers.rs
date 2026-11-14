@@ -261,6 +261,8 @@ fn a_name_that_only_begins_like_a_root_a_relative_value_and_an_empty_value_are_r
         let lookalike = PathBuf::from(format!("{}foo", temporary.display())).join("evidence");
         let mut values: Vec<(PathBuf, &str)> = vec![
             (lookalike, OUTSIDE),
+            // The temporary folder itself holds no evidence.
+            (temporary.clone(), OUTSIDE),
             (PathBuf::from("evidence"), "not an absolute path"),
             (PathBuf::from("./evidence"), "not an absolute path"),
             (PathBuf::new(), "it is empty"),

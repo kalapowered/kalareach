@@ -90,6 +90,8 @@ _kr_artifacts_confine() {
   [ "$_kr_value" = / ] || _kr_value="${_kr_value%/}"
   _kr_probe="$_kr_value"
   while [ -n "$_kr_probe" ] && [ ! -e "$_kr_probe" ]; do
+    # Each pass drops one name, so the loop ends at the top of the path.
+    [ "$_kr_probe" != "${_kr_probe%/*}" ] || break
     _kr_rest="/${_kr_probe##*/}$_kr_rest"
     _kr_probe="${_kr_probe%/*}"
   done

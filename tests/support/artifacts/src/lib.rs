@@ -300,6 +300,7 @@ mod tests {
         let first = directory_from(None);
         assert!(first.is_dir(), "{}", first.display());
         assert_eq!(directory_from(None), first);
+        assert_eq!(real(&first), first, "the directory is given resolved");
         assert!(confine(&first).is_ok());
         std::fs::remove_dir(&first).expect("removes the run's own directory");
     }
