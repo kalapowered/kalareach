@@ -193,6 +193,8 @@ pub enum Purpose {
 #[derive(Debug)]
 pub struct WorkerProxy {
     session_id: SessionId,
+    /// The connection identity the worker assigned to this link.
+    connection_id: kr_protocol::ids::ConnectionId,
     /// Notified once this link has ended, whichever way it ended.
     ///
     /// A connection whose link has gone has no subscription and no attachment at the worker, so it
@@ -277,20 +279,56 @@ impl WorkerProxy {
         lost: Arc<tokio::sync::Notify>,
         receive: ReceiveLimits,
     ) -> Result<Arc<Self>> {
+        let client =
+            Self::connect_as(controller, worker, receive, ControllerConnectionRole::Proxy).await?;
+        let level = client.level();
+        let (reader, writer, acknowledgement) = client.into_halves();
+        let waiters: Arc<std::sync::Mutex<Waiters>> =
+            Arc::new(std::sync::Mutex::new(Waiters::default()));
+        let reader = tokio::spawn(read_loop(
+            reader,
+            Arc::clone(&waiters),
+            notifications,
+            budget,
+            Arc::clone(&lost),
+        ));
+        Ok(Arc::new(Self {
+            session_id: worker.descriptor.session_id,
+            connection_id: acknowledgement.connection_id,
+            lost,
+            writer: Mutex::new(Some(writer)),
+            waiters,
+            reader,
+            next_request: AtomicU64::new(1),
+            level,
+            capabilities: acknowledgement.capabilities,
+            #[cfg(test)]
+            calls_at_the_writer: AtomicU64::new(0),
+        }))
+    }
+
+    /// Connects to a worker, proves it is the session its descriptor names, declares what this
+    /// connection is for and presents the generation it speaks for, in that order.
+    ///
+    /// Declaring before presenting is what keeps a link that is not the authority from displacing
+    /// the daemon's own authority connection.
+    async fn connect_as(
+        controller: &Arc<Controller>,
+        worker: &KnownWorker,
+        receive: ReceiveLimits,
+        role: ControllerConnectionRole,
+    ) -> Result<BoundLink> {
         let mut client =
             BoundLink::connect_receiving(&worker.endpoint, controller.build_id.clone(), receive)
                 .await?;
         client.verify_worker(&worker.descriptor).await?;
-        client
-            .send(&ControlFrame::ControllerRole(
-                ControllerConnectionRole::Proxy,
-            ))
-            .await?;
+        client.send(&ControlFrame::ControllerRole(role)).await?;
         match client.recv().await? {
-            ControlFrame::ControllerRole(ControllerConnectionRole::Proxy) => {}
+            ControlFrame::ControllerRole(echoed) if echoed == role => {}
             other => {
                 return Err(ControllerError::supervision(format!(
-                    "the worker did not accept this connection as a proxy: {}",
+                    "the worker did not accept this connection as a {}: {}",
+                    role.as_str(),
                     frame_name(&other)
                 )));
             }
@@ -305,30 +343,46 @@ impl WorkerProxy {
                     .map_err(kr_ipc::IpcError::from)
             })
             .await?;
+        Ok(client)
+    }
 
+    /// Opens the link that carries one attachment's typing to its worker: a second connection that
+    /// declares the input-lane role and borrows the binding of the `Proxy` link whose connection
+    /// identity `lane` names.
+    ///
+    /// The halves are returned as the link has them after the generation was presented; binding the
+    /// lane is the caller's, and it is the same step for a worker's own endpoint and for a scripted
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker cannot be reached, does not prove itself, or refuses the
+    /// role or the generation.
+    pub async fn open_input_lane(
+        controller: &Arc<Controller>,
+        worker: &KnownWorker,
+        receive: ReceiveLimits,
+    ) -> Result<(
+        kr_ipc::client::LinkReader,
+        kr_ipc::client::LinkWriter,
+        kr_protocol::retained::Level,
+    )> {
+        let client = Self::connect_as(
+            controller,
+            worker,
+            receive,
+            ControllerConnectionRole::ProxyInput,
+        )
+        .await?;
         let level = client.level();
-        let (reader, writer, acknowledgement) = client.into_halves();
-        let waiters: Arc<std::sync::Mutex<Waiters>> =
-            Arc::new(std::sync::Mutex::new(Waiters::default()));
-        let reader = tokio::spawn(read_loop(
-            reader,
-            Arc::clone(&waiters),
-            notifications,
-            budget,
-            Arc::clone(&lost),
-        ));
-        Ok(Arc::new(Self {
-            session_id: worker.descriptor.session_id,
-            lost,
-            writer: Mutex::new(Some(writer)),
-            waiters,
-            reader,
-            next_request: AtomicU64::new(1),
-            level,
-            capabilities: acknowledgement.capabilities,
-            #[cfg(test)]
-            calls_at_the_writer: AtomicU64::new(0),
-        }))
+        let (reader, writer, _acknowledgement) = client.into_halves();
+        Ok((reader, writer, level))
+    }
+
+    /// The identity the worker gave this link: what an input lane names to borrow its binding.
+    #[must_use]
+    pub const fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
+        self.connection_id
     }
 
     /// Returns true while this link can still carry a call.

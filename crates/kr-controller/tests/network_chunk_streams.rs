@@ -264,7 +264,7 @@ async fn a_device_with_no_rights_is_told_which_streams_the_host_takes() {
         .expect("a result of the declared shape");
     assert_eq!(
         answered.accepted_streams,
-        vec![StreamKind::AttachmentChunks]
+        vec![StreamKind::AttachmentChunks, StreamKind::TerminalInput]
     );
 
     let unlisted = raw

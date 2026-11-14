@@ -3,18 +3,21 @@
 
 use std::sync::Arc;
 
+use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ProtocolError;
-use kr_protocol::ids::{ActorId, EnvironmentId};
+use kr_protocol::ids::{ActorId, EnvironmentId, SessionId};
 use kr_protocol::method::Method;
+use kr_protocol::scalars::{Nullable, U64};
 use kr_transfer::service::StoredSubject;
 use kr_transport::listener::ReceivedFrame;
 use kr_transport::streams::DataWriter;
 
 use super::output::{FrameSink, RemoteOutput, WITHDRAWN};
 use super::{Answered, RemoteConnection};
-use crate::service::Controller;
 use crate::service::net::chunks::ChunkAdmission;
+use crate::service::net::proxy::WorkerProxy;
+use crate::service::{Controller, FeedStanding};
 
 /// A data stream's writer, as the connection's write boundary writes to it.
 ///
@@ -117,5 +120,80 @@ impl RemoteConnection {
         admission: &Arc<ChunkAdmission>,
     ) -> Option<Answered> {
         self.answer_via(received, Some(admission)).await
+    }
+}
+
+/// What the host decided for one frame of typing: everything the worker is given with it, and the
+/// grants the frame stands on, which the writer asks the feed about again immediately before the
+/// frame goes to the worker.
+#[derive(Clone, Debug)]
+pub(crate) struct InputDecision {
+    /// The actor the frame is attributed to, at the revision the decision was taken at.
+    pub(crate) actor: ActorEnvelope,
+    /// When the authority behind the frame runs out, as a remaining duration, or null.
+    pub(crate) authority_deadline: Nullable<U64>,
+    /// The grants the frame stands on.
+    pub(crate) standing: FeedStanding,
+}
+
+impl RemoteConnection {
+    /// The session and the open link to its worker, once this connection's route is fixed.
+    pub(crate) async fn fixed_input_route(&self) -> Option<(SessionId, Arc<WorkerProxy>)> {
+        let proxy = self
+            .proxy
+            .lock()
+            .await
+            .as_ref()
+            .filter(|proxy| proxy.is_open())
+            .map(Arc::clone)?;
+        let (session, _grant) = (*self
+            .fixed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        Some((session, proxy))
+    }
+
+    /// What the device this connection serves said it can receive, which a link opened for it is
+    /// told.
+    pub(crate) fn receive_limits(&self) -> kr_protocol::hello::ReceiveLimits {
+        self.output.receive()
+    }
+
+    /// Resolves when this connection's grant choices change: the route may then be fixed.
+    pub(crate) async fn until_the_route_may_have_changed(&self) {
+        self.acting_changed.notified().await;
+    }
+
+    /// Decides one frame of typing for `session`, as a key sent on the control stream is decided:
+    /// the registration and its revision, the authority feed's refusal, and the rights, selectors
+    /// and scope the door decides for `input.write`, and the authority's deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal a key for the same would be given.
+    pub(crate) async fn decide_an_input_frame(
+        &self,
+        session: SessionId,
+    ) -> std::result::Result<InputDecision, ProtocolError> {
+        let validated = self.admitted_at().await?;
+        let asked = self.ask_naming(Some(session), Method::InputWrite.entry(), false, None)?;
+        let authority_deadline = self.authority_deadline(&asked)?;
+        let standing = self.feed_standing(&asked.acting.grant);
+        self.controller
+            .refuse_while_the_feed_refuses(&standing)
+            .map_err(|error| error.to_protocol_error())?;
+        Ok(InputDecision {
+            actor: self.envelope(asked.acting.grant.grant_id, validated),
+            authority_deadline,
+            standing,
+        })
+    }
+
+    /// Whether the authority feed refuses a frame that stands on `standing`, asked again
+    /// immediately before the frame is written to the worker.
+    pub(crate) fn feed_admits(&self, standing: &FeedStanding) -> bool {
+        self.controller
+            .refuse_while_the_feed_refuses(standing)
+            .is_ok()
     }
 }
