@@ -15,7 +15,9 @@ A program that cannot be read fails the read; none is skipped.
 """
 
 import argparse
+import contextlib
 import hashlib
+import io
 import os
 import re
 import subprocess
@@ -26,14 +28,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Libraries no program of the product imports: Visual C++'s runtime, its C++ library, OpenMP, the
-# concurrency runtime, the universal runtime (the API sets and the library behind them, debug builds
-# included), older and debug runtimes (`msvcr120`, `msvcrt`, `msvcp140d`), and libsodium's own library.
-DENIED = re.compile(r"^(vcruntime|msvcp|vcomp|concrt|ucrtbase|msvcr|api-ms-win-crt-|libsodium)", re.I)
+# concurrency runtime, C++/CX and C++ AMP, MFC, the universal runtime (the API sets and the library
+# behind them, debug builds included), older and debug runtimes (`msvcr120`, `msvcrt`, `msvcp140d`),
+# and libsodium's own library. The Windows component `msvcp_win` has the prefix of the C++ library and is
+# refused with it: no program of the product imports it.
+DENIED = re.compile(
+    r"^(vcruntime|msvcp|vcomp|concrt|vccorlib|vcamp|mfc\d|ucrtbase|msvcr|api-ms-win-crt-|libsodium)", re.I
+)
 API_SET = re.compile(r"^(api|ext)-ms-win-", re.I)
 
 
 def dependents(text):
-    """The libraries `dumpbin /dependents` lists, as (imports, delay-load imports)."""
+    """The libraries `dumpbin /dependents` lists, as (imports, delay-load imports).
+
+    Every entry of a list is a library, whatever its extension (`WINSPOOL.DRV` is one) and even with a
+    space in its name: an entry that is not read would be an import that is not checked.
+    """
     imports, delay, current = [], [], None
     for row in text.splitlines():
         if "Image has the following dependencies" in row:
@@ -43,18 +53,35 @@ def dependents(text):
         elif re.match(r"^\s*Summary", row):
             current = None
         elif current is not None:
-            found = re.match(r"^\s+(\S+\.dll)\s*$", row, re.I)
+            found = re.match(r"^\s+(\S(?:.*\S)?)\s*$", row)
             if found:
                 current.append(found.group(1))
     return imports, delay
 
 
-def classify(name, system_dir):
-    """What a library is: DENIED, a Windows API set, a library of the system directory, or NOT FOUND."""
+def api_set_present(name):
+    """Whether this machine implements an API set contract, asked of the loader, which resolves the name
+    through the system's API set schema; None where the loader cannot be asked (not Windows)."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    try:
+        ctypes.WinDLL(name)
+    except OSError:
+        return False
+    return True
+
+
+def classify(name, system_dir, api_present=api_set_present):
+    """What a library is: DENIED, a Windows API set, a library of the system directory, or NOT FOUND.
+
+    An API set is a name the loader resolves, so a name that this machine does not implement is NOT
+    FOUND, however well it is spelled."""
     if DENIED.match(name):
         return "DENIED"
     if API_SET.match(name):
-        return "a Windows API set"
+        return "NOT FOUND" if api_present(name) is False else "a Windows API set"
     if system_dir is not None and (system_dir / name).is_file():
         return "a Windows system library"
     return "NOT FOUND"
@@ -95,7 +122,7 @@ def imports_command(dumpbin, programs, system_dir):
         print(f"::error::{problem}")
     if problems:
         return 1
-    print(f"No program of {len(programs)} imports a runtime library, and every import is a Windows library.")
+    print(f"No program of {len(programs)} imports a runtime library, and every import is a Windows API set or a library of the system directory.")
     return 0
 
 
@@ -160,9 +187,17 @@ def control_command(dumpbin, system_dir):
 
     A read that finds nothing is worth something only when it is shown to find the fault: the program
     that carries its runtime passes both reads, the one that imports the dynamic runtime is refused by
-    the import read, and a link that asks for both runtimes prints LNK4098 through the same build path
-    that the product's builds print their messages by.
+    the import read, and a link that asks for both runtimes prints LNK4098 where this read looks for it.
+    The programs are linked by `rustc` with the lint levels it has by default, which the product's builds
+    keep (no flag or setting of ours changes the level of the linker's messages).
     """
+    failed = []
+    # The loader resolves an API set by name: a real contract must resolve here and one that does not exist must not.
+    for name, want in (("api-ms-win-core-synch-l1-2-0.dll", True), ("api-ms-win-core-nothing-of-the-kind-l1-1-0.dll", False)):
+        got = api_set_present(name)
+        print(f"control API set {name}: this machine implements it: {got}")
+        if got is not want:
+            failed.append(f"the API set control {name}: implemented: {got}, expected {want}")
     work = Path(tempfile.mkdtemp(prefix="read-windows-imports-"))
     source = work / "hello.rs"
     source.write_text(HELLO)
@@ -171,7 +206,6 @@ def control_command(dumpbin, system_dir):
         ("dynamic", ["-C", "target-feature=-crt-static"], True, False),
         ("both", ["-C", "target-feature=-crt-static", "-C", "link-arg=/DEFAULTLIB:libcmt"], True, True),
     ]
-    failed = []
     for name, flags, imports_runtime, says_lnk4098 in cases:
         program, log = work / f"{name}.exe", work / f"{name}.log"
         build = subprocess.run(
@@ -240,6 +274,10 @@ def self_test():
     check("the first and last import are read", (clean[0], clean[-1]), ("KERNEL32.dll", "api-ms-win-core-realtime-l1-1-1.dll"))
     check("the summary's lines are no import", any(".data" in name for name in clean), False)
     check("a delay-load import is read as one", dependents(DELAY)[1], ["MSVCP140.dll"])
+    odd = CLEAN.replace("    bcrypt.dll\n", "    bcrypt.dll\n    WINSPOOL.DRV\n    my library.dll\n")
+    check("an entry that is no .dll is read", dependents(odd)[0][-3:-1], ["WINSPOOL.DRV", "my library.dll"])
+    check("it is classified by the same rule", [classify(n, None) for n in ("WINSPOOL.DRV", "VCCORLIB140.dll", "mfc140u.dll", "VCAMP140.dll")], ["NOT FOUND", "DENIED", "DENIED", "DENIED"])
+    check("a Media Foundation library is no MFC", classify("mfcore.dll", None), "NOT FOUND")
     check("it is not an ordinary import", "MSVCP140.dll" in dependents(DELAY)[0], False)
     check("a text with no list has no import", dependents("Dump of file x.exe\n"), ([], []))
 
@@ -247,12 +285,17 @@ def self_test():
         system = Path(directory)
         for name in ("KERNEL32.dll", "WS2_32.dll", "ADVAPI32.dll", "ntdll.dll", "bcryptprimitives.dll", "USERENV.dll", "CRYPT32.dll", "bcrypt.dll"):
             (system / name).write_text("")
-        check("no import of the clean program is refused or lost", [classify(n, system) for n in clean].count("DENIED") + [classify(n, system) for n in clean].count("NOT FOUND"), 0)
+        implemented = lambda n: True  # the self-test holds the classification, not the machine it runs on
+        classes = [classify(n, system, implemented) for n in clean]
+        check("no import of the clean program is refused or lost", classes.count("DENIED") + classes.count("NOT FOUND"), 0)
         check("a library of the system directory is named so", classify("KERNEL32.dll", system), "a Windows system library")
-        check("an API set is named so", classify("api-ms-win-core-synch-l1-2-0.dll", system), "a Windows API set")
-        check("an extension API set is named so", classify("ext-ms-win-gdi-desktop-l1-1-0.dll", system), "a Windows API set")
+        check("an API set is named so", classify("api-ms-win-core-synch-l1-2-0.dll", system, implemented), "a Windows API set")
+        check("an extension API set is named so", classify("ext-ms-win-gdi-desktop-l1-1-0.dll", system, implemented), "a Windows API set")
         check("a library that is nowhere is not found", classify("nowhere.dll", system), "NOT FOUND")
         check("with no system directory a plain library is not found", classify("kernel32.dll", None), "NOT FOUND")
+        for answer, want in ((False, "NOT FOUND"), (True, "a Windows API set"), (None, "a Windows API set")):
+            check(f"an API set that the loader answers {answer} for", classify("api-ms-win-core-x-l1-1-0.dll", None, lambda n, a=answer: a), want)
+        check("a denied name is refused before the loader is asked", classify("api-ms-win-crt-heap-l1-1-0.dll", None, lambda n: True), "DENIED")
 
     for name in (
         "VCRUNTIME140.dll", "vcruntime140_1.dll", "VCRUNTIME140D.dll", "MSVCP140.dll", "msvcp140d.dll", "VCOMP140.DLL",
@@ -283,10 +326,18 @@ def self_test():
         quiet.write_text("warning: unused variable\nLINK : warning LNK4099: PDB not found\n")
         loud.write_text("LINK : warning LNK4098: defaultlib 'LIBCMT' conflicts with use of other libs\n")
         empty.write_text("")
-        check("a log with no LNK4098 passes", messages_command([str(quiet)]), 0)
-        check("a log with LNK4098 is refused", messages_command([str(quiet), str(loud)]), 1)
-        check("an empty log cannot be read", messages_command([str(empty)]), 2)
-        check("a log that is not there cannot be read", messages_command([str(Path(directory) / "none.log")]), 2)
+        # The refusals print workflow annotations, which a green self-test must not leave in a run's log.
+        with contextlib.redirect_stdout(io.StringIO()):
+            answers = [
+                messages_command([str(quiet)]),
+                messages_command([str(quiet), str(loud)]),
+                messages_command([str(empty)]),
+                messages_command([str(Path(directory) / "none.log")]),
+            ]
+        check("a log with no LNK4098 passes", answers[0], 0)
+        check("a log with LNK4098 is refused", answers[1], 1)
+        check("an empty log cannot be read", answers[2], 2)
+        check("a log that is not there cannot be read", answers[3], 2)
 
     for failure in failures:
         print(f"self-test: {failure}", file=sys.stderr)
