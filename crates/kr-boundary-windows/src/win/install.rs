@@ -3918,12 +3918,14 @@ impl Run {
                 Ok(found) => found,
                 Err(error) => {
                     // Where the replacement that the rename put at the manifest's name is still
-                    // held (a read of the proof failed, or its mark failed), it is the manifest
-                    // from then on, and the object that an earlier save proved no longer has that
-                    // name: its identity is dropped, so that the one object at the name is held
-                    // once. Where the write marked the replacement because another object stands
-                    // at the name, the earlier identity stays, and the rollback names what stands
-                    // there instead of saying that its records are deleted.
+                    // held at that path (a read of the proof failed), it is the manifest from then
+                    // on, and the object that an earlier save proved no longer has that name: its
+                    // identity is dropped, so that the one object at the name is held once. Where
+                    // a read showed that another object stands at the name, the earlier identity
+                    // stays, whether the write marked the replacement or its mark failed (the
+                    // write then holds it with the path that it was made at, not the manifest's),
+                    // and the rollback names what stands there instead of saying that its records
+                    // are deleted.
                     let mut laid = ffi::locked(&self.laid);
                     if laid
                         .replacement
@@ -7033,12 +7035,13 @@ mod tests {
         let error = roll_back(&mut run).unwrap_err().to_string();
         assert!(error.contains("found nothing there"), "{error}");
         assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), run.manifest);
-        // The write cannot begin (no handle of the data directory is held): the ending says so,
-        // names what stays, never says that a write may have published a record, and never says
-        // that a record is kept.
+        // A run before its first write, which never held a handle of the data directory and has
+        // no record on disk: the write cannot begin, and the ending says so, names what stays
+        // (nothing), never says that a write may have published a record, and never says that a
+        // record is kept.
         let top = tempfile::tempdir().unwrap();
-        let mut run = laid_run(top.path());
-        run.directory = None;
+        let mut run = unwritten_run(top.path(), false);
+        assert!(!run.paths.manifest.try_exists().unwrap());
         crate::manifest::forced::fail_the_next("manager");
         let error = roll_back(&mut run).unwrap_err().to_string();
         assert!(
@@ -7062,15 +7065,16 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains("What this run made and the rollback did not take away"),
-            "{error}"
-        );
-        assert!(
-            error.contains(&run.paths.data.display().to_string()),
+            error.contains(
+                "What this run made and the rollback did not take away: this run held no object that it had made"
+            ),
             "{error}"
         );
         assert!(!error.contains("records are kept"), "{error}");
         assert!(!error.contains("stays where it is"), "{error}");
+        // The disk after the ending holds no record of this run, as the words say.
+        assert!(!run.paths.manifest.try_exists().unwrap());
+        assert_eq!(std::fs::read_dir(&run.paths.data).unwrap().count(), 0);
     }
 
     /// A save that fails before its rename changed nothing at the manifest's name, and the ending
