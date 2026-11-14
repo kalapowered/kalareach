@@ -5,13 +5,13 @@ name: companion-bundle
 #
 # The application links the static C runtime, through the `crt-static` target feature that the
 # workspace's configuration gives the MSVC targets, so it imports no runtime library. The Tauri
-# command line asks for its own static runtime, a hybrid that would put a second runtime in the link,
+# command line asks for its own static runtime, a hybrid whose program imports the universal runtime,
 # unless the environment says otherwise. The build step below starts with `STATIC_VCRUNTIME=true` in
 # its environment, which is what the command line would have set, so a build that passes shows that
 # the entry replaces it. Two reads then look at the link: the build's log has no `LNK4098` (the
 # linker's report of objects that ask for two runtimes), and the executable imports no runtime
 # library (none of Visual C++'s, the universal runtime's, an older or a debug one, or libsodium's)
-# and every import is a Windows library. A step before the build links three small programs, one
+# and every import is a Windows API set or a library of the system directory. A step before the build links three small programs, one
 # that carries its runtime, one that imports the dynamic runtime and one that asks for both, and
 # shows that each read refuses what it must: a read that finds nothing is worth something only when
 # it is shown to find the fault. Each installer is then opened: the NSIS installer is run silently
@@ -28,8 +28,9 @@ on:
     branches: ["main"]
     paths:
       - apps/companion/src-tauri/**
-      - apps/companion/scripts/desktop.mjs
+      - apps/companion/scripts/**
       - apps/companion/package.json
+      - Cargo.toml
       - pnpm-lock.yaml
       - .cargo/config.toml
       - Cargo.lock
@@ -143,7 +144,7 @@ jobs:
           fi
 
           # Read one: the linker did not report objects that ask for two C runtimes.
-          # Python is a Windows program: it is given the log's path as Windows writes it.
+          # Python is a Windows program: it is given the log's path with forward slashes, which it reads.
           python scripts/read-windows-imports.py messages "$(cygpath -m "$log")"
 
           # Read two: the libraries the executable imports. No runtime library is among them, and
