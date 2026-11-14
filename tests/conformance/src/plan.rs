@@ -375,6 +375,28 @@ pub const fn unrun_reason(platform: Platform) -> &'static str {
     }
 }
 
+/// The steps of one part of a platform's plan, for a plan that one job cannot hold and separate runs
+/// carry out in parts: the build steps that open the plan, which every part needs for the programs
+/// the suites start, and then the remaining steps, cut in order into parts of nearly equal count.
+/// `part` is the number of the part from 1 and the number of parts.
+#[must_use]
+pub fn part_of(steps: Vec<Step>, part: (usize, usize)) -> Vec<Step> {
+    let (number, parts) = part;
+    let opening = steps
+        .iter()
+        .take_while(|step| step.reading == Reading::Build)
+        .count();
+    let rest = steps.len() - opening;
+    let from = opening + rest * number.saturating_sub(1) / parts.max(1);
+    let to = opening + rest * number / parts.max(1);
+    steps
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| *index < opening || (from..to).contains(index))
+        .map(|(_, step)| step)
+        .collect()
+}
+
 /// Every step the selected groups run on `platform`.
 ///
 /// `evidence` is the directory the vitest reports are written into, and `applications` names the
@@ -2341,6 +2363,30 @@ pub fn listed_rows() -> Vec<Identifier> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_parts_of_a_plan_each_hold_the_opening_builds_and_together_every_other_step_once() {
+        let step = |what: &str, reading: Reading| Step {
+            group: Group::Rust,
+            what: what.to_owned(),
+            command: vec!["cargo".to_owned()],
+            needs: Vec::new(),
+            reading,
+            filter: None,
+            skips: Vec::new(),
+        };
+        let mut steps = vec![step("a", Reading::Build), step("b", Reading::Build)];
+        steps.extend((0..7).map(|n| step(&format!("t{n}"), Reading::Cargo)));
+        let names = |part| -> Vec<String> {
+            part_of(steps.clone(), part)
+                .into_iter()
+                .map(|step| step.what)
+                .collect()
+        };
+        assert_eq!(names((1, 2)), ["a", "b", "t0", "t1", "t2"]);
+        assert_eq!(names((2, 2)), ["a", "b", "t3", "t4", "t5", "t6"]);
+        assert_eq!(names((1, 1)).len(), steps.len());
+    }
 
     #[test]
     fn a_pattern_matches_one_component_per_star_and_any_number_per_double_star() {

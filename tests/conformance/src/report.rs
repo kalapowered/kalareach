@@ -243,6 +243,9 @@ pub struct RunRecordHeader {
     pub applications: Option<Vec<ApplicationRecord>>,
     /// The groups this run selected.
     pub selection: Vec<String>,
+    /// The part of the platform's plan this run is, as `number/parts`, when it is one of several.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
     /// Whether the run was asked for the whole terminal matrix.
     pub all_terminals: bool,
     /// Where the evidence is.
@@ -344,6 +347,9 @@ pub struct Options {
     /// The `kr-conformance` program, which Cargo runs each test binary through while a step's
     /// tests are listed.
     pub lister: PathBuf,
+    /// Which part of the platform's plan this run is, as the number of the part from 1 and the
+    /// number of parts, when the plan is run in parts by separate runs.
+    pub part: Option<(usize, usize)>,
 }
 
 /// Why a run stopped before it ran anything.
@@ -454,6 +460,10 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             applications_plan.as_ref(),
         )
     });
+    let steps = match options.part {
+        Some(part) => plan::part_of(steps, part),
+        None => steps,
+    };
     let mut executed = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         progress(&format!(
@@ -678,6 +688,9 @@ pub fn assemble(
             packages,
             applications: options.applications.clone(),
             selection: groups.iter().map(|group| group.name().to_owned()).collect(),
+            part: options
+                .part
+                .map(|(number, parts)| format!("{number}/{parts}")),
             all_terminals: options.all_terminals,
             evidence_directory: options.evidence.to_string_lossy().replace('\\', "/"),
         },

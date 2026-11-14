@@ -92,6 +92,16 @@ terminal. Those terminals are qualified on the terminal matrix hosts and virtual
 this report, so the result records each one as not run, with that reason, the report names each on
 its output, and the run exits 1. `--all-terminals` takes no `--group`.
 
+### A plan run in parts
+
+`--part <number>/<parts>` runs one part of the platform's plan, for a plan that one job cannot hold.
+Every part runs the build steps that open the plan, which the suites that start a program need, and
+then its share of the other steps, cut in order into parts of nearly equal count. Each part writes
+its own result: a test that another part runs is recorded as not run, with the reason saying that
+this run is one part of the plan, and the result's `run.part` names the part. The Windows job runs
+its plan as two parts, one in each job of its matrix, and a part that fails does not stop the
+other.
+
 ### The classes of test in the landing workflow
 
 Section 21 names a tool for each class of test and asks for the tests' screenshots to be kept in
@@ -500,6 +510,7 @@ identifier's `references` and `figures`.
 | `figures` | The figures the identifier's measurements recorded in this run |
 | `failures_outside_identifiers` | Tests that failed in a step and name no identifier; any one fails the run |
 | `known_differences` | Every known difference, with the identifiers of the test that recorded it |
+| `run.part` | Present on a run that is one part of the platform's plan: `number/parts` |
 | `terminals` | Present when `--all-terminals` asked for section 27's terminal matrix: each terminal, its outcome and why. A terminal that did not pass fails the run |
 | `problems` | What makes the result incomplete, such as a record a test wrote that could not be read; any one fails the run |
 | `warnings` | What the report noted and carried on past, such as a declared module whose file is not there |

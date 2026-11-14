@@ -51,6 +51,7 @@ fn options(platform: Platform) -> Options {
         applications: None,
         steps: None,
         lister: PathBuf::from("/tmp/l"),
+        part: None,
         environment: Vec::new(),
     }
 }
