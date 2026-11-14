@@ -467,7 +467,7 @@ fn run_with(
         fs::write(root.join("installs-fail"), "").expect("a flag");
     }
     if setup.readable_outputs {
-        let folder = root.join("artefacts/pairing-device-android");
+        let folder = root.join("scratch/artefacts/pairing-device-android");
         fs::create_dir_all(&folder).expect("a directory");
         fs::write(folder.join("earlier.log"), "an earlier run\n").expect("a log");
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).expect("readable");
@@ -639,7 +639,10 @@ fn run_with(
         .env("HOME", root.join("home"))
         .env("TMPDIR", root.join("scratch"))
         .env("ANDROID_HOME", &sdk)
-        .env("KR_TEST_ARTIFACTS_DIR", root.join("artefacts"))
+        // Inside the temporary folder the run was given: the scripts refuse an evidence folder that
+        // is outside every temporary root, and under `env_clear` this folder is the only root a Mac
+        // run has besides `/tmp`.
+        .env("KR_TEST_ARTIFACTS_DIR", root.join("scratch/artefacts"))
         .env("KR_MOBILE_SCREENSHOT_DIR", root.join("scratch"))
         .env("KR_PAIRING_SHOTS", root.join("shots"))
         // A port nothing answers on, so that a machine that has an emulator's controller up does not
@@ -1004,7 +1007,7 @@ fn the_pairing_runs_output_is_for_its_owner_alone() {
     );
     let mut problems = Vec::new();
     let mut files = 0;
-    for folder in ["artefacts/pairing-device-android", "shots"] {
+    for folder in ["scratch/artefacts/pairing-device-android", "shots"] {
         let mut pending = vec![run.directory.path().join(folder)];
         while let Some(path) = pending.pop() {
             let mode = fs::metadata(&path)

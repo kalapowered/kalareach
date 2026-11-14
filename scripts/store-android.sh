@@ -242,8 +242,7 @@ if [ "$mode" = device ]; then
     # control for the platform verifier (it carries no credential).
     say "running the release TLS check on the store-signed package"
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(kr_store_cargo_target "$here")}"
-    KR_TEST_ARTIFACTS_DIR="$leg/e2e" KR_RELEASE_APK="$apk" bash "$here/scripts/e2e-android-release.sh" \
-        >"$leg/e2e-release.log" 2>&1
+    kr_store_release_tls "$here" "$apk" "$leg"
     e2e=$?
     grep -E '^== \[release-tls\]' "$leg/e2e-release.log" | tee -a "$log"
     if [ "$e2e" = 0 ]; then say "check=the release TLS check passed on the store-signed package ok=1"
