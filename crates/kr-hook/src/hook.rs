@@ -1125,6 +1125,28 @@ mod tests {
         }
     }
 
+    /// A run whose worker is silent is through inside the one-second timeout a session ending is
+    /// given, by the run's own clock: the longest it waits is its deadline, what its claim waits for
+    /// a replacement that is being started (on Unix, where a hook can be started in place of
+    /// another), and the allowance after its answer. The clock is made, so how fast the machine is
+    /// does not enter.
+    #[test]
+    fn a_run_whose_worker_is_silent_is_through_inside_the_session_end_timeout_on_its_own_clock() {
+        #[cfg(unix)]
+        let claim = crate::helper::CLAIM_WAIT;
+        #[cfg(not(unix))]
+        let claim = Duration::ZERO;
+        for write in [Write::Stalls, Write::Finishes] {
+            let ran = on_made_clock(Work::NeverAnswers, write, claim);
+            assert_held_to_its_bound(&ran, Work::NeverAnswers, write);
+            assert!(
+                ran.ended < SESSION_END_TIMEOUT,
+                "the run was through at {:?}, past the {SESSION_END_TIMEOUT:?} timeout",
+                ran.ended
+            );
+        }
+    }
+
     /// A run whose work failed says why, with how long it had run when its answer was written.
     #[test]
     fn a_run_whose_work_failed_says_why_and_when_it_answered() {
