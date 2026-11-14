@@ -630,6 +630,9 @@ struct RecordingWriter {
 #[cfg(feature = "testing")]
 impl std::io::Write for RecordingWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.log.is_failing() {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
         let written = self.inner.write(bytes)?;
         self.log.record(&bytes[..written]);
         Ok(written)
@@ -681,9 +684,8 @@ struct Sink {
     wake: Arc<Notify>,
     /// What tells the supervision that a process this session owns can have appeared.
     activity: Arc<crate::lifecycle::Activity>,
-    /// What the worker holds for the terminal, to which a batch that no writer will take is given
-    /// back.
-    room: Arc<crate::input_room::InputRoom>,
+    /// What settles a batch that no writer will take.
+    unwritten: Unwritten,
 }
 
 impl Sink {
@@ -696,10 +698,10 @@ impl Sink {
     fn send(&self, batches: Vec<InputBatch>) {
         let sent = !batches.is_empty();
         for batch in batches {
-            // A writer that has ended takes nothing more. What it cannot take is given back to the
-            // room here, as the writer gives back a batch it drops.
+            // A writer that has ended takes nothing more. What it cannot take is given back here,
+            // as the writer gives back a batch it drops.
             if let Err(unsent) = self.input.send(batch) {
-                drop(self.room.owed_for(&unsent.0));
+                self.unwritten.give_back(&unsent.0);
             }
         }
         // A new held prefix needs the timer to look again, and the permit has to survive the
@@ -723,18 +725,40 @@ impl Sink {
     }
 }
 
-/// Gives back to `room` the places of every batch still waiting in `receiver`, which no writer
-/// will write now.
+/// What settles a batch that no writer will write: the places it was charged in the room, and, for
+/// one of the host's own answers, the count of answers that did not reach the application.
+#[derive(Clone, Debug)]
+struct Unwritten {
+    room: Arc<crate::input_room::InputRoom>,
+    /// The bytes of answers queued for the terminal and neither written nor dropped.
+    unwritten_replies: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many answers the writer has dropped.
+    dropped_replies: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Unwritten {
+    /// Settles `batch`, which no writer will write, as the writer settles one it drops.
+    fn give_back(&self, batch: &InputBatch) {
+        use std::sync::atomic::Ordering;
+
+        if matches!(batch, InputBatch::Reply { .. }) {
+            // Counted before the room goes back, as the writer does: a reader of the counts that
+            // sees nothing owed has to see the drop that settled it.
+            self.dropped_replies.fetch_add(1, Ordering::AcqRel);
+            release(&self.unwritten_replies, batch.len());
+        }
+        drop(self.room.owed_for(batch));
+    }
+}
+
+/// Settles every batch still waiting in `receiver`, which no writer will write now.
 ///
 /// The channel is closed first: a batch sent after this finds nobody to take it, and the sender
 /// gives it back itself.
-fn give_back_unwritten(
-    receiver: &mut mpsc::UnboundedReceiver<InputBatch>,
-    room: &Arc<crate::input_room::InputRoom>,
-) {
+fn give_back_unwritten(receiver: &mut mpsc::UnboundedReceiver<InputBatch>, unwritten: &Unwritten) {
     receiver.close();
     while let Ok(batch) = receiver.try_recv() {
-        drop(room.owed_for(&batch));
+        unwritten.give_back(&batch);
     }
 }
 
@@ -910,11 +934,16 @@ impl SessionRuntime {
         let observing = Arc::new(tokio::sync::Mutex::new(()));
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
+        let unwritten = Unwritten {
+            room: Arc::clone(&room),
+            unwritten_replies: Arc::clone(&unwritten_replies),
+            dropped_replies: Arc::clone(&dropped_replies),
+        };
         let sink = Sink {
             input: input_sender,
             wake,
             activity: Arc::clone(&activity),
-            room: Arc::clone(&room),
+            unwritten: unwritten.clone(),
         };
 
         // The read loop runs on its own thread. The terminal answers a read with nothing to read
@@ -997,6 +1026,7 @@ impl SessionRuntime {
         let writer_fence = Arc::clone(&fence);
         let writer_gate = Arc::clone(&gate);
         let writer_room = Arc::clone(&room);
+        let writer_unwritten = unwritten;
         let writer_dropped_replies = Arc::clone(&dropped_replies);
         let writer_unwritten_replies = Arc::clone(&unwritten_replies);
         let writer_lease = Arc::clone(&queued_lease);
@@ -1214,7 +1244,7 @@ impl SessionRuntime {
             }
             // The terminal will take nothing more, so what is still waiting in the channel is never
             // written. Its places in the room go back as the writer gives back a batch it drops.
-            give_back_unwritten(&mut input_receiver, &writer_room);
+            give_back_unwritten(&mut input_receiver, &writer_unwritten);
         });
 
         let mut runtime = Self {
@@ -2795,17 +2825,25 @@ mod tests {
     }
 
     /// A writer that ends leaves batches in its channel that nothing will write. The room they were
-    /// charged is given back, and so is the room of a batch handed over after the writer has gone.
+    /// charged is given back, and so is the room of a batch handed over after the writer has gone;
+    /// an answer among them is counted as dropped and no longer owed to the application.
     #[test]
     fn a_writer_that_ends_gives_back_the_room_of_what_it_leaves_unwritten() {
+        use std::sync::atomic::Ordering;
+
         let room = std::sync::Arc::new(crate::input_room::InputRoom::default());
+        let unwritten = super::Unwritten {
+            room: std::sync::Arc::clone(&room),
+            unwritten_replies: std::sync::Arc::default(),
+            dropped_replies: std::sync::Arc::default(),
+        };
         let (sender, mut receiver) =
             tokio::sync::mpsc::unbounded_channel::<crate::session::InputBatch>();
         let sink = super::Sink {
             input: sender,
             wake: std::sync::Arc::default(),
             activity: crate::lifecycle::Activity::new(),
-            room: std::sync::Arc::clone(&room),
+            unwritten: unwritten.clone(),
         };
         let reply = |bytes: &[u8]| crate::session::InputBatch::Reply {
             bytes: bytes.to_vec(),
@@ -2813,14 +2851,19 @@ mod tests {
         };
         let queue = |batch: crate::session::InputBatch| {
             room.charge(&batch);
+            unwritten
+                .unwritten_replies
+                .fetch_add(batch.len(), Ordering::AcqRel);
             batch
         };
         sink.send(vec![queue(reply(b"one")), queue(reply(b"two"))]);
         assert_eq!(room.held().frames, 2, "two batches wait for a writer");
 
-        super::give_back_unwritten(&mut receiver, &room);
+        super::give_back_unwritten(&mut receiver, &unwritten);
         assert_eq!(room.held(), crate::input_room::Cost::default());
         assert_eq!(room.held_replies(), 0);
+        assert_eq!(unwritten.unwritten_replies.load(Ordering::Acquire), 0);
+        assert_eq!(unwritten.dropped_replies.load(Ordering::Acquire), 2);
 
         sink.send(vec![queue(reply(b"late"))]);
         assert_eq!(
@@ -2828,6 +2871,8 @@ mod tests {
             crate::input_room::Cost::default(),
             "a batch sent to a writer that has gone is given back by the sender"
         );
+        assert_eq!(unwritten.unwritten_replies.load(Ordering::Acquire), 0);
+        assert_eq!(unwritten.dropped_replies.load(Ordering::Acquire), 3);
     }
 
     /// A session of a program that echoes what it is given, on the internal disk.

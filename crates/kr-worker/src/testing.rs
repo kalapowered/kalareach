@@ -567,6 +567,8 @@ pub struct TerminalWrite {
 pub struct TerminalWrites {
     log: std::sync::Mutex<Vec<TerminalWrite>>,
     of_a_lease: std::sync::atomic::AtomicBool,
+    /// Whether the terminal refuses every write, as a pseudo-terminal does whose other end is gone.
+    failing: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "testing")]
@@ -575,6 +577,18 @@ impl TerminalWrites {
     pub(crate) fn of_a_lease(&self, yes: bool) {
         self.of_a_lease
             .store(yes, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Makes every write from now on fail, which is how a test ends the terminal's writer on a
+    /// platform whose pseudo-terminal would still take the bytes.
+    pub(crate) fn fail_from_now_on(&self) {
+        self.failing
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Returns whether the terminal refuses writes.
+    pub(crate) fn is_failing(&self) -> bool {
+        self.failing.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Keeps one write.
