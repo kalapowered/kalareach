@@ -138,8 +138,13 @@ async fn a_first_close_a_worker_answers_is_not_shown_when_a_fence_lands_after_it
 }
 
 /// KR-REQ-09.09: the answer a duplicate close is given from the closure record, when the session is
-/// no longer in the directory, is told while no fence is owed; a fence this host comes to owe after
-/// the record was read and before the answer is told keeps it from the caller.
+/// no longer in the directory, is a copy: it is told while no fence is owed and the connection's
+/// registration is the one the request was admitted under. A fence this host comes to owe after the
+/// record was read and before the answer is told keeps it from the caller, and so does another
+/// device's withdrawal that completes there, which leaves the connection standing with no fence
+/// owed and stamps its registration with a newer revision (a result of this route is withheld under
+/// a fence whatever its label, so only the restamp tells a copy from a first answer). The repeat
+/// on the same connection is admitted under the new revision and answered from the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_duplicate_close_answered_from_the_closure_record_is_not_shown_when_a_fence_lands_after_it()
  {
@@ -181,6 +186,30 @@ async fn a_duplicate_close_answered_from_the_closure_record_is_not_shown_when_a_
     )
     .await;
     assert!(is_not_shown(&told), "the answer is not shown: {told:?}");
+    let told = close_told(
+        &controller,
+        &who,
+        window,
+        &world::close_request(environment_id, closed),
+        Between::AnotherDevicesWithdrawal,
+    )
+    .await;
+    assert!(
+        is_not_shown(&told),
+        "a copy is not told under another revision than its request was admitted under: {told:?}"
+    );
+    let told = close_told(
+        &controller,
+        &who,
+        window,
+        &world::close_request(environment_id, closed),
+        Between::Nothing,
+    )
+    .await;
+    assert!(
+        refusal(&told).is_none(),
+        "the repeat is admitted under the new revision and answered: {told:?}"
+    );
     serving.abort();
 }
 
