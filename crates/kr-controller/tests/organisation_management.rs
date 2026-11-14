@@ -1140,8 +1140,10 @@ async fn a_lease_presented_across_another_devices_revocation_is_not_shown_and_it
 /// answered, or the host's own withdrawal of every connection (`revoke_authority`, which raises its
 /// own barrier). Each leaves the lease installed; the same lease presented again, on a connection
 /// under the authority now in force, is answered as the first presentation was. The case does not
-/// make a lease that ends sooner publish a debt of its own, so the debt pass's barrier for a
-/// request's own debt (plan row 17) is held by the barrier-level cases and not by this one.
+/// make a lease that ends sooner publish a debt of its own, so it does not reach the debt pass's
+/// barrier for a request's own debt, and no case joins that debt pass to this route: the
+/// barrier-level cases hold the barrier alone, and the withdrawn connection that the debt pass
+/// leaves is held by the service-level case of the route's refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_presented_while_a_fence_is_owed_or_the_host_withdraws_is_not_shown_and_is_answered_again()
  {

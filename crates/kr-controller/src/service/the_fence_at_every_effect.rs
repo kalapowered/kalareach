@@ -3638,8 +3638,8 @@ async fn the_refusal_from_a_stored_subject_is_not_shown_when_a_fence_lands_after
 /// KR-REQ-09.09: a repeat of `account.sign_out` is answered from the claim the first attempt left.
 /// The method takes no admission into the service, so the door's entry check is all that stands
 /// before the lookup, and a fence this host comes to owe at the lookup, after that check, is what
-/// the service's own check of the recorded answer meets: the repeat is not shown. The control: with no fence the repeat is
-/// given the first attempt's answer, and is again once the fence is gone.
+/// the service's own check of the recorded answer meets: the repeat is not shown. The control: with
+/// no fence the repeat is given the first attempt's answer, and is again once the fence is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sign_out_answered_from_its_claim_is_not_shown_when_a_fence_lands_at_the_lookup() {
     use super::a_recorded_answer_another_copy_wrote::answered_after_a_fence_lands_at_the_check;

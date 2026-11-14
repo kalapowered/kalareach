@@ -9536,6 +9536,10 @@ async fn an_automation_run_is_not_shown_when_a_fence_lands_after_the_route_answe
     host.controller.hold_fence(false);
     let told = failure(told.expect("the call reaches the daemon"));
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        told.message.contains("may have been carried out"),
+        "what is told is that what became of the action is not shown: {told:?}"
+    );
 
     let run: WorkflowRunResult = typed(
         &control
