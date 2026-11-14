@@ -333,8 +333,9 @@ impl RemoteConnection {
     pub async fn release(&self) {
         // The terminal-input streams of this connection stand on this link, and end with it by
         // whichever path it is released: the connection's end, a grant's end, a refusal that the
-        // authority feed puts on the connection (which leaves the connection standing), or the
-        // relay's end.
+        // authority feed puts on the connection, or the relay's end. The connection's own end
+        // follows a release by the loss of the link it waits for, and a stream does not wait for
+        // that end.
         self.inputs.before_the_revoke().await;
         self.inputs.revoke_connection(self.connection_id());
         if let Some(proxy) = self.proxy.lock().await.take() {
@@ -373,12 +374,20 @@ impl RemoteConnection {
         let lost = self.lost.notified();
         tokio::pin!(lost);
         lost.as_mut().enable();
-        let held = self.proxy.lock().await.as_ref().map(Arc::clone);
+        // The flag is read under the lock the link is installed under, so a link that is being
+        // opened is not read as no link with the flag already set.
+        let (held, had_a_link) = {
+            let link = self.proxy.lock().await;
+            (
+                link.as_ref().map(Arc::clone),
+                self.had_a_link.load(std::sync::atomic::Ordering::Acquire),
+            )
+        };
         match held {
             Some(proxy) => proxy.lost().await,
             // A link that was released is lost, and the notification it gave went out before this
             // wait was made.
-            None if self.had_a_link.load(std::sync::atomic::Ordering::Acquire) => {}
+            None if had_a_link => {}
             // Nothing to lose yet. Waiting for the notification the first link will send is what
             // keeps a connection that has not attached from ending itself.
             None => lost.await,

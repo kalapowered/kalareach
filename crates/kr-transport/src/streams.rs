@@ -341,7 +341,8 @@ impl DataReader {
     /// # Errors
     ///
     /// As [`DataReader::read_message`]; a reset that arrives while there is no room is the error
-    /// a read of the reset stream gives, with the peer's code.
+    /// a read of the reset stream gives, with the peer's code, and so is the loss of the
+    /// connection.
     pub async fn read_message_when<T: kr_protocol::wire::WireMessage>(
         &mut self,
         room: &mut tokio::sync::watch::Receiver<bool>,

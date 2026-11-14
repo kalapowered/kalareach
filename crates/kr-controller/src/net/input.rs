@@ -78,8 +78,9 @@ const CLIENT_WINDOW_BYTES: u64 = 512 * 1024;
 const FRAME_DEADLINE: Duration = CALL_TIMEOUT;
 
 /// How many frames the host keeps read and not yet routed: the one that waits for the worker's
-/// credit, and one more, read so that a device that ends or resets its stream while nothing is
-/// credited is heard. A frame's decision and its deadline are taken when it is routed, not when it
+/// credit, and one more, read so that a device that finishes its stream while nothing is credited
+/// is heard (a reset is heard whatever the room, by the transport's own watch for it). A frame's
+/// decision and its deadline are taken when it is routed, not when it
 /// is read, and from then on its deadline is not renewed while it waits for the lane's writer or
 /// for room in the socket: the decision a frame goes out on is the newest one.
 const READ_AHEAD_FRAMES: usize = 2;
@@ -255,17 +256,20 @@ impl InputStreams {
         }
     }
 
-    /// Tells the streams that serve `attachment`, of every connection, that it was detached. The
-    /// attachment is gone for all of them, so each ends; it is called for a detach that took effect
-    /// or may have, and for no other. Each
-    /// stream waits [`DETACH_NOTICE_WAIT`] for the worker's notice that the lease ended, if the view
-    /// held it and none came yet, writes it to the device, and ends.
-    pub(super) fn detached(&self, attachment: AttachmentId) {
+    /// Tells the stream that serves `attachment` of `connection` that the connection detached it. It
+    /// is called for a detach that took effect or may have, and for no other. The stream waits
+    /// [`DETACH_NOTICE_WAIT`] for the worker's notice that the lease ended, if the view held it and
+    /// none came yet, writes it to the device, and ends. Only the connection that asked is reached:
+    /// a worker detaches only attachments of the link that asks, so no other connection's stream
+    /// stands on an attachment this call can remove.
+    pub(super) fn detached(&self, connection: ConnectionId, attachment: AttachmentId) {
         self.stages.detach_told();
         let streams: Vec<Arc<Live>> = self
             .live()
             .iter()
-            .filter(|((_, held), _)| *held == attachment)
+            .filter(|((held_connection, held), _)| {
+                *held_connection == connection && *held == attachment
+            })
             .map(|(_, live)| Arc::clone(live))
             .collect();
         for stream in streams {
