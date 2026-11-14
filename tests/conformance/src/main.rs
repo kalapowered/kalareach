@@ -235,6 +235,10 @@ fn run(
             eprintln!("kr-conformance: refused: {problem}");
             return ExitCode::from(2);
         }
+        Err(Stopped::PrivateCopy(problem)) => {
+            eprintln!("kr-conformance: no step was run: {problem}");
+            return ExitCode::from(1);
+        }
     };
     let path = report::result_path(&evidence);
     let written = serde_json::to_string_pretty(&document)
