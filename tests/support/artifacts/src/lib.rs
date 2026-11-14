@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(text.as_bytes()[1], b':', "{text}");
         let extended = PathBuf::from(format!(r"\\?\{text}\evidence"));
         assert_eq!(
-            confine_in(&extended, &[real.clone()]).expect("inside"),
+            confine_in(&extended, std::slice::from_ref(&real)).expect("inside"),
             real.join("evidence")
         );
     }
