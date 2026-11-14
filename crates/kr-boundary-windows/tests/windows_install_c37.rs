@@ -440,10 +440,10 @@ impl Drop for ParentMadeByHand {
 }
 
 /// Makes the program directory's parent by hand, as an administrator makes a folder in
-/// `Program Files`, and prints its owner and its list. The Administrators group owns it: that is
-/// what an elevated administrator's folder gets where the token's default owner is the group. A
-/// token whose default owner is its own account makes a folder that the installer refuses, which
-/// is not what these cases observe.
+/// `Program Files`, and prints its owner and its list. The Administrators group owns it and only
+/// the system and that group change its list: that is what an elevated administrator's folder gets
+/// where the token's default owner is the group. A token whose default owner is its own account
+/// makes a folder that the installer refuses, which is not what these cases observe.
 fn make_the_program_parent_by_hand(paths: &Paths) -> ParentMadeByHand {
     let parent = paths
         .program
@@ -452,12 +452,26 @@ fn make_the_program_parent_by_hand(paths: &Paths) -> ParentMadeByHand {
         .to_owned();
     assert!(!parent.exists(), "the program directory's parent is there");
     std::fs::create_dir(&parent).unwrap();
-    let owned = Command::new("icacls")
-        .arg(&parent)
-        .args(["/setowner", "*S-1-5-32-544"])
-        .output()
-        .unwrap();
-    assert!(owned.status.success(), "{owned:?}");
+    // The owner, then a list that only the system and the Administrators group can change: a
+    // token whose default owner is its own account also leaves an entry for that account in the
+    // list that the folder inherits at its creation.
+    for arguments in [
+        &["/setowner", "*S-1-5-32-544"][..],
+        &["/inheritance:r"][..],
+        &[
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "*S-1-5-32-545:(OI)(CI)RX",
+        ][..],
+    ] {
+        let done = Command::new("icacls")
+            .arg(&parent)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{done:?}");
+    }
     let owner = Command::new("powershell")
         .args(["-NoProfile", "-Command"])
         .arg(format!(
