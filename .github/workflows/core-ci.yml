@@ -578,9 +578,12 @@ jobs:
       # disk. The script holds their digests and refuses other bytes, whatever the cache held. The
       # action then closes the route to the host for the rest of the job. It comes before the cargo
       # caches below because their key reads the directory's name, which holds the digests: a cache
-      # built with other archive bytes is not restored.
+      # built with other archive bytes is not restored. The step runs after an earlier failure too:
+      # the steps below that name `!cancelled()` still run cargo, and the action closes the route
+      # to the host for them.
       - name: Place libsodium's archives
         id: libsodium
+        if: ${{ !cancelled() }}
         uses: ./.github/actions/libsodium-archive
 
       - name: Restore the cargo cache

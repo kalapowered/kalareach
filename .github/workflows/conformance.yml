@@ -513,8 +513,10 @@ jobs:
       # middle of the compile. It comes after the steps the report needs whatever happens, so that
       # a failure here leaves them in place, and before the steps that can fail the build of the
       # test components, so that the report, which runs after such a failure, still finds the
-      # files and does not download them in its compile.
+      # files and does not download them in its compile. The step runs after an earlier failure
+      # too, so that the action closes the route to the host for those steps.
       - name: Place libsodium's archives
+        if: ${{ !cancelled() }}
         timeout-minutes: 15
         uses: ./.github/actions/libsodium-archive
 
