@@ -229,7 +229,7 @@ async fn the_keys_go_only_to_a_controller_that_produces_the_negotiated_protocol(
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// KR-REQ-08.60: `modifyOtherKeys` is a level, so the comparison is against the level in force.
@@ -267,7 +267,7 @@ async fn a_modifier_encoding_is_compared_at_the_level_the_application_asked_for(
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// KR-REQ-08.60: a Windows console, which declares a profile of its own, takes the keys while the
@@ -316,7 +316,7 @@ async fn a_windows_console_takes_the_keys_under_the_ordinary_encoding_and_under_
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -367,7 +367,7 @@ async fn turning_an_enhanced_protocol_on_takes_the_keys_from_a_terminal_that_can
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// KR-REQ-08.61: enhanced back to legacy leaves an encoding that terminal does produce.
@@ -404,7 +404,7 @@ async fn turning_it_off_again_lets_that_terminal_take_the_keys_back() {
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// KR-REQ-08.61: a holder that can produce both keeps the keys across every change.
@@ -448,7 +448,7 @@ async fn a_controller_that_produces_both_keeps_the_keys_across_the_change() {
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// The negotiations the companion's raw terminal view is to take the keys under: each with the
@@ -502,7 +502,7 @@ async fn the_companions_view_takes_the_keys_over_each_encoding_it_supplies() {
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// KR-REQ-08.60: the companion's view is refused what it does not produce, with the code a view
@@ -542,7 +542,7 @@ async fn the_companions_view_is_refused_an_encoding_it_does_not_produce() {
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// KR-REQ-08.61: the companion's view keeps the keys across a change between encodings it
@@ -610,7 +610,7 @@ async fn a_change_the_companions_view_cannot_follow_ends_its_lease() {
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -663,7 +663,7 @@ async fn a_takeover_is_immediate_and_the_previous_epoch_is_invalid_at_once() {
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// A prompt that can be answered twice, so a test can tell "answered once" from "cannot answer".
@@ -785,11 +785,6 @@ async fn a_takeover_ends_the_other_lease_and_the_approval_executes_once() {
 
     drop(first);
     drop(second);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -836,7 +831,7 @@ async fn a_write_without_the_lease_is_refused_and_never_acquires_it() {
         )
         .expect("starts"),
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 }
 
 /// KR-REQ-08.63: a network client cannot assert that it is local.
@@ -961,11 +956,6 @@ async fn a_forwarded_caller_claiming_a_network_ingress_is_refused_the_lease() {
 
     drop(local);
     drop(daemon);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-08.60, KR-REQ-23.36: the encoder check refuses over the wire, with its own code.
@@ -1013,11 +1003,6 @@ async fn an_incompatible_controller_is_refused_the_lease_over_the_wire() {
         .expect("a terminal that implements the protocol");
 
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-08.61, KR-REQ-08.64: a lease the host ends by itself reports what it interrupted.
@@ -1046,6 +1031,7 @@ async fn a_lease_the_host_ends_reports_its_interrupted_input_to_the_next_holder(
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     {
@@ -1102,8 +1088,6 @@ async fn a_lease_the_host_ends_reports_its_interrupted_input_to_the_next_holder(
         kr_worker::session::Interrupted::default(),
         "reported once, not once per acquire"
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1144,6 +1128,7 @@ async fn with_no_paste_mode_on() -> (
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plain_escape_is_not_held_when_the_mode_is_off_and_no_paste_is_open() {
     let (_host, runtime, id, epoch) = with_no_paste_mode_on().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     let accepted = {
         let mut session = runtime.session();
@@ -1156,8 +1141,6 @@ async fn a_plain_escape_is_not_held_when_the_mode_is_off_and_no_paste_is_open() 
         "nothing is held: the mode is off and no paste is open"
     );
     assert_eq!(accepted.forwarded_bytes, 1);
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// KR-REQ-08.64: and the Escape reaches the application at once.
@@ -1168,6 +1151,7 @@ async fn a_plain_escape_is_not_held_when_the_mode_is_off_and_no_paste_is_open() 
 )]
 async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
     let (_host, runtime, id, epoch) = with_no_paste_mode_on().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     runtime
         .session()
@@ -1179,8 +1163,6 @@ async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
         contains(&seen, b"kr-ready.\x1b"),
         "and it arrived at once: {seen:?}"
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// KR-REQ-08.64, KR-PERF-002: a delimiter split across frames is recognised once, payload kept.
@@ -1210,6 +1192,7 @@ async fn a_delimiter_split_across_frames_reaches_the_application_once_with_its_p
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     // Four bytes of the start delimiter, then the rest with its payload behind it.
@@ -1243,8 +1226,6 @@ async fn a_delimiter_split_across_frames_reaches_the_application_once_with_its_p
         contains(&seen, b"\x1b[200~pasted\x1b[201~"),
         "with the payload it arrived with, in order: {seen:?}"
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// KR-REQ-08.64: a paste open at a takeover is closed before the new lease's first byte.
@@ -1280,6 +1261,7 @@ async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_ne
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     {
@@ -1349,8 +1331,6 @@ async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_ne
         1,
         "closed once, not once per attempt"
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// KR-REQ-08.64: an incomplete delimiter is discarded on source loss and the loss is reported.
@@ -1381,6 +1361,7 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     {
@@ -1455,8 +1436,6 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
         4,
         "reported to whoever takes the keys next"
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1488,6 +1467,7 @@ async fn focus_scrollback_replies_and_an_idle_window_never_seize_the_lease() {
         )
         .expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     // An idle window opens. It observes and it takes nothing.
@@ -1527,8 +1507,6 @@ async fn focus_scrollback_replies_and_an_idle_window_never_seize_the_lease() {
         assert_eq!(session.lease().epoch.get(), epoch);
         assert_eq!(session.lease().holder.as_ref(), Some(&holder));
     }
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1650,11 +1628,6 @@ async fn nothing_journals_a_keystroke_and_reaching_the_terminal_is_not_an_effect
     drop(session);
 
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1671,6 +1644,10 @@ struct Wired {
     controller: Arc<ControllerIdentity>,
     /// The boot identity a generation token is signed over.
     boot: kr_protocol::identity::BootIdentity,
+    // These end the serving task and ask for the session's close when the fixture is dropped,
+    // whether or not a case closed it.
+    _serving: kr_ipc::testing::Serving,
+    _closing: kr_worker::testing::ClosedOnDrop,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -1752,8 +1729,11 @@ async fn wired_for(script: &str, backend: Option<kr_term::policy::Backend>) -> W
         )
         .expect("a worker service"),
     );
-    tokio::spawn(Arc::clone(&service).serve(listener));
+    let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
+    let closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     Wired {
+        _serving: serving,
+        _closing: closing,
         _temp: temp,
         service,
         runtime,
@@ -2069,11 +2049,6 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
     );
 
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-23.36: an attachment without the input capability cannot type, whatever it holds.
@@ -2138,11 +2113,6 @@ async fn an_attachment_without_the_input_capability_cannot_write() {
     );
 
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-08.65: a frame that is not this connection's business is refused rather than ignored.
@@ -2246,11 +2216,6 @@ async fn an_idle_connection_that_never_acquires_leaves_the_lease_where_it_was() 
 
     drop(holder);
     drop(idle);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2289,6 +2254,7 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
     let runtime = Arc::new(
         SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
     let deadline = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 1_000;
 
@@ -2354,8 +2320,6 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
         "and so is the lease's share of it"
     );
     drop(session);
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// The device-status question an application asks, and the answer the host owes it.
@@ -2407,6 +2371,7 @@ async fn echoing_session() -> (
 #[tokio::test(flavor = "multi_thread")]
 async fn a_takeover_stops_the_keystrokes_waiting_for_the_terminal_and_not_the_hosts_answer() {
     let (_host, runtime, _clock, session_id, holder, epoch) = echoing_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     let (taker, taken_epoch) = {
         let mut session = runtime.session();
@@ -2442,8 +2407,6 @@ async fn a_takeover_stops_the_keystrokes_waiting_for_the_terminal_and_not_the_ho
         "the keystrokes of the lease that was taken reached the application: {:?}",
         String::from_utf8_lossy(&seen)
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// KR-REQ-08.48: authority that ends while a batch waits for the terminal ends the keystrokes
@@ -2456,6 +2419,7 @@ async fn a_takeover_stops_the_keystrokes_waiting_for_the_terminal_and_not_the_ho
 #[tokio::test(flavor = "multi_thread")]
 async fn authority_that_ends_while_a_batch_waits_stops_the_keystrokes_and_not_the_hosts_answer() {
     let (_host, runtime, clock, _session_id, holder, epoch) = echoing_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
 
     {
         let mut session = runtime.session();
@@ -2494,8 +2458,6 @@ async fn authority_that_ends_while_a_batch_waits_stops_the_keystrokes_and_not_th
         "keystrokes written after the grant's end reached the application: {:?}",
         String::from_utf8_lossy(&seen)
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// KR-REQ-08.62 and KR-REQ-08.64, in part.
@@ -2524,6 +2486,7 @@ async fn a_discarded_prefix_takes_its_authority_deadline_with_it() {
     let runtime = Arc::new(
         SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
     let deadline = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 1_000;
 
@@ -2557,8 +2520,6 @@ async fn a_discarded_prefix_takes_its_authority_deadline_with_it() {
         "the next holder's input is not fenced by a deadline the previous holder's prefix \
          carried: {seen:?}"
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// KR-REQ-08.64, in part.
@@ -2590,6 +2551,7 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
     let runtime = Arc::new(
         SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
     let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
     let early = now + 1_000;
@@ -2630,8 +2592,6 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
         !contains(&seen, PASTE_START),
         "and the delimiter the first write's authority admitted is not: {seen:?}"
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2707,11 +2667,6 @@ async fn a_prefix_waits_for_its_deadline_from_the_write_whatever_held_the_sessio
     );
 
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-PERF-002: a lone Escape reaches the application at its deadline while the worker is reading
@@ -2775,11 +2730,6 @@ async fn a_lone_escape_is_forwarded_at_its_deadline_while_the_session_s_processe
     resume.send(()).expect("lets the observation go");
     watchdog.join().expect("the watchdog ends");
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// A root program that keeps what it reads in `received` as well as echoing it, with bracketed
@@ -2920,11 +2870,6 @@ async fn a_lone_escape_reaches_the_application_while_the_session_s_output_is_wai
     resume.send(()).expect("lets the write go");
     watchdog.join().expect("the watchdog ends");
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-PERF-002: a lone Escape reaches the application while a question's caller is being
@@ -3021,11 +2966,6 @@ async fn a_lone_escape_reaches_the_application_while_a_question_s_caller_is_bein
     watchdog.join().expect("the watchdog ends");
     let _ = asking.await;
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-11.63: an answer to a question is never inserted into the session's terminal.
@@ -3153,11 +3093,6 @@ async fn an_answer_to_a_question_is_never_inserted_into_the_terminal() {
 
     drop(client);
     drop(owner);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3297,11 +3232,6 @@ async fn a_run_of_the_disclosed_checks_sends_nothing_to_the_sessions_terminal() 
 
     drop(daemon);
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3418,11 +3348,6 @@ async fn output_is_readable_from_the_session_while_it_is_waiting_on_the_disk() {
     resume.send(()).expect("lets the write go");
     watchdog.join().expect("the watchdog ends");
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// What a held prefix's path records: each acquisition of the session with the instants it began
@@ -3527,11 +3452,6 @@ async fn the_recorder_keeps_each_acquisition_on_a_held_prefix_s_path() {
     );
 
     drop(client);
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-07.13: a process the session started is recorded by an observation made with the session
@@ -3583,12 +3503,6 @@ async fn a_process_the_session_started_is_recorded_by_an_observation_made_with_t
     })
     .await
     .expect("the process the shell started was recorded");
-
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-07.13: a closure goes on once the observation of the session's processes that was under
@@ -3813,11 +3727,7 @@ impl Rig {
     async fn close(self) {
         let Self { client, wired, .. } = self;
         drop(client);
-        wired
-            .runtime
-            .close(ClosureReason::CloseRequested)
-            .1
-            .release();
+        drop(wired);
     }
 }
 
@@ -4925,6 +4835,11 @@ async fn a_keystroke_after_a_close_is_refused_without_waiting_for_the_session() 
         "what the recogniser held, or the refused byte, reached the application: {:?}",
         rig.received()
     );
+    // The close was asked for above: its own steps, the drain among them, end before the
+    // fixture's directory is removed.
+    tokio::time::timeout(LIVENESS_DEADLINE, rig.wired.runtime.wait_closed())
+        .await
+        .expect("the closure completed");
     rig.close().await;
 }
 
@@ -5399,11 +5314,6 @@ async fn a_client_that_goes_after_a_key_sent_behind_its_mutation_leaves_nothing_
     })
     .await
     .expect("the connection's attachment was given up");
-    wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// A paired device's attachment on the control daemon's proxy link to the worker, holding the
@@ -5718,12 +5628,6 @@ async fn a_forwarded_key_sent_after_a_forwarded_mutation_reaches_the_application
         second.outcome,
         kr_protocol::envelope::Outcome::Ok(_)
     ));
-    proxied
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5900,13 +5804,6 @@ async fn key_records_reach_the_terminal_as_legacy_input_in_the_mode_the_applicat
     typing.write(ctrl_i).await.expect("accepted");
     typing.bytes(b"kr-j.").await;
     assert_eq!(typing.received_between(b"kr-i.", b"kr-j.").await, b"\t");
-
-    typing
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-08.53: records written to a session whose backend asked for them are spelled in the
@@ -5946,13 +5843,6 @@ async fn key_records_reach_the_terminal_as_records_while_the_backend_asks_for_th
     typing.write(keys()).await.expect("accepted");
     typing.bytes(b"kr-f.").await;
     assert_eq!(typing.received_between(b"kr-e.", b"kr-f.").await, b"a");
-
-    typing
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// KR-REQ-08.53: bytes and key records on one lease are one ordered stream, and a write refused for
@@ -5995,11 +5885,4 @@ async fn bytes_and_key_records_share_one_stream_and_a_refused_write_spends_no_nu
         b"",
         "nothing of the refused write reached the terminal"
     );
-
-    typing
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
