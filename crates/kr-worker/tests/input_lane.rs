@@ -1002,7 +1002,12 @@ async fn arrived(at: std::sync::mpsc::Receiver<()>) {
 /// input domain, while the lane's parent withdraws by `how`. The withdrawal's first step has run
 /// and its detach waits for the session, which a thread of the case holds: the frame is let go
 /// between the two, so that only that first step can refuse it. It is refused and never written.
-async fn a_frame_at_the_seam_when_the_parent_goes(how: Withdrawal) {
+///
+/// Every wait of the case is inside the bound of `within`, which fails it with the step it stood at:
+/// a worker that does not take the first step leaves the window where it was and the case waiting
+/// for it.
+async fn a_frame_at_the_seam_when_the_parent_goes(how: Withdrawal, stage: Stage) {
+    stage.at("the lane to bind");
     let mut rig = Rig::start().await;
     let attachment = rig.attach().await;
     let epoch = rig.acquire(attachment).await;
@@ -1010,9 +1015,11 @@ async fn a_frame_at_the_seam_when_the_parent_goes(how: Withdrawal) {
     assert_eq!(lane.epoch, epoch);
     let (at, release) = rig.service.pause_input_before_the_session();
     lane.send(b"seam-frame").await;
+    stage.at("the frame to reach the pause before the session");
     arrived(at).await;
 
     // A thread of the case holds the session, as a commit does, until the case lets it go.
+    stage.at("a thread of the case to take the session");
     let (held, holding) = std::sync::mpsc::channel::<()>();
     let (let_go, letting_go) = std::sync::mpsc::channel::<()>();
     let commit = {
@@ -1039,12 +1046,14 @@ async fn a_frame_at_the_seam_when_the_parent_goes(how: Withdrawal) {
         rig.proxy = None;
     }
     let steps = async {
+        stage.at("the first step of the parent's withdrawal to end the lane's window");
         until(
             "the first step of the withdrawal ended the lane's window",
             WAIT,
             || rig.runtime.input().lock().ledger().reserved == Cost::default(),
         )
         .await;
+        stage.at("the held frame to be refused and the lane to end");
         release.send(()).expect("lets the frame go");
         while let Some(seen) = lane.next().await {
             if let Seen::Answer(_, outcome) = seen {
@@ -1063,6 +1072,7 @@ async fn a_frame_at_the_seam_when_the_parent_goes(how: Withdrawal) {
             let ((), _second) = tokio::join!(steps, rig.connect(2, None));
         }
     }
+    stage.at("the thread that held the session to end, and the terminal's writer to drain");
     commit.join().expect("the thread ended");
     rig.drained().await;
     assert!(
@@ -1072,6 +1082,10 @@ async fn a_frame_at_the_seam_when_the_parent_goes(how: Withdrawal) {
     rig.finish().await;
 }
 
+/// How long a seam case is given in all, which decides nothing but how long a worker that fails it
+/// takes to say so: the case itself takes about a second.
+const SEAM_BOUND: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Copy)]
 enum Withdrawal {
     ItsLinkEnds,
@@ -1079,16 +1093,23 @@ enum Withdrawal {
 }
 
 /// KR-REQ-23.36: the connection's clean-up path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_frame_held_before_the_domain_is_refused_when_the_parents_link_ends() {
-    a_frame_at_the_seam_when_the_parent_goes(Withdrawal::ItsLinkEnds).await;
+#[test]
+fn a_frame_held_before_the_domain_is_refused_when_the_parents_link_ends() {
+    within(
+        SEAM_BOUND,
+        "a frame held before the domain was not refused when its parent's link ended",
+        |stage| a_frame_at_the_seam_when_the_parent_goes(Withdrawal::ItsLinkEnds, stage),
+    );
 }
 
 /// KR-REQ-23.36: the generation fence's withdrawal.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_frame_held_before_the_domain_is_refused_when_a_replacement_generation_withdraws_the_parent()
- {
-    a_frame_at_the_seam_when_the_parent_goes(Withdrawal::AReplacementGeneration).await;
+#[test]
+fn a_frame_held_before_the_domain_is_refused_when_a_replacement_generation_withdraws_the_parent() {
+    within(
+        SEAM_BOUND,
+        "a frame held before the domain was not refused when a replacement generation withdrew its parent",
+        |stage| a_frame_at_the_seam_when_the_parent_goes(Withdrawal::AReplacementGeneration, stage),
+    );
 }
 
 /// KR-PERF-002: credit reaches the host while a commit holds the session. The writer's give-back
@@ -1355,28 +1376,51 @@ async fn a_holder_the_revision_does_not_reach_keeps_typing_on_its_lane_and_nothi
     rig.finish().await;
 }
 
-/// Runs a case that can deadlock the worker on a runtime and a thread of its own, and waits for it
-/// by `bound`. A worker whose threads wait for each other then fails the case with its say, and
-/// the test process is not held by threads that never return.
+/// Where a case that `within` runs has got to, which the words of its bound say.
+#[derive(Clone, Default)]
+struct Stage(Arc<std::sync::Mutex<&'static str>>);
+
+impl Stage {
+    /// Says what the case is about to wait for.
+    fn at(&self, step: &'static str) {
+        *self.0.lock().expect("the stage is not poisoned") = step;
+    }
+
+    fn step(&self) -> &'static str {
+        *self.0.lock().expect("the stage is not poisoned")
+    }
+}
+
+/// Runs a case on a runtime and a thread of its own, and waits for it by `bound` on the calling
+/// thread, which depends on nothing the case's runtime does. A worker whose threads wait for
+/// each other, or whose runtime stops turning its timers because threads of it are blocked,
+/// then fails the case with its say, and with the step it had reached, and the test process is
+/// not held by threads that never return.
 fn within<Fut: std::future::Future<Output = ()>>(
     bound: Duration,
     what: &str,
-    case: impl FnOnce() -> Fut + Send + 'static,
+    case: impl FnOnce(Stage) -> Fut + Send + 'static,
 ) {
     let (done, finished) = std::sync::mpsc::channel::<()>();
+    let stage = Stage::default();
+    let reached = stage.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
             .build()
             .expect("a runtime");
-        runtime.block_on(case());
+        runtime.block_on(case(stage));
         let _ = done.send(());
     });
     match finished.recv_timeout(bound) {
         Ok(()) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("{what}: the worker did not finish within {bound:?}")
+            let step = reached.step();
+            if step.is_empty() {
+                panic!("{what}: the case did not finish within {bound:?}")
+            }
+            panic!("{what}: the case did not finish within {bound:?}; it was waiting for {step}")
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: the case failed"),
     }
@@ -1391,7 +1435,7 @@ fn a_lane_bind_and_a_deferred_revision_announcement_do_not_wait_for_each_other()
     within(
         Duration::from_secs(20),
         "a lane bind and a deferred revision announcement waited for each other",
-        || async {
+        |_| async {
             let mut rig = Rig::start().await;
             let attachment = rig.attach().await;
             rig.acquire(attachment).await;
@@ -1525,12 +1569,15 @@ async fn a_lane_connection_that_sends_before_its_bind_is_written_nothing_and_is_
 }
 
 /// A frame that a bound lane refuses by its role, sent straight behind the bind, is written behind
-/// the ready frame, as everything else on the lane is.
+/// the ready frame, as everything else on the lane is. The lane's writer stands before it takes
+/// the ready frame until the refusal has been dealt with, so that the order is the case's and not
+/// the scheduler's: a refusal that the connection wrote to the link itself would be read first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_the_lane_refuses_by_its_role_comes_behind_the_ready_frame() {
     let mut rig = Rig::start().await;
     let attachment = rig.attach().await;
     rig.acquire(attachment).await;
+    let (writer_at, writer_go) = rig.service.stall_next_lane_writer();
     let mut link = rig
         .connect(1, Some(ControllerConnectionRole::ProxyInput))
         .await;
@@ -1540,7 +1587,23 @@ async fn a_frame_the_lane_refuses_by_its_role_comes_behind_the_ready_frame() {
     }))
     .await
     .expect("asks for the lane");
+    tokio::time::timeout(WAIT, writer_at)
+        .await
+        .expect("the lane's writer stood before the ready frame in time")
+        .expect("the lane's writer stood before the ready frame");
+    let queued = rig.runtime.input().lock().queued_lane_frames();
+    assert_ne!(
+        queued, 0,
+        "the ready frame is queued, and nothing has taken it"
+    );
     link.send(&a_request()).await.expect("the frame is written");
+    until(
+        "the refusal was queued on the lane behind the ready frame",
+        Duration::from_secs(20),
+        || rig.runtime.input().lock().queued_lane_frames() > queued,
+    )
+    .await;
+    writer_go.send(()).expect("lets the writer go");
     match tokio::time::timeout(WAIT, link.recv())
         .await
         .expect("the worker answers")
@@ -1643,15 +1706,28 @@ async fn five_replacements_in_a_row_leave_no_lane_behind_but_the_last() {
     .await;
     assert_eq!(rig.runtime.input().lock().lane_count(), 1);
     let mut last = hosts.pop().expect("the last lane");
-    // Its window is whole, and it types.
+    // Its window is whole, and it types: the flood's refusals stand ahead of the answer to the new
+    // frame, which has to be an acceptance, and the terminal gets the key.
     last.sequence = 0;
-    last.send(b"k").await;
-    assert_eq!(
-        last.next_event()
-            .await
-            .map(|seen| matches!(seen, Seen::Answer(..))),
-        Some(true)
-    );
+    let typed = last.send(b"k").await;
+    loop {
+        match last.next_event().await {
+            Some(Seen::Answer(id, outcome)) if id == typed => {
+                assert!(
+                    matches!(outcome, Outcome::Ok(_)),
+                    "the last lane did not take its key: {outcome:?}"
+                );
+                break;
+            }
+            Some(Seen::Answer(id, outcome)) => assert!(
+                refusal(&outcome).is_some(),
+                "a frame of the flood, {id:?}, was accepted"
+            ),
+            Some(Seen::Window(_) | Seen::Credit(_)) => {}
+            None => panic!("the last lane ended before its key was answered"),
+        }
+    }
+    rig.received_exactly(b"k").await;
     rig.finish().await;
 }
 

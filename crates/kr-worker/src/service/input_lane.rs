@@ -127,12 +127,15 @@ impl WorkerService {
     /// and then closes the link.
     ///
     /// A queue that closes ends the link within `lane_close_bound` of the close, whatever the
-    /// host reads: the write that is waiting for a host that has stopped reading is cut and the
-    /// connection withdrawn, which ends the lane's task, its registration and its window. The
+    /// host reads: when the bound has passed, the write that is waiting for the host is cut and
+    /// the connection withdrawn, which ends the lane's task, its registration and its window. The
     /// bound is five seconds, the one a closing session's acceptance is given, and it starts at
-    /// the close, never earlier: a queue that is open is never cut. A host that reads takes the
-    /// whole of a closed queue, at most 4,097 frames of a few hundred bytes, from a local socket in
-    /// far less, so the bound cuts only a link nobody is reading.
+    /// the close, never earlier: a queue that is open is never cut. What is left to write at the
+    /// close is the closed queue, at most 4,097 frames of a few hundred bytes, and any batch the
+    /// writer took before it; a host that reads at an ordinary pace takes that from a local
+    /// socket in far less. A host that reads more slowly than the bound allows loses its link
+    /// too: the bound is a timeout on the close, and it does not tell a host that reads nothing
+    /// from one that reads slowly.
     pub(super) async fn write_lane(
         self: Arc<Self>,
         queue: Arc<LaneQueue>,
@@ -143,6 +146,8 @@ impl WorkerService {
     ) {
         #[cfg(feature = "testing")]
         let _counted = Counted::begin(&self.lane_writers);
+        #[cfg(feature = "testing")]
+        self.lane_writer_stall.stand();
         let bound = self.lane_close_bound;
         let cut = async {
             queue.closed().await;
