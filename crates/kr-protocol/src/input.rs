@@ -305,8 +305,9 @@ pub const fn max_input_bytes(limit: usize) -> usize {
 /// One frame of typing on a terminal-input stream, from the client to the host.
 ///
 /// A frame is one batch: the worker accepts all of its bytes or none of them. The sequence counts
-/// frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream. The debug
+/// form shows how many bytes the frame holds and never what they are: they are what a person typed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InputFrame {
     /// The lease epoch the client holds.
@@ -315,18 +316,6 @@ pub struct InputFrame {
     pub sequence: InputSequence,
     /// The bytes to write to the terminal. They are not decoded, re-encoded or normalised.
     pub bytes: Bytes,
-}
-
-impl std::fmt::Debug for InputFrame {
-    /// How much it holds, never what: a frame carries what a person typed.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("InputFrame")
-            .field("epoch", &self.epoch)
-            .field("sequence", &self.sequence)
-            .field("len", &self.bytes.len())
-            .finish()
-    }
 }
 
 /// How much the client may have written to a terminal-input stream and not yet had accepted.
