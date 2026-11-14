@@ -3157,6 +3157,8 @@ impl WorkerService {
                                         &kr_protocol::attachment::SessionDetachParams {
                                             attachment_id: Nullable::some(attachment_id),
                                             line_token: Nullable::null(),
+                                            after_input: None,
+                                            fenced_report: false,
                                         },
                                     ) {
                                         let _ = outlet.write(&notification).await;
@@ -4357,6 +4359,16 @@ impl WorkerService {
                 ),
             );
         }
+        // This worker binds no input lane, so it refuses the role and the connection keeps none.
+        if role == ControllerConnectionRole::ProxyInput {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::UnsupportedCapability,
+                    "this worker does not serve an input lane",
+                ),
+            );
+        }
         state.facts.controller_role = role;
         ControlFrame::ControllerRole(role)
     }
@@ -4514,6 +4526,9 @@ impl WorkerService {
                             fenced.push(previous);
                         }
                     }
+                    // `declare_role` refuses this role, so no connection holds it and none can
+                    // present a token under it.
+                    ControllerConnectionRole::ProxyInput => {}
                 }
                 drop(authority);
                 // Refusing a fenced connection's next request is not enough on its own: a
@@ -5316,6 +5331,8 @@ impl WorkerService {
             ControllerConnectionRole::Checks => {
                 authority.checks_connection == Some(facts.connection_id)
             }
+            // No connection holds this role: `declare_role` refuses it.
+            ControllerConnectionRole::ProxyInput => false,
         };
         if !bound {
             return Err(WorkerError::GenerationFenced {
@@ -9860,7 +9877,13 @@ impl WorkerService {
                 let params: InputReleaseParams = parse(params)?;
                 let lease = session.release_input(params.attachment_id, params.epoch.get())?;
                 self.runtime.flush_input();
-                Ok((encode(&InputLeaseResult { lease })?, AfterEffect::None))
+                Ok((
+                    encode(&InputLeaseResult {
+                        lease,
+                        fenced_bytes: None,
+                    })?,
+                    AfterEffect::None,
+                ))
             }
             Method::InputInterrupt => {
                 let params: InputInterruptParams = parse(params)?;
@@ -9881,6 +9904,7 @@ impl WorkerService {
                 Ok((
                     encode(&InputLeaseResult {
                         lease: session.lease(),
+                        fenced_bytes: None,
                     })?,
                     AfterEffect::None,
                 ))
@@ -13744,6 +13768,8 @@ mod tests {
         let params = SessionDetachParams {
             attachment_id: Nullable::null(),
             line_token: Nullable::some("a-line-capability".to_owned()),
+            after_input: None,
+            fenced_report: false,
         };
         let mutation = MutationRequest {
             request_id: RequestId::new(1),

@@ -1026,6 +1026,12 @@ export type ControlFrame =
   | {
       desktop_checks_answer: DesktopChecksAnswer
     }
+  | {
+      input_lane: InputLane
+    }
+  | {
+      input_lane_ready: InputLaneReady
+    }
 /**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
@@ -1046,6 +1052,15 @@ export type ControlEvent =
       action_window_renewed: ActionWindow
     }
   | 'keepalive'
+  | {
+      input_window: LaneWindow
+    }
+  | {
+      input_credit: LaneCredit
+    }
+  | {
+      input_launch_reserved: LaneLaunch
+    }
 /**
  * A palette a session can be started with, chosen before the shell has produced anything.
  *
@@ -1093,7 +1108,7 @@ export type SessionRoot = 'command'
  * speaks for, and only the holder of the environment's signing key can produce that proof.
  */
 export type ControllerConnectionRole =
-  'authority' | 'proxy' | 'attention' | 'descriptions' | 'checks'
+  'authority' | 'proxy' | 'attention' | 'descriptions' | 'checks' | 'proxy_input'
 /**
  * The control daemon's answer to a [`PluginRuntimeWanted`].
  */
@@ -1690,6 +1705,62 @@ export type VoiceSessionId = string
  * One automation definition.
  */
 export type WorkflowId = string
+/**
+ * What the host writes on a terminal-input stream, back to the client.
+ *
+ * The stream ends with a reset and no frame of its own. After a refusal the host forwards no
+ * later frame of that epoch and writes no second refusal.
+ */
+export type InputAck =
+  | {
+      kind: 'ready'
+      window: InputWindow
+    }
+  | {
+      /**
+       * The epoch the frames belong to.
+       */
+      epoch: string
+      kind: 'accepted'
+      /**
+       * The last accepted sequence.
+       */
+      through: string
+    }
+  | {
+      /**
+       * The last sequence accepted before it. Null when nothing of the epoch was accepted.
+       */
+      accepted_through: InputSequence | null
+      /**
+       * The epoch of the refused frame.
+       */
+      epoch: string
+      error: ProtocolError1
+      kind: 'refused'
+      /**
+       * An increasing sequence number inside one raw input stream.
+       */
+      sequence: string
+    }
+  | {
+      kind: 'launch_reserved'
+      /**
+       * The client's number of the launch.
+       */
+      launch: number
+    }
+  | {
+      /**
+       * The epoch that ended.
+       */
+      epoch: string
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      fenced_bytes: string
+      kind: 'epoch_ended'
+    }
 /**
  * What wrote an environment's current group record.
  */
@@ -3027,8 +3098,10 @@ export interface KalaReachProtocol {
     workspace_id?: WorkspaceId
   }
   inclusion_preview?: InclusionPreview
+  input_ack?: InputAck
   input_acquire_params?: InputAcquireParams
   input_acquire_result?: InputAcquireResult
+  input_frame?: InputFrame
   input_interrupt_params?: InputInterruptParams
   input_lease_result?: InputLeaseResult
   input_lease_state?: InputLeaseState3
@@ -8223,6 +8296,86 @@ export interface Notification {
   stream_id: string
 }
 /**
+ * The lane's window for one lease epoch, an event the worker sends on a lane.
+ *
+ * It is sent when an epoch starts for the lane's attachment, with `holder` true and the window,
+ * and when the lane's attachment loses the lease, with `holder` false and `ended` set. The
+ * `epoch` is the epoch that the event speaks of: after a release that leaves no holder it is the
+ * epoch that ended.
+ */
+export interface LaneWindow {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bytes: string
+  /**
+   * Set when the lane's attachment lost the lease: which epoch ended and how much it discarded.
+   */
+  ended: LaneEnded | null
+  /**
+   * The epoch this event speaks of.
+   */
+  epoch: string
+  /**
+   * The window's frames, in the worker's unit. Nought when `holder` is false.
+   */
+  frames: number
+  /**
+   * True when the lane's attachment holds the lease at `epoch`.
+   */
+  holder: boolean
+}
+/**
+ * An epoch that ended for a lane's attachment.
+ */
+export interface LaneEnded {
+  /**
+   * The epoch that ended.
+   */
+  epoch: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  fenced_bytes: string
+}
+/**
+ * Room given back to a lane's window, an event the worker sends on a lane when it has written
+ * frames of the epoch to the terminal.
+ *
+ * A host ignores it when `epoch` is not the epoch it is serving.
+ */
+export interface LaneCredit {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bytes: string
+  /**
+   * The epoch the room belongs to.
+   */
+  epoch: string
+  /**
+   * Frames given back, in the worker's unit.
+   */
+  frames: number
+}
+/**
+ * The worker has dealt with a launch, an event the worker sends on the lane of the attachment
+ * that asked for it.
+ *
+ * It means that later typing is now ordered by the worker's own fence, or that nothing is left to
+ * order. It says nothing about the launch's result.
+ */
+export interface LaneLaunch {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * The client's number of the launch.
+   */
+  launch: number
+}
+/**
  * A worker's startup claim, signed with the key it just generated.
  */
 export interface WorkerRendezvous {
@@ -10464,6 +10617,47 @@ export interface CapabilitySubject {
    * The terminal the record is about, where it is one.
    */
   terminal: string | null
+}
+/**
+ * What the daemon says first on a connection whose role is [`ControllerConnectionRole::ProxyInput`],
+ * after the role and the generation token: which attachment this lane carries typing for.
+ *
+ * The worker binds the lane only when `proxy_connection` names a live `Proxy` connection of the
+ * same generation that owns the attachment, and refuses it otherwise.
+ */
+export interface InputLane {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * The `Proxy` connection whose binding this lane borrows: the connection id the worker gave
+   * that link.
+   */
+  proxy_connection: string
+}
+/**
+ * The worker's answer to [`InputLane`], and the first frame it writes on the lane.
+ *
+ * The lane's own frames follow it in the order the worker's ledger changed.
+ */
+export interface InputLaneReady {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bytes: string
+  /**
+   * The lease epoch at the moment of the bind.
+   */
+  epoch: string
+  /**
+   * The window's frames, in the worker's unit. Nought when the lane is not the holder's.
+   */
+  frames: number
+  /**
+   * True when the lane's attachment holds the lease at `epoch`, so the lane has a window.
+   */
+  holder: boolean
 }
 /**
  * Where the disclosed checks stand on this host.
@@ -18463,6 +18657,109 @@ export interface InclusionPolicy2 {
   untracked_files: 'include' | 'exclude'
 }
 /**
+ * The client's window.
+ */
+export interface InputWindow {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bytes: string
+  /**
+   * Frames written and not yet accepted.
+   */
+  frames: number
+}
+/**
+ * The error object returned in a response or recorded on a receipt.
+ *
+ * The message is plain text for a person or a log. The user interface translates the code into a
+ * direct action and does not display protocol internals by default.
+ */
+export interface ProtocolError1 {
+  /**
+   * The stable code.
+   */
+  code:
+    | 'INVALID_ARGUMENT'
+    | 'UNSUPPORTED_SCHEMA'
+    | 'UNSUPPORTED_CAPABILITY'
+    | 'PERMISSION_DENIED'
+    | 'PAIRING_EXPIRED'
+    | 'PAIRING_REJECTED'
+    | 'PAIRING_AUTH_FAILED'
+    | 'PAIRING_ATTEMPTS_EXHAUSTED'
+    | 'RENDEZVOUS_UNAVAILABLE'
+    | 'RENDEZVOUS_CONFIG_ERROR'
+    | 'UNKNOWN_SESSION'
+    | 'AMBIGUOUS_SESSION'
+    | 'AMBIGUOUS_ATTACHMENT'
+    | 'TERMINAL_UNAVAILABLE'
+    | 'TERMINAL_PROBE_FAILED'
+    | 'INPUT_INCOMPATIBLE'
+    | 'SESSION_CLOSED'
+    | 'SESSION_LIMIT'
+    | 'RESOURCE_UNAVAILABLE'
+    | 'HOST_NOT_CONFIGURED'
+    | 'ENVIRONMENT_UNAVAILABLE'
+    | 'DESKTOP_UNAVAILABLE'
+    | 'STALE_SESSION'
+    | 'LEASE_LOST'
+    | 'GEOMETRY_NOT_OWNER'
+    | 'DRAFT_CONFLICT'
+    | 'EDITOR_BUSY'
+    | 'ID_CONFLICT'
+    | 'UPSTREAM_UNAVAILABLE'
+    | 'OUTCOME_UNKNOWN'
+    | 'RESYNC_REQUIRED'
+    | 'QUOTA_EXCEEDED'
+    | 'RATE_LIMITED'
+    | 'SERVICE_CAPACITY'
+    | 'CLOCK_UNTRUSTED'
+    | 'STORAGE_UNAVAILABLE'
+    | 'SHELL_INTEGRATION_UNSUPPORTED'
+    | 'ATTACHMENT_INTEGRITY'
+    | 'REPOSITORY_UNTRUSTED'
+    | 'PACKAGE_UNAVAILABLE_OFFLINE'
+    | 'PLUGIN_GRANT_REQUIRED'
+    | 'PLUGIN_DISABLED'
+    | 'QUESTION_RESOLVED'
+    | 'QUESTION_EXPIRED'
+    | 'NOT_IN_KR_SESSION'
+    | 'OWNER_CONFIRMATION_REQUIRED'
+    | 'CAUSAL_LIMIT'
+    | 'SOURCE_CHANGED'
+  /**
+   * An opaque identifier for correlating this failure with host diagnostics.
+   */
+  diagnostic_id: DiagnosticId | null
+  /**
+   * True when a worker refused a request because the connection it arrived on no longer speaks
+   * for the controller generation that holds the worker's authority. The refusal is the same
+   * `PERMISSION_DENIED` every other refusal of authority is; the member says that the
+   * connection itself is spent, so a controller that reads it ends the link instead of keeping
+   * it for the next request, and stops the worker's lease with it.
+   *
+   * It travels from a worker to the control daemon on this machine, which ends the link and does
+   * not pass the member on to a device. It is absent from the wire when it is false, so every
+   * other error is byte for byte what a reader built before this member expects. The omission
+   * and the default go for different reasons. The omission stays until no reader of a build
+   * before this member can still be given an error, because such a reader rejects a member it
+   * does not know: a device, a shell integration bridge, or a worker or daemon of an earlier
+   * build. The default stays until no error written without the member can still be read, and
+   * that includes every error this build stores or sends while the omission stands: a plugin
+   * receipt keeps its error in storage.
+   */
+  link_fenced?: boolean
+  /**
+   * A plain message. It never carries credentials or command text.
+   */
+  message: string
+  /**
+   * How the client may react. It must equal [`ErrorCode::retry_category`] for the code.
+   */
+  retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
+}
+/**
  * Parameters of `input.acquire`.
  */
 export interface InputAcquireParams {
@@ -18516,6 +18813,26 @@ export interface InputLeaseState1 {
   next_sequence: string
 }
 /**
+ * One frame of typing on a terminal-input stream, from the client to the host.
+ *
+ * A frame is one batch: the worker accepts all of its bytes or none of them. The sequence counts
+ * frames from 0 within an epoch, and a new epoch starts again at 0 on the same stream.
+ */
+export interface InputFrame {
+  /**
+   * The bytes to write to the terminal. They are not decoded, re-encoded or normalised.
+   */
+  bytes: string
+  /**
+   * The current input lease epoch.
+   */
+  epoch: string
+  /**
+   * An increasing sequence number inside one raw input stream.
+   */
+  sequence: string
+}
+/**
  * Parameters of `input.interrupt`.
  */
 export interface InputInterruptParams {
@@ -18540,6 +18857,14 @@ export interface InputInterruptParams {
  * The result of `input.interrupt` and `input.release`.
  */
 export interface InputLeaseResult {
+  /**
+   * The bytes this release discarded, when the request asked for the count.
+   *
+   * Absent from the wire when the request did not ask, and from every answer of a worker built
+   * before the member, which read as a count that is not known. It is never set for
+   * `input.interrupt`.
+   */
+  fenced_bytes?: U64 | null
   lease: InputLeaseState2
 }
 /**
@@ -18589,6 +18914,16 @@ export interface InputLeaseState3 {
  */
 export interface InputReleaseParams {
   /**
+   * The typing that must have arrived before this release is applied.
+   *
+   * Absent from the wire when the caller asks for no such order, which is every caller that
+   * sends its typing as requests on this connection: they are handled in the order they were
+   * sent. A request that uses none of the optional members is byte for byte what a worker
+   * built before them reads. A worker refuses a member it does not know, so the member is
+   * sent only to a worker that states the input lane.
+   */
+  after_input?: InputBarrier | null
+  /**
    * One CLI or application attachment, independently of its device.
    */
   attachment_id: string
@@ -18597,9 +18932,45 @@ export interface InputReleaseParams {
    */
   epoch: string
   /**
+   * True when the caller wants the count of bytes this release discarded in the answer.
+   *
+   * Absent from the wire when false, and sent only to a worker that states the input lane, for
+   * the reason `after_input` gives.
+   */
+  fenced_report?: boolean
+  /**
    * One KalaReach terminal session.
    */
   session_id: string
+}
+/**
+ * The typing that must have arrived at the worker before a request is applied.
+ *
+ * A client that sends its typing on a stream of its own cannot rely on the order of that stream
+ * against its requests on the control stream. A request that must come after some typing names
+ * the first `count` frames of one lease epoch for one attachment, sequences 0 to `count - 1`,
+ * counted over every frame the client has admitted, including frames it has not yet written. The
+ * worker applies the request only when it has accepted that many frames of the epoch, and
+ * refuses it otherwise. It checks the position and never waits for it.
+ */
+export interface InputBarrier {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  count: string
+  /**
+   * The current input lease epoch.
+   */
+  epoch: string
+  /**
+   * The client's own number for the launch this barrier belongs to, which the worker echoes
+   * when it has dealt with the launch. Null for a request that is not a launch.
+   */
+  launch: number | null
 }
 /**
  * Parameters of ordered `input.write`.
@@ -18632,7 +19003,7 @@ export interface InputWriteParams {
         kind: 'console_keys'
       }
   /**
-   * The position of this input in this connection's ordered input stream.
+   * An increasing sequence number inside one raw input stream.
    */
   sequence: string
   /**
@@ -18687,7 +19058,7 @@ export interface InputWriteResult {
    */
   held_prefix_bytes: string
   /**
-   * The sequence the worker has now consumed.
+   * An increasing sequence number inside one raw input stream.
    */
   sequence: string
 }
@@ -29218,6 +29589,14 @@ export interface DescriptionSetup {
  */
 export interface SessionDetachParams {
   /**
+   * The typing that must have arrived before this detach is applied.
+   *
+   * Absent from the wire when the caller asks for no such order, and sent only to a worker that
+   * states the input lane, since a worker refuses a member it does not know. A request that
+   * uses none of the optional members is byte for byte what a worker built before them reads.
+   */
+  after_input?: InputBarrier | null
+  /**
    * The attachment to remove. Null asks the host for the originating attachment.
    *
    * Section 7's `kr detach` takes no identifier inside its own context, and the host is the
@@ -29227,6 +29606,13 @@ export interface SessionDetachParams {
    * client happens to hold the input lease when the command runs.
    */
   attachment_id: AttachmentId | null
+  /**
+   * True when the caller wants the count of bytes this detach discarded in the answer.
+   *
+   * Absent from the wire when false, and sent only to a worker that states the input lane, for
+   * the reason `after_input` gives.
+   */
+  fenced_report?: boolean
   /**
    * The capability the accepted line this caller runs from was given.
    *
@@ -29255,6 +29641,13 @@ export interface SessionDetachResult {
    * One CLI or application attachment, independently of its device.
    */
   attachment_id: string
+  /**
+   * The bytes this detach discarded, when the request asked for the count.
+   *
+   * Absent from the wire when the request did not ask, and from every answer of a worker built
+   * before the member, which read as a count that is not known.
+   */
+  fenced_bytes?: U64 | null
   geometry: GeometryState5
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
@@ -29773,6 +30166,14 @@ export interface ShellCommandParams {
  * Parameters of `shell.launch`.
  */
 export interface ShellLaunchParams {
+  /**
+   * The typing that must have arrived before this launch is applied.
+   *
+   * Absent from the wire when the caller asks for no such order, so a launch that sends none is
+   * byte for byte what a worker built before the member reads. A worker refuses a member it
+   * does not know, so the member is sent only to a worker that states the input lane.
+   */
+  after_input?: InputBarrier | null
   /**
    * What to install.
    */

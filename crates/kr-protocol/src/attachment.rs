@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AttachmentId, AttachmentOrdinal, GeometryEpoch, SessionId};
+use crate::input::InputBarrier;
 use crate::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use crate::session::Dimensions;
 
@@ -306,6 +307,19 @@ pub struct SessionDetachParams {
     /// still be running, which is when every session that was live across the upgrade has closed.
     #[serde(default, skip_serializing_if = "no_capability")]
     pub line_token: Nullable<String>,
+    /// The typing that must have arrived before this detach is applied.
+    ///
+    /// Absent from the wire when the caller asks for no such order, and sent only to a worker that
+    /// states the input lane, since a worker refuses a member it does not know. A request that
+    /// uses none of the optional members is byte for byte what a worker built before them reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_input: Option<InputBarrier>,
+    /// True when the caller wants the count of bytes this detach discarded in the answer.
+    ///
+    /// Absent from the wire when false, and sent only to a worker that states the input lane, for
+    /// the reason `after_input` gives.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub fenced_report: bool,
 }
 
 /// Returns whether a detach presents no line capability.
@@ -323,6 +337,12 @@ pub struct SessionDetachResult {
     pub geometry: GeometryState,
     /// How many attachments remain. A live session may have none.
     pub remaining: U64,
+    /// The bytes this detach discarded, when the request asked for the count.
+    ///
+    /// Absent from the wire when the request did not ask, and from every answer of a worker built
+    /// before the member, which read as a count that is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fenced_bytes: Option<U64>,
 }
 
 /// Where an attachment's window sits in the session's rows.
@@ -556,6 +576,8 @@ mod tests {
         let named = SessionDetachParams {
             attachment_id: Nullable::some(attachment_id),
             line_token: Nullable::null(),
+            after_input: None,
+            fenced_report: false,
         };
         assert_eq!(
             serde_json::to_value(&named).expect("encodes"),
@@ -566,6 +588,8 @@ mod tests {
         let presented = SessionDetachParams {
             attachment_id: Nullable::null(),
             line_token: Nullable::some("a-line-capability".to_owned()),
+            after_input: None,
+            fenced_report: false,
         };
         assert_eq!(
             serde_json::to_value(&presented).expect("encodes"),

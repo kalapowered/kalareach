@@ -14,8 +14,8 @@ use crate::envelope::{MutationRequest, Request};
 use crate::hello::{ActionWindow, PACKAGE_VERSION, PackageVersion, ProtocolVersion, ReceiveLimits};
 use crate::identity::BootIdentity;
 use crate::ids::{
-    AuthorityRevision, BuildId, CapabilityId, ConnectionId, ControllerGeneration, EnvironmentId,
-    RemoteDispatchLeaseId,
+    AttachmentId, AuthorityRevision, BuildId, CapabilityId, ConnectionId, ControllerGeneration,
+    EnvironmentId, InputLeaseEpoch, RemoteDispatchLeaseId,
 };
 use crate::method::Method;
 use crate::scalars::{CanonicalSet, Nullable, U64};
@@ -571,6 +571,16 @@ pub enum ControllerConnectionRole {
     /// work that has a deadline. A newer one replaces it, and a replacement generation fences it
     /// along with the authority itself.
     Checks,
+    /// The connection the daemon carries one attachment's typing to the worker over.
+    ///
+    /// It is a second link for an attachment that a `Proxy` connection owns, and it borrows that
+    /// connection's binding: it holds no attachment of its own, so closing it detaches nothing. It
+    /// carries `input.write` for that attachment and nothing else, so a key never waits behind the
+    /// requests of the proxy connection, and the worker's answers on it are the lane's own frames
+    /// ([`InputLaneReady`] and the events [`LaneWindow`], [`LaneCredit`] and [`LaneLaunch`]). A
+    /// replacement generation fences it along with the authority itself. A worker that does not
+    /// state the input lane does not know the role, and the daemon never declares it to one.
+    ProxyInput,
 }
 
 impl ControllerConnectionRole {
@@ -583,8 +593,100 @@ impl ControllerConnectionRole {
             Self::Attention => "attention",
             Self::Descriptions => "descriptions",
             Self::Checks => "checks",
+            Self::ProxyInput => "proxy_input",
         }
     }
+}
+
+/// What the daemon says first on a connection whose role is [`ControllerConnectionRole::ProxyInput`],
+/// after the role and the generation token: which attachment this lane carries typing for.
+///
+/// The worker binds the lane only when `proxy_connection` names a live `Proxy` connection of the
+/// same generation that owns the attachment, and refuses it otherwise.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputLane {
+    /// The `Proxy` connection whose binding this lane borrows: the connection id the worker gave
+    /// that link.
+    pub proxy_connection: ConnectionId,
+    /// The attachment the lane carries typing for.
+    pub attachment_id: AttachmentId,
+}
+
+/// The worker's answer to [`InputLane`], and the first frame it writes on the lane.
+///
+/// The lane's own frames follow it in the order the worker's ledger changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputLaneReady {
+    /// The lease epoch at the moment of the bind.
+    pub epoch: InputLeaseEpoch,
+    /// True when the lane's attachment holds the lease at `epoch`, so the lane has a window.
+    pub holder: bool,
+    /// The window's frames, in the worker's unit. Nought when the lane is not the holder's.
+    pub frames: u32,
+    /// The window's bytes, in the worker's unit. Nought when the lane is not the holder's.
+    pub bytes: U64,
+}
+
+/// The lane's window for one lease epoch, an event the worker sends on a lane.
+///
+/// It is sent when an epoch starts for the lane's attachment, with `holder` true and the window,
+/// and when the lane's attachment loses the lease, with `holder` false and `ended` set. The
+/// `epoch` is the epoch that the event speaks of: after a release that leaves no holder it is the
+/// epoch that ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaneWindow {
+    /// The epoch this event speaks of.
+    pub epoch: InputLeaseEpoch,
+    /// True when the lane's attachment holds the lease at `epoch`.
+    pub holder: bool,
+    /// The window's frames, in the worker's unit. Nought when `holder` is false.
+    pub frames: u32,
+    /// The window's bytes, in the worker's unit. Nought when `holder` is false.
+    pub bytes: U64,
+    /// Set when the lane's attachment lost the lease: which epoch ended and how much it discarded.
+    pub ended: Nullable<LaneEnded>,
+}
+
+/// An epoch that ended for a lane's attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaneEnded {
+    /// The epoch that ended.
+    pub epoch: InputLeaseEpoch,
+    /// How many bytes the end discarded.
+    pub fenced_bytes: U64,
+}
+
+/// Room given back to a lane's window, an event the worker sends on a lane when it has written
+/// frames of the epoch to the terminal.
+///
+/// A host ignores it when `epoch` is not the epoch it is serving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaneCredit {
+    /// The epoch the room belongs to.
+    pub epoch: InputLeaseEpoch,
+    /// Frames given back, in the worker's unit.
+    pub frames: u32,
+    /// Bytes given back, in the worker's unit.
+    pub bytes: U64,
+}
+
+/// The worker has dealt with a launch, an event the worker sends on the lane of the attachment
+/// that asked for it.
+///
+/// It means that later typing is now ordered by the worker's own fence, or that nothing is left to
+/// order. It says nothing about the launch's result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaneLaunch {
+    /// The attachment that asked for the launch.
+    pub attachment_id: AttachmentId,
+    /// The client's number of the launch.
+    pub launch: u32,
 }
 
 /// A read the host admitted for a caller, passed to the component that owns its subject.

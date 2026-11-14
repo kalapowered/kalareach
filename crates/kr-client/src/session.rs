@@ -1944,6 +1944,12 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
             });
         }
         ControlFrame::Event(ControlEvent::Keepalive) => {}
+        // The events of a worker's input lane belong to the control daemon's link to a worker.
+        ControlFrame::Event(
+            ControlEvent::InputWindow(_)
+            | ControlEvent::InputCredit(_)
+            | ControlEvent::InputLaunchReserved(_),
+        ) => return false,
         // A client never receives a request or a mutation: the host does not call the client. The
         // rest of the union belongs to the host's own local endpoints — the local opening frames,
         // a worker's startup handshake, the generation and revision exchange, and a mutation one
@@ -1998,7 +2004,10 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         // The control daemon's request that a worker perform the disclosed checks, and the
         // worker's findings.
         | ControlFrame::DesktopChecks(_)
-        | ControlFrame::DesktopChecksAnswer(_) => return false,
+        | ControlFrame::DesktopChecksAnswer(_)
+        // The binding of a worker's input lane and the worker's answer: the control daemon's.
+        | ControlFrame::InputLane(_)
+        | ControlFrame::InputLaneReady(_) => return false,
     }
     true
 }
