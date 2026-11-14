@@ -56,8 +56,9 @@ Three rules are easy to get wrong:
   objects with different digests. A closed schema therefore requires every field to be present, and
   the Rust types use `Nullable<T>` rather than `Option<T>` so that a missing field is an error. The
   exception is a member that a type declares absent when unset. It is left out of the encoding when
-  it holds nothing: `None` for an optional member, `false` for the three flags `error_withheld` of a
-  receipt, `link_fenced` of an error and `holds_local_access` of a worker launch, and the empty or
+  it holds nothing: `None` for an optional member, `false` for the flags `error_withheld` of a
+  receipt, `link_fenced` of an error, `holds_local_access` of a worker launch and `fenced_report` of
+  a release and of a detach, and the empty or
   default value for a few others, such as the extension offers of a hello. A value that states such a
   member at its default is refused as non-canonical, because it would re-encode to different bytes: a
   sender that writes `"link_fenced": false` or `"line_token": null` is refused, and one that leaves
@@ -69,7 +70,8 @@ Three rules are easy to get wrong:
   summary, `metrics` of a session read, `session` of a close result, `origin` and `build` of the
   local hello and its acknowledgement and `build` of the bridge hello acknowledgement, `history`,
   `screen_basis`, `workflow_run_id` and `lease` of a forwarded request or mutation, and the optional
-  members of a worker launch and of an authority revision notice. The generated schema and
+  members of a worker launch and of an authority revision notice, and `after_input` of a release, a
+  detach and a launch, and `fenced_bytes` of a release's answer and of a detach's. The generated schema and
   TypeScript type accept the explicit default that the decoder refuses: null for an optional member
   and `false` for a flag. The host configuration document, which is JSON read from a file and not a
   wire message, leaves out its sections of later levels, its `disable_policy` and a test suite's
