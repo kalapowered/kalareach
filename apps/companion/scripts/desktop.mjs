@@ -5,7 +5,7 @@
 // The application links the static C runtime, through the `crt-static` target feature that
 // `.cargo/config.toml` gives the x86-64 and ARM64 MSVC targets. Tauri's own request for a static
 // runtime, `STATIC_VCRUNTIME=true`, makes a hybrid (the Visual C++ runtime static, the universal
-// runtime dynamic) and would put two runtimes in the link, so the variable stays `false`. The command
+// runtime dynamic) whose program imports `api-ms-win-crt-*`, so the variable stays `false`. The command
 // line tool sets it to `true` for a desktop build unless it is already `false`, the Tauri build step
 // reads it before the attribute this package gives it, and the package's build script then refuses
 // the build. So on Windows this gives the build `STATIC_VCRUNTIME=false`, whatever the caller's
@@ -35,8 +35,10 @@
 // - a Windows target on a machine that is not Windows, and on Windows an MSVC target that the
 //   configuration of `.cargo/config.toml` does not name (x86-64 and ARM64): the setting is made for the
 //   machine this runs on, and the target feature that makes the link static is given to those two;
-// - after a bare `--`, cargo's own `--config` and `--target`: either can set the environment, the
-//   flags or the target that this command holds;
+// - after a bare `--`, cargo's own `--config`, `--target`, `--profile`, `--release` (`-r`),
+//   `--target-dir` and `--manifest-path`: each can set the environment, the flags, the target, the
+//   profile or the directory that this command holds, and the build of libsodium's crate that is
+//   removed first is the one for the profile and target this command reads;
 // - `CARGO_BUILD_TARGET`: the command line tool does not read it, so cargo would build for it into the
 //   directory of that target and the bundle would be made from the program of another build; a target
 //   is given as `--target`;
@@ -45,7 +47,9 @@
 //   `.cargo/config.toml` with no message, and the others are a second source of flags that this build
 //   does not take;
 // - on Windows, `LINK` and `_LINK_`, which the linker reads before and after its options and which can
-//   add or leave out the runtime libraries of the link, and `SODIUM_LIB_DIR` and `SODIUM_USE_PKG_CONFIG`,
+//   add or leave out the runtime libraries of the link, `CL` and `_CL_`, which the C compiler reads
+//   before and after its options and which can change the runtime its objects ask for, and
+//   `SODIUM_LIB_DIR` and `SODIUM_USE_PKG_CONFIG`,
 //   with which libsodium's crate links the library they name and not the archive that was compared.
 import { spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
@@ -161,6 +165,11 @@ function givesLinkerOptions(name) {
   return ['LINK', '_LINK_'].includes(name.toUpperCase())
 }
 
+/** Whether a Windows environment variable name gives the C compiler's options (it reads both). */
+function givesCompilerDriverOptions(name) {
+  return ['CL', '_CL_'].includes(name.toUpperCase())
+}
+
 /** Whether a Windows environment variable name makes libsodium's crate link another library than the archive. */
 function givesAnotherSodium(name) {
   return /^SODIUM_(LIB_DIR|USE_PKG_CONFIG)$/.test(name.toUpperCase())
@@ -236,11 +245,12 @@ export function refusal(argv, platform = process.platform, env = process.env) {
   // What follows a bare `--` goes to cargo, whose own `--config` can set the environment and the flags
   // of the build and whose `--target` is read by none of the checks here.
   const cargo = rest.includes('--') ? rest.slice(rest.indexOf('--') + 1) : []
-  const own = cargo.find((word) => /^--(config|target)(=|$)/.test(word))
+  const own = cargo.find((word) => /^(--(config|target|profile|release|target-dir|manifest-path)(=|$)|-r$)/.test(word))
   if (own !== undefined) {
     return (
       `pnpm desktop does not pass \`${own}\` on to cargo (it was given \`${given}\`): it can change the environment, ` +
-      'the compiler flags or the target that this command holds. Give a target as `--target` before the `--`.'
+      'the compiler flags, the target, the profile or the directory that this command holds. Give a target as `--target` ' +
+      'before the `--`; a debug build is `--debug`.'
     )
   }
   for (const option of options) {
@@ -273,6 +283,13 @@ export function refusal(argv, platform = process.platform, env = process.env) {
       'before the options it is given and `_LINK_` after them, and either can add or leave out the runtime libraries of the link.'
     )
   }
+  const driver = Object.keys(env).find(givesCompilerDriverOptions)
+  if (driver !== undefined) {
+    return (
+      `pnpm desktop does not run a build with ${driver.toUpperCase()} in the environment: the C compiler reads \`CL\` ` +
+      'before the options it is given and `_CL_` after them, and either can change the runtime that the C objects of the build ask for.'
+    )
+  }
   const sodium = Object.keys(env).find(givesAnotherSodium)
   if (sodium !== undefined) {
     return (
@@ -284,8 +301,8 @@ export function refusal(argv, platform = process.platform, env = process.env) {
 }
 
 /**
- * The arguments of the command line tool: the build, with cargo as its runner. A configuration that
- * the caller gives can name another runner, and the tool takes that one only when it is not given one.
+ * The arguments of the command line tool: the build, with cargo as its runner. A configuration file
+ * can name another runner, and the tool takes that one only when it is not given one.
  */
 export function childArguments(argv) {
   const [command, ...rest] = argv
@@ -295,13 +312,17 @@ export function childArguments(argv) {
 /**
  * The directory libsodium's archive is placed in: the one the caller's environment names, else one in
  * the home directory that is named by the digests the placing script holds (its `--key`), so that no
- * directory is shared by two sets of bytes. It is written with forward slashes, as the script and the
- * crate's build script both read a path.
+ * directory is shared by two sets of bytes. It is absolute and written with forward slashes, so that the
+ * script and the crate's build script both read the same path.
  */
-export function archiveDirectory(env, home, key, platform = process.platform) {
+export function archiveDirectory(env, home, key, platform = process.platform, cwd = process.cwd()) {
   const named = environmentValue(env, ARCHIVE_VARIABLE, platform)
-  const directory = named !== undefined && named !== '' ? named : `${home}/${key}`
-  return directory.replaceAll('\\', '/')
+  const slashed = (path) => path.replaceAll('\\', '/')
+  if (named === undefined || named === '') return slashed(`${home}/${key}`)
+  // The script reads a relative name from the repository's root and the crate's build script from its
+  // own directory, so the name is made absolute, from where this was started, before either reads it.
+  const absolute = platform === WINDOWS ? /^([A-Za-z]:[\\/]|[\\/])/.test(named) : named.startsWith('/')
+  return slashed(absolute ? named : `${cwd}/${named}`)
 }
 
 /**

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Holds the desktop bundle build's entry to what it must give and refuse.
 //
-// The entry runs the desktop bundle build with Tauri's static Visual C++ runtime (a hybrid that would
-// put two runtimes in the link) turned off on Windows, where the command line tool turns it on and the
+// The entry runs the desktop bundle build with Tauri's static Visual C++ runtime (a hybrid whose program
+// imports the universal runtime) turned off on Windows, where the command line tool turns it on and the
 // package's build script refuses that build. None of
 // these cases runs a build: the decision about a command's arguments and the environment a build is
 // given are functions that take the platform and the environment in, so each platform's answer is held
@@ -167,11 +167,20 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--ci', '--', '--locked', '--config', 'build.rustflags=[]'],
     ['build', '--', '--target', 'x86_64-pc-windows-msvc'],
     ['build', '--', '--target=aarch64-apple-darwin'],
-    ['build', '--features', 'a', '--', '--target', 'x']
+    ['build', '--features', 'a', '--', '--target', 'x'],
+    // The build of libsodium's crate that is removed first is the one for the profile and the directory this
+    // command reads, so what cargo is given for either after the `--` is refused in every form.
+    ['build', '--', '--profile', 'dev'],
+    ['build', '--', '--profile=release-lto'],
+    ['build', '--', '--release'],
+    ['build', '--ci', '--', '-r'],
+    ['build', '--', '--target-dir', 'C:/cached-target'],
+    ['build', '--', '--target-dir=target-other'],
+    ['build', '--', '--manifest-path', 'other/Cargo.toml']
   ]) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}, since cargo would be given its own setting`, 'true', refused(argv, platform))
   }
-  for (const argv of [['build', '--', '--locked'], ['build', '--', '--offline', '--frozen'], ['build', '--', '--target-dir', 'x'], ['build', '--', '--configuration']]) {
+  for (const argv of [['build', '--', '--locked'], ['build', '--', '--offline', '--frozen'], ['build', '--', '--configuration'], ['build', '--', '--profile-x'], ['build', '--', '--releases']]) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is run as it is given on ${platform}`, 'false', refused(argv, platform))
   }
 }
@@ -211,6 +220,18 @@ for (const name of ['LINK', 'link', '_LINK_', '_link_', 'Link']) {
   held(`${name} is no matter on Linux`, 'false', refused(['build'], 'linux', { [name]: '/DEFAULTLIB:msvcrt' }))
 }
 held('names that only contain LINK are no matter on Windows', 'false', refused(['build'], 'win32', { LINKER: 'x', CARGO_LINK: 'x', MY_LINK_: 'x', LINK_X: 'x' }))
+
+// The C compiler reads `CL` before the options it is given and `_CL_` after them, and either can change the
+// runtime that the C objects of the build ask for. Only Windows has that compiler.
+for (const name of ['CL', 'cl', '_CL_', '_cl_']) {
+  for (const value of ['/MD', '']) {
+    const answer = refusal(['build'], 'win32', { PATH: 'x', [name]: value })
+    held(`${name}=${JSON.stringify(value)} is refused on Windows`, 'true', String(answer !== null))
+    held(`the refusal for ${name} names the variable`, 'true', String(answer?.includes(name.toUpperCase()) ?? false))
+  }
+  held(`${name} is no matter on macOS`, 'false', refused(['build'], 'darwin', { [name]: '/MD' }))
+}
+held('names that only contain CL are no matter on Windows', 'false', refused(['build'], 'win32', { CLANG: 'x', CL_X: 'x', MYCL: 'x', CARGO_CL_: 'x' }))
 
 // The crate that links libsodium takes a library directory (`SODIUM_LIB_DIR`) or a system's library
 // (`SODIUM_USE_PKG_CONFIG`) before it reads the archive that a digest holds, and links whatever those name.
@@ -256,6 +277,13 @@ for (const name of ['SODIUM_LIB_DIR', 'sodium_lib_dir', 'SODIUM_USE_PKG_CONFIG',
   held('a name in another spelling is read on Windows', 'D:/c', archiveDirectory({ sodium_dist_dir: 'D:/c' }, 'C:\\Users\\a', 'key', 'win32'))
   held('with no name the directory is in the home directory and named by the key', 'C:/Users/a/key', archiveDirectory({}, 'C:\\Users\\a', 'key', 'win32'))
   held('an empty name is no name', 'C:/Users/a/key', archiveDirectory({ SODIUM_DIST_DIR: '' }, 'C:\\Users\\a', 'key', 'win32'))
+  // The placing script reads a relative name from the repository's root and the crate's build script from
+  // its own directory: the name is made absolute, from where the command was started, before either reads it.
+  held('a relative name is made absolute on Windows', 'C:/work/app/archives', archiveDirectory({ SODIUM_DIST_DIR: 'archives' }, 'C:\\Users\\a', 'key', 'win32', 'C:\\work\\app'))
+  held('a name with a dot is made absolute too', 'C:/work/app/../cache', archiveDirectory({ SODIUM_DIST_DIR: '..\\cache' }, 'C:\\Users\\a', 'key', 'win32', 'C:\\work\\app'))
+  held('a name on a drive is kept', 'D:/c', archiveDirectory({ SODIUM_DIST_DIR: 'D:\\c' }, 'C:\\Users\\a', 'key', 'win32', 'C:\\work\\app'))
+  held('a name from the drive root is kept', '/c', archiveDirectory({ SODIUM_DIST_DIR: '/c' }, 'C:\\Users\\a', 'key', 'win32', 'C:\\work\\app'))
+  held('a relative name is made absolute elsewhere', '/work/app/archives', archiveDirectory({ SODIUM_DIST_DIR: 'archives' }, '/home/a', 'key', 'linux', '/work/app'))
 
   // The script itself, run for real on directories that hold other bytes: it compares what is in a
   // directory before anything is fetched, and refuses, so no network is needed and nothing is placed.
