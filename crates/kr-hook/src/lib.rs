@@ -38,6 +38,8 @@ pub mod qoder_cli;
 pub mod registration;
 pub mod relay;
 
+use std::sync::mpsc::RecvTimeoutError;
+
 /// Runs one parsed invocation, which started at `started`, and returns the exit code it ends with.
 ///
 /// Every program of an installed release holds that release for as long as it runs, and does not
@@ -128,16 +130,42 @@ pub fn report(line: &str) {
 /// ends with it, and its line is lost: with nothing left before `by`, the line is written only if
 /// that thread gets to it before the process ends.
 pub fn report_by(line: &str, by: std::time::Instant) {
-    report_with(line, by, |bytes| {
-        use std::io::Write as _;
-        let _ = std::io::stderr().lock().write_all(bytes);
-    });
+    report_with(
+        line,
+        by,
+        |bytes| {
+            use std::io::Write as _;
+            let _ = std::io::stderr().lock().write_all(bytes);
+        },
+        wait_by,
+    );
 }
 
-/// [`report_by`] with the write given, which is what a standard error is to it: the line is
-/// formatted here, and handed to `write` on a thread of its own, waited for no later than `by`.
-pub fn report_with(line: &str, by: std::time::Instant, write: impl FnOnce(&[u8]) + Send + 'static) {
-    write_by(format!("kr-hook: {line}\n").into_bytes(), by, write);
+/// [`report_by`] with the write given, which is what a standard error is to it, and the wait given:
+/// the line is formatted here, and handed to `write` on a thread of its own, waited for with `wait`
+/// no later than `by`.
+pub fn report_with(
+    line: &str,
+    by: std::time::Instant,
+    write: impl FnOnce(&[u8]) + Send + 'static,
+    wait: impl FnOnce(
+        &std::sync::mpsc::Receiver<Done>,
+        std::time::Instant,
+    ) -> Result<Done, RecvTimeoutError>,
+) {
+    write_by(format!("kr-hook: {line}\n").into_bytes(), by, write, wait);
+}
+
+/// What a thread a run waits for sends when it is through: how it went.
+pub type Done = Result<(), String>;
+
+/// The wait a run makes, on the system's clock: for what `channel` receives until `by`, which has
+/// passed when `by` is not ahead of the clock.
+pub(crate) fn wait_by(
+    channel: &std::sync::mpsc::Receiver<Done>,
+    by: std::time::Instant,
+) -> Result<Done, RecvTimeoutError> {
+    channel.recv_timeout(by.saturating_duration_since(std::time::Instant::now()))
 }
 
 /// How many diagnostic lines [`Reports`] holds while its writer waits on standard error.
@@ -339,18 +367,27 @@ fn dropped_notice(count: u64) -> String {
     }
 }
 
-/// Hands `bytes` to `write` on a thread of its own, and waits for it no later than `by`.
+/// Hands `bytes` to `write` on a thread of its own, and waits for it with `wait` no later than
+/// `by`.
 ///
 /// A thread that cannot be started writes nothing: a diagnostic never costs the caller its
 /// answer.
-fn write_by(bytes: Vec<u8>, by: std::time::Instant, write: impl FnOnce(&[u8]) + Send + 'static) {
+fn write_by(
+    bytes: Vec<u8>,
+    by: std::time::Instant,
+    write: impl FnOnce(&[u8]) + Send + 'static,
+    wait: impl FnOnce(
+        &std::sync::mpsc::Receiver<Done>,
+        std::time::Instant,
+    ) -> Result<Done, RecvTimeoutError>,
+) {
     let (written, done) = std::sync::mpsc::channel();
     let started = std::thread::Builder::new().spawn(move || {
         write(&bytes);
-        let _ = written.send(());
+        let _ = written.send(Ok(()));
     });
     if started.is_ok() {
-        let _ = done.recv_timeout(by.saturating_duration_since(std::time::Instant::now()));
+        let _ = wait(&done, by);
     }
 }
 
@@ -374,6 +411,7 @@ mod tests {
                 // half a minute, so a caller that waited for it fails rather than hangs.
                 let _ = stalled.recv_timeout(Duration::from_secs(30));
             },
+            wait_by,
         );
         let took = begun.elapsed();
         drop(release);
@@ -392,6 +430,7 @@ mod tests {
             move |bytes| {
                 into.lock().expect("the buffer").extend_from_slice(bytes);
             },
+            wait_by,
         );
         assert_eq!(
             written.lock().expect("the buffer").as_slice(),
@@ -613,9 +652,14 @@ mod tests {
     fn a_bound_already_passed_is_not_waited_for() {
         let (release, stalled) = std::sync::mpsc::channel::<()>();
         let begun = Instant::now();
-        write_by(b"a line".to_vec(), begun, move |_| {
-            let _ = stalled.recv_timeout(Duration::from_secs(30));
-        });
+        write_by(
+            b"a line".to_vec(),
+            begun,
+            move |_| {
+                let _ = stalled.recv_timeout(Duration::from_secs(30));
+            },
+            wait_by,
+        );
         let took = begun.elapsed();
         drop(release);
         assert!(took < Duration::from_secs(10), "{took:?}");

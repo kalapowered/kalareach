@@ -156,6 +156,8 @@ pub fn run(
             use std::io::Write as _;
             let _ = std::io::stderr().lock().write_all(bytes);
         },
+        std::time::Instant::now,
+        crate::wait_by,
     );
     std::process::ExitCode::SUCCESS
 }
@@ -229,13 +231,20 @@ fn resumed_by(
 /// gets what remains of the deadline, and at least [`DIAGNOSTIC_ALLOWANCE`] after the answer
 /// ([`diagnostic_bound`]). A run whose work finished says nothing. `claim` is what a run does first
 /// of all to be the one that answers, `answer` and `write` are what writes each, and `run` passes
-/// the real ones.
+/// the real ones. So are `now`, the clock every reading of the run's time is taken from, and
+/// `wait`, which waits for a message until the moment it is given, on that clock: `run` passes the
+/// system's.
 fn run_with(
     started: std::time::Instant,
     work: impl FnOnce(std::time::Instant) -> Result<(), String> + Send + 'static,
     claim: impl FnOnce(),
     answer: impl FnOnce(),
     write: impl FnOnce(&[u8]) + Send + 'static,
+    now: impl Fn() -> std::time::Instant,
+    wait: impl Fn(
+        &std::sync::mpsc::Receiver<crate::Done>,
+        std::time::Instant,
+    ) -> Result<crate::Done, std::sync::mpsc::RecvTimeoutError>,
 ) {
     let (finished, outcome) = std::sync::mpsc::channel();
     let working = std::thread::Builder::new().spawn(move || {
@@ -243,7 +252,7 @@ fn run_with(
     });
     let failure = match working {
         Err(error) => Some(format!("the hook's work could not be started: {error}")),
-        Ok(_) => match outcome.recv_timeout(HOOK_DEADLINE.saturating_sub(started.elapsed())) {
+        Ok(_) => match wait(&outcome, started + HOOK_DEADLINE) {
             Ok(Ok(())) => None,
             Ok(Err(failure)) => Some(failure),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(deadline_diagnostic()),
@@ -256,7 +265,7 @@ fn run_with(
     // started once the answer is out: only one process answers.
     claim();
     answer();
-    let answered = std::time::Instant::now();
+    let answered = now();
     if let Some(failure) = failure {
         let answered_after = answered.saturating_duration_since(started);
         crate::report_with(
@@ -266,6 +275,7 @@ fn run_with(
             ),
             diagnostic_bound(started, answered),
             write,
+            wait,
         );
     }
 }
@@ -710,6 +720,8 @@ mod tests {
             || order.borrow_mut().push("claimed"),
             || order.borrow_mut().push("answered"),
             |_| {},
+            std::time::Instant::now,
+            crate::wait_by,
         );
         assert_eq!(*order.borrow(), ["claimed", "answered"]);
     }
@@ -822,6 +834,8 @@ mod tests {
                 into.lock().expect("the line").extend_from_slice(bytes);
                 let _ = written.send(());
             },
+            std::time::Instant::now,
+            crate::wait_by,
         );
         let ran_for = started.elapsed();
         assert!(
@@ -894,6 +908,8 @@ mod tests {
                 let _ = stalled_write.recv_timeout(HUNG_WRITER);
                 write_ends.store(true, std::sync::atomic::Ordering::SeqCst);
             },
+            std::time::Instant::now,
+            crate::wait_by,
         );
         let through = std::time::Instant::now();
         let work_had_ended = work_ended.load(std::sync::atomic::Ordering::SeqCst);
