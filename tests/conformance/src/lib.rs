@@ -21,6 +21,7 @@ pub mod map;
 pub mod plan;
 pub mod report;
 pub mod run;
+pub mod runner_copy;
 pub mod rust_items;
 pub mod rust_lex;
 pub mod typescript;
