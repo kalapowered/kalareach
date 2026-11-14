@@ -35,7 +35,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{EndpointKey, Nullable, Uuid};
 use kr_transport::codec::STREAM_REVOKED;
 use kr_transport::config::EndpointConfig;
-use kr_transport::deadlines::{DeadlineKind, ManualDeadlines};
+use kr_transport::deadlines::{DeadlineKind, Deadlines, ManualDeadlines};
 use kr_transport::error::TransportError;
 use kr_transport::handshake::{self, AuthorisedConnection, PairedDirectory};
 use kr_transport::listener::{
@@ -345,9 +345,43 @@ struct Listening {
     client: Side,
 }
 
+/// Deadlines in which the idle deadline has already passed: a wait for a frame to begin is cut as
+/// soon as it starts, so a case sees whether a stream of a kind is held to that deadline at all
+/// without waiting for it. Every other kind is the case's [`ManualDeadlines`].
+#[derive(Debug)]
+struct IdlePassed(Arc<ManualDeadlines>);
+
+impl IdlePassed {
+    fn of(manual: Arc<ManualDeadlines>) -> Arc<dyn Deadlines> {
+        Arc::new(Self(manual))
+    }
+}
+
+impl Deadlines for IdlePassed {
+    fn start(&self, kind: DeadlineKind) -> BoxFuture<'static, ()> {
+        if kind == DeadlineKind::Idle {
+            Box::pin(std::future::ready(()))
+        } else {
+            self.0.start(kind)
+        }
+    }
+}
+
 impl Harness {
     async fn start(accepted: &[StreamKind], taking: Taking) -> Self {
         Self::listen(accepted, taking, None)
+            .await
+            .authorised()
+            .await
+    }
+
+    /// As [`Harness::start`], for a host whose deadlines are what `under` makes of the case's own.
+    async fn start_under(
+        accepted: &[StreamKind],
+        taking: Taking,
+        under: fn(Arc<ManualDeadlines>) -> Arc<dyn Deadlines>,
+    ) -> Self {
+        Self::listen_under(accepted, taking, None, under)
             .await
             .authorised()
             .await
@@ -358,6 +392,15 @@ impl Harness {
         accepted: &[StreamKind],
         taking: Taking,
         hold: Option<Arc<LookupHold>>,
+    ) -> Listening {
+        Self::listen_under(accepted, taking, hold, |manual| manual).await
+    }
+
+    async fn listen_under(
+        accepted: &[StreamKind],
+        taking: Taking,
+        hold: Option<Arc<LookupHold>>,
+        under: fn(Arc<ManualDeadlines>) -> Arc<dyn Deadlines>,
     ) -> Listening {
         let (host_side, client) = paired_pair().await;
         let (forwarded, admitted) = mpsc::unbounded_channel();
@@ -382,7 +425,7 @@ impl Harness {
         let deadlines = ManualDeadlines::new();
         let config = ListenerConfig {
             accepted_kinds: accepted.to_vec(),
-            deadlines: deadlines.clone(),
+            deadlines: under(deadlines.clone()),
             ..ListenerConfig::new(
                 EndpointConfig {
                     bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
@@ -556,6 +599,13 @@ fn terminal_header(connection_id: ConnectionId, session: u8) -> StreamHeader {
             attachment_id: Nullable::some(AttachmentId::new(Uuid::from_bytes([7; 16]))),
             transfer_id: Nullable::null(),
         },
+    }
+}
+
+fn input_header(connection_id: ConnectionId, session: u8) -> StreamHeader {
+    StreamHeader {
+        kind: StreamKind::TerminalInput,
+        ..terminal_header(connection_id, session)
     }
 }
 
@@ -874,12 +924,14 @@ async fn a_frame_that_stops_arriving_is_cut_by_the_stall_deadline() {
     harness.finish().await;
 }
 
-/// A stream that is quiet between frames is cut by the idle deadline, and the device
+/// A stream of `kind` that is quiet between frames is cut by the idle deadline, and the device
 /// sees it reset.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
-    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
-    let header = attachment_header(harness.authorised.connection_id, 1);
+async fn a_quiet_stream_is_cut_by_the_idle_deadline(
+    kind: StreamKind,
+    header: fn(ConnectionId) -> StreamHeader,
+) {
+    let mut harness = Harness::start(&[kind], Taking::Forward).await;
+    let header = header(harness.authorised.connection_id);
     let (_send, mut recv) = harness.raw(&header).await;
     let mut stream = harness.next().await;
 
@@ -900,6 +952,97 @@ async fn a_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
         "the wait was not cut by the idle deadline: {outcome:?}"
     );
     assert!(stream.is_revoked());
+    drop(stream);
+    assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+
+    harness.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
+    a_quiet_stream_is_cut_by_the_idle_deadline(StreamKind::AttachmentChunks, |connection_id| {
+        attachment_header(connection_id, 1)
+    })
+    .await;
+}
+
+/// The kind that carries typing is the one kind with no idle deadline: the other terminal kind
+/// keeps its.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_output_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
+    a_quiet_stream_is_cut_by_the_idle_deadline(StreamKind::TerminalOutput, |connection_id| {
+        terminal_header(connection_id, 1)
+    })
+    .await;
+}
+
+/// A stream that carries a person's typing is quiet whenever the person is, so the host holds it
+/// to no idle deadline. The idle deadline of this host has passed before any frame is sent: the
+/// first wait for a frame, and the wait after each frame, are both left open, and the stream
+/// carries what the device sends once it sends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_input_stream_that_is_quiet_between_frames_is_not_cut() {
+    let mut harness = Harness::start_under(
+        &[StreamKind::TerminalInput],
+        Taking::Forward,
+        IdlePassed::of,
+    )
+    .await;
+    let header = input_header(harness.authorised.connection_id, 1);
+    let mut device = awaited(
+        "the credit for the input stream",
+        harness.device.open(&harness.connection, header),
+    )
+    .await
+    .expect("the device's stream");
+    let mut stream = harness.next().await;
+
+    for keys in [&b"the first keys"[..], &b"the keys after a pause"[..]] {
+        let mut waiting = Box::pin(stream.read_payload());
+        if let std::task::Poll::Ready(outcome) = futures::poll!(&mut waiting) {
+            panic!("the wait for a frame was cut with nothing sent: {outcome:?}");
+        }
+        device.write_payload(keys).await.expect("a frame of keys");
+        let read = awaited("the frame the device sent", waiting)
+            .await
+            .expect("the stream is readable");
+        assert_eq!(read.as_deref(), Some(keys));
+    }
+    assert!(!stream.is_revoked(), "a quiet input stream was revoked");
+
+    harness.finish().await;
+}
+
+/// The input stream keeps the stall deadline: a frame that has begun has to finish, as on every
+/// other kind of stream, and the device sees the stream reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_input_frame_that_stops_arriving_is_cut_by_the_stall_deadline() {
+    let mut harness = Harness::start(&[StreamKind::TerminalInput], Taking::Forward).await;
+    let header = input_header(harness.authorised.connection_id, 1);
+    let (mut send, mut recv) = harness.raw(&header).await;
+    let mut stream = harness.next().await;
+
+    send.write_all(&100u32.to_be_bytes())
+        .await
+        .expect("a frame length");
+    send.write_all(&[7u8; 10]).await.expect("part of the frame");
+    let reading = tokio::spawn(async move {
+        let outcome = stream.read_payload().await;
+        (outcome, stream)
+    });
+    awaited(
+        "the stall deadline of the unfinished frame",
+        harness.deadlines.fire_when_armed(DeadlineKind::Stall),
+    )
+    .await;
+    let (outcome, stream) = awaited("the read that was cut", reading)
+        .await
+        .expect("the read task ended");
+    assert!(
+        matches!(outcome, Err(TransportError::Deadline(DeadlineKind::Stall))),
+        "the read was not cut by the stall deadline: {outcome:?}"
+    );
+    assert!(stream.is_revoked(), "a stream that stalled was left usable");
     drop(stream);
     assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
 
@@ -1592,6 +1735,119 @@ async fn a_host_that_drops_its_receiver_gives_no_more_credit() {
         "a device was given credit for a stream after the host dropped its receiver"
     );
     drop(next);
+
+    harness.finish().await;
+}
+
+/// The input streams a host takes on one connection by default: one for each attachment that may
+/// type at once.
+const INPUT_STREAMS: usize = 4;
+
+/// The device's next stream waits for credit that does not come: it asks for it and is told to
+/// wait, and the host has seen it blocked.
+async fn the_next_stream_finds_no_credit(harness: &Harness) {
+    let blocked = || {
+        harness
+            .host_connection
+            .stats()
+            .frame_rx
+            .streams_blocked_bidi
+    };
+    let before = blocked();
+    let mut next = Box::pin(harness.connection.open_bi());
+    assert!(
+        futures::poll!(&mut next).is_pending(),
+        "the device was given credit for a stream beyond the limit"
+    );
+    awaited("the host being told the device is blocked", async {
+        while blocked() == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        futures::poll!(&mut next).is_pending(),
+        "the device was given credit for a stream beyond the limit"
+    );
+}
+
+/// A host that takes input streams lets a device hold them beside everything else a connection
+/// carries: the control stream, the bulk streams, and the places a stream waits in while its header
+/// is read, with one spare. A stream of each long-lived kind is open and taken by the host; the
+/// device can still open every stream that is being announced, and no more than that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_has_room_for_input_streams_beside_the_bulk_streams() {
+    let mut harness = Harness::start(
+        &[StreamKind::AttachmentChunks, StreamKind::TerminalInput],
+        Taking::Forward,
+    )
+    .await;
+    let connection_id = harness.authorised.connection_id;
+    let bulk = SendLimits::default().max_bulk_streams;
+
+    let mut long_lived = Vec::new();
+    for transfer in 0..bulk {
+        let header = attachment_header(connection_id, u8::try_from(transfer).expect("a few"));
+        long_lived.push(
+            awaited(
+                "the credit for a bulk stream",
+                harness.device.open(&harness.connection, header),
+            )
+            .await
+            .expect("a bulk stream"),
+        );
+        let _ = harness.next().await;
+    }
+    for session in 0..INPUT_STREAMS {
+        let header = input_header(connection_id, u8::try_from(session).expect("a few"));
+        long_lived.push(
+            awaited(
+                "the credit for an input stream beside the bulk streams",
+                harness.device.open(&harness.connection, header),
+            )
+            .await
+            .expect("an input stream"),
+        );
+        let _ = harness.next().await;
+    }
+
+    let mut announcing = Vec::new();
+    for _ in 0..kr_transport::streams::MAX_PENDING_HEADERS + 1 {
+        announcing.push(
+            awaited(
+                "the credit for a stream beside the long-lived ones",
+                harness.connection.open_bi(),
+            )
+            .await
+            .expect("a stream"),
+        );
+    }
+    the_next_stream_finds_no_credit(&harness).await;
+
+    harness.finish().await;
+}
+
+/// A host that takes no input stream gives a device the room it always gave: its places are the
+/// control stream, the bulk streams, the header places and one spare, and a kind the host does not
+/// take adds none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_takes_no_input_streams_leaves_the_room_as_it_was() {
+    let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
+    let places =
+        SendLimits::default().max_bulk_streams + kr_transport::streams::MAX_PENDING_HEADERS + 1;
+
+    let mut opened = Vec::new();
+    for _ in 0..places {
+        opened.push(
+            awaited(
+                "the credit the first read gave",
+                harness.connection.open_bi(),
+            )
+            .await
+            .expect("a stream"),
+        );
+    }
+    the_next_stream_finds_no_credit(&harness).await;
 
     harness.finish().await;
 }

@@ -26,7 +26,8 @@
 //! reaches an operation that is already waiting. [`DataStream::split`] gives the reading half to
 //! one task and the writing half to another, which share the handle and keep the stream counted
 //! against the connection until both are gone. A stream whose registry holds deadlines
-//! ([`StreamRegistry::with_deadlines`]) is cut when its peer stops sending or stops reading.
+//! ([`StreamRegistry::with_deadlines`]) is cut when its peer stops sending or stops reading; a
+//! terminal-input stream is not cut for being quiet between frames, since a person's typing is.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -107,6 +108,15 @@ pub fn validate_header(
     } else {
         Err(HeaderRefusal::WrongResource)
     }
+}
+
+/// Whether a stream of `kind` is cut when it is quiet between frames.
+///
+/// A stream that carries a person's typing is quiet for as long as the person is, which says
+/// nothing of whether its peer has stopped. It keeps the header and stall deadlines: a frame that
+/// has begun has to finish.
+const fn is_cut_when_idle(kind: StreamKind) -> bool {
+    !matches!(kind, StreamKind::TerminalInput)
 }
 
 /// What keeps a stream counted against its connection while any half of it is held.
@@ -827,6 +837,11 @@ impl RegistryState {
         let reader = match &self.deadlines {
             Some(deadlines) => reader.with_deadlines(Arc::clone(deadlines)),
             None => reader,
+        };
+        let reader = if is_cut_when_idle(header.kind) {
+            reader
+        } else {
+            reader.without_idle_deadline()
         };
         DataStream {
             writer: DataWriter {
