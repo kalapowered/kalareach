@@ -114,9 +114,10 @@ report() {
 
 # The sampler: one process that reads the free space of the volume it was started in and sleeps.
 # A write that fails, on a disk with no room, is skipped and tried again at the next wake. At each
-# wake it reads the stop file, and it ends, after one last line `E <time>` in the samples, when
-# the file holds the token it was started with. A sampler that an earlier `begin` left running has
-# another token and is told to end by the stop file that `begin` writes first.
+# wake it reads the stop file, and it ends, after one last line `E <time> <token>` in the samples,
+# when the file holds the token it was started with. A sampler that an earlier `begin` left running
+# has another token and is told to end by the stop file that `begin` writes first; the line it
+# writes late has its own token, so `end` does not take it for the line of the sampler it waits for.
 start_sampler() {
     if ! command -v python3 > /dev/null 2>&1; then
         echo "  no sampling: python3 is not installed"
@@ -147,7 +148,7 @@ while True:
     time.sleep(interval)
 try:
     with open(path, "a") as samples:
-        samples.write("E %d\n" % time.time())
+        samples.write("E %d %s\n" % (time.time(), token))
 except OSError:
     pass
 ' "$samples" "$interval" "$stopfile" "$token" < /dev/null > /dev/null 2>&1 &
@@ -159,12 +160,19 @@ except OSError:
 # or held, and a process that has another number's place is not touched.
 stop_sampler() {
     [ -f "$tokenfile" ] || return 0
-    cat "$tokenfile" > "$stopfile" 2> /dev/null || return 0
+    token="$(cat "$tokenfile" 2> /dev/null)"
+    [ -n "$token" ] || return 0
+    printf '%s\n' "$token" > "$stopfile" 2> /dev/null || return 0
     waited=0
-    while [ "$waited" -lt 10 ] && ! grep -q '^E ' "$samples" 2> /dev/null; do
+    while [ "$waited" -lt 10 ] && ! sampler_ended "$token"; do
         sleep 0.5
         waited=$((waited + 1))
     done
+}
+
+# Whether the samples hold the last line of the sampler that has this token.
+sampler_ended() {
+    awk -v token="$1" '$1 == "E" && $3 == token { found = 1 } END { exit !found }' "$samples" 2> /dev/null
 }
 
 # The lowest sample after the last mark, as "<KiB> <epoch>", or nothing without one.

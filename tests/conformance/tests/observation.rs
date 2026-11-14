@@ -111,7 +111,7 @@ fn a_step_that_could_not_run_a_program_fails_once_and_keeps_the_file_as_it_was_s
     assert!(document.summary.failed_otherwise.is_empty());
     assert_eq!(
         document.summary.failure_line().unwrap(),
-        "1 failed steps: 1 carry an observation of a program that could not be run with damage \
+        "1 failed step: 1 carries an observation of a program that could not be run with damage \
          seen, 0 failed otherwise"
     );
     assert_eq!(
@@ -165,7 +165,7 @@ fn a_night_of_failed_steps_says_how_many_carry_the_observation_and_how_many_do_n
     assert_eq!(document.summary.failed_otherwise, [2]);
     assert_eq!(
         document.summary.failure_line().unwrap(),
-        "2 failed steps: 1 carry an observation of a program that could not be run with damage \
+        "2 failed steps: 1 carries an observation of a program that could not be run with damage \
          seen, 1 failed otherwise"
     );
     assert!(!document.passed());
