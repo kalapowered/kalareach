@@ -1137,6 +1137,7 @@ fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
             "const dir = env['KR_TEST_ARTIFACTS_DIR'] ?? '/tmp/x'",
         ),
         (script, "const dir = process.env.KR_TEST_ARTIFACTS_DIR"),
+        (script, "const same = KR_TEST_ARTIFACTS_DIR == other"),
         (flow, "        run: ls \"$KR_TEST_ARTIFACTS_DIR\""),
         (
             flow,
@@ -1174,8 +1175,12 @@ fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
             "Set `KR_TEST_ARTIFACTS_DIR` to a folder under /tmp.",
         ),
         (
+            rust,
+            "let other = std::env::var_os(\"MY_KR_TEST_ARTIFACTS_DIR_COPY\");",
+        ),
+        (
             "tests/support/artifacts/src/lib.rs",
-            "std::env::var_os(VARIABLE_NAMED_KR_TEST_ARTIFACTS_DIR)",
+            "std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\")",
         ),
     ] {
         assert!(
