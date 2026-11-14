@@ -108,7 +108,7 @@ Cargo runs each test binary of a step through the report's program, once to list
 
 The directory is named `kr-conformance-runner-<time>-<process number>-<count>`, where the time is when the report makes the directory, after it reads the map. The report removes nothing, so each run leaves one copy of the program in the temporary directory, about 10 MB in a debug build, and the system or the person clears it.
 
-The report refuses before it runs a step, with the reason on its standard error and exit status 2, when it cannot read its program, cannot write the copy, finds the copy unequal to the original, or finds the temporary directory inside the repository or inside the target directory the steps build in. It refuses the same way when the copy's path holds a space, because Cargo takes its runner as one word: set `TMPDIR` (`TMP` on Windows) to a directory whose path holds none. It never falls back to the original.
+The report refuses before it runs a step, with the reason on its standard error and exit status 2, when it cannot read its program, cannot write the copy, finds the copy unequal to the original, or finds the temporary directory inside the repository or inside the target directory the steps build in. It refuses the same way when the copy's path holds a space, because Cargo takes its runner as one word: set `TMPDIR` (`TMP` on Windows) to a directory whose path holds none. It never falls back to the original. The copy's folder, with the runner's records beside the copy, is left in the temporary directory when the run ends: the report removes nothing, and a source check holds that, so each run leaves one folder holding a copy of the report's program until the temporary directory is cleaned.
 
 ### A program a step could not run
 
