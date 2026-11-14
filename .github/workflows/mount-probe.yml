@@ -1,0 +1,33 @@
+name: mount-probe
+
+# One run of the conformance crate's rerun cases on the hosted macOS image, to see that a disk
+# image can be made and attached there. Nothing else runs.
+on:
+  push:
+    branches: ["scratch/T-FLAKE-71-mount-probe"]
+
+permissions:
+  contents: read
+
+jobs:
+  rerun-cases:
+    name: rerun cases on macOS
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 10
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: The rerun cases
+        timeout-minutes: 75
+        run: cargo test --locked -p kr-conformance --test rerun -- --test-threads=1
