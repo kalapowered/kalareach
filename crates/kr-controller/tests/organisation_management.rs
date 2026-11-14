@@ -1268,16 +1268,47 @@ async fn a_lease_for_the_local_owner_that_ends_sooner_is_told_while_its_own_barr
 /// KR-REQ-09.09, KR-REQ-17.54: a lease already in force, presented by the host's own local owner
 /// with a chain that drops another device's lease, changes the policy of its own and owes the whole
 /// host a fence: the presentation waits for the barrier that retires it and settles with the proof
-/// of it, so its answer is told while that revision is still the one in force. The dropped lease's
-/// connection ends with the host's. This is what `kr organisation present --chain` is told, and a
-/// hand-back that is limited to a lease that ends sooner would leave this answer to the debt pass's
-/// race.
+/// of it, so its answer is told while that revision is still the one in force. The dropped lease has
+/// ended: its device is refused on a new connection. This is what `kr organisation present --chain`
+/// is told, and a hand-back that is limited to a lease that ends sooner would leave this answer to
+/// the debt pass's race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_in_force_presented_with_a_chain_that_drops_a_lease_is_told_while_its_own_barrier_stands()
  {
+    a_lease_in_force_is_presented_with_a_chain_that_drops_a_lease(AtThePause::Nothing).await;
+}
+
+/// KR-REQ-09.09, KR-REQ-17.54: the answer of that chain presentation is under the revision of its
+/// own barrier, and no other. Another device's authority revoked after the route answered moves the
+/// revision once more, so the answer is not shown; the chain's effect stands all the same (the
+/// dropped lease has ended, the owner's lease is in force), and the same presentation on a new
+/// connection is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_in_force_presented_with_a_chain_that_drops_a_lease_is_not_shown_when_another_devices_authority_is_revoked_at_the_pause()
+ {
+    a_lease_in_force_is_presented_with_a_chain_that_drops_a_lease(
+        AtThePause::AnotherDevicesRevocation,
+    )
+    .await;
+}
+
+/// What lands after the route of the chain presentation has answered and before the door tells it.
+#[derive(Clone, Copy)]
+enum AtThePause {
+    /// Nothing: the revision in force is the one the presentation's own barrier set.
+    Nothing,
+    /// Another device's authority is revoked, which moves the revision again.
+    AnotherDevicesRevocation,
+}
+
+async fn a_lease_in_force_is_presented_with_a_chain_that_drops_a_lease(at_the_pause: AtThePause) {
     let mut fixture = Fixture::start().await;
     // Paired before the host is exclusive: afterwards no device of the owner's confirms a pairing.
     let bea = fixture.member("bea", SERVED).await;
+    let cy = match at_the_pause {
+        AtThePause::Nothing => None,
+        AtThePause::AnotherDevicesRevocation => Some(fixture.member("cy", SERVED).await),
+    };
     let mut client = fixture.host.client().await;
     fixture
         .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
@@ -1351,19 +1382,62 @@ async fn a_lease_in_force_presented_with_a_chain_that_drops_a_lease_is_told_whil
         fixture.authority_revision().get() > before.get(),
         "the presentation's own barrier advanced the revision before the route answered"
     );
+    let own = fixture.authority_revision();
+    if let Some(cy) = &cy {
+        controller
+            .revoke_device_authority(cy.record.device_id, None, None)
+            .await
+            .expect("another device's authority is revoked");
+        assert!(
+            fixture.authority_revision().get() > own.get(),
+            "the revocation moved the revision again"
+        );
+    }
     release.send(()).expect("the door goes on");
-    let told = telling
+    let answered = telling.await.expect("the door tells it");
+    match at_the_pause {
+        AtThePause::Nothing => {
+            let told =
+                answered.expect("the answer of the request whose chain dropped a lease is told");
+            assert_eq!(
+                told.expires_at_ms, owners.payload.expires_at_ms,
+                "the owner's lease is the one in force"
+            );
+        }
+        AtThePause::AnotherDevicesRevocation => {
+            let refused = answered.expect_err("a later withdrawal withholds the answer");
+            assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
+        }
+    }
+
+    // The chain's effect stands whether or not its answer was shown: the lease it dropped has ended,
+    // which a new connection of that device shows (the barrier closed its old one, and with it the
+    // control stream that it was read on).
+    drop(bea_raw);
+    fixture.until_the_fence_is_retired().await;
+    let fresh = bea.connect(&fixture).await;
+    let refused = read_host_info(&fresh)
         .await
-        .expect("the door tells it")
-        .expect("the answer of the request whose chain dropped a lease is told");
+        .expect_err("the lease the chain dropped has ended, so its device is refused");
+    assert!(denied(&refused), "{refused:?}");
+    fresh.close();
+    // The owner's lease is in force: the same presentation, on a new connection, is a repeat and is
+    // answered.
+    let mut again = fixture.host.client().await;
+    let repeated: kr_protocol::organisation::MembershipPresentResult = calls::mutate_as(
+        environment,
+        &mut again,
+        ActionId::new(kr_ipc::new_uuid()),
+        Method::MembershipPresent,
+        &params,
+    )
+    .await
+    .expect("the owner's lease that stands is answered when it is presented again");
     assert_eq!(
-        told.expires_at_ms, owners.payload.expires_at_ms,
+        repeated.expires_at_ms, owners.payload.expires_at_ms,
         "the owner's lease is the one in force"
     );
-    // The barrier withdrew every connection of the host, bea's included: its connection ends, and
-    // what it was served under is checked by the presentation suite's case of a chain that drops a
-    // lease.
-    drop(bea_raw);
+    drop(again);
     fixture.host.stop().await;
 }
 
