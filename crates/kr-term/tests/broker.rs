@@ -5,7 +5,7 @@
 //! application that asked and got nothing waits.
 
 use kr_term::engine::{Engine, EngineConfig};
-use kr_term::lane::{LaneGate, LaneLimits};
+use kr_term::lane::{DrainBudget, LaneGate, LaneLimits};
 use kr_term::modes::ModeKind;
 use kr_term::profile::{CAPABILITIES, Capability};
 use kr_term::snapshot::Viewport;
@@ -380,6 +380,45 @@ fn the_lane_respects_the_callers_byte_budget() {
         "the drain stopped at the byte budget"
     );
     assert!(engine.lane().pending() > 0, "the rest is still waiting");
+}
+
+/// KR-REQ-08.49: a caller that can hold only so many replies takes that many, and the rest stay in
+/// the lane in their order, under their own deadline.
+///
+/// What the drain leaves is neither lost nor kept alive by it: a drain that may take none still
+/// drops a reply that has waited past its deadline.
+#[test]
+fn the_lane_respects_the_callers_reply_budget_and_keeps_the_rest() {
+    let mut engine = engine();
+    engine.feed(&b"\x1b[6n".repeat(10), 0);
+    let budget = |replies| DrainBudget {
+        bytes: 1 << 20,
+        replies,
+    };
+
+    let none = engine
+        .lane_mut()
+        .drain_within(LaneGate::default(), budget(0), 0);
+    assert!(none.is_empty(), "a budget of no replies takes none");
+    assert_eq!(engine.lane().pending(), 10, "and loses none");
+
+    let four = engine
+        .lane_mut()
+        .drain_within(LaneGate::default(), budget(4), 0);
+    assert_eq!(four.len(), 4);
+    assert_eq!(engine.lane().pending(), 6, "the rest is still waiting");
+
+    let deadline = LaneLimits::DEFAULT.reply_deadline_ms;
+    let late = engine
+        .lane_mut()
+        .drain_within(LaneGate::default(), budget(0), deadline + 1);
+    assert!(late.is_empty());
+    assert_eq!(
+        engine.lane().pending(),
+        0,
+        "the deadline still ends what waited"
+    );
+    assert_eq!(engine.lane().degradation().expired, 6);
 }
 
 /// KR-REQ-08.48: a reply never lands inside an unfinished paste or a half-delivered human input
