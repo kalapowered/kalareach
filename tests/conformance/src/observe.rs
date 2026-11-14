@@ -79,6 +79,9 @@ pub struct Program {
     pub path: String,
     /// The log's own lines about it.
     pub lines: Vec<String>,
+    /// Whether the report's runner said it could not start the program, in its own words: the
+    /// shell's and Cargo's words do not say so.
+    pub said_by_runner: bool,
     /// When the file was looked at, in seconds since the epoch.
     pub observed_at: u64,
     /// What was found.
@@ -134,6 +137,7 @@ impl std::fmt::Display for Found {
 struct Refusal {
     path: String,
     lines: Vec<String>,
+    said_by_runner: bool,
 }
 
 /// Whether a line opens or closes a test's captured output in the standard harness's summary.
@@ -153,8 +157,15 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
     let mut test_failed = false;
     let mut in_test_output = false;
     let mut cause: Option<(usize, usize)> = None;
+    // Whether the program whose output is being read has shown that it started.
+    let mut started = false;
     for line in lines {
         let trimmed = line.trim();
+        if begins_a_program(trimmed) {
+            started = false;
+        } else if shows_a_program_started(trimmed) {
+            started = true;
+        }
         if trimmed.starts_with("test result: FAILED")
             || (trimmed.starts_with("test ") && trimmed.ends_with(" ... FAILED"))
         {
@@ -190,14 +201,20 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
                 found.push(Refusal {
                     path,
                     lines: vec![trimmed.to_owned()],
+                    said_by_runner: false,
                 });
                 cause = Some((found.len() - 1, CAUSE_LINES));
             }
         } else if let Some(path) = runner_refusal(trimmed) {
-            if found.len() < MOST_PROGRAMS && !found.iter().any(|known| known.path == path) {
+            if started {
+                // Said by a program that was running, which is not the runner's refusal.
+            } else if let Some(known) = found.iter_mut().find(|known| known.path == path) {
+                known.said_by_runner = true;
+            } else if found.len() < MOST_PROGRAMS {
                 found.push(Refusal {
                     path,
                     lines: vec![trimmed.to_owned()],
+                    said_by_runner: true,
                 });
             }
         } else if let Some(path) = shell_refusal(trimmed)
@@ -213,6 +230,7 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, bool) {
                 found.push(Refusal {
                     path,
                     lines: vec![line],
+                    said_by_runner: false,
                 });
             }
         }
@@ -230,6 +248,21 @@ fn cargo_refusal(line: &str) -> Option<String> {
     let (_, rest) = line.split_once("could not execute process `")?;
     let (command, _) = rest.split_once('`')?;
     command.split_whitespace().next().map(str::to_owned)
+}
+
+/// Whether a line of a log begins the output of one program: Cargo's announcement of a test
+/// binary or of documentation tests, or the lister's line before it runs a binary to list it.
+fn begins_a_program(line: &str) -> bool {
+    line.starts_with("Running ")
+        || line.starts_with("Doc-tests ")
+        || line.starts_with(crate::run::LISTING_BEGIN)
+}
+
+/// Whether a line is one a test harness prints once it has started: its count of tests, or a
+/// test's own line.
+fn shows_a_program_started(line: &str) -> bool {
+    (line.starts_with("running ") && (line.ends_with(" tests") || line.ends_with(" test")))
+        || line.starts_with("test ")
 }
 
 /// The program in the runner's "<runner>: <program> could not start: <error>".
@@ -284,6 +317,7 @@ pub fn observe_log(log: &Path, now: SystemTime) -> Option<Observed> {
                 file: observe_file(Path::new(&refusal.path)),
                 path: refusal.path,
                 lines: refusal.lines,
+                said_by_runner: refusal.said_by_runner,
                 observed_at: epoch(now).unwrap_or(0),
             })
             .collect(),
@@ -635,6 +669,36 @@ mod tests {
     }
 
     #[test]
+    fn the_runner_s_refusal_names_a_program_only_before_that_program_has_printed() {
+        let (found, _) = refusals(text(&[
+            "Running tests/a.rs (/t/a)",
+            "kr-conformance run-one: /t/a could not start: no",
+            "Running tests/b.rs (/t/b)",
+            "running 1 test",
+            "kr-conformance run-one: /t/b could not start: no",
+            "Running tests/c.rs (/t/c)",
+            "test c ... kr-conformance run-one: /t/c could not start: no",
+            "kr-conformance run-one: /t/c could not start: no",
+        ]));
+        let named: Vec<(&str, bool)> = found
+            .iter()
+            .map(|refusal| (refusal.path.as_str(), refusal.said_by_runner))
+            .collect();
+        assert_eq!(named, [("/t/a", true)]);
+    }
+
+    #[test]
+    fn a_program_that_cargo_and_the_runner_both_name_is_one_the_runner_said_it_could_not_start() {
+        let (found, _) = refusals(text(&[
+            "Running tests/a.rs (/t/a)",
+            "could not execute process `/t/a` (never executed)",
+            "kr-conformance run-one: /t/a could not start: no",
+        ]));
+        assert_eq!(found.len(), 1);
+        assert!(found[0].said_by_runner);
+    }
+
+    #[test]
     fn the_shell_s_words_count_only_where_the_log_holds_exit_126() {
         let (found, _) = refusals(text(&["/t/a: /t/a: cannot execute binary file"]));
         assert!(found.is_empty(), "{found:?}");
@@ -671,6 +735,7 @@ mod tests {
         let damaged = Program {
             path: "/t/a".to_owned(),
             lines: Vec::new(),
+            said_by_runner: false,
             observed_at: 0,
             file: Found::Read {
                 size: 0,
