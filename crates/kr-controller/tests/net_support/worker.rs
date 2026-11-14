@@ -118,7 +118,7 @@ impl Worker {
 
     /// As [`Self::start_running`], for a session that keeps no spool and retains only the last
     /// `window` bytes of its output. A device whose position falls behind them is behind the
-    /// session's bounded history, which the session's own spool, at its host-wide size, would
+    /// session's bounded history, which the spool a host keeps, at 128 MiB for one session, would
     /// take far more output to reach.
     pub async fn start_running_with_a_window(
         tree: &kr_ipc::testing::TempHost,
