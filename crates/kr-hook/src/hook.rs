@@ -15,8 +15,12 @@
 //! the answer is written and the process ends, whatever is still in flight. The answer goes before
 //! anything the run says about itself: a diagnostic goes to standard error after it, and is waited
 //! for until the same deadline or [`DIAGNOSTIC_ALLOWANCE`] after the answer, whichever is later, so
-//! a standard error nobody reads can hold neither the answer nor, past that, the end. The
-//! diagnostic says how long the run had run, on its own clock, when its answer was written
+//! a standard error nobody reads can hold neither the answer nor, past that, the end. The longest
+//! a run lasts is therefore 600 ms on Windows: the deadline and the allowance after it. On Unix a
+//! hook started in place of another waits first, for at most `helper::CLAIM_WAIT` (100 ms), for a
+//! replacement that is being started, and the allowance counts from the answer, so the longest run
+//! is 700 ms there. Both are inside the one second, by 400 ms and 300 ms. The diagnostic says how
+//! long the run had run, on its own clock, when its answer was written
 //! ([`answered_after`]), which is the figure to hold against an application's timeout: how long the
 //! machine took to start the process and to let it end lies outside the run.
 
@@ -1128,14 +1132,16 @@ mod tests {
     /// A run whose worker is silent is through inside the one-second timeout a session ending is
     /// given, by the run's own clock: the longest it waits is its deadline, what its claim waits for
     /// a replacement that is being started (on Unix, where a hook can be started in place of
-    /// another), and the allowance after its answer. The clock is made, so how fast the machine is
-    /// does not enter.
+    /// another), and the allowance after its answer. That is 700 ms on Unix and 600 ms on Windows,
+    /// which has no claim to wait for: 300 ms and 400 ms inside the timeout. The clock is made, so
+    /// how fast the machine is does not enter.
     #[test]
     fn a_run_whose_worker_is_silent_is_through_inside_the_session_end_timeout_on_its_own_clock() {
         #[cfg(unix)]
         let claim = crate::helper::CLAIM_WAIT;
         #[cfg(not(unix))]
         let claim = Duration::ZERO;
+        let longest = Duration::from_millis(if cfg!(unix) { 700 } else { 600 });
         for write in [Write::Stalls, Write::Finishes] {
             let ran = on_made_clock(Work::NeverAnswers, write, claim);
             assert_held_to_its_bound(&ran, Work::NeverAnswers, write);
@@ -1144,6 +1150,9 @@ mod tests {
                 "the run was through at {:?}, past the {SESSION_END_TIMEOUT:?} timeout",
                 ran.ended
             );
+            if matches!(write, Write::Stalls) {
+                assert_eq!(ran.ended, longest, "the longest a run lasts");
+            }
         }
     }
 
