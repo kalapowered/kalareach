@@ -36,6 +36,8 @@ pub struct Written {
     pub epoch: u64,
     pub sequence: u64,
     pub bytes: Vec<u8>,
+    /// The authority revision the host validated the frame's grant at.
+    pub revision: Option<u64>,
 }
 
 /// What the lane did, in the order it happened.
@@ -265,7 +267,8 @@ fn note(shared: &Shared, change: impl FnOnce(&mut Log)) {
     shared.changed.notify_waiters();
 }
 
-/// Accepts the host's lane and plays it until it ends.
+/// Accepts the host's lanes. The first is the one a suite's commands go to and whose end it can
+/// wait for; each further one is answered alike and takes no commands.
 async fn serve(
     listener: Listener,
     shared: Arc<Shared>,
@@ -275,8 +278,30 @@ async fn serve(
     let Ok((connection, _peer)) = listener.accept().await else {
         return;
     };
-    play(connection, &shared, ready, &mut commands).await;
-    note(&shared, |log| log.ended = true);
+    let mut others = tokio::task::JoinSet::new();
+    let first = play(connection, &shared, ready.clone(), &mut commands);
+    tokio::pin!(first);
+    let mut first_done = false;
+    loop {
+        tokio::select! {
+            () = &mut first, if !first_done => {
+                first_done = true;
+                note(&shared, |log| log.ended = true);
+            }
+            accepted = listener.accept() => {
+                let Ok((connection, _peer)) = accepted else {
+                    return;
+                };
+                let shared = Arc::clone(&shared);
+                let ready = ready.clone();
+                others.spawn(async move {
+                    // The sender stays with the lane, so that it takes no command and does not end.
+                    let (_idle, mut none) = mpsc::unbounded_channel();
+                    play(connection, &shared, ready, &mut none).await;
+                });
+            }
+        }
+    }
 }
 
 async fn play(
@@ -327,6 +352,7 @@ async fn play(
                     epoch: params.epoch.get(),
                     sequence: params.sequence.get(),
                     bytes: bytes.as_slice().to_vec(),
+                    revision: forwarded.actor.grant_revision.0.map(|revision| revision.get()),
                 };
                 note(shared, |log| log.frames.push(written.clone()));
                 waiting.push_back((forwarded.request.request_id, written));
