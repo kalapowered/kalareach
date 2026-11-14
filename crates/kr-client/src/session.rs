@@ -581,14 +581,12 @@ impl ConnectionWatch {
         let _ = ended.wait_for(|ended| *ended).await;
     }
 
-    /// Whether the connection has ended.
-    pub(crate) fn has_ended(&self) -> bool {
-        *self.state.ended.borrow()
-    }
-
-    /// What the host refused the connection with, when it did.
-    pub(crate) fn refusal(&self) -> Option<kr_protocol::error::ProtocolError> {
-        self.state.waiters().refusal.clone()
+    /// Whether the connection has ended and what the host refused it with when it did, read
+    /// together: the refusal is recorded before the end, and two reads could see one without the
+    /// other.
+    pub(crate) fn state(&self) -> (bool, Option<kr_protocol::error::ProtocolError>) {
+        let waiters = self.state.waiters();
+        (waiters.ended, waiters.refusal.clone())
     }
 }
 
