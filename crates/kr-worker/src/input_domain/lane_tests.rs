@@ -661,3 +661,78 @@ fn a_give_back_on_another_thread_while_a_top_up_runs_is_never_lost() {
         );
     }
 }
+
+/// Credit never joins a sum of another epoch, and never joins past a window state of its own epoch:
+/// what the host reads is each epoch's credit behind that epoch's window.
+#[test]
+fn a_credit_never_joins_across_epochs_or_past_a_window_state_of_its_own_epoch() {
+    let queue = LaneQueue::default();
+    let credit = |epoch: u64| LaneCredit {
+        epoch: InputLeaseEpoch::new(epoch),
+        frames: 1,
+        bytes: U64::new(1),
+    };
+    let window = |epoch: u64| LaneWindow {
+        epoch: InputLeaseEpoch::new(epoch),
+        holder: true,
+        frames: 1,
+        bytes: U64::new(1),
+        ended: kr_protocol::scalars::Nullable::null(),
+    };
+    queue.push_credit(credit(1));
+    queue.push_credit(credit(2));
+    queue.push_window(window(2));
+    queue.push_credit(credit(2));
+    let shapes: Vec<(&str, u64, u32)> = queue
+        .drain()
+        .iter()
+        .map(|frame| match frame {
+            ControlFrame::Event(ControlEvent::InputCredit(c)) => {
+                ("credit", c.epoch.get(), c.frames)
+            }
+            ControlFrame::Event(ControlEvent::InputWindow(w)) => {
+                ("window", w.epoch.get(), w.frames)
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![
+            ("credit", 1, 1),
+            ("credit", 2, 1),
+            ("window", 2, 1),
+            ("credit", 2, 1)
+        ]
+    );
+}
+
+/// A give-back made outside any hold, as the writer makes it, is carried out by the end of the next
+/// hold: the window is whole again and the host is told, with no top-up asked for by anyone else.
+#[test]
+fn the_end_of_a_hold_gives_the_window_back_what_a_drop_outside_a_hold_returned() {
+    let mut rig = Rig::new();
+    let mut view = View::new();
+    rig.take(&mut view);
+    let lane = rig.bind(&view);
+    rig.write(&mut view, Some(lane.id), b"k").expect("accepted");
+    let batches = rig.input.take_pending();
+    let shared = InputShared::new(rig.input);
+    lane.queue.drain();
+    drop(batches);
+    // The ledger is read inside the hold, and the hold's end then carries the request out.
+    let during = shared.lock().ledger();
+    assert!(
+        during.reserved.frames < LANE_WINDOW.frames,
+        "the window was already whole before the end of a hold"
+    );
+    assert_eq!(shared.lock().ledger().reserved, LANE_WINDOW);
+    let told = lane.queue.drain();
+    assert!(
+        told.iter().any(|frame| matches!(
+            frame,
+            ControlFrame::Event(ControlEvent::InputCredit(credit)) if credit.frames == 2
+        )),
+        "the host was not told of the credit: {told:?}"
+    );
+}
