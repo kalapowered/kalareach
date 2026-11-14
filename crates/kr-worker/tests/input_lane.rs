@@ -271,6 +271,8 @@ struct Rig {
     _temp: kr_ipc::testing::TempHost,
     _kept: tempfile::TempDir,
     received: std::path::PathBuf,
+    /// The pipe that an application which waits to read its terminal is let go through.
+    go: std::path::PathBuf,
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -292,30 +294,50 @@ impl Rig {
     /// A rig whose worker ends the link of a closed lane queue after `close_bound`, where one is
     /// given, rather than after the five seconds of the shipped worker.
     async fn start_with(close_bound: Option<Duration>) -> Self {
-        Self::start_built(close_bound, false).await
+        Self::start_built(close_bound, false, false).await
     }
 
     /// A rig whose session is a managed shell with the root editor's fence machine, its bridge
     /// registered and its hooks live, and no reader in an editor yet: input is accepted as it is
     /// outside an editor, and a launch asked of it is refused by the machine at once.
     async fn start_fenced() -> Self {
-        Self::start_built(None, true).await
+        Self::start_built(None, true, false).await
     }
 
-    async fn start_built(close_bound: Option<Duration>, fenced: bool) -> Self {
+    /// A rig whose application does not read its terminal until [`Self::let_the_application_read`]:
+    /// what the worker writes to it waits in the terminal, which holds only a little.
+    async fn start_unreading() -> Self {
+        Self::start_built(None, false, true).await
+    }
+
+    async fn start_built(close_bound: Option<Duration>, fenced: bool, waits: bool) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let kept = tempfile::tempdir().expect("a directory for what the application keeps");
         let received = kept.path().join("received");
+        let go = kept.path().join("go");
+        let wait = if waits {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&go)
+                    .status()
+                    .expect("mkfifo runs")
+                    .success(),
+                "the pipe for the application was made"
+            );
+            format!("read go < {}; ", kr_worker::testing::shell_quoted(&go))
+        } else {
+            String::new()
+        };
         let config = SessionConfig {
             session_id,
             session_epoch: SessionEpoch::V1,
             environment_id,
             display_number: DisplayNumber::new(1),
             shell: kr_worker::testing::posix_script(&format!(
-                "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee {}",
+                "stty raw -echo; printf '\\033[?2004hkr-ready.'; {wait}exec tee {}",
                 kr_worker::testing::shell_quoted(&received)
             )),
             shell_mode: if fenced {
@@ -407,6 +429,7 @@ impl Rig {
             _temp: temp,
             _kept: kept,
             received,
+            go,
             service,
             runtime,
             session_id,
@@ -572,16 +595,22 @@ impl Rig {
         })
     }
 
-    /// Puts the reader of the root editor at an empty prompt behind an acknowledged fence, as the
-    /// shell's bridge reports it, so that a launch asked of the session is reserved.
-    fn at_a_prompt(&self) {
-        let session_id = self.session_id;
-        let editor = EditorState {
+    /// The editor state the reader reports at an empty prompt.
+    fn an_empty_prompt() -> EditorState {
+        EditorState {
             buffer_empty: true,
             buffer_revision: EditorBufferRevision::new(1),
             keymap: EditorKeymap::Emacs,
             pending: PendingReaderInput::NONE,
-        };
+        }
+    }
+
+    /// Has the reader of the root editor enter an empty prompt, as the shell's bridge reports it,
+    /// and returns the fence that the worker asks it for. Until the reader answers the fence, the
+    /// machine holds the keys that the session accepts.
+    fn reader_enters(&self) -> kr_protocol::root::FenceId {
+        let session_id = self.session_id;
+        let editor = Self::an_empty_prompt();
         let mut asked = None;
         self.runtime
             .session()
@@ -609,7 +638,14 @@ impl Rig {
                 effects
             })
             .expect("the session has a fence machine");
-        let fence_id = asked.expect("the reader was asked for a fence");
+        asked.expect("the reader was asked for a fence")
+    }
+
+    /// Puts the reader of the root editor at an empty prompt behind an acknowledged fence, so that
+    /// a launch asked of the session is reserved.
+    fn at_a_prompt(&self) {
+        let fence_id = self.reader_enters();
+        let editor = Self::an_empty_prompt();
         self.runtime
             .session()
             .stimulate_fence(|driver| {
@@ -653,18 +689,21 @@ impl Rig {
 
     /// Takes the keys for `attachment`, from whoever holds them.
     async fn acquire(&mut self, attachment: AttachmentId) -> InputLeaseEpoch {
+        self.acquire_result(attachment).await.lease.epoch
+    }
+
+    /// Takes the keys for `attachment`, from whoever holds them, and returns the whole answer.
+    async fn acquire_result(&mut self, attachment: AttachmentId) -> InputAcquireResult {
         let params = InputAcquireParams {
             session_id: self.session_id,
             attachment_id: attachment,
             expected_epoch: Nullable::null(),
         };
-        let lease: InputAcquireResult = self
-            .forward_at(Method::InputAcquire, &params, 1)
+        self.forward_at(Method::InputAcquire, &params, 1)
             .await
             .expect("the device takes the keys")
             .to_typed()
-            .expect("a lease");
-        lease.lease.epoch
+            .expect("a lease")
     }
 
     /// Sends the bind of a lane that names `proxy_connection` and `attachment`, and returns the
@@ -768,6 +807,15 @@ impl Rig {
     ) -> Result<ParamsValue, ProtocolError> {
         let params = self.launch_params(after);
         self.forward_at(Method::ShellLaunch, &params, 1).await
+    }
+
+    /// Lets an application that waits to read its terminal go on.
+    async fn let_the_application_read(&self) {
+        let go = self.go.clone();
+        tokio::task::spawn_blocking(move || std::fs::write(go, b"go\n"))
+            .await
+            .expect("the write ran")
+            .expect("the application was let go");
     }
 
     /// What the application has received so far.
@@ -1432,13 +1480,36 @@ async fn proxy_write(
     sequence: u64,
     revision: u64,
 ) -> Outcome {
+    proxy_write_of(
+        rig,
+        attachment,
+        epoch,
+        sequence,
+        b"p",
+        Nullable::null(),
+        revision,
+    )
+    .await
+}
+
+/// A forwarded `input.write` of `bytes` on the proxy link, admitted under an authority that ends
+/// at `deadline`, whose caller was validated at `revision`.
+async fn proxy_write_of(
+    rig: &mut Rig,
+    attachment: AttachmentId,
+    epoch: InputLeaseEpoch,
+    sequence: u64,
+    bytes: &[u8],
+    deadline: Nullable<U64>,
+    revision: u64,
+) -> Outcome {
     let params = InputWriteParams {
         session_id: rig.session_id,
         attachment_id: attachment,
         epoch,
         sequence: InputSequence::new(sequence),
         input: InputContent::Bytes {
-            bytes: Bytes::new(b"p".to_vec()),
+            bytes: Bytes::new(bytes.to_vec()),
         },
     };
     let id = RequestId::new(9_000 + sequence);
@@ -1453,7 +1524,7 @@ async fn proxy_write(
                 params: ParamsValue::from_typed(&params).expect("encodes"),
             },
             actor,
-            authority_deadline_boot_ms: Nullable::null(),
+            authority_deadline_boot_ms: deadline,
             history: None,
         })))
         .await
@@ -2377,6 +2448,175 @@ async fn the_marker_of_a_reserved_launch_follows_the_acceptances_before_its_barr
         answer.is_err(),
         "nothing was installed in the closing session"
     );
+}
+
+/// KR-REQ-23.36: a parent's withdrawal ends its lanes' windows as its first step. A replacement
+/// generation's withdrawal is stopped after its latch is set and before it has detached anything,
+/// and the lane's window has ended by then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parents_withdrawal_ends_its_lanes_window_before_it_sets_its_latch() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    rig.acquire(attachment).await;
+    let _lane = rig.lane(attachment).await;
+    assert_ne!(
+        rig.runtime.input().lock().ledger().reserved,
+        Cost::default(),
+        "the lane has its window while its parent is linked"
+    );
+
+    let (stopped, go) = rig.service.stall_next_withdrawal_after_the_latch();
+    let steps = async {
+        tokio::time::timeout(WAIT, stopped)
+            .await
+            .expect("the withdrawal reached its latch")
+            .expect("the stop was armed");
+        assert_eq!(
+            rig.runtime.input().lock().ledger().reserved,
+            Cost::default(),
+            "the lane's window had not ended when the withdrawal set its latch"
+        );
+        go.send(()).expect("lets the withdrawal go");
+    };
+    // The new generation's handshake waits for the withdrawals it makes.
+    let ((), _second) = tokio::join!(steps, rig.connect(2, None));
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: typing that the session accepted from a holder with no lane is never discarded
+/// with no word. The writer drops the batch at its deadline and ends the epoch, and the count of
+/// the bytes it dropped is what the next acquire reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_dropped_for_a_holder_with_no_lane_is_counted_by_the_next_acquire() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let other = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let (stopped, release) = rig.runtime.input().writer_hold().arm();
+    let deadline = kr_ipc::clock::boot_elapsed_ms() + 1_500;
+    let outcome = proxy_write_of(
+        &mut rig,
+        attachment,
+        epoch,
+        0,
+        b"abc",
+        Nullable::some(U64::new(deadline)),
+        1,
+    )
+    .await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the key is accepted before its deadline: {outcome:?}"
+    );
+    stopped.await.expect("the writer took the batch");
+    until("the batch's authority ended", WAIT, || {
+        kr_ipc::clock::boot_elapsed_ms() >= deadline
+    })
+    .await;
+    release.send(()).expect("lets the writer go");
+    until("the writer ended the holder's epoch", WAIT, || {
+        rig.runtime.input().lock().lease().holder.0.is_none()
+    })
+    .await;
+
+    let taken = rig.acquire_result(other).await;
+    assert_eq!(
+        taken.discarded_bytes.get(),
+        3,
+        "the next acquire reports what the writer dropped"
+    );
+    rig.drained().await;
+    assert!(
+        rig.received().is_empty(),
+        "no piece of the batch reached the application"
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: a revision that takes the keys from the holder counts what it discarded in the
+/// lane's notice, the batch the writer holds and the frame behind it together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_that_reaches_the_holder_counts_what_it_discarded_in_the_notice() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let (stopped, go) = rig.runtime.input().writer_hold().arm();
+    typed(&mut lane, &[b"abc"]).await;
+    stopped.await.expect("the writer took the batch");
+    typed(&mut lane, &[b"de"]).await;
+
+    announce_two(&rig, reach(&rig, Reach::Device)).await;
+    let notice = next_window(&mut lane).await;
+    let ended = notice.ended.0.expect("the notice says an epoch ended");
+    assert_eq!((ended.epoch, ended.fenced_bytes.get()), (epoch, 5));
+    go.send(()).expect("lets the writer go");
+    rig.drained().await;
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: a batch whose authority ends while the writer is part way through it is not
+/// written past its deadline, and the notice counts the rest: what the application received and
+/// what the notice counts are the bytes of the frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_remainder_of_a_batch_the_writer_abandons_at_its_deadline_is_counted_in_the_notice() {
+    const FRAME: usize = 60_000;
+    let mut rig = Rig::start_unreading().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+
+    // The terminal holds only a little of a frame while its application does not read, so the
+    // writer is part way through the batch when the authority behind it ends.
+    let deadline = kr_ipc::clock::boot_elapsed_ms() + 5_000;
+    let frame = [b'q'; FRAME];
+    let id = lane.send_before(&frame, deadline).await;
+    assert_eq!(
+        lane.accepted().await,
+        id,
+        "the frame is accepted before its deadline"
+    );
+    until("the batch's authority ended", WAIT, || {
+        kr_ipc::clock::boot_elapsed_ms() >= deadline
+    })
+    .await;
+    rig.let_the_application_read().await;
+
+    let notice = next_window(&mut lane).await;
+    let ended = notice.ended.0.expect("the notice says an epoch ended");
+    assert_eq!(ended.epoch, epoch);
+    let fenced = usize::try_from(ended.fenced_bytes.get()).expect("a count");
+    assert!(
+        fenced > 0 && fenced < FRAME,
+        "the writer was part way through the batch: {fenced} of {FRAME} bytes were not written"
+    );
+    rig.received_exactly(&frame[..FRAME - fenced]).await;
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: what the root editor's machine holds for a lease that ends is part of the fenced
+/// count, in the answer of a release and in the notice. The reader has not answered the fence it
+/// was asked for, so the machine holds the two bytes that the session accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fenced_count_includes_what_the_root_editors_machine_holds() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    rig.reader_enters();
+    typed(&mut lane, &[b"x", b"y"]).await;
+
+    let released = rig
+        .release_with(attachment, epoch, None, true)
+        .await
+        .expect("released");
+    assert_eq!(released.fenced_bytes.map(U64::get), Some(2));
+    let notice = next_window(&mut lane).await;
+    assert_eq!(
+        notice.ended.0.expect("an epoch ended").fenced_bytes.get(),
+        2
+    );
+    rig.finish().await;
 }
 
 /// KR-REQ-23.36: the hello states the lane's capability, which promises the window, the position
