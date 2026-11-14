@@ -722,6 +722,60 @@ async fn an_older_epoch_with_two_frames_at_the_lane_is_told_refused_once() {
     rig.stop().await;
 }
 
+/// A worker that does not answer a frame is cut at the frame's deadline: the device's stream is
+/// reset, and the connection stands. The deadline is shortened for the case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_does_not_answer_is_cut_at_the_frames_deadline() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    rig.adopted
+        .host
+        .network()
+        .input_stages()
+        .set_frame_deadline(Duration::from_millis(500));
+    rig.lane.hold_answers();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    let ended = loop {
+        match next_or_reset(&mut stream).await {
+            Ok(Some(_)) => {}
+            other => break other,
+        }
+    };
+    assert!(ended.is_err(), "the stream is reset: {ended:?}");
+    rig.stop().await;
+}
+
+/// A frame keeps the deadline it was given when it was passed on: waiting for the lane's writer does
+/// not renew it. A frame that the writer is held at past its deadline is cut, not written. The
+/// deadline is shortened for the case, and the hold lasts longer than it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_that_waits_for_the_writer_past_its_deadline_is_cut_and_not_written() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    stages.set_frame_deadline(Duration::from_millis(300));
+    let (at_write, go) = stages.hold_before_a_lane_write();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    arrived(at_write).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let _ = go.send(());
+    let ended = loop {
+        match next_or_reset(&mut stream).await {
+            Ok(Some(InputAck::Accepted { .. })) => panic!("a frame past its deadline was accepted"),
+            Ok(Some(_)) => {}
+            other => break other,
+        }
+    };
+    assert!(ended.is_err(), "the stream is reset: {ended:?}");
+    rig.stop().await;
+}
+
 /// Opens a stream with `header` and says the host ended it without serving it: the device is not
 /// told `Ready`, and no lane was bound for it at the worker.
 async fn is_not_served(rig: &Rig, header: StreamHeader) {

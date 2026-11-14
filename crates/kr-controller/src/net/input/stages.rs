@@ -107,6 +107,7 @@ mod with_seams {
         read: AtomicU64,
         detaches: AtomicU64,
         cuts: AtomicU64,
+        frame_deadline_ms: AtomicU64,
         reads_full: watch::Sender<u64>,
         reads_ended: watch::Sender<u64>,
         drain_waits: watch::Sender<u64>,
@@ -130,6 +131,7 @@ mod with_seams {
                 read: AtomicU64::new(0),
                 detaches: AtomicU64::new(0),
                 cuts: AtomicU64::new(0),
+                frame_deadline_ms: AtomicU64::new(0),
                 reads_full: watch::channel(0).0,
                 reads_ended: watch::channel(0).0,
                 drain_waits: watch::channel(0).0,
@@ -197,6 +199,15 @@ mod with_seams {
         #[must_use]
         pub fn hold_after_a_graceful_look(&self) -> Held {
             self.after_a_graceful_look.arm()
+        }
+
+        /// Gives the frames that the host passes on from now a deadline of `deadline` from the moment
+        /// they are passed on, instead of the door's own.
+        pub fn set_frame_deadline(&self, deadline: std::time::Duration) {
+            let millis = u64::try_from(deadline.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            self.frame_deadline_ms.store(millis, Ordering::SeqCst);
         }
 
         /// What the stages hold now and the most they have held, across the streams of the host.
@@ -309,6 +320,13 @@ mod with_seams {
             self.cuts.fetch_add(1, Ordering::SeqCst);
         }
 
+        pub(in crate::service::net) fn frame_deadline(&self) -> std::time::Duration {
+            match self.frame_deadline_ms.load(Ordering::SeqCst) {
+                0 => super::super::FRAME_DEADLINE,
+                millis => std::time::Duration::from_millis(millis),
+            }
+        }
+
         pub(in crate::service::net) fn frame_taken(&self) {
             self.host_holds.rise();
         }
@@ -372,6 +390,10 @@ mod without_seams {
         pub(in crate::service::net) fn detach_told(&self) {}
 
         pub(in crate::service::net) fn stream_cut(&self) {}
+
+        pub(in crate::service::net) fn frame_deadline(&self) -> std::time::Duration {
+            super::super::FRAME_DEADLINE
+        }
 
         pub(in crate::service::net) fn frame_taken(&self) {}
 

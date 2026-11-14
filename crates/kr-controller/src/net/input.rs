@@ -655,7 +655,7 @@ impl Flow {
                         } else if *frames >= claim.frames as u64 && *bytes >= claim.bytes as u64 {
                             *frames -= claim.frames as u64;
                             *bytes -= claim.bytes as u64;
-                            Routed::Forward(Instant::now() + FRAME_DEADLINE)
+                            Routed::Forward(Instant::now() + self.stages.frame_deadline())
                         } else {
                             Routed::Wait
                         }
