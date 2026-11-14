@@ -1065,12 +1065,23 @@ impl Made {
             // The folder is not tried while the data directory's own removal did not finish. The
             // words give what that removal answered and no more: a directory that holds an entry
             // and another object at the directory's name are different answers.
-            Some(_) if matches!(directory, Taken::Stays(_) | Taken::Unconfirmed(_)) => {
-                let (Taken::Stays(why) | Taken::Unconfirmed(why)) = &directory else {
-                    unreachable!("the arm matched a directory that stays or is not confirmed gone")
+            Some(_) if matches!(directory, Taken::Stays(_)) => {
+                let Taken::Stays(why) = &directory else {
+                    unreachable!("the arm matched a directory that stays")
                 };
                 Taken::Stays(format!(
                     "not tried: the removal of the data directory did not finish ({why})"
+                ))
+            }
+            // A directory that was marked and whose name could not be read afterwards is not known
+            // to stay: the folder above it is not tried, and the words say that the removal was not
+            // confirmed.
+            Some(_) if matches!(directory, Taken::Unconfirmed(_)) => {
+                let Taken::Unconfirmed(why) = &directory else {
+                    unreachable!("the arm matched a directory that is not confirmed gone")
+                };
+                Taken::Stays(format!(
+                    "not tried: the removal of the data directory was not confirmed ({why})"
                 ))
             }
             Some(_) if directory == Taken::NotFound => Taken::Stays(
@@ -4146,9 +4157,14 @@ impl Run {
                 // that was not found, and is not counted as gone or as a record that was marked:
                 // nothing read shows where it is.
                 taken => {
-                    rolled
-                        .stayed
-                        .extend(remedy::rollback_entry(&taken, &path.display().to_string()));
+                    let entry = remedy::rollback_entry(&taken, &path.display().to_string());
+                    // An object that was marked and whose name could not be read afterwards is not
+                    // said to be kept: its words say that the mark was set and the read failed.
+                    if matches!(taken, Taken::Unconfirmed(_)) {
+                        rolled.unconfirmed.extend(entry);
+                    } else {
+                        rolled.stayed.extend(entry);
+                    }
                     false
                 }
             }
@@ -4201,8 +4217,13 @@ impl Run {
                 Some(Taken::Marked) => rolled.marked.push(path),
                 // A folder that stays is not in the data directory's place: it has a clause of its
                 // own in the ending.
-                Some(taken @ (Taken::NotFound | Taken::Stays(_) | Taken::Unconfirmed(_))) => {
+                Some(taken @ (Taken::NotFound | Taken::Stays(_))) => {
                     rolled.folder.extend(remedy::rollback_entry(&taken, &path));
+                }
+                Some(taken @ Taken::Unconfirmed(_)) => {
+                    rolled
+                        .unconfirmed
+                        .extend(remedy::rollback_entry(&taken, &path));
                 }
                 Some(Taken::NotMade) | None => {}
             }
@@ -4216,6 +4237,10 @@ impl Run {
             let path = path.display().to_string();
             if taken == Taken::Marked {
                 rolled.marked.push(path);
+            } else if matches!(taken, Taken::Unconfirmed(_)) {
+                rolled
+                    .unconfirmed
+                    .extend(remedy::rollback_entry(&taken, &path));
             } else {
                 rolled.stayed.extend(remedy::rollback_entry(&taken, &path));
             }
@@ -4237,6 +4262,10 @@ struct Rolled {
     /// The folder above the program directory, where this run made it and it stays or was not
     /// found: apart from `stayed`, since it is not in the data directory's place.
     folder: Vec<String>,
+    /// Each object that was marked for removal and whose name could not be read afterwards: the
+    /// words say that the mark was set and the read failed, and nothing says that it stays or that
+    /// it is gone.
+    unconfirmed: Vec<String>,
     /// Whether the run wrote records and the rollback marked each of them.
     records_deleted: bool,
 }
@@ -6232,7 +6261,10 @@ fn undo_recorded(
                 // directory's own removal names it.
                 run.sweep(Layout::Staging);
                 let rolled = run.take_away();
-                if rolled.stayed.is_empty() && rolled.folder.is_empty() {
+                if rolled.stayed.is_empty()
+                    && rolled.folder.is_empty()
+                    && rolled.unconfirmed.is_empty()
+                {
                     // text: remove_at-28
                     say(&format!(
                         "{}{unread_prior}",
@@ -6244,6 +6276,7 @@ fn undo_recorded(
                     Err(Error::Failed(remedy::rollback_laid_stays(
                         &rolled.stayed,
                         &rolled.folder,
+                        &rolled.unconfirmed,
                         &rolled.marked,
                     )))
                 }
