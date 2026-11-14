@@ -424,6 +424,93 @@ fn lease_ended(rig: &Rig) -> LaneWindow {
     }
 }
 
+/// The refusal of the lane's current epoch stands when a late answer of an older epoch comes: the
+/// device is told once that the current epoch's typing is refused, and is not told again by the
+/// older epoch's answer, nor for each later frame of the current epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refusal_of_the_current_epoch_stands_against_a_late_answer_of_an_older_epoch() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    rig.lane.hold_answers();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    rig.lane
+        .until("the older epoch's frame is at the lane", |frames| {
+            frames.len() == 1
+        })
+        .await;
+
+    let newer = InputLeaseEpoch::new(rig.epoch.get() + 1);
+    rig.lane.send_window(LaneWindow {
+        epoch: newer,
+        holder: false,
+        frames: 0,
+        bytes: U64::new(0),
+        ended: Nullable::some(LaneEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+    });
+    let newer_frame = |sequence: u64| InputFrame {
+        epoch: newer,
+        sequence: InputSequence::new(sequence),
+        bytes: Bytes::new(b"n".to_vec()),
+    };
+    stream
+        .write_message(&newer_frame(0))
+        .await
+        .expect("the frame is written");
+    let mut refused_newer = 0;
+    loop {
+        match next(&mut stream).await {
+            Some(InputAck::Refused { epoch, .. }) if epoch == newer => {
+                refused_newer += 1;
+                break;
+            }
+            Some(InputAck::EpochEnded { .. }) => {}
+            other => panic!("the host was to refuse the newer epoch's frame: {other:?}"),
+        }
+    }
+
+    // The worker now answers the older epoch's frame with the refusal that the window's move
+    // gives it, and the device then types once more in the current epoch.
+    rig.lane.refuse_from(0);
+    rig.lane.release_answers();
+    until("the late answer is read", || {
+        stages.counts().unanswered == 0
+    })
+    .await;
+    let (mut reader, mut writer) = stream.split();
+    writer
+        .write_message(&newer_frame(1))
+        .await
+        .expect("the frame is written");
+    drop(writer);
+    let mut refused_older = 0;
+    while let Some(ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the host answers in time")
+        .expect("the stream is not reset")
+    {
+        if let InputAck::Refused { epoch, .. } = ack {
+            if epoch == newer {
+                refused_newer += 1;
+            } else {
+                refused_older += 1;
+            }
+        }
+    }
+    assert_eq!(refused_newer, 1, "the current epoch is refused once");
+    assert_eq!(
+        refused_older, 0,
+        "the older epoch's late answer says nothing"
+    );
+    rig.stop().await;
+}
+
 /// The authority feed withdraws what a frame stands on between the host's decision for it and the
 /// write to the worker: the worker is never given the frame. The withdrawal also takes the
 /// connection away, which may stop the writer before it asks the feed again, so this shows that the
@@ -798,6 +885,42 @@ async fn a_reset_is_learned_while_the_credit_is_spent() {
         counts.read == 2 && counts.held == 1
     })
     .await;
+    read_until_accepted(&mut stream, 0).await;
+    stream.reset();
+    rig.lane.until_ended().await;
+    until("the stages are empty", || {
+        let counts = stages.counts();
+        counts.held == 0 && counts.unanswered == 0
+    })
+    .await;
+    rig.stop().await;
+}
+
+/// A device that resets its stream while the host holds as many frames as it reads ahead and the
+/// credit is spent is heard all the same, though the host reads no third frame: the stream and its
+/// lane end, and the frames it held are dropped with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_is_learned_while_the_read_ahead_is_full() {
+    let claim = input_claim(2);
+    let rig = Rig::start_with_credit(claim.frames as u32, claim.bytes as u64).await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut full = stages.reads_full();
+    rig.lane.withhold_credit();
+    for (sequence, bytes) in counters(3).iter().enumerate() {
+        stream
+            .write_message(&rig.frame(sequence as u64, bytes))
+            .await
+            .expect("the frame is written");
+    }
+    tokio::time::timeout(WAIT, full.wait_for(|turns| *turns >= 1))
+        .await
+        .expect("the host stopped reading in time")
+        .expect("the count stands");
+    assert_eq!(stages.counts().held, READ_AHEAD, "the read-ahead is full");
+    // The one forwarded frame is acknowledged first, so that the host has nothing to write to the
+    // device and only its read can learn of the reset.
+    read_until_accepted(&mut stream, 0).await;
     stream.reset();
     rig.lane.until_ended().await;
     until("the stages are empty", || {
@@ -1128,6 +1251,18 @@ async fn type_and_wait(rig: &Rig, stream: &mut DataStream, sequence: u64, bytes:
         match next(stream).await {
             Some(InputAck::Accepted { through, .. }) if through.get() >= sequence => return,
             Some(InputAck::Accepted { .. }) => {}
+            other => panic!("the typing was to be accepted, and the host said {other:?}"),
+        }
+    }
+}
+
+/// Reads acknowledgements until the host has accepted the frame at `sequence`, so that nothing is
+/// left for the host to write to the device afterwards.
+async fn read_until_accepted(stream: &mut DataStream, sequence: u64) {
+    loop {
+        match next(stream).await {
+            Some(InputAck::Accepted { through, .. }) if through.get() >= sequence => return,
+            Some(InputAck::Ready { .. } | InputAck::Accepted { .. }) => {}
             other => panic!("the typing was to be accepted, and the host said {other:?}"),
         }
     }
