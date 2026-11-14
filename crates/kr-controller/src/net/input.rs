@@ -724,14 +724,20 @@ pub(super) async fn serve(door: Arc<DataDoor>, mut reader: DataReader, writer: D
             let _ = acked.send(());
         }
     });
-    run(&door, &mut reader, &flow, &queue, session, attachment).await;
-    match flow.ended() {
-        // What the device is owed is written, and the stream finishes. A write that the device
-        // does not read is cut by the write deadline.
-        Some(End::Graceful) => {
-            let _ = acks_flushed.await;
-        }
-        _ => handle.revoke(),
+    run(
+        &door,
+        &mut reader,
+        &flow,
+        &queue,
+        session,
+        attachment,
+        acks_flushed,
+    )
+    .await;
+    // A graceful end was waited out inside `run`, with what the device is owed written. A stream
+    // that was cut or revoked is reset now.
+    if flow.ended() != Some(End::Graceful) {
+        handle.revoke();
     }
     drop(standing);
 }
@@ -864,7 +870,10 @@ async fn bind(
 /// or hold it until the worker's window for its epoch arrives. Returns when the stream ends.
 ///
 /// A read that is dropped part way resets the stream, so one read is kept pending across the
-/// loop's waits and is never raced away.
+/// loop's waits and is never raced away. For the same reason a stream that the host ends by its own
+/// decision keeps that read until `acks_flushed` says that what the device is owed has been written
+/// and the stream's writing half has finished: letting the read go sooner would reset the stream
+/// under the last acknowledgement.
 async fn run(
     door: &Arc<DataDoor>,
     reader: &mut DataReader,
@@ -872,6 +881,7 @@ async fn run(
     queue: &mpsc::UnboundedSender<LaneFrame>,
     session: kr_protocol::ids::SessionId,
     attachment: AttachmentId,
+    acks_flushed: tokio::sync::oneshot::Receiver<()>,
 ) {
     let handle = reader.handle();
     let mut version = flow.subscribe();
@@ -884,7 +894,7 @@ async fn run(
     let mut finished = false;
     loop {
         if flow.ended().is_some() || handle.is_revoked() {
-            return;
+            break;
         }
         // Marked before the state is looked at, so a change after the look is never missed.
         version.borrow_and_update();
@@ -920,7 +930,7 @@ async fn run(
         if finished && held.is_empty() && flow.drained() {
             // The device is done and what it wrote is answered: the stream finishes.
             flow.end(End::Graceful);
-            return;
+            break;
         }
         tokio::select! {
             _ = version.changed() => {}
@@ -947,6 +957,13 @@ async fn run(
             }
             () = handle.revoked() => return,
         }
+    }
+    if flow.ended() == Some(End::Graceful) {
+        // The stream task has read all it will. What the device is owed is written, and the
+        // writing half finishes, before the pending read is let go. A write that the device does
+        // not read is cut by the write deadline, which ends the wait.
+        flow.stages.read_ends();
+        let _ = acks_flushed.await;
     }
 }
 
