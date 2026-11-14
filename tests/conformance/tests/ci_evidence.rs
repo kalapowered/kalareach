@@ -1014,11 +1014,51 @@ fn artifacts_assignment(line: &str) -> Option<String> {
     Some(leading_value(&line[at + ARTIFACTS_VARIABLE.len() + 1..]))
 }
 
+/// Whether the text `head` in front of the variable's name ends inside a shell test: a `[` or `[[`
+/// that starts a command and has no `]` after it yet, or a `test` that starts a command and has no
+/// `;`, `&` or `|` after it yet. A bracket that is part of a word, a string or a script's subscript
+/// (`os.environ["NAME"]`, `process.env['NAME']`) is no shell test.
+fn inside_shell_test(head: &str) -> bool {
+    const BEFORE_A_COMMAND: [&str; 7] = ["if", "elif", "while", "until", "then", "else", "do"];
+    let separator = |character: char| matches!(character, '(' | '{' | ';' | '!' | '&' | '|');
+    let starts_a_command = |before: &str| {
+        let before = before.trim_end();
+        before.is_empty()
+            || before.ends_with(separator)
+            || BEFORE_A_COMMAND.iter().any(|word| {
+                before.strip_suffix(word).is_some_and(|rest| {
+                    rest.chars()
+                        .last()
+                        .is_none_or(|last| last.is_whitespace() || separator(last))
+                })
+            })
+    };
+    head.char_indices().any(|(at, _)| {
+        let rest = &head[at..];
+        let Some(opener) = ["[[", "[", "test"].into_iter().find(|opener| {
+            rest.strip_prefix(opener)
+                .is_some_and(|after| after.starts_with([' ', '\t']))
+        }) else {
+            return false;
+        };
+        let inside = &rest[opener.len()..];
+        let open = if opener == "test" {
+            !inside.contains([';', '&', '|'])
+        } else {
+            !inside.contains(']')
+        };
+        open && starts_a_command(&head[..at])
+    })
+}
+
 /// Whether a line writes the variable in a way `artifacts_assignment` does not read: PowerShell's
-/// `$env:NAME = value`, a script's `os.environ["NAME"] = value` or `NAME += value`, a setter that
-/// takes the name and a value (`SetEnvironmentVariable('NAME', value)`), an object key in a script,
-/// or an expansion with a form of default or alternate other than `${NAME:-default}`, `${NAME:?}` and
-/// `${NAME:+word}`. A comparison, a plain read and an expansion with a default are not writes.
+/// `$env:NAME = value`, a script's `os.environ["NAME"] = value` (either quote), `os.putenv("NAME",
+/// value)`, `process.env.NAME = value` or `process.env['NAME'] = value`, `NAME += value`, `NAME ??=
+/// value` or `NAME ||= value`, a setter that takes the name and a value
+/// (`SetEnvironmentVariable('NAME', value)`), an object key in a script, or an expansion with a form
+/// of default or alternate other than `${NAME:-default}`, `${NAME:?}` and `${NAME:+word}`. A
+/// comparison (`==`, `=~`, or a shell test with the name inside it), a plain read and an expansion
+/// with a default are not writes.
 fn writes_unread(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.starts_with('#') || trimmed.starts_with("//") || artifacts_assignment(line).is_some()
@@ -1028,8 +1068,7 @@ fn writes_unread(line: &str) -> bool {
     line.match_indices(ARTIFACTS_VARIABLE).any(|(at, _)| {
         let head = &line[..at];
         let after = line[at + ARTIFACTS_VARIABLE.len()..]
-            .trim_start_matches(['"', '\'', ']', ')'])
-            .trim_start();
+            .trim_start_matches(['"', '\'', ']', ')', ' ', '\t']);
         if head.ends_with("${") {
             return !(after.starts_with(":-")
                 || after.starts_with(":?")
@@ -1037,12 +1076,14 @@ fn writes_unread(line: &str) -> bool {
                 || after.starts_with('}'));
         }
         let call_or_key = head.trim_end_matches(['"', '\'', ' ', '\t']);
-        let comparison = head.contains('[') || head.contains("test ");
+        let comparison = inside_shell_test(head);
         (after.starts_with('=')
             && !after.starts_with("==")
             && !after.starts_with("=~")
             && !comparison)
             || after.starts_with("+=")
+            || after.starts_with("??=")
+            || after.starts_with("||=")
             || (after.starts_with(',') && call_or_key.ends_with('('))
             || (after.starts_with(':')
                 && !after.starts_with(":-")
@@ -1364,5 +1405,75 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
     assert!(
         steps_with_a_tool >= 3,
         "the case found {steps_with_a_tool} steps that run a screenshot tool"
+    );
+}
+
+/// A write of the variable in each spelling a script or a workflow gives one is a write that
+/// `writes_unread` reports, whether the value is a plain path or not: the case refuses what it
+/// cannot read, and never lets a script hand its children a directory outside a temporary folder.
+#[test]
+fn every_spelling_of_a_write_of_the_artifacts_directory_is_a_write() {
+    let missed = [
+        r#"$env:KR_TEST_ARTIFACTS_DIR = "/home/runner/evidence""#,
+        r#"$env:KR_TEST_ARTIFACTS_DIR += "\more""#,
+        r#"os.environ["KR_TEST_ARTIFACTS_DIR"] = "/home/runner/evidence""#,
+        r#"os.environ['KR_TEST_ARTIFACTS_DIR'] = '/home/runner/evidence'"#,
+        r#"    os.environ[ "KR_TEST_ARTIFACTS_DIR" ] = "/home/runner/evidence""#,
+        r#"os.putenv("KR_TEST_ARTIFACTS_DIR", "/home/runner/evidence")"#,
+        r#"process.env.KR_TEST_ARTIFACTS_DIR = '/home/runner/evidence';"#,
+        r#"process.env['KR_TEST_ARTIFACTS_DIR'] = '/home/runner/evidence';"#,
+        r#"process.env["KR_TEST_ARTIFACTS_DIR"] ??= "/home/runner/evidence";"#,
+        r#"process.env.KR_TEST_ARTIFACTS_DIR ||= '/home/runner/evidence';"#,
+        r#"[Environment]::SetEnvironmentVariable('KR_TEST_ARTIFACTS_DIR', 'C:\evidence')"#,
+        r#"environment = { KR_TEST_ARTIFACTS_DIR: "/home/runner/evidence" }"#,
+        r#"print("a [ b"); os.environ["KR_TEST_ARTIFACTS_DIR"] = "/home/runner/evidence""#,
+        r#"echo latest; os.environ["KR_TEST_ARTIFACTS_DIR"] = "/home/runner/evidence""#,
+        r#"[ -n "$x" ] && os.environ["KR_TEST_ARTIFACTS_DIR"] = "/home/runner/evidence""#,
+    ]
+    .into_iter()
+    .filter(|line| !writes_unread(line))
+    .collect::<Vec<_>>();
+    assert!(
+        missed.is_empty(),
+        "not read as a write:\n{}",
+        missed.join("\n")
+    );
+}
+
+/// A comparison, a plain read and a shell test with the name inside it are not writes. The bracket
+/// of a shell test (`[ ... ]`, `[[ ... ]]`, or `test ...` at the start of a command) is the only one
+/// that makes the `=` after the name a comparison.
+#[test]
+fn a_comparison_or_a_read_of_the_artifacts_directory_is_no_write() {
+    let wrongly = [
+        r#"if [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ]; then"#,
+        r#"if [[ "$KR_TEST_ARTIFACTS_DIR" = /tmp/* ]]; then"#,
+        r#"[ -n "$x" ] && [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ] && echo same"#,
+        r#"while [ "$KR_TEST_ARTIFACTS_DIR" = "" ]; do"#,
+        r#"until [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ]; do"#,
+        r#"elif [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ]; then"#,
+        r#"if ! [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ]; then"#,
+        r#"if true; then [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ] || exit 1; fi"#,
+        r#"else [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ] || exit 1"#,
+        r#"for tool in a b; do [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ] && break; done"#,
+        r#"true; [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ]"#,
+        r#"{ [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ]; }"#,
+        r#"( [ "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" ] )"#,
+        r#"test "$KR_TEST_ARTIFACTS_DIR" = "/tmp/kr" || exit 1"#,
+        r#"if ! mkdir -p "$KR_TEST_ARTIFACTS_DIR" || [ ! -w "$KR_TEST_ARTIFACTS_DIR" ]; then"#,
+        r#"if os.environ["KR_TEST_ARTIFACTS_DIR"] == "/tmp/kr":"#,
+        r#"directory = os.environ.get("KR_TEST_ARTIFACTS_DIR")"#,
+        r#"const directory = process.env['KR_TEST_ARTIFACTS_DIR'] ?? '/tmp/kr-test-artifacts';"#,
+        r#"if (process.env.KR_TEST_ARTIFACTS_DIR === undefined) {"#,
+        r#"echo "$KR_TEST_ARTIFACTS_DIR""#,
+        r#"# os.environ["KR_TEST_ARTIFACTS_DIR"] = "/home/runner/evidence""#,
+    ]
+    .into_iter()
+    .filter(|line| writes_unread(line))
+    .collect::<Vec<_>>();
+    assert!(
+        wrongly.is_empty(),
+        "read as a write:\n{}",
+        wrongly.join("\n")
     );
 }
