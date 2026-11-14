@@ -44,25 +44,67 @@ _kr_artifacts_fold() {
   fi
 }
 
-# Prints each temporary root that exists, resolved through its links, one to a line.
+# Prints the real path of the folder that $1 names, through its links, and fails where $1 is not an
+# absolute path to a folder or where a line feed is in the real path. A root is passed from the
+# producer below to its consumer one to a line, which a line feed would cut in two, and a command
+# substitution drops the line feeds at the end of a name, which would name another folder.
+_kr_artifacts_resolve() {
+  local _kr_path
+  case "$1" in /*) ;; *) return 1 ;; esac
+  # The `x` shows the end of the path, so that no line feed of its own is lost.
+  _kr_path="$(cd -P -- "$1" 2>/dev/null && pwd -P && printf x)" || return 1
+  _kr_path="${_kr_path%x}"
+  _kr_path="${_kr_path%$'\n'}"
+  case "$_kr_path" in *$'\n'*) return 1 ;; esac
+  printf '%s\n' "$_kr_path"
+}
+
+# Succeeds when $1, a folder as Windows writes it, is the top of a file system: a drive (`C:\`) or a
+# share (`\\server\share`), with or without the last backslash.
+_kr_artifacts_windows_top() {
+  local _kr_top
+  case "$1" in
+    [A-Za-z]: | [A-Za-z]:[\\/]) return 0 ;;
+    \\\\*)
+      _kr_top="${1#\\\\}"
+      _kr_top="${_kr_top%\\}"
+      case "$_kr_top" in
+        ?*\\?*) case "${_kr_top#*\\}" in *\\*) ;; *) return 0 ;; esac ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+# Prints each temporary root that exists, resolved through its links, one to a line. A root has no
+# line feed in it, and is never the top of a file system.
 _kr_artifacts_roots() {
-  local _kr_candidate _kr_real _kr_windows=0 _kr_seen=$'\n'
+  local _kr_candidate _kr_real _kr_windows=0 _kr_seen=$'\n' _kr_temp=""
   local _kr_named=(/tmp "${TMPDIR:-}" "${RUNNER_TEMP:-}")
   if _kr_artifacts_windows; then
     _kr_windows=1
     _kr_named+=("${TEMP:-}")
+    # Git Bash makes /tmp from the temporary folder of the process that started the first Git Bash
+    # of the session, so it can be a folder that this process's TEMP does not name: /tmp is a root
+    # here only where it is the folder TEMP names.
+    _kr_temp="$(_kr_artifacts_resolve "$(_kr_artifacts_posix "${TEMP:-}")")" || _kr_temp=""
   fi
   for _kr_candidate in "${_kr_named[@]}"; do
+    # The name as it was given: the conversion below drops the line feeds at its end.
+    case "$_kr_candidate" in *$'\n'*) continue ;; esac
     [ "$_kr_windows" = 1 ] && _kr_candidate="$(_kr_artifacts_posix "$_kr_candidate")"
-    case "$_kr_candidate" in /*) ;; *) continue ;; esac
-    _kr_real="$(cd -P -- "$_kr_candidate" 2>/dev/null && pwd -P)" || continue
+    _kr_real="$(_kr_artifacts_resolve "$_kr_candidate")" || continue
     if [ -n "$_kr_real" ] && [ "$_kr_real" != / ]; then
       # A drive's top (/c) is a filesystem root on Windows, as / is elsewhere, and so is any folder
-      # that Windows writes as `C:\`, whatever name Git Bash gives it: with the temporary folder at
-      # the top of a drive it writes the whole drive under /tmp.
+      # that Windows writes as the top of a drive (`C:\`) or of a share (`\\server\share`), whatever
+      # name Git Bash gives it: with the temporary folder at the top of a drive it writes the whole
+      # drive under /tmp.
       if [ "$_kr_windows" = 1 ]; then
         case "$_kr_real" in /?) continue ;; esac
-        case "$(cygpath -w -- "$_kr_real" 2>/dev/null)" in [A-Za-z]: | [A-Za-z]:[\\/]) continue ;; esac
+        _kr_artifacts_windows_top "$(cygpath -w -- "$_kr_real" 2>/dev/null)" && continue
+        if [ "$_kr_candidate" = /tmp ] && [ "$(_kr_artifacts_fold "$_kr_real")" != "$(_kr_artifacts_fold "$_kr_temp")" ]; then
+          continue
+        fi
       fi
       # Two names for one folder (/tmp and the folder TMPDIR names) are one root.
       case "$_kr_seen" in *$'\n'"$_kr_real"$'\n'*) continue ;; esac
@@ -140,6 +182,8 @@ _kr_artifacts_confine() {
   _kr_real="$_kr_real$_kr_rest"
   _kr_real_folded="$(_kr_artifacts_fold "$_kr_real")"
   while IFS= read -r _kr_root; do
+    # An empty root would make the pattern below `/*`, which every path matches.
+    [ -n "$_kr_root" ] || continue
     case "$_kr_real_folded" in
       "$(_kr_artifacts_fold "$_kr_root")"/*) _kr_inside=1 ;;
     esac

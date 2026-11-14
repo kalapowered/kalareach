@@ -36,8 +36,9 @@ struct Reading {
     directory: Option<PathBuf>,
     /// What `KR_TEST_ARTIFACTS_DIR` was once the reader had run.
     exported: Option<PathBuf>,
-    /// What the shell that ran the reader says `/tmp` is, as Windows writes it (`C:\`, `\\server\share`);
-    /// `None` for PowerShell and wherever the shell has no `cygpath`.
+    /// What the shell that ran the reader says `/tmp` is, as Windows writes it (`C:\`,
+    /// `\\server\share`); `None` for PowerShell and wherever the shell has no `cygpath`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     slash_tmp: Option<PathBuf>,
     /// Everything the reader said on its error stream.
     words: String,
@@ -504,6 +505,24 @@ fn a_temporary_folder_whose_name_holds_line_feeds_admits_nothing_outside_the_roo
             "a folder beside a temporary folder whose name ends with a line feed",
             OUTSIDE,
         );
+        // The temporary folder is a link with a plain name to each of those folders: the line
+        // feeds are in the folder that the link resolves to.
+        let to_inside = parent.path().join("kr-link");
+        let to_trailing = parent.path().join("kr-link-trailing");
+        std::os::unix::fs::symlink(&inside, &to_inside).expect("a link");
+        std::os::unix::fs::symlink(&trailing, &to_trailing).expect("a link");
+        assert_refused(
+            reader,
+            &reader.read(Some(outside.as_os_str()), Some(&to_inside)),
+            "a folder outside the roots when the temporary folder is a link to a name with line feeds",
+            OUTSIDE,
+        );
+        assert_refused(
+            reader,
+            &reader.read(Some(value.as_os_str()), Some(&to_trailing)),
+            "a folder beside the target of a temporary folder link whose name ends with a line feed",
+            OUTSIDE,
+        );
     }
 }
 
@@ -786,11 +805,21 @@ mod windows_paths {
         }
     }
 
+    /// `path` as it is written once its links and short names are resolved, where it exists.
+    fn resolved(path: &Path) -> PathBuf {
+        if path.exists() {
+            real(path)
+        } else {
+            path.to_owned()
+        }
+    }
+
     /// Asserts that the Git Bash that ran the reader read `/tmp` as `folder`, so that a case about
     /// what the reader does with that `/tmp` is never about another Git Bash's.
     fn assert_own_slash_tmp(reading: &Reading, folder: &Path) {
         let fold = |path: &Path| {
-            path.to_string_lossy()
+            resolved(path)
+                .to_string_lossy()
                 .to_lowercase()
                 .replace('/', "\\")
                 .trim_end_matches('\\')
