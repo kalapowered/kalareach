@@ -211,7 +211,7 @@ impl Default for LeaseBytes {
 }
 
 /// Gives back what a counter was holding for bytes that have reached the application or gone.
-fn release(counter: &std::sync::atomic::AtomicUsize, bytes: usize) {
+pub(crate) fn release(counter: &std::sync::atomic::AtomicUsize, bytes: usize) {
     if bytes == 0 {
         return;
     }
