@@ -7,7 +7,7 @@
 //! | --- | --- |
 //! | [`DeadlineKind::Header`] | Reading a stream's 1 KiB header |
 //! | [`DeadlineKind::Admission`] | The host's own lookup that admits a stream, once it has the header |
-//! | [`DeadlineKind::Idle`] | The wait for the next frame to begin |
+//! | [`DeadlineKind::Idle`] | The wait for the next frame to begin, on every stream but a terminal-input one |
 //! | [`DeadlineKind::Stall`] | Progress while the bytes of one frame arrive |
 //! | [`DeadlineKind::Write`] | Writing one frame to a peer that has to read it |
 //!
@@ -32,7 +32,8 @@ pub enum DeadlineKind {
     Header,
     /// The host's lookup that admits a stream whose header it has read.
     Admission,
-    /// The wait for a frame to begin on a stream that is between frames.
+    /// The wait for a frame to begin on a stream that is between frames. A terminal-input stream
+    /// is not held to it: a person's typing is quiet whenever the person is.
     Idle,
     /// Progress while a frame's bytes arrive: each piece the reader takes has to come within it.
     Stall,
@@ -89,7 +90,7 @@ pub struct TimerDeadlines {
     /// How long the host's lookup for a stream has.
     pub admission: Duration,
     /// How long a stream may be quiet between frames. A stream that is open and waiting for its
-    /// next chunk is not idle for longer than this.
+    /// next chunk is not idle for longer than this. A terminal-input stream is held to no such bound.
     pub idle: Duration,
     /// How long a frame may go without a further byte arriving once it has begun. It is a bound on
     /// each piece and not on the frame, so a slow link is never cut for the size of a chunk, and a

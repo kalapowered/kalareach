@@ -744,11 +744,16 @@ fn fallback_nameservers() -> Vec<iroh::dns::NameserverConfig> {
 const UNAUTHORISED_BIDI_STREAMS: u32 = 1;
 
 /// How many bidirectional streams a peer may have open on one authorised connection to a host that
-/// lets it hold `max_bulk_streams` bulk streams: the control stream, the bulk streams, the streams
-/// whose headers are being read ([`MAX_PENDING_HEADERS`]) and one more, so that a stream the
-/// peer opens as another ends is not refused for the moment the old one's end takes to reach it.
-const fn max_peer_bidi_streams(max_bulk_streams: usize) -> u32 {
-    let streams = (max_bulk_streams as u64).saturating_add(1 + MAX_PENDING_HEADERS as u64 + 1);
+/// lets it hold `max_bulk_streams` bulk streams and `max_input_streams` input streams: the control
+/// stream, the bulk streams, the input streams, the streams whose headers are being read
+/// ([`MAX_PENDING_HEADERS`]) and one more, so that a stream the peer opens as another ends is not
+/// refused for the moment the old one's end takes to reach it. An input stream lives as long as
+/// the attachment it types into, so it holds a place for good where a header's place is for a
+/// moment; the places for headers are therefore not shared with it.
+const fn max_peer_bidi_streams(max_bulk_streams: usize, max_input_streams: usize) -> u32 {
+    let streams = (max_bulk_streams as u64)
+        .saturating_add(max_input_streams as u64)
+        .saturating_add(1 + MAX_PENDING_HEADERS as u64 + 1);
     if streams > u32::MAX as u64 {
         u32::MAX
     } else {
@@ -759,14 +764,20 @@ const fn max_peer_bidi_streams(max_bulk_streams: usize) -> u32 {
 /// Lets the peer of a connection open the streams a device's transfers need.
 ///
 /// A connection starts with room for one bidirectional stream ([`transport_config`]); this raises
-/// it to [`max_peer_bidi_streams`]. The listener calls it when the host first reads its data
-/// streams, which is not when the connection is authorised: the listener cannot know when the host
+/// it to [`max_peer_bidi_streams`]; a host that takes no input stream passes none. The listener
+/// calls it when the host first reads its data streams, which is not when the connection is authorised: the listener cannot know when the host
 /// has finished its own check of the device, so where that first read falls relative to the check
 /// is the host's to arrange. The library grants the difference at once, and a stream the peer
 /// tried to open in the meantime waits for that credit and is opened when it arrives.
-pub(crate) fn allow_data_streams(connection: &Connection, max_bulk_streams: usize) {
-    connection
-        .set_max_concurrent_bi_streams(VarInt::from_u32(max_peer_bidi_streams(max_bulk_streams)));
+pub(crate) fn allow_data_streams(
+    connection: &Connection,
+    max_bulk_streams: usize,
+    max_input_streams: usize,
+) {
+    connection.set_max_concurrent_bi_streams(VarInt::from_u32(max_peer_bidi_streams(
+        max_bulk_streams,
+        max_input_streams,
+    )));
 }
 
 /// Takes the peer's stream limit back to the control stream's one.
@@ -792,12 +803,13 @@ pub(crate) fn withdraw_data_streams(connection: &Connection) {
 /// ([`UNAUTHORISED_BIDI_STREAMS`]) and raises it when a host that takes data streams first reads
 /// them ([`allow_data_streams`]). A host that reads only after its own check of the device, as its
 /// documentation asks, leaves a peer that is not yet admitted holding one stream's buffer and not
-/// ten; a host that reads sooner gives the peer ten from that read. An endpoint that only dials
-/// starts at none: a host opens no stream to a client. What an authorised connection can hold is
-/// then at most [`max_peer_bidi_streams`] streams, each up to the library's per-stream receive
-/// window of 1.25 MB, and one decoded frame for each stream whose frame is being read. A finite
-/// connection-wide receive window, if one is ever set, has to stay above that product, or a stalled
-/// data stream could take the credit the control stream needs.
+/// ten, or fourteen for a host that takes input streams; a host that reads sooner gives the peer
+/// that many from that read. An endpoint that only dials starts at none: a host opens no stream
+/// to a client. What an authorised connection can hold is then at most [`max_peer_bidi_streams`]
+/// streams, each up to the library's per-stream receive window of 1.25 MB, and one decoded frame
+/// for each stream whose frame is being read. A finite connection-wide receive window, if one is
+/// ever set, has to stay above that product, or a stalled data stream could take the credit the
+/// control stream needs.
 fn transport_config(incoming_bidi_streams: u32) -> QuicTransportConfig {
     let idle_timeout = IDLE_TIMEOUT
         .try_into()
@@ -899,15 +911,18 @@ mod tests {
         assert_eq!(ALPN, b"kalareach");
     }
 
-    /// A peer may open the control stream, the bulk streams the endpoint allows, the streams whose
-    /// headers are being read and one more, and a bound near the largest `usize` does not wrap to
-    /// a small one, which would leave the peer unable to open the control stream.
+    /// A peer may open the control stream, the bulk streams and input streams the endpoint allows,
+    /// the streams whose headers are being read and one more, and a bound near the largest `usize`
+    /// does not wrap to a small one, which would leave the peer unable to open the control stream.
     #[test]
     fn the_stream_limit_is_the_control_stream_the_bulk_streams_and_the_header_places() {
-        assert_eq!(max_peer_bidi_streams(DEFAULT_MAX_BULK_STREAMS), 10);
-        assert_eq!(max_peer_bidi_streams(8), 14);
-        assert_eq!(max_peer_bidi_streams(usize::MAX), u32::MAX);
-        assert_eq!(max_peer_bidi_streams(usize::MAX - 3), u32::MAX);
+        assert_eq!(max_peer_bidi_streams(DEFAULT_MAX_BULK_STREAMS, 0), 10);
+        assert_eq!(max_peer_bidi_streams(8, 0), 14);
+        assert_eq!(max_peer_bidi_streams(DEFAULT_MAX_BULK_STREAMS, 4), 14);
+        assert_eq!(max_peer_bidi_streams(usize::MAX, 0), u32::MAX);
+        assert_eq!(max_peer_bidi_streams(usize::MAX - 3, 0), u32::MAX);
+        assert_eq!(max_peer_bidi_streams(4, usize::MAX), u32::MAX);
+        assert_eq!(max_peer_bidi_streams(usize::MAX, usize::MAX), u32::MAX);
     }
 
     /// KR-REQ-23.22: the transport configuration every connection is opened with carries the
