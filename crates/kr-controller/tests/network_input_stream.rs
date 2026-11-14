@@ -511,6 +511,38 @@ async fn the_refusal_of_the_current_epoch_stands_against_a_late_answer_of_an_old
     rig.stop().await;
 }
 
+/// How many acknowledgements the host keeps for a device that does not read them, as the door
+/// names it.
+const MAX_UNREAD_ACKS: usize = 64;
+
+/// A device that does not read what it is told holds the host to a bounded number of
+/// acknowledgements: the worker's events would make the host hold more, so the stream is cut, and
+/// the device's connection stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_acknowledgements_owed_to_a_device_that_does_not_read_are_bounded() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let (at_ack, go_ack) = stages.hold_before_an_ack_write();
+
+    // The first notice parks the acknowledgement writer; the rest wait behind it.
+    rig.lane.send_window(lease_ended(&rig));
+    arrived(at_ack).await;
+    for _ in 0..MAX_UNREAD_ACKS + 8 {
+        rig.lane.send_window(lease_ended(&rig));
+    }
+    assert!(
+        reads_to_the_end(&mut stream, 0).await.is_err(),
+        "the stream is cut when more is owed than the host keeps"
+    );
+    rig.device
+        .read(Method::HostInfo, &NoParams {})
+        .await
+        .expect("the connection stands and answers");
+    drop(go_ack);
+    rig.stop().await;
+}
+
 /// The authority feed withdraws what a frame stands on between the host's decision for it and the
 /// write to the worker: the worker is never given the frame. The withdrawal also takes the
 /// connection away, which may stop the writer before it asks the feed again, so this shows that the
