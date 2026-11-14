@@ -146,7 +146,7 @@ pub fn report_by(line: &str, by: std::time::Instant) {
 /// [`report_by`] with the write given, which is what a standard error is to it, and the wait given:
 /// the line is formatted here, and handed to `write` on a thread of its own, waited for with `wait`
 /// no later than `by`.
-pub fn report_with(
+pub(crate) fn report_with(
     line: &str,
     by: std::time::Instant,
     write: impl FnOnce(&[u8]) + Send + 'static,
@@ -159,7 +159,7 @@ pub fn report_with(
 }
 
 /// What a thread a run waits for sends when it is through: how it went.
-pub type Done = Result<(), String>;
+pub(crate) type Done = Result<(), String>;
 
 /// The wait a run makes, on the system's clock: for what `channel` receives until `by`, which has
 /// passed when `by` is not ahead of the clock.
