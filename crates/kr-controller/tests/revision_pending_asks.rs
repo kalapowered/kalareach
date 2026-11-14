@@ -293,6 +293,85 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
     drop(workers);
 }
 
+/// KR-REQ-09.12: a worker whose ask is stuck does not hold up the ask of another pending worker.
+///
+/// Both workers refused the restriction for the moment. The connection of the one the pass asks
+/// first is held by the case, so its ask waits for the whole of its time. The other is told in the
+/// same pass, and not after the first ask has given up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_stuck_ask_does_not_hold_up_the_ask_of_another_pending_worker() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(2).await;
+    for worker in &workers {
+        worker
+            .service
+            .hold_the_boundary_for_one_announcement_after(0);
+    }
+    let barrier = host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the restriction is recorded");
+    assert!(!barrier.holds(), "both workers refused for the moment");
+    let pending = host
+        .controller()
+        .revision_pending()
+        .await
+        .expect("the registry is read");
+    assert_eq!(pending.len(), 2, "both workers are pending");
+    // The pass asks in the order the registry lists them.
+    let (stuck, free) = (pending[0], pending[1]);
+    let link = host
+        .controller()
+        .hold_a_worker_link_for_tests(stuck)
+        .await
+        .expect("the worker is reached");
+
+    until(
+        DEBT_PASS_INTERVAL * 2 + SLACK,
+        "the first ask of the pass at the worker whose connection is held",
+        || !asks_of(host.controller(), stuck).is_empty(),
+    )
+    .await;
+    let began = asks_of(host.controller(), stuck)[0];
+    let by = began + Duration::from_secs(3);
+    loop {
+        let pending = host
+            .controller()
+            .revision_pending()
+            .await
+            .expect("the registry is read");
+        if !pending.contains(&free) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the other worker was not told within 3 s of the stuck ask's beginning: {pending:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        host.controller()
+            .revision_pending()
+            .await
+            .expect("the registry is read")
+            .contains(&stuck),
+        "the worker whose connection is held is still pending"
+    );
+    drop(link);
+    until_nobody_is_pending(
+        host.controller(),
+        Duration::from_secs(60),
+        "the worker acknowledged once its connection was free",
+    )
+    .await;
+    host.stop().await;
+    drop(workers);
+}
+
 /// KR-REQ-09.12: the asks end when the worker has acknowledged the revision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_asks_end_when_the_worker_acknowledged() {
