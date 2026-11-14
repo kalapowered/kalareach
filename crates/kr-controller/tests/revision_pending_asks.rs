@@ -1472,12 +1472,25 @@ async fn listed(client: &mut kr_ipc::client::LocalClient) -> Vec<SessionId> {
         .collect()
 }
 
+/// Whether the daemon serves a read of the session: it does once it has reached the worker.
+async fn read_is_served(client: &mut kr_ipc::client::LocalClient, session_id: SessionId) -> bool {
+    client
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams { session_id },
+        )
+        .await
+        .expect("the daemon answers")
+        .is_ok()
+}
+
 /// KR-REQ-09.12, KR-ACC-022: a client that polls `session.list` while a restarted daemon's worker
 /// holds its dispatch boundary adds no presentation at that boundary.
 ///
 /// The start's own look at the worker meets the held boundary and gives up after its bound; the
 /// presentation stays at the boundary for the whole hold, on a thread of the worker's and with one
-/// of its connections. Each list looks again for the unlisted worker, so a look that presented
+/// of its connections; the start's own reading of the worker's published descriptor leaves one
+/// beside it. Each list looks again for the unlisted worker, so a look that presented
 /// anew would leave one more at each poll, and an hour of polling would take the connections of the
 /// worker, its owner's own included. The three lists run together; the worker's count of the
 /// presentations waiting is what shows how many the daemon made. The lists are answered within two
@@ -1503,9 +1516,9 @@ async fn a_list_polled_while_a_boundary_is_held_leaves_one_presentation_at_it() 
     .expect("the three lists were answered within two bounds of a look at the worker");
     assert_eq!(
         service.presentations_waiting_for_tests(),
-        1,
-        "the daemon's presentations waiting at the held boundary after three lists, {at_the_start} \
-         after its start"
+        at_the_start,
+        "the daemon's presentations waiting at the held boundary after three lists: the start \
+         left {at_the_start}, and a list adds none"
     );
     assert!(
         host.controller()
@@ -1518,13 +1531,13 @@ async fn a_list_polled_while_a_boundary_is_held_leaves_one_presentation_at_it() 
 }
 
 /// KR-REQ-09.12, KR-ACC-022: the answer of a presentation that outlived the look that made it is
-/// used: once the boundary is let go, the next list names the session, and the worker is presented
-/// to no further time for it.
+/// used: once the boundary is let go, the next read reaches the session's worker, and the worker is
+/// presented to no further time for it.
 ///
 /// The worker decides the presentation when the hold ends, long after the start's look gave up on
-/// it. The next list finds that answer and adopts the worker on it, with no restart of the daemon.
+/// it. The next read finds that answer and adopts the worker on it, with no restart of the daemon.
 /// The worker's count of the connections the daemon made is what shows a second presentation: the
-/// list's own read of the worker opens the daemon's one link, and nothing else is opened.
+/// read of the worker opens the daemon's one link, and nothing else is opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_boundary_is_let_go() {
     let RestartedAtAHeldBoundary {
@@ -1536,8 +1549,8 @@ async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_bo
     let service = Arc::clone(&worker.service);
     let mut client = host.client().await;
     assert!(
-        !listed(&mut client).await.contains(&worker.session_id),
-        "a worker whose boundary is held is not listed"
+        !read_is_served(&mut client, worker.session_id).await,
+        "a worker whose boundary is held is not reached"
     );
 
     held.release();
@@ -1549,13 +1562,13 @@ async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_bo
     .await;
     let connections = service.controller_connections_for_tests();
     assert!(
-        listed(&mut client).await.contains(&worker.session_id),
-        "the next list names the session"
+        read_is_served(&mut client, worker.session_id).await,
+        "the next read of the session reaches the worker"
     );
     assert_eq!(
         service.controller_connections_for_tests() - connections,
         1,
-        "the list adopted the worker on the answer it had, and opened only the daemon's one link"
+        "the read adopted the worker on the answer it had, and opened only the daemon's one link"
     );
     host.stop().await;
     drop(workers);
