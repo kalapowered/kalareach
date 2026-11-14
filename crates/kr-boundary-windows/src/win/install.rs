@@ -7217,6 +7217,63 @@ mod tests {
         assert_eq!(std::fs::read_dir(&run.paths.data).unwrap().count(), 1);
     }
 
+    /// A save that fails before its rename after an earlier save whose rename put the record at the
+    /// manifest's name and whose proof read failed: the run holds that replacement at the manifest's
+    /// path and no proved identity, the record may stand there, and the ending says so as it does
+    /// for a proved earlier write.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_save_that_fails_before_its_rename_after_a_published_replacement_leaves_that_record_standing()
+     {
+        let _one = ffi::locked(&FORCED);
+        let top = tempfile::tempdir().unwrap();
+        let mut run = unwritten_run(top.path(), true);
+        run.manifest.record(
+            ObjectKind::Directory,
+            &run.paths.data.display().to_string(),
+            None,
+        );
+        crate::manifest::forced::fail_the_next("proof");
+        run.save().unwrap_err();
+        {
+            let laid = ffi::locked(&run.laid);
+            assert!(laid.manifest.is_none());
+            assert_eq!(
+                laid.replacement.as_ref().map(|file| file.path.clone()),
+                Some(run.paths.manifest.clone())
+            );
+        }
+        let published = run.manifest.clone();
+        // The record changes in memory and its save fails before the rename.
+        run.manifest
+            .record(ObjectKind::Account, "krb-checkout", None);
+        crate::manifest::forced::fail_the_next("replacement");
+        let left = run.keep_record();
+        let remedy::RecordLeft::NotSaved {
+            found,
+            renamed,
+            earlier_write,
+            ..
+        } = &left
+        else {
+            panic!("{left:?}");
+        };
+        assert!(!renamed, "{left:?}");
+        assert!(earlier_write, "{left:?}");
+        assert_eq!(*found, remedy::NotProved::Differs, "{left:?}");
+        let words = remedy::rollback_failed(&["a step failed".to_owned()], &left, "");
+        assert!(
+            words.contains("and a record that an earlier write of this run left may stand there"),
+            "{words}"
+        );
+        assert!(
+            !words.contains("no write of this run's record reached"),
+            "{words}"
+        );
+        // The disk after the ending holds the published record.
+        assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), published);
+    }
+
     /// The refusal of a service that stands at the broker's name, where the one save of its result
     /// fails: the error says the refusal and the failed save (not the save's error alone), and the
     /// result `refused` stands in the run's manifest, which a rollback acts on. A run before its
