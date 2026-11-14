@@ -301,10 +301,10 @@ names another. Core's lock takes 17 crates that way: 14 packages of the project'
 the upstream noq repository and `noq-proto` from the project's noq fork. The last two replace the
 registry crates through `[patch.crates-io]` in the root `Cargo.toml`. An advisory filed against a
 crate's crates.io release does not reach its Git copy, and no workflow or script in this repository
-reads advisories against the upstream repositories of these crates. The `patched_crates` test in `tests/conformance` covers one further
-case: when nothing in the graph can use a `[patch.crates-io]` entry, cargo takes the registry crate,
-warns and writes a `[[patch.unused]]` table into the lock, and the test fails on that table and
-names the entry.
+reads advisories against the upstream repositories of these crates. The `patched_crates` test in
+`tests/conformance` covers one further case: when nothing in the graph can use a
+`[patch.crates-io]` entry, cargo takes the registry crate, warns and writes a `[[patch.unused]]`
+table into the lock, and the test fails on that table and names the entry.
 
 There is no second specification hierarchy. The protocol reference, its generated method index and
 glossary, and the generated schemas and vectors live beside the code they describe, in
