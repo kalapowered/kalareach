@@ -2809,6 +2809,15 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             held_a,
             Some(unknown),
         ),
+        (
+            "a PowerShell helper that a foreach sets",
+            vec![(
+                ".github/workflows/w.yml",
+                "$t = (Get-Item $env:TEMP).FullName\n\"@V@=$t\\e\" >> $env:GITHUB_ENV\nforeach ($t in 'C:\\y') { }\n",
+            )],
+            held_w,
+            Some("names the helper"),
+        ),
     ];
     for (name, files, held, fails_with) in cases {
         let problems = findings(&tree(&files), &format!("\n{}\n", named(held)));
