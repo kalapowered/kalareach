@@ -3823,6 +3823,13 @@ async fn a_store_that_cannot_be_read_still_takes_the_interrupt_and_the_close() {
         "the repeat joins the closure rather than finding a live session"
     );
     assert_eq!(again.durability, kr_protocol::session::Durability::Volatile);
+    // The close was asked for above: its own steps, the drain among them, end before the
+    // fixture's directory is removed.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        host.runtime.wait_closed(),
+    )
+    .await;
 }
 
 /// KR-REQ-07.57: a condition the store has already reported fences typed mutations before the
