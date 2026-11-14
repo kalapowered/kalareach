@@ -1146,15 +1146,24 @@ impl<'a> Resolver<'a> {
         let mut runs = Vec::new();
         for (index, binary) in self.ran.get(target).into_iter().flatten() {
             let step = &self.executed[*index].step;
+            // The runner said, in its own words, that it could not start this test program.
             let refused = self.executed[*index]
                 .observation
                 .as_ref()
                 .and_then(|observed| {
                     observed.programs.iter().find(|program| {
-                        run::file_name(&program.path) == run::file_name(&binary.executable)
+                        program.said_by_runner
+                            && run::file_name(&program.path) == run::file_name(&binary.executable)
                     })
                 });
-            let record = if let (Some(_), Some(program)) = (&binary.problem, refused) {
+            // A test of the program that failed shows that it started.
+            let a_test_failed = binary
+                .tests
+                .values()
+                .any(|outcome| *outcome == LibtestOutcome::Failed);
+            let record = if let (Some(_), false, Some(program)) =
+                (&binary.problem, a_test_failed, refused)
+            {
                 // The program was never started, so none of its tests ran.
                 RunRecord {
                     step: index + 1,

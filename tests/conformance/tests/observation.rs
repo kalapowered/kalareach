@@ -202,33 +202,46 @@ fn a_program_that_is_whole_or_a_link_does_not_count_as_damage_seen() {
     assert_eq!(document.summary.failed_otherwise, [1]);
 }
 
-#[test]
-fn a_test_program_that_could_not_start_is_not_run_with_the_reason_and_not_passed_or_not_built() {
+/// A runner that lists through the report's own program and, for each test binary that is run,
+/// runs `refusal` as a shell script with the binary's path as `$2`.
+fn runner_that_runs(held: &Path, refusal: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let held = tempfile::tempdir().unwrap();
-    let evidence = tempfile::tempdir().unwrap();
-    // A runner that lists through the report's own program and refuses to start any test binary
-    // that is run.
-    let runner = held.path().join("kr-conformance");
+    let runner = held.join("kr-conformance");
     std::fs::write(
         &runner,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  run-one) echo \"kr-conformance run-one: $2 could not start: \
-             Exec format error (os error 8)\" >&2; exit 1;;\n  *) exec \"{}\" \"$@\";;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  run-one) {refusal};;\n  *) exec \"{}\" \"$@\";;\nesac\n",
             lister().display()
         ),
     )
     .unwrap();
     std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let document = run(
-        evidence.path(),
+    runner
+}
+
+/// The report over the `forms` tree's tests, run through `runner`.
+fn tests_through(evidence: &Path, runner: PathBuf) -> Document {
+    run(
+        evidence,
         runner,
         vec![Step::cargo(
             Group::Rust,
             "the tree's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         )],
+    )
+}
+
+#[test]
+fn a_test_program_that_could_not_start_is_not_run_with_the_reason_and_not_passed_or_not_built() {
+    let held = tempfile::tempdir().unwrap();
+    let evidence = tempfile::tempdir().unwrap();
+    // A runner that refuses to start any test binary that is run.
+    let runner = runner_that_runs(
+        held.path(),
+        "echo \"kr-conformance run-one: $2 could not start: Exec format error (os error 8)\" >&2; exit 1",
     );
+    let document = tests_through(evidence.path(), runner);
     assert!(!document.passed(), "a step that failed fails the run");
     assert_eq!(document.summary.failed_steps, [1]);
     let counts = &document.summary.tests;
@@ -241,4 +254,54 @@ fn a_test_program_that_could_not_start_is_not_run_with_the_reason_and_not_passed
         reason.contains("could not be started") && reason.contains("Exec format error"),
         "{reason}"
     );
+}
+
+#[test]
+fn the_shell_s_words_for_a_test_program_do_not_make_its_tests_not_run() {
+    let held = tempfile::tempdir().unwrap();
+    let evidence = tempfile::tempdir().unwrap();
+    let runner = runner_that_runs(
+        held.path(),
+        "echo \"$2: $2: cannot execute binary file\" >&2; exit 126",
+    );
+    let document = tests_through(evidence.path(), runner);
+    let test = &document.identifiers["KR-REQ-03.02"].tests[0];
+    assert_eq!(test.outcome, Outcome::Failed, "{test:?}");
+    assert_eq!(document.summary.tests.not_run, 0);
+}
+
+#[test]
+fn a_test_that_printed_the_runner_s_refusal_itself_and_then_aborted_stays_failed() {
+    let held = tempfile::tempdir().unwrap();
+    let evidence = tempfile::tempdir().unwrap();
+    // The binary started: it printed that it was running a test, and the test said what the runner
+    // says when it cannot start a program, and then the process ended without a summary.
+    let runner = runner_that_runs(
+        held.path(),
+        "echo \"running 1 test\"; echo \"test documented ... \"; \
+         echo \"kr-conformance run-one: $2 could not start: Exec format error (os error 8)\" >&2; exit 134",
+    );
+    let document = tests_through(evidence.path(), runner);
+    let test = &document.identifiers["KR-REQ-03.02"].tests[0];
+    assert_eq!(test.outcome, Outcome::Failed, "{test:?}");
+    assert!(!document.passed());
+}
+
+#[test]
+fn a_test_program_with_a_failed_test_is_not_run_whatever_line_the_runner_wrote_before_it() {
+    let held = tempfile::tempdir().unwrap();
+    let evidence = tempfile::tempdir().unwrap();
+    // The runner's refusal comes first, and the program then shows a failed test in its record and
+    // its output, with a summary that does not add up to the record.
+    let runner = runner_that_runs(
+        held.path(),
+        "echo \"kr-conformance run-one: $2 could not start: Exec format error (os error 8)\" >&2; \
+         echo \"running 1 test\"; echo \"test documented ... FAILED\"; echo; echo \"failures:\"; \
+         echo \"    documented\"; echo; \
+         echo \"test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\"; \
+         printf 'failed documented\\n' > \"$KR_CONFORMANCE_RECORDS/$(basename \"$2\")\"; exit 101",
+    );
+    let document = tests_through(evidence.path(), runner);
+    let test = &document.identifiers["KR-REQ-03.02"].tests[0];
+    assert_eq!(test.outcome, Outcome::Failed, "{test:?}");
 }
