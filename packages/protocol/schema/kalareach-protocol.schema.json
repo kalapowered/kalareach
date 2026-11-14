@@ -10719,6 +10719,45 @@
           "const": "keepalive",
           "description": "A keepalive. It carries nothing; its arrival is the whole message.\n\nSection 23 puts the keepalive at ten seconds while active and the inactivity threshold at\n30. The transport's own keepalive covers a network connection; this one also covers a local\nsocket, which carries the same typed frames and has no equivalent underneath it.",
           "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A worker's window for the typing of one lease epoch, on the connection of an input lane.\n\nIt starts a window when the lane's attachment takes the lease, and ends one, with the bytes\nthe end discarded, when it loses the lease.",
+          "properties": {
+            "input_window": {
+              "$ref": "#/$defs/LaneWindow"
+            }
+          },
+          "required": [
+            "input_window"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Room that a worker gives back to a lane's window, on the connection of an input lane.",
+          "properties": {
+            "input_credit": {
+              "$ref": "#/$defs/LaneCredit"
+            }
+          },
+          "required": [
+            "input_credit"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A worker's statement that it has dealt with a launch, on the connection of an input lane.",
+          "properties": {
+            "input_launch_reserved": {
+              "$ref": "#/$defs/LaneLaunch"
+            }
+          },
+          "required": [
+            "input_launch_reserved"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -11296,6 +11335,32 @@
             "desktop_checks_answer"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Which attachment an input lane carries typing for, the first frame the control daemon sends\non a connection of role `proxy_input` after its generation token.",
+          "properties": {
+            "input_lane": {
+              "$ref": "#/$defs/InputLane"
+            }
+          },
+          "required": [
+            "input_lane"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's answer to that binding, and the first frame it writes on the lane.",
+          "properties": {
+            "input_lane_ready": {
+              "$ref": "#/$defs/InputLaneReady"
+            }
+          },
+          "required": [
+            "input_lane_ready"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -11325,6 +11390,11 @@
         {
           "const": "checks",
           "description": "The connection the daemon asks a worker to perform the disclosed desktop checks over.\n\nIt carries the checks request and nothing else, and the worker performs one run at a time\nwhatever connections ask. The run takes a screen image and starts an application, so it can\nlast about two minutes; a connection of its own keeps the authority connection free for the\nwork that has a deadline. A newer one replaces it, and a replacement generation fences it\nalong with the authority itself.",
+          "type": "string"
+        },
+        {
+          "const": "proxy_input",
+          "description": "The connection the daemon carries one attachment's typing to the worker over.\n\nIt is a second link for an attachment that a `Proxy` connection owns, and it borrows that\nconnection's binding: it holds no attachment of its own, so closing it detaches nothing. It\ncarries `input.write` for that attachment and nothing else, so a key never waits behind the\nrequests of the proxy connection, and the worker's answers on it are the lane's own frames\n([`InputLaneReady`] and the events [`LaneWindow`], [`LaneCredit`] and [`LaneLaunch`]). A\nreplacement generation fences it along with the authority itself. A worker that does not\nstate the input lane does not know the role, and the daemon never declares it to one.",
           "type": "string"
         }
       ]
@@ -19545,6 +19615,140 @@
         }
       ]
     },
+    "InputAck": {
+      "description": "What the host writes on a terminal-input stream, back to the client.\n\nThe stream ends with a reset and no frame of its own. After a refusal the host forwards no\nlater frame of that epoch and writes no second refusal.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The first thing the host writes, once the stream is admitted and the worker's lane is\nbound: how much the client may have outstanding.",
+          "properties": {
+            "kind": {
+              "const": "ready",
+              "type": "string"
+            },
+            "window": {
+              "$ref": "#/$defs/InputWindow",
+              "description": "The client's window."
+            }
+          },
+          "required": [
+            "kind",
+            "window"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker accepted every frame of `epoch` with a sequence up to `through`.\n\n`through` only increases within an epoch. Acceptance is not delivery: it does not say that\nthe program read the bytes, and a change of the lease discards accepted bytes that the\nworker had not yet written.",
+          "properties": {
+            "epoch": {
+              "$ref": "#/$defs/InputLeaseEpoch",
+              "description": "The epoch the frames belong to."
+            },
+            "kind": {
+              "const": "accepted",
+              "type": "string"
+            },
+            "through": {
+              "$ref": "#/$defs/InputSequence",
+              "description": "The last accepted sequence."
+            }
+          },
+          "required": [
+            "kind",
+            "epoch",
+            "through"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The first definite refusal of an epoch, from the worker or from the host itself.",
+          "properties": {
+            "accepted_through": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputSequence"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The last sequence accepted before it. Null when nothing of the epoch was accepted."
+            },
+            "epoch": {
+              "$ref": "#/$defs/InputLeaseEpoch",
+              "description": "The epoch of the refused frame."
+            },
+            "error": {
+              "$ref": "#/$defs/ProtocolError",
+              "description": "Why."
+            },
+            "kind": {
+              "const": "refused",
+              "type": "string"
+            },
+            "sequence": {
+              "$ref": "#/$defs/InputSequence",
+              "description": "The refused frame. Every later frame of the epoch is refused as well."
+            }
+          },
+          "required": [
+            "kind",
+            "epoch",
+            "sequence",
+            "accepted_through",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker has dealt with the launch that the barrier numbered `launch` belonged to.\n\nIt is written after the `Accepted` that covers every frame before the barrier. It means\nthat later typing is now ordered by the worker's own fence, or that nothing is left to\norder; it says nothing about the launch's result.",
+          "properties": {
+            "kind": {
+              "const": "launch_reserved",
+              "type": "string"
+            },
+            "launch": {
+              "description": "The client's number of the launch.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "launch"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The view no longer holds the lease of `epoch`: another view took control, the view released\nit, or the grant behind it ended. It is written even when the client has no frame\noutstanding.",
+          "properties": {
+            "epoch": {
+              "$ref": "#/$defs/InputLeaseEpoch",
+              "description": "The epoch that ended."
+            },
+            "fenced_bytes": {
+              "$ref": "#/$defs/U64",
+              "description": "How many bytes the end discarded, accepted ones the worker had not yet written\nincluded."
+            },
+            "kind": {
+              "const": "epoch_ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "epoch",
+            "fenced_bytes"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "InputAcquireParams": {
       "additionalProperties": false,
       "description": "Parameters of `input.acquire`.",
@@ -19600,6 +19804,44 @@
       ],
       "type": "object"
     },
+    "InputBarrier": {
+      "additionalProperties": false,
+      "description": "The typing that must have arrived at the worker before a request is applied.\n\nA client that sends its typing on a stream of its own cannot rely on the order of that stream\nagainst its requests on the control stream. A request that must come after some typing names\nthe first `count` frames of one lease epoch for one attachment, sequences 0 to `count - 1`,\ncounted over every frame the client has admitted, including frames it has not yet written. The\nworker applies the request only when it has accepted that many frames of the epoch, and\nrefuses it otherwise. It checks the position and never waits for it.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment whose frames are counted."
+        },
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many frames of the epoch must have been accepted."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The lease epoch of those frames."
+        },
+        "launch": {
+          "anyOf": [
+            {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The client's own number for the launch this barrier belongs to, which the worker echoes\nwhen it has dealt with the launch. Null for a request that is not a launch."
+        }
+      },
+      "required": [
+        "attachment_id",
+        "epoch",
+        "count",
+        "launch"
+      ],
+      "type": "object"
+    },
     "InputContent": {
       "description": "What one `input.write` carries.\n\nA write is one or the other, never both: bytes a client has already spelled, or key records the\nworker spells for the session's terminal. Both go through the same ordered stream, the same\npaste recogniser and the same bound on what one write may produce.",
       "oneOf": [
@@ -19646,6 +19888,30 @@
         }
       ]
     },
+    "InputFrame": {
+      "additionalProperties": false,
+      "description": "One frame of typing on a terminal-input stream, from the client to the host.\n\nA frame is one batch: the worker accepts all of its bytes or none of them. The sequence counts\nframes from 0 within an epoch, and a new epoch starts again at 0 on the same stream.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The bytes to write to the terminal. They are not decoded, re-encoded or normalised."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The lease epoch the client holds."
+        },
+        "sequence": {
+          "$ref": "#/$defs/InputSequence",
+          "description": "The position of this frame among the epoch's frames."
+        }
+      },
+      "required": [
+        "epoch",
+        "sequence",
+        "bytes"
+      ],
+      "type": "object"
+    },
     "InputInterruptParams": {
       "additionalProperties": false,
       "description": "Parameters of `input.interrupt`.",
@@ -19675,6 +19941,56 @@
       ],
       "type": "object"
     },
+    "InputLane": {
+      "additionalProperties": false,
+      "description": "What the daemon says first on a connection whose role is [`ControllerConnectionRole::ProxyInput`],\nafter the role and the generation token: which attachment this lane carries typing for.\n\nThe worker binds the lane only when `proxy_connection` names a live `Proxy` connection of the\nsame generation that owns the attachment, and refuses it otherwise.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment the lane carries typing for."
+        },
+        "proxy_connection": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The `Proxy` connection whose binding this lane borrows: the connection id the worker gave\nthat link."
+        }
+      },
+      "required": [
+        "proxy_connection",
+        "attachment_id"
+      ],
+      "type": "object"
+    },
+    "InputLaneReady": {
+      "additionalProperties": false,
+      "description": "The worker's answer to [`InputLane`], and the first frame it writes on the lane.\n\nThe lane's own frames follow it in the order the worker's ledger changed.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "The window's bytes, in the worker's unit. Nought when the lane is not the holder's."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The lease epoch at the moment of the bind."
+        },
+        "frames": {
+          "description": "The window's frames, in the worker's unit. Nought when the lane is not the holder's.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder": {
+          "description": "True when the lane's attachment holds the lease at `epoch`, so the lane has a window.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "epoch",
+        "holder",
+        "frames",
+        "bytes"
+      ],
+      "type": "object"
+    },
     "InputLeaseEpoch": {
       "description": "The current input lease epoch.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -19684,6 +20000,17 @@
       "additionalProperties": false,
       "description": "The result of `input.interrupt` and `input.release`.",
       "properties": {
+        "fenced_bytes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The bytes this release discarded, when the request asked for the count.\n\nAbsent from the wire when the request did not ask, and from every answer of a worker built\nbefore the member, which read as a count that is not known. It is never set for\n`input.interrupt`."
+        },
         "lease": {
           "$ref": "#/$defs/InputLeaseState",
           "description": "The lease after the operation."
@@ -19741,6 +20068,17 @@
       "additionalProperties": false,
       "description": "Parameters of `input.release`.",
       "properties": {
+        "after_input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputBarrier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The typing that must have arrived before this release is applied.\n\nAbsent from the wire when the caller asks for no such order, which is every caller that\nsends its typing as requests on this connection: they are handled in the order they were\nsent. A request that uses none of the optional members is byte for byte what a worker\nbuilt before them reads. A worker refuses a member it does not know, so the member is\nsent only to a worker that states the input lane."
+        },
         "attachment_id": {
           "$ref": "#/$defs/AttachmentId",
           "description": "The attachment releasing the lease."
@@ -19748,6 +20086,10 @@
         "epoch": {
           "$ref": "#/$defs/InputLeaseEpoch",
           "description": "The epoch it holds."
+        },
+        "fenced_report": {
+          "description": "True when the caller wants the count of bytes this release discarded in the answer.\n\nAbsent from the wire when false, and sent only to a worker that states the input lane, for\nthe reason `after_input` gives.",
+          "type": "boolean"
         },
         "session_id": {
           "$ref": "#/$defs/SessionId",
@@ -19765,6 +20107,27 @@
       "description": "An increasing sequence number inside one raw input stream.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "InputWindow": {
+      "additionalProperties": false,
+      "description": "How much the client may have written to a terminal-input stream and not yet had accepted.\n\nIt is fixed for the life of the stream, and it is the client's own quantity: the worker's room\nfor the typing is counted in the worker's own unit and belongs to one lease epoch.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Encoded bytes of those frames."
+        },
+        "frames": {
+          "description": "Frames written and not yet accepted.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "frames",
+        "bytes"
+      ],
+      "type": "object"
     },
     "InputWriteParams": {
       "additionalProperties": false,
@@ -20763,6 +21126,115 @@
           "type": "string"
         }
       ]
+    },
+    "LaneCredit": {
+      "additionalProperties": false,
+      "description": "Room given back to a lane's window, an event the worker sends on a lane when it has written\nframes of the epoch to the terminal.\n\nA host ignores it when `epoch` is not the epoch it is serving.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Bytes given back, in the worker's unit."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The epoch the room belongs to."
+        },
+        "frames": {
+          "description": "Frames given back, in the worker's unit.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "epoch",
+        "frames",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "LaneEnded": {
+      "additionalProperties": false,
+      "description": "An epoch that ended for a lane's attachment.",
+      "properties": {
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The epoch that ended."
+        },
+        "fenced_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "How many bytes the end discarded."
+        }
+      },
+      "required": [
+        "epoch",
+        "fenced_bytes"
+      ],
+      "type": "object"
+    },
+    "LaneLaunch": {
+      "additionalProperties": false,
+      "description": "The worker has dealt with a launch, an event the worker sends on the lane of the attachment\nthat asked for it.\n\nIt means that later typing is now ordered by the worker's own fence, or that nothing is left to\norder. It says nothing about the launch's result.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment that asked for the launch."
+        },
+        "launch": {
+          "description": "The client's number of the launch.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "attachment_id",
+        "launch"
+      ],
+      "type": "object"
+    },
+    "LaneWindow": {
+      "additionalProperties": false,
+      "description": "The lane's window for one lease epoch, an event the worker sends on a lane.\n\nIt is sent when an epoch starts for the lane's attachment, with `holder` true and the window,\nand when the lane's attachment loses the lease, with `holder` false and `ended` set. The\n`epoch` is the epoch that the event speaks of: after a release that leaves no holder it is the\nepoch that ended.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "The window's bytes, in the worker's unit. Nought when `holder` is false."
+        },
+        "ended": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaneEnded"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set when the lane's attachment lost the lease: which epoch ended and how much it discarded."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The epoch this event speaks of."
+        },
+        "frames": {
+          "description": "The window's frames, in the worker's unit. Nought when `holder` is false.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder": {
+          "description": "True when the lane's attachment holds the lease at `epoch`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "epoch",
+        "holder",
+        "frames",
+        "bytes",
+        "ended"
+      ],
+      "type": "object"
     },
     "LaunchCommand": {
       "description": "What a launch installs in the editor./// What a launch installs in the editor.\n\nAn argument vector is the safe form: the integration quotes it for its own shell. A quoted\ncommand is already the exact text to run, and neither form is assembled by interpolation.",
@@ -37394,6 +37866,17 @@
       "additionalProperties": false,
       "description": "Parameters of `session.detach`.",
       "properties": {
+        "after_input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputBarrier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The typing that must have arrived before this detach is applied.\n\nAbsent from the wire when the caller asks for no such order, and sent only to a worker that\nstates the input lane, since a worker refuses a member it does not know. A request that\nuses none of the optional members is byte for byte what a worker built before them reads."
+        },
         "attachment_id": {
           "anyOf": [
             {
@@ -37404,6 +37887,10 @@
             }
           ],
           "description": "The attachment to remove. Null asks the host for the originating attachment.\n\nSection 7's `kr detach` takes no identifier inside its own context, and the host is the\nonly place that knows what that context is: the attachment whose input the root editor\naccepted the line under, recorded through the fence at acceptance. A caller that names\nnothing gets that attachment or `AMBIGUOUS_ATTACHMENT`, never a guess and never whichever\nclient happens to hold the input lease when the command runs."
+        },
+        "fenced_report": {
+          "description": "True when the caller wants the count of bytes this detach discarded in the answer.\n\nAbsent from the wire when false, and sent only to a worker that states the input lane, for\nthe reason `after_input` gives.",
+          "type": "boolean"
         },
         "line_token": {
           "anyOf": [
@@ -37429,6 +37916,17 @@
         "attachment_id": {
           "$ref": "#/$defs/AttachmentId",
           "description": "The attachment that was removed."
+        },
+        "fenced_bytes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The bytes this detach discarded, when the request asked for the count.\n\nAbsent from the wire when the request did not ask, and from every answer of a worker built\nbefore the member, which read as a count that is not known."
         },
         "geometry": {
           "$ref": "#/$defs/GeometryState",
@@ -38408,6 +38906,17 @@
       "additionalProperties": false,
       "description": "Parameters of `shell.launch`.",
       "properties": {
+        "after_input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputBarrier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The typing that must have arrived before this launch is applied.\n\nAbsent from the wire when the caller asks for no such order, so a launch that sends none is\nbyte for byte what a worker built before the member reads. A worker refuses a member it\ndoes not know, so the member is sent only to a worker that states the input lane."
+        },
         "command": {
           "$ref": "#/$defs/LaunchCommand",
           "description": "What to install."
@@ -45245,11 +45754,17 @@
     "inclusion_preview": {
       "$ref": "#/$defs/InclusionPreview"
     },
+    "input_ack": {
+      "$ref": "#/$defs/InputAck"
+    },
     "input_acquire_params": {
       "$ref": "#/$defs/InputAcquireParams"
     },
     "input_acquire_result": {
       "$ref": "#/$defs/InputAcquireResult"
+    },
+    "input_frame": {
+      "$ref": "#/$defs/InputFrame"
     },
     "input_interrupt_params": {
       "$ref": "#/$defs/InputInterruptParams"

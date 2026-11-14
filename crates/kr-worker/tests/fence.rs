@@ -1370,6 +1370,7 @@ async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connecti
         command: LaunchCommand::QuotedCommand("true".to_owned()),
         expected_prompt_generation: PromptGeneration::new(1),
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
     let target = wired.target();
     // The caller's connection is handed back with its answer and kept until the case ends. It is
@@ -2109,6 +2110,7 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
         command: LaunchCommand::QuotedCommand("kr-launched-command".to_owned()),
         expected_prompt_generation: PromptGeneration::new(1),
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
     let target = wired.target();
     let calling = tokio::spawn(async move {
@@ -4660,6 +4662,7 @@ async fn a_profile_that_refuses_a_fenced_launch_installs_nothing() {
                 command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
                 expected_prompt_generation: fence.prompt_generation,
                 expected_buffer_revision: EditorBufferRevision::new(1),
+                after_input: None,
             },
         )
         .await
@@ -4712,6 +4715,8 @@ async fn detach(
             &kr_protocol::attachment::SessionDetachParams {
                 attachment_id,
                 line_token,
+                after_input: None,
+                fenced_report: false,
             },
         )
         .await
@@ -5180,6 +5185,7 @@ async fn an_unanswered_launch_is_outstanding_through_its_revocation_and_ends_wit
         command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
         expected_prompt_generation: fence.prompt_generation,
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
     let target = wired.target();
     let calling = tokio::spawn(async move {
@@ -5277,6 +5283,7 @@ async fn a_lost_bridge_leaves_no_launch_outstanding() {
         command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
         expected_prompt_generation: fence.prompt_generation,
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
     let target = wired.target();
     let calling = tokio::spawn(async move {
@@ -5331,6 +5338,7 @@ async fn a_launch_is_installed_through_the_reader_and_never_written_into_the_ter
         ]),
         expected_prompt_generation: fence.prompt_generation,
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
     let target = wired.target();
     // The caller's connection is handed back with its answer and kept until the case ends: it is
@@ -5422,6 +5430,7 @@ async fn an_intervening_local_edit_is_a_draft_conflict() {
         command: LaunchCommand::QuotedCommand("cargo test".to_owned()),
         expected_prompt_generation: fence.prompt_generation,
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
     let target = wired.target();
     let calling = tokio::spawn(async move {
@@ -5490,6 +5499,7 @@ async fn a_launch_that_holds_a_nul_is_refused_and_the_reader_is_never_asked() {
             command: command.clone(),
             expected_prompt_generation: fence.prompt_generation,
             expected_buffer_revision: EditorBufferRevision::new(1),
+            after_input: None,
         };
         let target = wired.target();
         let calling = tokio::spawn(async move {
@@ -5533,6 +5543,7 @@ async fn a_launch_the_reader_never_answers_revokes_and_reports_what_it_can() {
         command: LaunchCommand::QuotedCommand("cargo test".to_owned()),
         expected_prompt_generation: fence.prompt_generation,
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
     let target = wired.target();
     let calling = tokio::spawn(async move {
@@ -5863,6 +5874,7 @@ async fn a_request_that_expires_a_hold_delivers_what_it_released() {
                 command: kr_protocol::root::LaunchCommand::Arguments(vec!["ls".to_owned()]),
                 expected_prompt_generation: PromptGeneration::new(1),
                 expected_buffer_revision: EditorBufferRevision::new(1),
+                after_input: None,
             },
         )
         .await
@@ -6411,6 +6423,7 @@ async fn a_launch_answered_after_its_revocation_is_reported_and_recorded() {
                 command: LaunchCommand::QuotedCommand("ls".to_owned()),
                 expected_prompt_generation: prompt,
                 expected_buffer_revision: EditorBufferRevision::new(1),
+                after_input: None,
             },
         )
         .await
@@ -6430,6 +6443,7 @@ async fn a_launch_answered_after_its_revocation_is_reported_and_recorded() {
                     command: LaunchCommand::QuotedCommand("ls".to_owned()),
                     expected_prompt_generation: prompt,
                     expected_buffer_revision: EditorBufferRevision::new(1),
+                    after_input: None,
                 },
             )
             .await
@@ -6501,6 +6515,7 @@ fn launch_of(
         command: LaunchCommand::QuotedCommand(command.to_owned()),
         expected_prompt_generation: fence.prompt_generation,
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     }
 }
 
@@ -6662,6 +6677,8 @@ async fn a_launch_is_refused_unless_its_connection_holds_the_current_input_lease
                 session_id: wired.session_id,
                 attachment_id: holder,
                 epoch,
+                after_input: None,
+                fenced_report: false,
             },
         )
         .await
@@ -6695,6 +6712,7 @@ async fn a_launch_is_refused_without_a_fence_and_at_a_prompt_other_than_the_one_
         command: LaunchCommand::QuotedCommand("kr-before-any-fence".to_owned()),
         expected_prompt_generation: PromptGeneration::new(1),
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
     let refused = refused_launch(&mut client, &wired, &unfenced).await;
     assert_eq!(refused.code, ErrorCode::EditorBusy, "{refused}");
@@ -6884,6 +6902,7 @@ async fn a_launch_to_a_session_that_runs_a_stock_shell_is_refused_before_it_is_d
                 command: LaunchCommand::QuotedCommand("kr-into-a-stock-shell".to_owned()),
                 expected_prompt_generation: PromptGeneration::new(1),
                 expected_buffer_revision: EditorBufferRevision::new(1),
+                after_input: None,
             },
         )
         .await
@@ -6941,6 +6960,7 @@ async fn a_launch_is_refused_once_an_application_takes_the_foreground_and_is_nev
         command: LaunchCommand::QuotedCommand("printf 'kala%s-launched\\n' reach".to_owned()),
         expected_prompt_generation: offered.prompt_generation,
         expected_buffer_revision: EditorBufferRevision::new(1),
+        after_input: None,
     };
 
     // The person runs a command, and the application it starts has the terminal.
@@ -7408,6 +7428,7 @@ async fn an_answer_queued_after_the_fence_invalidates_it_until_the_reader_proves
                 command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
                 expected_prompt_generation: fence.prompt_generation,
                 expected_buffer_revision: EditorBufferRevision::new(1),
+                after_input: None,
             },
         )
         .await
@@ -7444,6 +7465,7 @@ async fn an_answer_queued_after_the_fence_invalidates_it_until_the_reader_proves
                     command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
                     expected_prompt_generation: PromptGeneration::new(1),
                     expected_buffer_revision: EditorBufferRevision::new(1),
+                    after_input: None,
                 },
             )
             .await
@@ -7533,6 +7555,7 @@ async fn a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused() {
                     command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
                     expected_prompt_generation: prompt,
                     expected_buffer_revision: EditorBufferRevision::new(1),
+                    after_input: None,
                 },
             )
             .await
@@ -7650,6 +7673,7 @@ async fn the_hosts_answer_goes_ahead_of_the_keys_the_root_editor_holds_and_apart
                     command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
                     expected_prompt_generation: prompt,
                     expected_buffer_revision: EditorBufferRevision::new(1),
+                    after_input: None,
                 },
             )
             .await
@@ -7772,6 +7796,7 @@ async fn the_client_is_told_the_editor_was_busy_after_the_hosts_answer_released_
                     command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
                     expected_prompt_generation: prompt,
                     expected_buffer_revision: EditorBufferRevision::new(1),
+                    after_input: None,
                 },
             )
             .await
@@ -9203,6 +9228,7 @@ fn launch_quoting(
         command: LaunchCommand::Arguments(command.iter().map(|word| (*word).to_owned()).collect()),
         expected_prompt_generation: generation,
         expected_buffer_revision: revision,
+        after_input: None,
     }
 }
 

@@ -135,8 +135,8 @@ use crate::identity::{
 use crate::ids;
 use crate::ids::SessionRef;
 use crate::input::{
-    InputAcquireParams, InputAcquireResult, InputInterruptParams, InputLeaseResult,
-    InputLeaseState, InputReleaseParams, InputWriteParams, InputWriteResult,
+    InputAck, InputAcquireParams, InputAcquireResult, InputFrame, InputInterruptParams,
+    InputLeaseResult, InputLeaseState, InputReleaseParams, InputWriteParams, InputWriteResult,
 };
 use crate::invitation::{
     PairCancelParams, PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult,
@@ -504,6 +504,8 @@ pub fn protocol_schema() -> Value {
         "host_update_handover_result" => HostUpdateHandoverResult,
         "input_acquire_params" => InputAcquireParams,
         "input_acquire_result" => InputAcquireResult,
+        "input_ack" => InputAck,
+        "input_frame" => InputFrame,
         "input_interrupt_params" => InputInterruptParams,
         "input_lease_result" => InputLeaseResult,
         "input_lease_state" => InputLeaseState,

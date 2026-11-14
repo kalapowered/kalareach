@@ -603,6 +603,8 @@ pub async fn detach_attachment(
                     .flatten()
                     .filter(|token| !token.is_empty()),
             ),
+            after_input: None,
+            fenced_report: false,
         },
     )
     .await

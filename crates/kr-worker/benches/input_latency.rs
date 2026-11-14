@@ -1301,6 +1301,8 @@ impl Mutating {
                             &SessionDetachParams {
                                 attachment_id: Nullable::some(attached.attachment.attachment_id),
                                 line_token: Nullable::null(),
+                                after_input: None,
+                                fenced_report: false,
                             },
                         )
                         .await

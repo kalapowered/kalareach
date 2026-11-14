@@ -5060,6 +5060,8 @@ async fn a_refusal_the_host_could_decide_leaves_a_rejection_rather_than_an_uncer
             session_id: host.session_id,
             attachment_id: attached.attachment.attachment_id,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(9),
+            after_input: None,
+            fenced_report: false,
         })
         .expect("encodes"),
         ..close_mutation(
@@ -5337,6 +5339,8 @@ async fn a_refusal_the_host_could_decide_leaves_a_rejection_rather_than_an_uncer
             session_id: host.session_id,
             attachment_id: attached.attachment.attachment_id,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(9),
+            after_input: None,
+            fenced_report: false,
         })
         .expect("encodes"),
         ..close_mutation(
@@ -9185,6 +9189,8 @@ async fn a_rejection_under_privacy_mode_commits_the_receipt_without_the_envelope
                 session_id: host.session_id,
                 attachment_id: attachment,
                 epoch: kr_protocol::ids::InputLeaseEpoch::new(9),
+                after_input: None,
+                fenced_report: false,
             })
             .expect("encodes"),
             ..close_mutation(

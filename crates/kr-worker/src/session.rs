@@ -2538,6 +2538,7 @@ impl Session {
             attachment_id,
             geometry: change.state,
             remaining: U64::new(self.attachments.len() as u64),
+            fenced_bytes: None,
         })
     }
 

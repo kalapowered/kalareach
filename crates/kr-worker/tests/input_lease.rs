@@ -2034,6 +2034,8 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
                 session_id: wired.session_id,
                 attachment_id,
                 epoch: kr_protocol::ids::InputLeaseEpoch::new(epoch.get() + 1),
+                after_input: None,
+                fenced_report: false,
             },
         )
         .await
@@ -2049,6 +2051,8 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
                 session_id: wired.session_id,
                 attachment_id,
                 epoch,
+                after_input: None,
+                fenced_report: false,
             },
         )
         .await
@@ -5217,6 +5221,8 @@ async fn a_key_sent_after_a_detach_on_its_own_connection_waits_for_it_and_is_ref
     let detach = kr_protocol::attachment::SessionDetachParams {
         attachment_id: Nullable::some(rig.attachment),
         line_token: Nullable::null(),
+        after_input: None,
+        fenced_report: false,
     };
     let (standing, detach_id) = stall_own(&mut rig, Method::SessionDetach, &detach).await;
     let (key, _) = send_key(&mut rig, b"x").await;

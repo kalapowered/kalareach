@@ -1285,6 +1285,7 @@ impl WorkerLease {
             self.next = 0;
             let answer = kr_protocol::input::InputLeaseResult {
                 lease: self.state(),
+                fenced_bytes: None,
             };
             link.answer(call, &answer).await;
         } else if call.method == Method::InputWrite.to_string() {
