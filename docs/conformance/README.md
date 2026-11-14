@@ -113,34 +113,63 @@ that needs it.
 A step that ends so, naming a program that the step itself wrote and Cargo has a record of
 building (in a profile directory, its `deps` or a unit's directory under its `build`, with the
 unit's records in the profile directory's `.fingerprint`, or a link to a unit's file in `deps`), is
-run once more, after the file, its build directory and Cargo's record of building it are removed, along
-with every other program the step wrote in those places that is empty or cut short. A removal
-never follows a link out of the target directory. A step in which a test failed is not run again,
-and neither is one whose first run took longer than what is left of the five minutes that the
-report spends in all on second runs, counted by what each second run took: the report's own limit
-could not hold more. The step keeps its failure, with that reason added.
+run once more. Before that the report removes the file, its build directory and Cargo's record of
+building it, and every other program the step wrote in those places that is empty or cut short.
+
+The removal is checked in full before any of it is made. A file goes only if the step wrote it,
+which the file's modification time says: a file older than the step is not one its build made. A
+directory goes because Cargo's record of the unit names it, and goes empty, after what is in it.
+The removal enters no directory that is on another device than the build's output, so a mount below
+a unit is left alone with what it holds. It follows no link, and on Windows it enters no reparse
+point. Where it meets one of these, or a file the step did not write, it removes nothing of any unit,
+the step is not run again, and the step ends red with the path and the reason.
+
+A step in which a test failed is not run again, and neither is one whose first run took longer
+than the time left for a second run, which is the least a second run takes. That time is the lesser
+of two figures: what is left of the five minutes that the report spends in all on second runs, and
+what the job's limit leaves less the two minutes the report keeps to write its result. The workflow
+gives the job's limit in `KR_REPORT_DEADLINE`, the moment the limit ends the report, in seconds since
+the epoch; each report step computes it from `REPORT_MINUTES`, which is the step's own
+`timeout-minutes`. Without the variable only the five minutes apply, and a value that is not a
+number allows no second run.
+
+The time left is the second run's deadline. When it passes, the step's process group is asked to
+end and, after five seconds, killed (on Windows `taskkill /T /F` ends the tree), the step ends red
+with "the second run passed its time", and the report goes on with the next step and writes its
+result. What the second run took is taken from the five minutes. A step that is not run again keeps
+its failure, with the reason added.
 
 The result's step holds a `rerun` object with the first run's log and exit status, the files, the
 cause, and the file under `conformance/faults/` that keeps each file's size, first bytes, Mach-O
-header and the system's check of its signature, and the count of the kernel's lines about failed
-writes to storage; the lines themselves are in the file beside it that ends in `.kernel.txt`. The
-kernel's log is read from three minutes before the earliest of the files was written to three
-minutes after the latest, and no further than the time of the check. If the first
-run's evidence could not be kept, the step has an error and the run fails. `summary.rerun_steps`
-lists the steps, and the run's last line says how many were run again.
+header and the system's check of its signature, the count of the kernel's lines about failed
+writes to storage, and the lowest free space of the volume; the lines themselves are in the file
+beside it that ends in `.kernel.txt`. The kernel's log is read from three minutes before the
+earliest of the files was written to three minutes after the latest, and no further than the time
+of the check. The free space is the lowest sample that `scripts/disk-report.sh` kept in that stretch
+(the file `kr-disk-report/samples` under `RUNNER_TEMP`, `TMPDIR` or `/tmp`) or the volume as `df`
+reads it at the check, whichever is lower. If the first run's evidence could not be kept, the step
+has an error and the run fails. `summary.rerun_steps` lists the steps, and the run's last line
+counts the ones that passed with the runner's disk as the cause.
 
-The `cause` is `runner_disk` where the evidence shows it: a file is empty, its first bytes are
-zeros, it is cut short (its load commands or segments end past the end of the file, a load command
-is under eight bytes, or its signature is empty), or a Mach-O program's signature does not check,
-or the kernel logged a storage error. It is `unexplained` where nothing shows damage in the file, which may be a script
-or a program of another system that the check of signatures does not read, and the kernel logged
-no storage error, and then the step has an error and the run fails, because the cause may be this
-repository's.
+The `cause` is `runner_disk` only where the system says so: the kernel's log holds a line about a
+failed write to storage in that stretch (`I/O error`, `cluster_pageout`, `cluster_push() failed` or
+`trim_list failed`) and the volume never had less than 2 GiB free. A damaged file does not show it.
+A program of this repository's that writes to a wrong path, or a test that fills the volume,
+damages a file the same way a failing disk does. The file's state (empty, zeros, cut short, a
+signature that does not check) is recorded for a person to read, and it does not decide the cause.
+The cause is `unexplained` in every other case: no such line, a log that could not be read (the
+machine gives no `sudo`, or the platform is not macOS), a volume under the floor, or a volume whose
+free space could not be read. The step is then run again as before, its error is set, and the run
+fails, because the cause may be this repository's.
+
+That has a price: a night with a real disk fault and no readable kernel log ends red. The step is
+run again and may pass, the run still exits 1 with no warning, and a person reads the facts file.
 
 A run in which every step run again passed the second time and has the runner's disk as its cause
 exits 0, and says so where a reader of the workflow's runs sees it: under GitHub Actions the
 program prints one `::warning` annotation for each such step, naming the step and the files that
-could not be started, and the last line counts the steps run again.
+could not be started, and the last line counts them. A step run again for a cause that is not shown
+has neither: it has an error, the run exits 1, and no count is printed for it.
 
 ### The classes of test in the landing workflow
 
