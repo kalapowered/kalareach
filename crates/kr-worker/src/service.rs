@@ -498,6 +498,10 @@ pub struct WorkerService {
     /// build.
     #[cfg(feature = "testing")]
     acceptance_stall: crate::testing::Stall,
+    /// A stop in an input lane's writer, before it takes the first frame of the lane's queue,
+    /// which this host's own tests arm. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    lane_writer_stall: crate::testing::Stall,
     /// How many times a thread has found the authority lock held by another and waited for it,
     /// for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -899,6 +903,8 @@ impl WorkerService {
             owe_fence_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             acceptance_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            lane_writer_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             authority_waits: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
@@ -1497,6 +1503,22 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.acceptance_stall.arm()
+    }
+
+    /// Stops the next input lane's writer before it takes the first frame of the lane's queue,
+    /// which is the ready frame, for this host's own tests.
+    ///
+    /// Returns the end that says the writer has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_lane_writer(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.lane_writer_stall.arm()
     }
 
     /// Returns how many times a thread has found the authority lock held and waited for it, for
