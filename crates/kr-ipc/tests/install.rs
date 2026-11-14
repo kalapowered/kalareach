@@ -2560,8 +2560,8 @@ mod switch_probe {
             std::env::var("KR_PROBE_PROTECTION").unwrap_or_else(|_| "unset".to_owned());
 
         let test = TestStore::create();
-        let one = release("0.1.0+aaaaaaaaaaaa");
-        let two = release("0.2.0+bbbbbbbbbbbb");
+        let one = release("0.9.0+aaaaaaaaaaaa");
+        let two = release("0.10.0+bbbbbbbbbbbb");
         test.install(&one);
         test.install(&two);
         test.switch(&one);

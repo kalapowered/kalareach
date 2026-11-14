@@ -1,43 +1,56 @@
-"""Applies one named mutation to the store's source, in place. Exits 2 when the text it replaces is not there."""
+"""Applies one named mutation to the store's source, in place. Exits 2 when the text it replaces is not there once."""
 import sys
 
 WINDOWS = "crates/kr-ipc/src/install/windows.rs"
 INSTALL = "crates/kr-ipc/src/install.rs"
 
-TAG_CHECK = """    if reparse_tag(&directory)? != Some(IO_REPARSE_TAG_MOUNT_POINT) {
-        return Ok(false);
+FIRST_TAG_CHECK = """    if reparse_tag(&looked)? != Some(IO_REPARSE_TAG_MOUNT_POINT) {
+        return Ok(Pointed::NotAJunction);
     }
 """
 
-SWITCH_USES_IT = """        if windows::point_junction(&self.current_link(), &target)
-            .map_err(|error| InstallError::io("point the link", self.current_link(), error))?
-        {
-            return Ok(());
-        }
+SECOND_TAG_CHECK = """    if reparse_tag(&directory)? != Some(IO_REPARSE_TAG_MOUNT_POINT) {
+        return Ok(Pointed::NotAJunction);
+    }
+"""
+
+CHANGE_OPEN = """    let directory = match open_to_change(link) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Pointed::NotAJunction),
+        Err(error) => return Err(error),
+    };
+"""
+
+VERDICT = """    Ok(if identity(&named)? == identity(&directory)? {
+        Pointed::Done
+    } else {
+        Pointed::Moved
+    })
 """
 
 MUTANTS = {
-    # The junction is never pointed in place: the rename replaces it, as it did before.
-    "M1": [(WINDOWS, "pub(super) fn point_junction(link: &Path, target: &Path) -> io::Result<bool> {\n",
-            "pub(super) fn point_junction(link: &Path, target: &Path) -> io::Result<bool> {\n    return Ok(false);\n")],
-    # What is there is not checked to be a junction before the target is set.
-    "M2": [(WINDOWS, TAG_CHECK, "    let _ = reparse_tag(&directory)?;\n")],
-    # The target is set through the name and not through the handle that was looked at.
+    # The junction is never pointed in place: the rename replaces it, as before.
+    "M1": [(WINDOWS, "pub(super) fn point_junction(link: &Path, target: &Path) -> io::Result<Pointed> {\n",
+            "pub(super) fn point_junction(link: &Path, target: &Path) -> io::Result<Pointed> {\n    return Ok(Pointed::NotAJunction);\n")],
+    # The object the change is made through is not checked to be a junction again.
+    "M2": [(WINDOWS, SECOND_TAG_CHECK, "    let _ = reparse_tag(&directory)?;\n")],
+    # The target is set through the name and not through the handle that was checked.
     "M3": [(WINDOWS, "    set_reparse_data(&directory, &data)?;\n    at(Moment::JunctionPointed, link);",
             "    set_junction(link, &data)?;\n    at(Moment::JunctionPointed, link);")],
     # The change is not flushed.
-    "M4": [(WINDOWS, "    directory.sync_all()?;\n    Ok(true)", "    Ok(true)")],
+    "M4": [(WINDOWS, "    directory.sync_all()?;\n    let named", "    let named")],
     # The target is not set at all, and the switch says it was.
     "M5": [(WINDOWS, "    set_reparse_data(&directory, &data)?;\n    at(Moment::JunctionPointed, link);",
             "    let _ = (&directory, &data);\n    at(Moment::JunctionPointed, link);")],
-    # Where there is no junction the switch makes none.
-    "M6": [(INSTALL, SWITCH_USES_IT,
-            """        windows::point_junction(&self.current_link(), &target)
-            .map_err(|error| InstallError::io("point the link", self.current_link(), error))?;
-        return Ok(());
-""")],
-    # The switch says it did not point the junction after it did, so the rename replaces it too.
-    "M7": [(WINDOWS, "    directory.sync_all()?;\n    Ok(true)", "    directory.sync_all()?;\n    Ok(false)")],
+    # Where there is no junction the switch says it is done and changes nothing.
+    "M6": [(INSTALL, "            windows::Pointed::NotAJunction => {}\n",
+            "            windows::Pointed::NotAJunction => return Ok(()),\n")],
+    # A name that was replaced while it was pointed is not told.
+    "M7": [(WINDOWS, VERDICT, "    let _ = (identity(&named)?, identity(&directory)?);\n    Ok(Pointed::Done)\n")],
+    # What is not a junction on the first look is said to be done.
+    "M8": [(WINDOWS, FIRST_TAG_CHECK, FIRST_TAG_CHECK.replace("NotAJunction", "Done"))],
+    # A junction that cannot be opened to be changed is replaced by a rename.
+    "M9": [(WINDOWS, CHANGE_OPEN, CHANGE_OPEN.replace("        Err(error) => return Err(error),\n", "        Err(_) => return Ok(Pointed::NotAJunction),\n"))],
 }
 
 

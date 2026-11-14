@@ -3,7 +3,7 @@
 # in-place switch and the loop case, and says what happened: killed (a case failed), limit (the run was ended by its
 # limit), not built (the mutated text did not compile) or survived (every case passed). A control run of the same cases
 # at the unmutated text comes first and must pass.
-CASES=(a_reader_that_holds_current_open a_switch_that_ends_at_any_moment a_current_that_is_a_plain_directory a_name_put_in_the_place_of_current current_names_a_whole_release_at_every_moment_of_a_switch)
+CASES=(a_reader_that_holds_current_open a_switch_that_ends_at_any_moment a_current_that_is_a_plain_directory a_name_put_in_the_place_of_current a_name_that_stops_being_a_junction a_junction_that_cannot_be_opened_to_change current_names_a_whole_release_at_every_moment_of_a_switch)
 
 echo "MUTANT-CONTROL building"
 if ! cargo test --locked -p kr-ipc --test install --no-run > control-build.log 2>&1; then

@@ -32,10 +32,9 @@ jobs:
           - { name: loop-2, kind: loop }
           - { name: loop-3, kind: loop }
           - { name: loop-4, kind: loop }
-          - { name: loop-5, kind: loop }
           - { name: mutants-a, kind: mutants, ids: "M1 M2 M3" }
           - { name: mutants-b, kind: mutants, ids: "M4 M5 M6" }
-          - { name: mutants-c, kind: mutants, ids: "M7" }
+          - { name: mutants-c, kind: mutants, ids: "M7 M8 M9" }
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
