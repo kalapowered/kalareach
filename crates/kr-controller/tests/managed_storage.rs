@@ -9470,8 +9470,10 @@ async fn a_deletion_the_host_cannot_make_is_refused_and_sends_nothing() {
 }
 
 /// KR-REQ-24.29: an answer the service did not give leaves the deletion asked and not
-/// confirmed; the list says so, and asking again under privacy mode sends what is still unanswered
-/// and confirms it.
+/// confirmed, and the list says so. Once the service answers again the deletion is confirmed, by
+/// the call that asks again or by a pass of the carrier that was already owed, which sends the
+/// request that stays written down. Which of the two it was is not decided here; that a second ask
+/// is what sends is held by the case that follows, where no pass is owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_asked_again() {
     let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
@@ -9518,6 +9520,82 @@ async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_a
     assert!(confirmed(&rig));
     for object in second_objects() {
         assert!(rig.held_at_the_service(object), "{object} is not asked for");
+    }
+}
+
+/// KR-REQ-24.29: asking again under privacy mode sends what is still unanswered and confirms it,
+/// and nothing but that ask does. The first ask's answers are lost and the daemon is restarted:
+/// while privacy mode stays on the restarted host sends nothing the person has not just asked for,
+/// so no pass of its carrier is owed the deletion, and the deletion is confirmed only if the second
+/// ask itself sends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_ask_sends_what_is_still_unanswered_when_no_pass_is_owed_it() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    rig.set_up_after(2);
+    rig.fence().await;
+    assert!(
+        !rig.delete_retained_while_answers_are_lost(&reference_of(1))
+            .await
+            .expect("the call is answered")
+            .deleted
+    );
+
+    // The requests the first daemon sent are counted once its carrier has ended, and the service
+    // answers the restarted daemon's.
+    let environment = rig.host.environment_id();
+    let mut ended = rig.controller.backup_runtime().expect("a carrier").passes();
+    let (host, served, timer) = rig.stop().await;
+    within("the first daemon's carrier ends", async {
+        while ended.changed().await.is_ok() {}
+    })
+    .await;
+    let sent = served.web().requests_to(DELETE);
+    served.web().mend();
+    let (controller, endpoint, _serving) = start_daemon(&host, timer).await;
+
+    // The restarted carrier has looked, and sent nothing it was not just asked for.
+    let runtime = controller.backup_runtime().expect("a carrier");
+    let mut passes = runtime.passes();
+    runtime.wake();
+    let seen = *passes.borrow_and_update();
+    within("a pass after the restart", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    assert_eq!(served.web().requests_to(DELETE), sent);
+    let confirmed = || {
+        controller
+            .backup()
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("the store reads")
+            .iter()
+            .all(|object| object.released_at_ms.is_some())
+    };
+    assert!(
+        !confirmed(),
+        "the deletion is not confirmed before it is asked again"
+    );
+
+    // Nothing else can confirm it: the call is answered, and it is the call's own pass that sent.
+    let second = delete_retained_at(&endpoint, environment, &reference_of(1))
+        .await
+        .expect("asked again, and not refused: no pass was owed the deletion");
+    assert!(second.deleted, "the second ask confirmed the deletion");
+    assert!(confirmed());
+    assert!(
+        served.web().requests_to(DELETE) >= sent + first_objects().len(),
+        "the second ask sent a request for each object that was unanswered"
+    );
+    for object in second_objects() {
+        assert!(
+            served
+                .web()
+                .stored(&archive_id().to_string(), &object.to_string())
+                .is_some(),
+            "{object} is not asked for"
+        );
     }
 }
 
