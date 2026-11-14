@@ -274,6 +274,23 @@ impl Manifest {
         }
     }
 
+    /// Turns an object whose result is `refused` back into an intent, an entry with no result.
+    /// A repair that makes the object itself after none stands does this before the call that makes
+    /// it, so that a death after the call leaves an intent (which a removal decides from the
+    /// object's own mark) and never the refusal of an object that this installation then made.
+    /// Returns whether an entry was changed.
+    pub fn drop_refusal(&mut self, kind: ObjectKind, id: &str) -> bool {
+        let Some(object) = self.objects.iter_mut().find(|object| {
+            object.kind == kind
+                && object.id.eq_ignore_ascii_case(id)
+                && object.outcome == Some(Outcome::Refused)
+        }) else {
+            return false;
+        };
+        object.outcome = None;
+        true
+    }
+
     /// The recorded object of a kind and name, if there is one.
     #[must_use]
     pub fn find(&self, kind: ObjectKind, id: &str) -> Option<&Object> {
