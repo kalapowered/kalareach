@@ -31,7 +31,7 @@ import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { env } from 'node:process'
 
 /** The variable that names where a run keeps its evidence. */
-export const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
+const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
 const windows = platform() === 'win32'
 

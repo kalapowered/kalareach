@@ -8,7 +8,9 @@ import { join } from 'node:path'
 import { chdir, cwd } from 'node:process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { VARIABLE, artefactsDirectory } from '../e2e/evidence'
+import { artefactsDirectory } from '../e2e/evidence'
+
+const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
 const windows = platform() === 'win32'
 const elsewhere = windows ? 'C:\\Windows\\kr-evidence' : '/etc/kr-evidence'
