@@ -12,11 +12,11 @@ import {
   symlinkSync
 } from 'node:fs'
 import { platform, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { chdir, cwd } from 'node:process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { artefactsDirectory, fullyQualified, ownDirectory, temporaryRoots } from '../e2e/evidence'
+import { artefactsDirectory, fullyQualified, temporaryRoots } from '../e2e/evidence'
 
 const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
@@ -126,10 +126,23 @@ describe('the evidence directory reader', () => {
     )
   })
 
-  it('makes nothing in a temporary folder that is no root', () => {
-    // The folder sits outside every platform root, so it is a root of no run.
+  it('makes nothing in a temporary folder that is no root, and names the folder in its refusal', () => {
+    // A relative name is no root, though the folder exists under the working directory. The case
+    // reads through the entry point, as a test does.
     const parent = folder(cwd())
-    expect(() => ownDirectory(parent)).toThrow(/temporary roots/)
+    const name = relative(cwd(), parent)
+    for (const variable of ['TMPDIR', 'TEMP', 'TMP']) vi.stubEnv(variable, name)
+    vi.stubEnv(VARIABLE, undefined)
+    let words = ''
+    try {
+      artefactsDirectory()
+    } catch (error) {
+      words = String(error)
+    }
+    expect(words).toContain('temporary roots')
+    expect(words).toContain(name)
+    expect(words).toContain('not an absolute path')
+    expect(words).not.toContain('leave it unset')
     expect(readdirSync(parent)).toEqual([])
   })
 

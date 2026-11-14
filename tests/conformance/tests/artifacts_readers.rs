@@ -187,6 +187,7 @@ impl Reader {
                 run.args([
                     "-c",
                     r#". "$1"
+                    [ -z "${KR_READER_CALLER_OPTION:-}" ] || shopt -s "$KR_READER_CALLER_OPTION"
                     printf 'slash_tmp=%s\n' "$(cygpath -w /tmp 2>/dev/null)"
                     kr_artifacts_dir
                     printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)""#,
@@ -345,10 +346,21 @@ fn a_value_inside_a_root_is_accepted_and_handed_on_resolved() {
 #[test]
 fn a_run_without_the_variable_gets_a_directory_of_its_own_that_exists() {
     for reader in readers() {
-        let reading = reader.read(None, None);
+        // The temporary folder is named here, with one folder for TMPDIR, TEMP and TMP, so that the
+        // case does not depend on how the machine's own variables stand to each other.
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let reading = reader.read(None, Some(temporary.path()));
         assert!(reading.succeeded, "{reader:?}: {reading:?}");
         let directory = reading.directory.clone().expect("a directory");
         assert!(directory.is_dir(), "{reader:?}: {}", directory.display());
+        assert!(
+            same(
+                directory.parent().expect("a parent"),
+                &real(temporary.path())
+            ),
+            "{reader:?}: the directory is made under the temporary folder: {}",
+            directory.display()
+        );
         assert!(
             same(&real(&directory), &directory),
             "{reader:?}: the directory is given resolved: {}",
@@ -422,7 +434,7 @@ fn a_step_up_is_refused_even_when_it_ends_inside_a_root() {
 }
 
 /// The top of a drive, or of the file system, is no evidence folder: a value that is one is
-/// refused by each reader, spelled with one slash or with two.
+/// refused by the shell reader and by PowerShell, spelled with one slash or with two.
 #[test]
 fn a_filesystem_root_as_the_value_is_refused() {
     for reader in readers() {
@@ -562,16 +574,28 @@ fn a_runner_folder_with_a_line_feed_at_its_end_names_no_folder_and_so_no_root() 
 fn a_temporary_folder_that_is_no_root_is_left_without_a_directory_of_the_runs_own() {
     for reader in readers() {
         let working = tempfile::tempdir().expect("a working directory");
-        std::fs::create_dir(working.path().join("tmp")).expect("a folder");
+        std::fs::create_dir(working.path().join("kr-no-root")).expect("a folder");
         // A relative name is no root, though the folder exists under the working directory.
-        let reading = reader.read_in(None, Some(Path::new("tmp")), Some(working.path()));
+        let reading = reader.read_in(None, Some(Path::new("kr-no-root")), Some(working.path()));
         assert!(!reading.succeeded, "{reader:?}: {reading:?}");
         assert!(
             reading.words.contains("temporary roots"),
             "{reader:?} refused without naming the roots: {}",
             reading.words
         );
-        let left = std::fs::read_dir(working.path().join("tmp"))
+        // No variable was set, so the words name the temporary folder and why it is refused, and do
+        // not tell the caller to leave the variable unset.
+        assert!(
+            reading.words.contains("kr-no-root") && reading.words.contains("not an absolute path"),
+            "{reader:?} refused without naming the temporary folder and why: {}",
+            reading.words
+        );
+        assert!(
+            !reading.words.contains("leave it unset"),
+            "{reader:?} tells a run that set nothing to leave it unset: {}",
+            reading.words
+        );
+        let left = std::fs::read_dir(working.path().join("kr-no-root"))
             .expect("reads the folder")
             .count();
         assert_eq!(left, 0, "{reader:?} made a directory in a refused folder");
@@ -799,36 +823,159 @@ fn slash_tmp_is_a_root_where_the_temporary_folder_names_another() {
     }
 }
 
+/// The top of the file system is no root, whatever way a temporary variable spells it: bash keeps a
+/// leading `//` as it is, so the shell reader meets `//` and `//.` as the top itself.
 #[test]
 fn a_temporary_folder_that_is_a_filesystem_root_admits_nothing_beside_the_other_roots() {
-    let top = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+    let tops: &[&str] = if cfg!(windows) {
+        &[r"C:\"]
+    } else {
+        &["/", "//", "//."]
+    };
     for reader in readers() {
-        let outside = if cfg!(windows) {
-            PathBuf::from(r"C:\Windows\kr-evidence")
-        } else {
-            PathBuf::from("/usr/kr-evidence")
-        };
+        for top in tops {
+            let top = Path::new(top);
+            let outside = if cfg!(windows) {
+                PathBuf::from(r"C:\Windows\kr-evidence")
+            } else {
+                PathBuf::from("/usr/kr-evidence")
+            };
+            let reading = reader.read_with(
+                Some(outside.as_os_str()),
+                Some(top),
+                &[("RUNNER_TEMP", top.as_os_str())],
+            );
+            assert_refused(
+                reader,
+                &reading,
+                &format!("a folder outside the roots when the temporary folder is {top:?}"),
+                OUTSIDE,
+            );
+            // The top of the file system is no root, so the words do not list it among them.
+            if cfg!(unix) {
+                for listed in [
+                    "(/,", ", /,", ", /)", "(/)", "(//,", ", //,", ", //)", "(//)", "(//.,",
+                    ", //.,", ", //.)", "(//.)",
+                ] {
+                    assert!(
+                        !reading.words.contains(listed),
+                        "{reader:?} lists the top of the file system as a root ({top:?}): {}",
+                        reading.words
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A temporary folder that is a link to the top of the file system, with its target written `//`,
+/// is no root: a value through the link names a folder at the top of the disk, which no reader
+/// admits.
+#[cfg(unix)]
+#[test]
+fn a_temporary_folder_that_is_a_link_to_the_top_of_the_file_system_admits_nothing() {
+    for reader in readers() {
+        let parent = beside_the_build();
+        let link = parent.path().join("top");
+        std::os::unix::fs::symlink("//", &link).expect("a link whose target is written //");
+        // A name that is not at the top of the disk, so that only the top itself could admit it.
+        let name = format!("kr-evidence-{}", std::process::id());
+        let value = link.join(&name);
         let reading = reader.read_with(
-            Some(outside.as_os_str()),
-            Some(top),
-            &[("RUNNER_TEMP", top.as_os_str())],
+            Some(value.as_os_str()),
+            Some(&link),
+            &[("RUNNER_TEMP", link.as_os_str())],
         );
         assert_refused(
             reader,
             &reading,
-            "a folder outside the roots when the temporary folder is a filesystem root",
+            "a folder at the top of the disk through a link to //",
             OUTSIDE,
         );
-        // The top of the file system is no root, so the words do not list it among them.
-        if cfg!(unix) {
-            for listed in ["(/,", ", /,", ", /)", "(/)"] {
-                assert!(
-                    !reading.words.contains(listed),
-                    "{reader:?} lists the top of the file system as a root: {}",
-                    reading.words
-                );
-            }
-        }
+        assert!(
+            !Path::new("/").join(&name).exists(),
+            "{reader:?} made a folder at the top of the disk"
+        );
+    }
+}
+
+/// A folder written with a second slash in front (a path built as `/` and an absolute path) is that
+/// folder, and so is a link whose target is written that way: the shell reader does not take `//`
+/// at the front of a real path for another place.
+#[cfg(unix)]
+#[test]
+fn a_leading_double_slash_is_read_as_the_folder_it_names() {
+    for reader in readers() {
+        let runner = beside_the_build();
+        let real_runner = real(runner.path());
+        let doubled = |path: &Path| PathBuf::from(format!("/{}", path.display()));
+        // The runner's folder written with a second slash.
+        let value = real_runner.join("evidence");
+        let reading = reader.read_with(
+            Some(value.as_os_str()),
+            None,
+            &[("RUNNER_TEMP", doubled(&real_runner).as_os_str())],
+        );
+        assert!(reading.succeeded, "{reader:?}: {reading:?}");
+        let directory = reading.directory.as_deref().expect("a directory");
+        assert!(same(directory, &value), "{reader:?}: {directory:?}");
+        // A link inside the runner folder whose target is written with a second slash.
+        let inner = real_runner.join("inner");
+        std::fs::create_dir(&inner).expect("a folder");
+        std::os::unix::fs::symlink(doubled(&inner), real_runner.join("double"))
+            .expect("a link whose target is written with a second slash");
+        let through = real_runner.join("double").join("evidence");
+        let reading = reader.read_with(
+            Some(through.as_os_str()),
+            None,
+            &[("RUNNER_TEMP", real_runner.as_os_str())],
+        );
+        assert!(reading.succeeded, "{reader:?}: {reading:?}");
+        let directory = reading.directory.as_deref().expect("a directory");
+        assert!(
+            same(directory, &inner.join("evidence")),
+            "{reader:?}: {directory:?}"
+        );
+    }
+}
+
+/// The shell reader compares by exact letters whatever options its caller set: with `nocasematch`
+/// a `case` takes /ROOT for /root. The two folders differ in case alone, so a disk that keeps them
+/// as one (the Mac's usual one) cannot show it, and the case says so.
+#[cfg(unix)]
+#[test]
+fn the_shell_reader_compares_exact_letters_whatever_the_callers_nocasematch_is() {
+    if shell().is_none() {
+        return;
+    }
+    let parent = beside_the_build();
+    let root = parent.path().join("root");
+    std::fs::create_dir(&root).expect("a folder");
+    if parent.path().join("ROOT").exists() {
+        eprintln!(
+            "the disk under {} keeps /root and /ROOT as one folder: the case says nothing here",
+            parent.path().display()
+        );
+        return;
+    }
+    let other = parent.path().join("ROOT");
+    std::fs::create_dir(&other).expect("the folder that differs in letter case alone");
+    for option in ["", "nocasematch"] {
+        let named = [
+            ("RUNNER_TEMP", root.as_os_str()),
+            ("KR_READER_CALLER_OPTION", OsStr::new(option)),
+        ];
+        let outside = other.join("evidence");
+        let reading = Reader::Shell.read_with(Some(outside.as_os_str()), None, &named);
+        assert_refused(
+            Reader::Shell,
+            &reading,
+            &format!("a folder that differs from the root in letter case alone ({option:?})"),
+            OUTSIDE,
+        );
+        let inside = root.join("evidence");
+        let reading = Reader::Shell.read_with(Some(inside.as_os_str()), None, &named);
+        assert!(reading.succeeded, "{option:?}: {reading:?}");
     }
 }
 
@@ -839,7 +986,8 @@ mod windows_paths {
     /// The value the Windows acceptance run passes (the temporary folder by its long name) where
     /// the machine's own `TEMP` may be its short name, and the same value in another letter case.
     #[test]
-    fn the_long_name_and_a_changed_letter_case_of_the_temporary_folder_are_read_by_every_reader() {
+    fn the_long_name_and_a_changed_letter_case_of_the_temporary_folder_are_read_by_the_shell_and_powershell()
+     {
         for reader in readers() {
             let temporary = tempfile::tempdir().expect("a temporary folder");
             let long = real(temporary.path());
@@ -941,8 +1089,77 @@ mod windows_paths {
         if shell().is_none() {
             return;
         }
-        let reading = Reader::Shell.read(Some(OsStr::new("/tmp/kr-evidence")), None);
+        // One folder for TMPDIR, TEMP and TMP, so that the case does not depend on how the machine's
+        // own variables stand to each other.
+        let folder = tempfile::tempdir().expect("a temporary folder");
+        let reading = Reader::Shell.read(Some(OsStr::new("/tmp/kr-evidence")), Some(folder.path()));
+        assert_own_slash_tmp(&reading, &real(folder.path()));
         assert!(reading.succeeded, "{reading:?}");
+    }
+
+    /// With `TMP` and `TEMP` apart and no variable set, the run's own directory is made under the
+    /// folder `TEMP` names, which is the reader's temporary folder, and not under `/tmp`, which
+    /// Git Bash made from `TMP`.
+    #[test]
+    fn a_run_whose_tmp_and_temp_differ_gets_its_own_directory_under_temp() {
+        if shell().is_none() {
+            return;
+        }
+        let there = tempfile::tempdir().expect("a folder that /tmp is");
+        let here = tempfile::tempdir().expect("the reader's temporary folder");
+        let named = [
+            ("TMP", there.path().as_os_str()),
+            ("TEMP", here.path().as_os_str()),
+            ("TMPDIR", OsStr::new("")),
+        ];
+        let reading = Reader::Shell.read_with(None, None, &named);
+        assert_own_slash_tmp(&reading, &real(there.path()));
+        assert!(reading.succeeded, "{reading:?}");
+        let directory = reading.directory.clone().expect("a directory");
+        assert!(directory.is_dir(), "{}", directory.display());
+        assert!(
+            same(directory.parent().expect("a parent"), &real(here.path())),
+            "the directory is made under TEMP's folder: {}",
+            directory.display()
+        );
+        std::fs::remove_dir(&directory).expect("removes the directory the run made");
+    }
+
+    /// A `TEMP` with a line feed at its end names no folder, so Git Bash's `/tmp`, which is the
+    /// folder `TEMP` would name without the line feed, is no root: the reader checks the name as it
+    /// was given. A run that sets no variable is refused, and nothing is made.
+    #[test]
+    fn a_temp_that_ends_with_a_line_feed_names_no_folder_and_so_makes_slash_tmp_no_root() {
+        if shell().is_none() {
+            return;
+        }
+        let there = tempfile::tempdir().expect("a folder that /tmp is");
+        let mut broken = there.path().as_os_str().to_owned();
+        broken.push("\n");
+        let named = [
+            ("TMP", there.path().as_os_str()),
+            ("TEMP", broken.as_os_str()),
+            ("TMPDIR", OsStr::new("")),
+        ];
+        let reading = Reader::Shell.read_with(Some(OsStr::new("/tmp/kr-evidence")), None, &named);
+        assert_own_slash_tmp(&reading, &real(there.path()));
+        assert_refused(
+            Reader::Shell,
+            &reading,
+            "a folder under /tmp when TEMP ends with a line feed",
+            OUTSIDE,
+        );
+        let reading = Reader::Shell.read_with(None, None, &named);
+        assert!(!reading.succeeded, "{reading:?}");
+        assert!(
+            !reading.words.contains("leave it unset"),
+            "a run that set nothing is told to leave it unset: {}",
+            reading.words
+        );
+        let left = std::fs::read_dir(there.path())
+            .expect("reads the folder")
+            .count();
+        assert_eq!(left, 0, "a directory was made in /tmp");
     }
 
     /// Git Bash makes `/tmp` from the `TMP` of the process that starts it (and, with several
