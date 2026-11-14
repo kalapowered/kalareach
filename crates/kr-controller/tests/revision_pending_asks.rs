@@ -1423,3 +1423,192 @@ async fn the_pass_looks_at_a_worker_whose_presentation_is_waiting_and_asks_it_no
     host.stop().await;
     drop(workers);
 }
+
+/// A daemon that starts again while one worker's dispatch boundary is held. The start meets the
+/// held boundary with its own look at the worker, which the worker decides only when the boundary
+/// is let go, so the worker is unlisted until then.
+struct RestartedAtAHeldBoundary {
+    host: Host,
+    workers: Vec<Worker>,
+    held: net_support::worker::HeldBoundary,
+}
+
+async fn restarted_with_the_boundary_held() -> RestartedAtAHeldBoundary {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let held = workers[0].hold_the_dispatch_boundary().await;
+    let stopped = host.shut_down().await;
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    RestartedAtAHeldBoundary {
+        host,
+        workers,
+        held,
+    }
+}
+
+/// The sessions one `session.list` names.
+async fn listed(client: &mut kr_ipc::client::LocalClient) -> Vec<SessionId> {
+    let listed: kr_protocol::session::SessionListResult = client
+        .request(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: false,
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("a list is served on the local socket")
+        .to_typed()
+        .expect("a result of the declared shape");
+    listed
+        .sessions
+        .iter()
+        .map(|session| session.session_id)
+        .collect()
+}
+
+/// KR-REQ-09.12, KR-ACC-022: a client that polls `session.list` while a restarted daemon's worker
+/// holds its dispatch boundary adds no presentation at that boundary.
+///
+/// The start's own look at the worker meets the held boundary and gives up after its bound; the
+/// presentation stays at the boundary for the whole hold, on a thread of the worker's and with one
+/// of its connections. Each list looks again for the unlisted worker, so a look that presented
+/// anew would leave one more at each poll, and an hour of polling would take the connections of the
+/// worker, its owner's own included. The three lists run together; the worker's count of the
+/// presentations waiting is what shows how many the daemon made. The lists are answered within two
+/// of the bound, which is what a look that waits for the presentation under way, one list after the
+/// other, would not be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_list_polled_while_a_boundary_is_held_leaves_one_presentation_at_it() {
+    let RestartedAtAHeldBoundary {
+        host,
+        workers,
+        held,
+    } = restarted_with_the_boundary_held().await;
+    let service = Arc::clone(&workers[0].service);
+    let at_the_start = service.presentations_waiting_for_tests();
+    let mut first = host.client().await;
+    let mut second = host.client().await;
+    let mut third = host.client().await;
+    tokio::time::timeout(
+        kr_controller::directory::RECONNECT_TIMEOUT * 2 + SLACK,
+        async { tokio::join!(listed(&mut first), listed(&mut second), listed(&mut third)) },
+    )
+    .await
+    .expect("the three lists were answered within two bounds of a look at the worker");
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        1,
+        "the daemon's presentations waiting at the held boundary after three lists, {at_the_start} \
+         after its start"
+    );
+    assert!(
+        host.controller()
+            .presentation_in_flight_for_tests(workers[0].session_id),
+        "the one presentation is still under way"
+    );
+    held.release();
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12, KR-ACC-022: the answer of a presentation that outlived the look that made it is
+/// used: once the boundary is let go, the next list names the session, and the worker is presented
+/// to no further time for it.
+///
+/// The worker decides the presentation when the hold ends, long after the start's look gave up on
+/// it. The next list finds that answer and adopts the worker on it, with no restart of the daemon.
+/// The worker's count of the connections the daemon made is what shows a second presentation: the
+/// list's own read of the worker opens the daemon's one link, and nothing else is opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_boundary_is_let_go() {
+    let RestartedAtAHeldBoundary {
+        host,
+        workers,
+        held,
+    } = restarted_with_the_boundary_held().await;
+    let worker = &workers[0];
+    let service = Arc::clone(&worker.service);
+    let mut client = host.client().await;
+    assert!(
+        !listed(&mut client).await.contains(&worker.session_id),
+        "a worker whose boundary is held is not listed"
+    );
+
+    held.release();
+    until(
+        Duration::from_secs(10),
+        "the worker's decision of the presentation that waited",
+        || service.presentations_waiting_for_tests() == 0,
+    )
+    .await;
+    let connections = service.controller_connections_for_tests();
+    assert!(
+        listed(&mut client).await.contains(&worker.session_id),
+        "the next list names the session"
+    );
+    assert_eq!(
+        service.controller_connections_for_tests() - connections,
+        1,
+        "the list adopted the worker on the answer it had, and opened only the daemon's one link"
+    );
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12, KR-ACC-022: a closure while a presentation waits at a held boundary ends the
+/// daemon's part in it, and the daemon's stop does not wait for it.
+///
+/// The presentation is the daemon's task. The session's closure takes its entry away, and the task
+/// ends with it; a stop that follows lets the daemon go while the worker's boundary is still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_closure_while_a_presentation_waits_ends_it_and_the_stop_does_not_wait_for_it() {
+    let RestartedAtAHeldBoundary {
+        host,
+        workers,
+        held,
+    } = restarted_with_the_boundary_held().await;
+    let session_id = workers[0].session_id;
+    assert!(
+        host.controller()
+            .presentation_in_flight_for_tests(session_id),
+        "the start's look left its presentation under way"
+    );
+    host.controller()
+        .retire(&kr_protocol::session::ClosureRecord {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::CloseRequested,
+            root_exit_code: Nullable::some(kr_protocol::scalars::U64::new(0)),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Complete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_ipc::now_ms(),
+        })
+        .await
+        .expect("the closure is recorded");
+    assert!(
+        !host
+            .controller()
+            .presentation_in_flight_for_tests(session_id),
+        "the closure ended the presentation's entry"
+    );
+
+    let daemon = Arc::downgrade(host.controller());
+    host.stop().await;
+    until(
+        Duration::from_secs(10),
+        "the daemon let go with the boundary still held",
+        || daemon.strong_count() == 0,
+    )
+    .await;
+    held.release();
+    drop(workers);
+}
