@@ -2,13 +2,21 @@
 // platform's temporary roots where the value is used. Each case sets the variable in the
 // environment the way a build does and reads the directory through the reader's own entry point.
 
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync
+} from 'node:fs'
 import { platform, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { chdir, cwd } from 'node:process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { artefactsDirectory, fullyQualified, temporaryRoots } from '../e2e/evidence'
+import { artefactsDirectory, fullyQualified, ownDirectory, temporaryRoots } from '../e2e/evidence'
 
 const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
@@ -116,6 +124,13 @@ describe('the evidence directory reader', () => {
     expect(read('/tmp/kr-evidence-reader-case/evidence')).toBe(
       join(realpathSync.native('/tmp'), 'kr-evidence-reader-case', 'evidence')
     )
+  })
+
+  it('makes nothing in a temporary folder that is no root', () => {
+    // The folder sits outside every platform root, so it is a root of no run.
+    const parent = folder(cwd())
+    expect(() => ownDirectory(parent)).toThrow(/temporary roots/)
+    expect(readdirSync(parent)).toEqual([])
   })
 
   it('takes a temporary folder that is a filesystem root for no root', () => {

@@ -116,6 +116,9 @@ if ($null -ne $named) {
     $directory = Confine-Value $named
 } else {
     $made = Join-Path ([System.IO.Path]::GetTempPath()) ('kr-test-artifacts-' + [System.Guid]::NewGuid().ToString('N'))
+    # The folder is checked before the directory is made in it, so that a temporary folder that is
+    # no root is left as it was.
+    Confine-Value $made | Out-Null
     [System.IO.Directory]::CreateDirectory($made) | Out-Null
     $directory = Confine-Value $made
     [Console]::Error.WriteLine("$variable is not set: this run keeps its evidence in $directory")

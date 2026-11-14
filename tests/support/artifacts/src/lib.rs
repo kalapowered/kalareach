@@ -118,10 +118,7 @@ fn refused(value: &Path, why: &str, roots: &[PathBuf]) -> Refused {
 fn own() -> &'static Path {
     static OWN: OnceLock<PathBuf> = OnceLock::new();
     OWN.get_or_init(|| {
-        let made = make_own().unwrap_or_else(|error| {
-            panic!("no directory of this run's own can be made for its evidence: {error}")
-        });
-        let own = confine(&made).unwrap_or_else(|refused| panic!("{refused}"));
+        let own = own_in(&std::env::temp_dir(), &roots());
         eprintln!(
             "{VARIABLE} is not set: this run keeps its evidence in {}",
             own.display()
@@ -130,9 +127,23 @@ fn own() -> &'static Path {
     })
 }
 
-/// Makes a directory under the temporary folder that nothing else has, readable by this account
-/// only. The name is made exclusively, so a name an earlier run took is never reused.
-fn make_own() -> std::io::Result<PathBuf> {
+/// A directory of this run's own under `temporary`, which has to be inside one of `roots`. The
+/// folder is checked before the directory is made in it, so that a temporary folder that is no
+/// root is left as it was.
+fn own_in(temporary: &Path, roots: &[PathBuf]) -> PathBuf {
+    confine_in(&temporary.join(OWN_PREFIX), roots).unwrap_or_else(|refused| panic!("{refused}"));
+    let made = make_own(temporary).unwrap_or_else(|error| {
+        panic!("no directory of this run's own can be made for its evidence: {error}")
+    });
+    confine_in(&made, roots).unwrap_or_else(|refused| panic!("{refused}"))
+}
+
+/// The start of the name of a run's own directory.
+const OWN_PREFIX: &str = "kr-test-artifacts-";
+
+/// Makes a directory under `temporary` that nothing else has, readable by this account only. The
+/// name is made exclusively, so a name an earlier run took is never reused.
+fn make_own(temporary: &Path) -> std::io::Result<PathBuf> {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -140,7 +151,7 @@ fn make_own() -> std::io::Result<PathBuf> {
     let mut attempts = 0_u32;
     loop {
         let suffix = std::hash::BuildHasher::hash_one(&RandomState::new(), attempts);
-        let path = std::env::temp_dir().join(format!("kr-test-artifacts-{suffix:016x}"));
+        let path = temporary.join(format!("{OWN_PREFIX}{suffix:016x}"));
         match builder.create(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == ErrorKind::AlreadyExists && attempts < 100 => {
@@ -464,11 +475,29 @@ mod tests {
         assert!(words.contains("temporary roots"), "{words}");
     }
 
+    #[test]
+    fn nothing_is_made_in_a_temporary_folder_that_is_no_root() {
+        let outside = beside_the_build();
+        let result = std::panic::catch_unwind(|| own_in(outside.path(), &[]));
+        assert!(
+            result.is_err(),
+            "a run's own directory was made in {outside:?}"
+        );
+        let left = std::fs::read_dir(outside.path())
+            .expect("reads the folder")
+            .count();
+        assert_eq!(
+            left, 0,
+            "a refused temporary folder was left with a folder in it"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_directory_of_a_runs_own_is_readable_by_this_account_only() {
         use std::os::unix::fs::PermissionsExt;
-        let own = make_own().expect("makes a directory");
+        let temporary = temporary();
+        let own = make_own(temporary.path()).expect("makes a directory");
         let mode = std::fs::metadata(&own)
             .expect("reads it")
             .permissions()
