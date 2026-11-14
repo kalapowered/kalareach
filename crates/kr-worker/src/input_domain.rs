@@ -163,6 +163,14 @@ impl InputShared {
         Arc::clone(&self.lock().writer().writer_hold)
     }
 
+    /// Returns the stop the pump stands in once it has read the room for the answers that wait in
+    /// the lane, and before it says whether answers still wait, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pump_hold(&self) -> Arc<crate::testing::Stall> {
+        Arc::clone(&self.lock().writer().pump_hold)
+    }
+
     /// Asks the pump to take the session and do what is owed.
     pub fn wake_pump(&self) {
         self.pump.notify_one();
@@ -343,6 +351,10 @@ pub(crate) struct WriterHandles {
     /// The stop the writer stands in when it has taken a batch, for this host's own tests.
     #[cfg(feature = "testing")]
     pub(crate) writer_hold: Arc<crate::testing::Stall>,
+    /// The stop the pump stands in when it has read the room for the answers in the lane, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) pump_hold: Arc<crate::testing::Stall>,
 }
 
 impl WriterHandles {
@@ -361,6 +373,8 @@ impl WriterHandles {
             terminal_writes: Arc::default(),
             #[cfg(feature = "testing")]
             writer_hold: Arc::default(),
+            #[cfg(feature = "testing")]
+            pump_hold: Arc::default(),
         }
     }
 }
