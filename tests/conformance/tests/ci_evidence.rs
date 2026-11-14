@@ -2373,6 +2373,12 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
             None,
         ),
+        (
+            "a held value that is the start of a longer name",
+            vec![("scripts/c.sh", "d=\"${@V@:-/tmp/abc}\"\n")],
+            "file: scripts/c.sh\n| d=\"${@V@:-/tmp/abc}\"\nvalue: /tmp/a",
+            Some(value),
+        ),
     ];
     for (name, files, held, fails_with) in cases {
         let problems = findings(&tree(&files), &format!("\n{}\n", named(held)));
