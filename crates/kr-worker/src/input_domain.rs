@@ -56,10 +56,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use kr_protocol::attachment::AttachmentCapability;
-use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+use kr_protocol::envelope::{ControlEvent, ControlFrame, Outcome, Response};
 use kr_protocol::ids::{AttachmentId, AuthorityRevision, ConnectionId, InputLeaseEpoch, SessionId};
-use kr_protocol::input::InputLeaseState;
-use kr_protocol::local::{InputLaneReady, LaneCredit, LaneEnded, LaneWindow};
+use kr_protocol::input::{InputBarrier, InputLeaseState};
+use kr_protocol::local::{InputLaneReady, LaneCredit, LaneEnded, LaneLaunch, LaneWindow};
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_protocol::session::SessionState;
 use kr_shell_integration::contract::fence::{LaunchStanding, LeaseView};
@@ -2273,6 +2273,48 @@ impl InputDomain {
             reserved: LANE_WINDOW.least(free),
             outstanding: Arc::new(Outstanding::default()),
         });
+    }
+
+    /// Checks the position a dependent request names: the typing it must come after has been
+    /// accepted. It runs in the same hold as the request's action, so no frame of the epoch is
+    /// accepted between the two.
+    ///
+    /// The position is consulted only while the barrier's epoch is the current one and its
+    /// attachment holds the lease. After a takeover the old epoch accepts no more frames, so
+    /// there is nothing left to order and the request goes on to the checks of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::PreconditionFailed`] when the epoch is live and fewer frames of it
+    /// have been accepted than the barrier counts.
+    pub(crate) fn check_position(&self, barrier: &InputBarrier) -> Result<()> {
+        if barrier.epoch.get() != self.lease.epoch()
+            || self.lease.holder() != Some(barrier.attachment_id)
+            || self.lease.next_sequence() >= barrier.count.get()
+        {
+            return Ok(());
+        }
+        Err(WorkerError::PreconditionFailed {
+            detail: "The typing before this request has not all arrived.".to_owned(),
+        })
+    }
+
+    /// Tells the lane of `attachment_id` that the worker has dealt with the launch the client
+    /// numbered `launch`: the fence holds the keys typed after it, or nothing is left to order.
+    /// It is queued behind every answer already queued on that lane, in the hold of the launch.
+    pub(crate) fn launch_handled(&self, attachment_id: AttachmentId, launch: u32) {
+        if let Some(lane) = self
+            .lanes
+            .values()
+            .find(|lane| lane.attachment_id == attachment_id && lane.parent_ok)
+        {
+            lane.queue.push_frame(ControlFrame::Event(
+                ControlEvent::InputLaunchReserved(LaneLaunch {
+                    attachment_id,
+                    launch,
+                }),
+            ));
+        }
     }
 
     /// Says that the epoch whose window ended is over, with what the end has discarded, to the

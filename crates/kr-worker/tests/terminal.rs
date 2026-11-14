@@ -926,7 +926,7 @@ async fn losing_the_paste_holder_closes_the_paste_before_a_held_reply() {
     // The person holding the paste goes away without finishing it.
     {
         let mut session = host.runtime.session();
-        session.detach(keys.attachment()).expect("detaches");
+        session.detach(keys.attachment(), None).expect("detaches");
         host.runtime.flush_input();
     }
     std::fs::write(&read, b"").expect("opens the gate");

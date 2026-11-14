@@ -29,7 +29,7 @@ use kr_protocol::ids::{
     AttachmentId, ConnectionId, DeviceId, EnvironmentId, GrantId, PendingResourceId, SessionEpoch,
     SessionId, StreamCursor,
 };
-use kr_protocol::input::{InputAcquireResult, InputLeaseState};
+use kr_protocol::input::{InputAcquireResult, InputBarrier, InputLeaseState};
 use kr_protocol::projection::ProjectionResetReason;
 use kr_protocol::recovery::{EventsSnapshotResult, HistoryPageResult, ResyncReason};
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
@@ -1002,6 +1002,47 @@ impl Session {
         Some(outcome)
     }
 
+    /// Runs a stimulus that starts a launch for the typing a barrier names, in one hold of the
+    /// input domain, and tells the launch's lane that the worker has dealt with it.
+    ///
+    /// In that hold and before the machine sees the launch, the barrier's attachment and epoch
+    /// are compared with the lease's holder and epoch, and then its position is checked. A
+    /// launch that marked one epoch and arrives under another, or from an attachment that does
+    /// not hold the keys, is refused as a lost lease with nothing reserved, and a position the
+    /// live epoch has not reached is a definite refusal with nothing applied. Once the machine
+    /// has reserved the launch or refused it by itself, and in the same hold, the lane of the
+    /// requester is given the marker for the barrier's launch number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::LeaseLost`] and [`WorkerError::PreconditionFailed`] as above.
+    pub fn stimulate_fence_after<F>(
+        &mut self,
+        barrier: &InputBarrier,
+        stimulate: F,
+    ) -> Result<Option<FenceOutcome>>
+    where
+        F: FnOnce(&mut crate::fence::FenceDriver) -> crate::fence::Effects,
+    {
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        if input.holder() != Some(barrier.attachment_id) || input.epoch() != barrier.epoch.get() {
+            return Err(WorkerError::LeaseLost);
+        }
+        input.check_position(barrier)?;
+        let Some(driver) = input.fence_mut() else {
+            return Ok(None);
+        };
+        let effects = stimulate(driver);
+        let Applied { mut outcome, owed } = input.apply_effects(effects);
+        if let Some(launch) = barrier.launch.0 {
+            input.launch_handled(barrier.attachment_id, launch);
+        }
+        drop(input);
+        self.finish_fence(owed, &mut outcome);
+        Ok(Some(outcome))
+    }
+
     /// Returns the input domain this session shares with its keystroke path.
     #[must_use]
     pub fn input(&self) -> Arc<InputShared> {
@@ -1035,7 +1076,7 @@ impl Session {
                 ),
                 Step::RemoveAttachment(attachment_id) => {
                     // A detach the reader asked for removes exactly the attachment the fence named.
-                    let _ = self.detach(attachment_id);
+                    let _ = self.detach(attachment_id, None);
                 }
                 Step::Interrupt(_) => {
                     self.interrupt_failed = self
@@ -2472,13 +2513,26 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns an error when the attachment is unknown.
-    pub fn detach(&mut self, attachment_id: AttachmentId) -> Result<SessionDetachResult> {
+    /// Returns an error when the attachment is unknown, and [`WorkerError::PreconditionFailed`],
+    /// with nothing removed, when the barrier names a position of the live epoch that has not
+    /// been reached.
+    pub fn detach(
+        &mut self,
+        attachment_id: AttachmentId,
+        after: Option<&InputBarrier>,
+    ) -> Result<SessionDetachResult> {
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        // The position is checked first, in the hold that does the removals, so a refusal has no
+        // effect. A stale epoch proceeds: a detach does not depend on the lease.
+        if let Some(barrier) = after
+            && barrier.attachment_id == attachment_id
+        {
+            input.check_position(barrier)?;
+        }
         self.content_scopes.remove(&attachment_id);
         self.resource_views.remove(&attachment_id);
         self.live_views.remove(&attachment_id);
-        let shared = Arc::clone(&self.input);
-        let mut input = shared.lock();
         input.forget_attachment(attachment_id);
         // Undelivered input from the removed attachment goes with it; nothing is replayed. A paste
         // it had open is closed first, so the application is not left inside a bracketed paste
@@ -2846,17 +2900,24 @@ impl Session {
     /// Releases the lease held by this attachment, and returns the lease and how many bytes the
     /// release discarded.
     ///
+    /// A release that carries a barrier is applied only when the typing the barrier counts has
+    /// been accepted, checked in the hold that applies it.
+    ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::LeaseLost`] when the caller does not hold it at that epoch.
+    /// Returns [`WorkerError::LeaseLost`] when the caller does not hold it at that epoch, which
+    /// is also the answer for an epoch that has ended whatever the barrier says, and
+    /// [`WorkerError::PreconditionFailed`] when the epoch is live and its position is not reached.
     pub fn release_input(
         &mut self,
         attachment_id: AttachmentId,
         epoch: u64,
+        after: Option<&InputBarrier>,
     ) -> Result<(InputLeaseState, u64)> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
-        let (owed, fenced) = self.release_input_locked(&mut input, attachment_id, epoch)?;
+        let (owed, fenced) =
+            self.release_input_locked(&mut input, attachment_id, epoch, after)?;
         let lease = input.lease();
         drop(input);
         self.carry_out(owed, &mut FenceOutcome::default());
@@ -2871,7 +2932,18 @@ impl Session {
         input: &mut InputDomain,
         attachment_id: AttachmentId,
         epoch: u64,
+        after: Option<&InputBarrier>,
     ) -> Result<(Vec<crate::fence::Step>, u64)> {
+        // The holder is checked first, as the release itself does: a view that no longer holds the
+        // keys has no position to wait for and is told so.
+        if let Some(barrier) = after {
+            if input.holder() != Some(attachment_id) || input.epoch() != epoch {
+                return Err(WorkerError::LeaseLost);
+            }
+            if barrier.attachment_id == attachment_id {
+                input.check_position(barrier)?;
+            }
+        }
         let ending_epoch = input.epoch();
         let discarded_queue = input
             .release(attachment_id, epoch)
@@ -2993,7 +3065,7 @@ impl Session {
             };
             if to_fence {
                 let epoch = input.epoch();
-                if let Ok((steps, _)) = self.release_input_locked(&mut input, holder, epoch) {
+                if let Ok((steps, _)) = self.release_input_locked(&mut input, holder, epoch, None) {
                     owed = steps;
                 }
             }
@@ -3020,7 +3092,7 @@ impl Session {
             return;
         }
         let owed = self
-            .release_input_locked(&mut input, holder, epoch)
+            .release_input_locked(&mut input, holder, epoch, None)
             .map(|(owed, _)| owed)
             .unwrap_or_default();
         drop(input);
