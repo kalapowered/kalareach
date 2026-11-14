@@ -823,6 +823,8 @@ const NOT_READ: &str = "some of the revisions announced to this worker before re
 /// What follows the first of those for a worker that can be asked, and for one that cannot.
 const NEXT_ANNOUNCEMENT_ASKS: &str = ", and the next announcement asks";
 const NO_LONGER_ASKED: &str = ", and it can no longer be asked";
+/// How an entry begins its sentence that this daemon holds no names under the revision reported.
+const NO_NAMES_HELD: &str = "this daemon holds no names under revision ";
 
 /// What an ended worker's entry says when `pending_names` of the actions its fence named did not
 /// reach this daemon before it ended.
@@ -831,6 +833,29 @@ fn ended_before_its_names(pending_names: u64) -> String {
         "this worker's execution is confirmed ended, and {pending_names} of the actions its fence \
          named did not reach this daemon before it did; nothing can ask for them now"
     )
+}
+
+/// The sentences of `given`'s detail on the revisions announced to its worker that it has not said
+/// what its fence named for, cannot say, or whose fences are not read. They say what an answer did
+/// not have, so an entry that stands in for `given` keeps them; for a worker that has `ended` they
+/// say that it can no longer be asked.
+fn what_the_worker_has_not_said(given: &WorkerBarrier, ended: bool) -> Vec<String> {
+    given
+        .detail
+        .split("; ")
+        .filter(|sentence| {
+            sentence.starts_with(NOT_SAID)
+                || sentence.starts_with(CANNOT_SAY)
+                || sentence.starts_with(NOT_READ)
+        })
+        .map(|sentence| {
+            if ended {
+                sentence.replace(NEXT_ANNOUNCEMENT_ASKS, NO_LONGER_ASKED)
+            } else {
+                sentence.to_owned()
+            }
+        })
+        .collect()
 }
 
 /// The entry of a worker that was pending in `given` and whose session has closed since: it is
@@ -846,20 +871,49 @@ pub(crate) fn ended_since(given: &WorkerBarrier) -> WorkerBarrier {
         "this worker's execution is confirmed ended, so it can no longer dispatch anything"
             .to_owned()
     };
-    for sentence in given.detail.split("; ") {
-        if sentence.starts_with(NOT_SAID)
-            || sentence.starts_with(CANNOT_SAY)
-            || sentence.starts_with(NOT_READ)
-        {
-            detail.push_str("; ");
-            detail.push_str(&sentence.replace(NEXT_ANNOUNCEMENT_ASKS, NO_LONGER_ASKED));
-        }
+    for sentence in what_the_worker_has_not_said(given, true) {
+        detail.push_str("; ");
+        detail.push_str(&sentence);
     }
     WorkerBarrier {
         state: BarrierState::Ended,
         detail,
         ..given.clone()
     }
+}
+
+/// The detail of the entry that stands for `given` when the daemon's own entry `now` lacks names
+/// that `given` held, and the merged entry carries them.
+///
+/// The entry says what `now` says, except that this daemon holds no names under the revision,
+/// which is not so for the merged entry; it says how many names the answer `given` owed or had lost
+/// that no entry names now (`left_out`, when `now` does not already count that many); and it keeps
+/// what `given` said of the revisions its worker had not said what its fence named for.
+#[must_use]
+pub(crate) fn detail_beside_the_names_of(
+    now: &WorkerBarrier,
+    given: &WorkerBarrier,
+    left_out: u64,
+) -> String {
+    let mut sentences: Vec<String> = now
+        .detail
+        .split("; ")
+        .filter(|sentence| !sentence.is_empty() && !sentence.starts_with(NO_NAMES_HELD))
+        .map(str::to_owned)
+        .collect();
+    if left_out > 0 {
+        sentences.push(format!(
+            "at least {left_out} of the actions its fence named are not named here, which an \
+             earlier answer to this revocation gave as still to come or no longer held, so this \
+             names what is held rather than everything the fence found"
+        ));
+    }
+    for sentence in what_the_worker_has_not_said(given, now.state == BarrierState::Ended) {
+        if !sentences.contains(&sentence) {
+            sentences.push(sentence);
+        }
+    }
+    sentences.join("; ")
 }
 
 /// The daemon's half of the dispatch lease and the revocation barrier.
@@ -1440,12 +1494,11 @@ impl AuthorityBarrier {
             // dispatch anything, whatever it had said about any revision.
             BarrierState::Acknowledged if answered_later => format!(
                 "this worker's barrier holds because it installed a later revision, which fences \
-                 everything revision {revision} would have; this daemon holds no names under \
-                 revision {revision} itself"
+                 everything revision {revision} would have; {NO_NAMES_HELD}{revision} itself"
             ),
             BarrierState::Ended if answered_later => format!(
                 "this worker's execution is confirmed ended, so it can no longer dispatch \
-                 anything; this daemon holds no names under revision {revision} itself"
+                 anything; {NO_NAMES_HELD}{revision} itself"
             ),
             BarrierState::Acknowledged | BarrierState::Ended => String::new(),
             // Two different ways to be pending, and a person reading `pending` is owed the
