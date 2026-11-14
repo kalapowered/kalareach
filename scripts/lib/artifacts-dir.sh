@@ -16,10 +16,13 @@
 # the exit.
 #
 # The temporary roots are /tmp, the folder TMPDIR names and the folder RUNNER_TEMP names, and on
-# Windows (Git Bash) the folder TEMP names, where each is an absolute path to a directory. A root
-# is resolved through its links as the platform resolves it (/tmp is /private/tmp on macOS), and so
-# is the part of the value that exists, so a link inside a root that leads out of it is refused and
-# a root that is itself behind a link is honoured. A value is compared with a root by path
+# Windows (Git Bash) the folder TEMP names, where each is an absolute path to a directory; on
+# Windows /tmp is a root only where it is the folder TEMP names, since Git Bash makes it from the
+# temporary folder of the first Git Bash process of a session. A root is resolved through its links
+# as the platform resolves it (/tmp is /private/tmp on macOS), and so is the part of the value that
+# exists, so a link inside a root that leads out of it is refused and a root that is itself behind
+# a link is honoured. The top of a file system (/, a drive's top, a share's top) is no root, and
+# neither is a folder with a line feed in its name or in its real path. A value is compared with a root by path
 # components, never by text: /tmpfoo is not inside /tmp. On Windows the comparison ignores letter
 # case. A relative value, an empty value and a value with a `..` in it are refused, and so is a
 # root itself.
