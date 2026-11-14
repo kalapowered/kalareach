@@ -10498,13 +10498,16 @@ async fn a_key_the_machine_holds_counts_against_the_room_beside_a_full_queue() {
     // queued: the room is full of what the terminal has not taken.
     let (_stopped, release) = wired.runtime.input().writer_hold().arm();
     let mut sequence = 0;
-    let large = vec![b'x'; 60_000];
+    const LARGE: usize = 60_000;
+    let large = vec![b'x'; LARGE];
+    let mut large_writes = 0;
     while ROOM.bytes - committed(&wired.runtime).bytes >= 64_000 {
         assert!(
             typed(&wired, holder, sequence, &large),
             "the room had space"
         );
         sequence += 1;
+        large_writes += 1;
     }
 
     // The machine is entered and its reader is asked: it holds the next key.
@@ -10530,7 +10533,16 @@ async fn a_key_the_machine_holds_counts_against_the_room_beside_a_full_queue() {
 
     // What is left of the room with the machine's key counted. A write that claims that much plus
     // the key's bytes would fit only if the key were left out.
-    let left = ROOM.bytes - committed(&wired.runtime).bytes;
+    // What the worker has to keep for what it accepted, counted from what the case wrote and not
+    // from the worker's own ledger: each large write holds its bytes, the held key holds its own,
+    // and every accepted write has promised the delimiter that may still follow it.
+    let counted = LARGE * large_writes + HELD_KEY.len() + CLAIMED_BEYOND * (large_writes + 1);
+    assert_eq!(
+        committed(&wired.runtime).bytes,
+        counted,
+        "the worker's count of what it holds leaves out a key the machine holds"
+    );
+    let left = ROOM.bytes - counted;
     let too_large = left + HELD_KEY.len() - CLAIMED_BEYOND;
     assert!(
         !typed(&wired, holder, sequence, &vec![b'y'; too_large]),
