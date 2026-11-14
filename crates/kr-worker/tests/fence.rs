@@ -67,6 +67,15 @@ const REAL_SHELL_LIVENESS: Duration = Duration::from_secs(120);
 /// How long a test waits for something that should already have happened.
 const SOON: Duration = Duration::from_secs(5);
 
+/// How long a case waits for a fixture to let go of its files or its runtime before it takes the
+/// fixture for one that keeps them. It is a liveness bound and decides nothing: the cases that use
+/// it hold that the fixture does let go, and each of them ends as soon as it has. It is not
+/// `kr_ipc::testing::REMOVAL_PATIENCE`, which is how long the drop of a fixture's directory tries
+/// its removal again before it says so and leaves the directory to the cleanup of the temporary
+/// folder. A journal can stay open for longer than that in a blocking thread or in a shell's
+/// teardown on a loaded hosted runner, and that is no fault of the fixture.
+const FIXTURE_LET_GO_LIVENESS: Duration = Duration::from_secs(60);
+
 /// How long a case waits for a real package to register and qualify, or for the worker to close the
 /// session it lost, before it takes the package for hung. Nothing is decided by it: a package that
 /// is slow because the machine is busy is waited for, and the case ends on what the worker reports.
@@ -10315,10 +10324,9 @@ async fn a_closed_session_lets_go_of_its_files_when_its_fixture_is_dropped() {
     let _holder = holder_over(&mut client, &wired).await;
     let temp = wired.end().await;
     let root = temp.root().to_path_buf();
-    // The client is still connected. What is waited for is the condition, and the bound is how long
-    // the drop of a fixture's directory tries its removal again, so that this case fails where
-    // that drop prints its line.
-    let _ = tokio::time::timeout(kr_ipc::testing::REMOVAL_PATIENCE, async {
+    // The client is still connected. What is waited for is the condition, and the bound only ends
+    // the wait for a fixture that keeps its files.
+    let _ = tokio::time::timeout(FIXTURE_LET_GO_LIVENESS, async {
         while !files_open_under(&root).is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -10341,9 +10349,9 @@ async fn the_directory_of_a_closed_session_is_removed_at_the_first_try() {
     let temp = wired.end().await;
     let root = temp.root().to_path_buf();
     // Tasks and a thread of the session let go of its files after the fixture is dropped. What is
-    // waited for is the condition, and the bound is how long the drop of a fixture's directory
-    // tries its removal again, so that this case fails where that drop prints its line.
-    let _ = tokio::time::timeout(kr_ipc::testing::REMOVAL_PATIENCE, async {
+    // waited for is the condition, and the bound only ends the wait for a fixture that keeps its
+    // files.
+    let _ = tokio::time::timeout(FIXTURE_LET_GO_LIVENESS, async {
         while a_file_under_is_held(&root) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -10400,10 +10408,9 @@ async fn a_dropped_service_lets_go_of_its_session_without_a_close() {
     let runtime = Arc::downgrade(&wired.runtime);
     assert_eq!(wired.runtime.session().state(), SessionState::Live);
     drop(wired);
-    // The tasks the drop cancelled go at the runtime's next turn. The bound is how long the removal
-    // of a fixture's directory is tried again, so that this case fails where that drop prints its
-    // line.
-    tokio::time::timeout(kr_ipc::testing::REMOVAL_PATIENCE, async {
+    // The tasks the drop cancelled go at the runtime's next turn. What is waited for is the
+    // condition, and the bound only ends the wait for a fixture that keeps its runtime.
+    tokio::time::timeout(FIXTURE_LET_GO_LIVENESS, async {
         while runtime.strong_count() > 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
