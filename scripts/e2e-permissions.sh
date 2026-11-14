@@ -526,7 +526,7 @@ evidence="$run_root/evidence"
   fi
   if [ -n "$driver" ] && [ -n "$node_binary" ]; then
     cd "$run_root"
-    if NODE_PATH="$driver" "$node_binary" "$run_root/bin/browser-check.mjs" "\$evidence/browser.png" \
+    if NODE_PATH="$driver" "$node_binary" "$run_root/bin/browser-check.mjs" "$artefacts/browser.png" \
       > "\$evidence/browser.txt" 2>&1; then
       echo "browser: \$(tail -1 "\$evidence/browser.txt")"
     else
@@ -552,7 +552,7 @@ if [ ! -s "$run_root/evidence/tools.status" ]; then
   fail "the tools step answered"
 else
   cp "$run_root/evidence/tools.txt" "$artefacts/tools.txt" 2>/dev/null || true
-  for file in peekaboo-apps.txt simulators.txt parallels.txt browser.txt browser.png; do
+  for file in peekaboo-apps.txt simulators.txt parallels.txt browser.txt; do
     [ -s "$run_root/evidence/$file" ] && cp "$run_root/evidence/$file" "$artefacts/$file"
   done
   sed 's/^/  /' "$run_root/evidence/tools.txt"
