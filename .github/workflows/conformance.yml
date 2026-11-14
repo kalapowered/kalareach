@@ -362,14 +362,15 @@ jobs:
       # minutes: 8 November's runner ran 14 percent slower than 7 November's, and the outage of that
       # night's downloads added 3 minutes more. The limit is what the job's limit leaves once the
       # other steps have theirs, less 3 minutes for the set-up and clean-up that no step limit
-      # counts. Those steps' limits add up to 63 minutes, each at least twice the longest its step
-      # took in the eleven nights (the disk step, at 3.8 minutes, has 8), so the limits of the
-      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The report's 289
-      # minutes are 24 over 8 November's need with its outage, 27 over it without, and 5 over it
+      # counts. Those steps' limits add up to 65 minutes, each at least twice the longest its step
+      # took in the eleven nights (the disk step, at 3.8 minutes, has 8; the closing report, which
+      # also reads the kernel's log for failed writes to the volume, has 4), so the limits of the
+      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The report's 287
+      # minutes are 22 over 8 November's need with its outage, 25 over it without, and 3 over it
       # with the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) in place
       # of the outage.
       - name: The conformance report
-        timeout-minutes: 289
+        timeout-minutes: 287
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
         run: |
@@ -426,7 +427,7 @@ jobs:
       - name: What the disk has left
         if: ${{ !cancelled() }}
         continue-on-error: true
-        timeout-minutes: 2
+        timeout-minutes: 4
         run: bash scripts/disk-report.sh end "what the disk has left"
 
       - name: Keep the result and the evidence
