@@ -475,15 +475,31 @@ mod tests {
         assert!(words.contains("temporary roots"), "{words}");
     }
 
+    /// A temporary folder that is no root is left as it was: a run that sets no variable is
+    /// refused before the directory of its own is made in it, and the words name that folder. The
+    /// case reads through `directory`, as a program does.
     #[test]
     fn nothing_is_made_in_a_temporary_folder_that_is_no_root() {
-        let outside = beside_the_build();
-        let result = std::panic::catch_unwind(|| own_in(outside.path(), &[]));
-        assert!(
-            result.is_err(),
-            "a run's own directory was made in {outside:?}"
+        let working = temporary();
+        let name = OsStr::new("kr-no-root");
+        std::fs::create_dir(working.path().join(name)).expect("a folder");
+        // A relative name is no root, though the folder exists under the working directory.
+        let output = read_in_a_run_with(
+            None,
+            Some(working.path()),
+            &[("TMPDIR", name), ("TEMP", name), ("TMP", name)],
         );
-        let left = std::fs::read_dir(outside.path())
+        assert!(!output.status.success(), "{output:?}");
+        let words = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            words.contains("kr-no-root") && words.contains("not an absolute path"),
+            "the words do not name the temporary folder and why it is refused: {words}"
+        );
+        assert!(
+            !words.contains("leave it unset"),
+            "a run that set nothing is told to leave it unset: {words}"
+        );
+        let left = std::fs::read_dir(working.path().join(name))
             .expect("reads the folder")
             .count();
         assert_eq!(
