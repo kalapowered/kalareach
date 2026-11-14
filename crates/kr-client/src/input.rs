@@ -16,8 +16,8 @@
 //!
 //! At most the host's window of frames and encoded bytes is written to the stream and not yet
 //! accepted. The frames that wait behind them, the frames written and not yet accepted, and the
-//! frames held for a launch are bounded together by [`MAX_LOCAL_INPUT_FRAMES`] and
-//! [`MAX_LOCAL_INPUT_BYTES`]. At the bound [`InputLane::try_send`] refuses with
+//! frames held for a launch, and the frames of earlier epochs that the host has not answered, are
+//! bounded together by [`MAX_LOCAL_INPUT_FRAMES`] and [`MAX_LOCAL_INPUT_BYTES`]. At the bound [`InputLane::try_send`] refuses with
 //! [`InputRefusal::Full`], and nothing already admitted is dropped.
 //!
 //! # What a caller learns
@@ -48,6 +48,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -66,10 +67,10 @@ use kr_transport::TransportError;
 use kr_transport::deadlines::{DeadlineKind, Deadlines, TimerDeadlines};
 use kr_transport::scheduler::StreamBudget;
 use kr_transport::streams::{DataReader, DataWriter, StreamHandle};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 
 use crate::error::{ClientError, Result};
-use crate::session::{ConnectionWatch, LaneSupport, LocalInput, Session};
+use crate::session::{Answering, ConnectionWatch, LaneSupport, LocalInput, Session, Settled};
 use crate::shown::Shown;
 
 /// How long the open of the stream and the wait for the host's first word may take.
@@ -99,7 +100,8 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 const NO_INPUT_STREAM: &str = "This host cannot take typing on a stream of its own.";
 
 /// The bounds a lane waits under: the open is the stream's header phase, and a barrier's wait is the
-/// admission phase, which no input stream of the client's has any other use for.
+/// admission phase, which no input stream of the client's has any other use for. The same bound
+/// limits the wait for the session to record the connection's end after a stream was lost with it.
 fn lane_bounds() -> TimerDeadlines {
     TimerDeadlines {
         header: INPUT_OPEN_WAIT,
@@ -385,25 +387,110 @@ pub enum InputEvent {
 }
 
 /// The events of one lane, in the order they happened.
+///
+/// The queue of events the holder has not read is bounded by the holder's own calls and not by how
+/// much it types: a run of acceptances with no other event between them is kept as one event (the
+/// latest `through`, with the frames and bytes of the run added up), so the typing the host accepts
+/// leaves one unread event however many keys it was. What else waits is one event for each epoch's
+/// refusal and end notice, for each barrier the holder marked, for each launch it reserved and for
+/// the lane's end. A holder reads its events as they come; one that reads none keeps those few.
 pub struct InputEvents {
-    receiver: mpsc::UnboundedReceiver<InputEvent>,
+    queue: Arc<EventQueue>,
 }
 
 impl InputEvents {
     /// Waits for the next event, and returns none once the lane has ended and every event has been
     /// read.
     pub async fn recv(&mut self) -> Option<InputEvent> {
-        self.receiver.recv().await
+        loop {
+            let changed = self.queue.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(event) = self.queue.pop() {
+                return Some(event);
+            }
+            if self.queue.closed.load(Ordering::Acquire) {
+                return self.queue.pop();
+            }
+            changed.await;
+        }
     }
 
     /// Returns the next event if one is waiting.
     pub fn try_recv(&mut self) -> Option<InputEvent> {
-        self.receiver.try_recv().ok()
+        self.queue.pop()
     }
 }
 
-/// An ordered request's turn, queued behind the typing of a local lane.
-type Work = Pin<Box<dyn Future<Output = ()> + Send>>;
+/// The events the holder has not read.
+struct EventQueue {
+    unread: Mutex<VecDeque<InputEvent>>,
+    changed: Notify,
+    closed: AtomicBool,
+}
+
+impl EventQueue {
+    fn new() -> Self {
+        Self {
+            unread: Mutex::new(VecDeque::new()),
+            changed: Notify::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn pop(&self) -> Option<InputEvent> {
+        self.unread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+    }
+
+    /// Adds an event. An acceptance joins the unread acceptance of the same epoch that stands last
+    /// in the queue: nothing came between them, so the order of events is kept.
+    fn push(&self, event: InputEvent) {
+        {
+            let mut unread = self.unread.lock().unwrap_or_else(PoisonError::into_inner);
+            let joined = match (&event, unread.back_mut()) {
+                (
+                    InputEvent::Accepted {
+                        epoch,
+                        through,
+                        frames,
+                        bytes,
+                    },
+                    Some(InputEvent::Accepted {
+                        epoch: held_epoch,
+                        through: held_through,
+                        frames: held_frames,
+                        bytes: held_bytes,
+                    }),
+                ) if held_epoch == epoch => {
+                    *held_through = *through;
+                    *held_frames += *frames;
+                    *held_bytes += *bytes;
+                    true
+                }
+                _ => false,
+            };
+            if !joined {
+                unread.push_back(event);
+            }
+        }
+        self.changed.notify_one();
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.changed.notify_one();
+    }
+}
+
+/// An ordered request's turn, queued behind the typing of a local lane: `turn` sends it, and
+/// `refuse` tells its caller that it was never sent.
+struct Work {
+    turn: Pin<Box<dyn Future<Output = ()> + Send>>,
+    refuse: Box<dyn FnOnce() + Send>,
+}
 
 enum Entry {
     Frame(Queued),
@@ -601,7 +688,13 @@ struct Core {
     /// The window's charge: every frame written and not yet answered, in the order written.
     charges: VecDeque<Charge>,
     charge_cost: usize,
-    events: mpsc::UnboundedSender<InputEvent>,
+    events: Arc<EventQueue>,
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        self.events.close();
+    }
 }
 
 /// The encoded bytes a frame of `key_len` key bytes can take: its length prefix, its framing at
@@ -613,7 +706,7 @@ const fn cost_of(key_len: usize) -> usize {
 
 impl Core {
     fn emit(&self, event: InputEvent) {
-        let _ = self.events.send(event);
+        self.events.push(event);
     }
 
     fn live(&self) -> std::result::Result<&Epoch, InputRefusal> {
@@ -628,19 +721,32 @@ impl Core {
         }
     }
 
-    fn fits(epoch: &Epoch, frames: usize, cost: usize) -> bool {
-        epoch.frames_in_use + frames <= MAX_LOCAL_INPUT_FRAMES
-            && epoch.cost_in_use + cost <= MAX_LOCAL_INPUT_BYTES
+    /// The frames and encoded bytes of earlier epochs that the host has not answered: they stand in
+    /// the stream's window and count against the bound with the current epoch's own.
+    fn older_charges(&self) -> (usize, usize) {
+        let current = self.epoch.as_ref().map(|epoch| epoch.epoch.get());
+        self.charges
+            .iter()
+            .filter(|charge| Some(charge.epoch) != current)
+            .fold((0, 0), |(frames, cost), charge| {
+                (frames + 1, cost + charge.cost)
+            })
+    }
+
+    fn fits(epoch: &Epoch, older: (usize, usize), frames: usize, cost: usize) -> bool {
+        epoch.frames_in_use + older.0 + frames <= MAX_LOCAL_INPUT_FRAMES
+            && epoch.cost_in_use + older.1 + cost <= MAX_LOCAL_INPUT_BYTES
     }
 
     /// Admits `pieces` as one unit: all of them or none, in order.
     fn admit(&mut self, pieces: &[&[u8]]) -> std::result::Result<Vec<Writing>, InputRefusal> {
         self.live()?;
         let total: usize = pieces.iter().map(|piece| cost_of(piece.len())).sum();
+        let older = self.older_charges();
         let Some(epoch) = self.epoch.as_mut() else {
             return Err(InputRefusal::NoEpoch);
         };
-        if !Self::fits(epoch, pieces.len(), total) {
+        if !Self::fits(epoch, older, pieces.len(), total) {
             return Err(InputRefusal::Full);
         }
         let mut written = Vec::with_capacity(pieces.len());
@@ -749,6 +855,11 @@ impl Core {
                 epoch.end_hold();
                 epoch.phase = Phase::Ending;
             }
+        }
+        // A local lane orders by its queue alone: it takes no barrier, so it waits for nothing and
+        // tells nothing of one.
+        if local {
+            return Ok((barrier, None));
         }
         if epoch.proven() >= epoch.next_sequence {
             self.emit(InputEvent::Reached(barrier.clone()));
@@ -1178,6 +1289,16 @@ impl Core {
             None => (None, None),
         };
         self.ended = Some(cause.clone());
+        // A request still queued is never sent: its caller is told so at once and sends its own
+        // ending request, as no key follows.
+        if let Some(current) = self.epoch.as_mut() {
+            for entry in std::mem::take(&mut current.queue) {
+                if let Entry::Work(work) = entry {
+                    (work.refuse)();
+                }
+            }
+            current.frames_in_use = 0;
+        }
         self.emit(InputEvent::Ended { epoch, cause, sets });
         self.not_reached(waits, NotReached::StreamEnded);
         true
@@ -1296,6 +1417,11 @@ impl Core {
     /// finished.
     fn finish(&mut self) {
         self.finishing = true;
+        // A hold left standing would keep frames that no writer will send: they are unsent, and a
+        // later release finds nothing to release.
+        if let Some(epoch) = self.epoch.as_mut() {
+            epoch.end_hold();
+        }
     }
 }
 
@@ -1331,10 +1457,21 @@ impl Shared {
         }
     }
 
-    /// Ends the lane for a failure of the stream or the connection.
-    fn end_by_failure(&self) {
+    /// Ends the lane for a failure of the stream or the connection. `lost` says that the failure is
+    /// the connection's own: its control stream ended, so every stream under it was revoked. The
+    /// session records that end on its task, which may not have run yet when the stream fails, and
+    /// it records the host's refusal before the end. The lane waits for the record, for the
+    /// admission bound at most, and reads the end and the refusal together.
+    async fn end_by_failure(&self, lost: bool) {
+        if lost {
+            let passed = self.bounds.start(DeadlineKind::Admission);
+            tokio::select! {
+                () = self.connection.ended() => {}
+                () = passed => {}
+            }
+        }
         let (ended, refusal) = self.connection.state();
-        if ended || refusal.is_some() {
+        if lost || ended {
             self.end(EndCause::Connection { refusal });
         } else {
             self.end(EndCause::Reset);
@@ -1476,6 +1613,9 @@ impl InputLane {
     /// With no launch number, the mark is a release's or a detach's: the epoch takes no more typing,
     /// and whatever was held is counted unsent and released by nothing.
     ///
+    /// A local lane takes no barrier: the barrier it returns carries the count and nothing waits
+    /// for it, so the lane says neither [`InputEvent::Reached`] nor [`InputEvent::NotReached`] of it.
+    ///
     /// # Errors
     ///
     /// Returns [`InputRefusal::LaunchWaiting`], and the refusals of an epoch that has not begun, is
@@ -1509,7 +1649,10 @@ impl InputLane {
     /// Finishes the lane's side of the stream once every frame admitted so far is written, as a
     /// view's end or a detach does. The lane takes no more typing and no new epoch; the host's
     /// answers are still read until it finishes its side. Nothing is discarded: unlike dropping
-    /// the lane, which resets the stream, a finish leaves the host to read every frame written.
+    /// the lane, which resets the stream, a finish leaves the host to read every frame written. A
+    /// hold that stands is ended first and its frames are counted unsent, and a later release does
+    /// nothing. The holder keeps the lane until [`InputEvent::Ended`] says
+    /// [`EndCause::Finished`]: dropping it sooner resets the stream.
     pub fn finish(&self) {
         self.shared.lock().finish();
         self.shared.wake.notify_one();
@@ -1540,26 +1683,29 @@ impl InputLane {
     /// connection's requests in the order it reads them, sees them in the order the view admitted
     /// them.
     ///
-    /// `request` is called when the request's turn comes, with a [`RequestSent`] that it signals once
-    /// the request is on the connection, and returns the future that carries the request to its
-    /// answer. The lane writes later frames as soon as the request is sent, not when it is answered,
-    /// so a launch holds no later typing; the answer comes back on the returned channel.
+    /// `send` is called when the request's turn comes, and returns the future of the call that
+    /// writes the request ([`Session::send_written`]): the lane's writer waits for that future,
+    /// which resolves once the request's frame is on the connection, and then writes the next key.
+    /// The host's answer is not waited for, so a launch holds no later typing; it comes back on the
+    /// returned channel.
     ///
     /// A request is not typing: it outlives an epoch that ends, and waits for its turn under the
-    /// next one. A lane that ends before its turn drops it unpolled.
+    /// next one. When the lane ends before its turn, the request is never sent and the channel
+    /// resolves at once with [`ClientError::Withheld`], so that its caller can send an ending
+    /// request itself. When the lane ends while the request is being written, the channel is
+    /// dropped: what became of the request is not known.
     ///
     /// # Errors
     ///
     /// Returns [`InputRefusal::NotLocal`] on a network lane, [`InputRefusal::Full`] when too much
     /// work is queued, and the refusals of a lane that has not begun an epoch or has ended.
-    pub fn after_keys<T, F, Fut>(
+    pub fn after_keys<F, Fut>(
         &self,
-        request: F,
-    ) -> std::result::Result<oneshot::Receiver<T>, InputRefusal>
+        send: F,
+    ) -> std::result::Result<oneshot::Receiver<Result<Settled>>, InputRefusal>
     where
-        F: FnOnce(RequestSent) -> Fut + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Answering>> + Send + 'static,
     {
         let mut core = self.shared.lock();
         if !self.local {
@@ -1578,40 +1724,43 @@ impl InputLane {
             return Err(InputRefusal::Full);
         }
         let (answer, answered) = oneshot::channel();
-        let turn: Work = Box::pin(async move {
-            let (signal, sent) = oneshot::channel();
-            let carried = request(RequestSent {
-                signal: Some(signal),
-            });
-            tokio::spawn(async move {
-                let _ = answer.send(carried.await);
-            });
-            // The signal, or the request's end without one, lets the next frame go.
-            let _ = sent.await;
+        let answer = Arc::new(Mutex::new(Some(answer)));
+        let refused = Arc::clone(&answer);
+        let turn = Box::pin(async move {
+            match send().await {
+                Ok(answering) => {
+                    tokio::spawn(async move {
+                        let settled = answering.await;
+                        if let Some(answer) = take_sender(&answer) {
+                            let _ = answer.send(settled);
+                        }
+                    });
+                }
+                Err(error) => {
+                    if let Some(answer) = take_sender(&answer) {
+                        let _ = answer.send(Err(error));
+                    }
+                }
+            }
         });
+        let work = Work {
+            turn,
+            refuse: Box::new(move || {
+                if let Some(answer) = take_sender(&refused) {
+                    let _ = answer.send(Err(ClientError::Withheld));
+                }
+            }),
+        };
         epoch.frames_in_use += 1;
-        epoch.queue.push_back(Entry::Work(turn));
+        epoch.queue.push_back(Entry::Work(work));
         drop(core);
         self.shared.wake.notify_one();
         Ok(answered)
     }
 }
 
-/// What a queued request signals when it is on the connection: the lane then goes on to write the
-/// frames behind it, without waiting for the answer.
-pub struct RequestSent {
-    signal: Option<oneshot::Sender<()>>,
-}
-
-crate::debug_as_name!(RequestSent);
-
-impl RequestSent {
-    /// The request has been handed to the connection.
-    pub fn sent(mut self) {
-        if let Some(signal) = self.signal.take() {
-            let _ = signal.send(());
-        }
-    }
+fn take_sender<T>(slot: &Mutex<Option<oneshot::Sender<T>>>) -> Option<oneshot::Sender<T>> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 
 /// The most paste bytes an empty lane admits whatever they hold, for frames of `frame_bytes` key
@@ -1820,7 +1969,7 @@ fn shared_for(
     local: bool,
     window: InputWindow,
 ) -> (Arc<Shared>, InputEvents) {
-    let (events, receiver) = mpsc::unbounded_channel();
+    let events = Arc::new(EventQueue::new());
     let shared = Arc::new(Shared {
         core: Mutex::new(Core {
             attachment_id: target.attachment_id,
@@ -1834,7 +1983,7 @@ fn shared_for(
             finishing: false,
             charges: VecDeque::new(),
             charge_cost: 0,
-            events,
+            events: Arc::clone(&events),
         }),
         wake: Notify::new(),
         over: watch::channel(false).0,
@@ -1842,7 +1991,7 @@ fn shared_for(
         bounds: Arc::clone(&target.bounds),
         connection: support.connection.clone(),
     });
-    (shared, InputEvents { receiver })
+    (shared, InputEvents { queue: events })
 }
 
 fn refusal(code: ErrorCode, message: &'static str) -> ClientError {
@@ -1852,7 +2001,7 @@ fn refusal(code: ErrorCode, message: &'static str) -> ClientError {
 /// Ends the lane when the connection ends, which an idle lane would not otherwise see.
 async fn watch_connection(shared: Arc<Shared>) {
     shared.connection.ended().await;
-    shared.end_by_failure();
+    shared.end_by_failure(true).await;
 }
 
 /// Waits for the writer's next piece of work, or for the lane to end.
@@ -1916,8 +2065,10 @@ async fn network_writer(
                         _ = over.wait_for(|over| *over) => return,
                     }
                 }
-                Err(_) => {
-                    shared.end_by_failure();
+                Err(error) => {
+                    shared
+                        .end_by_failure(matches!(error, TransportError::ControlLost))
+                        .await;
                     return;
                 }
             }
@@ -1934,8 +2085,10 @@ async fn network_reader(shared: Arc<Shared>, mut reader: DataReader) {
                 shared.end(EndCause::Finished);
                 return;
             }
-            Err(_) => {
-                shared.end_by_failure();
+            Err(error) => {
+                shared
+                    .end_by_failure(matches!(error, TransportError::ControlLost))
+                    .await;
                 return;
             }
         }
@@ -1957,7 +2110,12 @@ async fn local_writer(
     while let Some(next) = next_to_write(&shared, &mut over).await {
         match next {
             Next::Work(work) => {
-                work.await;
+                // The request is written here, and the next key waits for that and not for the
+                // host's answer, which goes to its caller on the channel.
+                tokio::select! {
+                    () = work.turn => {}
+                    _ = over.wait_for(|over| *over) => return,
+                }
                 shared.wake.notify_one();
             }
             Next::Frame { epoch, sequence } => {
@@ -1978,7 +2136,7 @@ async fn local_writer(
                     // refusal, which says nothing of this frame. Its outcome is unknown, and the
                     // lane ends with the refusal.
                     Err(ClientError::Host(_)) if shared.connection.state().1.is_some() => {
-                        shared.end_by_failure();
+                        shared.end_by_failure(true).await;
                         return;
                     }
                     Ok(_) => shared.apply(InputAck::Accepted {
@@ -1999,7 +2157,7 @@ async fn local_writer(
                         return;
                     }
                     Err(_) => {
-                        shared.end_by_failure();
+                        shared.end_by_failure(true).await;
                         return;
                     }
                 }

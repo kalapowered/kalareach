@@ -567,6 +567,10 @@ pub(crate) struct LaneSupport {
     pub(crate) local: LocalInput,
 }
 
+/// The answer to a request whose frame is already on the connection: it resolves when the host
+/// answers, or when the connection ends.
+pub type Answering = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Settled>> + Send>>;
+
 /// What a lane learns of its session's connection: that it has ended, and what the host refused it
 /// with when it was the host that ended it.
 #[derive(Clone)]
@@ -1418,6 +1422,24 @@ impl Session {
         self.submit_composed(composed, None).await
     }
 
+    /// Sends a composed mutation for the first time as [`Session::send`] does, and returns once its
+    /// frame is written to the connection, with the future that resolves at the host's answer.
+    ///
+    /// For a caller that must have a later write follow this frame on the connection without
+    /// waiting for the host to answer it. The frame is written whole under the connection's turn
+    /// before this returns, so a frame written after the return is read by the host after it. The
+    /// answer's future holds the mutation's place among the outstanding ones until it resolves.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::send`], for everything that happens before the frame is written.
+    pub async fn send_written(&self, composed: &ComposedMutation) -> Result<Answering> {
+        if composed.composed_on != Some(self.id) {
+            return Err(ClientError::Misdirected { repeating: false });
+        }
+        self.submit_written(composed, None).await
+    }
+
     /// Sends a composed mutation for the first time as [`Session::send`] does, and writes nothing
     /// after `not_after`, or once `wanted` says no.
     ///
@@ -1551,12 +1573,22 @@ impl Session {
         composed: &ComposedMutation,
         limit: Option<(tokio::time::Instant, &(dyn Fn() -> bool + Send + Sync))>,
     ) -> Result<Settled> {
+        self.submit_written(composed, limit).await?.await
+    }
+
+    /// Records a composed mutation and sends it as [`Session::submit_composed`] does, and returns
+    /// once the frame is written to the connection, with the future of the host's answer.
+    async fn submit_written(
+        &self,
+        composed: &ComposedMutation,
+        limit: Option<(tokio::time::Instant, &(dyn Fn() -> bool + Send + Sync))>,
+    ) -> Result<Answering> {
         let Some(method) = composed.request.method.method() else {
             return Err(ClientError::Cbor(crate::shown::Shown::said(
                 "a composed mutation names a method this build lacks",
             )));
         };
-        let _permit = MutationPermit::acquire(&self.state)?;
+        let permit = MutationPermit::acquire(&self.state)?;
         let action_id = composed.request.action_id;
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;
@@ -1600,14 +1632,18 @@ impl Session {
             Err(_) if self.connection_was_refused() => {}
             Err(_) => return Err(ClientError::SubmissionUncertain { action_id }),
         }
-        match waiter.wait().await {
-            Ok(Answer::Receipt(receipt)) => Ok(Settled::Receipt(receipt)),
-            Ok(Answer::Response(response)) => match response.outcome {
-                Outcome::Error(error) => Err(refused_or_unknown(action_id, error)),
-                Outcome::Ok(value) => Ok(Settled::Result(value)),
-            },
-            Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
-        }
+        Ok(Box::pin(async move {
+            // The permit stands until the answer, as it does for a caller that waits.
+            let _permit = permit;
+            match waiter.wait().await {
+                Ok(Answer::Receipt(receipt)) => Ok(Settled::Receipt(receipt)),
+                Ok(Answer::Response(response)) => match response.outcome {
+                    Outcome::Error(error) => Err(refused_or_unknown(action_id, error)),
+                    Outcome::Ok(value) => Ok(Settled::Result(value)),
+                },
+                Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
+            }
+        }))
     }
 
     /// Subscribes to a session's event streams from the cursor the parameters name.
