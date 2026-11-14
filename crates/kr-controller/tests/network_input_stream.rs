@@ -1238,9 +1238,46 @@ async fn a_restriction_that_reaches_the_whole_host_ends_every_remote_stream() {
     rig.stop().await;
 }
 
+/// A feed refusal releases each refused connection's link to its worker and leaves the
+/// connection standing, so the connection's own task never learns of it. The connection's input
+/// streams end with the link all the same. The handler is held, so that the connection stands
+/// through the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_ends_when_a_feed_refusal_releases_its_connections_link() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    let (answered, release) = rig.adopted.host.pause_after_a_frame_is_answered();
+    rig.device
+        .read(Method::HostInfo, &NoParams {})
+        .await
+        .expect("the read is answered");
+    arrived(answered).await;
+
+    rig.adopted
+        .host
+        .controller()
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+    let _ = stream.write_message(&rig.frame(1, b"b")).await;
+    assert!(
+        reads_to_the_end(&mut stream, 1).await.is_err(),
+        "the stream is reset with the link"
+    );
+    assert_eq!(
+        rig.lane.frames().len(),
+        1,
+        "the frame written after the refusal was not forwarded"
+    );
+    drop(release);
+    rig.stop().await;
+}
+
 /// C6, the end the plan is for: the device's control stream ends while its connection stands. The
-/// input stream goes with it, the next frame the device writes is never forwarded, and the lane
-/// ends.
+/// input stream goes with it and the lane ends. Two streams have no order between them, so a frame
+/// written at the same moment as the control stream's end may reach the host first and is decided
+/// as any frame is; the case writes its next frame once the device has been told that the stream
+/// ended, and that frame is never forwarded.
 async fn the_control_stream_ends_while_the_connection_stands(reset: bool) {
     let rig = Rig::start().await;
     let mut stream = rig.open().await;
@@ -1251,26 +1288,17 @@ async fn the_control_stream_ends_while_the_connection_stands(reset: bool) {
     } else {
         rig.device.finish_control().await;
     }
-    // The device keeps typing on its input stream: whatever the host does with the frame, it is
-    // never given to the worker.
-    let _ = stream.write_message(&rig.frame(1, b"b")).await;
-    let ended = loop {
-        match next_or_reset(&mut stream).await {
-            Ok(Some(InputAck::Accepted { through, .. })) => {
-                assert_eq!(through.get(), 0, "only the first frame was accepted");
-            }
-            other => break other,
-        }
-    };
+    let ended = reads_to_the_end(&mut stream, 1).await;
     assert!(
         !matches!(ended, Ok(Some(_))),
         "the input stream ends with the control stream: {ended:?}"
     );
+    let _ = stream.write_message(&rig.frame(1, b"b")).await;
     rig.lane.until_ended().await;
     assert_eq!(
         rig.lane.frames().len(),
         1,
-        "the frame written after the control stream ended was not forwarded"
+        "the frame written after the stream ended was not forwarded"
     );
     rig.stop().await;
 }

@@ -117,6 +117,9 @@ pub struct RemoteConnection {
     budget: Arc<RelayBudget>,
     /// Notified when this connection's link to its worker ends, whichever way it ends.
     lost: Arc<tokio::sync::Notify>,
+    /// Whether a link was ever opened for this connection. A connection that had one and has none
+    /// has lost it, and a wait for the loss made after the notification was given resolves.
+    had_a_link: AtomicBool,
     windows: Arc<kr_transport::window::ActionWindowIssuer>,
     /// The terminal-input streams of this host, which an attachment's detach is told to.
     inputs: Arc<super::input::InputStreams>,
@@ -182,6 +185,7 @@ impl RemoteConnection {
                     .min(RELAY_QUEUED_BYTES),
             )),
             lost: Arc::new(tokio::sync::Notify::new()),
+            had_a_link: AtomicBool::new(false),
             windows: Arc::clone(&session.windows),
             inputs: Arc::default(),
         }
@@ -274,6 +278,7 @@ impl RemoteConnection {
             notifications,
             budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
             lost: Arc::new(tokio::sync::Notify::new()),
+            had_a_link: AtomicBool::new(false),
             windows: Arc::new(
                 kr_transport::window::ActionWindowIssuer::with_default_validity(Arc::clone(
                     &controller.clock,
@@ -319,12 +324,18 @@ impl RemoteConnection {
         false
     }
 
-    /// Ends this connection's worker link and detaches whatever it owned.
+    /// Ends this connection's worker link and its terminal-input streams, and detaches whatever it
+    /// owned.
     ///
     /// Closing the link is what the worker reads as the connection ending, and the worker's own
     /// deregistration then detaches the attachments and stops the delivery task. It runs on a task
     /// that outlives the connection, because dropping the handler is a cancellation.
     pub async fn release(&self) {
+        // The terminal-input streams of this connection stand on this link, and end with it by
+        // whichever path it is released: the connection's end, a grant's end, a refusal that the
+        // authority feed puts on the connection (which leaves the connection standing), or the
+        // relay's end.
+        self.inputs.revoke_connection(self.connection_id());
         if let Some(proxy) = self.proxy.lock().await.take() {
             proxy.close();
         }
@@ -357,12 +368,19 @@ impl RemoteConnection {
     /// caller selecting on it does not have to know whether one was ever opened — except that a
     /// connection which has not attached yet has nothing to lose, and waits.
     pub async fn link_lost(&self) {
+        // Made before the link is looked at, so that a loss while it is looked at is heard.
+        let lost = self.lost.notified();
+        tokio::pin!(lost);
+        lost.as_mut().enable();
         let held = self.proxy.lock().await.as_ref().map(Arc::clone);
         match held {
             Some(proxy) => proxy.lost().await,
+            // A link that was released is lost, and the notification it gave went out before this
+            // wait was made.
+            None if self.had_a_link.load(std::sync::atomic::Ordering::Acquire) => {}
             // Nothing to lose yet. Waiting for the notification the first link will send is what
             // keeps a connection that has not attached from ending itself.
-            None => self.lost.notified().await,
+            None => lost.await,
         }
     }
 
