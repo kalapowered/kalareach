@@ -139,6 +139,9 @@ struct Setup<'a> {
     readable_outputs: bool,
     /// The device refuses every installation, so that a script that goes on to install ends there.
     installs_fail: bool,
+    /// The emulator's program runs its first line only after a moment, as it does on a loaded
+    /// machine, so that what a script does before the emulator has run is what a case sees.
+    emulator_starts_late: bool,
 }
 
 impl Run {
@@ -182,13 +185,18 @@ impl Run {
 /// It is placed by a process that starts nothing else, so that no thread of this test binary
 /// holds it open for writing when another starts it.
 fn stand_in(directory: &Path, name: &str, record: &Path, body: &str) {
+    stand_in_after(directory, name, record, "", body);
+}
+
+/// [`stand_in`], whose program runs `first` before it appends to the record.
+fn stand_in_after(directory: &Path, name: &str, record: &Path, first: &str, body: &str) {
     let path = directory.join(name);
     fs::create_dir_all(directory).expect("a directory");
     let text = directory.join(format!("{name}.text"));
     fs::write(
         &text,
         format!(
-            "#!/bin/sh\necho \"{name} $*\" >>\"{}\"\n{body}\n",
+            "#!/bin/sh\n{first}echo \"{name} $*\" >>\"{}\"\n{body}\n",
             record.display()
         ),
     )
@@ -485,16 +493,26 @@ fn run_with(
     }
 
     // The SDK's two programs. The emulator lists what the machine has and, asked to start a
-    // device, only records it. The debug bridge reports the running emulator and its device, and
-    // says the boot is complete only where a script waits for that.
+    // device, only records it, and then marks that it has. The debug bridge reports the running
+    // emulator and its device, and says the boot is complete only where a script waits for that and
+    // only once an emulator is running: one that was already up, or the one the script started,
+    // as a device cannot finish booting before its emulator has begun. A script that goes on at
+    // that answer therefore finds the emulator's start in the record, however late the program ran.
     let stopped = root.join("emulator-stopped");
-    stand_in(
+    stand_in_after(
         &sdk.join("emulator"),
         "emulator",
         &record,
+        if setup.emulator_starts_late {
+            "sleep 0.5\n"
+        } else {
+            ""
+        },
         &format!(
-            "[ \"$1\" = -list-avds ] && cat \"{}\"\n{}exit 0",
+            "[ \"$1\" = -list-avds ] && cat \"{}\"\n\
+             [ \"$1\" = -list-avds ] || : >\"{}\"\n{}exit 0",
             root.join("avds.txt").display(),
+            root.join("emulator-started").display(),
             // A device that boots stays up until the script that started it has gone or has asked
             // it to stop, as the real one does.
             if setup.boots_as.is_some() {
@@ -519,13 +537,14 @@ fn run_with(
              *'emu kill'*) : >\"{stopped}\" ;;\n\
              *install*) [ -f \"{installs_fail}\" ] && exit 1 ;;\n\
              *'emu avd name'*) [ -f \"{running_avd}\" ] && {{ cat \"{running_avd}\"; echo OK; }} ;;\n\
-             *getprop*sys.boot_completed*) [ -f \"{booted}\" ] && echo 1 ;;\n\
+             *getprop*sys.boot_completed*) [ -f \"{booted}\" ] && {{ [ -f \"{running}\" ] || [ -f \"{emulator_started}\" ]; }} && echo 1 ;;\n\
              *getprop*) echo stand-in ;;\n\
              devices*) echo 'List of devices attached'; [ -f \"{running}\" ] && cat \"{running}\"; [ -f \"{started}\" ] && cat \"{started}\" ;;\n\
              esac\nexit 0",
             running_avd = root.join("running-avd.txt").display(),
             booted = root.join("booted").display(),
             running = root.join("running.txt").display(),
+            emulator_started = root.join("emulator-started").display(),
             started = root.join("started.txt").display(),
             installs_fail = root.join("installs-fail").display(),
             stopped = stopped.display(),
@@ -904,6 +923,7 @@ fn a_device_on_any_scripts_own_serial_that_is_not_kalareachs_is_left_alone() {
             &[],
             &Setup {
                 boots_as: Some(OTHERS[0]),
+                emulator_starts_late: true,
                 ..Setup::default()
             },
         );
