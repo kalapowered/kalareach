@@ -377,11 +377,6 @@ pub(super) fn create_junction(link: &Path, target: &Path) -> io::Result<()> {
     set
 }
 
-/// Points the existing junction `link` at `target` in place.
-pub(super) fn retarget_junction(link: &Path, target: &Path) -> io::Result<()> {
-    set_junction(link, &junction_data(target)?)
-}
-
 /// The reparse data of a junction that names the directory `target`.
 fn junction_data(target: &Path) -> io::Result<Vec<u8>> {
     let substitute = nt_path(target)?;
