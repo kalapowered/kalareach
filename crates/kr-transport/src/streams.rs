@@ -331,6 +331,43 @@ impl DataReader {
         };
         self.handle.revoke_if_cut(unless.finish(outcome))
     }
+
+    /// Reads one frame and deserialises it, as [`DataReader::read_message`] does, but takes no data
+    /// from the stream while `room` says `false`. It only watches for the peer's reset then, so a
+    /// reset is heard whether or not the caller has room for another frame. A frame that has begun
+    /// to be read is read whole, whatever `room` says after. The caller holds the future across its
+    /// own waits and changes `room` as its room changes.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataReader::read_message`]; a reset that arrives while there is no room is the error
+    /// a read of the reset stream gives.
+    pub async fn read_message_when<T: kr_protocol::wire::WireMessage>(
+        &mut self,
+        room: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<T>> {
+        loop {
+            if *room.borrow_and_update() {
+                return self.read_message().await;
+            }
+            tokio::select! {
+                changed = room.changed() => {
+                    if changed.is_err() {
+                        return self.read_message().await;
+                    }
+                }
+                reset = self.reader.peer_reset() => {
+                    if !reset {
+                        // Finished or stopped: nothing is left to hear, and the frames that wait
+                        // are read when there is room.
+                        let _ = room.wait_for(|room| *room).await;
+                    }
+                    return self.read_message().await;
+                }
+                () = self.handle.revoked() => return Err(TransportError::ControlLost),
+            }
+        }
+    }
 }
 
 impl Drop for DataReader {
