@@ -210,6 +210,10 @@ impl Drop for InputGuard<'_> {
     /// or a debt that dropped inside the hold took no lock, and this is where its request is
     /// carried out.
     fn drop(&mut self) {
+        // An epoch that ended in this hold is told to its lane before the hold ends, with what
+        // the sites that ended it counted, unless the site keeps it open for a count that the
+        // next hold completes.
+        self.guard.settle_ending_if_due();
         if self.guard.writer.room.topup().take() {
             self.guard.top_up_taken();
         }
@@ -464,6 +468,9 @@ pub struct InputDomain {
     next_lane: u64,
     /// The room kept for the lane of the view that holds the keys, when it has a lane.
     window: Option<Window>,
+    /// The epoch whose window ended in the hold that is under way, until the hold says what its
+    /// end discarded.
+    ending: Option<Ending>,
     writer: WriterHandles,
     /// The root editor's fence and detach machine, for a managed session.
     ///
@@ -499,6 +506,17 @@ pub struct InputDomain {
     >,
     /// Commands a reader installed after their transaction had been revoked.
     late_installations: Vec<kr_protocol::root::ShellLaunchResult>,
+}
+
+/// An epoch whose window ended in a hold that has not yet said how much the end discarded.
+#[derive(Debug)]
+struct Ending {
+    /// The lane that spent the window and the epoch it belonged to, when the window had a lane.
+    window: Option<(LaneId, u64)>,
+    /// What the end has discarded so far.
+    fenced: u64,
+    /// Kept open past the end of the hold that began it, for a count the next hold completes.
+    deferred: bool,
 }
 
 /// Returns whichever of two authority deadlines ends first.
@@ -554,6 +572,7 @@ impl InputDomain {
             parents_closed: BTreeSet::new(),
             next_lane: 0,
             window: None,
+            ending: None,
             writer: WriterHandles::new(),
             fence: None,
             revision: None,
@@ -793,7 +812,16 @@ impl InputDomain {
     /// this returns, no write of that lease's bytes can begin, and none was part way through while
     /// the count was taken. That is what makes the number a receipt can quote exact rather than an
     /// estimate of what a writer might still be doing.
-    pub(crate) fn end_lease(&mut self) -> LeaseEnded {
+    ///
+    /// `base` is what the lease's end discards beyond what the writer still held: the queue the
+    /// release took and the delimiter prefix the framer dropped. The window ends here and its
+    /// lane is told at [`Self::settle_ending`], which adds what the root editor's machine held,
+    /// so the notice carries the whole count.
+    pub(crate) fn end_lease(&mut self, base: u64) -> LeaseEnded {
+        // An ending an earlier hold kept open is told as it stands: its count cannot grow now.
+        if let Some(stale) = self.ending.take() {
+            self.announce_end(&stale);
+        }
         let gate = Arc::clone(&self.writer.gate);
         let boundary = gate.lock().expect("the input boundary is not poisoned");
         // Read before the fence goes out. The writer clears this latch when it sees the fence
@@ -804,9 +832,13 @@ impl InputDomain {
         self.publish_lease();
         let left = self.writer.queued_lease_bytes.take(self.lease.epoch()) as u64;
         drop(boundary);
-        // The window moves with the lease, in this hold: the old epoch's window ends and the new
-        // holder's lane, if it has one, gets the next.
-        self.move_window(left);
+        // The window ends with the lease, in this hold. Its lane is told, and the new holder's
+        // lane gets the next window, when the hold says what the end discarded.
+        self.ending = Some(Ending {
+            window: self.window.take().map(|window| (window.lane, window.epoch)),
+            fenced: base.saturating_add(left),
+            deferred: false,
+        });
         LeaseEnded {
             left,
             paste_open_for,
@@ -1723,6 +1755,7 @@ impl InputDomain {
     pub(crate) fn note_lease_change(&mut self, discarded_bytes: u64) -> (u64, Vec<Step>) {
         let lease = self.lease_view();
         let Some(driver) = self.fence.as_mut() else {
+            self.settle_ending(0);
             return (discarded_bytes, Vec::new());
         };
         let effects = driver.lease_changed(
@@ -1731,15 +1764,16 @@ impl InputDomain {
             kr_protocol::root::FenceId::new(kr_ipc::new_uuid()),
         );
         let applied = self.apply_effects(effects);
-        (
-            applied
-                .outcome
-                .lease_acknowledged
-                .map_or(discarded_bytes, |acknowledgement| {
-                    acknowledgement.discarded_bytes.get()
-                }),
-            applied.owed,
-        )
+        let total = applied
+            .outcome
+            .lease_acknowledged
+            .map_or(discarded_bytes, |acknowledgement| {
+                acknowledgement.discarded_bytes.get()
+            });
+        // What the machine held for the ended lease is the part of the total that the caller did
+        // not already count.
+        self.settle_ending(total.saturating_sub(discarded_bytes));
+        (total, applied.owed)
     }
 
     /// Carries out what one stimulus left for the input domain to do.
@@ -2066,14 +2100,14 @@ impl InputDomain {
         });
     }
 
-    /// Moves the window with the lease, in the hold that ended the lease: the old epoch's window
-    /// ends, its lane is told so with what the lease left unwritten, and the new holder's lane, if
-    /// it has one, gets the window of the new epoch. Nothing of one epoch is charged to the other.
-    fn move_window(&mut self, left: u64) {
-        if let Some(old) = self.window.take()
-            && let Some(lane) = self.lanes.get(&old.lane)
-        {
-            let epoch = InputLeaseEpoch::new(old.epoch);
+    /// Says that the epoch whose window ended is over, with what the end has discarded, to the
+    /// lane that spent the window. Nothing of one epoch is charged to the other.
+    fn announce_end(&self, ending: &Ending) {
+        let Some((lane, epoch)) = ending.window else {
+            return;
+        };
+        if let Some(lane) = self.lanes.get(&lane) {
+            let epoch = InputLeaseEpoch::new(epoch);
             lane.queue.push_window(LaneWindow {
                 epoch,
                 holder: false,
@@ -2081,10 +2115,41 @@ impl InputDomain {
                 bytes: U64::new(0),
                 ended: Nullable::some(LaneEnded {
                     epoch,
-                    fenced_bytes: U64::new(left),
+                    fenced_bytes: U64::new(ending.fenced),
                 }),
             });
         }
+    }
+
+    /// Completes the ending the hold began: `held` is what the root editor's machine held for the
+    /// ended lease and discarded. The old lane is told first, then the new holder's lane, if it
+    /// has one, gets the window of the new epoch.
+    pub(crate) fn settle_ending(&mut self, held: u64) {
+        let Some(mut ending) = self.ending.take() else {
+            return;
+        };
+        ending.fenced = ending.fenced.saturating_add(held);
+        self.announce_end(&ending);
+        self.start_next_window();
+    }
+
+    /// Settles an ending that no site kept open, as the end of the hold requires.
+    fn settle_ending_if_due(&mut self) {
+        if self.ending.as_ref().is_some_and(|ending| !ending.deferred) {
+            self.settle_ending(0);
+        }
+    }
+
+    /// Keeps the ending of this hold open past the end of the hold, for the count that the caller
+    /// completes in its next one.
+    pub(crate) fn defer_ending(&mut self) {
+        if let Some(ending) = self.ending.as_mut() {
+            ending.deferred = true;
+        }
+    }
+
+    /// Starts the window of the lease's new holder, if its attachment has a bound lane.
+    fn start_next_window(&mut self) {
         let Some(holder) = self.lease.holder() else {
             return;
         };
@@ -2230,7 +2295,7 @@ mod tests {
         });
         // The lease changes hands. Its own count goes with the takeover, and the bytes stay in the
         // queue until a writer reaches them and sees they are stale; no writer runs here.
-        let ended = input.end_lease();
+        let ended = input.end_lease(0);
         assert_eq!(ended.left, MAX_PENDING_REPLY_BYTES as u64);
 
         let answer = b"\x1b[0n".to_vec();

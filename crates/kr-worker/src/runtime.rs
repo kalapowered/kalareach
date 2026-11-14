@@ -744,9 +744,22 @@ pub struct SessionRuntime {
     /// as it did when the observation kept the session: a process a reading found is in the record
     /// before the step that stops what the record names.
     observing: Arc<tokio::sync::Mutex<()>>,
+    /// The epochs whose batches the writer dropped at their authority's deadline. The service
+    /// takes the receiving end once and ends each lease from a task of its own: the writer never
+    /// waits for the session.
+    epoch_expiry: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u64>>>,
 }
 
 impl SessionRuntime {
+    /// Takes the receiving end of the epochs whose batches the writer dropped at their deadline.
+    /// There is one, and a second call finds it taken.
+    pub fn take_epoch_expiry(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<u64>> {
+        self.epoch_expiry
+            .lock()
+            .expect("the expiry channel is not poisoned")
+            .take()
+    }
+
     /// Starts the reader, the writer and the timers around an already launched session.
     ///
     /// `shared_clock` is the machine's own continuous clock, which is the clock a forwarded
@@ -960,6 +973,7 @@ impl SessionRuntime {
         let writer_lease_change = Arc::clone(&lease_change_queued);
         let writer_gone = Arc::clone(&terminal_gone);
         let writer_clock = Arc::clone(&shared_clock);
+        let (epoch_expired, epoch_expiry) = tokio::sync::mpsc::unbounded_channel::<u64>();
         #[cfg(feature = "testing")]
         let writer_log = Arc::clone(&terminal_writes);
         std::thread::spawn(move || {
@@ -1074,10 +1088,13 @@ impl SessionRuntime {
                         })
                 };
                 if expired(writer_clock.as_ref()) {
-                    // Only a lease batch carries an authority deadline, and the lease itself has
-                    // not moved: its share of the queue is still counted against it, so it comes
-                    // back here, and the room with it as this goes out of scope.
-                    writer_lease.release(lease_epoch, bytes.len());
+                    // Only a lease batch carries an authority deadline. The bytes are not written,
+                    // and they are not forgotten: the lease has not moved, so its count still
+                    // holds them, and its end, which is asked for here, reports them as what it
+                    // discarded to the view that typed them or, when that view has no stream
+                    // left, to whoever takes the keys next. The room goes back as this goes out of
+                    // scope.
+                    let _ = epoch_expired.send(lease_epoch);
                     continue;
                 }
                 // Written in pieces, with the fence looked at before each one, so that a
@@ -1164,11 +1181,12 @@ impl SessionRuntime {
                     if is_reply {
                         release(&writer_unwritten_replies, remainder);
                     }
-                    // The lease's own share comes back only while the lease is still the one that
-                    // queued these bytes: a lease change has already taken its count, and the
-                    // count names the epoch it belongs to, so this subtracts nothing after one.
-                    if epoch.is_some() {
-                        writer_lease.release(lease_epoch, remainder);
+                    // A lease change has already taken the count of its bytes, this remainder
+                    // with them. When the lease has not moved the batch was abandoned because its
+                    // authority ended: the remainder stays in the lease's count, and the lease's
+                    // end, asked for here, reports it as discarded.
+                    if epoch.is_some() && lease_epoch >= writer_fence.load(Ordering::Acquire) {
+                        let _ = epoch_expired.send(lease_epoch);
                     }
                 }
             }
@@ -1184,6 +1202,7 @@ impl SessionRuntime {
             progress: progress.clone(),
             trace: trace.clone(),
             observing: Arc::clone(&observing),
+            epoch_expiry: std::sync::Mutex::new(Some(epoch_expiry)),
         };
 
         let ingest_session = Arc::clone(&session);
@@ -1303,6 +1322,9 @@ impl SessionRuntime {
                 progress: monitor_progress,
                 trace: monitor_trace.clone(),
                 observing: Arc::clone(&monitor_observing),
+                // The monitor's copy closes sessions only: the service's own runtime holds the
+                // receiving end.
+                epoch_expiry: std::sync::Mutex::new(None),
             });
             // Built here rather than by the caller: waiting for a child to end is the runtime's
             // own facility, and this is the task that does the waiting.
