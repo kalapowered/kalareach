@@ -155,6 +155,17 @@ impl LaneQueue {
         );
     }
 
+    /// Returns how many frames are queued, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.items
+            .lock()
+            .expect("the lane queue is not poisoned")
+            .frames
+            .len()
+    }
+
     /// Takes everything queued, in order.
     pub fn drain(&self) -> Vec<ControlFrame> {
         let mut items = self.items.lock().expect("the lane queue is not poisoned");
