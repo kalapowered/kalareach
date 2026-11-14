@@ -117,7 +117,7 @@ fn kr_req_07_67_closing_an_attachment_leaves_a_gateway_served_session_running() 
         .view
         .runtime
         .session()
-        .detach(shell.view.attachment_id)
+        .detach(shell.view.attachment_id, None)
         .expect("the attachment closes");
     shell.view.runtime.flush_input();
     assert_eq!(detached.remaining.get(), 0, "it was the session's only one");

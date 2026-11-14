@@ -516,7 +516,7 @@ impl Worker {
         let mut session = self._runtime.session();
         for attachment in session.attachments() {
             session
-                .detach(attachment.attachment_id)
+                .detach(attachment.attachment_id, None)
                 .expect("the attachment is held");
         }
     }

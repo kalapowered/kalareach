@@ -213,7 +213,7 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     // Detaching removes the attachment and the session stays live with none.
     {
         let mut session = runtime.session();
-        let detached = session.detach(attachment_id).expect("detaches");
+        let detached = session.detach(attachment_id, None).expect("detaches");
         assert_eq!(detached.remaining.get(), 0);
         assert_eq!(session.state(), SessionState::Live);
         let summary = session.summary();
@@ -870,7 +870,7 @@ async fn detaching_mid_paste_publishes_the_fence_and_closes_the_paste() {
 
     {
         let mut session = runtime.session();
-        session.detach(attachment_id).expect("detaches");
+        session.detach(attachment_id, None).expect("detaches");
         runtime.flush_input();
     }
     let session = runtime.session();
@@ -1609,7 +1609,7 @@ async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_wit
 
     let before = session.geometry();
     let refused = session
-        .detach(owner)
+        .detach(owner, None)
         .expect_err("the succession is refused");
     assert_eq!(
         refused.to_protocol_error().code,

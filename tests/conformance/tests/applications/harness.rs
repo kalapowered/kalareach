@@ -624,7 +624,7 @@ impl Session {
         assert_eq!(presentation, Some(TerminalPresentationMode::Viewport));
         subscribe(&mut client, self.session_id, attachment_id).await;
         let screen = read_snapshot(&mut client).await;
-        let _ = self.runtime.session().detach(attachment_id);
+        let _ = self.runtime.session().detach(attachment_id, None);
         screen
     }
 
