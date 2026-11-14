@@ -681,6 +681,10 @@ impl Controller {
         let ends = OpeningEnds(Arc::clone(running));
         let daemon = self.me.clone();
         let challenge = matches!(presentation, Presentation::Challenge { .. });
+        #[cfg(feature = "testing")]
+        if challenge {
+            self.challenges_presented.fetch_add(1, Ordering::SeqCst);
+        }
         OpenTask {
             challenge,
             handle: tokio::spawn(async move {
