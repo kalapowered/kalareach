@@ -581,6 +581,34 @@ fn a_service_that_a_new_installation_refused_is_refused_at_the_first_look_and_ac
     assert_eq!(source.matches("refused_service()").count(), 2);
 }
 
+/// A repair that finds no service standing over a record that says `refused` writes the step as an
+/// intent with no result before it creates the service, so that the state "created, and the record
+/// still `refused`" cannot be left: at every point between the creation and the save of `made` the
+/// record on disk holds an intent, which a removal decides from the service's own mark.
+#[test]
+fn a_repair_that_makes_the_service_over_a_refusal_writes_an_intent_before_the_creation() {
+    let source = install_source();
+    let lay = code_of(body_of(&source, "fn lay_down("));
+    let step = lay
+        .find("    let broker_service = match manager.open(SERVICE)? {")
+        .expect("the service step reads the service manager");
+    let step = &lay[step..];
+    let at = |needle: &str| {
+        step.find(needle)
+            .unwrap_or_else(|| panic!("the service step has no {needle}"))
+    };
+    let none = at("        None => {");
+    let drop = at("run.manifest.drop_refusal(ObjectKind::Service, SERVICE)");
+    let save = at("run.save()?;");
+    let create = at("manager.create(");
+    let die = at("die_at(\"service\");");
+    let made = at("run.conclude(ObjectKind::Service, SERVICE, Outcome::Made)?;");
+    // The intent is saved on the arm that makes the service, before the call and with nothing between.
+    assert!(none < drop && drop < save && save < create && create < die && die < made);
+    assert!(!step[drop..create].contains("manager."));
+    assert_eq!(code_of(&source).matches(".drop_refusal(").count(), 1);
+}
+
 /// A service that a new installation refused (its result `refused`) is left alone by the ordinary
 /// removal's steps, and the check after them names it where a read of the service manager finds it
 /// standing; the manifest's word alone does not make the check say that it is gone or that it
