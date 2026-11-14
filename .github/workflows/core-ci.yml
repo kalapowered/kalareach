@@ -1097,14 +1097,14 @@ jobs:
 
       # The directory secret store a test run or `--secret-store file` names flushes each name it
       # creates, replaces or removes, a directory made for a secret's scope among them, and reports
-      # a flush that is refused. The crate's whole suite runs, the libsodium boundary among it. It
-      # runs in pwsh: from bash two store cases fail, for a reason that is not the runtime.
+      # a flush that is refused. The crate's whole suite runs, the libsodium boundary among it, in the
+      # job's default shell, pwsh.
       - name: Test the directory secret store and the libsodium boundary
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-crypto
 
       # The same suite against libsodium's release library, which is the one the shipped programs
-      # link, and the profile whose link carries the static C runtime alone.
+      # link.
       - name: Test the libsodium boundary in the release profile
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked --release -p kr-crypto
