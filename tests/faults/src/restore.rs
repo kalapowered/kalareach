@@ -1299,7 +1299,7 @@ impl Stage {
 
     /// Everything queued for the program's input since the last call.
     pub(crate) fn pending_input(&mut self) -> Vec<InputBatch> {
-        self.session.take_pending_input()
+        kr_worker::testing::take_pending_input(&mut self.session)
     }
 
     /// Where client `index` differs from the session's screen now; empty when it holds it.

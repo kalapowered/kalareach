@@ -179,8 +179,7 @@ impl Fixture {
 
     /// The replies queued for the application since the last call.
     fn replies(&mut self) -> Vec<Vec<u8>> {
-        self.session
-            .take_pending_input()
+        kr_worker::testing::take_pending_input(&mut self.session)
             .into_iter()
             .filter_map(|batch| match batch {
                 InputBatch::Reply { bytes, .. } => Some(bytes),
@@ -397,8 +396,7 @@ impl Fixture {
     /// host answers and what the person typed.
     #[cfg(not(windows))]
     fn queued(&mut self) -> Vec<(&'static str, Vec<u8>)> {
-        self.session
-            .take_pending_input()
+        kr_worker::testing::take_pending_input(&mut self.session)
             .into_iter()
             .filter_map(|batch| match batch {
                 InputBatch::Reply { bytes, .. } => Some(("reply", bytes)),

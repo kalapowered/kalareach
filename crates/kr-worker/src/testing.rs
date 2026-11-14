@@ -18,6 +18,18 @@
 //! drives PowerShell 7 itself.
 
 use crate::pty::ShellCommand;
+use crate::session::{InputBatch, Session};
+
+/// Takes every batch queued for the program's input that may be written now, in the order it was
+/// queued, from a session that a harness drives by hand with no writer behind it.
+///
+/// This is the one door a harness outside this crate uses to reach into a session's input queue.
+/// No program of the product calls it, and nothing in this crate's own code does: it exists so
+/// that a harness builds against the worker with no feature of the worker in its dependencies.
+/// What else such a harness needs of the queue comes through this module too.
+pub fn take_pending_input(session: &mut Session) -> Vec<InputBatch> {
+    session.take_pending_input()
+}
 
 /// The environment every test shell is given.
 ///
