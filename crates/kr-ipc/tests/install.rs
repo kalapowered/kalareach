@@ -1521,6 +1521,207 @@ fn current_names_a_whole_release_at_every_moment_of_a_switch() {
     assert!(reads.load(Ordering::SeqCst) > 0, "the readers read");
 }
 
+/// Opens `current` itself, not what it names, the way a program reads the link, and keeps it open.
+#[cfg(windows)]
+fn open_current_itself(test: &TestStore) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(test.store.current_link())
+        .expect("current opens")
+}
+
+/// The target a junction names, as the system keeps it, read through a handle that is open on the
+/// junction.
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "a handle's reparse data is read through a control code that has no safe interface"
+)]
+fn target_through(held: &std::fs::File) -> std::io::Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut returned = 0_u32;
+    // SAFETY: the handle is the open file's own, and the output buffer is as long as the length
+    // says; no input is given.
+    let done = unsafe {
+        DeviceIoControl(
+            held.as_raw_handle(),
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(buffer.len()).expect("a length"),
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if done == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A junction's record: the tag, the data's length and a reserved word, then the offset and the
+    // length of the name the junction names, and of the name it shows, then the names from byte 16.
+    let word = |at: usize| usize::from(u16::from_le_bytes([buffer[at], buffer[at + 1]]));
+    let (offset, length) = (16 + word(8), word(10));
+    let units: Vec<u16> = buffer[offset..offset + length]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    Ok(String::from_utf16_lossy(&units))
+}
+
+/// A program that opened `current` before a switch and reads it after reads the release that is
+/// current after it, whole. A switch changes where the junction points and does not put another
+/// junction in its place, which a reader that has the old one open would be refused or read as it
+/// was.
+#[cfg(windows)]
+#[test]
+fn a_reader_that_holds_current_open_across_a_switch_reads_the_release_switched_to() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    test.install(&one);
+    test.install(&two);
+    test.switch(&one);
+    let named = |of: &ReleaseName| {
+        std::path::absolute(test.store.release_directory(of))
+            .expect("a path")
+            .display()
+            .to_string()
+    };
+    let held = open_current_itself(&test);
+    let before = target_through(&held).expect("the junction reads");
+    assert!(
+        before.ends_with(&named(&one)),
+        "it names the first: {before}"
+    );
+    test.switch(&two);
+    let after = target_through(&held).expect("the junction still reads");
+    assert!(
+        after.ends_with(&named(&two)),
+        "it names the second: {after}"
+    );
+    assert_eq!(test.store.current().expect("reads"), Some(two));
+}
+
+/// A switch that ends at any moment of the change leaves `current` naming a whole release, the one
+/// it was or the one it goes to, and never none or a mixture: before the target is set it names the
+/// old one, and after it the new one, with the change not yet flushed. A panic in the seam stands
+/// for the end of the process there, and a store opened afresh for what a restart finds.
+#[cfg(windows)]
+#[test]
+fn a_switch_that_ends_at_any_moment_leaves_current_naming_a_whole_release() {
+    use kr_ipc::install::removal_race::{Moment, hook};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let _hooked = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (moment, goes_to_the_new) in [
+        (Moment::JunctionChecked, false),
+        (Moment::JunctionPointed, true),
+    ] {
+        let test = TestStore::create();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let two = release("0.2.0+bbbbbbbbbbbb");
+        test.install(&one);
+        test.install(&two);
+        test.switch(&one);
+        let link = test.store.current_link();
+        hook(Some(std::sync::Arc::new(move |at, path: &Path| {
+            assert!(!(at == moment && path == link), "the switch ends here");
+        })));
+        let ended = catch_unwind(AssertUnwindSafe(|| test.switch(&two)));
+        hook(None);
+        assert!(ended.is_err(), "the switch ends at {moment:?}");
+        let restarted = Store::at(test.store.root().to_path_buf());
+        let named = restarted
+            .current()
+            .expect("current reads after the end")
+            .expect("current names a release after the end");
+        assert_eq!(
+            named,
+            if goes_to_the_new { two } else { one },
+            "at {moment:?}"
+        );
+        assert!(
+            restarted.release_program(&named, Program::Kr).is_file(),
+            "the release it names is whole, at {moment:?}"
+        );
+    }
+}
+
+/// A `current` that is a plain directory is not made a junction where it is: the directory that was
+/// there stays what it is, whether the switch then replaces it or refuses.
+#[cfg(windows)]
+#[test]
+fn a_current_that_is_a_plain_directory_is_not_turned_into_a_junction_in_place() {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    std::fs::create_dir(test.store.current_link()).expect("a directory in the place of current");
+    let held = open_current_itself(&test);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test.switch(&one)));
+    assert!(
+        !matches!(
+            held.metadata(),
+            Ok(kept) if kept.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        ),
+        "the directory that was there is not a junction now"
+    );
+}
+
+/// What another process of the account puts in the place of `current` after the switch has looked
+/// at it and before it sets the target is left as it is: the target is set through the handle that
+/// was looked at, and not through the name.
+#[cfg(windows)]
+#[test]
+fn a_name_put_in_the_place_of_current_during_a_switch_is_not_pointed_at_the_release() {
+    use kr_ipc::install::removal_race::{Moment, hook, make_junction_in_place};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let _hooked = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    test.install(&one);
+    test.install(&two);
+    test.switch(&one);
+    let elsewhere = test.root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("a place for the other junction to name");
+    let link = test.store.current_link();
+    let moved = test.store.root().join("moved-current");
+    let (at_link, to_name) = (link.clone(), elsewhere.clone());
+    hook(Some(std::sync::Arc::new(move |at, path: &Path| {
+        if at == Moment::JunctionChecked && path == at_link {
+            std::fs::rename(&at_link, &moved).expect("the junction that was looked at moves away");
+            std::fs::create_dir(&at_link).expect("another directory takes the name");
+            make_junction_in_place(&at_link, &to_name).expect("which is a junction");
+        }
+    })));
+    let _ = catch_unwind(AssertUnwindSafe(|| test.switch(&two)));
+    hook(None);
+    assert_eq!(
+        std::fs::read_link(&link).expect("the name is still a junction"),
+        elsewhere,
+        "the junction put there still names what it named"
+    );
+}
+
 /// A `current` that is no link is an error, and a store with no `current` has no current release:
 /// the read that reads again for a link a switch took away does not turn the one into the other.
 #[test]
