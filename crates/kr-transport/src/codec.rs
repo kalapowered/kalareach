@@ -406,7 +406,8 @@ impl FrameReader {
 
     /// Holds every frame this reader reads to `deadlines`.
     ///
-    /// The wait for a frame to begin is bounded by [`DeadlineKind::Idle`] and each piece of a frame
+    /// The wait for a frame to begin is bounded by [`DeadlineKind::Idle`], unless the reader was
+    /// told to leave it open ([`FrameReader::without_idle_deadline`]), and each piece of a frame
     /// that arrives after it has begun by [`DeadlineKind::Stall`]. A read that is cut ends with
     /// [`TransportError::Deadline`], stops the stream and leaves the reader refusing every further
     /// read, since part of a frame has been consumed. A reader that was given none waits for its

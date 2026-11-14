@@ -1,13 +1,15 @@
 //! The deadlines a data stream is held to, as futures its owner can start and a test can fire.
 //!
 //! A stream the peer opens costs the host a task, a place in a queue and memory for as long as it
-//! stays open, so every wait on a peer has an end. There are five, each a [`DeadlineKind`]:
+//! stays open, so every wait on a peer has an end, except the quiet between the frames of a
+//! terminal-input stream, which lasts as long as the person is not typing. There are five, each a
+//! [`DeadlineKind`]:
 //!
 //! | Kind | What it bounds |
 //! | --- | --- |
 //! | [`DeadlineKind::Header`] | Reading a stream's 1 KiB header |
 //! | [`DeadlineKind::Admission`] | The host's own lookup that admits a stream, once it has the header |
-//! | [`DeadlineKind::Idle`] | The wait for the next frame to begin, on every stream but a terminal-input one |
+//! | [`DeadlineKind::Idle`] | The wait for the next frame to begin (not on terminal input) |
 //! | [`DeadlineKind::Stall`] | Progress while the bytes of one frame arrive |
 //! | [`DeadlineKind::Write`] | Writing one frame to a peer that has to read it |
 //!
@@ -90,7 +92,8 @@ pub struct TimerDeadlines {
     /// How long the host's lookup for a stream has.
     pub admission: Duration,
     /// How long a stream may be quiet between frames. A stream that is open and waiting for its
-    /// next chunk is not idle for longer than this. A terminal-input stream is held to no such bound.
+    /// next chunk is not idle for longer than this. A terminal-input stream is held to no such
+    /// bound.
     pub idle: Duration,
     /// How long a frame may go without a further byte arriving once it has begun. It is a bound on
     /// each piece and not on the frame, so a slow link is never cut for the size of a chunk, and a

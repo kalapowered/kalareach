@@ -966,12 +966,23 @@ async fn a_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
     .await;
 }
 
-/// The kind that carries typing is the one kind with no idle deadline: the other terminal kind
-/// keeps its.
+/// The kind that carries typing is the one kind with no idle deadline: the other kinds a host
+/// takes from a device keep theirs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_output_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
     a_quiet_stream_is_cut_by_the_idle_deadline(StreamKind::TerminalOutput, |connection_id| {
         terminal_header(connection_id, 1)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_semantic_updates_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
+    a_quiet_stream_is_cut_by_the_idle_deadline(StreamKind::SemanticUpdates, |connection_id| {
+        StreamHeader {
+            kind: StreamKind::SemanticUpdates,
+            ..terminal_header(connection_id, 1)
+        }
     })
     .await;
 }
@@ -1773,8 +1784,9 @@ async fn the_next_stream_finds_no_credit(harness: &Harness) {
 
 /// A host that takes input streams lets a device hold them beside everything else a connection
 /// carries: the control stream, the bulk streams, and the places a stream waits in while its header
-/// is read, with one spare. A stream of each long-lived kind is open and taken by the host; the
-/// device can still open every stream that is being announced, and no more than that.
+/// is read, with one spare. A stream of each long-lived kind is open on both sides, and the host
+/// holds all of them at once; the device can still open every stream that is being announced, and
+/// no more than that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_has_room_for_input_streams_beside_the_bulk_streams() {
     let mut harness = Harness::start(
@@ -1786,6 +1798,7 @@ async fn a_connection_has_room_for_input_streams_beside_the_bulk_streams() {
     let bulk = SendLimits::default().max_bulk_streams;
 
     let mut long_lived = Vec::new();
+    let mut taken = Vec::new();
     for transfer in 0..bulk {
         let header = attachment_header(connection_id, u8::try_from(transfer).expect("a few"));
         long_lived.push(
@@ -1796,7 +1809,7 @@ async fn a_connection_has_room_for_input_streams_beside_the_bulk_streams() {
             .await
             .expect("a bulk stream"),
         );
-        let _ = harness.next().await;
+        taken.push(harness.next().await);
     }
     for session in 0..INPUT_STREAMS {
         let header = input_header(connection_id, u8::try_from(session).expect("a few"));
@@ -1808,8 +1821,18 @@ async fn a_connection_has_room_for_input_streams_beside_the_bulk_streams() {
             .await
             .expect("an input stream"),
         );
-        let _ = harness.next().await;
+        taken.push(harness.next().await);
     }
+    assert_eq!(
+        harness.registry.len(),
+        bulk + INPUT_STREAMS,
+        "the host does not hold every long-lived stream at once"
+    );
+    assert_eq!(
+        harness.registry.budget().open_bulk_streams(),
+        bulk,
+        "the host does not hold every bulk slot at once"
+    );
 
     let mut announcing = Vec::new();
     for _ in 0..kr_transport::streams::MAX_PENDING_HEADERS + 1 {
@@ -1823,6 +1846,11 @@ async fn a_connection_has_room_for_input_streams_beside_the_bulk_streams() {
         );
     }
     the_next_stream_finds_no_credit(&harness).await;
+    assert_eq!(
+        harness.registry.len(),
+        taken.len(),
+        "a long-lived stream left the host's registry while the probe ran"
+    );
 
     harness.finish().await;
 }

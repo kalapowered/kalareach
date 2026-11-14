@@ -761,14 +761,15 @@ const fn max_peer_bidi_streams(max_bulk_streams: usize, max_input_streams: usize
     }
 }
 
-/// Lets the peer of a connection open the streams a device's transfers need.
+/// Lets the peer of a connection open the streams a device's transfers and typing need.
 ///
 /// A connection starts with room for one bidirectional stream ([`transport_config`]); this raises
 /// it to [`max_peer_bidi_streams`]; a host that takes no input stream passes none. The listener
-/// calls it when the host first reads its data streams, which is not when the connection is authorised: the listener cannot know when the host
-/// has finished its own check of the device, so where that first read falls relative to the check
-/// is the host's to arrange. The library grants the difference at once, and a stream the peer
-/// tried to open in the meantime waits for that credit and is opened when it arrives.
+/// calls it when the host first reads its data streams, which is not when the connection is
+/// authorised: the listener cannot know when the host has finished its own check of the device, so
+/// where that first read falls relative to the check is the host's to arrange. The library grants
+/// the difference at once, and a stream the peer tried to open in the meantime waits for that
+/// credit and is opened when it arrives.
 pub(crate) fn allow_data_streams(
     connection: &Connection,
     max_bulk_streams: usize,
