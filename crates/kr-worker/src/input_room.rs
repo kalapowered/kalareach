@@ -189,6 +189,12 @@ impl TopUp {
         self.due.swap(false, Ordering::AcqRel)
     }
 
+    /// Says whether a request is waiting, without taking it.
+    #[cfg(test)]
+    pub(crate) fn is_due(&self) -> bool {
+        self.due.load(Ordering::Acquire)
+    }
+
     /// Waits for a request.
     pub async fn asked(&self) {
         self.wake.notified().await;
