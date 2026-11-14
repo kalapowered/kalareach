@@ -112,7 +112,9 @@ impl Rig {
             .count()
     }
 
-    /// The sum that admission reads, which must never pass the room.
+    /// The sum that admission reads. It stays inside the room for the writes the cases here make; a
+    /// held key that its timer has released is counted twice until its batch is done, and one case
+    /// shows the sum passing the room by those entries.
     fn committed(&self) -> Cost {
         let ledger = self.input.ledger();
         ledger.held.plus(ledger.reserved).plus(ledger.promised)

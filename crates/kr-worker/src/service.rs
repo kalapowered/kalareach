@@ -417,11 +417,10 @@ pub struct WorkerService {
     controller_public_key: AuthorisationKey,
     /// Which generation and which connections speak for this environment.
     ///
-    /// The order of every lock that is held while another is taken is one order, everywhere: this
-    /// one first, then the input domain, then the connection registry, then one registration's
-    /// list of attachments. Nothing that holds the input domain takes this lock, so a path that
-    /// holds this lock may wait for the domain, and a path that holds the domain never waits for
-    /// this.
+    /// This lock comes before the input domain wherever a path holds both: a path that holds this
+    /// lock may wait for the domain, and a path that holds the domain never waits for this. After
+    /// the domain come the connection registry and then one registration's list of attachments.
+    /// The dispatch boundary, where a path holds it, is taken before this lock.
     authority: Mutex<Authority>,
     /// What this session's local owner may do, as the control daemon last told this worker.
     gate: Arc<crate::local_gate::LocalGate>,
