@@ -785,6 +785,11 @@ fn the_words_for_an_object_that_a_rollback_left_say_what_the_record_holds_and_gi
     assert!(words[0].contains("holds no result that the step made it"));
     assert!(words[1].contains("found it where it looked and did not make it"));
     assert!(words[2].contains("went no further with it"));
+    // An object with the result `made` is not left, so its words say only that this run made it.
+    assert_eq!(
+        left_alone("account", "krb-checkout", Some(Outcome::Made)),
+        "account krb-checkout: this run made it"
+    );
     assert!(words[3].contains("holds no result that this run changed it"));
 }
 
@@ -1005,10 +1010,11 @@ fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_insta
         FolderRecord::of(Some(Outcome::Found), true),
         FolderRecord::Found
     );
-    // A result of refused belongs to the service and is never read as a folder to remove.
+    // A result of refused belongs to the service: no folder has it, and it is never read as a folder
+    // to remove or as one that stood there before the installation.
     assert_eq!(
         FolderRecord::of(Some(Outcome::Refused), true),
-        FolderRecord::Found
+        FolderRecord::NoIdentity
     );
     assert_eq!(
         FolderRecord::of(Some(Outcome::Found), false),
