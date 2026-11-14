@@ -540,11 +540,11 @@ async fn the_refusal_of_the_current_epoch_stands_against_a_late_answer_of_an_old
     rig.stop().await;
 }
 
-/// A frame of an older epoch that the device writes after the newest epoch was refused is not
-/// passed on, and the device is told that its epoch is refused, once: the cutoff for passing frames
-/// on is not the record of what the device has been told.
+/// The epochs of the frames on one stream never go back: a frame of an epoch lower than the newest
+/// one the host has read breaks the stream's order, and the stream is cut, as for a malformed frame.
+/// The device is told that the newer epoch is refused first, and then the stream is reset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_older_epochs_frame_written_after_the_newest_refusal_is_refused_once() {
+async fn a_frame_of_an_older_epoch_after_a_newer_one_cuts_the_stream() {
     let rig = Rig::start().await;
     let mut stream = rig.open().await;
     let newer = InputLeaseEpoch::new(rig.epoch.get() + 1);
@@ -555,13 +555,8 @@ async fn an_older_epochs_frame_written_after_the_newest_refusal_is_refused_once(
         bytes: U64::new(0),
         ended: Nullable::null(),
     });
-    let newer_frame = InputFrame {
-        epoch: newer,
-        sequence: InputSequence::new(0),
-        bytes: Bytes::new(b"n".to_vec()),
-    };
     stream
-        .write_message(&newer_frame)
+        .write_message(&frame_of(newer.get(), 0, b"n"))
         .await
         .expect("the frame is written");
     assert!(
@@ -572,30 +567,14 @@ async fn an_older_epochs_frame_written_after_the_newest_refusal_is_refused_once(
         "the newer epoch is refused first"
     );
 
-    let (mut reader, mut writer) = stream.split();
-    for sequence in 0..3 {
-        writer
-            .write_message(&rig.frame(sequence, b"o"))
-            .await
-            .expect("the frame is written");
-    }
-    drop(writer);
-    let mut refused_older = 0;
-    while let Some(ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
-        .await
-        .expect("the host answers in time")
-        .expect("the stream is not reset")
-    {
-        match ack {
-            InputAck::Refused { epoch, .. } if epoch == rig.epoch => refused_older += 1,
-            InputAck::Refused { .. } => panic!("the newer epoch is not refused again"),
-            _ => {}
+    let _ = stream.write_message(&rig.frame(0, b"o")).await;
+    let ended = loop {
+        match next_or_reset(&mut stream).await {
+            Ok(Some(_)) => {}
+            other => break other,
         }
-    }
-    assert_eq!(
-        refused_older, 1,
-        "the older epoch is refused once for all its frames"
-    );
+    };
+    assert!(ended.is_err(), "the stream is cut, and reset: {ended:?}");
     assert!(
         rig.lane.frames().is_empty(),
         "no frame of either epoch was passed on"
@@ -603,69 +582,184 @@ async fn an_older_epochs_frame_written_after_the_newest_refusal_is_refused_once(
     rig.stop().await;
 }
 
-/// How many acknowledgements the host keeps for a device that does not read them, as the door
-/// names it.
-const MAX_UNREAD_ACKS: usize = 64;
-
-/// How many epochs the host keeps a first refusal for on one stream, as the door names it.
-const MAX_REFUSED_EPOCHS: u64 = 64;
-
-/// A device whose frames carry more distinct stale epochs than the host keeps refusals for loses its
-/// stream, and its connection stands: each epoch is told refused once, and the host does not keep
-/// an unbounded record of what it has told.
+/// One stream serves an attachment across the lease's changes of hands, so a long session crosses
+/// far more epochs than the host holds frames for. Seventy epochs run on one stream, each in four
+/// steps: the view holds the lease and one frame is accepted; the lease moves on and the device is
+/// told so; one more frame of the epoch is refused. The device reads what it is told between the
+/// steps. The stream stays open, every epoch is told ended and refused once, and the host's record
+/// of what it has told never holds more epochs than the frames it holds plus one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_whose_frames_span_many_refused_epochs_loses_its_stream() {
+async fn seventy_changes_of_the_lease_on_one_stream_leave_it_open_and_the_record_small() {
     let rig = Rig::start().await;
     let mut stream = rig.open().await;
-    let current = InputLeaseEpoch::new(rig.epoch.get() + 1_000);
+    let stages = rig.adopted.host.network().input_stages();
+    let first = rig.epoch.get() + 10;
+    let mut last = first;
+    for cycle in 0..70 {
+        let epoch = first + 2 * cycle;
+        last = epoch;
+        rig.lane.send_window(holding(epoch));
+        stream
+            .write_message(&frame_of(epoch, 0, b"a"))
+            .await
+            .expect("the frame is written");
+        assert!(
+            matches!(
+                next(&mut stream).await,
+                Some(InputAck::Accepted { epoch: told, through })
+                    if told.get() == epoch && through.get() == 0
+            ),
+            "the first frame of epoch {epoch} is accepted"
+        );
+        rig.lane.send_window(moved_on(epoch));
+        assert!(
+            matches!(
+                next(&mut stream).await,
+                Some(InputAck::EpochEnded { epoch: told, .. }) if told.get() == epoch
+            ),
+            "the end of epoch {epoch} is told"
+        );
+        stream
+            .write_message(&frame_of(epoch, 1, b"b"))
+            .await
+            .expect("the frame is written");
+        assert!(
+            matches!(
+                next(&mut stream).await,
+                Some(InputAck::Refused { epoch: told, sequence, accepted_through, .. })
+                    if told.get() == epoch
+                        && sequence.get() == 1
+                        && accepted_through.0.is_some_and(|through| through.get() == 0)
+            ),
+            "the second frame of epoch {epoch} is refused once, and the first stands accepted"
+        );
+    }
+    let counts = stages.counts();
+    assert!(
+        counts.records_peak <= counts.host_holds_peak + 1,
+        "the record held {} epochs when the host held at most {} frames",
+        counts.records_peak,
+        counts.host_holds_peak
+    );
+    assert_eq!(counts.host_holds, 0, "every frame was answered or refused");
+    assert_eq!(counts.records, 1, "only the newest epoch's record is kept");
+
+    let epoch = last + 2;
+    rig.lane.send_window(holding(epoch));
+    stream
+        .write_message(&frame_of(epoch, 0, b"z"))
+        .await
+        .expect("the frame is written");
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::Accepted { epoch: told, .. }) if told.get() == epoch
+        ),
+        "the stream is open and takes typing after seventy changes"
+    );
+    rig.stop().await;
+}
+
+/// An older epoch with two frames at the lane when a newer epoch is read has its first refusal told
+/// once: the record of the older epoch is kept for as long as a frame of it is at the host, so the
+/// worker's second answer for it tells the device nothing again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_epoch_with_two_frames_at_the_lane_is_told_refused_once() {
+    let rig = Rig::start().await;
+    let stream = rig.open().await;
+    rig.lane.hold_answers();
+    let (mut reader, mut writer) = stream.split();
+    for sequence in 0..2 {
+        writer
+            .write_message(&rig.frame(sequence, b"o"))
+            .await
+            .expect("the frame is written");
+    }
+    rig.lane
+        .until("both frames of the older epoch are at the lane", |frames| {
+            frames.len() == 2
+        })
+        .await;
+    let newer = InputLeaseEpoch::new(rig.epoch.get() + 1);
+    writer
+        .write_message(&frame_of(newer.get(), 0, b"n"))
+        .await
+        .expect("the newer epoch's frame is written");
     rig.lane.send_window(LaneWindow {
-        epoch: current,
+        epoch: newer,
+        holder: false,
+        frames: 0,
+        bytes: U64::new(0),
+        ended: Nullable::null(),
+    });
+    loop {
+        let ack = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+            .await
+            .expect("the host answers in time")
+            .expect("the stream is not reset")
+            .expect("the stream stays open");
+        if matches!(ack, InputAck::Refused { epoch, .. } if epoch == newer) {
+            break;
+        }
+    }
+    rig.lane.refuse_from(0);
+    rig.lane.release_answers();
+    drop(writer);
+    let mut refused_older = 0;
+    while let Some(ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the host answers in time")
+        .expect("the stream is not reset")
+    {
+        if matches!(ack, InputAck::Refused { epoch, .. } if epoch == rig.epoch) {
+            refused_older += 1;
+        }
+    }
+    assert_eq!(
+        refused_older, 1,
+        "the older epoch is told refused once for its two answers"
+    );
+    rig.stop().await;
+}
+
+/// The window of the lane's epoch: the view holds the lease, with credit for what the cases write.
+fn holding(epoch: u64) -> LaneWindow {
+    LaneWindow {
+        epoch: InputLeaseEpoch::new(epoch),
+        holder: true,
+        frames: 32,
+        bytes: U64::new(64 * 1024),
+        ended: Nullable::null(),
+    }
+}
+
+/// The window after the lease of `epoch` moved to another view: the view holds nothing, and the
+/// end of its lease is told with no bytes fenced.
+fn moved_on(epoch: u64) -> LaneWindow {
+    LaneWindow {
+        epoch: InputLeaseEpoch::new(epoch + 1),
         holder: false,
         frames: 0,
         bytes: U64::new(0),
         ended: Nullable::some(LaneEnded {
-            epoch: rig.epoch,
+            epoch: InputLeaseEpoch::new(epoch),
             fenced_bytes: U64::new(0),
         }),
-    });
-    assert!(
-        matches!(next(&mut stream).await, Some(InputAck::EpochEnded { .. })),
-        "the lane's window is applied"
-    );
-
-    let (mut reader, mut writer) = stream.split();
-    for epoch in 1..=MAX_REFUSED_EPOCHS + 2 {
-        let frame = InputFrame {
-            epoch: InputLeaseEpoch::new(epoch),
-            sequence: InputSequence::new(0),
-            bytes: Bytes::new(b"s".to_vec()),
-        };
-        if writer.write_message(&frame).await.is_err() {
-            break;
-        }
     }
-    let mut refused = 0;
-    let ended = loop {
-        match tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
-            .await
-            .expect("the host answers or ends the stream in time")
-        {
-            Ok(Some(InputAck::Refused { .. })) => refused += 1,
-            Ok(Some(_)) => {}
-            ended => break ended,
-        }
-    };
-    assert!(ended.is_err(), "the stream is reset: {ended:?}");
-    assert!(
-        refused <= MAX_REFUSED_EPOCHS,
-        "the device was told of no more epochs than the host keeps: {refused}"
-    );
-    assert!(
-        rig.lane.frames().is_empty(),
-        "no frame of a stale epoch was passed on"
-    );
-    rig.stop().await;
 }
+
+/// A frame of `epoch`, as a device writes it.
+fn frame_of(epoch: u64, sequence: u64, bytes: &[u8]) -> InputFrame {
+    InputFrame {
+        epoch: InputLeaseEpoch::new(epoch),
+        sequence: InputSequence::new(sequence),
+        bytes: Bytes::new(bytes.to_vec()),
+    }
+}
+
+/// How many acknowledgements the host keeps for a device that does not read them, as the door
+/// names it.
+const MAX_UNREAD_ACKS: usize = 64;
 
 /// A device that does not read what it is told holds the host to a bounded number of
 /// acknowledgements: the worker's events would make the host hold more, so the stream is cut, and
@@ -753,7 +847,9 @@ async fn a_withdrawal_after_the_decision_is_caught_by_the_feed_check_before_the_
 
 /// The stream task marks the state's version before it looks at whether the stream has ended, so an
 /// end that comes between the mark and the look is seen at the look, and one that comes after the
-/// look is seen as a change. The task is held between the two while a detach ends the stream.
+/// look is seen as a change. The task is woken by a credit from the worker, so that no frame is
+/// ready for it to turn on, and held between the mark and the look while a detach ends the stream:
+/// a task that missed the end would wait for a frame that never comes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_end_that_comes_between_the_mark_and_the_look_is_not_missed() {
     let rig = Rig::start().await;
@@ -761,10 +857,7 @@ async fn an_end_that_comes_between_the_mark_and_the_look_is_not_missed() {
     let stages = rig.adopted.host.network().input_stages();
     let mut ended = rig.adopted.host.network().input_tasks_ended();
     let (at_mark, go) = stages.hold_after_the_version_mark();
-    stream
-        .write_message(&rig.frame(0, b"a"))
-        .await
-        .expect("the frame is written");
+    rig.lane.send_credit(rig.epoch.get(), 1, 1);
     arrived(at_mark).await;
 
     rig.lane.send_window(lease_ended(&rig));
@@ -787,6 +880,78 @@ async fn an_end_that_comes_between_the_mark_and_the_look_is_not_missed() {
         .await
         .expect("the stream task ended in time once it was let go")
         .expect("the count stands");
+    rig.stop().await;
+}
+
+/// A stream is finished only if its end is graceful when the acknowledgement writer lets it go. A
+/// cut that comes after the writer found the end graceful, and before it let go, is a reset: the
+/// device must not read a clean end for a stream that was cut. The writer is held after it has
+/// looked at a graceful end with nothing left to write, while the worker's lane ends; the stream
+/// task, which waits for the writer, has not revoked the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_that_follows_the_writers_look_at_a_graceful_end_is_a_reset_not_a_finish() {
+    let rig = Rig::start().await;
+    let stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let (at_look, go) = stages.hold_after_a_graceful_look();
+    let (mut reader, writer) = stream.split();
+    drop(writer);
+    arrived(at_look).await;
+
+    rig.lane.close();
+    until("the lane's end cut the stream", || {
+        stages.counts().cuts == 1
+    })
+    .await;
+    let _ = go.send(());
+    let ended = loop {
+        match tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+            .await
+            .expect("the host ends the stream in time")
+        {
+            Ok(Some(_)) => {}
+            other => break other,
+        }
+    };
+    assert!(
+        ended.is_err(),
+        "a cut stream is reset, and the device read {ended:?}"
+    );
+    rig.stop().await;
+}
+
+/// A stream that is cut is reset by the acknowledgement writer itself, whatever the stream task is
+/// doing: the device must not read a clean end for it. The stream task is woken by a credit and held
+/// between the mark and the look, where it cannot reset the stream, while the worker's lane ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_while_the_stream_task_is_held_is_a_reset_that_the_writer_gives() {
+    let rig = Rig::start().await;
+    let stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let (at_mark, go) = stages.hold_after_the_version_mark();
+    rig.lane.send_credit(rig.epoch.get(), 1, 1);
+    arrived(at_mark).await;
+
+    rig.lane.close();
+    until("the lane's end cut the stream", || {
+        stages.counts().cuts == 1
+    })
+    .await;
+    let (mut reader, _writer) = stream.split();
+    let ended = loop {
+        match tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+            .await
+            .expect("the host ends the stream in time")
+        {
+            Ok(Some(_)) => {}
+            other => break other,
+        }
+    };
+    assert!(
+        ended.is_err(),
+        "a cut stream is reset, and the device read {ended:?}"
+    );
+    let _ = go.send(());
     rig.stop().await;
 }
 
@@ -1036,7 +1201,11 @@ async fn a_detach_that_names_another_devices_attachment_leaves_its_stream_standi
         )
         .await
         .expect_err("the worker refuses a detach of another device's attachment");
-    println!("the worker's refusal: {refused:?}");
+    assert_eq!(
+        refused.code,
+        ErrorCode::AmbiguousAttachment,
+        "the worker refuses it as an attachment its link does not hold: {refused:?}"
+    );
     assert_eq!(
         stages.counts().detaches,
         0,
@@ -1046,6 +1215,57 @@ async fn a_detach_that_names_another_devices_attachment_leaves_its_stream_standi
     drop(second);
     rig.stop().await;
 }
+
+/// A detach that another device sends for this device's attachment, and that the worker refuses as
+/// `INVALID_ARGUMENT` before it checks whose attachment it is (an unknown key among the facts it
+/// expects), counts as one that may have acted, and the hook is told of it. The hook reaches the
+/// asking connection's stream alone, so this device's stream stands and takes its next frame after
+/// the wait that a detach's notice gets. The wait is not a delay the case relies on to pass: a
+/// stream that the hook ended would end within it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_another_device_sends_and_the_worker_refuses_as_invalid_leaves_this_stream_standing()
+ {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+
+    let second = rig.second_typist().await;
+    let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    let refused = second
+        .device
+        .mutate_expecting(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &serde_json::json!({ "no_such_fact": 1 }),
+            &SessionDetachParams {
+                attachment_id: Nullable::some(rig.attachment),
+                line_token: Nullable::null(),
+                after_input: None,
+                fenced_report: false,
+            },
+        )
+        .await
+        .expect_err("the worker refuses a detach that expects a fact it does not know");
+    assert_eq!(
+        refused.code,
+        ErrorCode::InvalidArgument,
+        "the worker refuses it before it checks whose attachment it is: {refused:?}"
+    );
+    assert_eq!(
+        stages.counts().detaches,
+        1,
+        "the hook was told of a detach that may have acted"
+    );
+    tokio::time::sleep(DETACH_NOTICE_WAIT + Duration::from_secs(1)).await;
+    type_and_wait(&rig, &mut stream, 1, b"b").await;
+    drop(second);
+    rig.stop().await;
+}
+
+/// How long the host waits for the notice of a detach, as the door names it.
+const DETACH_NOTICE_WAIT: Duration = Duration::from_secs(2);
 
 /// A detach whose worker sends no notice ends the stream when the wait for it is over, and the
 /// device is told nothing it was not told.

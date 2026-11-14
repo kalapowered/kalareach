@@ -155,10 +155,13 @@ fn unreadable_retained_answer() -> ProtocolError {
 /// Whether a detach whose call to the worker ended as `carried_out` took effect, or may have.
 ///
 /// The worker removes the attachment before the geometry step that follows, so an answer that is an
-/// error counts only when it is one the worker can give after the removal: a refused resize
+/// error counts only when its code is one the worker gives after the removal: a refused resize
 /// (`RESOURCE_UNAVAILABLE`, or `INVALID_ARGUMENT` from the size's own validation) or an outcome that
-/// is unknown. Every refusal that comes before the effect leaves the attachment and its stream as
-/// they were: the grant's (`PERMISSION_DENIED`), an attachment the link does not hold
+/// is unknown. `INVALID_ARGUMENT` counts although the worker also gives it for a request it refuses
+/// before it removes anything: the code does not tell the two apart, so a detach refused for that
+/// reason can still end the asking connection's stream. Counting it is safe only because the hook
+/// reaches the asking connection's stream alone. The codes that the worker gives only before
+/// the effect do not count: the grant's (`PERMISSION_DENIED`), an attachment the link does not hold
 /// (`AMBIGUOUS_ATTACHMENT`), a subject precondition that no longer holds (`DRAFT_CONFLICT`), a
 /// journal that refuses the intent (`STORAGE_UNAVAILABLE`). A call this host refused before it was
 /// sent did nothing either; any other failure of the call leaves its outcome unknown, and so

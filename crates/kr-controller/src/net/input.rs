@@ -23,10 +23,13 @@
 //! and about 1 KiB each for the envelope), and, when the lease moves to a new epoch while frames of
 //! the older one are still queued for the writer, the same again for each such epoch, which only
 //! the other views' takeovers cause; the acknowledgements owed to the device, at most
-//! [`MAX_UNREAD_ACKS`] (those for accepted frames coalesce); and the epochs whose first refusal has
-//! been told, at most [`MAX_REFUSED_EPOCHS`]. A device that does not read what it is told loses the
-//! stream when more than the first is owed, and one whose frames have had more epochs refused than
-//! the second loses it too. The host reads a frame only while fewer than
+//! [`MAX_UNREAD_ACKS`] (those for accepted frames coalesce); and the record of the epochs whose
+//! first refusal has been told, which is kept for an epoch only while a frame of it is at the host
+//! (read and not yet answered or refused) or while it is the newest epoch read, so it holds no more
+//! epochs than the frames at the host plus one. A device that does not read what it is told loses
+//! the stream when more than the first is owed. The epochs of the frames on one stream never go
+//! back: a frame of an epoch lower than the newest one read breaks the stream's order, and the
+//! stream is cut. The host reads a frame only while fewer than
 //! [`READ_AHEAD_FRAMES`] wait, and a frame waits only for credit. A device's reset is heard in every
 //! one of these states; its finish is heard once the frames it wrote have been read.
 
@@ -92,11 +95,6 @@ const READ_AHEAD_FRAMES: usize = 2;
 /// marker) are bounded by nothing the device does, so a device that reads more slowly than the
 /// worker writes them can reach the bound too.
 const MAX_UNREAD_ACKS: usize = 64;
-
-/// How many epochs the host keeps a first refusal for on one stream. A device whose frames have had
-/// more distinct epochs refused than this loses the stream: an honest device writes in the epoch it
-/// holds, so its frames span a few.
-const MAX_REFUSED_EPOCHS: usize = 64;
 
 /// How long a detach waits for the worker's notice that the view's lease ended, which comes on the
 /// lane's link while the detach's answer comes on another, before the stream ends.
@@ -438,11 +436,20 @@ struct State {
     /// What the device is to be told, in the order it is to be told it.
     acks: VecDeque<InputAck>,
     /// The epochs, as numbers, whose first definite refusal has been told to the device: each epoch
-    /// is told once. The newest of them is also the cutoff for passing frames on: no frame of that
-    /// epoch or an older one goes to the worker, whether or not the older epoch's own refusal has
-    /// been told yet. An older epoch's refusal is told when it comes and never moves the cutoff
-    /// down, so a late answer of an older epoch does not replace what is known of the newer one.
+    /// is told once. An epoch is kept here while a frame of it is at the host and while it is the
+    /// newest epoch read, and no longer: no frame of an epoch that is neither can come, since the
+    /// epochs of the frames on a stream never go back. An older epoch's refusal is told when it
+    /// comes, and never moves the cutoff down, so a late answer of an older epoch does not replace
+    /// what is known of the newer one.
     refused: BTreeSet<u64>,
+    /// The newest epoch whose first refusal was told. No frame of it or of an older epoch goes to
+    /// the worker. It is one number kept for the life of the stream, apart from the record.
+    cutoff: Option<u64>,
+    /// The newest epoch of a frame read from the device. The epochs of the frames on a stream never
+    /// go back.
+    newest_read: Option<u64>,
+    /// How many frames of each epoch the host holds: read, and not yet answered or refused.
+    holds: BTreeMap<u64, usize>,
     ended: Option<End>,
     next_request: u64,
     /// The newest epoch of this lane's lease whose end the device has been told. The notice of an
@@ -450,6 +457,7 @@ struct State {
     epoch_ended: Option<InputLeaseEpoch>,
     /// Frames queued for the lane's writer or written and not yet answered.
     in_flight: usize,
+    stages: Arc<InputStages>,
 }
 
 impl State {
@@ -464,9 +472,7 @@ impl State {
 
     /// Whether no frame of `epoch` is passed on: it is the newest refused epoch, or older than it.
     fn cut_off(&self, epoch: InputLeaseEpoch) -> bool {
-        self.refused
-            .last()
-            .is_some_and(|newest| epoch.get() <= *newest)
+        self.cutoff.is_some_and(|newest| epoch.get() <= newest)
     }
 
     /// Whether the device has been told that `epoch` is refused.
@@ -474,9 +480,55 @@ impl State {
         self.refused.contains(&epoch.get())
     }
 
+    /// Takes a frame read from the device into the host's hands, and says whether the stream's
+    /// order holds: a frame of an epoch lower than the newest one read does not belong on this
+    /// stream, and the stream is cut. The caller wakes the tasks that wait on the state.
+    fn read(&mut self, epoch: InputLeaseEpoch) -> bool {
+        if self.newest_read.is_some_and(|newest| epoch.get() < newest) {
+            return false;
+        }
+        self.newest_read = Some(epoch.get());
+        *self.holds.entry(epoch.get()).or_insert(0) += 1;
+        self.stages.frame_taken();
+        self.forget();
+        true
+    }
+
+    /// Lets go of a frame of `epoch` that was answered, refused or discarded. Its epoch's record goes
+    /// with the last of its frames, unless the epoch is the newest one read.
+    fn resolved(&mut self, epoch: InputLeaseEpoch) {
+        if let Some(held) = self.holds.get_mut(&epoch.get()) {
+            *held -= 1;
+            if *held == 0 {
+                self.holds.remove(&epoch.get());
+            }
+            self.stages.frame_let_go();
+        }
+        self.forget();
+    }
+
+    /// Drops the record of every epoch that has no frame at the host and is older than the newest
+    /// epoch read: no frame of it can come.
+    fn forget(&mut self) {
+        let Self {
+            refused,
+            holds,
+            newest_read,
+            stages,
+            ..
+        } = self;
+        let before = refused.len();
+        refused.retain(|epoch| {
+            newest_read.is_none_or(|newest| *epoch >= newest) || holds.contains_key(epoch)
+        });
+        stages.records_fell(before - refused.len());
+    }
+
     /// Tells the device the first definite refusal of `epoch` when it has not been told one for that
-    /// epoch, and says whether it did. The stream is cut when the refusals told on it span more than
-    /// [`MAX_REFUSED_EPOCHS`] epochs. The caller wakes the tasks that wait on the state.
+    /// epoch, and says whether it did. The host may refuse frame `k` of an epoch while frames before
+    /// `k` are still in flight, with their answers to come: the refusal names what was accepted so
+    /// far, and no later acceptance of that epoch is told. The caller wakes the tasks that wait on
+    /// the state.
     fn refuse(
         &mut self,
         live: &Live,
@@ -487,6 +539,11 @@ impl State {
         if !self.refused.insert(epoch.get()) {
             return false;
         }
+        self.stages.record_made();
+        self.cutoff = Some(
+            self.cutoff
+                .map_or(epoch.get(), |newest| newest.max(epoch.get())),
+        );
         let accepted_through = live.through(epoch).map(InputSequence::new);
         self.tell(InputAck::Refused {
             epoch,
@@ -494,9 +551,6 @@ impl State {
             accepted_through: Nullable(accepted_through),
             error,
         });
-        if self.refused.len() > MAX_REFUSED_EPOCHS {
-            self.ended = Some(End::Cut);
-        }
         true
     }
 }
@@ -527,10 +581,14 @@ impl Flow {
                 outstanding: VecDeque::new(),
                 acks,
                 refused: BTreeSet::new(),
+                cutoff: None,
+                newest_read: None,
+                holds: BTreeMap::new(),
                 ended: None,
                 next_request: 1,
                 epoch_ended: None,
                 in_flight: 0,
+                stages: Arc::clone(&stages),
             }),
             version: watch::channel(0).0,
             live,
@@ -557,6 +615,9 @@ impl Flow {
             let mut state = self.lock();
             if state.ended != Some(End::Cut) {
                 state.ended = Some(how);
+                if how == End::Cut {
+                    self.stages.stream_cut();
+                }
             }
         }
         self.changed();
@@ -612,12 +673,24 @@ impl Flow {
     }
 
     /// Records the first definite refusal of `epoch`, by the host, and queues the word for the
-    /// device. A refusal of an epoch that has one is not recorded again.
+    /// device. A refusal of an epoch that has one is not recorded again. The refused frame is let
+    /// go: it is the host's no longer.
     fn refuse(&self, epoch: InputLeaseEpoch, sequence: u64, error: ProtocolError) {
-        let told = self.lock().refuse(&self.live, epoch, sequence, error);
+        let told = {
+            let mut state = self.lock();
+            let told = state.refuse(&self.live, epoch, sequence, error);
+            state.resolved(epoch);
+            told
+        };
         if told {
             self.changed();
         }
+    }
+
+    /// Takes a frame read from the device, and says whether the stream's order holds: a frame of an
+    /// epoch lower than the newest one read cuts the stream, as a malformed frame does.
+    fn take(&self, epoch: InputLeaseEpoch) -> bool {
+        self.lock().read(epoch)
     }
 
     /// Takes back a frame that was entered as outstanding and was not written.
@@ -690,6 +763,7 @@ impl Flow {
                     }
                 }
             }
+            state.resolved(front.epoch);
         }
         self.changed();
         true
@@ -1028,6 +1102,13 @@ async fn run(
                 match read {
                     Ok(Some(frame)) => {
                         flow.stages.frame_read();
+                        if !flow.take(frame.epoch) {
+                            // The epochs of the frames on a stream never go back: this one is
+                            // not an honest device's, and the stream is cut as for a malformed
+                            // frame.
+                            flow.end(End::Cut);
+                            return;
+                        }
                         held.push_back(Held {
                             frame,
                             _held: flow.stages.held_frame(),
@@ -1163,6 +1244,7 @@ async fn write_lane(
             if state.cut_off(item.epoch) {
                 state.in_flight -= 1;
                 state.refuse(&flow.live, item.epoch, item.sequence, lease_lost());
+                state.resolved(item.epoch);
                 true
             } else {
                 state.outstanding.push_back(Outstanding {
@@ -1314,8 +1396,27 @@ async fn write_acks(mut writer: DataWriter, flow: &Arc<Flow>) {
             continue;
         }
         match ended {
-            // Everything owed is written: finishing the stream is dropping its writer.
-            Some(End::Graceful) => return,
+            // Everything owed was written when the state was looked at, and finishing the stream is
+            // dropping its writer. Whether the stream is finished or reset is decided again under
+            // the state's lock, with the writer let go while the lock is held: a cut decided before
+            // that is a reset, and one decided after it comes to a stream that has already
+            // finished with nothing owed.
+            Some(End::Graceful) => {
+                flow.stages.after_a_graceful_look().await;
+                let state = flow.lock();
+                match state.ended {
+                    Some(End::Graceful) if state.acks.is_empty() => {
+                        drop(writer);
+                        return;
+                    }
+                    Some(End::Cut) => {
+                        writer.handle().revoke();
+                        return;
+                    }
+                    // Something more is owed: it is written first.
+                    _ => continue,
+                }
+            }
             Some(End::Cut) => {
                 writer.handle().revoke();
                 return;
