@@ -8,10 +8,12 @@
 #
 # On Windows the crate links libsodium's own prebuilt MSVC libraries. The build script starts from
 # the source archive the crate ships, which it cannot configure there, and falls back to a prebuilt
-# archive. Windows links the archive of libsodium's release tag, as every other target compiles
-# that tag: upstream's `libsodium-1.0.22-msvc.zip`, signed on 2026-04-09 at 22:11:03 UTC by the key
-# that has the id 1fe8b442180f62e7 (the signature's trusted comment holds the time). Upstream's
-# `-stable-` archive of the same version is replaced in place from time to time, so it is not used.
+# archive. A build whose `SODIUM_DIST_DIR` names a directory this script filled links the archive of
+# libsodium's release tag, the tag that every other target compiles: upstream's
+# `libsodium-1.0.22-msvc.zip`, signed on 2026-04-09 at 22:11:03 UTC by the key that has the id
+# 1fe8b442180f62e7 (the signature's trusted comment holds the time). A build whose environment names
+# no such directory links what the crate fetches: upstream's `-stable-` archive of the same version,
+# which is replaced in place from time to time and which no digest here holds.
 #
 # The build script reads a fixed base name, `libsodium-1.0.22-stable-msvc`, so the tag's archive
 # and its signature lie under that name in DIR. The build then checks the signature against
