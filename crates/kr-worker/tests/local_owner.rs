@@ -390,6 +390,8 @@ struct Wired {
     /// The root shell's side of a managed session's bridge, which this test plays, and the task
     /// serving the worker's side. Neither exists for an unmanaged session.
     bridge: Option<(ScriptedBridge, tokio::task::JoinHandle<()>)>,
+    // Ends the serving task when the fixture is dropped, whether or not a case closed it.
+    _serving: kr_ipc::testing::Serving,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -1321,8 +1323,9 @@ async fn wired_in(script: &str, shell_mode: ShellMode) -> Wired {
         )
         .expect("a worker service"),
     );
-    tokio::spawn(Arc::clone(&service).serve(listener));
+    let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
     Wired {
+        _serving: serving,
         _temp: temp,
         service,
         runtime,
