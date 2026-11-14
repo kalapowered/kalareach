@@ -36,6 +36,9 @@ use kr_worker::session::{Session, SessionConfig};
 // The harness
 // ---------------------------------------------------------------------------------------------
 
+/// A case that uses this runs on the multi-thread runtime: the drop of the fixture waits, in the
+/// removal of its directory, for the tasks it cancelled to go, and a runtime with one thread
+/// would never run them.
 struct Host {
     service: Arc<WorkerService>,
     session_id: SessionId,
@@ -482,7 +485,7 @@ fn host_texts(page: &AttentionSourcePage) -> Vec<Option<String>> {
 /// KR-REQ-18.01 and KR-REQ-25.03: a page carries each source's records after the cursor it names,
 /// up to that source's head, with the text the session serves and a fingerprint for each
 /// notification; a page that stops short says so by its head.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_page_carries_each_source_after_its_cursor_up_to_its_head() {
     let host = host().await;
     ask(&host, "r-1", "which branch?");
@@ -556,7 +559,7 @@ async fn within(link: &mut Link, bound: Duration) -> Answer {
 
 /// KR-REQ-25.03: a request with nothing to answer with is held, and a question committed while it
 /// is held answers it at once; a text request is served beside it meanwhile.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_held_page_answers_when_a_question_is_committed() {
     let host = host().await;
     notify(&host, "the build finished");
@@ -587,7 +590,7 @@ async fn a_held_page_answers_when_a_question_is_committed() {
 }
 
 /// KR-REQ-25.03: a host event committed while a request is held answers it at once.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_held_page_answers_when_a_host_event_is_committed() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -645,7 +648,7 @@ async fn until_held_again(host: &Host, held_before: u64) {
 /// goes with the next page. The approval relayed then answers the request, with the unbound
 /// request's record before it, within five seconds of a request held for twenty: a commit that did
 /// not wake it fails here, and so does an answer to every transition.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_held_page_answers_when_an_approval_is_committed() {
     use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
     use kr_worker::broker::connectors::fixture;
@@ -699,7 +702,7 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
 /// holds the unbound request's record and no approval's, and ends before the broker's newest
 /// record: that answers the request, which a worker that answered only for a page that carries an
 /// approval's transition would not do until the bound.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_held_page_answers_when_an_approval_waits_behind_a_full_page() {
     use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
     use kr_worker::broker::connectors::fixture;
@@ -761,7 +764,7 @@ async fn a_held_page_answers_when_an_approval_waits_behind_a_full_page() {
 /// journal the same way a closed session's is read, with privacy mode off and then on: what an
 /// approval asks is the application's to show. The control is a host event committed beside it,
 /// whose words are served in the same request while privacy mode is off.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_broker_transition_serves_no_text_whatever_privacy_mode_says() {
     use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
     use kr_worker::broker::connectors::fixture;
@@ -843,7 +846,7 @@ async fn a_broker_transition_serves_no_text_whatever_privacy_mode_says() {
 
 /// KR-REQ-24.11: a privacy transition committed while a request is held answers it at once,
 /// under the new generation, though no record was added.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_held_page_answers_when_privacy_mode_changes() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -863,7 +866,7 @@ async fn a_held_page_answers_when_privacy_mode_changes() {
 }
 
 /// A held request is answered when its bound runs out, with nothing in it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_held_page_answers_at_its_bound() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -881,7 +884,7 @@ async fn a_held_page_answers_at_its_bound() {
 /// KR-PERF-003: the same request for a session whose journal nothing has been committed to since is
 /// answered with the page it was answered with, without the journal being read again; a commit
 /// makes the next page a read, and the page then carries what was committed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kr_perf_003_an_empty_page_is_not_read_again_while_nothing_is_committed() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -936,7 +939,7 @@ async fn kr_perf_003_an_empty_page_is_not_read_again_while_nothing_is_committed(
 
 /// A newer request replaces a held one, which then answers nothing, even when something it
 /// would have answered with is committed afterwards.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_newer_request_replaces_a_held_one() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -1007,7 +1010,7 @@ async fn a_newer_request_replaces_a_held_one() {
 
 /// The attention requests are served only on the daemon's attention connection, and that
 /// connection serves nothing else.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_attention_requests_travel_on_the_attention_connection_alone() {
     let host = host().await;
     for role in [
@@ -1066,7 +1069,7 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
 }
 
 /// A newer attention connection replaces the one before it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_newer_attention_connection_replaces_the_older() {
     let host = host().await;
     let mut older = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -1095,7 +1098,7 @@ async fn a_newer_attention_connection_replaces_the_older() {
 /// KR-REQ-24.11: text from before privacy mode was enabled, and text written while it was on, is
 /// never served again, live or from the session's journal, and text written after it was turned
 /// off is.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn text_from_before_a_privacy_transition_is_never_served_again() {
     let host = host().await;
     ask(&host, "r-1", "before");
@@ -1157,7 +1160,7 @@ async fn text_from_before_a_privacy_transition_is_never_served_again() {
 /// KR-REQ-24.11: a question's later transitions never serve the wording it was asked with, so a
 /// question asked before privacy mode was enabled, or while it was on, and withdrawn after it was
 /// turned off serves no text from either record.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_question_resolved_after_a_privacy_transition_serves_no_earlier_text() {
     let host = host().await;
     let before = ask(&host, "r-1", "asked before");
@@ -1235,7 +1238,7 @@ async fn a_question_resolved_after_a_privacy_transition_serves_no_earlier_text()
 /// A page fits the frame the daemon's connection said it can receive, and a text request whose
 /// answer would not fit is refused under its own identifier; a frame too small for even one record
 /// refuses the page the same way.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_answer_fits_the_frame_the_connection_can_receive() {
     let host = host().await;
     for index in 0..40 {
@@ -1330,7 +1333,7 @@ async fn an_answer_fits_the_frame_the_connection_can_receive() {
 
 /// KR-REQ-24.11: a session that never changed privacy mode serves its text, live and from its
 /// journal, and a journal whose privacy record is gone serves none.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_session_that_never_changed_privacy_mode_serves_its_text_and_a_lost_record_serves_none() {
     let host = host().await;
     ask(&host, "r-1", "which branch?");
@@ -1367,7 +1370,7 @@ async fn a_session_that_never_changed_privacy_mode_serves_its_text_and_a_lost_re
 /// identical notifications are one condition across privacy transitions; the same key makes the
 /// same fingerprint from the session's journal once the session is read there, and another key
 /// makes another.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_fingerprint_is_the_same_across_privacy_transitions() {
     let host = host().await;
     notify(&host, "the build finished");
@@ -1526,7 +1529,7 @@ fn revoke(host: &Host, bound: &Bound) -> String {
 /// transition still travels, so the item is raised and resolved all the same; once the session
 /// holds no binding on the package's revoked releases, that is recorded too. An application's
 /// notification with the very same words carries no transition.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words_do() {
     let host = host().await;
     let bound = bound(&host);
@@ -1633,7 +1636,7 @@ fn journalled(host: &Host) -> Vec<(String, String)> {
 /// host event, however often the hook says so, and a page carries it with its status whether or
 /// not its words are served. The command line is not kept anywhere in the journal, and the words
 /// that are served name no identifier.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_command_is_one_record_with_its_status_and_never_its_line() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -1719,7 +1722,7 @@ async fn a_failed_command_is_one_record_with_its_status_and_never_its_line() {
 
 /// KR-REQ-18.01: the words of a host event that carries a line of identifiers are what a text
 /// request answers, and not the line: an adapter's warning and a command's ending read as words.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_text_request_answers_the_words_of_a_record_and_not_its_line_of_identifiers() {
     let host = host().await;
     let bound = bound(&host);
@@ -1786,7 +1789,7 @@ async fn faults_opened(health: &kr_worker::persistence::JournalHealth, count: u6
 /// notice's own, and this test's runtime runs nothing else until it waits. Only the journal
 /// recovers before each notice is looked for, so what brings the write is the journal's recovery,
 /// not the broker's or another notice.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_adapter_transition_the_journal_refuses_is_written_once_the_journal_recovers() {
     let host = host().await;
     let bound = bound(&host);
@@ -1867,7 +1870,7 @@ fn as_previous_version(path: &std::path::Path) {
 /// KR-REQ-24.11: a journal starts with privacy mode off and nothing before it; one the previous
 /// version wrote is brought forward with the record it lacks when it never changed privacy mode,
 /// and with its sources' present heads when it did, so nothing from before is served for it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_journal_is_brought_forward_to_the_privacy_record_it_needs() {
     let temp = tempfile::tempdir().expect("a temporary directory");
     let directory = temp.path();
@@ -1971,7 +1974,7 @@ fn reconciled(host: &Host, attention: &kr_worker::attention_fence::AttentionPriv
 
 /// KR-REQ-24.11: each attention connection starts with the worker's statement of its fence, and
 /// statements share one order across connections.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn each_attention_connection_starts_with_a_statement_of_the_fence() {
     let host = host().await;
     let older = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -1989,7 +1992,7 @@ async fn each_attention_connection_starts_with_a_statement_of_the_fence() {
 /// raise. The raise returns at the acknowledgement without waiting out the text already answered
 /// with, since that daemon has stopped releasing it; no answer carries text while the transition
 /// is raised; and the settling statement carries the generation committed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_acknowledged_raise_lets_the_commit_proceed_at_once() {
     let host = host().await;
     notify(&host, "before");
@@ -2029,7 +2032,7 @@ async fn an_acknowledged_raise_lets_the_commit_proceed_at_once() {
 /// the raise. The commit waits until every lease the worker issued has ended, so text answered
 /// before the raise cannot be released after the commit whatever that daemon holds, and a text
 /// request while the transition is raised is answered with none.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn without_an_acknowledgement_the_commit_waits_out_the_last_lease() {
     let host = host().await;
     notify(&host, "before");
@@ -2070,7 +2073,7 @@ async fn without_an_acknowledgement_the_commit_waits_out_the_last_lease() {
 /// KR-REQ-24.11: a request that names a generation behind the worker's is answered with no text,
 /// compared with the generation that decided the answer, and a held page that does is answered at
 /// once, so the daemon learns a transition without waiting for the request's bound.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_request_behind_the_worker_s_generation_gets_no_text_and_its_page_at_once() {
     let host = host().await;
     enable_privacy(&host);
@@ -2111,7 +2114,7 @@ async fn a_request_behind_the_worker_s_generation_gets_no_text_and_its_page_at_o
 
 /// KR-REQ-24.11: privacy mode reports complete only once a request on the current attention
 /// connection names the generation it committed; a connection that replaces it starts from none.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn privacy_mode_completes_once_the_current_connection_names_the_generation() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2144,7 +2147,7 @@ async fn privacy_mode_completes_once_the_current_connection_names_the_generation
 
 /// KR-REQ-24.11: one transition is raised at a time. A second raise waits until the first is
 /// settled, and a transition dropped without being settled is settled then.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_transition_is_settled_and_a_second_raise_waits_for_it() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2185,7 +2188,7 @@ async fn a_dropped_transition_is_settled_and_a_second_raise_waits_for_it() {
 /// The connection's writer is held busy, so the raise's statement waits for its turn until its
 /// bound passes; a statement the peer has part of when the bound passes is the bounded write's own
 /// test, in the service.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_statement_that_cannot_be_written_ends_the_connection() {
     let host = host().await;
     let mut older = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2225,7 +2228,7 @@ async fn a_statement_that_cannot_be_written_ends_the_connection() {
 /// KR-REQ-24.11: a worker that cannot read its journal's privacy generation cannot say where the
 /// session stands, so its statement keeps the daemon's barrier raised, and the connection is ended
 /// so the next one states the fence again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_worker_that_cannot_read_its_generation_keeps_the_barrier() {
     let host = host_with(false).await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2244,7 +2247,7 @@ async fn a_worker_that_cannot_read_its_generation_keeps_the_barrier() {
 ///
 /// The writer is held busy, the settlement is seen to have begun (the fence is settled and its
 /// statement is waiting for the writer), and only then does its caller stop waiting.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_settlement_whose_caller_stops_waiting_is_still_stated() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2287,7 +2290,7 @@ async fn a_settlement_whose_caller_stops_waiting_is_still_stated() {
 /// connection's first statement settles the transition at the generation committed.
 ///
 /// The connection's writer is held busy past the settlement's bound.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_settlement_that_cannot_be_written_is_stated_by_the_next_connection() {
     let host = host().await;
     let mut older = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2326,7 +2329,7 @@ async fn a_settlement_that_cannot_be_written_is_stated_by_the_next_connection() 
 
 /// KR-REQ-24.11: enable, disable and enable in quick succession, each enable raised and
 /// acknowledged, are stated in order, each settlement with the generation it committed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn enable_disable_and_enable_are_stated_in_order() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2373,7 +2376,7 @@ async fn enable_disable_and_enable_are_stated_in_order() {
 /// KR-REQ-24.11: a disable committed between a raise and its enable leaves the transition raised:
 /// no answer carries text until the enable is settled, and the settlement names the generation
 /// the enable committed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_disable_between_a_raise_and_its_enable_keeps_the_transition_raised() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2411,7 +2414,7 @@ async fn a_disable_between_a_raise_and_its_enable_keeps_the_transition_raised() 
 
 /// The same request once the transition is settled and privacy mode turned off again carries its
 /// text, so what withheld it above was the raise.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn text_withheld_only_by_a_raise_is_served_once_it_is_settled() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -2440,7 +2443,7 @@ async fn text_withheld_only_by_a_raise_is_served_once_it_is_settled() {
 
 /// KR-REQ-24.11: a journal that holds no privacy record serves no text, and its statement names no
 /// generation; but the journal was read, so the connection stays and its pages go on being read.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_journal_with_no_privacy_record_keeps_its_connection() {
     let host = host().await;
     ask(&host, "r-1", "which branch?");
