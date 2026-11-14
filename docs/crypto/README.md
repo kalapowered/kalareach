@@ -721,15 +721,30 @@ Pin these in the release manifest, with their exact versions and the resolved de
 | `keyring` | 4.2.0 |
 | `spake2` | 0.4.0 |
 
-`libsodium-sys-stable` 1.24.0 bundles libsodium's release tag 1.0.22, and every target links that
-tag. Linux and macOS compile the source archive that the crate ships. Windows MSVC links libsodium's
-prebuilt libraries of the same tag: upstream's `libsodium-1.0.22-msvc.zip` (17,690,194 bytes,
-SHA-256 `3e03a726fac4bc09cb61d8f29d658ef7a5eca0811de59082130414f7ca2e4279`) and its signature
+`libsodium-sys-stable` 1.24.0 bundles libsodium's release tag 1.0.22. On Linux and macOS the crate
+compiles the source archive that it ships. On Windows MSVC it cannot compile that archive, so it
+links a prebuilt MSVC archive, and the build's environment decides which one.
+
+The Windows MSVC jobs that test and release the product link upstream's
+`libsodium-1.0.22-msvc.zip`, the archive of the tag (17,690,194 bytes, SHA-256
+`3e03a726fac4bc09cb61d8f29d658ef7a5eca0811de59082130414f7ca2e4279`), and its signature
 `libsodium-1.0.22-msvc.zip.minisig` (320 bytes, SHA-256
 `3210cf4d985f7b192bb8d5eb2ec7f481e0f47420f144cf1069921f714bfad1d1`), signed on 2026-04-09 at
-22:11:03 UTC with libsodium's key, whose identifier is `1fe8b442180f62e7`. Upstream also serves a
-`libsodium-1.0.22-stable-msvc.zip` and replaces that file in place under the same name. No build
-links it.
+22:11:03 UTC with libsodium's key, whose identifier is `1fe8b442180f62e7`. Each of those jobs places
+the two files with `scripts/place-libsodium-archive.sh` and names the directory in `SODIUM_DIST_DIR`.
+
+An MSVC build whose environment names no such directory does not get those bytes. The crate's build
+script fetches upstream's `libsodium-1.0.22-stable-msvc.zip` over HTTP, keeps it in the crate's
+source directory, where later builds read it again, and checks its signature alone. Upstream
+replaces that file in place under the same name, so no digest here holds what such a build links.
+Without the placing step, every build on a developer's Windows machine is such a build, and so is a
+check of the Windows MSVC target from another system, which fetches the file and links nothing. A
+developer whose build makes a program that leaves the machine runs
+`scripts/place-libsodium-archive.sh DIR` in a bash shell, as the jobs do, and sets `SODIUM_DIST_DIR`
+to `DIR` before the build, written as a Windows program reads a path (`cygpath -m DIR` prints it). A
+target directory that already holds a build of the crate keeps what that build linked, because the
+build script does not run again when `SODIUM_DIST_DIR` changes: run `cargo clean -p
+libsodium-sys-stable`, with the build's own `--target` and profile options, first.
 
 `scripts/place-libsodium-archive.sh` places the two files and holds their sizes and digests. It
 compares a file that it fetched, and a file that was already in the directory (a restored cache
@@ -739,12 +754,15 @@ cache nor the cache's key stands in for the comparison. The crate's build script
 base name `libsodium-1.0.22-stable-msvc`, so the files lie under that name, and the build's own
 signature check then verifies upstream's signature of the tag's bytes against libsodium's public
 key. The digests move only together with the crate's pin, to the archive of the tag that the new
-crate version bundles, so that every target keeps one tag. They never move alone, and a refusal in a
-job is not cured by a new digest in the change that met it.
+crate version bundles, so that the jobs' Windows builds keep the tag that the crate bundles. They
+never move alone, and a refusal in a job is not cured by a new digest in the change that met it.
 
 The manifest records the crate version, not a system library version. A Windows MSVC release's
 manifest also names the archive above and its digest, and `kr-release` refuses to write it when this
-document names another. Compile and verify it on every Tauri target.
+document names another. The manifest records what the placing script fixes, not what a build linked:
+a Windows MSVC release that was built where the script did not run links what the crate's build
+script fetched, and its manifest still names this archive. Compile and verify it on every Tauri
+target.
 
 `hmac` 0.13.0 and `sha2` 0.11.0, the versions pinned above, are built with their `zeroize`
 features, so their internal buffers are cleared. `hkdf` 0.13.0 has no such feature; its pseudorandom
