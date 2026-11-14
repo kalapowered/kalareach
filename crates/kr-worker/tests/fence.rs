@@ -10391,6 +10391,27 @@ async fn a_guarded_fixture_asks_for_no_close_when_it_is_dropped() {
     wired.close().await;
 }
 
+/// A fixture that is dropped with its session still running, and that asked for no close, lets go
+/// of the session: nothing that its service started keeps the session's runtime, and so its
+/// journal, once the service is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_service_lets_go_of_its_session_without_a_close() {
+    let wired = wired().await;
+    let runtime = Arc::downgrade(&wired.runtime);
+    assert_eq!(wired.runtime.session().state(), SessionState::Live);
+    drop(wired);
+    // The tasks the drop cancelled go at the runtime's next turn. The bound is how long the removal
+    // of a fixture's directory is tried again, so that this case fails where that drop prints its
+    // line.
+    tokio::time::timeout(kr_ipc::testing::REMOVAL_PATIENCE, async {
+        while runtime.strong_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a handle to the session's runtime is still held after its service was dropped");
+}
+
 /// A session that refused a request goes on: the error answer ends nothing, and the same
 /// connection and the bridge are served after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -468,6 +468,19 @@ async fn an_open_question_is_the_applications_state_until_it_is_withdrawn() {
     world.shows(Some(ApplicationState::ShellReady)).await;
 }
 
+/// A service that is still there goes on following what its session's application is doing,
+/// whatever other handles to it came and went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_that_lives_goes_on_following_what_the_application_is_doing() {
+    let world = World::new().await;
+    drop(Arc::clone(&world.service));
+    world.shows(Some(ApplicationState::ShellReady)).await;
+    let question = world.ask("req-1");
+    world.shows(Some(ApplicationState::AwaitingInput)).await;
+    world.withdraw(&question);
+    world.shows(Some(ApplicationState::ShellReady)).await;
+}
+
 /// A turn the connector's table names is the application's state until it ends; an
 /// open question outranks it and an approval outranks both, and each gives way to the next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
