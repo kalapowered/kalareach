@@ -6,8 +6,8 @@
 //! past a fixed number of chunks. The number counts chunks, not bytes. The stream's receive window
 //! bounds how many bytes a sender may be ahead of its reader, so large frames, which fill whole
 //! packets, reach the window with a short queue; small frames, one to a packet, can make a long
-//! queue inside the window. This case holds a reader still while a sender writes each of the two
-//! kinds, over the product's own endpoints and frame codec on loopback with no relay and no
+//! queue inside the window. This case holds a reader still while a sender writes each of the shapes
+//! below, over the product's own endpoints and frame codec on loopback with no relay and no
 //! discovery, and then lets the reader read everything.
 //!
 //! Nothing here waits for a time. The reader reads one frame and then waits for a count that its
@@ -72,9 +72,9 @@ const LARGE_FRAME: usize = 1_000_000;
 /// How many large frames the sender writes in all.
 const LARGE_FRAMES: usize = 4;
 
-/// The library's default receive window for one stream, in bytes, which the product keeps. A
-/// receiving connection that has taken this many bytes of datagrams holds about 1.2 MB of stream
-/// data that nobody has read.
+/// The library's default receive window for one stream, in bytes, which the product keeps. The
+/// reader's wait counts bytes from the start of the case, so it includes the first frame, which the
+/// reader has read already: the reader is then behind by the window less that frame.
 const STREAM_WINDOW: u64 = 1_250_000;
 
 /// What the reader says when the stream and the exchange after it went right.
