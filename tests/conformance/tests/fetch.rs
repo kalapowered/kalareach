@@ -65,7 +65,7 @@ impl Stage {
             "work",
             "cache",
             "tmp",
-            "evidence",
+            "tmp/evidence",
             "target/debug",
         ] {
             fs::create_dir_all(stage.path(directory)).expect("a directory");
@@ -75,6 +75,13 @@ impl Stage {
             stage.path("tree/scripts/run-conformance.sh"),
         )
         .expect("the script is copied");
+        // The script reads the evidence directory through the reader that sits beside it.
+        fs::create_dir_all(stage.path("tree/scripts/lib")).expect("a directory");
+        fs::copy(
+            repository().join("scripts/lib/artifacts-dir.sh"),
+            stage.path("tree/scripts/lib/artifacts-dir.sh"),
+        )
+        .expect("the reader is copied");
         stage.program("stubs/curl", CURL);
         stage.program("stubs/cargo", NOTHING);
         stage.program("target/debug/kr-conformance", NOTHING);
@@ -185,7 +192,7 @@ echo built > '{mark}'
             .env("PATH", path)
             .env("TMPDIR", self.path("tmp"))
             .env("KR_CONFORMANCE_APPLICATIONS", self.path("cache"))
-            .env("KR_TEST_ARTIFACTS_DIR", self.path("evidence"))
+            .env("KR_TEST_ARTIFACTS_DIR", self.path("tmp/evidence"))
             .env("CARGO_TARGET_DIR", self.path("target"))
             .env("STUB_SERVE", self.path("served"))
             .env("STUB_LOG", self.path("asked.log"))
