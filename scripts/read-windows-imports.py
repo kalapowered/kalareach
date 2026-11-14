@@ -310,6 +310,8 @@ def main(arguments):
     commands.add_parser("messages").add_argument("logs", nargs="+")
     commands.add_parser("self-test")
     chosen = parser.parse_args(arguments)
+    # A path that a shell captures must not end in a carriage return.
+    sys.stdout.reconfigure(newline="\n")
     if chosen.command == "find-dumpbin":
         return find_dumpbin_command(chosen.arch)
     if chosen.command == "imports":
