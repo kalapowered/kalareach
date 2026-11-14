@@ -63,9 +63,18 @@ def dependents(text):
     return imports, delay
 
 
+# The system's limit for a part of a file name (NTFS): a longer name is no file name, and nothing is asked about it.
+NAME_LIMIT = 255
+
+
 def plain(name):
-    """Whether an import is a file name alone: no path part, no drive and no dot segment."""
-    return not any(mark in name for mark in "/\\:\0") and name not in (".", "..")
+    """Whether an import is a file name alone: no path part, no drive, no dot segment, and a length a file name has."""
+    return len(name) <= NAME_LIMIT and not any(mark in name for mark in "/\\:\0") and name not in (".", "..")
+
+
+def api_set_name(name):
+    """Whether an import is the name of an API set contract and `.dll`: the only form the system is asked about."""
+    return plain(name) and API_SET_NAME.fullmatch(name) is not None
 
 
 def api_set_present(name):
@@ -73,8 +82,8 @@ def api_set_present(name):
     which answers from the API set schema and loads nothing; None where it cannot be asked (not Windows).
 
     Only a plain API set name is asked about: the question takes the contract name without `.dll`."""
-    if API_SET_NAME.fullmatch(name) is None:
-        raise ValueError(f"{name!r} is no plain API set name, so the API set query is not made for it")
+    if not api_set_name(name):
+        raise ValueError(f"{name[:80]!r} is no plain API set name, so the API set query is not made for it")
     if os.name != "nt":
         return None
     import ctypes
@@ -101,7 +110,7 @@ def classify(name, system_dir, api_present=api_set_present):
     if DENIED.match(name):
         return "DENIED"
     if API_SET.match(name):
-        if API_SET_NAME.fullmatch(name) is None:
+        if not api_set_name(name):
             return "NOT A PLAIN NAME"
         answer = api_present(name)
         return "NOT CHECKED" if answer is None else "a Windows API set" if answer else "NOT FOUND"
@@ -322,27 +331,41 @@ def self_test():
         # where it cannot be asked (a machine that is not Windows) the name is not accepted by its prefix.
         for answer, want in ((False, "NOT FOUND"), (True, "a Windows API set"), (None, "NOT CHECKED")):
             check(f"an API set that the loader answers {answer} for", classify("api-ms-win-core-x-l1-1-0.dll", None, lambda n, a=answer: a), want)
-        check("a denied name is refused before the loader is asked", classify("api-ms-win-crt-heap-l1-1-0.dll", None, lambda n: True), "DENIED")
         asked = []
 
         def listening(name):
             asked.append(name)
             return True
 
+        def question(name, system_dir=system):
+            """The verdict for a name, with the names that the loader was asked about on the way to it."""
+            asked.clear()
+            try:
+                verdict = classify(name, system_dir, listening)
+            except OSError as error:
+                verdict = f"raised {type(error).__name__}"
+            return verdict, list(asked)
+
+        check("a denied name is refused before the loader is asked", question("api-ms-win-crt-heap-l1-1-0.dll"), ("DENIED", []))
         for name in (
             "api-ms-win-x/../helper.dll", "api-ms-win-core-x-l1-1-0.dll\\..\\helper.dll", "ext-ms-win-x/y.dll", "api-ms-win-core-x-l1-1-0.dll.exe",
             "api-ms-win-core_x-l1-1-0.dll", "api-ms-win-core-x-l1-1-0", "ext-ms-win-c:x.dll", "api-ms-win-.dll", "api-ms-win-core-x-l1-1-0.dll\n",
             "C:\\Windows\\System32\\kernel32.dll", "C:kernel32.dll", "..\\kernel32.dll", "sub/kernel32.dll", "..", ".",
         ):
-            check(f"the name {name!r} is refused as no plain name", classify(name, system, listening), "NOT A PLAIN NAME")
-        check("no such name is asked of the loader", asked, [])
-        check("an API set name in capitals is a plain name", classify("API-MS-WIN-CORE-X-L1-1-0.DLL", None, listening), "a Windows API set")
-        check("and the loader is asked for it", asked, ["API-MS-WIN-CORE-X-L1-1-0.DLL"])
-        try:
-            api_set_present("api-ms-win-x/../helper.dll")
-            check("the loader's question refuses a name that is not plain", "answered", "ValueError")
-        except ValueError:
-            pass
+            check(f"the name {name!r} is refused as no plain name, and no question is asked", question(name), ("NOT A PLAIN NAME", []))
+        # A file name's part is at most 255 characters on the system (NTFS): a longer name is refused, and the loader
+        # is asked about none, a plain library included. A name of exactly 255 is asked about.
+        longest = "api-ms-win-" + "a" * 240 + ".dll"
+        check("the longest API set name is a plain name and is asked about", (len(longest), question(longest)), (255, ("a Windows API set", [longest])))
+        for name in ("api-ms-win-" + "a" * 241 + ".dll", "api-ms-win-" + "a" * 300 + ".dll", "ext-ms-win-" + "b" * 1000 + ".dll", "k" * 252 + ".dll", "k" * 300 + ".dll"):
+            check(f"the name of {len(name)} characters is refused as no plain name, and no question is asked", question(name), ("NOT A PLAIN NAME", []))
+        check("an API set name in capitals is a plain name and is asked about", question("API-MS-WIN-CORE-X-L1-1-0.DLL", None), ("a Windows API set", ["API-MS-WIN-CORE-X-L1-1-0.DLL"]))
+        for name in ("api-ms-win-x/../helper.dll", "api-ms-win-" + "a" * 300 + ".dll"):
+            try:
+                api_set_present(name)
+                check(f"the loader's question refuses the name of {len(name)} characters", "answered", "ValueError")
+            except ValueError:
+                pass
         if os.name != "nt":
             check("where the loader cannot be asked the answer is None", api_set_present("api-ms-win-core-synch-l1-2-0.dll"), None)
 
