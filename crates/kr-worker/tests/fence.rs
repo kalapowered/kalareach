@@ -10270,7 +10270,9 @@ async fn kr_req_13_11_the_answers_recorded_for_the_page_are_the_ones_a_worker_gi
 /// How many tasks are alive on the runtime this case runs on.
 #[cfg(windows)]
 fn tasks_alive() -> usize {
-    tokio::runtime::Handle::current().metrics().num_alive_tasks()
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
 }
 
 /// The files this process has open under `root`, read from `/proc/self/fd`.
