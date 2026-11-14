@@ -4493,6 +4493,20 @@ fn refused_service() -> Error {
     ))
 }
 
+/// Records the refusal of a service that stands at the broker's name with its result, in one write
+/// of the manifest (a new object is recorded with its result by `conclude`), and returns the
+/// refusal. Where that write fails, the error says both: the refusal and the failed write.
+fn refuse_service(run: &mut Run) -> Error {
+    let refusal = refused_service();
+    match run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused) {
+        Ok(()) => refusal,
+        // text: lay_down-21-unsaved
+        Err(failure) => Error::Failed(format!(
+            "{refusal}; writing the record of this refusal also failed ({failure})"
+        )),
+    }
+}
+
 /// Makes the folder directly above the program directory where it is not there, and records what
 /// became of it: the intent before the call, then the folder's identity and the result `made` where
 /// the run's own call made it, or, in a new installation, the result `found` where something stood
@@ -4667,17 +4681,16 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // this first look, before any call that changes the service (the stop below is a repair's).
     // A service that an earlier run refused is refused again by a repair that finds one standing,
     // so that a repair never takes over what a new installation refused; where none stands, the
-    // repair goes on and its own creation records `made`. The refusal is recorded as the service
-    // step records it, before the return, so that the record that a failed rollback leaves names
-    // the service as one that no tree acts on.
+    // repair goes on and its own creation records `made`. The refusal is recorded with its result in
+    // one write before the return, so that no refusal leaves an intent that a repair or a removal
+    // acts on, and the record that a failed rollback leaves names the service as one that no tree
+    // acts on.
     let refused_before = run
         .manifest
         .find(ObjectKind::Service, SERVICE)
         .is_some_and(|object| object.outcome == Some(Outcome::Refused));
     if broker_service.is_some() && (!existing || refused_before) {
-        run.record(ObjectKind::Service, SERVICE, None)?;
-        run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;
-        return Err(refused_service());
+        return Err(refuse_service(run));
     }
     // A repair has no rollback: the broker is said to stay stopped only where a read of its service
     // said stopped. A service that is running is asked to stop and waited for; one that is on its way
@@ -4849,8 +4862,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         Some(_) => {
             // A result that neither a rollback nor the removal acts on: not `found`, which the
             // removal acts on where a repair found and used the service.
-            run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;
-            return Err(refused_service());
+            return Err(refuse_service(run));
         }
         None => {
             let made = manager.create(
