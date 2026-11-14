@@ -522,11 +522,12 @@ async fn a_retry_is_answered_even_after_its_own_effect_moved_the_subject() {
     );
     // The close was asked for above: its own steps, the drain among them, end before the
     // fixture's directory is removed.
-    let _ = tokio::time::timeout(
+    tokio::time::timeout(
         std::time::Duration::from_secs(30),
         host.service.runtime().wait_closed(),
     )
-    .await;
+    .await
+    .expect("the session's closure finishes after the close was accepted");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

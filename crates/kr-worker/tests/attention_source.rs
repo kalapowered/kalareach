@@ -38,7 +38,8 @@ use kr_worker::session::{Session, SessionConfig};
 
 /// A case that uses this runs on the multi-thread runtime: the drop of the fixture waits, in the
 /// removal of its directory, for the tasks it cancelled to go, and a runtime with one thread
-/// would never run them.
+/// would never run them. One case stays on a runtime of one thread, because it needs the
+/// runtime to run nothing else while it waits, and its removal of the directory is refused.
 struct Host {
     service: Arc<WorkerService>,
     session_id: SessionId,
