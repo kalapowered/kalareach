@@ -619,7 +619,8 @@ impl ClosedOnDrop {
         Self(cfg!(unix).then(|| std::sync::Arc::clone(runtime)))
     }
 
-    /// Lets the session go on after this is dropped, for a fixture that hands it to another.
+    /// Keeps this from closing the session when it is dropped, for a fixture that hands the
+    /// session to another. A disarmed session ends with its runtime and writes no closure.
     pub fn disarm(&mut self) {
         self.0 = None;
     }
