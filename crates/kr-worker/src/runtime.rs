@@ -2925,22 +2925,20 @@ mod tests {
         // The lane's deadlines are readings of the session's continuous clock, the clock the writer
         // holds.
         let now = runtime.shared_clock.boot_elapsed_ms();
-        runtime
-            .sink
-            .input
-            .send(InputBatch::Reply {
+        // Through the domain's queue, as every batch the writer takes comes: it is charged there,
+        // and the writer gives back what it was charged.
+        {
+            let mut input = runtime.domain.lock();
+            input.queue_input(InputBatch::Reply {
                 bytes: b"kr-late\n".to_vec(),
                 expires_at_ms: Some(now.saturating_sub(1)),
-            })
-            .expect("the writer is taking input");
-        runtime
-            .sink
-            .input
-            .send(InputBatch::Reply {
+            });
+            input.queue_input(InputBatch::Reply {
                 bytes: b"kr-early\n".to_vec(),
                 expires_at_ms: Some(now + 60_000),
-            })
-            .expect("the writer is taking input");
+            });
+        }
+        runtime.flush_input();
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             while !retained_output(&runtime)
                 .windows(b"kr-early".len())
