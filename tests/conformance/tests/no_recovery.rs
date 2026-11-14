@@ -15,8 +15,9 @@ const PROGRAMS: [&str; 11] = [
     "rmdir",
 ];
 
-/// Functions that remove from the disk, replace a file or signal a process, as they are called.
-const CALLS: [&str; 10] = [
+/// Names of functions that remove from the disk, replace a file or signal a process, wherever
+/// they are written: called, taken as a value, given type arguments, imported or renamed.
+const NAMES: [&str; 10] = [
     "remove_dir_all",
     "remove_dir",
     "remove_file",
@@ -88,7 +89,9 @@ fn end_of_item(tokens: &[Token], from: usize) -> usize {
     tokens.len()
 }
 
-/// The tokens of `source` that are not a comment and not part of an item under `#[cfg(test)]`.
+/// The tokens of `source` that are not a comment and not part of an item under `#[cfg(test)]`. A
+/// `#[cfg(test)]` inside the input of a macro skips nothing: the macro may build code that is not
+/// under it.
 fn product_tokens(source: &str) -> Result<Vec<Token>, String> {
     let tokens: Vec<Token> = lex(source)
         .map_err(|error| format!("line {}: {}", error.line, error.what))?
@@ -96,14 +99,31 @@ fn product_tokens(source: &str) -> Result<Vec<Token>, String> {
         .filter(|token| !token.is_comment())
         .collect();
     let mut product = Vec::new();
+    // For each open bracket: whether it holds a macro's input.
+    let mut groups: Vec<bool> = Vec::new();
     let mut at = 0;
     while at < tokens.len() {
-        if opens_a_test_item(&tokens[at..]) {
+        if opens_a_test_item(&tokens[at..]) && !groups.contains(&true) {
             at = end_of_item(&tokens, at + 7);
-        } else {
-            product.push(tokens[at].clone());
-            at += 1;
+            continue;
         }
+        match tokens[at].tok {
+            Tok::Punct('{' | '(' | '[') => {
+                let named_call =
+                    at >= 2 && tokens[at - 1].is_punct('!') && tokens[at - 2].ident().is_some();
+                let definition = at >= 3
+                    && tokens[at - 1].ident().is_some()
+                    && tokens[at - 2].is_punct('!')
+                    && tokens[at - 3].ident() == Some("macro_rules");
+                groups.push(named_call || definition || groups.contains(&true));
+            }
+            Tok::Punct('}' | ')' | ']') => {
+                groups.pop();
+            }
+            _ => {}
+        }
+        product.push(tokens[at].clone());
+        at += 1;
     }
     Ok(product)
 }
@@ -119,8 +139,10 @@ fn found(source: &str) -> Result<Vec<String>, String> {
             }
             Tok::Ident(name)
                 if SIGNALS.contains(&name.as_str())
-                    || (CALLS.contains(&name.as_str())
-                        && tokens.get(at + 1).is_some_and(|next| next.is_punct('('))) =>
+                    || (NAMES.contains(&name.as_str())
+                        // `rename = "x"` is the key of an attribute, as in `#[serde(rename = "x")]`.
+                        && !(name == "rename"
+                            && tokens.get(at + 1).is_some_and(|next| next.is_punct('=')))) =>
             {
                 format!("`{name}`")
             }
@@ -188,6 +210,13 @@ fn the_check_finds_what_it_is_there_for() {
         "nix::sys::signal::kill(pid, signal)",
         "command.process_group(0);",
         "let signal = SIGKILL;",
+        "let remove = std::fs::remove_file;",
+        "std::fs::remove_file::<std::path::PathBuf>(path)",
+        "(std::fs::remove_file)(path)",
+        "use std::fs::remove_dir_all as clean;",
+        "let signal_it = Child::kill;",
+        "m! { #[cfg(test)] fn f() { std::fs::remove_file(x); } }",
+        "macro_rules! m { () => { #[cfg(test)] fn f() { child.kill(); } } }",
     ] {
         assert!(
             !found(code).expect("a source").is_empty(),
@@ -202,7 +231,8 @@ fn the_check_finds_what_it_is_there_for() {
         "let text = \"the log has all of it\";",
         "let text = \"step {step} did not pass: {} (log {})\";",
         "#[serde(rename_all = \"snake_case\")]\nstruct S;",
-        "let renamed = rename;",
+        "#[serde(rename = \"x\")]\nstruct S;",
+        "let renamed = renamed;",
     ] {
         assert!(
             found(code).expect("a source").is_empty(),
