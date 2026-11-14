@@ -3331,10 +3331,12 @@ jobs:
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15-intel
-    # The build alone is about an hour on this runner. Every step has a limit of its own, and the
-    # limits add up to less than this one. The build's limit is at least twice the longest it has
-    # taken, so that its work can grow before the limit is reached.
-    timeout-minutes: 300
+    # The build alone is about an hour on this runner when its cache is warm. With no cache the
+    # first of its two commands took from 47 to 120 minutes, on a runner that was slow that day,
+    # and the second had run 40 more without ending. Every step has a limit of its own, and the
+    # limits add up to less than this one: the build's 240 minutes, twice the 120, and the other
+    # steps' 111 make 351, and this limit of 355 is under the 360 at which GitHub ends a hosted job.
+    timeout-minutes: 355
     steps:
       - name: Check out
         timeout-minutes: 5
@@ -3375,9 +3377,12 @@ jobs:
           name: macos-reference
 
       # Everything the script below builds before it measures, so that the script has as little
-      # left to build as it can.
+      # left to build as it can. Its limit is twice the 120 minutes the first command took with no
+      # cache on a slow runner, so that a slow build with no cache still ends here and is saved
+      # below, where one that is cut leaves the next run as cold as this one.
       - name: Build what the measurements run
-        timeout-minutes: 160
+        id: build
+        timeout-minutes: 240
         run: |
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
@@ -3417,7 +3422,13 @@ jobs:
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
+      # A build with no cache is hours of work, and a measurement that fails, runs out of its limit
+      # or is cut by a newer push must not make the next run do it again. So the save runs after
+      # any of them, and after no build that did not end well: that one would be saved under the
+      # key of a complete one. It is the one save of the job, and it comes after the measurements
+      # because it takes this workspace's own output out of the build directory, which they run.
       - name: Save the cargo cache
+        if: ${{ always() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
