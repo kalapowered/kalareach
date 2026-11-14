@@ -4033,7 +4033,16 @@ impl Run {
             Err(found) => found,
         };
         // Where the save failed decides what the ending may say: only a write whose rename put an
-        // object at the manifest's name can have published the record.
+        // object at the manifest's name can have published the record. An earlier write of this
+        // run's record, which the run holds, may stand there whatever became of this one.
+        let earlier_write = {
+            let laid = ffi::locked(&self.laid);
+            laid.manifest.is_some()
+                || laid
+                    .replacement
+                    .as_ref()
+                    .is_some_and(|file| file.path == self.paths.manifest)
+        };
         let renamed = Cell::new(false);
         match self.save_noting(&renamed) {
             Ok(()) => remedy::RecordLeft::Saved { manifest, found },
@@ -4042,6 +4051,7 @@ impl Run {
                 why: error.to_string(),
                 stays: self.held_paths(),
                 renamed: renamed.get(),
+                earlier_write,
             },
         }
     }
@@ -7045,7 +7055,8 @@ mod tests {
         crate::manifest::forced::fail_the_next("manager");
         let error = roll_back(&mut run).unwrap_err().to_string();
         assert!(
-            error.contains("and no write of this run's record reached the manifest's name"),
+            error
+                .contains(", and this write of the run's record did not reach the manifest's name"),
             "{error}"
         );
         assert!(!error.contains("may have published it"), "{error}");
@@ -7107,7 +7118,8 @@ mod tests {
         assert_eq!(std::fs::read_dir(&run.paths.data).unwrap().count(), 0);
         let words = remedy::rollback_failed(&["a step failed".to_owned()], &left, "");
         assert!(
-            words.contains("and no write of this run's record reached the manifest's name"),
+            words
+                .contains(", and this write of the run's record did not reach the manifest's name"),
             "{words}"
         );
         assert!(
@@ -7115,6 +7127,66 @@ mod tests {
             "{words}"
         );
         assert!(!words.contains("may have published"), "{words}");
+    }
+
+    /// A save that fails before its rename after an earlier save of the same run was proved: the
+    /// earlier record stands at the manifest's name, and the ending speaks of this write alone. It
+    /// says that this write did not reach the name and that a record that an earlier write of this
+    /// run left may stand there, never that no write of the run's record reached the name; the disk
+    /// after the ending holds the earlier record.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_save_that_fails_before_its_rename_after_a_proved_save_leaves_the_earlier_record_standing()
+    {
+        let _one = ffi::locked(&FORCED);
+        let top = tempfile::tempdir().unwrap();
+        let mut run = unwritten_run(top.path(), true);
+        run.manifest.record(
+            ObjectKind::Directory,
+            &run.paths.data.display().to_string(),
+            None,
+        );
+        run.save().unwrap();
+        let earlier = run.manifest.clone();
+        // The record changes in memory and its save fails before the rename: in the run, and again
+        // where the rollback keeps its record.
+        run.manifest
+            .record(ObjectKind::Account, "krb-checkout", None);
+        crate::manifest::forced::fail_the_next("replacement");
+        run.save().unwrap_err();
+        assert!(ffi::locked(&run.laid).manifest.is_some());
+        crate::manifest::forced::fail_the_next("replacement");
+        let left = run.keep_record();
+        let remedy::RecordLeft::NotSaved {
+            found,
+            renamed,
+            earlier_write,
+            ..
+        } = &left
+        else {
+            panic!("{left:?}");
+        };
+        assert!(!renamed, "{left:?}");
+        assert!(earlier_write, "{left:?}");
+        assert_eq!(*found, remedy::NotProved::Differs, "{left:?}");
+        let words = remedy::rollback_failed(&["a step failed".to_owned()], &left, "");
+        assert!(
+            words
+                .contains(", and this write of the run's record did not reach the manifest's name"),
+            "{words}"
+        );
+        assert!(
+            words.contains("and a record that an earlier write of this run left may stand there"),
+            "{words}"
+        );
+        assert!(
+            !words.contains("no write of this run's record reached"),
+            "{words}"
+        );
+        assert!(!words.contains("may have published"), "{words}");
+        // The disk after the ending holds the earlier record, and no replacement beside it.
+        assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), earlier);
+        assert_eq!(std::fs::read_dir(&run.paths.data).unwrap().count(), 1);
     }
 
     /// A save whose rename put an object at the manifest's name and whose proof then failed may
@@ -7138,7 +7210,10 @@ mod tests {
             words.contains("the write may have published it before its proof failed"),
             "{words}"
         );
-        assert!(!words.contains("reached the manifest's name"), "{words}");
+        assert!(
+            !words.contains("did not reach the manifest's name"),
+            "{words}"
+        );
     }
 
     /// A new installation that fails before its first directory record and whose rollback then has a
