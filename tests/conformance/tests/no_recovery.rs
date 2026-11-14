@@ -68,6 +68,82 @@ fn opens_a_test_item(tokens: &[Token]) -> bool {
             .all(|(token, tok)| token.tok == *tok)
 }
 
+/// The words that begin an item.
+const ITEM_WORDS: [&str; 13] = [
+    "mod", "fn", "use", "impl", "struct", "enum", "trait", "type", "const", "static", "extern",
+    "unsafe", "async",
+];
+
+/// Whether `tokens`, which follow an attribute, begin an item: more attributes and a visibility
+/// may come first. An attribute on a match arm, an argument, a field or a statement is on no item.
+fn starts_an_item(tokens: &[Token]) -> bool {
+    let mut at = 0;
+    while tokens.get(at).is_some_and(|token| token.is_punct('#'))
+        && tokens.get(at + 1).is_some_and(|token| token.is_punct('['))
+    {
+        at = after_brackets(tokens, at + 1);
+    }
+    if tokens.get(at).and_then(Token::ident) == Some("pub") {
+        at += 1;
+        if tokens.get(at).is_some_and(|token| token.is_punct('(')) {
+            while tokens.get(at).is_some_and(|token| !token.is_punct(')')) {
+                at += 1;
+            }
+            at += 1;
+        }
+    }
+    tokens
+        .get(at)
+        .and_then(Token::ident)
+        .is_some_and(|word| ITEM_WORDS.contains(&word))
+}
+
+/// The index after the `]` that closes the `[` at `open`, or the end of `tokens`.
+fn after_brackets(tokens: &[Token], open: usize) -> usize {
+    let mut depth = 0_usize;
+    for (at, token) in tokens.iter().enumerate().skip(open) {
+        match token.tok {
+            Tok::Punct('[') => depth += 1,
+            Tok::Punct(']') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
+/// Whether each token of `tokens` is inside an attribute: from `#[` or `#![` to the `]` that closes it.
+fn inside_attributes(tokens: &[Token]) -> Vec<bool> {
+    let mut inside = vec![false; tokens.len()];
+    let mut at = 0;
+    while at < tokens.len() {
+        let open = if tokens[at].is_punct('#') {
+            match tokens.get(at + 1) {
+                Some(next) if next.is_punct('[') => Some(at + 1),
+                Some(next) if next.is_punct('!') => tokens
+                    .get(at + 2)
+                    .filter(|t| t.is_punct('['))
+                    .map(|_| at + 2),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(open) = open {
+            let end = after_brackets(tokens, open);
+            inside[at..end].fill(true);
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    inside
+}
+
 /// Where the item that begins at `from` ends: after its closing brace, or after the semicolon of an
 /// item with no body. Braces and semicolons inside a string or a comment are not tokens of their
 /// own, and a semicolon inside a bracket does not end an item.
@@ -105,7 +181,10 @@ fn product_tokens(source: &str) -> Result<Vec<Token>, String> {
     let mut groups: Vec<bool> = Vec::new();
     let mut at = 0;
     while at < tokens.len() {
-        if opens_a_test_item(&tokens[at..]) && !groups.contains(&true) {
+        if opens_a_test_item(&tokens[at..])
+            && !groups.contains(&true)
+            && starts_an_item(&tokens[at + 7..])
+        {
             at = end_of_item(&tokens, at + 7);
             continue;
         }
@@ -133,6 +212,7 @@ fn product_tokens(source: &str) -> Result<Vec<Token>, String> {
 /// What in `source` removes, replaces, signals or starts a program that does, each with its line.
 fn found(source: &str) -> Result<Vec<String>, String> {
     let tokens = product_tokens(source)?;
+    let in_attribute = inside_attributes(&tokens);
     let mut found = Vec::new();
     for (at, token) in tokens.iter().enumerate() {
         let what = match &token.tok {
@@ -142,8 +222,10 @@ fn found(source: &str) -> Result<Vec<String>, String> {
             Tok::Ident(name)
                 if SIGNALS.contains(&name.as_str())
                     || (NAMES.contains(&name.as_str())
-                        // `rename = "x"` is the key of an attribute, as in `#[serde(rename = "x")]`.
+                        // `rename = "x"` is the key of an attribute, as in `#[serde(rename = "x")]`,
+                        // and is not one anywhere else.
                         && !(name == "rename"
+                            && in_attribute[at]
                             && tokens.get(at + 1).is_some_and(|next| next.is_punct('=')))) =>
             {
                 format!("`{name}`")
@@ -219,6 +301,12 @@ fn the_check_finds_what_it_is_there_for() {
         "let signal_it = Child::kill;",
         "m! { #[cfg(test)] fn f() { std::fs::remove_file(x); } }",
         "macro_rules! m { () => { #[cfg(test)] fn f() { child.kill(); } } }",
+        "let rename = 1;",
+        "rename = other;",
+        "state.rename = 1;",
+        "call!(rename = (\"old\", \"new\"));",
+        "macro_rules! call { ($f:ident = ($a:expr)) => { std::fs::$f($a) }; }\ncall!(rename = (\"o\", \"n\"));",
+        "#[serde(rename = std::fs::rename)]\nstruct S;",
     ] {
         assert!(
             !found(code).expect("a source").is_empty(),
@@ -235,6 +323,9 @@ fn the_check_finds_what_it_is_there_for() {
         "#[serde(rename_all = \"snake_case\")]\nstruct S;",
         "#[serde(rename = \"x\")]\nstruct S;",
         "let renamed = renamed;",
+        "#[cfg_attr(feature = \"x\", serde(rename = \"y\"))]\nstruct S;",
+        "#![serde(rename = \"x\")]",
+        "#[serde(alias = \"y\", rename = \"x\")]\nfn f() {}",
     ] {
         assert!(
             found(code).expect("a source").is_empty(),
@@ -251,6 +342,10 @@ fn what_is_under_cfg_test_is_not_read_and_what_follows_it_is() {
         "#[cfg(test)]\nfn helper() -> [u8; 2] { std::fs::remove_file(x); [0; 2] }",
         "#[cfg(test)]\nuse std::process::Command;\nfn product() {}",
         "#[cfg(test)]\nmod a {\n}\n#[cfg(test)]\nmod b { fn f() { child.kill(); } }",
+        "#[cfg(test)]\n#[derive(Debug)]\nstruct X { a: u8 }\nfn product() {}",
+        "#[cfg(test)]\npub(crate) fn helper() { std::fs::remove_file(x); }",
+        "#[cfg(test)]\nimpl X { fn f(&self) { child.kill(); } }",
+        "#[cfg(test)]\nconst X: u8 = { std::fs::remove_file(x); 1 };",
     ] {
         assert!(
             found(code).expect("a source").is_empty(),
@@ -262,6 +357,11 @@ fn what_is_under_cfg_test_is_not_read_and_what_follows_it_is() {
         "#[cfg(test)]\nfn helper() {}\nfn product() { std::fs::remove_file(x); }",
         "#[cfg(test)]\nuse std::fs;\nfn product() { child.kill(); }",
         "#[cfg(test)]\nmod a { fn f() { let s = \"{\"; } }\nfn product() { std::fs::rename(a, b); }",
+        // A `#[cfg(test)]` that is on no item skips nothing: a match arm, an argument, a field.
+        "fn p() { match x { #[cfg(test)] A => 1, B => { std::fs::remove_file(p); 2 } } }",
+        "fn p() { foo(#[cfg(test)] 1, std::fs::remove_file(p)); }",
+        "fn p() { let s = S { #[cfg(test)] a: 1, b: std::fs::remove_file(p) }; }",
+        "fn p() { #[cfg(test)] let a = 1; std::fs::remove_file(p); }",
     ] {
         assert!(
             !found(code).expect("a source").is_empty(),
