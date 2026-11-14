@@ -1103,6 +1103,17 @@ impl Core {
         true
     }
 
+    /// Whether the lane still means to write the frame: its epoch is the current one and has not
+    /// ended. The writer asks before each attempt, so a frame of an epoch that a new one superseded
+    /// while the writer waited for room is not written under the old epoch.
+    fn still_wanted(&self, epoch: InputLeaseEpoch, sequence: u64) -> bool {
+        self.ended.is_none()
+            && self.epoch.as_ref().is_some_and(|current| {
+                current.epoch == epoch
+                    && current.flight.iter().any(|sent| sent.sequence == sequence)
+            })
+    }
+
     /// What the writer does next, within the window.
     fn next(&mut self) -> Next {
         if self.ended.is_some() {
@@ -1710,6 +1721,10 @@ async fn network_writer(
             bytes: Bytes::new(bytes),
         };
         loop {
+            // A frame whose epoch ended or was superseded since the writer took it is not written.
+            if !shared.lock().still_wanted(epoch, sequence) {
+                break;
+            }
             // The wait for room is made before the attempt, so room given back in between is not
             // missed.
             let released = budget.as_ref().map(|budget| budget.released());
@@ -1780,6 +1795,9 @@ async fn local_writer(
                         bytes: Bytes::new(bytes),
                     },
                 };
+                if !shared.lock().still_wanted(epoch, sequence) {
+                    continue;
+                }
                 match local.write(&params).await {
                     Ok(_) => shared.apply(InputAck::Accepted {
                         epoch,
