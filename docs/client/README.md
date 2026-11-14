@@ -1705,7 +1705,7 @@ that named a deployment and then ran nothing against it has proved nothing. One 
 under the directory `KR_TEST_ARTIFACTS_DIR` names, so a leg that failed keeps its whole output and
 not the line the report had room for.
 
-This is what such a run sends, and what it leaves. Every principal is made when a leg starts and
+This is what such a run sends, and what it leaves. Every key is made when a leg starts and
 discarded when it ends: a fresh authorisation key signs, and the identifiers the legs publish are
 drawn for that run alone, so a leg touches nothing that was not made for it. No account is created
 and nothing is bought. Each leg gives back what it took before it reports: a host removes itself
@@ -1717,7 +1717,14 @@ is acknowledged, refused or removed, so that one does not lapse on its own and a
 is reporting something that needs a hand. Settings sync keeps some things by its own rules, which no
 client may remove: each request identity's receipt for thirty days, a record of each removed
 object's place in the order with no content in it, spent nonces, and the ledger's record of the
-installation a run's key made.
+installation a run's key made. The service's directory keeps an entry for each mailbox, ledger,
+collection and feed that a run's keys made, and the billing rows of their principals, and nothing
+removes them: each run of the legs against a deployment adds a batch of them.
+
+The landing workflow runs `scripts/e2e-deployment.sh` and the checkpoint's pairing leg against the
+production origin at a push to main and at a manual run that sets the `deployment_legs` input. A
+pull request's run and every other manual run leave them out, so a branch's run writes nothing to
+that deployment.
 
 ## Recovery
 

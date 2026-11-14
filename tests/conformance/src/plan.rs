@@ -359,7 +359,7 @@ const MACOS_SKIPS: &[(&str, &str)] = &[
 /// Why a package no macOS step runs is left out there.
 pub const MACOS_EXCLUDED: &[(&str, &str)] = &[(
     "kr-sync-integration",
-    "every test of this package is a leg against a live deployment; the Linux run takes each leg against the deployment it names",
+    "every test of this package is a leg against a live deployment; the landing workflow's Linux job runs each leg against the deployment it names at a push to main and at a manual run that asks for the legs",
 )];
 
 /// Why a test no step runs on this platform is not run, when the platform says why in general.
