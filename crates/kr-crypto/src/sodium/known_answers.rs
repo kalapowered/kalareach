@@ -14,8 +14,9 @@
 //! make a failure go away: an implementation that disagrees with them is the one that is wrong.
 //! The other documents that this module reads are the vectors the RFCs publish
 //! (`published-vectors.json`).
-
-use std::path::{Path, PathBuf};
+//!
+//! Every file the cases read is part of the test program, taken in at compile time: the program
+//! also runs on a phone, which has no checkout to read a path of.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -40,15 +41,21 @@ const AAD_LEN: usize = 37;
 const TAG_PUSH: u8 = 1;
 const TAG_REKEY: u8 = 2;
 
-pub(super) fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/crypto")
-}
-
+/// The JSON document `relative` of `fixtures/crypto`, as the program holds it.
 pub(super) fn read_json(relative: &str) -> Value {
-    let path = fixtures_dir().join(relative);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    let text = match relative {
+        "cipher-known-answers.json" => {
+            include_str!("../../../../fixtures/crypto/cipher-known-answers.json")
+        }
+        "published-vectors.json" => {
+            include_str!("../../../../fixtures/crypto/published-vectors.json")
+        }
+        "wycheproof/ed25519-verdicts.json" => {
+            include_str!("../../../../fixtures/crypto/wycheproof/ed25519-verdicts.json")
+        }
+        other => panic!("{other} is not a fixture these cases hold"),
+    };
+    serde_json::from_str(text).unwrap_or_else(|error| panic!("{relative}: {error}"))
 }
 
 pub(super) fn hex_vec(value: &Value, key: &str) -> Vec<u8> {
