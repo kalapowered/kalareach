@@ -638,6 +638,14 @@ impl Rig {
             .expect("the lane has another event")
     }
 
+    /// The next event, which the case needs within a few seconds: a lane that never tells it fails
+    /// the case here, by this assertion, and not by the liveness limit.
+    async fn event_soon(&mut self) -> InputEvent {
+        let event = tokio::time::timeout(Duration::from_secs(5), self.events.recv()).await;
+        assert!(event.is_ok(), "the lane told nothing within five seconds");
+        event.ok().flatten().expect("the lane has another event")
+    }
+
     /// Reads events until `want` picks one, and fails on none of them.
     async fn event_where(&mut self, want: impl Fn(&InputEvent) -> bool) -> InputEvent {
         loop {
@@ -1103,9 +1111,16 @@ async fn a_notice_that_comes_before_the_epoch_begins_is_told_when_it_begins() {
     rig.script.epoch_ended(6, 7);
     rig.settled().await;
     assert_eq!(rig.lane.begin_epoch(epoch(6)), Ok(Some(Sets::default())));
-    let event = rig
-        .event_where(|event| matches!(event, InputEvent::EpochEnded { .. }))
-        .await;
+    // The call that begins the epoch tells the notice it kept.
+    let mut told = Vec::new();
+    while let Some(event) = rig.events.try_recv() {
+        told.push(event);
+    }
+    let event = told
+        .iter()
+        .find(|event| matches!(event, InputEvent::EpochEnded { .. }))
+        .cloned()
+        .expect("the notice is told when the epoch begins");
     assert!(
         matches!(event, InputEvent::EpochEnded { epoch: e, fenced_bytes: 7, .. } if e == epoch(6)),
         "{event:?}"
@@ -1966,7 +1981,11 @@ async fn a_barrier_is_reached_by_acceptance_and_times_out_by_its_own_bound() {
     let empty = rig.lane.mark(Some(1)).expect("a barrier");
     assert_eq!(empty.count.get(), 0);
     assert_eq!(empty.launch, Nullable::some(1));
-    assert_eq!(rig.event().await, InputEvent::Reached(empty));
+    assert_eq!(
+        rig.events.try_recv(),
+        Some(InputEvent::Reached(empty)),
+        "an empty barrier is reached by the call that marks it"
+    );
     assert_eq!(rig.lane.discard_held(), Count::default());
     for number in 0..4 {
         rig.lane.try_send(&key(number)).expect("admitted");
@@ -1991,7 +2010,7 @@ async fn a_barrier_is_reached_by_acceptance_and_times_out_by_its_own_bound() {
         .await;
     rig.deadlines.fire(DeadlineKind::Admission);
     assert_eq!(
-        rig.event().await,
+        rig.event_soon().await,
         InputEvent::NotReached {
             barrier: barrier.clone(),
             reason: NotReached::Timeout,
@@ -2226,7 +2245,7 @@ async fn a_barrier_that_times_out_leaves_the_hold_in_place() {
         .await;
     rig.deadlines.fire(DeadlineKind::Admission);
     assert_eq!(
-        rig.event().await,
+        rig.event_soon().await,
         InputEvent::NotReached {
             barrier,
             reason: NotReached::Timeout,
@@ -2549,6 +2568,42 @@ async fn a_stream_lost_with_the_connection_waits_for_the_sessions_record_of_the_
         panic!("the connection's end with the host's refusal, not {event:?}");
     };
     assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+}
+
+/// When the session records nothing within the admission bound, a stream lost with the connection
+/// still ends the lane as the connection's end, not as a reset.
+#[tokio::test]
+async fn a_stream_lost_with_the_connection_ends_the_lane_as_the_connections_when_the_session_says_nothing()
+ {
+    let mut rig = rig(2).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.script
+        .until("the frame", |seen| !seen.frames.is_empty())
+        .await;
+    rig.session.transport().revoke_streams();
+    let fired = tokio::time::timeout(
+        Duration::from_secs(5),
+        rig.deadlines.fire_when_armed(DeadlineKind::Admission),
+    )
+    .await;
+    assert!(
+        fired.is_ok(),
+        "the lane waits for the session's record under the admission bound"
+    );
+    let ended = tokio::time::timeout(
+        Duration::from_secs(5),
+        rig.event_where(|event| matches!(event, InputEvent::Ended { .. })),
+    )
+    .await;
+    assert!(ended.is_ok(), "the lane ended when the bound passed");
+    let Ok(InputEvent::Ended { cause, .. }) = ended else {
+        unreachable!();
+    };
+    assert!(
+        matches!(cause, EndCause::Connection { refusal: None }),
+        "the connection's end, not {cause:?}"
+    );
 }
 
 /// The most paste the lane says an empty lane certainly admits is admitted whole when every cut
