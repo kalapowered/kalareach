@@ -3892,7 +3892,8 @@ async fn the_attempt_a_copy_finds_still_running_is_not_shown_when_a_fence_lands_
 /// attempt, which is a record of its claim, is withheld by the revision the copy was admitted under
 /// alone, and the word it is told is the one that says what became of the action is not shown. The
 /// host's own account says the attempt has not finished: the text is what tells the two apart,
-/// since both are `OUTCOME_UNKNOWN`.
+/// since both are `OUTCOME_UNKNOWN`. The revocation also moves the revision the first attempt itself
+/// was admitted under, so its service refuses it where it would begin the upload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_attempt_a_copy_finds_still_running_is_not_shown_when_another_devices_authority_is_revoked_at_the_pause()
  {
@@ -3950,10 +3951,20 @@ async fn the_attempt_a_copy_finds_still_running_at_the_pause(landing: AtThePause
     );
 
     let_it_go_on.send(()).expect("the first attempt is waiting");
-    running
+    let first = running
         .await
         .expect("the first attempt ran")
-        .expect("the call reaches the daemon")
-        .expect("upload.begin succeeds");
+        .expect("the call reaches the daemon");
+    match landing {
+        AtThePause::AFence => {
+            first.expect("upload.begin succeeds");
+        }
+        AtThePause::AnotherDevicesRevocation => {
+            // The revocation moved the revision the first attempt was admitted under, so the
+            // service refuses it where it would begin the upload.
+            let refused = failure(first);
+            assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+        }
+    }
     host.stop().await;
 }
