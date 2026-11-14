@@ -1766,3 +1766,316 @@ fn presentation_length(
         .size_bytes
         .get()
 }
+
+/// The keys of a burst, as a device sends them and as the host answered them.
+struct Burst {
+    /// The frames the device wrote to its connection.
+    sent: usize,
+    /// The answers that came back, by outcome.
+    answered_ok: usize,
+    answered_otherwise: usize,
+    /// The most frames the device had written and not yet seen answered, at any time: no less than
+    /// the frames the host held for its handler, and more by the frames still on their way.
+    most_unanswered: usize,
+    /// The frame at which a write failed, and the error, when the connection was lost.
+    cut: Option<(usize, String)>,
+    /// How the connection's reader ended, when it ended on an error.
+    ended: Option<String>,
+    /// What the application has of the keys written, and whether that is all of them or a
+    /// beginning of them.
+    received: usize,
+    written: usize,
+    clean_prefix: bool,
+    /// A request that is not a key, whose answer is kept apart from the keys' while the burst is
+    /// counted, and the answer it got.
+    watched: Option<RequestId>,
+    watched_outcome: Option<Outcome>,
+    /// The first answer that was not a success, as the daemon said it.
+    first_refusal: Option<String>,
+}
+
+impl Burst {
+    fn new(watched: Option<RequestId>) -> Self {
+        Self {
+            sent: 0,
+            answered_ok: 0,
+            answered_otherwise: 0,
+            most_unanswered: 0,
+            cut: None,
+            ended: None,
+            received: 0,
+            written: 0,
+            clean_prefix: true,
+            watched,
+            watched_outcome: None,
+            first_refusal: None,
+        }
+    }
+
+    /// Counts one answer: of a key by its outcome, or of the request watched.
+    fn counted(&mut self, id: RequestId, outcome: Outcome) {
+        if self.watched == Some(id) {
+            self.watched_outcome = Some(outcome);
+        } else if matches!(outcome, Outcome::Ok(_)) {
+            self.answered_ok += 1;
+        } else {
+            self.answered_otherwise += 1;
+            if self.first_refusal.is_none() {
+                let said = format!("{outcome:?}");
+                self.first_refusal = Some(said.chars().take(200).collect());
+            }
+        }
+    }
+
+    fn kept(&self) -> bool {
+        self.cut.is_none() && self.ended.is_none()
+    }
+
+    fn whole(&self) -> bool {
+        self.kept()
+            && self.answered_ok == self.sent
+            && self.answered_otherwise == 0
+            && self.received == self.written
+    }
+
+    fn line(&self, what: &str, run: usize) -> String {
+        format!(
+            "{what}, run {run}: {} written, {} answered ok, {} otherwise ({:?}), at most {} \
+             unanswered; the application has {} of {} bytes ({}); {}",
+            self.sent,
+            self.answered_ok,
+            self.answered_otherwise,
+            self.first_refusal,
+            self.most_unanswered,
+            self.received,
+            self.written,
+            if self.received == self.written {
+                "all"
+            } else if self.clean_prefix {
+                "a clean prefix"
+            } else {
+                "NOT a prefix"
+            },
+            match (&self.cut, &self.ended) {
+                (None, None) => "the connection stayed".to_owned(),
+                (cut, ended) =>
+                    format!("the connection was lost: write failed at {cut:?}, reader {ended:?}"),
+            }
+        )
+    }
+}
+
+impl Rig {
+    /// Writes one `input.write` without waiting for its answer, and says why it could not be
+    /// written when the connection is gone. What is written is typed: the application is expected
+    /// to have it, in order.
+    async fn try_send_key(&mut self, bytes: &[u8]) -> Result<(), kr_client::ClientError> {
+        let params = InputWriteParams {
+            session_id: self.worker.session_id,
+            attachment_id: self.attachment,
+            epoch: self.epoch,
+            sequence: InputSequence::new(self.sequence),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(bytes.to_vec()),
+            },
+        };
+        self.device
+            .try_submit_read(Method::InputWrite, &params)
+            .await?;
+        self.sequence += 1;
+        self.typed.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Reads, without waiting, every answer the device's connection has already heard, and counts
+    /// them.
+    async fn count_answers_heard(&self, burst: &mut Burst) {
+        while let Some((id, outcome)) = self.device.next_answer(Duration::ZERO).await {
+            burst.counted(id, outcome);
+        }
+    }
+
+    /// What the application has once it has everything typed, or has taken nothing more for a
+    /// while: after a lost connection or a refusal, what the host had already put to it is still
+    /// being read.
+    async fn settled_received(&self) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+        let mut last = self.received();
+        let mut since = tokio::time::Instant::now();
+        while last != self.typed
+            && since.elapsed() < Duration::from_millis(1500)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = self.received();
+            if now.len() != last.len() {
+                since = tokio::time::Instant::now();
+            }
+            last = now;
+        }
+        last
+    }
+
+    /// Reads the answers still to come until every frame written has one, the connection ends, or
+    /// the wait runs out, and then looks at what the application has.
+    async fn finish_burst(&self, mut burst: Burst) -> Burst {
+        let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+        while burst.answered_ok + burst.answered_otherwise < burst.sent
+            || (burst.watched.is_some() && burst.watched_outcome.is_none())
+        {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match self.device.next_answer(remaining).await {
+                Some((id, outcome)) => burst.counted(id, outcome),
+                None => break,
+            }
+        }
+        let received = self.settled_received().await;
+        burst.clean_prefix = self.typed.starts_with(&received);
+        burst.received = received.len();
+        burst.written = self.typed.len();
+        burst.ended = self.device.how_it_ended();
+        burst
+    }
+}
+
+/// A burst: `frames` written one after another with no wait between them, as a client writes what
+/// it held back while its link was stalled.
+async fn burst_of(rig: &mut Rig, frames: &[Vec<u8>]) -> Burst {
+    let mut burst = Burst::new(None);
+    for (number, frame) in frames.iter().enumerate() {
+        if let Err(error) = rig.try_send_key(frame).await {
+            burst.cut = Some((number, format!("{error:?}")));
+            break;
+        }
+        burst.sent += 1;
+        rig.count_answers_heard(&mut burst).await;
+        burst.most_unanswered = burst
+            .most_unanswered
+            .max(burst.sent - burst.answered_ok - burst.answered_otherwise);
+    }
+    rig.finish_burst(burst).await
+}
+
+/// `count` frames of `size` bytes each, every frame of one letter and no two neighbours alike, so
+/// that what the application has says which frames it has and in what order.
+fn frames_of(count: usize, size: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|number| vec![b'a' + u8::try_from(number % 26).expect("a letter"); size])
+        .collect()
+}
+
+/// How many times each burst is made.
+const BURST_RUNS: usize = 10;
+
+/// KR-REQ-09.22 (provisional): a device that writes keys back to back, as a paste divided into
+/// frames or the keys a client held while its link was stalled, keeps its connection, and the
+/// application has every byte once and in order.
+///
+/// The daemon keeps 64 frames for a handler that has not read them and ends the connection at the
+/// next, and a client has no limit on the keys it has written and not seen answered. No request
+/// waits at the worker here: the keys alone are the load, and each is a round trip to the worker.
+/// Every burst is made on a connection of its own, ten times. The case records for each burst how
+/// many of the runs kept the connection and what the application had, and fails when a run lost the
+/// connection or a byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_that_writes_a_burst_of_keys_keeps_its_connection_and_the_application_has_every_byte()
+ {
+    let bursts: Vec<(&str, Vec<Vec<u8>>)> = vec![
+        ("64 KiB in 8 KiB frames", frames_of(8, 8 * 1024)),
+        ("256 KiB in 8 KiB frames", frames_of(32, 8 * 1024)),
+        ("512 KiB in 8 KiB frames", frames_of(64, 8 * 1024)),
+        ("1 MiB in 8 KiB frames", frames_of(128, 8 * 1024)),
+        ("64 keys of one byte", frames_of(64, 1)),
+        ("65 keys of one byte", frames_of(65, 1)),
+        ("128 keys of one byte", frames_of(128, 1)),
+        ("256 keys of one byte", frames_of(256, 1)),
+    ];
+    let mut lost = Vec::new();
+    for (what, frames) in &bursts {
+        let mut kept = 0;
+        for run in 1..=BURST_RUNS {
+            let mut rig = Rig::start().await;
+            let burst = burst_of(&mut rig, frames).await;
+            eprintln!("{}", burst.line(what, run));
+            if burst.whole() {
+                kept += 1;
+            } else {
+                lost.push(burst.line(what, run));
+            }
+            rig.close().await;
+        }
+        eprintln!("{what}: {kept} of {BURST_RUNS} runs kept the connection and every byte");
+    }
+    assert!(
+        lost.is_empty(),
+        "{} of {} runs lost the connection or a byte:\n{}",
+        lost.len(),
+        bursts.len() * BURST_RUNS,
+        lost.join("\n")
+    );
+}
+
+/// How long a mutation is held in the worker's commit, and how fast a key repeats meanwhile.
+const HELD_FOR: Duration = Duration::from_secs(3);
+const REPEAT_EVERY: Duration = Duration::from_millis(33);
+
+/// KR-REQ-09.22 (provisional): a device that holds a key down while a mutation of its session is
+/// slow at the worker keeps its connection, the mutation is answered, and the application has
+/// every key once and in order.
+///
+/// The mutation is a second attachment of the session, which a key does not go ahead of, held in
+/// the worker's commit for three seconds: the commit of a journal on a busy disk. The key repeats
+/// every 33 milliseconds, thirty a second, on the same connection. The daemon reads nothing ahead
+/// of a frame it does not let a key pass, so the keys wait in its queue of 64; the case records the
+/// key and the time at which the connection was lost, if it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_key_held_down_while_a_mutation_of_its_session_is_slow_at_the_worker_keeps_the_connection()
+ {
+    let mut rig = Rig::start().await;
+    let second = SessionAttachParams {
+        session_id: rig.worker.session_id,
+        mode: AttachMode::Terminal,
+        claim_geometry: false,
+        dimensions: Nullable::some(Dimensions::new(80, 24)),
+        terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+        requested: [AttachmentCapability::ObserveTerminal]
+            .into_iter()
+            .collect(),
+    };
+    let (stall, attach) = rig.stall_own(Method::SessionAttach, &second).await;
+    let mut burst = Burst::new(Some(attach));
+    let began = Instant::now();
+    let mut ticks = tokio::time::interval(REPEAT_EVERY);
+    let mut lost_at = None;
+    while began.elapsed() < HELD_FOR {
+        ticks.tick().await;
+        let key = [b'a' + u8::try_from(burst.sent % 26).expect("a letter")];
+        if let Err(error) = rig.try_send_key(&key).await {
+            lost_at = Some((burst.sent, began.elapsed()));
+            burst.cut = Some((burst.sent, format!("{error:?}")));
+            break;
+        }
+        burst.sent += 1;
+        rig.count_answers_heard(&mut burst).await;
+        burst.most_unanswered = burst
+            .most_unanswered
+            .max(burst.sent - burst.answered_ok - burst.answered_otherwise);
+    }
+    let keys_answered_while_held = burst.answered_ok + burst.answered_otherwise;
+    stall.let_go();
+    let burst = rig.finish_burst(burst).await;
+    let attached = burst.watched_outcome.clone();
+    eprintln!(
+        "held for {HELD_FOR:?} at {REPEAT_EVERY:?} a key: {} keys written, {keys_answered_while_held} \
+         answered while the mutation was held, the mutation answered {attached:?}; lost at {lost_at:?}; {}",
+        burst.sent,
+        burst.line("the held key", 1)
+    );
+    rig.close().await;
+    assert!(
+        burst.whole() && matches!(attached, Some(Outcome::Ok(_))),
+        "the connection did not stay, a key was lost, or the mutation was not answered: {}; the \
+         mutation was answered {attached:?}",
+        burst.line("the held key", 1)
+    );
+}

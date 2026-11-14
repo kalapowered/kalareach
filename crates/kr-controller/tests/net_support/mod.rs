@@ -2076,6 +2076,9 @@ pub struct RawDevice {
     /// The frames the reading task has found, in the order they arrived.
     heard: tokio::sync::Mutex<Heard>,
     reading: tokio::task::JoinHandle<()>,
+    /// Why the reading task stopped, when the connection ended with an error and not with the end of
+    /// the control stream.
+    ended: Arc<std::sync::Mutex<Option<String>>>,
     /// How long a mutation this connection sends asks to stand, from the moment the host receives it,
     /// and how long [`Self::mutate_in`] waits for its answer.
     request_life: Duration,
@@ -2146,14 +2149,27 @@ impl RawDevice {
             renewals: tokio::sync::watch::channel(0).0,
         });
         let (found, heard) = tokio::sync::mpsc::unbounded_channel();
+        let ended = Arc::new(std::sync::Mutex::new(None));
         let reading = tokio::spawn({
             use kr_client::transport::ControlTransport as _;
             use kr_protocol::envelope::{ControlEvent, ControlFrame};
 
             let transport = Arc::clone(&transport);
             let windows = Arc::clone(&windows);
+            let ended = Arc::clone(&ended);
             async move {
-                while let Ok(Some(frame)) = transport.recv().await {
+                loop {
+                    let frame = match transport.recv().await {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => break,
+                        Err(error) => {
+                            *ended
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(format!("{error:?}"));
+                            break;
+                        }
+                    };
                     if let ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) = &frame {
                         *windows
                             .current
@@ -2175,6 +2191,7 @@ impl RawDevice {
             next_request: std::sync::atomic::AtomicU64::new(1),
             heard: tokio::sync::Mutex::new(heard),
             reading,
+            ended,
             request_life: Duration::from_secs(120),
         })
     }
@@ -2497,6 +2514,33 @@ impl RawDevice {
             .await
             .expect("the frame is sent");
         request_id
+    }
+
+    /// As [`Self::submit_read`], for a connection the host may have ended: the error the send
+    /// failed with is returned and the case goes on.
+    ///
+    /// # Errors
+    ///
+    /// Returns the client's error when the frame could not be written.
+    pub async fn try_submit_read<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        params: &P,
+    ) -> std::result::Result<kr_protocol::ids::RequestId, kr_client::ClientError> {
+        use kr_client::transport::ControlTransport as _;
+
+        let (request_id, frame) = self.read_frame(method, params);
+        self.transport.send(&frame).await?;
+        Ok(request_id)
+    }
+
+    /// Why the control stream's reader stopped, when it stopped on an error: the way the connection
+    /// was lost, as the client library reports it.
+    pub fn how_it_ended(&self) -> Option<String> {
+        self.ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The next frame the host sends that nothing has read, or `None` when `within` passes first or
