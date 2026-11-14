@@ -1317,6 +1317,18 @@ fn is_word(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
 }
 
+/// Whether the path that a value ends in goes on after its closing quote or brace, and steps up
+/// (`"/tmp/x"/../..`).
+fn steps_up_after(rest: &str) -> bool {
+    let tail = rest.trim_start_matches(['"', '\'', '}']);
+    tail.starts_with(['/', '\\'])
+        && tail
+            .split(char::is_whitespace)
+            .next()
+            .unwrap_or("")
+            .contains("..")
+}
+
 /// The span of `value` in `line` from `start`, when it is a whole value and not the start of a longer
 /// one (`/tmp/a` is not the start of `/tmp/a/../b`).
 fn delimited(line: &str, start: usize, value: &str) -> Option<(usize, usize)> {
@@ -1325,7 +1337,7 @@ fn delimited(line: &str, start: usize, value: &str) -> Option<(usize, usize)> {
         .chars()
         .next()
         .is_none_or(|character| VALUE_ENDS.contains(&character))
-        && !rest.split_whitespace().next().unwrap_or("").contains(".."))
+        && !steps_up_after(rest))
     .then_some((start, start + value.len()))
 }
 
@@ -1380,7 +1392,7 @@ fn is_a_read(line: &str, at: usize) -> bool {
     } else if lower.ends_with("$env:") {
         // Whatever follows an assignment operator, a default (`??`), a list (`,`) or a line
         // continuation (a backtick) may give the variable a value.
-        !["=", "+=", "-=", "*=", "/=", "%=", "??", ",", "`"]
+        !["=", "+=", "-=", "*=", "/=", "%=", "??", ",", "`", "<#"]
             .iter()
             .any(|start| rest.starts_with(start))
     } else if before.ends_with("${") {
@@ -1467,6 +1479,12 @@ fn lines_that_cannot_run(path: &str, lines: &[&str]) -> Vec<bool> {
                         }
                         return !fenced && !body.starts_with("    ") && !body.starts_with('\t');
                     }
+                    if !trimmed.is_empty()
+                        && !trimmed.starts_with("//")
+                        && !trimmed.starts_with("#[")
+                    {
+                        fenced = false;
+                    }
                     trimmed.starts_with("//")
                 }
                 "md" => {
@@ -1538,10 +1556,35 @@ fn assigned_name(line: &str) -> Option<&str> {
     (!name.is_empty() && assigns).then_some(name)
 }
 
-/// Whether a line gives `name` a value in one of the ordinary shell and PowerShell ways.
+/// Whether a line gives `name` a value in one of the ordinary shell and PowerShell ways: `name=` or
+/// `name+=` that starts a word of any command of the line (`test -d x && name=y`, `declare -x
+/// name=y`), PowerShell's `$name`, `$script:name` or `[type]$name` followed by an assignment
+/// operator, `${name:=`, `for name in`, `read name` and `printf -v name`.
 fn gives_value_to(line: &str, name: &str) -> bool {
     let line = line.trim();
-    assigned_name(line) == Some(name)
+    let assigned = line.match_indices(name).any(|(at, _)| {
+        let (before, rest) = (&line[..at], &line[at + name.len()..]);
+        if before.chars().next_back().is_some_and(is_word)
+            || rest.chars().next().is_some_and(is_word)
+        {
+            return false;
+        }
+        let powershell = before.ends_with('$')
+            || before
+                .rsplit_once('$')
+                .is_some_and(|(_, scope)| scope.ends_with(':') && !scope.contains(' '));
+        let operator = rest.trim_start();
+        if powershell {
+            ["=", "+=", "-=", "*=", "/=", "%=", "??="]
+                .iter()
+                .any(|start| operator.starts_with(start))
+                && !operator.starts_with("==")
+        } else {
+            !before.ends_with(['$', '-', '.', '{', '/'])
+                && ((rest.starts_with('=') && !rest.starts_with("==")) || rest.starts_with("+="))
+        }
+    });
+    assigned
         || line.contains(&format!("${{{name}:="))
         || line.contains(&format!("${{{name}="))
         || line.starts_with(&format!("for {name} in "))
@@ -1560,6 +1603,9 @@ fn redefinitions(entry: &Held, lines: &[&str], spans: &[(usize, usize)]) -> Vec<
             .filter_map(|line| assigned_name(line))
             .collect();
         for (number, line) in lines.iter().enumerate().take(pair[1].0).skip(pair[0].1) {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
             for name in &names {
                 if gives_value_to(line, name) {
                     problems.push(format!(
@@ -2378,6 +2424,60 @@ fn the_source_case_fails_on_what_it_does_not_know() {
             vec![("scripts/c.sh", "d=\"${@V@:-/tmp/abc}\"\n")],
             "file: scripts/c.sh\n| d=\"${@V@:-/tmp/abc}\"\nvalue: /tmp/a",
             Some(value),
+        ),
+        (
+            "a variable given another value by a command after && between the held lines",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\ntest -d \"$PWD\" && d=\"$PWD/e\"\nexport @V@=\"$d/e\"\n",
+            )],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
+            Some("another value"),
+        ),
+        (
+            "a variable given another value by a declaration between the held lines",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\ndeclare -x d=\"$PWD/e\"\nexport @V@=\"$d/e\"\n",
+            )],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
+            Some("another value"),
+        ),
+        (
+            "a comment between the held lines that names the helper",
+            vec![(
+                "scripts/b.sh",
+                "d=/tmp/x\n# d=y is not used\nexport @V@=\"$d/e\"\n",
+            )],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
+            None,
+        ),
+        (
+            "a documentation test after an unclosed fence of another item",
+            vec![
+                a,
+                (
+                    "crates/x/src/lib.rs",
+                    "/// ```rust\n/// assert!(true);\npub fn first() {}\n\n/// ```rust\n/// cmd.env(\"@V@\", \"/home/x\");\n/// ```\npub fn second() {}\n",
+                ),
+            ],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a comment between the name and the operator in PowerShell",
+            vec![a, ("scripts/c.ps1", "$env:@V@ <# c #> = 'C:\\x'\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a held value followed by a step up in another argument",
+            vec![(
+                "crates/x/tests/t.rs",
+                "cmd.env(\"@V@\", \"/tmp/x\").current_dir(\"..\");\n",
+            )],
+            "file: crates/x/tests/t.rs\n| cmd.env(\"@V@\", \"/tmp/x\").current_dir(\"..\");\nvalue: /tmp/x",
+            None,
         ),
     ];
     for (name, files, held, fails_with) in cases {
