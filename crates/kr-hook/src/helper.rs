@@ -346,26 +346,34 @@ mod tests {
         );
     }
 
-    /// On a clock that a case moves: a claim that finds a replacement holding it waits for the time
-    /// it is given and no longer, a pause at a time, and leaves the claim to the replacement.
+    /// On a clock that a case moves: a claim that finds a replacement holding it looks again after
+    /// each pause and goes on at the first look at or after the time it is given, which is that
+    /// time for a pause that divides it and the first multiple of the pause above it for one that
+    /// does not. A claim that does not read its clock, or reads it for more, ends elsewhere.
     #[test]
     fn a_claim_held_by_a_replacement_waits_for_the_time_it_is_given_and_no_longer() {
-        let made = crate::made::Made::new([]);
-        let answered = std::sync::Mutex::new(false);
-        let held = answered.lock().expect("the claim");
-        let within = Duration::from_millis(100);
-        let pause = Duration::from_millis(1);
-        claim(&answered, within, || made.now(), || made.pass(pause));
-        assert!(
-            made.passed() >= within && made.passed() <= within + pause,
-            "the claim waited {:?} for {within:?}",
-            made.passed()
-        );
-        drop(held);
-        assert!(
-            !*answered.lock().expect("the claim"),
-            "the claim was left to the replacement"
-        );
+        let within_ms: u64 = 100;
+        let within = Duration::from_millis(within_ms);
+        for pause_ms in [1, 7] {
+            let made = crate::made::Made::new([]);
+            let answered = std::sync::Mutex::new(false);
+            let _held = answered.lock().expect("the claim");
+            claim(
+                &answered,
+                within,
+                || made.now(),
+                || {
+                    made.pass(Duration::from_millis(pause_ms));
+                    // A claim that never ends fails here and does not hang.
+                    assert!(made.passed() <= within * 10, "the claim never ended");
+                },
+            );
+            assert_eq!(
+                made.passed(),
+                Duration::from_millis(within_ms.div_ceil(pause_ms) * pause_ms),
+                "the claim waited for {within:?} by pauses of {pause_ms} ms"
+            );
+        }
     }
 
     /// A claim goes on the moment a replacement lets it go, and takes it: the answer waits for the
