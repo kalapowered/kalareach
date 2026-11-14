@@ -250,7 +250,10 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
             }
             cause = None;
         }
-        if trimmed.contains("exit status: 126") || trimmed.contains("(exit 126)") {
+        if trimmed.contains("exit status: 126")
+            || trimmed.contains("exit code: 126")
+            || trimmed.contains("(exit 126)")
+        {
             saw_126 = true;
         }
         let named = cargo_refusal(trimmed)
@@ -314,10 +317,13 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
 
 /// Whether `status`, the text after a failed command in Cargo's line about it, is a status that a
 /// program gets for not being started: 1, which the runner ends with, or 126, which the shell does.
+/// Cargo writes the status as the platform's own text for it: `(exit status: N)` on Unix and
+/// `(exit code: N)` on Windows.
 fn is_a_refusal_status(status: &str) -> bool {
+    let status = status.trim_start();
     status
-        .trim_start()
         .strip_prefix("(exit status: ")
+        .or_else(|| status.strip_prefix("(exit code: "))
         .and_then(|rest| rest.split_once(')'))
         .is_some_and(|(code, _)| matches!(code, "1" | "126"))
 }
@@ -854,11 +860,20 @@ mod tests {
     fn the_shell_s_words_count_only_where_the_log_holds_exit_126() {
         let (found, _) = refusals(text(&["/t/a: /t/a: cannot execute binary file"]));
         assert!(found.is_empty(), "{found:?}");
-        let (found, _) = refusals(text(&[
-            "/t/a: /t/a: cannot execute binary file",
-            "process didn't exit successfully: `/t/a` (exit status: 126)",
-        ]));
-        assert_eq!(found.len(), 1);
+        // Cargo writes the status as the platform's own text for it, which is `exit status` on Unix
+        // and `exit code` on Windows.
+        for form in ["exit status", "exit code"] {
+            let (found, _) = refusals(text(&[
+                "/t/a: /t/a: cannot execute binary file",
+                &format!("process didn't exit successfully: `/t/a` ({form}: 126)"),
+            ]));
+            assert_eq!(found.len(), 1, "{form}");
+            let (found, _) = refusals(text(&[
+                "/t/a: /t/a: cannot execute binary file",
+                &format!("process didn't exit successfully: `/t/a` ({form}: 127)"),
+            ]));
+            assert!(found.is_empty(), "{form}: {found:?}");
+        }
     }
 
     #[test]
@@ -1109,12 +1124,19 @@ mod tests {
                 format!("  process didn't exit successfully: `/r run-one /t/a` ({status})");
             refusals(text(&[refused, &failed])).1
         };
-        assert!(!facts("exit status: 1").unexplained_failure);
-        // The shell ends with 126 for a program it could not execute.
-        assert!(!facts("exit status: 126").unexplained_failure);
-        assert!(facts("exit status: 101").unexplained_failure);
-        assert!(facts("exit status: 2").unexplained_failure);
-        assert!(facts("exit status: 10").unexplained_failure);
+        // Cargo writes the status as the platform's own text for it, which is `exit status` on Unix
+        // and `exit code` on Windows, and the same numbers account for a refused program on both.
+        for form in ["exit status", "exit code"] {
+            assert!(!facts(&format!("{form}: 1")).unexplained_failure, "{form}");
+            // The shell ends with 126 for a program it could not execute.
+            assert!(
+                !facts(&format!("{form}: 126")).unexplained_failure,
+                "{form}"
+            );
+            assert!(facts(&format!("{form}: 101")).unexplained_failure, "{form}");
+            assert!(facts(&format!("{form}: 2")).unexplained_failure, "{form}");
+            assert!(facts(&format!("{form}: 10")).unexplained_failure, "{form}");
+        }
         assert!(facts("signal: 9, SIGKILL: kill").unexplained_failure);
         let bare = "  process didn't exit successfully: `/r run-one /t/a`";
         assert!(refusals(text(&[refused, bare])).1.unexplained_failure);
