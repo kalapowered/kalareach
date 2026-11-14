@@ -795,6 +795,18 @@ jobs:
         if: ${{ matrix.part == 'first' }}
         run: cargo test --locked -p kr-term -p kr-project -p kr-cli
 
+      # Each language reads the evidence directory through one reader that refuses a value outside
+      # the platform's temporary roots. On this platform the Rust reader, the PowerShell reader and
+      # the shell reader under Git Bash meet Windows paths: the drive-relative and UNC forms, the
+      # extended-length form, short names and letter case.
+      - name: Test the Rust reader of the evidence directory
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        run: cargo test --locked -p kr-test-artifacts
+
+      - name: Test the PowerShell and shell readers of the evidence directory
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        run: cargo test --locked -p kr-conformance --test artifacts_readers
+
       - name: Test the worker's library
         if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-worker --lib
