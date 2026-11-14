@@ -538,6 +538,14 @@ impl TerminalEngine {
         self.engine.lane().pending() > 0
     }
 
+    /// Returns how many replies the response lane has dropped because each waited past its
+    /// deadline, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn replies_expired(&self) -> u64 {
+        self.engine.lane().degradation().expired
+    }
+
     /// Takes whatever the response lane is allowed to write right now.
     ///
     /// The lane holds a reply back while a bracketed paste or a human input frame is open, so the
