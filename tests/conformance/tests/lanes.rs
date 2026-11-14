@@ -53,6 +53,7 @@ fn options(platform: Platform) -> Options {
         lister: PathBuf::from("/tmp/l"),
         part: None,
         environment: Vec::new(),
+        runner_base: PathBuf::new(),
     }
 }
 
@@ -865,6 +866,8 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
     run.evidence = checked;
     run.steps = Some(vec![step]);
     run.lister = PathBuf::from(env!("CARGO_BIN_EXE_kr-conformance"));
+    let base = tempfile::tempdir().expect("a directory for the copy");
+    run.runner_base = base.path().to_path_buf();
     let document = report::run(&run, &mut |_| {}).expect("the run");
     assert!(document.passed(), "{:?}", document.problems);
     assert_eq!(

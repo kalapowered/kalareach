@@ -381,6 +381,9 @@ pub struct Options {
     /// Which part of the platform's plan this run is, as the number of the part from 1 and the
     /// number of parts, when the plan is run in parts by separate runs.
     pub part: Option<(usize, usize)>,
+    /// The directory the run makes the copy's own directory in. The program gives the
+    /// temporary directory; a case gives a directory that it removes.
+    pub runner_base: PathBuf,
 }
 
 /// Why a run stopped before it ran anything.
@@ -514,7 +517,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
     };
     let runner = runner_copy::private_copy(
         &options.lister,
-        &std::env::temp_dir(),
+        &options.runner_base,
         &build_directories(options),
     )
     .map_err(Stopped::PrivateCopy)?;

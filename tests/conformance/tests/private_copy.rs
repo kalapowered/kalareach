@@ -36,7 +36,7 @@ fn zeroing(path: &Path) -> Step {
     }
 }
 
-fn options(evidence: &Path, lister: PathBuf, steps: Vec<Step>) -> Options {
+fn options(evidence: &Path, base: &Path, lister: PathBuf, steps: Vec<Step>) -> Options {
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-private-copy");
     Options {
         root: tree("forms"),
@@ -56,6 +56,7 @@ fn options(evidence: &Path, lister: PathBuf, steps: Vec<Step>) -> Options {
             target.to_string_lossy().into_owned(),
         )],
         part: None,
+        runner_base: base.to_path_buf(),
     }
 }
 
@@ -65,6 +66,7 @@ fn a_step_that_writes_zeros_at_the_programs_shared_path_does_not_break_a_later_l
     let shared = held.path().join("kr-conformance");
     std::fs::copy(env!("CARGO_BIN_EXE_kr-conformance"), &shared).expect("a program to damage");
     let evidence = tempfile::tempdir().expect("an evidence directory");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let steps = vec![
         zeroing(&shared),
         Step::cargo(
@@ -74,7 +76,7 @@ fn a_step_that_writes_zeros_at_the_programs_shared_path_does_not_break_a_later_l
         ),
     ];
     let document = report::run(
-        &options(evidence.path(), shared.clone(), steps),
+        &options(evidence.path(), base.path(), shared.clone(), steps),
         &mut |_| {},
     )
     .unwrap_or_else(|stopped| panic!("{stopped:?}"));
@@ -109,10 +111,14 @@ fn marking(path: &Path) -> Step {
 fn a_program_that_cannot_be_copied_ends_the_run_with_a_failure_before_its_first_step() {
     let held = tempfile::tempdir().expect("a directory");
     let evidence = tempfile::tempdir().expect("an evidence directory");
+    let base = tempfile::tempdir().expect("a directory for the copy");
     let mark = held.path().join("ran");
     let missing = held.path().join("no-such-program");
     let steps = vec![marking(&mark)];
-    match report::run(&options(evidence.path(), missing, steps), &mut |_| {}) {
+    match report::run(
+        &options(evidence.path(), base.path(), missing, steps),
+        &mut |_| {},
+    ) {
         Err(Stopped::PrivateCopy(problem)) => {
             assert!(problem.contains("no-such-program"), "{problem}");
         }
