@@ -507,7 +507,24 @@ impl Controller {
         self.worker_client(&worker).await
     }
 
+    /// Opens this daemon's link to a worker, and one more where the worker says that a later
+    /// connection of this daemon holds its authority.
+    ///
+    /// A worker of an earlier build gives a role to the connection whose presentation it decides
+    /// last, and a worker of this build refuses a connection whose hello it answered before one it
+    /// accepted: either way a link this daemon opened and gave up on can end the new link's life
+    /// before its first exchange. The request that wanted the link is not refused for that. One
+    /// further link is opened inside the time the request has, and a second refusal is the answer.
     async fn open_worker(&self, worker: &KnownWorker) -> Result<BoundLink> {
+        match self.open_worker_once(worker).await {
+            Err(error) if is_displaced_by_a_later_connection(&error) => {
+                self.open_worker_once(worker).await
+            }
+            opened => opened,
+        }
+    }
+
+    async fn open_worker_once(&self, worker: &KnownWorker) -> Result<BoundLink> {
         let mut client = BoundLink::connect(&worker.endpoint, self.build_id.clone()).await?;
         // Two proofs, both required: the worker proves it is the one the descriptor names, and
         // this daemon proves which generation it speaks for.
@@ -529,4 +546,15 @@ impl Controller {
             .await?;
         Ok(client)
     }
+}
+
+/// Whether opening a link failed because the worker said that a later connection holds its
+/// authority: in answer to the presentation of the generation, or to the first thing the link was
+/// asked.
+fn is_displaced_by_a_later_connection(error: &ControllerError) -> bool {
+    matches!(
+        error,
+        ControllerError::Ipc(kr_ipc::IpcError::IdentityUnavailable { detail, .. })
+            if detail.contains(kr_worker::service::LATER_CONNECTION_HOLDS_AUTHORITY)
+    )
 }
