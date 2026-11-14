@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { chdir, cwd } from 'node:process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { artefactsDirectory } from '../e2e/evidence'
+import { artefactsDirectory, fullyQualified } from '../e2e/evidence'
 
 const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
@@ -109,5 +109,40 @@ describe('the evidence directory reader', () => {
     expect(read(join(parent, 'link', 'evidence'))).toBe(expected)
     expect(read(join(parent, 'target', 'evidence'))).toBe(expected)
     expect(() => read(join(parent, 'neighbour', 'evidence'))).toThrow(/temporary roots/)
+  })
+
+  it.skipIf(windows)('takes /tmp for a root where the temporary folder names another', () => {
+    vi.stubEnv('TMPDIR', folder(cwd()))
+    expect(read('/tmp/kr-evidence-reader-case/evidence')).toBe(
+      join(realpathSync.native('/tmp'), 'kr-evidence-reader-case', 'evidence')
+    )
+  })
+
+  it('takes a temporary folder that is a filesystem root for no root', () => {
+    const top = windows ? 'C:\\' : '/'
+    for (const name of ['TMPDIR', 'TEMP', 'TMP', 'RUNNER_TEMP']) vi.stubEnv(name, top)
+    expect(() => read(elsewhere)).toThrow(/temporary roots/)
+  })
+
+  it.skipIf(!windows)('takes a runner folder that depends on the current drive for no root', () => {
+    vi.stubEnv('RUNNER_TEMP', '\\Windows')
+    expect(() => read(elsewhere)).toThrow(/temporary roots/)
+  })
+
+  it.each([
+    ['/x', false, true],
+    ['x', false, false],
+    ['', false, false],
+    ['C:\\x', true, true],
+    ['C:/x', true, true],
+    ['\\\\server\\share\\x', true, true],
+    ['\\\\?\\C:\\x', true, true],
+    ['//?/C:/x', true, true],
+    ['\\x', true, false],
+    ['/x', true, false],
+    ['C:x', true, false],
+    ['x\\y', true, false]
+  ])('says of %s on Windows=%s that it is fully qualified: %s', (path, onWindows, expected) => {
+    expect(fullyQualified(path, onWindows)).toBe(expected)
   })
 })

@@ -12,8 +12,9 @@
 # refused (which ends a step that stops on errors, as a workflow's pwsh step does).
 #
 # The temporary roots are the folder the system names for the user's temporary files (TMPDIR on
-# Unix, TEMP on Windows), the folder RUNNER_TEMP names, and on Unix /tmp, where each is an absolute
-# path to a directory. A root is resolved through its links as the platform resolves it (/tmp is
+# Unix, TEMP on Windows), the folder RUNNER_TEMP names, and on Unix /tmp, where each is a fully
+# qualified path to a directory (on Windows C:\..., a UNC path or an extended-length path; a path
+# that depends on the current drive is none of them). A root is resolved through its links as the platform resolves it (/tmp is
 # /private/tmp on macOS, a short Windows name is its long one), and so is the part of the value
 # that exists, so a link inside a root that leads out of it is refused and a root that is itself
 # behind a link is honoured. A value is compared with a root by path components, never by text:
@@ -28,6 +29,16 @@ $variable = 'KR_TEST_ARTIFACTS_DIR'
 $windows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 $comparison = if ($windows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
 $separators = [char[]] @([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+
+# A path in the extended-length form (\\?\C:\... or \\?\UNC\server\share\...) as the ordinary form the
+# platform's temporary folder is given in; any other path as it is.
+function Remove-ExtendedPrefix {
+    param([string] $Path)
+    if (-not $windows) { return $Path }
+    if ($Path.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return '\\' + $Path.Substring(8) }
+    if ($Path.StartsWith('\\?\')) { return $Path.Substring(4) }
+    return $Path
+}
 
 # The path with every link in it resolved, as the platform resolves them. The part that does not
 # exist yet is kept as written.
@@ -66,10 +77,17 @@ function Get-TemporaryRoots {
     if (-not $windows) { $named += '/tmp' }
     $roots = @()
     foreach ($candidate in $named) {
-        if ([string]::IsNullOrEmpty($candidate) -or -not [System.IO.Path]::IsPathRooted($candidate)) { continue }
+        # A path that depends on the current drive (\folder) or on a drive's current directory
+        # (C:folder) is rooted but names no one place, so it is no root.
+        if ([string]::IsNullOrEmpty($candidate) -or -not [System.IO.Path]::IsPathFullyQualified($candidate)) { continue }
+        $candidate = Remove-ExtendedPrefix $candidate
         if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
-        $real = (Get-RealPath $candidate).TrimEnd($separators)
-        if ($real -and -not ($roots -contains $real)) { $roots += $real }
+        $found = Get-RealPath $candidate
+        # A temporary folder that is a filesystem root (/, C:\, a share's top) would admit every
+        # path on its disk.
+        if ($found.TrimEnd($separators) -eq [System.IO.Path]::GetPathRoot($found).TrimEnd($separators)) { continue }
+        $real = $found.TrimEnd($separators)
+        if (-not ($roots -contains $real)) { $roots += $real }
     }
     return $roots
 }
@@ -84,11 +102,9 @@ function Stop-Refused {
 function Confine-Value {
     param([string] $Value)
     if ([string]::IsNullOrEmpty($Value)) { Stop-Refused $Value 'it is empty' }
-    if (-not [System.IO.Path]::IsPathRooted($Value) -or ($windows -and $Value -notmatch '^[A-Za-z]:[\\/]')) {
-        Stop-Refused $Value 'it is not an absolute path'
-    }
+    if (-not [System.IO.Path]::IsPathFullyQualified($Value)) { Stop-Refused $Value 'it is not an absolute path' }
     if ($Value.Split($separators) -contains '..') { Stop-Refused $Value 'it steps up a directory with `..`' }
-    $real = (Get-RealPath $Value).TrimEnd($separators)
+    $real = (Get-RealPath (Remove-ExtendedPrefix $Value)).TrimEnd($separators)
     foreach ($root in (Get-TemporaryRoots)) {
         if ($real.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, $comparison)) { return $real }
     }
