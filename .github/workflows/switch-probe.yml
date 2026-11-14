@@ -69,5 +69,5 @@ jobs:
       - name: Run the probe
         env:
           KR_PROBE_PROTECTION: ${{ matrix.protection }}
-          KR_PROBE_SECONDS: "300"
-        run: cargo test --locked -p kr-ipc --test install probe_current_during_a_switch -- --nocapture --test-threads=1
+          KR_PROBE_SECONDS: "150"
+        run: cargo test --locked -p kr-ipc --test install probe_current_during_a -- --nocapture --test-threads=1

@@ -2142,6 +2142,7 @@ mod switch_probe {
     }
 
     /// What `std::fs::read_link` does, in its two steps, so that a refusal says which step.
+    #[allow(unsafe_code)]
     fn stepped_read(link: &Path) -> Result<(), Refusal> {
         let file = std::fs::OpenOptions::new()
             .access_mode(0)
@@ -2214,8 +2215,23 @@ mod switch_probe {
             .unwrap_or(default)
     }
 
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Replace,
+        Retarget,
+    }
+
     #[test]
     fn probe_current_during_a_switch() {
+        measure(Mode::Replace, "replace");
+    }
+
+    #[test]
+    fn probe_current_during_a_retarget() {
+        measure(Mode::Retarget, "retarget");
+    }
+
+    fn measure(mode: Mode, name: &str) {
         struct Stop<'a>(&'a AtomicBool);
         impl Drop for Stop<'_> {
             fn drop(&mut self) {
@@ -2251,7 +2267,11 @@ mod switch_probe {
                 .map(|_| scope.spawn(|| reader(&test.store, &finished)))
                 .collect();
             while switches < cap && began.elapsed() < Duration::from_secs(seconds) {
-                test.switch(if switches % 2 == 0 { &two } else { &one });
+                let next = if switches % 2 == 0 { &two } else { &one };
+                match mode {
+                    Mode::Replace => test.switch(next),
+                    Mode::Retarget => test.store.probe_retarget(next).expect("retargets"),
+                }
                 switches += 1;
             }
             finished.store(true, Ordering::SeqCst);
@@ -2278,7 +2298,7 @@ mod switch_probe {
             lines.extend(tally.lines);
         }
         println!(
-            "PROBE-RUN protection={protection} readers={readers} switches={switches} seconds={}",
+            "PROBE-RUN mode={name} protection={protection} readers={readers} switches={switches} seconds={}",
             began.elapsed().as_secs()
         );
         for (label, count) in &ok {

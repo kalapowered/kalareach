@@ -2358,6 +2358,18 @@ pub fn hold_writers(
 
 #[cfg(windows)]
 impl Store {
+    /// Measurement only: points the existing `current` at `release` in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the retarget.
+    pub fn probe_retarget(&self, release: &ReleaseName) -> Result<()> {
+        let target = std::path::absolute(self.release_directory(release))
+            .map_err(|error| InstallError::io("resolve", self.release_directory(release), error))?;
+        windows::retarget_junction(&self.current_link(), &target)
+            .map_err(|error| InstallError::io("retarget", self.current_link(), error))
+    }
+
     /// Makes `release` current: one new junction, renamed over `current` in one step, and the
     /// store's directory flushed so the rename survives a crash. Nothing else changes.
     ///
