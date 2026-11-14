@@ -341,7 +341,7 @@ impl DataReader {
     /// # Errors
     ///
     /// As [`DataReader::read_message`]; a reset that arrives while there is no room is the error
-    /// a read of the reset stream gives.
+    /// a read of the reset stream gives, with the peer's code.
     pub async fn read_message_when<T: kr_protocol::wire::WireMessage>(
         &mut self,
         room: &mut tokio::sync::watch::Receiver<bool>,
@@ -357,12 +357,15 @@ impl DataReader {
                     }
                 }
                 reset = self.reader.peer_reset() => {
-                    if !reset {
-                        // Finished or stopped: nothing is left to hear, and the frames that wait
-                        // are read when there is room.
-                        let _ = room.wait_for(|room| *room).await;
-                    }
-                    return self.read_message().await;
+                    return match reset {
+                        Some(error) => self.handle.revoke_if_cut(Err(error)),
+                        None => {
+                            // Finished or stopped: nothing is left to hear, and the frames that
+                            // wait are read when there is room.
+                            let _ = room.wait_for(|room| *room).await;
+                            self.read_message().await
+                        }
+                    };
                 }
                 () = self.handle.revoked() => return Err(TransportError::ControlLost),
             }
