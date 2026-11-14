@@ -196,19 +196,16 @@ stolen_words() {
 }
 
 # The evidence directory, and a working directory of this run's own.
-if [ -z "${KR_TEST_ARTIFACTS_DIR:-}" ]; then
-  temporary="${TMPDIR:-/tmp}"
-  KR_TEST_ARTIFACTS_DIR="$(mktemp -d "${temporary%/}/kalareach-bench.XXXXXX")" || exit 1
-fi
-if ! mkdir -p "$KR_TEST_ARTIFACTS_DIR" || [ ! -w "$KR_TEST_ARTIFACTS_DIR" ]; then
-  echo "bench-all: the evidence directory $KR_TEST_ARTIFACTS_DIR cannot be written" >&2
+# The reader gives an absolute path, which each suite needs because it runs in its own package's
+# directory and would read a relative path as a directory of its own.
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$root/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+evidence="$kr_artifacts"
+if ! mkdir -p "$evidence" || [ ! -w "$evidence" ]; then
+  echo "bench-all: the evidence directory $evidence cannot be written" >&2
   exit 1
 fi
-# Absolute, because each suite runs in its own package's directory and would read a relative path
-# as a directory of its own.
-evidence="$(cd "$KR_TEST_ARTIFACTS_DIR" && pwd)"
-KR_TEST_ARTIFACTS_DIR="$evidence"
-export KR_TEST_ARTIFACTS_DIR
 record="$evidence/bench-all.md"
 temporary="${TMPDIR:-/tmp}"
 work="$(mktemp -d "${temporary%/}/kalareach-bench-work.XXXXXX")" || exit 1

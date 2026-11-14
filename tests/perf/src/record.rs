@@ -29,9 +29,6 @@ mod conditions;
 
 use conditions::{Host, MAX_STOLEN_SHARE, REFERENCE_CORES, REFERENCE_MEMORY_BYTES, StolenTime};
 
-/// The variable that names where a run keeps its evidence.
-pub const ARTIFACTS: &str = "KR_TEST_ARTIFACTS_DIR";
-
 /// How many steps the fixed piece of work a host's speed is read by has.
 const SPEED_STEPS: u64 = 20_000_000;
 
@@ -502,7 +499,8 @@ fn load_average() -> Option<String> {
 
 /// Prints one measurement's section and keeps it where the run keeps its evidence.
 ///
-/// A run that has not set `KR_TEST_ARTIFACTS_DIR` prints the section and keeps nothing.
+/// A run that has not set `KR_TEST_ARTIFACTS_DIR` keeps the section in a directory of its own under
+/// the temporary folder.
 ///
 /// # Panics
 ///
@@ -510,8 +508,12 @@ fn load_average() -> Option<String> {
 /// is missing has none, and an earlier record in the same place would hide that. The lines are
 /// printed first, so nothing measured is lost with the file.
 pub fn report(file: &str, measurement: &str, lines: &[String]) {
-    let directory = std::env::var_os(ARTIFACTS).map(PathBuf::from);
-    report_in(directory.as_deref(), file, measurement, lines);
+    report_in(
+        Some(&kr_test_artifacts::directory()),
+        file,
+        measurement,
+        lines,
+    );
 }
 
 /// [`report`], with the evidence directory given rather than read from the environment.

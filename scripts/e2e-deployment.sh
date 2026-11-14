@@ -108,7 +108,10 @@ done
 # under it and writes one log per leg there, so a leg that failed leaves its whole output behind
 # rather than the few lines this report prints. It is a directory this run made: nothing here
 # removes anything, so a second run beside this one keeps its own evidence and neither loses it.
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$root/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts"
 case "$artefacts" in
   /*) ;;
   *) artefacts="$PWD/$artefacts" ;;

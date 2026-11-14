@@ -1004,485 +1004,297 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
 }
 
 /// The variable that names the one directory every test artefact of a run is kept in.
-const ARTIFACTS_VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
+const VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
 
-/// How a value may begin and still lie in a temporary folder: `/tmp`, or the runner's or the
-/// platform's temporary folder, spelled as a shell, PowerShell and the workflow syntax spell it. A
-/// shell's `$TMPDIR` alone is not here, since a shell that has none gives `/`: it needs a default,
-/// which `lies_in_a_temporary_folder` reads.
-const TEMPORARY_FOLDERS: [&str; 7] = [
-    "/tmp/",
-    "$RUNNER_TEMP",
-    "${RUNNER_TEMP}",
-    "$env:RUNNER_TEMP",
-    "${{ runner.temp }}",
-    "$env:TEMP",
-    "$env:TMP",
+/// Each language's one reader of the variable, where its definition is, and the cases that run the
+/// readers with the variable set. They are the files that may read it as they like.
+const READERS: [&str; 7] = [
+    "tests/support/artifacts/src/lib.rs",
+    "scripts/lib/artifacts-dir.sh",
+    "scripts/artifacts-dir.ps1",
+    "apps/companion/e2e/evidence.ts",
+    "tests/conformance/tests/artifacts_readers.rs",
+    "apps/companion/test/artefacts-dir.test.ts",
+    "tests/conformance/tests/ci_evidence.rs",
 ];
 
-/// The values made from the variable's own value, which is the one checked where it was set: the
-/// variable itself, and the two commands that make its path absolute or a Windows path a POSIX one.
-const DERIVED_FROM_ITSELF: [&str; 4] = [
-    "$KR_TEST_ARTIFACTS_DIR",
-    "${KR_TEST_ARTIFACTS_DIR}",
-    "$(cygpath -u \"$KR_TEST_ARTIFACTS_DIR\")",
-    "$(cd \"$KR_TEST_ARTIFACTS_DIR\" && pwd)",
-];
-
-/// The assignments the build's own scripts make that the case cannot follow to a temporary folder,
-/// each with the reason it is allowed: the file, the text of the line, and why.
-const UNFOLLOWED_ASSIGNMENTS: [(&str, &str, &str); 1] = [(
-    "scripts/store-android.sh",
-    "KR_TEST_ARTIFACTS_DIR=\"$leg/e2e\"",
-    "the store build keeps the logs of its release check beside the signed bundle, in the directory \
-     the caller names, and that check keeps its screenshots in the folder its own default names",
-)];
-
-/// The tools that take a screenshot, by the name a workflow step runs them under.
-const SCREENSHOT_TOOLS: [&str; 12] = [
-    "check-test-evidence.sh",
-    "desktop-controls-macos.sh",
-    "android-app-launch.sh",
-    "ios-app-launch.sh",
-    "e2e-permissions.sh",
-    "e2e-pairing-device.sh",
-    "e2e-mobile.sh",
-    "e2e-voice-device.sh",
-    "e2e-voice-call-device.sh",
-    "e2e-push-device.sh",
-    "e2e-update.sh",
-    "playwright",
-];
-
-/// Whether `value` begins with the folder `folder`, as a whole name and not as the start of a longer
-/// one (`$env:TEMP` is not `$env:TEMPLATES`).
-fn begins_with_folder(value: &str, folder: &str) -> bool {
-    value.strip_prefix(folder).is_some_and(|rest| {
-        folder.ends_with('/') || rest.is_empty() || rest.starts_with(['/', '\\'])
-    })
+/// The languages whose files may name the variable, each with how a whole-line comment begins.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Language {
+    /// Code with `//` comments.
+    Slashes,
+    /// Code, a workflow or a manifest with `#` comments.
+    Hash,
+    /// Prose, where every line is a comment.
+    Prose,
 }
 
-/// The name and the default of a value that begins with `${NAME:-default}`.
-fn expansion_default(value: &str) -> Option<(&str, String)> {
-    let (name, after) = value.strip_prefix("${")?.split_once(":-")?;
-    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .then(|| (name, after.chars().take_while(|c| *c != '}').collect()))
+fn language(path: &str) -> Option<Language> {
+    let extension = path.rsplit_once('.')?.1;
+    match extension {
+        "rs" | "ts" | "tsx" | "js" | "mjs" => Some(Language::Slashes),
+        "sh" | "bash" | "ps1" | "psm1" | "yml" | "yaml" | "toml" => Some(Language::Hash),
+        "md" => Some(Language::Prose),
+        _ => None,
+    }
 }
 
-/// `value` with the quotes around it taken off.
-fn unquoted(value: &str) -> &str {
-    value.trim().trim_matches(['"', '\''])
-}
-
-/// The value at the start of `rest`: a quoted one to its closing quote, an unquoted one to the next
-/// space, a command substitution inside either read whole.
-fn leading_value(rest: &str) -> String {
-    let quoted = rest.starts_with('"');
-    let mut value = String::new();
-    let mut depth = 0_usize;
-    let mut characters = rest.chars().skip(usize::from(quoted)).peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '$' if characters.peek() == Some(&'(') => {
-                depth += 1;
-                value.push(character);
-                value.extend(characters.next());
-            }
-            ')' if depth > 0 => {
-                depth -= 1;
-                value.push(character);
-            }
-            '"' if depth == 0 => break,
-            ' ' | '\t' if depth == 0 && !quoted => break,
-            _ => value.push(character),
+/// Whether the whole line is a comment.
+fn is_comment(language: Language, line: &str) -> bool {
+    let line = line.trim_start();
+    match language {
+        Language::Prose => true,
+        Language::Hash => line.starts_with('#'),
+        Language::Slashes => {
+            line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
         }
     }
-    value
 }
 
-/// The value a line gives the variable: an entry of a workflow's `env` (`NAME: value`) or an
-/// assignment (`NAME=value`, after `export`, in front of a command, or inside the quoted line a
-/// PowerShell step writes to the job's environment file). A comment gives none.
-fn artifacts_assignment(line: &str) -> Option<String> {
+/// Where the name stands in `line` as a whole name.
+fn occurrences(line: &str) -> Vec<usize> {
+    let word = |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    line.match_indices(VARIABLE)
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            !word(line[..at].chars().next_back())
+                && !word(line[at + VARIABLE.len()..].chars().next())
+        })
+        .collect()
+}
+
+/// Whether the name at `at` is being given a value, in one of the forms a write takes: an
+/// assignment (`NAME=value`, also behind `export`, a quote or a PowerShell `$env:`), a key of a
+/// workflow's `env` (`NAME: value`), or a program's environment (`.env("NAME", value)`). A write
+/// needs no proof here: the reader refuses a wrong value where it is used.
+fn is_write(line: &str, at: usize) -> bool {
+    let before = &line[..at];
+    let after = &line[at + VARIABLE.len()..];
+    let assigns = after
+        .trim_start()
+        .strip_prefix('=')
+        .is_some_and(|rest| !rest.starts_with('='));
+    let target = before.is_empty()
+        || before.ends_with(char::is_whitespace)
+        || before.ends_with(['"', '\'', ';'])
+        || before.ends_with("$env:");
+    let key = before.trim().is_empty() && after.starts_with(": ");
+    let program = before.ends_with(".env(\"") && after.starts_with("\",");
+    (assigns && target && !before.ends_with("${")) || key || program
+}
+
+/// Whether the line hands the directory to the upload of a run's evidence (`path:` or a line of its
+/// list), which reads the files the readers' directory holds and writes none.
+fn is_upload(line: &str) -> bool {
+    let expression = format!("${{{{ env.{VARIABLE} }}}}");
     let line = line.trim();
-    if line.starts_with('#') || line.starts_with("//") {
-        return None;
-    }
-    if let Some(rest) = line.strip_prefix(&format!("{ARTIFACTS_VARIABLE}:")) {
-        return Some(unquoted(without_comment(rest)).to_owned());
-    }
-    let at = line.find(&format!("{ARTIFACTS_VARIABLE}="))?;
-    Some(leading_value(&line[at + ARTIFACTS_VARIABLE.len() + 1..]))
+    line == expression || line == format!("path: {expression}")
 }
 
-/// Whether a line writes the variable in a way `artifacts_assignment` does not read: PowerShell's
-/// `$env:NAME = value`, `NAME += value`, a setter that takes the name and a value
-/// (`SetEnvironmentVariable('NAME', value)`), an object key in a script, or an expansion with a
-/// form of default or alternate other than `${NAME:-default}`, `${NAME:?}` and `${NAME:+word}`. A
-/// comparison, a plain read and an expansion with a default are not writes.
-///
-/// Where a `[` or `test ` stands anywhere before the name on the line, the `=` after the name is
-/// taken for a comparison. So Python's `os.environ["NAME"] = value` and JavaScript's
-/// `process.env['NAME'] = value` are not read as writes, and nor is a write with no `=` or `:`
-/// after the name (`printf` into the environment file, `printf -v`, `read`, `NAME<<EOF`).
-fn writes_unread(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') || trimmed.starts_with("//") || artifacts_assignment(line).is_some()
+/// What is wrong with one file's naming of the variable, one finding for each line.
+fn findings(path: &str, bytes: &[u8]) -> Vec<String> {
+    if READERS.contains(&path)
+        || !bytes
+            .windows(VARIABLE.len())
+            .any(|w| w == VARIABLE.as_bytes())
     {
-        return false;
+        return Vec::new();
     }
-    line.match_indices(ARTIFACTS_VARIABLE).any(|(at, _)| {
-        let head = &line[..at];
-        let after = line[at + ARTIFACTS_VARIABLE.len()..]
-            .trim_start_matches(['"', '\'', ']', ')'])
-            .trim_start();
-        if head.ends_with("${") {
-            return !(after.starts_with(":-")
-                || after.starts_with(":?")
-                || after.starts_with(":+")
-                || after.starts_with('}'));
-        }
-        let call_or_key = head.trim_end_matches(['"', '\'', ' ', '\t']);
-        let comparison = head.contains('[') || head.contains("test ");
-        (after.starts_with('=')
-            && !after.starts_with("==")
-            && !after.starts_with("=~")
-            && !comparison)
-            || after.starts_with("+=")
-            || (after.starts_with(',') && call_or_key.ends_with('('))
-            || (after.starts_with(':')
-                && !after.starts_with(":-")
-                && call_or_key.ends_with(['{', ',']))
-    })
-}
-
-/// What a script falls back on where the variable is unset: the text of each `${NAME:-default}` on
-/// a line, less the empty ones, which only pass on what the caller gave.
-fn artifacts_defaults(line: &str) -> Vec<String> {
-    let opening = format!("${{{ARTIFACTS_VARIABLE}:-");
-    line.match_indices(&opening)
-        .map(|(at, _)| {
-            let mut depth = 0_usize;
-            let mut default = String::new();
-            for character in line[at + opening.len()..].chars() {
-                match character {
-                    '{' => depth += 1,
-                    '}' if depth == 0 => break,
-                    '}' => depth -= 1,
-                    _ => {}
-                }
-                default.push(character);
-            }
-            default
-        })
-        .filter(|default| !default.is_empty())
-        .collect()
-}
-
-/// The name of the variable a value begins with, in a shell's (`$name`, `${name`) or PowerShell's
-/// (`$name`) spelling. `$env:` and `$(` begin no name.
-fn leading_variable(value: &str) -> Option<&str> {
-    let rest = value
-        .strip_prefix("${")
-        .or_else(|| value.strip_prefix('$'))?;
-    let end = rest
-        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-        .unwrap_or(rest.len());
-    (end > 0).then(|| &rest[..end])
-}
-
-/// Every non-empty value `text` gives the variable `name`, in a shell's spelling (`name=value`) or
-/// PowerShell's (`$name = value`).
-fn values_of(text: &str, name: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let line = ["local ", "export ", "readonly "]
-                .iter()
-                .find_map(|word| line.strip_prefix(word))
-                .unwrap_or(line);
-            let rest = line
-                .strip_prefix(&format!("{name}="))
-                .or_else(|| line.strip_prefix(&format!("${name} = ")))
-                .or_else(|| line.strip_prefix(&format!("${name}=")))?;
-            let value = if let Some(command) = rest.strip_prefix("Join-Path ") {
-                command
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned()
-            } else if let Some(command) = rest.strip_prefix("(Get-Item ") {
-                command.split(')').next().unwrap_or_default().to_owned()
-            } else {
-                leading_value(rest)
-            };
-            (!value.is_empty()).then_some(value)
-        })
-        .collect()
-}
-
-/// Whether `value`, as a script or a workflow writes it, lies in a temporary folder: it begins with
-/// one, or with the default that a `${NAME:-default}` falls back on, or with a command that makes a
-/// directory in one, or with another variable of `text` whose every value does. A value made from
-/// the variable's own value is the one checked where that was set. A step up (`..`) is never inside.
-fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
-    let value = unquoted(value);
-    if depth == 0 || value.is_empty() || value.split(['/', '\\']).any(|part| part == "..") {
-        return false;
-    }
-    if DERIVED_FROM_ITSELF.contains(&value)
-        || value.starts_with("$KR_TEST_ARTIFACTS_DIR/")
-        || value.starts_with("${KR_TEST_ARTIFACTS_DIR}/")
-    {
-        return true;
-    }
-    if let Some((name, default)) = expansion_default(value) {
-        // The variable's own default is the one to check; a folder variable's default may be `/tmp`
-        // itself, which a path under it then extends; any other name is also read where this text
-        // gives it a value, since that value is what the expansion yields when it is set.
-        let in_a_folder = lies_in_a_temporary_folder(&default, text, depth - 1);
-        return if name == ARTIFACTS_VARIABLE {
-            default.is_empty() || in_a_folder
-        } else if ["TMPDIR", "RUNNER_TEMP", "TEMP", "TMP"].contains(&name) {
-            default == "/tmp" || in_a_folder
-        } else {
-            let values = values_of(text, name);
-            in_a_folder
-                && !values.is_empty()
-                && values
-                    .iter()
-                    .all(|value| lies_in_a_temporary_folder(value, text, depth - 1))
-        };
-    }
-    if TEMPORARY_FOLDERS
-        .iter()
-        .any(|folder| begins_with_folder(value, folder))
-    {
-        return true;
-    }
-    if value.starts_with("$(")
-        && let Some(after) = value.split("mktemp").nth(1)
-    {
-        let mut rest = after.trim_start();
-        while rest.starts_with('-') {
-            rest = rest
-                .split_once(char::is_whitespace)
-                .map_or("", |(_, tail)| tail);
-            rest = rest.trim_start();
-        }
-        return lies_in_a_temporary_folder(&leading_value(rest), text, depth - 1);
-    }
-    leading_variable(value).is_some_and(|name| {
-        let values = values_of(text, name);
-        !values.is_empty()
-            && values
-                .iter()
-                .all(|value| lies_in_a_temporary_folder(value, text, depth - 1))
-    })
-}
-
-/// Every file under `directory` whose name ends in one of `endings`.
-fn files_ending(directory: &Path, endings: &[&str], found: &mut Vec<PathBuf>) {
-    let mut entries: Vec<PathBuf> = fs::read_dir(directory)
-        .unwrap_or_else(|error| panic!("{} is read: {error}", directory.display()))
-        .map(|entry| entry.expect("an entry").path())
-        .collect();
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            files_ending(&path, endings, found);
-        } else if endings
-            .iter()
-            .any(|ending| path.to_string_lossy().ends_with(ending))
-        {
-            found.push(path);
-        }
-    }
-}
-
-/// Whether a step's own `if` is the constant false, so that the step never runs. A step that may
-/// fail without stopping the job (`continue-on-error`) still runs.
-fn never_runs(step: &str) -> bool {
-    step.lines().any(|line| {
-        let Some((_, key, value)) = key_value(line) else {
-            return false;
-        };
-        let value = compact(value.split(" #").next().unwrap_or_default());
-        key == "if" && (value == "false" || value == "${{false}}")
-    })
-}
-
-/// KR-REQ-27.03, the part about the build's directory: every value the workflows and scripts it
-/// reads give the artefacts directory, as `NAME=value`, `NAME: value` or the default of
-/// `${NAME:-default}`, lies in a temporary folder (`/tmp`, or the runner's or the platform's own),
-/// and a job that runs a screenshot tool has the variable set when that step starts. A value
-/// spelled in a way this does not know is refused; the one assignment it cannot follow is named,
-/// with its reason.
-///
-/// The case reads a fixed list of forms as text, and other forms pass it. It has four gaps:
-///
-/// - A variable that a value names is read from any definition of it in the same file (`name=value`
-///   or PowerShell's `$name = value`), wherever that stands, so a definition below the write or in
-///   another step can make the write pass. A definition in a workflow's `env` or one made through
-///   the environment file is not read.
-/// - An assignment after a `[` on the same line, which is how Python and JavaScript write
-///   `os.environ["NAME"] = value` and `process.env['NAME'] = value`, is taken for a comparison.
-/// - A write with no `=` or `:` after the name is not seen: `printf` into the environment file,
-///   `printf -v`, `read`, and the `NAME<<EOF` form.
-/// - Files outside `.github` and the root `scripts/` directory are not read, and inside them only
-///   workflows (`.yml`, `.yaml`) and scripts ending in `.sh`, `.bash`, `.py`, `.mjs`, `.js` or
-///   `.ps1`.
-///
-/// Not shown here: that each run gets a directory of its own (the scripts' fixed default is shared
-/// by successive runs on one machine) and that on macOS the default is the OS-resolved `$TMPDIR`
-/// rather than `/tmp`; the directory the evidence check accepts is shown by the two cases in the
-/// conformance library.
-#[test]
-fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder() {
-    let root = repository();
-    let mut workflows = Vec::new();
-    files_ending(&root.join(".github"), &[".yml", ".yaml"], &mut workflows);
-    let mut scripts = Vec::new();
-    files_ending(
-        &root.join("scripts"),
-        &[".sh", ".bash", ".py", ".mjs", ".js", ".ps1"],
-        &mut scripts,
-    );
-    let mut outside = Vec::new();
-    let mut seen = 0_usize;
-    for path in workflows.iter().chain(&scripts) {
-        let name = path
-            .strip_prefix(&root)
-            .expect("under the repository")
-            .to_string_lossy()
-            .into_owned();
-        let text =
-            fs::read_to_string(path).unwrap_or_else(|error| panic!("{name} is read: {error}"));
-        for (number, line) in text.lines().enumerate() {
-            if writes_unread(line) {
-                outside.push(format!(
-                    "{name}:{}: a write of the variable this case does not read: {}",
-                    number + 1,
-                    line.trim()
-                ));
-            }
-            let mut values: Vec<String> = artifacts_assignment(line).into_iter().collect();
-            seen += values.len();
-            if let Some(excused) = UNFOLLOWED_ASSIGNMENTS
-                .iter()
-                .find(|(file, needle, _)| *file == name && line.contains(needle))
-            {
-                assert!(!excused.2.is_empty(), "an exception names its reason");
-                values.clear();
-            }
-            for default in artifacts_defaults(line) {
-                seen += 1;
-                values.push(default);
-            }
-            for value in values {
-                if !lies_in_a_temporary_folder(&value, &text, 6) {
-                    outside.push(format!("{name}:{}: {value}", number + 1));
-                }
-            }
-        }
-    }
-    assert!(seen >= 30, "the case found only {seen} values to read");
-    assert!(
-        outside.is_empty(),
-        "values outside a temporary folder:\n{}",
-        outside.join("\n")
-    );
-
-    // The one assignment the case does not follow is made by a store build whose release check keeps
-    // its screenshots where the check's own default puts them: that has to stay in a temporary
-    // folder, or the exception hides a screenshot outside one.
-    let check = fs::read_to_string(root.join("scripts/e2e-android-release.sh")).expect("the check");
-    let shots = values_of(&check, "shots");
-    assert!(
-        !shots.is_empty()
-            && shots.iter().all(|value| expansion_default(value)
-                .is_some_and(|(_, default)| lies_in_a_temporary_folder(&default, &check, 6))),
-        "the store build's release check keeps its screenshots outside a temporary folder: {shots:?}"
-    );
-    let store = fs::read_to_string(root.join("scripts/store-android.sh")).expect("the store build");
-    assert!(
-        !store.contains("KR_PAIRING_SHOTS"),
-        "the store build gives its release check another folder for its screenshots"
-    );
-
-    // The companion's browser tests keep their screenshots under the variable, and under `/tmp`
-    // where it is unset.
-    let browser =
-        fs::read_to_string(root.join("apps/companion/e2e/evidence.ts")).expect("evidence");
-    assert!(
-        browser.contains("env['KR_TEST_ARTIFACTS_DIR'] ?? '/tmp/kr-test-artifacts'"),
-        "the browser tests' default directory is not under /tmp"
-    );
-
-    // A job that runs a screenshot tool has the variable when that step starts: from its workflow,
-    // from its own `env`, from a step that wrote it to the job's environment file earlier, or from
-    // the step's own `env` or an assignment in the step ahead of the tool.
-    let mut steps_with_a_tool = 0_usize;
-    for path in &workflows {
-        let name = path
-            .file_name()
-            .expect("a name")
-            .to_string_lossy()
-            .into_owned();
-        let text = fs::read_to_string(path).expect("a workflow");
-        if !text.lines().any(|line| without_comment(line) == "jobs:") {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return vec![format!(
+            "{path}: names {VARIABLE} and is not text this case can read"
+        )];
+    };
+    let Some(language) = language(path) else {
+        return vec![format!(
+            "{path}: names {VARIABLE} in a language this case does not know"
+        )];
+    };
+    let mut found = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let names = occurrences(line);
+        if names.is_empty() || is_comment(language, line) {
             continue;
         }
-        let set_for_all = text
-            .lines()
-            .take_while(|line| without_comment(line) != "jobs:")
-            .any(|line| artifacts_assignment(line).is_some());
-        for job_name in jobs_of(&text) {
-            let body = job(&text, &job_name);
-            let mut set = set_for_all
-                || body
-                    .lines()
-                    .take_while(|line| !line.starts_with("    steps:"))
-                    .any(|line| artifacts_assignment(line).is_some());
-            for step in steps_of(&body) {
-                if never_runs(&step) {
-                    continue;
-                }
-                let lines: Vec<&str> = step.lines().collect();
-                // The tool is named in a command, not in the step's name; the step's own `env`
-                // gives the variable wherever it stands in the step; an assignment in a command
-                // counts only ahead of the tool, and a write to the environment file counts for the
-                // steps after this one, not for this one.
-                let tool = lines.iter().position(|line| {
-                    let text = line.trim_start().trim_start_matches("- ");
-                    !text.starts_with("name:")
-                        && SCREENSHOT_TOOLS.iter().any(|tool| line.contains(tool))
-                });
-                let in_env = lines
-                    .iter()
-                    .any(|line| line.trim().starts_with(&format!("{ARTIFACTS_VARIABLE}:")));
-                let own = lines.iter().position(|line| {
-                    !line.contains("GITHUB_ENV") && artifacts_assignment(line).is_some()
-                });
-                if let Some(tool) = tool {
-                    steps_with_a_tool += 1;
-                    assert!(
-                        set || in_env || own.is_some_and(|own| own <= tool),
-                        "{name}: the job {job_name} runs a screenshot tool in a step that has no \
-                         {ARTIFACTS_VARIABLE} yet:\n{step}"
-                    );
-                }
-                if lines
-                    .iter()
-                    .any(|line| line.contains("GITHUB_ENV") && artifacts_assignment(line).is_some())
-                {
-                    set = true;
-                }
-            }
+        if names.iter().all(|&at| is_write(line, at)) || is_upload(line) {
+            continue;
         }
+        found.push(format!(
+            "{path}:{}: reads {VARIABLE} outside its language's reader: {}",
+            number + 1,
+            line.trim()
+        ));
+    }
+    found
+}
+
+/// The files of the checkout, tracked or not yet, as their paths from the repository's root.
+fn repository_files(root: &Path) -> Vec<String> {
+    let listed = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(root)
+        .output()
+        .expect("git lists the repository's files");
+    assert!(listed.status.success(), "git ls-files failed: {listed:?}");
+    let mut files: Vec<String> = listed
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8(name.to_vec()).expect("a file name that is text"))
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// KR-REQ-27.03, the part about the build's directory: every line of the repository that reads
+/// the artefacts variable is the definition of its language's reader or inside a file that tests
+/// one. The readers (`kr-test-artifacts` for Rust, `scripts/lib/artifacts-dir.sh`,
+/// `scripts/artifacts-dir.ps1`, `apps/companion/e2e/evidence.ts`) refuse a value outside the
+/// platform's temporary roots where it is used, so the build fails there whatever way the value
+/// took; their own cases run them in `artifacts_readers.rs`, in the reader's crate and in the
+/// companion's tests.
+///
+/// So this case holds only what the readers cannot: that nothing else reads the variable. A line
+/// that names it passes when it is a whole-line comment, an assignment, a workflow `env` key, a
+/// program's `.env("NAME", value)` or the upload of the directory as a run's evidence; every other
+/// line fails with its file and line, and so does a file that names it in a language this case does
+/// not know or that is not text. Writes are not listed: a wrong write fails at the reader.
+///
+/// Not seen: a name put together at run time, and a value that reaches a program in an argument
+/// instead of the variable (the conformance runner's `--evidence` passes the same check).
+#[test]
+fn nothing_reads_the_artifacts_variable_beside_the_reader_of_its_language() {
+    let root = repository();
+    let mut found = Vec::new();
+    let mut named = 0_usize;
+    for path in repository_files(&root) {
+        let file = root.join(&path);
+        if !fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let bytes = fs::read(&file).unwrap_or_else(|error| panic!("{path} is read: {error}"));
+        if bytes
+            .windows(VARIABLE.len())
+            .any(|w| w == VARIABLE.as_bytes())
+        {
+            named += 1;
+        }
+        found.extend(findings(&path, &bytes));
+    }
+    for reader in READERS {
+        let text = fs::read_to_string(root.join(reader))
+            .unwrap_or_else(|error| panic!("the reader {reader} is read: {error}"));
+        assert!(text.contains(VARIABLE), "{reader} does not name {VARIABLE}");
     }
     assert!(
-        steps_with_a_tool >= 3,
-        "the case found {steps_with_a_tool} steps that run a screenshot tool"
+        named > READERS.len(),
+        "the case found {named} files that name {VARIABLE}"
     );
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// The case fails closed: each shape of a read in each language fails, a file it cannot read or a
+/// language it does not know fails, and the shapes of a write and the reader's own file pass.
+#[test]
+fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
+    let rust = "tests/e2e/x.rs";
+    let shell = "scripts/x.sh";
+    let power = "scripts/x.ps1";
+    let script = "apps/companion/e2e/x.ts";
+    let flow = ".github/workflows/x.yml";
+    for (path, line) in [
+        (
+            rust,
+            "let dir = std::env::var_os(\"KR_TEST_ARTIFACTS_DIR\");",
+        ),
+        (
+            rust,
+            "let dir = std::env::var(NAME).or(std::env::var(\"KR_TEST_ARTIFACTS_DIR\"));",
+        ),
+        (shell, "artefacts=\"${KR_TEST_ARTIFACTS_DIR:-/tmp/x}\""),
+        (shell, "artefacts=\"$KR_TEST_ARTIFACTS_DIR/x\""),
+        (
+            shell,
+            "KR_TEST_ARTIFACTS_DIR=\"${KR_TEST_ARTIFACTS_DIR:-/tmp/x}\"",
+        ),
+        (
+            shell,
+            "[ \"$KR_TEST_ARTIFACTS_DIR\" = x ] && echo yes # KR_TEST_ARTIFACTS_DIR",
+        ),
+        (power, "$evidence = $env:KR_TEST_ARTIFACTS_DIR"),
+        (
+            power,
+            "$env:KR_TEST_ARTIFACTS_DIR = \"$env:KR_TEST_ARTIFACTS_DIR\\x\"",
+        ),
+        (
+            script,
+            "const dir = env['KR_TEST_ARTIFACTS_DIR'] ?? '/tmp/x'",
+        ),
+        (script, "const dir = process.env.KR_TEST_ARTIFACTS_DIR"),
+        (flow, "        run: ls \"$KR_TEST_ARTIFACTS_DIR\""),
+        (
+            flow,
+            "          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}/more",
+        ),
+    ] {
+        assert_eq!(
+            findings(path, line.as_bytes()).len(),
+            1,
+            "{path}: {line} is a read"
+        );
+    }
+    for (path, line) in [
+        (
+            rust,
+            "/// KR_TEST_ARTIFACTS_DIR is where this build keeps its figures.",
+        ),
+        (rust, "        .env(\"KR_TEST_ARTIFACTS_DIR\", &evidence)"),
+        (shell, "# KR_TEST_ARTIFACTS_DIR is not set here."),
+        (
+            shell,
+            "KR_TEST_ARTIFACTS_DIR=\"$leg/e2e\" bash scripts/x.sh",
+        ),
+        (shell, "export KR_TEST_ARTIFACTS_DIR=\"$RUNNER_TEMP/x\""),
+        (
+            power,
+            "\"KR_TEST_ARTIFACTS_DIR=$temporary\\x\" >> $env:GITHUB_ENV",
+        ),
+        (power, "$env:KR_TEST_ARTIFACTS_DIR = $directory"),
+        (flow, "  KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts"),
+        (flow, "          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}"),
+        (flow, "            ${{ env.KR_TEST_ARTIFACTS_DIR }}"),
+        (
+            "docs/x.md",
+            "Set `KR_TEST_ARTIFACTS_DIR` to a folder under /tmp.",
+        ),
+        (
+            "tests/support/artifacts/src/lib.rs",
+            "std::env::var_os(VARIABLE_NAMED_KR_TEST_ARTIFACTS_DIR)",
+        ),
+    ] {
+        assert!(
+            findings(path, line.as_bytes()).is_empty(),
+            "{path}: {line} is not a read"
+        );
+    }
+    assert_eq!(
+        findings("data/x.json", b"{\"a\": \"KR_TEST_ARTIFACTS_DIR\"}").len(),
+        1
+    );
+    assert_eq!(
+        findings("scripts/x", b"echo $KR_TEST_ARTIFACTS_DIR").len(),
+        1
+    );
+    assert_eq!(
+        findings("scripts/x.sh", b"\xff KR_TEST_ARTIFACTS_DIR").len(),
+        1
+    );
+    assert!(findings("scripts/x.sh", b"\xff\xfe").is_empty());
 }

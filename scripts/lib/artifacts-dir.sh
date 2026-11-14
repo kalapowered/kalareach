@@ -1,0 +1,153 @@
+# shellcheck shell=bash
+# Where a test run keeps its evidence: the one reader of KR_TEST_ARTIFACTS_DIR for shell.
+#
+# Section 27 puts every screenshot and evidence file of a release test run in one directory,
+# KR_TEST_ARTIFACTS_DIR, set under a temporary folder for the build. A script reads the variable only
+# through this file, so a value outside this platform's temporary roots is refused where it is used,
+# whatever way the value took. Source it, then:
+#
+#   kr_artifacts_dir          sets kr_artifacts to the evidence directory
+#   kr_artifacts_dir_if_set   the same, but kr_artifacts is empty and nothing is made where the
+#                             variable is not set (for a report that only looks at the directory)
+#
+# Both export KR_TEST_ARTIFACTS_DIR with the resolved value, so a program the script starts reads
+# the same directory, and both end the script with status 1 and the words below when the value is
+# refused. They run in the script's own shell: `x=$(kr_artifacts_dir)` would lose the variable and
+# the exit.
+#
+# The temporary roots are /tmp, the folder TMPDIR names and the folder RUNNER_TEMP names, and on
+# Windows (Git Bash) the folder TEMP names, where each is an absolute path to a directory. A root
+# is resolved through its links as the platform resolves it (/tmp is /private/tmp on macOS), and so
+# is the part of the value that exists, so a link inside a root that leads out of it is refused and
+# a root that is itself behind a link is honoured. A value is compared with a root by path
+# components, never by text: /tmpfoo is not inside /tmp. A relative value, an empty value and a
+# value with a `..` in it are refused, and so is a root itself.
+#
+# Where the variable is not set, the run makes a directory of its own under the temporary folder
+# (readable by this account only) and says where it is on standard error.
+
+# Prints each temporary root that exists, resolved through its links, one to a line.
+_kr_artifacts_roots() {
+  local _kr_candidate _kr_real _kr_windows=0
+  local _kr_named=(/tmp "${TMPDIR:-}" "${RUNNER_TEMP:-}")
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+      _kr_windows=1
+      _kr_named+=("${TEMP:-}")
+      ;;
+  esac
+  for _kr_candidate in "${_kr_named[@]}"; do
+    [ "$_kr_windows" = 1 ] && _kr_candidate="$(_kr_artifacts_posix "$_kr_candidate")"
+    case "$_kr_candidate" in /*) ;; *) continue ;; esac
+    _kr_real="$(cd -P -- "$_kr_candidate" 2>/dev/null && pwd -P)" || continue
+    if [ -n "$_kr_real" ] && [ "$_kr_real" != / ]; then
+      printf '%s\n' "$_kr_real"
+    fi
+  done
+  return 0
+}
+
+# Prints $1 as a path Git Bash reads, when it is written the way Windows writes it (C:\... or C:/...).
+_kr_artifacts_posix() {
+  case "$1" in
+    [A-Za-z]:[\\/]*) cygpath -u -- "$1" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# Prints why $1 is refused, with the variable and the roots named, on standard error.
+_kr_artifacts_refuse() {
+  local _kr_roots
+  _kr_roots="$(_kr_artifacts_roots | awk 'BEGIN { s = "" } { s = s (NR > 1 ? ", " : "") $0 } END { print s }')"
+  printf '%s\n' "kr-artifacts: the evidence directory '$1' (KR_TEST_ARTIFACTS_DIR) is refused: $2. It has to be an absolute path inside one of this platform's temporary roots (${_kr_roots}). Set it to a folder under one of them, or leave it unset and the run makes a directory of its own." >&2
+  return 1
+}
+
+# Prints the real path of $1 when it is inside a temporary root; else says why not and returns 1.
+_kr_artifacts_confine() {
+  local _kr_value="$1" _kr_probe _kr_rest="" _kr_real _kr_root _kr_inside=0
+  _kr_value="$(_kr_artifacts_posix "$_kr_value")"
+  if [ -z "$_kr_value" ]; then
+    _kr_artifacts_refuse "$1" "it is empty"
+    return 1
+  fi
+  case "$_kr_value" in
+    /*) ;;
+    *)
+      _kr_artifacts_refuse "$1" "it is not an absolute path"
+      return 1
+      ;;
+  esac
+  case "/$_kr_value/" in
+    */../*)
+      _kr_artifacts_refuse "$1" "it steps up a directory with \`..\`"
+      return 1
+      ;;
+  esac
+  while :; do
+    case "$_kr_value" in *//*) _kr_value="${_kr_value//\/\//\/}" ;; *) break ;; esac
+  done
+  [ "$_kr_value" = / ] || _kr_value="${_kr_value%/}"
+  _kr_probe="$_kr_value"
+  while [ -n "$_kr_probe" ] && [ ! -e "$_kr_probe" ]; do
+    _kr_rest="/${_kr_probe##*/}$_kr_rest"
+    _kr_probe="${_kr_probe%/*}"
+  done
+  [ -n "$_kr_probe" ] || _kr_probe=/
+  if [ ! -d "$_kr_probe" ]; then
+    _kr_artifacts_refuse "$1" "$_kr_probe is not a directory"
+    return 1
+  fi
+  _kr_real="$(cd -P -- "$_kr_probe" 2>/dev/null && pwd -P)" || {
+    _kr_artifacts_refuse "$1" "$_kr_probe cannot be resolved"
+    return 1
+  }
+  [ "$_kr_real" = / ] && _kr_real=""
+  _kr_real="$_kr_real$_kr_rest"
+  while IFS= read -r _kr_root; do
+    case "$_kr_real" in
+      "$_kr_root"/*) _kr_inside=1 ;;
+    esac
+  done < <(_kr_artifacts_roots)
+  if [ "$_kr_inside" != 1 ]; then
+    _kr_artifacts_refuse "$1" "it is not inside a temporary root"
+    return 1
+  fi
+  printf '%s\n' "$_kr_real"
+}
+
+# Makes a directory of this run's own under the temporary folder and prints its real path.
+_kr_artifacts_own() {
+  local _kr_made
+  _kr_made="$(mktemp -d "${TMPDIR:-/tmp}/kr-test-artifacts.XXXXXX")" || {
+    echo "kr-artifacts: no directory of this run's own can be made for its evidence" >&2
+    return 1
+  }
+  _kr_artifacts_confine "$_kr_made"
+}
+
+# kr_artifacts_dir: sets kr_artifacts to the evidence directory, and exports KR_TEST_ARTIFACTS_DIR.
+kr_artifacts_dir() {
+  local _kr_dir
+  if [ "${KR_TEST_ARTIFACTS_DIR+set}" = set ]; then
+    _kr_dir="$(_kr_artifacts_confine "$KR_TEST_ARTIFACTS_DIR")" || exit 1
+  else
+    _kr_dir="$(_kr_artifacts_own)" || exit 1
+    echo "KR_TEST_ARTIFACTS_DIR is not set: this run keeps its evidence in $_kr_dir" >&2
+  fi
+  KR_TEST_ARTIFACTS_DIR="$_kr_dir"
+  export KR_TEST_ARTIFACTS_DIR
+  # shellcheck disable=SC2034 # The script that sources this file reads it.
+  kr_artifacts="$_kr_dir"
+}
+
+# kr_artifacts_dir_if_set: as kr_artifacts_dir, but kr_artifacts is empty and nothing is made where
+# the variable is not set.
+kr_artifacts_dir_if_set() {
+  if [ "${KR_TEST_ARTIFACTS_DIR+set}" = set ]; then
+    kr_artifacts_dir
+  else
+    # shellcheck disable=SC2034 # The script that sources this file reads it.
+    kr_artifacts=""
+  fi
+}

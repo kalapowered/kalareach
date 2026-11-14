@@ -101,6 +101,8 @@ exacl.workspace = true
 # The tests act exactly when a held rename was refused, through the retry's own seam, and make the
 # flush of a directory fail after a rename.
 kr-flush = { workspace = true, features = ["testing"] }
+# Where the performance cases keep their figures, through the performance record they include.
+kr-test-artifacts.workspace = true
 # This crate's own tests, with the pause above compiled in.
 kr-controller = { path = ".", features = ["testing"] }
 # The keys and expiry a catalogue suite test signs a generation of its own with, through the

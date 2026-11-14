@@ -129,18 +129,15 @@ fn report(measurement: &str, lines: &[String]) {
 ///
 /// Section 27 asks for the figures to be recorded with the host they were taken on and for a
 /// release run's evidence to be kept. `KR_TEST_ARTIFACTS_DIR` is where this build puts that, and a
-/// run that has not set it prints the record and keeps nothing. The record is written before the
-/// target is asserted, so a run the target failed on retains the figure and the verdict rather
-/// than only the panic.
+/// run that has not set it keeps the record in a directory of its own under the temporary folder.
+/// The record is written before the target is asserted, so a run the target failed on retains the
+/// figure and the verdict rather than only the panic.
 fn record_evidence(measurement: &str, lines: &[String]) {
-    let Some(dir) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
-        return;
-    };
     // A run that asked for its evidence to be kept and could not keep it has no evidence, and a
     // retained directory that happens to hold an earlier record would hide that. So a write that
     // fails fails the run, naming where it was writing and why it could not. The lines are already
     // printed by the time this runs, so nothing measured is lost with the file.
-    let dir = std::path::PathBuf::from(dir);
+    let dir = kr_test_artifacts::directory();
     let mut record = format!("## {measurement}\n\n");
     for line in lines {
         record.push_str(line);

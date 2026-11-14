@@ -10,4 +10,5 @@ declare module 'node:os' {
   export function arch(): string
   export function cpus(): ReadonlyArray<{ model: string }>
   export function totalmem(): number
+  export function tmpdir(): string
 }

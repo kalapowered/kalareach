@@ -240,8 +240,8 @@ Two measurements are not steps of `scripts/bench-all.sh`.
 KR-PERF-006's reconnect to a real daemon is
 `cargo test --locked --release -p kr-controller --test network_reconnect_time -- --nocapture`. The
 case is built for macOS and Linux only; on Windows the command runs no test and exits 0. A run
-whose restored screen passes the case's checks records its figure, printed and, where `KR_TEST_ARTIFACTS_DIR` is set, written to
-`kr-controller-reconnect.md`, in the form the records below take: the build, the operating system
+whose restored screen passes the case's checks records its figure, printed and written to
+`kr-controller-reconnect.md` in the directory `KR_TEST_ARTIFACTS_DIR` names, in the form the records below take: the build, the operating system
 and architecture, the processor, the processors, the memory, the load average and the host's speed
 at both edges, the disk's durable writes on Linux, and the share of time a hypervisor took where
 the platform accounts for it. It names each condition it reads that the host is shown to lack. It
@@ -270,7 +270,7 @@ where and why. The conformance report attaches each section to its identifier (s
 | `kr-worker-input.md` | `input_latency.rs` | KR-PERF-001, KR-PERF-002 |
 | `kr-worker-performance.md` | `performance.rs` | KR-PERF-003, KR-PERF-004 |
 | `kr-transport-scheduling.md` | `crates/kr-transport/tests/perf.rs` | KR-PERF-005, KR-PERF-006 |
-| `kr-controller-reconnect.md` | `crates/kr-controller/tests/network_reconnect_time.rs`, when a run sets `KR_TEST_ARTIFACTS_DIR` | KR-PERF-006 |
+| `kr-controller-reconnect.md` | `crates/kr-controller/tests/network_reconnect_time.rs` | KR-PERF-006 |
 | `kr-term-output-handling.md` | `crates/kr-term/tests/perf.rs` | KR-PERF-007 four times |
 | `kr-perf-stress.md` | `tests/perf/tests/stress.rs` | KR-PERF-001, KR-PERF-003 twice, KR-PERF-007 |
 | `bench-all.md` | `scripts/bench-all.sh` | KR-PERF-006's client share, KR-PERF-008, KR-PERF-009, KR-PERF-010, and one conditions section for each identifier the run measured |

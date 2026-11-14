@@ -36,7 +36,7 @@
 # default WSL version to 2, makes and removes a distribution, shuts WSL down to change the
 # networking mode in step 6, and restores `.wslconfig` when it ends.
 #
-# Every artefact is written under ${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}. The Windows
+# Every artefact is written under the directory KR_TEST_ARTIFACTS_DIR names. The Windows
 # daemon this starts keeps its keys in its own run directory (never the Credential Manager). The
 # pairing in step 6 changes each distribution it does not remove, and leaves the changes there: it
 # selects the loopback network in the installation's configuration document (and refuses a document
@@ -1073,7 +1073,10 @@ if [ -n "$log" ]; then
   exec > >(tee "$log") 2>&1
 fi
 
-artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$root/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artifacts="$kr_artifacts"
 mkdir -p "$artifacts"
 run_stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
 run_dir="$artifacts/wsl-$run_stamp"

@@ -90,6 +90,8 @@ kr-worker = { path = ".", features = ["testing"] }
 # The test that stands the journal in the interval its previous holder is letting go of it.
 kr-flush = { workspace = true, features = ["testing", "sqlite"] }
 kr-cbor.workspace = true
+# Where the performance cases keep their figures, through the performance record they include.
+kr-test-artifacts.workspace = true
 # The performance measurement stops its clock when a *client* is holding a screen and has drawn
 # it, which is what the section-27 figure means by usable. That is the client library's own work,
 # so the measurement uses the client library rather than a second opinion about it.

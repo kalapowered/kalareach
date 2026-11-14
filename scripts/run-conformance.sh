@@ -87,11 +87,10 @@ case "$(uname -m)" in
 esac
 platform="$arch-$os"
 
-evidence="${KR_TEST_ARTIFACTS_DIR:-}"
-if [ -z "$evidence" ]; then
-    evidence="$(mktemp -d "${TMPDIR:-/tmp}/kr-conformance.XXXXXX")"
-fi
-export KR_TEST_ARTIFACTS_DIR="$evidence"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$root/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+evidence="$kr_artifacts"
 
 echo "run-conformance: platform $platform, evidence $evidence"
 

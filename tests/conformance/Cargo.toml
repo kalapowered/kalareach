@@ -13,6 +13,8 @@ name = "kr-conformance"
 path = "src/main.rs"
 
 [dependencies]
+# The rule for where the evidence directory may be.
+kr-test-artifacts.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -23,7 +23,10 @@ set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 companion="$here/apps/companion"
 apple="$companion/src-tauri/gen/apple"
-artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/privacy-manifest-ios"
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$here/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+artefacts="$kr_artifacts/privacy-manifest-ios"
 mkdir -p "${artefacts:?}"
 
 say() { printf '== [privacy-manifest] %s\n' "$*"; }
