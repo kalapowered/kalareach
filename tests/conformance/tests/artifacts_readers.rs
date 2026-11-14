@@ -73,7 +73,7 @@ fn shell() -> Option<PathBuf> {
     }
     let found = ["ProgramFiles", "ProgramW6432"]
         .iter()
-        .filter_map(|name| std::env::var_os(name))
+        .filter_map(std::env::var_os)
         .map(|folder| PathBuf::from(folder).join(r"Git\bin\bash.exe"))
         .find(|path| path.is_file());
     assert!(
@@ -660,6 +660,16 @@ fn a_temporary_folder_that_is_a_filesystem_root_admits_nothing_beside_the_other_
             "a folder outside the roots when the temporary folder is a filesystem root",
             OUTSIDE,
         );
+        // The top of the file system is no root, so the words do not list it among them.
+        if cfg!(unix) {
+            for listed in ["(/,", ", /,", ", /)", "(/)"] {
+                assert!(
+                    !reading.words.contains(listed),
+                    "{reader:?} lists the top of the file system as a root: {}",
+                    reading.words
+                );
+            }
+        }
     }
 }
 

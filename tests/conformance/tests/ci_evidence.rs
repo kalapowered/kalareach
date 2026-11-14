@@ -1307,7 +1307,7 @@ fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
             rust,
             "        .env(\"KR_TEST_ARTIFACTS_DIR\", std::env::var(\"KR_TEST_ARTIFACTS_DIR\").unwrap())",
         ),
-        (rust, "        \"KR_TEST_ARTIFACTS_DIR\" => 1,"),
+        (rust, "        KR_TEST_ARTIFACTS_DIR => 1,"),
     ] {
         assert_eq!(
             findings(path, line.as_bytes()).len(),
@@ -1447,7 +1447,8 @@ fn the_source_case_lets_the_evidence_upload_name_the_directory_and_nothing_else(
 /// A file that is not UTF-8 text names the variable without a byte string that says so.
 #[test]
 fn the_source_case_fails_a_file_that_names_the_variable_in_utf_16() {
-    let name = "KR_TEST_ARTIFACTS_DIR=/x\n";
+    // The file ends with the name, so that neither encoding is seen through the other's reading.
+    let name = "KR_TEST_ARTIFACTS_DIR";
     let little: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let big: Vec<u8> = name.encode_utf16().flat_map(u16::to_be_bytes).collect();
     for bytes in [little, big] {
