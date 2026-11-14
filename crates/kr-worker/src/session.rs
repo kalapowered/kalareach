@@ -3575,6 +3575,12 @@ impl Session {
         // gate being read and the answers being queued behind it.
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
+        // Said before the room is read, not after: room the writer gives back while this pass
+        // runs wakes the pump only if answers are already known to wait, and a pass that reads
+        // no room and then says so would miss room that came back in between.
+        if self.engine.replies_pending() {
+            input.publish_waiting_replies();
+        }
         let replies = self
             .engine
             .drain_replies(input.lane_gate(), input.reply_allowance());

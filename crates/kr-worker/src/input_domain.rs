@@ -872,6 +872,12 @@ impl InputDomain {
         self.writer.room.set_replies_waiting(waiting);
     }
 
+    /// Says that answers wait in the lane, before the room is read for them, so that room the
+    /// writer gives back during the pass wakes the pump.
+    pub(crate) fn publish_waiting_replies(&self) {
+        self.writer.room.publish_waiting_replies();
+    }
+
     /// Returns whether the response lane held replies the gate allows out when it was last
     /// drained, which the next keystroke asks the pump to take.
     #[must_use]
