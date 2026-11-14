@@ -719,8 +719,9 @@ impl Sink {
 /// The tasks a runtime started, which end when the runtime is dropped.
 ///
 /// Each of them holds a clone of something the runtime owns, the session and its journal among
-/// it, and none of them has an end of its own while the session's owner is there to be asked
-/// anything. Dropping a handle to a task leaves it running, so the runtime keeps their abort
+/// it. The paste timer and the pump have no end of their own, and the other two end only when the
+/// terminal or the session has ended, which a session nobody closes never does. Dropping a handle
+/// to a task leaves it running, so the runtime keeps their abort
 /// handles and lets go of them here: nothing is waited for, and a task that is in the middle of
 /// work it began without a wait finishes that work before the abort reaches it.
 #[derive(Debug, Default)]
