@@ -57,6 +57,8 @@ struct Host {
     journal_path: std::path::PathBuf,
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: kr_protocol::ids::EnvironmentId,
+    // Ends the serving task when the fixture is dropped, whether or not a case closed it.
+    _serving: kr_ipc::testing::Serving,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -143,8 +145,9 @@ async fn host_started(
         )
         .expect("a worker service"),
     );
-    tokio::spawn(Arc::clone(&service).serve(listener));
+    let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
     Host {
+        _serving: serving,
         _temp: temp,
         service,
         runtime,
