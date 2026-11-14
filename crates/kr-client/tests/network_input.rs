@@ -16,7 +16,7 @@ use iroh::{Endpoint, EndpointAddr};
 use kr_client::error::ClientError;
 use kr_client::input::{
     Count, EndCause, EpochKnown, InputEvent, InputEvents, InputLane, InputRefusal, InputTarget,
-    NotReached, Over, Sets,
+    LOCAL_SEND_BOUND, NotReached, Over, Sets,
 };
 use kr_client::session::Session;
 use kr_client::transport::{ControlTransport, NetworkTransport, StreamOpener, TransportFuture};
@@ -2833,7 +2833,7 @@ mod local {
     ) -> tokio::sync::oneshot::Receiver<kr_client::Result<kr_client::Settled>> {
         let composed = request_of(session, number).await;
         let sender = Arc::clone(session);
-        lane.after_keys(move || async move { sender.send_written(&composed).await })
+        lane.after_keys(move |limit| async move { sender.send_written(&composed, &limit).await })
             .expect("queued")
     }
 
@@ -2849,8 +2849,20 @@ mod local {
         }
     }
 
+    /// Where a bounded send of the next frame stops on the double, as it does on a socket whose
+    /// worker has stopped reading.
+    #[derive(Clone, Copy, Debug)]
+    enum Stall {
+        /// Another sender holds the connection's turn, and keeps it until `Socket::free`.
+        Turn,
+        /// Part of the frame is with the worker, which takes no more until `Socket::free`.
+        Write,
+    }
+
     /// A transport to a host on this machine: no data streams, one connection, requests answered by
-    /// the case.
+    /// the case. A bounded send behaves as the local socket's does: it stops at its time or when it
+    /// is no longer wanted, a frame none of which went is taken back and the connection stands, and
+    /// a frame part of which went ends the connection with it.
     #[derive(Debug)]
     struct Socket {
         sent: Mutex<VecDeque<ControlFrame>>,
@@ -2858,6 +2870,11 @@ mod local {
         words: tokio::sync::mpsc::UnboundedSender<ControlFrame>,
         incoming: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ControlFrame>>>,
         claimed: AtomicBool,
+        stalled: Mutex<Option<Stall>>,
+        entered: tokio::sync::Notify,
+        freed: tokio::sync::Notify,
+        ended: tokio::sync::Notify,
+        closed: AtomicBool,
     }
 
     impl Socket {
@@ -2869,7 +2886,27 @@ mod local {
                 words,
                 incoming: Mutex::new(Some(incoming)),
                 claimed: AtomicBool::new(false),
+                stalled: Mutex::new(None),
+                entered: tokio::sync::Notify::new(),
+                freed: tokio::sync::Notify::new(),
+                ended: tokio::sync::Notify::new(),
+                closed: AtomicBool::new(false),
             })
+        }
+
+        /// The next bounded send stops at `stall` until the case frees it or its time passes.
+        fn stall(&self, stall: Stall) {
+            *self.stalled.lock().expect("stalled") = Some(stall);
+        }
+
+        /// Waits until a bounded send has reached its stall.
+        async fn stalled_send(&self) {
+            self.entered.notified().await;
+        }
+
+        /// Lets the stalled send go on.
+        fn free(&self) {
+            self.freed.notify_one();
         }
 
         /// Waits for the next frame of any kind that the client wrote, as the host reads it.
@@ -2960,9 +2997,51 @@ mod local {
             None
         }
         fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+            // A connection that ended takes no more frames.
+            if self.closed.load(Ordering::Acquire) {
+                return Box::pin(async { Err(ClientError::ConnectionEnded) });
+            }
             self.sent.lock().expect("sent").push_back(frame.clone());
             self.changed.notify_waiters();
             Box::pin(async { Ok(()) })
+        }
+        fn send_before<'a>(
+            &'a self,
+            frame: &'a ControlFrame,
+            not_after: tokio::time::Instant,
+            wanted: &'a (dyn Fn() -> bool + Send + Sync),
+        ) -> TransportFuture<'a, bool> {
+            Box::pin(async move {
+                let stall = self.stalled.lock().expect("stalled").take();
+                if let Some(stall) = stall {
+                    self.entered.notify_one();
+                    let freed = tokio::time::timeout_at(not_after, self.freed.notified()).await;
+                    match stall {
+                        // The wait for the turn ends with the time, and nothing went.
+                        Stall::Turn => {
+                            if freed.is_err()
+                                || tokio::time::Instant::now() > not_after
+                                || !wanted()
+                            {
+                                return Ok(false);
+                            }
+                        }
+                        // The time passed or the lane's wish changed with part of the frame gone:
+                        // the connection ends with it, and the peer acts on none of it.
+                        Stall::Write => {
+                            if freed.is_err() || !wanted() {
+                                self.closed.store(true, Ordering::Release);
+                                self.ended.notify_one();
+                                return Ok(false);
+                            }
+                        }
+                    }
+                } else if tokio::time::Instant::now() > not_after || !wanted() {
+                    return Ok(false);
+                }
+                self.send(frame).await?;
+                Ok(true)
+            })
         }
         fn claim_receiver(&self) -> kr_client::Result<()> {
             if self.claimed.swap(true, Ordering::AcqRel) {
@@ -2981,13 +3060,18 @@ mod local {
                 .take()
                 .expect("one reader");
             Box::pin(async move {
-                let frame = incoming.recv().await;
+                let frame = tokio::select! {
+                    frame = incoming.recv() => frame,
+                    () = self.ended.notified() => None,
+                };
                 *self.incoming.lock().expect("incoming") = Some(incoming);
                 Ok(frame)
             })
         }
         fn revoke_streams(&self) {}
-        fn close(&self) {}
+        fn close(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
     }
 
     async fn local_lane(
@@ -3014,6 +3098,14 @@ mod local {
 
     async fn event(events: &mut InputEvents) -> InputEvent {
         within(events.recv()).await.expect("an event")
+    }
+
+    /// The next event, which the case needs within a few seconds: a lane that never tells it fails
+    /// the case here, by this assertion, and not by the liveness limit.
+    async fn event_soon(events: &mut InputEvents) -> InputEvent {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(event.is_ok(), "the lane told nothing within five seconds");
+        event.ok().flatten().expect("an event")
     }
 
     /// Typing goes as ordered `input.write` requests, one at a time, each answered before the next
@@ -3288,6 +3380,162 @@ mod local {
         session.close();
     }
 
+    /// What a request's channel says once its send stage ended with the bound: the case fails by its
+    /// assertion when the stage outlasts the figure, and not by the liveness limit. The clock of the
+    /// cases that use this is paused, so the figure passes with no time spent.
+    async fn told_by_the_bound(
+        request: tokio::sync::oneshot::Receiver<kr_client::Result<kr_client::Settled>>,
+    ) -> kr_client::Result<kr_client::Settled> {
+        let told = tokio::time::timeout(LOCAL_SEND_BOUND + Duration::from_secs(1), request).await;
+        assert!(told.is_ok(), "the request's send stage outlasted its bound");
+        told.ok()
+            .expect("in time")
+            .expect("the channel is answered")
+    }
+
+    /// A request that waits for the connection's turn past the bound is not sent: its caller is
+    /// told so, the connection stands, and the key behind it is written, so the request held the
+    /// lane's writer for no longer than the bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_waits_for_the_connections_turn_past_the_bound_is_not_sent() {
+        let (socket, session, lane, mut events) = local_lane(false).await;
+        socket.stall(Stall::Turn);
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        let request = queue_request(&lane, &session, 1).await;
+        lane.try_send(&key(0)).expect("admitted");
+        socket.stalled_send().await;
+        let told = told_by_the_bound(request).await;
+        assert!(matches!(told, Err(ClientError::Withheld)), "{told:?}");
+        let frame = socket
+            .next_frame_within(Duration::from_secs(5))
+            .await
+            .expect("the key behind the request is written once the bound has passed");
+        let (label, id) = labelled(&frame);
+        assert_eq!(label, "key0", "the request itself was never written");
+        socket.accept(id);
+        let accepted = event_soon(&mut events).await;
+        assert!(
+            matches!(accepted, InputEvent::Accepted { .. }),
+            "the connection stands: {accepted:?}"
+        );
+        session.close();
+    }
+
+    /// A request whose write stalls past the bound with part of its frame gone is cut off, and the
+    /// connection ends with it, so that the worker reads a frame that stops short and acts on none
+    /// of it: its caller is told that it was not sent, the session says that its connection ended,
+    /// and the lane ends with the connection's cause.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_whose_write_stalls_past_the_bound_is_cut_off_with_the_connection() {
+        let (socket, session, lane, mut events) = local_lane(false).await;
+        socket.stall(Stall::Write);
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        let request = queue_request(&lane, &session, 1).await;
+        lane.try_send(&key(0)).expect("admitted");
+        socket.stalled_send().await;
+        let told = told_by_the_bound(request).await;
+        assert!(matches!(told, Err(ClientError::Withheld)), "{told:?}");
+        let ended = event_soon(&mut events).await;
+        assert!(
+            matches!(
+                ended,
+                InputEvent::Ended {
+                    cause: EndCause::Connection { refusal: None },
+                    ..
+                }
+            ),
+            "{ended:?}"
+        );
+        assert!(
+            socket.sent.lock().expect("sent").is_empty(),
+            "no frame, the request's or the key's, was written whole"
+        );
+        let composed = request_of(&session, 2).await;
+        let sent = session.send(&composed).await;
+        assert!(
+            matches!(sent, Err(ClientError::ConnectionEnded)),
+            "the session's state says that the connection ended: {sent:?}"
+        );
+    }
+
+    /// A lane that ends while a request waits for the connection's turn does not have it sent when
+    /// the turn comes: the connection asks whether the lane still wants it.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waiting_for_the_connections_turn_when_the_lane_ends_is_not_sent() {
+        let (socket, session, lane, mut events) = local_lane(false).await;
+        socket.stall(Stall::Turn);
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        let request = queue_request(&lane, &session, 1).await;
+        socket.stalled_send().await;
+        session.close();
+        let ended = event_soon(&mut events).await;
+        assert!(matches!(ended, InputEvent::Ended { .. }), "{ended:?}");
+        socket.free();
+        let told = told_by_the_bound(request).await;
+        assert!(matches!(told, Err(ClientError::Withheld)), "{told:?}");
+        assert!(
+            socket.sent.lock().expect("sent").is_empty(),
+            "the request was never written"
+        );
+    }
+
+    /// A local lane tells its completion as a network lane does: once its writer has written every
+    /// frame that was admitted before the finish, the lane ends as finished.
+    #[tokio::test]
+    async fn a_local_lane_finishes_when_its_writer_has_written_every_frame() {
+        let (socket, session, lane, mut events) = local_lane(false).await;
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        lane.try_send(&key(0)).expect("admitted");
+        lane.try_send(&key(1)).expect("admitted");
+        lane.finish();
+        for number in 0..2 {
+            let (request, params) = socket.next_write().await;
+            assert_eq!(params.sequence, sequence(number));
+            socket.accept(request);
+        }
+        let ended = loop {
+            let event = event_soon(&mut events).await;
+            if matches!(event, InputEvent::Ended { .. }) {
+                break event;
+            }
+        };
+        assert!(
+            matches!(
+                ended,
+                InputEvent::Ended {
+                    cause: EndCause::Finished,
+                    ..
+                }
+            ),
+            "{ended:?}"
+        );
+        session.close();
+    }
+
+    /// An answer of the worker's that does not decode says nothing of the connection, which stands:
+    /// the lane ends as reset and not as a lost connection.
+    #[tokio::test]
+    async fn a_workers_answer_that_does_not_decode_resets_the_stream_and_loses_no_connection() {
+        let (socket, session, lane, mut events) = local_lane(false).await;
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        lane.try_send(&key(0)).expect("admitted");
+        let (request, _) = socket.next_write().await;
+        // A result that is not an `input.write` result.
+        socket.answer_mutation(request);
+        let ended = event_soon(&mut events).await;
+        assert!(
+            matches!(
+                ended,
+                InputEvent::Ended {
+                    cause: EndCause::Reset,
+                    ..
+                }
+            ),
+            "{ended:?}"
+        );
+        session.close();
+    }
+
     /// A local lane takes no barrier: a mark waits for nothing and tells nothing of one, and the mark
     /// of an ending still ends the typing.
     #[tokio::test]
@@ -3330,7 +3578,7 @@ mod local {
         rig.lane.begin_epoch(epoch(5)).expect("an epoch");
         assert_eq!(
             rig.lane
-                .after_keys(|| async { Err(ClientError::ConnectionEnded) })
+                .after_keys(|_| async { Err(ClientError::ConnectionEnded) })
                 .err(),
             Some(InputRefusal::NotLocal)
         );

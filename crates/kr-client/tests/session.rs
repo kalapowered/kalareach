@@ -3845,6 +3845,70 @@ async fn a_request_the_socket_cannot_take_before_its_time_runs_out_is_cut_off_an
     serving.abort();
 }
 
+/// A request whose last write is made just as its time passes is told as sent, and the connection
+/// stands: the time is looked at before every write to the socket and never after the last one, so
+/// a write that completes is never cut. The check before the only write blocks until the time has
+/// passed and then allows the write, which the socket takes whole.
+#[tokio::test]
+async fn a_request_whose_last_byte_goes_as_its_time_passes_is_sent_and_the_connection_stands() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Session::start(transport.shared()).expect("a session");
+
+    let request = padded_request(&session, 0x64, 10).await;
+    let not_after = tokio::time::Instant::now() + Duration::from_millis(50);
+    // The first look is the connection's, once it holds the turn; the second is the write's own,
+    // made just before the one write that a frame this small takes. It returns once the time has
+    // passed.
+    let looks = std::sync::atomic::AtomicUsize::new(0);
+    let wanted = || {
+        if looks.fetch_add(1, Ordering::AcqRel) >= 1 {
+            while tokio::time::Instant::now() <= not_after {
+                std::thread::yield_now();
+            }
+        }
+        true
+    };
+    let settled = tokio::time::timeout(
+        BOUNDED_SEND_WATCHDOG,
+        session.send_before(&request, not_after, &wanted),
+    )
+    .await
+    .expect("the send ends");
+    assert!(
+        settled.is_ok(),
+        "a write that completed as the time passed is not cut: {settled:?}"
+    );
+    assert!(
+        tokio::time::Instant::now() > not_after,
+        "the time had passed when the write completed"
+    );
+    assert_eq!(
+        script.actions.lock().await.len(),
+        1,
+        "the peer read the request whole"
+    );
+    assert!(
+        session
+            .read::<_, SessionList>(Method::SessionList, &Empty {})
+            .await
+            .is_ok(),
+        "the connection stands"
+    );
+    session.close();
+    serving.abort();
+}
+
 /// The build identity a command line presents. It is a client build, not a host's.
 fn kr_cli_build_id() -> BuildId {
     BuildId::new("kr/0.1.0+test").expect("a build identity")
