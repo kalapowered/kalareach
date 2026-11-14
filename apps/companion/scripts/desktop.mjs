@@ -35,9 +35,9 @@
 // - a Windows target on a machine that is not Windows, and on Windows an MSVC target that the
 //   configuration of `.cargo/config.toml` does not name (x86-64 and ARM64): the setting is made for the
 //   machine this runs on, and the target feature that makes the link static is given to those two;
-// - after a bare `--`, cargo's own `--config`, `--target`, `--profile`, `--release`, `--target-dir` and
-//   `--manifest-path`, the short forms `-r` and `-m` included, alone or in a cluster of short flags
-//   (`-vr`): each can set the environment, the flags, the target, the profile or the directory that this
+// - after a bare `--`, every word that begins with cargo's own `--config`, `--target` (`--target-dir`
+//   too), `--profile`, `--release` or `--manifest-path`, and the short forms `-r` and `-m`, alone or in a
+//   cluster of short flags (`-vr`): each can set the environment, the flags, the target, the profile or the directory that this
 //   command holds, and the build of libsodium's crate that is removed first is the one for the profile
 //   and target this command reads;
 // - `CARGO_BUILD_TARGET`: the command line tool does not read it, so cargo would build for it into the
@@ -261,10 +261,10 @@ export function refusal(argv, platform = process.platform, env = process.env) {
   // short forms are refused too. Cargo reads a cluster of short flags from the left and ends it at the first
   // letter that takes a value (`-p`, `-F`, `-j`, `-m`, `-Z`), so `r` and `m` count only where nothing but
   // the flags `v`, `q` and `h` stand before them (`-rv`, `-vr`, `-qr`, `-vm path`; not `-pr`, a package `r`).
+  // A long option is refused by its name as a prefix, since Tauri reads its own options by prefix while cargo
+  // ends in an error on a word it does not know (`--profile-x=dev`); cargo takes no abbreviation of a name.
   const cargo = rest.includes('--') ? rest.slice(rest.indexOf('--') + 1) : []
-  const own = cargo.find((word) =>
-    /^(--(config|target|profile|release|target-dir|manifest-path)(=|$)|-[vqh]*[rm])/.test(word)
-  )
+  const own = cargo.find((word) => /^(--(config|target|profile|release|manifest-path)|-[vqh]*[rm])/.test(word))
   if (own !== undefined) {
     return (
       `pnpm desktop does not pass \`${own}\` on to cargo (it was given \`${given}\`): it can change the environment, ` +
