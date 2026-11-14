@@ -66,7 +66,7 @@ use kr_transport::TransportError;
 use kr_transport::deadlines::{DeadlineKind, Deadlines, TimerDeadlines};
 use kr_transport::scheduler::StreamBudget;
 use kr_transport::streams::{DataReader, DataWriter, StreamHandle};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::error::{ClientError, Result};
 use crate::session::{ConnectionWatch, LaneSupport, LocalInput, Session};
@@ -276,6 +276,19 @@ pub enum NotReached {
     Timeout,
 }
 
+/// What the lane knew of an epoch when the host's notice that it ended arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochKnown {
+    /// The epoch was live: this notice ended it.
+    Typing,
+    /// The view had marked a release or a detach, and the epoch was taking no more typing.
+    Ending,
+    /// A refusal had already ended the epoch and told its sets.
+    Refused,
+    /// The epoch is older than the current one: a later epoch began first.
+    Older,
+}
+
 /// Why the lane ended.
 #[derive(Clone, PartialEq, Eq)]
 pub enum EndCause {
@@ -344,15 +357,20 @@ pub enum InputEvent {
         released: Count,
     },
     /// The host says the view no longer holds the lease of `epoch`, which another view took, the view
-    /// released, or a grant's end took. It is not given for an epoch the view itself ended by a
-    /// release or a detach.
+    /// released, or a grant's end took. It is told once for each epoch, in every phase the epoch can
+    /// be in: the lane suppresses nothing, and `known` says what it already knew, so that a holder
+    /// whose own release or detach answered with the count can leave the notice's words out.
     EpochEnded {
         /// The epoch.
         epoch: InputLeaseEpoch,
         /// The bytes the end discarded, accepted ones the worker had not written included.
         fenced_bytes: u64,
-        /// Where the epoch's frames stand.
-        sets: Sets,
+        /// Where the epoch's frames stand, when this notice is what ended the epoch for the lane. None
+        /// when the epoch's sets were told already (a refusal ended it) or it is older than the
+        /// current one.
+        sets: Option<Sets>,
+        /// What the lane knew of the epoch when the notice came.
+        known: EpochKnown,
     },
     /// The lane has ended, and takes nothing more.
     Ended {
@@ -360,8 +378,9 @@ pub enum InputEvent {
         epoch: Option<InputLeaseEpoch>,
         /// Why.
         cause: EndCause,
-        /// Where that epoch's frames stand: for an epoch that was already over, as they stood then.
-        sets: Sets,
+        /// Where that epoch's frames stand, when this end is what ended the epoch. None when the
+        /// epoch was already over: an earlier event gave its sets, and they do not change.
+        sets: Option<Sets>,
     },
 }
 
@@ -433,12 +452,13 @@ struct Epoch {
     next_sequence: u64,
     queue: VecDeque<Entry>,
     flight: VecDeque<Sent>,
-    flight_cost: usize,
     accepted: Count,
     accepted_through: Option<u64>,
     /// Frames dropped from a hold that nobody was given the count of.
     unsent_dropped: Count,
     phase: Phase,
+    /// The host's notice that this epoch ended has been told.
+    noticed: bool,
     hold: Option<Hold>,
     waits: Vec<Wait>,
     /// Frames and encoded bytes held against the bound: queued, written and held, and the ordered
@@ -455,11 +475,11 @@ impl Epoch {
             next_sequence: 0,
             queue: VecDeque::new(),
             flight: VecDeque::new(),
-            flight_cost: 0,
             accepted: Count::default(),
             accepted_through: None,
             unsent_dropped: Count::default(),
             phase: Phase::Live,
+            noticed: false,
             hold: None,
             waits: Vec::new(),
             frames_in_use: 0,
@@ -527,7 +547,6 @@ impl Epoch {
                 break;
             };
             newly.add(Count::of(sent.key_len));
-            self.flight_cost -= sent.cost;
             self.frames_in_use -= 1;
             self.cost_in_use -= sent.cost;
         }
@@ -547,14 +566,24 @@ impl Epoch {
 
 /// What the writer does next.
 enum Next {
+    /// The frame at the front of the queue may be written: the window has room for it.
     Frame {
         epoch: InputLeaseEpoch,
         sequence: u64,
-        bytes: Vec<u8>,
     },
     Work(Work),
     Idle,
+    /// The holder finished the lane and everything admitted has been written.
+    Done,
     Over,
+}
+
+/// A frame whose write has begun and which the host has not yet answered: it is charged against the
+/// stream's window, whatever epoch it belongs to.
+struct Charge {
+    epoch: u64,
+    sequence: u64,
+    cost: usize,
 }
 
 struct Core {
@@ -566,6 +595,12 @@ struct Core {
     early_ends: BTreeMap<u64, u64>,
     next_wait: u64,
     ended: Option<EndCause>,
+    /// The holder finished the lane: it takes nothing more, and the writer finishes the stream after
+    /// the last frame.
+    finishing: bool,
+    /// The window's charge: every frame written and not yet answered, in the order written.
+    charges: VecDeque<Charge>,
+    charge_cost: usize,
     events: mpsc::UnboundedSender<InputEvent>,
 }
 
@@ -582,7 +617,7 @@ impl Core {
     }
 
     fn live(&self) -> std::result::Result<&Epoch, InputRefusal> {
-        if self.ended.is_some() {
+        if self.ended.is_some() || self.finishing {
             return Err(InputRefusal::Over(Over::StreamEnded));
         }
         let epoch = self.epoch.as_ref().ok_or(InputRefusal::NoEpoch)?;
@@ -638,11 +673,15 @@ impl Core {
         Ok(written)
     }
 
-    /// Gives the held frames their sequences, in order, behind what is already queued.
-    fn release_hold(&mut self) -> Count {
+    /// Gives the frames held for `launch` their sequences, in order, behind what is already queued.
+    /// The hold of another launch is left as it is.
+    fn release_hold(&mut self, launch: u32) -> Count {
         let Some(epoch) = self.epoch.as_mut() else {
             return Count::default();
         };
+        if epoch.hold.as_ref().is_none_or(|hold| hold.launch != launch) {
+            return Count::default();
+        }
         let Some(hold) = epoch.hold.take() else {
             return Count::default();
         };
@@ -771,28 +810,32 @@ impl Core {
     }
 
     /// Ends the current epoch for `over`, counts every frame in one of the four sets, and leaves the
-    /// waits for the caller to answer after the cause is told.
-    fn freeze(epoch: &mut Epoch, over: Over) -> (Sets, Vec<Wait>) {
+    /// waits for the caller to answer after the cause is told. For a refusal `refused_from` is the
+    /// refused frame: the frames written before it are uncertain, it and every later frame refused.
+    /// Ordered work in the queue is not typing and outlives the epoch.
+    fn freeze(epoch: &mut Epoch, over: Over, refused_from: Option<u64>) -> (Sets, Vec<Wait>) {
         let mut sets = Sets {
             accepted: epoch.accepted,
             unsent: epoch.unsent_dropped,
             ..Sets::default()
         };
-        let mut written = Count::default();
-        for sent in &epoch.flight {
-            written.add(Count::of(sent.key_len));
-        }
         let mut queued = Count::default();
         for entry in &epoch.queue {
             if let Entry::Frame(frame) = entry {
                 queued.add(Count::of(frame.bytes.len()));
             }
         }
-        if over == Over::Refused {
-            sets.refused = written;
+        for sent in &epoch.flight {
+            let frame = Count::of(sent.key_len);
+            if refused_from.is_some_and(|first| sent.sequence >= first) {
+                sets.refused.add(frame);
+            } else {
+                sets.uncertain.add(frame);
+            }
+        }
+        if refused_from.is_some() {
             sets.refused.add(queued);
         } else {
-            sets.uncertain = written;
             sets.unsent.add(queued);
         }
         if let Some(hold) = &epoch.hold {
@@ -802,11 +845,10 @@ impl Core {
         }
         epoch.frozen = Some(sets);
         epoch.phase = Phase::Over(over);
-        epoch.queue.clear();
+        epoch.queue.retain(|entry| matches!(entry, Entry::Work(_)));
         epoch.flight.clear();
-        epoch.flight_cost = 0;
         epoch.hold = None;
-        epoch.frames_in_use = 0;
+        epoch.frames_in_use = epoch.queue.len();
         epoch.cost_in_use = 0;
         (sets, std::mem::take(&mut epoch.waits))
     }
@@ -827,7 +869,7 @@ impl Core {
         &mut self,
         epoch: InputLeaseEpoch,
     ) -> std::result::Result<Option<Sets>, InputRefusal> {
-        if self.ended.is_some() {
+        if self.ended.is_some() || self.finishing {
             return Err(InputRefusal::Over(Over::StreamEnded));
         }
         let mut superseded = None;
@@ -836,14 +878,23 @@ impl Core {
                 return Err(InputRefusal::EpochNotNew);
             }
             if !current.is_over() {
-                let (sets, waits) = Self::freeze(current, Over::Superseded);
+                let (sets, waits) = Self::freeze(current, Over::Superseded, None);
                 self.not_reached(waits, NotReached::Superseded);
                 superseded = Some(sets);
             }
         }
         self.early_ends.retain(|ended, _| *ended >= epoch.get());
         let already_ended = self.early_ends.remove(&epoch.get());
-        self.epoch = Some(Epoch::new(epoch));
+        // Ordered work waits for its turn whatever epoch it was queued under.
+        let carried = self
+            .epoch
+            .as_mut()
+            .map(|current| std::mem::take(&mut current.queue))
+            .unwrap_or_default();
+        let mut fresh = Epoch::new(epoch);
+        fresh.frames_in_use = carried.len();
+        fresh.queue = carried;
+        self.epoch = Some(fresh);
         if let Some(fenced_bytes) = already_ended {
             self.epoch_ended(epoch, fenced_bytes)
                 .map_err(|_| InputRefusal::Over(Over::StreamEnded))?;
@@ -851,7 +902,8 @@ impl Core {
         Ok(superseded)
     }
 
-    /// The host's notice that `epoch` ended.
+    /// The host's notice that `epoch` ended. It is told once for each epoch, in whatever phase the
+    /// epoch is: the lane suppresses nothing, and says what it knew.
     fn epoch_ended(
         &mut self,
         epoch: InputLeaseEpoch,
@@ -862,26 +914,41 @@ impl Core {
             return Ok(());
         };
         if epoch.get() < current.epoch.get() {
+            self.emit(InputEvent::EpochEnded {
+                epoch,
+                fenced_bytes,
+                sets: None,
+                known: EpochKnown::Older,
+            });
             return Ok(());
         }
         if epoch.get() > current.epoch.get() {
             self.early(epoch, fenced_bytes)?;
             return Ok(());
         }
-        // The view ended this epoch itself by a release or a detach, and shows the words of that
-        // answer: the host's notice for the same epoch says nothing it has not.
-        let own = matches!(current.phase, Phase::Ending);
-        if current.is_over() {
+        if current.noticed {
             return Ok(());
         }
-        let (sets, waits) = Self::freeze(current, Over::LeaseEnded);
-        if !own {
-            self.emit(InputEvent::EpochEnded {
-                epoch,
-                fenced_bytes,
-                sets,
-            });
-        }
+        current.noticed = true;
+        let (known, sets, waits) = match current.phase {
+            Phase::Over(Over::Refused) => (EpochKnown::Refused, None, Vec::new()),
+            Phase::Over(_) => return Ok(()),
+            Phase::Live | Phase::Ending => {
+                let known = if matches!(current.phase, Phase::Ending) {
+                    EpochKnown::Ending
+                } else {
+                    EpochKnown::Typing
+                };
+                let (sets, waits) = Self::freeze(current, Over::LeaseEnded, None);
+                (known, Some(sets), waits)
+            }
+        };
+        self.emit(InputEvent::EpochEnded {
+            epoch,
+            fenced_bytes,
+            sets,
+            known,
+        });
         self.not_reached(waits, NotReached::EpochEnded);
         Ok(())
     }
@@ -925,17 +992,36 @@ impl Core {
         }
     }
 
-    /// Which epoch an acknowledgement is about: the current one, or one the lane has finished with
-    /// (None), or one it has not begun, which no frame of its own can have caused.
-    fn about(&self, epoch: InputLeaseEpoch) -> std::result::Result<Option<()>, &'static str> {
+    /// Which epoch an acknowledgement is about, against the current one. The lane has begun every
+    /// epoch a frame of its own can belong to, so a later one breaks the stream's contract.
+    fn about(
+        &self,
+        epoch: InputLeaseEpoch,
+    ) -> std::result::Result<std::cmp::Ordering, &'static str> {
         let Some(current) = self.epoch.as_ref() else {
             return Err("an acknowledgement before any epoch");
         };
         match epoch.get().cmp(&current.epoch.get()) {
-            std::cmp::Ordering::Less => Ok(None),
-            std::cmp::Ordering::Equal => Ok(Some(())),
             std::cmp::Ordering::Greater => Err("an acknowledgement for an epoch not begun"),
+            order => Ok(order),
         }
+    }
+
+    /// Lifts the window's charge for the frames of `epoch` up to `through`, or for all of them.
+    fn resolve_charges(&mut self, epoch: InputLeaseEpoch, through: Option<u64>) {
+        let mut kept = VecDeque::with_capacity(self.charges.len());
+        let mut cost = 0;
+        for charge in self.charges.drain(..) {
+            if charge.epoch == epoch.get()
+                && through.is_none_or(|through| charge.sequence <= through)
+            {
+                continue;
+            }
+            cost += charge.cost;
+            kept.push_back(charge);
+        }
+        self.charges = kept;
+        self.charge_cost = cost;
     }
 
     fn accepted(
@@ -943,7 +1029,10 @@ impl Core {
         epoch: InputLeaseEpoch,
         through: u64,
     ) -> std::result::Result<(), &'static str> {
-        if self.about(epoch)?.is_none() {
+        if self.about(epoch)? == std::cmp::Ordering::Less {
+            // Frames of an older epoch that were still at the host: the answer lifts their charge
+            // from the window, and the sets given for that epoch do not change.
+            self.resolve_charges(epoch, Some(through));
             return Ok(());
         }
         let Some(current) = self.epoch.as_mut() else {
@@ -958,8 +1047,12 @@ impl Core {
                     Ok(())
                 };
             }
-            // Frames of an epoch that has ended are no longer counted.
-            Phase::Over(_) => return Ok(()),
+            // Frames of an epoch that has ended are no longer counted, but the window is the
+            // stream's and they were charged against it.
+            Phase::Over(_) => {
+                self.resolve_charges(epoch, Some(through));
+                return Ok(());
+            }
             Phase::Live | Phase::Ending => {}
         }
         match current.accepted_through {
@@ -971,6 +1064,7 @@ impl Core {
             return Err("an acceptance of a frame that was never written");
         }
         let newly = current.accept_through(through);
+        self.resolve_charges(epoch, Some(through));
         self.emit(InputEvent::Accepted {
             epoch,
             through: InputSequence::new(through),
@@ -988,7 +1082,10 @@ impl Core {
         accepted_through: Option<u64>,
         error: ProtocolError,
     ) -> std::result::Result<(), &'static str> {
-        if self.about(epoch)?.is_none() {
+        if self.about(epoch)? == std::cmp::Ordering::Less {
+            // The first refusal of an older epoch whose frames were still at the host: they are
+            // answered, which lifts their charge from the window.
+            self.resolve_charges(epoch, None);
             return Ok(());
         }
         let Some(current) = self.epoch.as_mut() else {
@@ -996,20 +1093,33 @@ impl Core {
         };
         match current.phase {
             Phase::Over(Over::Refused) => return Err("a second refusal in one epoch"),
-            Phase::Over(_) => return Ok(()),
+            Phase::Over(_) => {
+                self.resolve_charges(epoch, None);
+                return Ok(());
+            }
             Phase::Live | Phase::Ending => {}
         }
-        if sequence != accepted_through.map_or(0, |through| through + 1) {
-            return Err("a refusal that does not follow the accepted prefix");
-        }
+        // The host can refuse a frame while the frames before it still await the worker, so the
+        // refused frame may lie above the accepted prefix. It cannot lie in it, or past what was
+        // written, and the prefix cannot go back.
         if accepted_through < current.accepted_through {
             return Err("a refusal that took back an acceptance");
+        }
+        let first_open = match accepted_through {
+            Some(through) => through
+                .checked_add(1)
+                .ok_or("a refusal whose accepted prefix cannot be")?,
+            None => 0,
+        };
+        if sequence < first_open {
+            return Err("a refusal at or below the accepted prefix");
         }
         if current.last_written().is_none_or(|last| sequence > last) {
             return Err("a refusal of a frame that was never written");
         }
         let newly = accepted_through.map(|through| current.accept_through(through));
-        let (sets, waits) = Self::freeze(current, Over::Refused);
+        let (sets, waits) = Self::freeze(current, Over::Refused, Some(sequence));
+        self.resolve_charges(epoch, None);
         if let (Some(newly), Some(through)) = (newly, accepted_through)
             && !newly.is_empty()
         {
@@ -1021,7 +1131,7 @@ impl Core {
             });
         }
         // The accepted prefix is in the refusal's sets, and waits it covers are reached.
-        let proven = accepted_through.map_or(0, |through| through + 1);
+        let proven = first_open;
         let (reached, missed): (Vec<_>, Vec<_>) = waits
             .into_iter()
             .partition(|wait| wait.barrier.count.get() <= proven);
@@ -1030,11 +1140,6 @@ impl Core {
                 timer.abort();
             }
             self.emit(InputEvent::Reached(wait.barrier));
-        }
-        let mut sets = sets;
-        sets.accepted = self.epoch.as_ref().map_or(sets.accepted, |e| e.accepted);
-        if let Some(epoch_state) = self.epoch.as_mut() {
-            epoch_state.frozen = Some(sets);
         }
         self.emit(InputEvent::Refused {
             epoch,
@@ -1048,16 +1153,7 @@ impl Core {
     }
 
     fn launch_reserved(&mut self, launch: u32) {
-        let held_for_it = self
-            .epoch
-            .as_ref()
-            .and_then(|epoch| epoch.hold.as_ref())
-            .is_some_and(|hold| hold.launch == launch);
-        let released = if held_for_it {
-            self.release_hold()
-        } else {
-            Count::default()
-        };
+        let released = self.release_hold(launch);
         self.emit(InputEvent::LaunchReserved { launch, released });
     }
 
@@ -1069,16 +1165,17 @@ impl Core {
         let mut waits = Vec::new();
         let (epoch, sets) = match self.epoch.as_mut() {
             Some(current) => {
+                // An epoch that was already over gave its sets when it ended.
                 let sets = if current.is_over() {
-                    current.sets()
+                    None
                 } else {
-                    let (sets, taken) = Self::freeze(current, Over::StreamEnded);
+                    let (sets, taken) = Self::freeze(current, Over::StreamEnded, None);
                     waits = taken;
-                    sets
+                    Some(sets)
                 };
                 (Some(current.epoch), sets)
             }
-            None => (None, Sets::default()),
+            None => (None, None),
         };
         self.ended = Some(cause.clone());
         self.emit(InputEvent::Ended { epoch, cause, sets });
@@ -1086,28 +1183,88 @@ impl Core {
         true
     }
 
-    /// Whether the lane still means to write the frame: its epoch is the current one and has not
-    /// ended. The writer asks before each attempt, so a frame of an epoch that a new one superseded
-    /// while the writer waited for room is not written under the old epoch.
-    fn still_wanted(&self, epoch: InputLeaseEpoch, sequence: u64) -> bool {
-        self.ended.is_none()
-            && self.epoch.as_ref().is_some_and(|current| {
-                current.epoch == epoch
-                    && current.flight.iter().any(|sent| sent.sequence == sequence)
-            })
+    /// Takes the frame at the front of the queue to write, when it is still the frame the writer
+    /// chose: its epoch is the current one and has not ended, and nothing took it from the queue.
+    /// From here the frame is written, charged against the window, and counted uncertain.
+    fn begin(&mut self, epoch: InputLeaseEpoch, sequence: u64) -> Option<Vec<u8>> {
+        if self.ended.is_some() {
+            return None;
+        }
+        let current = self.epoch.as_mut()?;
+        if current.epoch != epoch || current.is_over() {
+            return None;
+        }
+        match current.queue.front() {
+            Some(Entry::Frame(queued)) if queued.sequence == sequence => {}
+            _ => return None,
+        }
+        let Some(Entry::Frame(queued)) = current.queue.pop_front() else {
+            return None;
+        };
+        current.flight.push_back(Sent {
+            sequence,
+            key_len: queued.bytes.len(),
+            cost: queued.cost,
+        });
+        self.charges.push_back(Charge {
+            epoch: epoch.get(),
+            sequence,
+            cost: queued.cost,
+        });
+        self.charge_cost += queued.cost;
+        Some(queued.bytes)
     }
 
-    /// What the writer does next, within the window.
+    /// Gives a frame back whose write the transport refused before a byte of it went out: it is
+    /// unsent again, at the front of the queue, and no longer charged. A frame whose epoch ended in
+    /// between stays counted as it was when the epoch ended.
+    fn unbegin(&mut self, epoch: InputLeaseEpoch, sequence: u64, bytes: Vec<u8>) {
+        if self
+            .charges
+            .back()
+            .is_some_and(|charge| charge.epoch == epoch.get() && charge.sequence == sequence)
+            && let Some(charge) = self.charges.pop_back()
+        {
+            self.charge_cost -= charge.cost;
+        }
+        let Some(current) = self.epoch.as_mut() else {
+            return;
+        };
+        if current.epoch != epoch || current.is_over() {
+            return;
+        }
+        if current
+            .flight
+            .back()
+            .is_some_and(|sent| sent.sequence == sequence)
+            && let Some(sent) = current.flight.pop_back()
+        {
+            current.queue.push_front(Entry::Frame(Queued {
+                sequence,
+                bytes,
+                cost: sent.cost,
+            }));
+        }
+    }
+
+    /// What the writer does next, within the stream's window.
     fn next(&mut self) -> Next {
         if self.ended.is_some() {
             return Next::Over;
         }
+        let idle = if self.finishing {
+            Next::Done
+        } else {
+            Next::Idle
+        };
         let window = self.window;
+        let charged_frames = self.charges.len();
+        let charged_bytes = self.charge_cost;
         let Some(epoch) = self.epoch.as_mut() else {
-            return Next::Idle;
+            return idle;
         };
         match epoch.queue.front() {
-            None => Next::Idle,
+            None => idle,
             Some(Entry::Work(_)) => {
                 if !epoch.flight.is_empty() {
                     return Next::Idle;
@@ -1121,28 +1278,24 @@ impl Core {
                 }
             }
             Some(Entry::Frame(queued)) => {
-                let room = epoch.flight.len()
-                    < usize::try_from(window.frames).unwrap_or(usize::MAX)
-                    && (epoch.flight_cost + queued.cost) as u64 <= window.bytes.get();
-                if !room {
-                    return Next::Idle;
-                }
-                let Some(Entry::Frame(queued)) = epoch.queue.pop_front() else {
-                    return Next::Idle;
-                };
-                epoch.flight.push_back(Sent {
-                    sequence: queued.sequence,
-                    key_len: queued.bytes.len(),
-                    cost: queued.cost,
-                });
-                epoch.flight_cost += queued.cost;
-                Next::Frame {
-                    epoch: epoch.epoch,
-                    sequence: queued.sequence,
-                    bytes: queued.bytes,
+                let room = charged_frames < usize::try_from(window.frames).unwrap_or(usize::MAX)
+                    && (charged_bytes + queued.cost) as u64 <= window.bytes.get();
+                if room {
+                    Next::Frame {
+                        epoch: epoch.epoch,
+                        sequence: queued.sequence,
+                    }
+                } else {
+                    Next::Idle
                 }
             }
         }
+    }
+
+    /// The holder will send nothing more: once every admitted frame is written the stream is
+    /// finished.
+    fn finish(&mut self) {
+        self.finishing = true;
     }
 }
 
@@ -1180,8 +1333,8 @@ impl Shared {
 
     /// Ends the lane for a failure of the stream or the connection.
     fn end_by_failure(&self) {
-        let refusal = self.connection.refusal();
-        if self.connection.has_ended() || refusal.is_some() {
+        let (ended, refusal) = self.connection.state();
+        if ended || refusal.is_some() {
             self.end(EndCause::Connection { refusal });
         } else {
             self.end(EndCause::Reset);
@@ -1343,12 +1496,23 @@ impl InputLane {
         Ok(barrier)
     }
 
-    /// Releases the held frames: they take their sequences, in order, behind what is queued. It does
-    /// nothing, and returns nothing, once the hold has ended by any other way.
-    pub fn release_hold(&self) -> Count {
-        let released = self.shared.lock().release_hold();
+    /// Releases the frames held for `launch`: they take their sequences, in order, behind what is
+    /// queued. It does nothing, and returns nothing, once that hold has ended by any other way, and
+    /// when the hold now standing is another launch's: a launch's answer can come after the next
+    /// launch's hold began.
+    pub fn release_hold(&self, launch: u32) -> Count {
+        let released = self.shared.lock().release_hold(launch);
         self.shared.wake.notify_one();
         released
+    }
+
+    /// Finishes the lane's side of the stream once every frame admitted so far is written, as a
+    /// view's end or a detach does. The lane takes no more typing and no new epoch; the host's
+    /// answers are still read until it finishes its side. Nothing is discarded: unlike dropping
+    /// the lane, which resets the stream, a finish leaves the host to read every frame written.
+    pub fn finish(&self) {
+        self.shared.lock().finish();
+        self.shared.wake.notify_one();
     }
 
     /// Drops the held frames, ends the hold and returns what it dropped: those bytes are counted
@@ -1371,33 +1535,40 @@ impl InputLane {
         self.fenced_report
     }
 
-    /// Queues `work` behind every frame admitted so far and ahead of every later one, on a local
-    /// lane: it runs once the host has answered the frames before it, and the frames after it are
-    /// written once it has finished. A release, a detach and a launch go this way, so that a local
-    /// host, which handles one connection's requests in the order it reads them, sees them in the
-    /// order the view admitted them.
+    /// Queues a request behind every frame admitted so far and ahead of every later one, on a local
+    /// lane. A release, a detach and a launch go this way, so that a local host, which handles one
+    /// connection's requests in the order it reads them, sees them in the order the view admitted
+    /// them.
     ///
-    /// A lane that ends before the work's turn drops it unpolled.
+    /// `request` is called when the request's turn comes, with a [`RequestSent`] that it signals once
+    /// the request is on the connection, and returns the future that carries the request to its
+    /// answer. The lane writes later frames as soon as the request is sent, not when it is answered,
+    /// so a launch holds no later typing; the answer comes back on the returned channel.
+    ///
+    /// A request is not typing: it outlives an epoch that ends, and waits for its turn under the
+    /// next one. A lane that ends before its turn drops it unpolled.
     ///
     /// # Errors
     ///
     /// Returns [`InputRefusal::NotLocal`] on a network lane, [`InputRefusal::Full`] when too much
-    /// work is queued, and the refusals of an epoch that has not begun or is over.
-    pub fn after_keys(
+    /// work is queued, and the refusals of a lane that has not begun an epoch or has ended.
+    pub fn after_keys<T, F, Fut>(
         &self,
-        work: impl Future<Output = ()> + Send + 'static,
-    ) -> std::result::Result<(), InputRefusal> {
+        request: F,
+    ) -> std::result::Result<oneshot::Receiver<T>, InputRefusal>
+    where
+        F: FnOnce(RequestSent) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
         let mut core = self.shared.lock();
         if !self.local {
             return Err(InputRefusal::NotLocal);
         }
-        if core.ended.is_some() {
+        if core.ended.is_some() || core.finishing {
             return Err(InputRefusal::Over(Over::StreamEnded));
         }
         let epoch = core.epoch.as_mut().ok_or(InputRefusal::NoEpoch)?;
-        if let Phase::Over(over) = epoch.phase {
-            return Err(InputRefusal::Over(over));
-        }
         let queued = epoch
             .queue
             .iter()
@@ -1406,11 +1577,40 @@ impl InputLane {
         if queued >= MAX_ORDERED_WORK || epoch.frames_in_use >= MAX_LOCAL_INPUT_FRAMES {
             return Err(InputRefusal::Full);
         }
+        let (answer, answered) = oneshot::channel();
+        let turn: Work = Box::pin(async move {
+            let (signal, sent) = oneshot::channel();
+            let carried = request(RequestSent {
+                signal: Some(signal),
+            });
+            tokio::spawn(async move {
+                let _ = answer.send(carried.await);
+            });
+            // The signal, or the request's end without one, lets the next frame go.
+            let _ = sent.await;
+        });
         epoch.frames_in_use += 1;
-        epoch.queue.push_back(Entry::Work(Box::pin(work)));
+        epoch.queue.push_back(Entry::Work(turn));
         drop(core);
         self.shared.wake.notify_one();
-        Ok(())
+        Ok(answered)
+    }
+}
+
+/// What a queued request signals when it is on the connection: the lane then goes on to write the
+/// frames behind it, without waiting for the answer.
+pub struct RequestSent {
+    signal: Option<oneshot::Sender<()>>,
+}
+
+crate::debug_as_name!(RequestSent);
+
+impl RequestSent {
+    /// The request has been handed to the connection.
+    pub fn sent(mut self) {
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
     }
 }
 
@@ -1559,18 +1759,21 @@ impl Session {
                 transfer_id: Nullable::null(),
             },
         };
-        let mut stream = bounded(
-            target.bounds.as_ref(),
-            DeadlineKind::Header,
-            opener.open(header),
-        )
-        .await?;
+        // The open and the host's first word, its window, share one wait.
+        let passed = target.bounds.start(DeadlineKind::Header);
+        tokio::pin!(passed);
+        let opened = tokio::select! {
+            biased;
+            opened = opener.open(header) => opened,
+            () = &mut passed => Err(ClientError::Transport(TransportError::Deadline(DeadlineKind::Header))),
+        };
+        let mut stream = opened?;
         let handle = stream.handle();
-        // The first word is the host's window. Reading it is part of the open, under the same bound.
-        let ready = bounded(target.bounds.as_ref(), DeadlineKind::Header, async {
-            Ok(stream.read_message::<InputAck>().await?)
-        })
-        .await;
+        let ready = tokio::select! {
+            biased;
+            ready = stream.read_message::<InputAck>() => ready.map_err(ClientError::from),
+            () = &mut passed => Err(ClientError::Transport(TransportError::Deadline(DeadlineKind::Header))),
+        };
         let window = match ready {
             Ok(Some(InputAck::Ready { window })) => window,
             Ok(_) => {
@@ -1628,6 +1831,9 @@ fn shared_for(
             early_ends: BTreeMap::new(),
             next_wait: 0,
             ended: None,
+            finishing: false,
+            charges: VecDeque::new(),
+            charge_cost: 0,
             events,
         }),
         wake: Notify::new(),
@@ -1641,20 +1847,6 @@ fn shared_for(
 
 fn refusal(code: ErrorCode, message: &'static str) -> ClientError {
     ClientError::refusal(code, Shown::said(message))
-}
-
-async fn bounded<T>(
-    bounds: &dyn Deadlines,
-    kind: DeadlineKind,
-    wait: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    let passed = bounds.start(kind);
-    tokio::pin!(wait);
-    tokio::select! {
-        biased;
-        outcome = &mut wait => outcome,
-        () = passed => Err(ClientError::Transport(TransportError::Deadline(kind))),
-    }
 }
 
 /// Ends the lane when the connection ends, which an idle lane would not otherwise see.
@@ -1689,31 +1881,35 @@ async fn network_writer(
 ) {
     let mut over = shared.over.subscribe();
     while let Some(next) = next_to_write(&shared, &mut over).await {
-        let Next::Frame {
-            epoch,
-            sequence,
-            bytes,
-        } = next
-        else {
+        let (epoch, sequence) = match next {
+            Next::Frame { epoch, sequence } => (epoch, sequence),
+            // Everything admitted is written: dropping the writer finishes the stream, which the
+            // host reads as the end of the view's typing and not as a cut.
+            Next::Done => return,
             // A network lane queues no ordered work.
-            continue;
-        };
-        let frame = InputFrame {
-            epoch,
-            sequence: InputSequence::new(sequence),
-            bytes: Bytes::new(bytes),
+            _ => continue,
         };
         loop {
-            // A frame whose epoch ended or was superseded since the writer took it is not written.
-            if !shared.lock().still_wanted(epoch, sequence) {
-                break;
-            }
             // The wait for room is made before the attempt, so room given back in between is not
             // missed.
             let released = budget.as_ref().map(|budget| budget.released());
+            // A frame whose epoch ended or was superseded since the writer chose it is not written.
+            let Some(bytes) = shared.lock().begin(epoch, sequence) else {
+                break;
+            };
+            let frame = InputFrame {
+                epoch,
+                sequence: InputSequence::new(sequence),
+                bytes: Bytes::new(bytes),
+            };
             match writer.write_message(&frame).await {
                 Ok(()) => break,
+                // The queue's limit refuses before a byte goes out, so the frame is unsent again
+                // while the writer waits, and the check above is made once more after the wait.
                 Err(TransportError::LimitExceeded { .. }) if released.is_some() => {
+                    shared
+                        .lock()
+                        .unbegin(epoch, sequence, frame.bytes.into_vec());
                     let Some(released) = released else { break };
                     tokio::select! {
                         () = released => {}
@@ -1764,11 +1960,10 @@ async fn local_writer(
                 work.await;
                 shared.wake.notify_one();
             }
-            Next::Frame {
-                epoch,
-                sequence,
-                bytes,
-            } => {
+            Next::Frame { epoch, sequence } => {
+                let Some(bytes) = shared.lock().begin(epoch, sequence) else {
+                    continue;
+                };
                 let params = InputWriteParams {
                     session_id,
                     attachment_id,
@@ -1778,10 +1973,14 @@ async fn local_writer(
                         bytes: Bytes::new(bytes),
                     },
                 };
-                if !shared.lock().still_wanted(epoch, sequence) {
-                    continue;
-                }
                 match local.write(&params).await {
+                    // The host refused the connection: every pending call is answered with that
+                    // refusal, which says nothing of this frame. Its outcome is unknown, and the
+                    // lane ends with the refusal.
+                    Err(ClientError::Host(_)) if shared.connection.state().1.is_some() => {
+                        shared.end_by_failure();
+                        return;
+                    }
                     Ok(_) => shared.apply(InputAck::Accepted {
                         epoch,
                         through: InputSequence::new(sequence),
@@ -1805,6 +2004,7 @@ async fn local_writer(
                     }
                 }
             }
+            Next::Done => return,
             Next::Idle | Next::Over => {}
         }
     }
