@@ -101,7 +101,7 @@ mod waits_only_through_the_seam {
         "park_timeout",
         "wait_timeout",
         "thread::park",
-        ".join(",
+        ".join()",
         ".recv()",
         ".wait(",
         "wait_while",
@@ -154,7 +154,9 @@ mod waits_only_through_the_seam {
     /// holds: there is no other wait in what the run executes, so no case can pass with a wait it
     /// cannot see. `observe` is the run's work, which the run abandons at its deadline; `wait_by`
     /// is the system's wait that a run is given; `start` and `finish` are the report writer's own
-    /// thread and its closing wait, which the channel server runs and a hook run never does.
+    /// thread and its closing wait, which the channel server runs and a hook run never does; and
+    /// `claim` is the wait of a run's claim for a replacement that is being started, bounded by
+    /// `CLAIM_WAIT`, which a run is given as its `claim` and the cases give time on their clock.
     #[test]
     fn a_hook_run_waits_only_through_the_wait_it_is_given() {
         for (file, source, allowed) in [
@@ -164,6 +166,7 @@ mod waits_only_through_the_seam {
                 include_str!("lib.rs"),
                 &["wait_by", "start", "finish"][..],
             ),
+            ("helper.rs", include_str!("helper.rs"), &["claim"][..]),
         ] {
             let found = blocking_waits(source, allowed);
             assert!(
@@ -177,6 +180,9 @@ mod waits_only_through_the_seam {
     /// comment, an allowed function by its name, and a test module.
     #[test]
     fn the_scan_finds_every_blocking_wait_and_passes_a_comment() {
+        // Joining a path takes an argument and waits for nothing; joining a thread does not.
+        let path = "fn hand_over() {\n    let at = dir.join(\"bin\");\n}\n";
+        assert!(blocking_waits(path, &[]).is_empty(), "a path is joined");
         for word in BLOCKING {
             let wait = format!("fn run_with() {{\n    let _ = outcome {word} 5;\n}}\n");
             assert_eq!(blocking_waits(&wait, &[]).len(), 1, "`{word}` is found");
