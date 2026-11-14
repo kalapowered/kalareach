@@ -1883,11 +1883,16 @@ mod tests {
             bytes: b"\x1b[0n".to_vec(),
             expires_at_ms: None,
         };
-        for _ in 0..MAX_PENDING_REPLY_FRAMES + 5 {
+        // More short answers than the room has entries, as an application that asks questions and
+        // never reads the answers would send. The batches stay in hand, as they are while the
+        // writer holds them, so what they are charged is still charged when the room is read.
+        let mut taken = Vec::new();
+        for _ in 0..MAX_QUEUED_INPUT_FRAMES {
             let _ = input.queue_replies(vec![short()]);
+            taken.extend(input.take_pending());
         }
         assert_eq!(
-            input.take_pending().len(),
+            taken.len(),
             MAX_PENDING_REPLY_FRAMES,
             "the answers queued are the share and no more"
         );
