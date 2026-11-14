@@ -1691,6 +1691,10 @@ mod a_publication_that_outlives_its_request;
 #[cfg(test)]
 mod a_worker_the_host_tells;
 
+/// A link this daemon opened that a worker says a later connection has displaced.
+#[cfg(test)]
+mod a_link_a_later_connection_displaced;
+
 /// A create whose session closed after its worker reported itself.
 #[cfg(test)]
 mod a_create_whose_session_closed;
