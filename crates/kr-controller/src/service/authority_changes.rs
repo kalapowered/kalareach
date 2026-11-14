@@ -3506,7 +3506,8 @@ fn open_number(
 /// of the answer whose session has since closed.
 ///
 /// A worker that was pending takes the daemon's state, acknowledged revision and detail for it when
-/// that is an answer, and keeps the names of both entries ([`with_the_names_of`]); a worker that
+/// that is an answer, and keeps the names of both entries without reading as more complete than
+/// the kept answer where the daemon's entry lacks one ([`with_the_names_of`]); a worker that
 /// has ended takes an ending that keeps what the answer held of it. A worker that owed names takes
 /// the daemon's entry when [`carries_what_was_given`]. Then every worker that is pending in the
 /// barrier as it stands and not in the answer is added: an answer is cut when a host has more
@@ -3560,10 +3561,19 @@ fn barrier_read_again(
 
 /// The daemon's entry for a worker with every name `given` held of it that the entry lacks, so that
 /// no name of either is dropped and the state is the daemon's.
+///
+/// An entry that lacks a name `given` held cannot say more of the worker's evidence than `given`
+/// did, so the merged entry does not read as more complete than the answer it stands for: the
+/// totals of `given` are minimums, the names it still owed or had lost count as left out, and what
+/// it said of the revisions the worker had not said what its fence named for is kept. An entry
+/// that holds every name is the daemon's own and is taken as it is.
 fn with_the_names_of(
     now: &kr_protocol::action::WorkerBarrier,
     given: &kr_protocol::action::WorkerBarrier,
 ) -> kr_protocol::action::WorkerBarrier {
+    if keeps_the_names(now, given) {
+        return now.clone();
+    }
     let mut merged = now.clone();
     for name in &given.rejected_actions {
         if !merged.rejected_actions.contains(name) {
@@ -3582,13 +3592,29 @@ fn with_the_names_of(
     merged.rejected_actions_total = kr_protocol::scalars::U64::new(
         now.rejected_actions_total
             .get()
+            .max(given.rejected_actions_total.get())
             .max(merged.rejected_actions.len() as u64),
     );
     merged.possibly_executed_total = kr_protocol::scalars::U64::new(
         now.possibly_executed_total
             .get()
+            .max(given.possibly_executed_total.get())
             .max(merged.possibly_executed.len() as u64),
     );
+    // The names `given` still owed and the ones it had lost are in no entry now. The daemon's
+    // own count of what it lost may be the same names counted again, so the larger of the two
+    // stands.
+    let owed = given
+        .omitted_actions
+        .get()
+        .saturating_add(given.names_pending.get());
+    merged.omitted_actions = kr_protocol::scalars::U64::new(now.omitted_actions.get().max(owed));
+    let left_out = if owed > now.omitted_actions.get() {
+        owed
+    } else {
+        0
+    };
+    merged.detail = crate::authority::detail_beside_the_names_of(now, given, left_out);
     merged
 }
 
@@ -4390,6 +4416,183 @@ mod tests {
             read.workers[0].state,
             BarrierState::Pending,
             "a worker that has not closed stays pending: {read:?}"
+        );
+    }
+
+    /// KR-REQ-09.12, KR-REQ-10.45: a repeat whose barrier lacks a name the kept answer held reads as
+    /// no more complete than that answer did.
+    ///
+    /// A fence names 300 actions. The first answer lists 200 of the first page of 256 that reached
+    /// the daemon, says that 44 are still to come, and shows the worker pending because it refused
+    /// the last notice. The daemon restarts and the worker acknowledges the revision in force: the
+    /// new daemon holds no name of this revocation. A repeat that took its counts and its detail
+    /// from that entry alone would show the worker acknowledged, with nothing to come and nothing
+    /// left out, though 44 names never reached any answer and the answer's own total was higher.
+    #[test]
+    fn a_repeat_whose_barrier_lacks_a_name_reads_as_incomplete_as_the_kept_answer_did() {
+        use kr_protocol::action::{BarrierState, RevocationBarrier};
+        use kr_protocol::scalars::U64;
+
+        let revision = AuthorityRevision::new(5);
+        let page: Vec<u8> = (0..=u8::MAX).collect();
+        assert_eq!(page.len(), kr_protocol::action::MAX_NAMED_FENCED_ACTIONS);
+        let mut first = worker_entry(1, BarrierState::Pending, &page[..200], 44);
+        first.rejected_actions_total = U64::new(256);
+        first.detail = "this worker has not acknowledged revision 5 and has not been confirmed \
+                        ended, so the revocation is not complete for it; this worker has not said \
+                        what its fence named for 2 of the revisions announced to it with revision \
+                        5 or before it, and the next announcement asks"
+            .to_owned();
+        let given = RevocationBarrier::new(revision, vec![first]);
+        let mut restarted = worker_entry(1, BarrierState::Acknowledged, &[], 0);
+        restarted.acknowledged_revision = Nullable::some(AuthorityRevision::new(7));
+        restarted.detail = "this worker's barrier holds because it installed a later revision, \
+                            which fences everything revision 5 would have; this daemon holds no \
+                            names under revision 5 itself"
+            .to_owned();
+        let live = RevocationBarrier::new(revision, vec![restarted]);
+
+        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new());
+        let worker = &read.workers[0];
+        assert!(read.holds(), "the worker acknowledged: {read:?}");
+        assert_eq!(
+            worker.rejected_actions, given.workers[0].rejected_actions,
+            "no name of the kept answer is dropped"
+        );
+        assert!(
+            worker.rejected_actions_total.get() >= 256,
+            "the kept answer's total is a minimum: {worker:?}"
+        );
+        assert!(
+            worker.omitted_actions.get() >= 44,
+            "the names still to come in the kept answer count as left out: {worker:?}"
+        );
+        assert!(
+            worker.detail.contains("44"),
+            "the entry says how many names are left out: {worker:?}"
+        );
+        assert!(
+            worker
+                .detail
+                .contains("has not said what its fence named for 2 of the revisions"),
+            "what the kept answer said of the revisions the worker has not said is kept: {worker:?}"
+        );
+        assert!(
+            !worker.detail.contains("holds no names under revision"),
+            "the daemon does hold names here, the kept answer's: {worker:?}"
+        );
+    }
+
+    /// KR-REQ-09.12: a worker that installed the revision and reported nothing about what its fence
+    /// did is still pending in a repeat, because the answer to the question the barrier asks is
+    /// half given, and its entry keeps the names the kept answer held.
+    #[test]
+    fn a_worker_that_installed_the_revision_and_reported_nothing_stays_pending_in_a_repeat() {
+        use kr_protocol::action::{BarrierState, RevocationBarrier};
+
+        let revision = AuthorityRevision::new(5);
+        let given = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(1, BarrierState::Pending, &[10], 0)],
+        );
+        let mut installed = worker_entry(1, BarrierState::Pending, &[], 0);
+        installed.acknowledged_revision = Nullable::some(revision);
+        let live = RevocationBarrier::new(revision, vec![installed]);
+
+        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new());
+        assert!(
+            !read.holds(),
+            "a worker that did not report its fence is never read as holding: {read:?}"
+        );
+        assert_eq!(read.workers[0].state, BarrierState::Pending, "{read:?}");
+        assert_eq!(
+            read.workers[0].rejected_actions, given.workers[0].rejected_actions,
+            "the names the kept answer held are kept"
+        );
+        assert_eq!(read.pending(), vec![given.workers[0].session_id]);
+    }
+
+    /// KR-REQ-09.12, KR-REQ-10.45: the actions that had already won the dispatch race are names
+    /// too, and a repeat keeps those that only the kept answer holds beside those that only the
+    /// daemon's entry holds.
+    #[test]
+    fn a_repeat_keeps_a_possibly_executed_name_that_only_the_kept_answer_holds() {
+        use kr_protocol::action::{BarrierState, PossiblyExecutedAction, RevocationBarrier};
+        use kr_protocol::ids::ActorId;
+        use kr_protocol::method::Method;
+        use kr_protocol::receipt::ReceiptState;
+        use kr_protocol::scalars::U64;
+
+        let executed = |byte: u8| PossiblyExecutedAction {
+            action_id: ActionId::new(uuid(byte)),
+            actor_id: ActorId::new("device:phone").expect("an actor"),
+            method: Method::AgentApprovalRespond.into(),
+            state: ReceiptState::Unknown,
+        };
+        let revision = AuthorityRevision::new(5);
+        let mut first = worker_entry(1, BarrierState::Pending, &[], 0);
+        first.possibly_executed = vec![executed(10)];
+        first.possibly_executed_total = U64::new(1);
+        let given = RevocationBarrier::new(revision, vec![first]);
+        let mut now = worker_entry(1, BarrierState::Acknowledged, &[], 0);
+        now.acknowledged_revision = Nullable::some(revision);
+        now.possibly_executed = vec![executed(11)];
+        now.possibly_executed_total = U64::new(1);
+        let live = RevocationBarrier::new(revision, vec![now]);
+
+        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new());
+        let worker = &read.workers[0];
+        assert!(read.holds(), "{read:?}");
+        assert!(
+            worker.possibly_executed.contains(&executed(10)),
+            "the name only the kept answer holds is kept: {worker:?}"
+        );
+        assert!(
+            worker.possibly_executed.contains(&executed(11)),
+            "the name only the daemon's entry holds is kept: {worker:?}"
+        );
+        assert_eq!(worker.possibly_executed_total.get(), 2, "{worker:?}");
+    }
+
+    /// KR-REQ-09.12: a worker whose session closed since the kept answer is ended in a repeat, and
+    /// the entry keeps what the kept answer said of the revisions the worker had not said what its
+    /// fence named for, as a worker that can no longer be asked.
+    #[test]
+    fn a_closure_keeps_what_the_kept_answer_said_the_worker_had_not_said() {
+        use kr_protocol::action::{BarrierState, RevocationBarrier};
+
+        let revision = AuthorityRevision::new(5);
+        let mut first = worker_entry(1, BarrierState::Pending, &[10], 0);
+        first.detail = "this worker has not acknowledged revision 5 and has not been confirmed \
+                        ended, so the revocation is not complete for it; this worker has not said \
+                        what its fence named for 2 of the revisions announced to it with revision \
+                        5 or before it, and the next announcement asks; this worker cannot say \
+                        what its fence named for 1 of the revisions announced to it with revision \
+                        5 or before it"
+            .to_owned();
+        let given = RevocationBarrier::new(revision, vec![first]);
+        let live = RevocationBarrier::new(revision, Vec::new());
+        let closed: std::collections::BTreeSet<_> = [given.workers[0].session_id].into();
+
+        let read = barrier_read_again(&given, &live, &closed);
+        let worker = &read.workers[0];
+        assert_eq!(worker.state, BarrierState::Ended, "{read:?}");
+        assert!(
+            worker
+                .detail
+                .contains("has not said what its fence named for 2 of the revisions"),
+            "the revisions the worker had not said are kept: {worker:?}"
+        );
+        assert!(
+            worker
+                .detail
+                .contains("cannot say what its fence named for 1 of the revisions"),
+            "the revisions the worker cannot say are kept: {worker:?}"
+        );
+        assert!(
+            worker.detail.contains("it can no longer be asked")
+                && !worker.detail.contains("the next announcement asks"),
+            "a worker that has ended is not asked again: {worker:?}"
         );
     }
 }
