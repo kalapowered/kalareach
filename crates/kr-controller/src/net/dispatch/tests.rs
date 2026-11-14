@@ -1798,6 +1798,48 @@ async fn a_page_is_written_whole_under_the_privacy_state_it_was_read_in_and_hold
     world.serving.abort();
 }
 
+/// A wait for the link's loss that is made after the link was released resolves at once. The
+/// release's notification was given before the wait was made, so a wait that only listened for it
+/// would never end, and the connection that waits would never end either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wait_for_the_links_loss_made_after_its_release_resolves() {
+    use kr_protocol::envelope::ControlFrame;
+
+    let page = a_page_of_retained_output();
+    let world = worker_answering_pages_with(&page).await;
+    let (connection, _kept) = viewing_connection(&world.controller, 62);
+    connection
+        .answer_now(ControlFrame::Request(history_page_of(world.session_id, 1)))
+        .await
+        .expect("an answer");
+    connection.release().await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), connection.link_lost())
+        .await
+        .expect("a wait made after the release resolves");
+    world.serving.abort();
+}
+
+/// A connection that has not opened a link has none to lose, and its wait goes on: it is the
+/// connection that has not attached yet, and ending it would end every such connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_never_had_a_link_waits_for_its_first() {
+    let page = a_page_of_retained_output();
+    let world = worker_answering_pages_with(&page).await;
+    let (connection, _kept) = viewing_connection(&world.controller, 63);
+
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            connection.link_lost()
+        )
+        .await
+        .is_err(),
+        "a connection with no link yet does not end itself"
+    );
+    world.serving.abort();
+}
+
 /// A page the worker answered while privacy mode was off is withheld when privacy mode is turned on
 /// before the page is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

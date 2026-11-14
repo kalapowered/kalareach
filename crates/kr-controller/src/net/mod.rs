@@ -1153,11 +1153,9 @@ impl NetworkHost {
         guard.watch = Some(
             tokio::spawn({
                 let remote = Arc::clone(&remote);
-                let host = Arc::clone(&self);
                 async move {
                     remote.grant_ended().await;
                     remote.output().withdraw();
-                    host.input.revoke_connection(connection_id);
                     remote.release().await;
                 }
             })
