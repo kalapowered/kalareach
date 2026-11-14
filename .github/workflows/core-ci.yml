@@ -398,8 +398,8 @@ jobs:
       # nothing is bought, and each leg gives back what it published before it reports. What each
       # key's principal made in the service's directory stays, with its billing rows, so the legs
       # run only where their evidence is needed: at a push to main, and at a manual run that sets
-      # `deployment_legs`. A pull request and every other manual run skip them, and the job's
-      # result does not depend on them.
+      # `deployment_legs`. A pull request and every other manual run skip them, and there the
+      # job's result does not depend on them.
       #
       # It sits after every check that reads only this repository, so all of those have reported by
       # the time anything here contacts a service, and a deployment that is unreachable fails this
@@ -434,8 +434,8 @@ jobs:
       # stopped before the legs and a step that was cancelled all leave what they wrote. It is an
       # artifact of its own, named for what it holds, so a run's legs are found by name and not among
       # the performance figures. A step that stopped before it made its directory leaves nothing,
-      # which the upload says and does not count as a second failure. It runs where the two steps
-      # above run, and nowhere else.
+      # which the upload says and does not count as a second failure. It is eligible at the same
+      # events as the two steps above, and at no other.
       - name: Keep the deployment legs' logs
         if: ${{ always() && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.deployment_legs)) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
