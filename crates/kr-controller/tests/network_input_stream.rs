@@ -20,7 +20,9 @@ use kr_protocol::attachment::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::ids::{ActionId, AttachmentId, InputLeaseEpoch, InputSequence, SessionId};
-use kr_protocol::input::{InputAck, InputAcquireParams, InputAcquireResult, InputFrame};
+use kr_protocol::input::{
+    InputAck, InputAcquireParams, InputAcquireResult, InputFrame, input_claim,
+};
 use kr_protocol::local::{InputLaneReady, LaneEnded, LaneWindow};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -67,7 +69,14 @@ fn attach_params(session: SessionId, requested: &[AttachmentCapability]) -> Sess
 }
 
 impl Rig {
+    /// A rig whose lane gives the credit that the worker's own lane gives an attachment that holds
+    /// the lease: 32 frames of the smallest claim.
     async fn start() -> Self {
+        Self::start_with_credit(64, 512 * 1024).await
+    }
+
+    /// A rig whose lane begins with `frames` queue entries and `bytes` of credit.
+    async fn start_with_credit(frames: u32, bytes: u64) -> Self {
         let adopted = Adopted::start(1).await;
         let host = &adopted.host;
         let worker: &Worker = &adopted.workers[0];
@@ -119,8 +128,8 @@ impl Rig {
         let lane = ScriptedLane::start(InputLaneReady {
             epoch,
             holder: true,
-            frames: 64,
-            bytes: U64::new(512 * 1024),
+            frames,
+            bytes: U64::new(bytes),
         });
         host.network().use_input_lane_at(lane.endpoint());
         Self {
@@ -135,6 +144,10 @@ impl Rig {
     }
 
     fn header(&self) -> StreamHeader {
+        self.header_for(self.attachment)
+    }
+
+    fn header_for(&self, attachment: AttachmentId) -> StreamHeader {
         StreamHeader {
             kind: StreamKind::TerminalInput,
             connection_id: self.device.connection_id(),
@@ -142,7 +155,7 @@ impl Rig {
             resource: StreamResource {
                 environment_id: self.adopted.host.environment_id,
                 session_id: Nullable::some(self.session),
-                attachment_id: Nullable::some(self.attachment),
+                attachment_id: Nullable::some(attachment),
                 transfer_id: Nullable::null(),
             },
         }
@@ -150,7 +163,12 @@ impl Rig {
 
     /// Opens the attachment's input stream and reads the host's `Ready`.
     async fn open(&self) -> DataStream {
-        let mut stream = self.device.open_stream(self.header()).await;
+        self.open_for(self.attachment).await
+    }
+
+    /// Opens the input stream that names `attachment` and reads the host's `Ready`.
+    async fn open_for(&self, attachment: AttachmentId) -> DataStream {
+        let mut stream = self.device.open_stream(self.header_for(attachment)).await;
         match next(&mut stream).await {
             Some(InputAck::Ready { window }) => {
                 assert_eq!(u64::from(window.frames), CLIENT_WINDOW);
@@ -486,5 +504,321 @@ async fn a_detach_with_no_notice_ends_the_stream_when_the_wait_is_over() {
         "the stream ends cleanly, with no notice"
     );
     rig.lane.until_ended().await;
+    rig.stop().await;
+}
+
+/// Frames the host passes on within the lane's credit at most, when each claims the least: the lane
+/// begins an epoch with 64 queue entries and a frame claims two.
+const LANE_FRAMES: u64 = 32;
+
+/// How many frames the host keeps read and not yet routed, as the door names it.
+const READ_AHEAD: u64 = 2;
+
+/// A new attachment identifier, for a stream that names an attachment the device has not made.
+fn another_attachment() -> AttachmentId {
+    AttachmentId::new(kr_ipc::new_uuid())
+}
+
+/// The most input streams one connection holds, as the listener allows.
+const MAX_STREAMS: usize = kr_transport::listener::DEFAULT_MAX_INPUT_STREAMS;
+
+/// A stream that is refused is reset and given no place: the connection holds as many as it may,
+/// and the streams it holds go on typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fifth_input_stream_of_a_connection_is_refused() {
+    let rig = Rig::start().await;
+    let mut streams = vec![rig.open().await];
+    for _ in 1..MAX_STREAMS {
+        streams.push(rig.open_for(another_attachment()).await);
+    }
+    let mut fifth = rig
+        .device
+        .open_stream(rig.header_for(another_attachment()))
+        .await;
+    assert!(
+        next_or_reset(&mut fifth).await.is_err(),
+        "the stream above the bound is reset"
+    );
+    assert_eq!(rig.lane.binds().len(), MAX_STREAMS, "it was given no lane");
+
+    streams[0]
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    assert_eq!(
+        next(&mut streams[0]).await,
+        Some(InputAck::Accepted {
+            epoch: rig.epoch,
+            through: InputSequence::new(0),
+        }),
+        "the control: a stream within the bound types"
+    );
+    rig.stop().await;
+}
+
+/// A newer stream for an attachment replaces the older, which is reset, and the newer carries the
+/// typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_newer_stream_for_an_attachment_replaces_the_older() {
+    let rig = Rig::start().await;
+    let mut older = rig.open().await;
+    let mut newer = rig.open().await;
+    assert!(
+        next_or_reset(&mut older).await.is_err(),
+        "the older stream is reset"
+    );
+    newer
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    assert_eq!(
+        next(&mut newer).await,
+        Some(InputAck::Accepted {
+            epoch: rig.epoch,
+            through: InputSequence::new(0),
+        }),
+        "the newer stream types"
+    );
+    rig.stop().await;
+}
+
+/// Credit comes for one epoch: a credit that names another epoch is ignored, so only the credit of
+/// the lane's own epoch lets a held frame go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credit_of_another_epoch_is_ignored() {
+    let claim = input_claim(2);
+    let rig = Rig::start_with_credit(claim.frames as u32, claim.bytes as u64).await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut full = stages.reads_full();
+    rig.lane.withhold_credit();
+    let frames = counters(5);
+    for (sequence, bytes) in frames.iter().enumerate() {
+        stream
+            .write_message(&rig.frame(sequence as u64, bytes))
+            .await
+            .expect("the frame is written");
+    }
+    tokio::time::timeout(WAIT, full.wait_for(|turns| *turns >= 1))
+        .await
+        .expect("the host stopped reading in time")
+        .expect("the count stands");
+    rig.lane
+        .until("the one frame that fits the credit", |read| read.len() == 1)
+        .await;
+
+    rig.lane.send_credit(rig.epoch.get() + 1, 200, 1 << 20);
+    rig.lane
+        .send_credit(rig.epoch.get(), claim.frames as u32, claim.bytes as u64);
+    until("what the host has read is on the lane or waiting", || {
+        let counts = stages.counts();
+        counts.read >= 4 && rig.lane.frames().len() as u64 + counts.held == counts.read
+    })
+    .await;
+    assert_eq!(
+        rig.lane.bytes(),
+        frames[..2].concat(),
+        "the credit of the other epoch let nothing go: one frame more went, for the credit of the epoch"
+    );
+    rig.stop().await;
+}
+
+/// A frame of an epoch older than the lane's is refused by the host, and never forwarded; the
+/// frame behind it, of the same epoch, is passed over and the refusal is not given twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_of_an_older_epoch_is_refused_by_the_host_and_never_forwarded() {
+    let rig = Rig::start().await;
+    let stream = rig.open().await;
+    let newer = InputLeaseEpoch::new(rig.epoch.get() + 1);
+    rig.lane.send_window(LaneWindow {
+        epoch: newer,
+        holder: false,
+        frames: 0,
+        bytes: U64::new(0),
+        ended: Nullable::some(LaneEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+    });
+    let (mut reader, mut writer) = stream.split();
+    let ended = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the host tells the device in time")
+        .expect("not reset");
+    assert_eq!(
+        ended,
+        Some(InputAck::EpochEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+        "the device is told the epoch ended"
+    );
+    writer
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    writer
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    drop(writer);
+    let Some(InputAck::Refused {
+        epoch,
+        sequence,
+        accepted_through,
+        error,
+    }) = reader.read_message::<InputAck>().await.expect("not reset")
+    else {
+        panic!("the older epoch's frame was to be refused");
+    };
+    assert_eq!(epoch, rig.epoch);
+    assert_eq!(sequence.get(), 0);
+    assert_eq!(accepted_through.0, None);
+    assert_eq!(error.code, ErrorCode::LeaseLost);
+    assert!(
+        matches!(reader.read_message::<InputAck>().await, Ok(None)),
+        "the stream ends with no second refusal"
+    );
+    assert!(rig.lane.frames().is_empty(), "nothing was forwarded");
+    rig.stop().await;
+}
+
+/// 32 frames are in flight on the lane at once, and reach it in the order they were read, each once,
+/// before the worker answers any.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frames_in_flight_on_the_lane_keep_their_order() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    rig.lane.hold_answers();
+    let frames = counters(LANE_FRAMES as usize);
+    for (sequence, bytes) in frames.iter().enumerate() {
+        stream
+            .write_message(&rig.frame(sequence as u64, bytes))
+            .await
+            .expect("the frame is written");
+    }
+    rig.lane
+        .until("all 32 frames, none answered", |read| {
+            read.len() == LANE_FRAMES as usize
+        })
+        .await;
+    let written = rig.lane.frames();
+    for (index, frame) in written.iter().enumerate() {
+        assert_eq!(frame.sequence, index as u64, "in the order they were read");
+    }
+    assert_eq!(rig.lane.bytes(), frames.concat());
+    assert_eq!(
+        rig.adopted
+            .host
+            .network()
+            .input_stages()
+            .counts()
+            .unanswered_peak,
+        LANE_FRAMES,
+        "they were in flight together"
+    );
+    rig.lane.release_answers();
+    loop {
+        let ack = next(&mut stream).await.expect("the stream stays open");
+        if matches!(
+            ack,
+            InputAck::Accepted { through, .. } if through.get() == LANE_FRAMES - 1
+        ) {
+            break;
+        }
+    }
+    rig.stop().await;
+}
+
+/// The host reads at most [`READ_AHEAD`] frames that wait for credit, and no third: with the credit
+/// spent it has the one it forwarded and the two it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_third_frame_is_read_while_the_credit_is_spent() {
+    let claim = input_claim(2);
+    let rig = Rig::start_with_credit(claim.frames as u32, claim.bytes as u64).await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut full = stages.reads_full();
+    rig.lane.withhold_credit();
+    for (sequence, bytes) in counters(6).iter().enumerate() {
+        stream
+            .write_message(&rig.frame(sequence as u64, bytes))
+            .await
+            .expect("the frame is written");
+    }
+    tokio::time::timeout(WAIT, full.wait_for(|turns| *turns >= 1))
+        .await
+        .expect("the host stopped reading in time")
+        .expect("the count stands");
+    let counts = stages.counts();
+    assert_eq!(
+        counts.read,
+        1 + READ_AHEAD,
+        "one forwarded, two held, no third"
+    );
+    assert_eq!(counts.held, READ_AHEAD);
+    assert_eq!(counts.held_peak, READ_AHEAD);
+    rig.stop().await;
+}
+
+/// A device that resets its stream while the credit is spent is heard: the host has one frame
+/// waiting and reads on, so it learns of the reset, and the stream and its lane end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_is_learned_while_the_credit_is_spent() {
+    let claim = input_claim(2);
+    let rig = Rig::start_with_credit(claim.frames as u32, claim.bytes as u64).await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    rig.lane.withhold_credit();
+    for (sequence, bytes) in counters(2).iter().enumerate() {
+        stream
+            .write_message(&rig.frame(sequence as u64, bytes))
+            .await
+            .expect("the frame is written");
+    }
+    until("one frame is forwarded and one waits", || {
+        let counts = stages.counts();
+        counts.read == 2 && counts.held == 1
+    })
+    .await;
+    stream.reset();
+    rig.lane.until_ended().await;
+    until("the stages are empty", || {
+        let counts = stages.counts();
+        counts.held == 0 && counts.unanswered == 0
+    })
+    .await;
+    rig.stop().await;
+}
+
+/// A device that finishes its stream is answered for everything it wrote, and the stream then ends
+/// cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_finishes_its_stream_is_answered_for_all_it_wrote() {
+    let rig = Rig::start().await;
+    let stream = rig.open().await;
+    let (mut reader, mut writer) = stream.split();
+    for (sequence, bytes) in counters(3).iter().enumerate() {
+        writer
+            .write_message(&rig.frame(sequence as u64, bytes))
+            .await
+            .expect("the frame is written");
+    }
+    drop(writer);
+    let mut through = None;
+    while let Some(ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the host answers in time")
+        .expect("the stream is not reset")
+    {
+        if let InputAck::Accepted { through: seen, .. } = ack {
+            through = Some(seen.get());
+        }
+    }
+    assert_eq!(
+        through,
+        Some(2),
+        "the last frame was answered before the end"
+    );
     rig.stop().await;
 }
