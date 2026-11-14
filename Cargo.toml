@@ -316,7 +316,10 @@ zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate
 # Remove this entry, and the git source it gives `noq-udp` in the lock, when the lock can take a
 # released `noq-udp` that holds the fix. The web repository's end-to-end program and discovery
 # harness are Cargo roots of their own and carry their own entry for the same commit; they go
-# together with this one.
+# together with this one. While the entry stands, `cargo audit` does not check `noq-udp`: it
+# matches an advisory only to a crate from the advisory's own source, which is crates.io unless the
+# advisory names another, and the entry gives the crate a Git source in the lock. No workflow or
+# script in this repository reads advisories against the upstream repository.
 [patch.crates-io]
 noq-udp = { git = "https://github.com/n0-computer/noq", rev = "04807b674cff617cbac323256416dc4779ccf7c2" }
 # `noq-proto` 1.4.0, the QUIC library under every endpoint, closes a whole connection ("too many
@@ -330,7 +333,11 @@ noq-udp = { git = "https://github.com/n0-computer/noq", rev = "04807b674cff617cb
 # `reader_falls_behind` in `crates/kr-transport/tests` passes without it and whose assembler also
 # joins chunks that touch before it bounds the queue and starts the compaction of an ordered stream
 # at the read position: the case holds a reader only a little past the library's present bound and
-# sends no duplicate data, so a release could pass it without either.
+# sends no duplicate data, so a release could pass it without either. For the same reason as
+# `noq-udp`, `cargo audit` does not check `noq-proto` while the entry stands, and no workflow or
+# script in this repository reads advisories against the upstream repository. The `patched_crates`
+# test in `tests/conformance` fails when nothing uses an entry here, so that the registry crate
+# cannot replace it unseen.
 noq-proto = { git = "https://github.com/kalapowered/noq", rev = "d8d5e9153f22f521bc5768c83fc4a50963d02bf3" }
 
 [workspace.lints.rust]
