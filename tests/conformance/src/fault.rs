@@ -1150,12 +1150,60 @@ fn gather(
 pub struct Removal {
     /// Each thing taken, with the files and directories in it, in the order they go.
     parts: Vec<(PathBuf, Vec<(PathBuf, bool)>)>,
+    /// The device of the build's output, which each entry is on.
+    device: Option<u64>,
+    /// When the step began: a file is older than it is not the step's.
+    began: SystemTime,
 }
 
 impl Removal {
+    /// Whether `path` is still what the plan found: not a link or reparse point, on the build's
+    /// device, and, where it is a file, written since the step began, and its directory too is no
+    /// link and on the device. It is read now, entry by entry, so that a change since the plan
+    /// (a link put in place of a directory, a volume mounted on it) is seen.
+    fn holds(&self, path: &Path, directory: bool) -> bool {
+        let sound = |path: &Path| {
+            std::fs::symlink_metadata(path).ok().filter(|metadata| {
+                !redirects(metadata)
+                    && match (self.device, device_of(metadata)) {
+                        (Some(want), Some(have)) => want == have,
+                        _ => true,
+                    }
+            })
+        };
+        let Some(metadata) = sound(path) else {
+            return false;
+        };
+        if !directory
+            && metadata
+                .modified()
+                .map_or(true, |written| written < self.began)
+        {
+            return false;
+        }
+        path.parent().is_some_and(|parent| sound(parent).is_some())
+    }
+
     /// Takes what the removal holds, entry by entry, with no walk of its own: a directory goes
-    /// when it is empty. Returns what went whole: each directory or file the removal was for.
-    pub fn carry_out(self) -> Vec<PathBuf> {
+    /// when it is empty. Every entry is read again first, and where any of them is no longer what
+    /// the plan found, nothing is taken at all. Returns what went whole: each directory or file the
+    /// removal was for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first entry that is no longer what the plan found, and takes nothing.
+    pub fn carry_out(self) -> Result<Vec<PathBuf>, String> {
+        let changed = self
+            .parts
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .find(|(path, directory)| !self.holds(path, *directory));
+        if let Some((path, _)) = changed {
+            return Err(format!(
+                "{} is no longer what the plan found, so nothing is removed",
+                path.display()
+            ));
+        }
         let mut removed = Vec::new();
         for (root, entries) in self.parts {
             let mut whole = true;
@@ -1171,7 +1219,7 @@ impl Removal {
                 removed.push(root);
             }
         }
-        removed
+        Ok(removed)
     }
 }
 
@@ -1216,7 +1264,11 @@ pub fn removal_of(
             }
         }
     }
-    Ok(Removal { parts })
+    Ok(Removal {
+        parts,
+        device,
+        began,
+    })
 }
 
 /// What a rerun's facts file says.
@@ -1380,16 +1432,8 @@ pub fn execute(
         .into_iter()
         .filter(|path| !named.contains(path) && built_by_cargo(path))
         .collect();
-    let removal = removal_of(
-        &target,
-        volume_of(&target),
-        began,
-        &named
-            .iter()
-            .chain(swept.iter())
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
+    let doomed: Vec<PathBuf> = named.iter().chain(swept.iter()).cloned().collect();
+    let removal = removal_of(&target, volume_of(&target), began, &doomed);
     let allowed = budget.allowed(SystemTime::now());
     let refusal = if has_failed_test(&first) {
         Some("a test of the step failed".to_owned())
@@ -1419,9 +1463,9 @@ pub fn execute(
     let now = SystemTime::now();
     let files: Vec<FileFacts> = named.iter().map(|path| facts_of(path, now)).collect();
     // The refusal above took a removal that may not be made.
-    let Ok(removal) = removal else {
+    if removal.is_err() {
         return first;
-    };
+    }
     let stem = Path::new(&first.log)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -1441,7 +1485,26 @@ pub fn execute(
     let free = (reads.free_space)(&target, from, until);
     let cause = cause_of(&storage, &free);
     let reason = reason_for(cause, &files, &storage, &free, place.root);
-    let removed = removal.carry_out();
+    // The plan that is carried out is the one made now, not the one made before the evidence was
+    // read, which took time (the kernel's log alone up to a minute and a half): a process of the
+    // first run could have changed what lies under a unit since. Each entry is read again as the
+    // removal goes (see `Removal::carry_out`).
+    let removed = match removal_of(&target, volume_of(&target), began, &doomed)
+        .and_then(Removal::carry_out)
+    {
+        Ok(removed) => removed,
+        Err(why) => {
+            let said = format!(
+                "a file the step linked could not be started, and the step is not run again: nothing of its units is removed, because {why}"
+            );
+            progress(&format!("  {said}"));
+            first.error = Some(match first.error.take() {
+                Some(error) => format!("{error}; {said}"),
+                None => said,
+            });
+            return first;
+        }
+    };
     let facts = format!("conformance/faults/{stem}.txt");
     if let Err(error) = std::fs::write(
         place.evidence.join(&facts),
@@ -1870,7 +1933,7 @@ mod tests {
     /// What the removal for `file` takes, with everything counted as written since the step began.
     fn removal(target: &Path, file: &Path) -> Result<Vec<PathBuf>, String> {
         removal_of(target, volume_of(target), UNIX_EPOCH, &[file.to_path_buf()])
-            .map(Removal::carry_out)
+            .and_then(Removal::carry_out)
     }
 
     #[test]
@@ -2160,9 +2223,62 @@ mod tests {
         assert!(script.exists());
         assert!(unit.join("out/data").exists());
         // On the files' own device the same removal takes the unit.
-        let removed = removal_on(device).unwrap().carry_out();
+        let removed = removal_on(device).unwrap().carry_out().unwrap();
         assert_eq!(removed.len(), 2);
         assert!(!unit.exists());
+    }
+
+    /// The plan is read again as it is carried out: an entry that a link took the place of, that is
+    /// on another device, or that is older than the step is no longer what the plan found, and
+    /// nothing of the removal is taken.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_takes_nothing_where_an_entry_is_no_longer_what_the_plan_found() {
+        let make = || {
+            let directory = tempfile::tempdir().unwrap();
+            let target = directory.path().join("target");
+            let unit = target.join("debug/build/x-0123456789abcdef");
+            let script = unit.join("build-script-build");
+            write(&script, b"");
+            write(&unit.join("out/data"), b"");
+            write(
+                &target.join("debug/.fingerprint/x-0123456789abcdef/invoked.timestamp"),
+                b"",
+            );
+            (directory, target, unit, script)
+        };
+        let plan = |target: &Path, script: &Path| {
+            removal_of(
+                target,
+                volume_of(target),
+                UNIX_EPOCH,
+                std::slice::from_ref(&script.to_path_buf()),
+            )
+            .unwrap()
+        };
+        // A link where a directory was.
+        let (directory, target, unit, script) = make();
+        let removal = plan(&target, &script);
+        let outside = directory.path().join("outside");
+        write(&outside.join("kept"), b"kept");
+        std::fs::remove_file(unit.join("out/data")).unwrap();
+        std::fs::remove_dir(unit.join("out")).unwrap();
+        std::os::unix::fs::symlink(&outside, unit.join("out")).unwrap();
+        let why = removal.carry_out().unwrap_err();
+        assert!(why.contains("no longer what the plan found"), "{why}");
+        assert!(script.exists() && outside.join("kept").exists());
+        // Another device than the plan's.
+        let (_directory, target, unit, script) = make();
+        let mut removal = plan(&target, &script);
+        removal.device = removal.device.map(|device| device + 1);
+        assert!(removal.carry_out().is_err());
+        assert!(script.exists() && unit.join("out/data").exists());
+        // A file older than the step began.
+        let (_directory, target, unit, script) = make();
+        let mut removal = plan(&target, &script);
+        removal.began = SystemTime::now() + Duration::from_secs(60);
+        assert!(removal.carry_out().is_err());
+        assert!(script.exists() && unit.join("out/data").exists());
     }
 
     /// A file of a unit that is older than the step is not one the step's build made, so the

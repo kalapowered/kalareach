@@ -573,6 +573,43 @@ fn a_file_of_a_unit_that_the_step_did_not_write_is_not_removed_and_the_step_is_n
     assert!(program.exists());
 }
 
+/// What lies under a unit changes after the first plan, while the evidence is read (the kernel's
+/// log can take a minute and a half): a link is put in where a directory was. The plan that is
+/// carried out is the one made right before, so it sees the link; the removal takes nothing of the
+/// unit and the step is not run again.
+#[cfg(unix)]
+#[test]
+fn a_link_put_in_a_unit_while_the_evidence_is_read_stops_the_removal_and_the_second_run() {
+    let tree = Tree::new();
+    let (program, unit) = unit_of(&tree);
+    let outside = tree.directory.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("kept"), "kept").unwrap();
+    std::fs::create_dir_all(unit.join("out")).unwrap();
+    let out = unit.join("out");
+    let reads = Reads {
+        kernel_log: Box::new(move |_, _, file| {
+            // Between the plan and the removal, the directory becomes a link to another place.
+            std::fs::remove_dir(&out).map_err(|error| error.to_string())?;
+            std::os::unix::fs::symlink(&outside, &out).map_err(|error| error.to_string())?;
+            std::fs::write(file, KERNEL_FAULT).map_err(|error| error.to_string())
+        }),
+        free_space: Box::new(|_, _, _| Ok(ROOM)),
+    };
+    let done = fault::execute(
+        &step(&[&tree.marker, &program]),
+        1,
+        &tree.place(),
+        &[],
+        &mut Budget::of(Duration::from_secs(3600)),
+        &reads,
+        &mut |_| {},
+    );
+    assert_run_once_with_reason(&done, "is a link");
+    assert!(program.exists(), "the program is left where it is");
+    assert!(tree.directory.path().join("outside/kept").exists());
+}
+
 /// A disk image of 4 MiB, in the case's own directory on the disk the temporary directory is on,
 /// attached with no browser window at a directory of the case's own, never under `/Volumes`. It
 /// is detached when this is dropped, which happens on every ending of the case that unwinds. The
