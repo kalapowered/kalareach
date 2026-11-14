@@ -416,6 +416,9 @@ pub struct Controller {
     /// has taken yet ([`workers::Opening`]): the one presentation of this daemon that a worker may
     /// be holding at its dispatch boundary.
     openings: std::sync::Mutex<BTreeMap<SessionId, Arc<workers::Opening>>>,
+    /// The tasks that hold this daemon through `barrier::while_held`, which are not counted as its
+    /// owners.
+    task_holds: Arc<barrier::TaskHolds>,
     /// The links remote connections hold to each session's worker, which the session's closure
     /// ends. Weakly, because a link belongs to the connection that opened it.
     ///
@@ -664,10 +667,10 @@ pub struct Controller {
     /// this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     pending_asks: std::sync::Mutex<Vec<(SessionId, tokio::time::Instant)>>,
-    /// How many times this daemon has asked whether a worker has ended, for this host's own tests.
-    /// Compiled away in every shipped build.
+    /// Every time this daemon has asked whether a worker has ended, by the worker's session, for
+    /// this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    reconciliations: std::sync::atomic::AtomicUsize,
+    reconciliations: std::sync::Mutex<Vec<SessionId>>,
     /// Where this host's own tests stop a barrier's first step once it has advanced the revision
     /// and withdrawn the registrations, before the lease issuer adopts the revision. The pause
     /// holds the thread, not the task: nothing the test asks from here awaits. Compiled away in
@@ -1284,12 +1287,44 @@ impl Controller {
             .clone()
     }
 
-    /// How many times this daemon has asked whether a worker has ended, for this host's own tests.
+    /// How many times this daemon has asked whether the worker of `session_id` has ended, for this
+    /// host's own tests.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn reconciliations_for_tests(&self) -> usize {
+    pub fn reconciliations_for_tests(&self, session_id: SessionId) -> usize {
         self.reconciliations
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|asked| **asked == session_id)
+            .count()
+    }
+
+    /// The barrier of the revision in force as the daemon holds it now, for this host's own tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    #[cfg(feature = "testing")]
+    pub async fn barrier_as_it_stands_for_tests(
+        &self,
+    ) -> Result<kr_protocol::action::RevocationBarrier> {
+        let revision = self.registry.lock().await.authority_revision()?;
+        self.barrier_as_it_stands(revision).await
+    }
+
+    /// Makes the registry refuse to write that a worker acknowledged a revision, or stops doing so,
+    /// for this host's own tests: the barrier takes an acknowledgement before its row is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be written.
+    #[cfg(feature = "testing")]
+    pub async fn refuse_acknowledged_rows_for_tests(&self, refusing: bool) -> Result<()> {
+        self.registry
+            .lock()
+            .await
+            .refuse_acknowledged_rows_for_tests(refusing)
     }
 
     /// The revision whose fence this host still owes, if it owes one, for this host's own tests.

@@ -514,15 +514,18 @@ const PASS_JITTER: std::time::Duration = std::time::Duration::from_millis(250);
 pub(super) const PASS_ASK_BOUND: std::time::Duration =
     super::net::ACKNOWLEDGEMENT_TIMEOUT.saturating_add(WORKER_EXCHANGE);
 
-/// The longest the interval between two asks of a worker that does not answer grows to.
+/// The longest wait that is scheduled after an ask that failed. The ask is made at the first pass
+/// that falls after the wait, so the gap between two asks can be longer.
 const ASK_INTERVAL_LONGEST: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// When the pass next asks each worker it has asked.
 ///
 /// A refusal costs one frame on a link that is still good, so the worker is asked again at the
-/// next pass. An ask that could not open a link or ran out costs a link attempt and the whole of
-/// its acknowledgement time: the interval before the next one, counted from its end, doubles from
-/// five seconds to a minute at most. An answer of any kind puts it back to five seconds. Only
+/// first pass that falls five seconds after the ask began. An ask that could not open a link or
+/// ran out costs a link attempt and the whole of its acknowledgement time: the wait before the next
+/// one, counted from its end, doubles from five seconds to a minute at most, and the ask is made
+/// at the first pass after it. An answer of any kind puts the wait back to five seconds. A worker
+/// whose earlier presentation is still waiting at its dispatch boundary is not asked at all. Only
 /// memory: the registry decides each pass who is pending.
 #[derive(Debug, Default)]
 pub(super) struct AskPace {
@@ -656,19 +659,56 @@ async fn until_told(telling: &mut Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
-/// Runs `work` on the daemon `daemon` names while something besides this task holds the daemon
-/// too, and answers `None` once it has gone or this task has let it go.
+/// How many tasks hold the daemon through [`while_held`] now.
+///
+/// Those tasks are the daemon's only holders once its owner has let it go, and each one has to
+/// know that without counting the others as owners. The count and the daemon's strong count are
+/// read under one lock. A task is counted only after it holds the daemon and is taken out before
+/// it lets the daemon go, so the count is never above the references these tasks hold: a strong
+/// count that is no higher than it means nothing else holds the daemon.
+#[derive(Debug, Default)]
+pub(super) struct TaskHolds(std::sync::Mutex<usize>);
+
+impl TaskHolds {
+    fn count(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One task's place in [`TaskHolds`], given up before the task lets go of the daemon.
+struct TaskHold(Arc<TaskHolds>);
+
+impl TaskHold {
+    fn begin(holds: &Arc<TaskHolds>) -> Self {
+        *holds.count() += 1;
+        Self(Arc::clone(holds))
+    }
+}
+
+impl Drop for TaskHold {
+    fn drop(&mut self) {
+        *self.0.count() -= 1;
+    }
+}
+
+/// Runs `work` on the daemon `daemon` names while something besides the tasks that run work this
+/// way holds the daemon too, and answers `None` once it has gone or this task has let it go.
 ///
 /// The daemon's own tasks hold it weakly, so none of them is what keeps a daemon, and its
 /// environment lock, alive once its owner has let it go. A task that has to hold it across a wait
 /// it cannot bound itself, as a barrier waits for its workers, holds it through this: every
-/// [`LAST_HOLDER_LOOK`] it looks at whether it has become the daemon's last holder, and once it
-/// has, it abandons the work and lets the daemon go.
+/// [`LAST_HOLDER_LOOK`] it looks at whether the tasks that hold the daemon this way ([`TaskHolds`])
+/// are its only holders, and once they are, it abandons the work and lets the daemon go. Two such
+/// tasks do not keep each other's daemon alive.
 pub(super) async fn while_held<T>(
     daemon: &std::sync::Weak<Controller>,
     work: impl AsyncFnOnce(&Arc<Controller>) -> T,
 ) -> Option<T> {
     let controller = daemon.upgrade()?;
+    // Declared after the daemon, so it is given up first.
+    let _hold = TaskHold::begin(&controller.task_holds);
     let mut working = std::pin::pin!(work(&controller));
     let mut looks = tokio::time::interval(LAST_HOLDER_LOOK);
     looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -676,7 +716,7 @@ pub(super) async fn while_held<T>(
         tokio::select! {
             done = &mut working => return Some(done),
             _ = looks.tick() => {
-                if Arc::strong_count(&controller) == 1 {
+                if Arc::strong_count(&controller) <= *controller.task_holds.count() {
                     return None;
                 }
             }
@@ -1919,15 +1959,15 @@ impl Controller {
         }
     }
 
-    /// The workers the pass asks for an acknowledgement: those the registry holds as not having
-    /// acknowledged the revision in force and, while the fence is owed, those the barrier as it
-    /// stands counts pending.
+    /// The workers that have not acknowledged the revision in force, which the pass asks and the
+    /// doctor counts: those the registry holds as not having acknowledged it and, while the fence is
+    /// owed, those the barrier as it stands counts pending.
     ///
     /// The two differ after a restart: a worker's row can say that it acknowledged the revision
     /// before the daemon stopped, while the start's announcement to it was refused and this
     /// daemon's barrier counts it pending. The fence is settled only when the barrier holds, so a
     /// worker that only the barrier counts is asked all the same.
-    async fn workers_to_ask(&self) -> Result<Vec<SessionId>> {
+    pub(super) async fn pending_workers(&self) -> Result<Vec<SessionId>> {
         let (mut pending, owed_at) = {
             let registry = self.registry.lock().await;
             let revision = registry.authority_revision()?;
@@ -1968,7 +2008,7 @@ impl Controller {
         pace: &mut AskPace,
         tick: tokio::time::Instant,
     ) {
-        if let Ok(pending) = self.workers_to_ask().await {
+        if let Ok(pending) = self.pending_workers().await {
             pace.keep_only(&pending);
             let mut due = Vec::new();
             for session_id in pending {
