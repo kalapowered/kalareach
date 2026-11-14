@@ -75,6 +75,8 @@ fn a_stop_file_that_holds_another_token_does_not_stop_the_sampler() {
     assert!(ok && text.lines().any(|line| line == "done"), "{text}");
 }
 
+// A scheduling case: it relies on the sampler not waking in the few milliseconds before the
+// script reads the samples, and passes with the token rule removed on the rare run that does.
 #[test]
 fn a_last_line_that_an_earlier_sampler_writes_late_does_not_end_the_wait_for_the_current_one() {
     let state = tempfile::tempdir().expect("a state directory");
@@ -109,6 +111,8 @@ fn a_case_that_fails_after_it_started_the_sampler_still_ends_it() {
     );
 }
 
+// A scheduling case: it holds that a read that does not end is ended by its own alarm well before
+// a sleep of thirty seconds would end, and it depends on the machine's timing.
 #[test]
 fn a_read_that_ends_at_once_signals_nothing_and_one_that_does_not_end_is_ended_by_its_own_alarm() {
     let state = tempfile::tempdir().expect("a state directory");
