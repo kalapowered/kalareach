@@ -55,6 +55,7 @@ pub mod controls;
 pub mod cursors;
 pub mod drafts;
 pub mod error;
+pub mod input;
 pub mod ipc;
 pub mod mailbox_reader;
 pub mod organisation;
