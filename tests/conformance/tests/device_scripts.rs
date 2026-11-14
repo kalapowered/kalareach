@@ -493,11 +493,14 @@ fn run_with(
     }
 
     // The SDK's two programs. The emulator lists what the machine has and, asked to start a
-    // device, only records it, and then marks that it has. The debug bridge reports the running
-    // emulator and its device, and says the boot is complete only where a script waits for that and
-    // only once an emulator is running: one that was already up, or the one the script started,
-    // as a device cannot finish booting before its emulator has begun. A script that goes on at
-    // that answer therefore finds the emulator's start in the record, however late the program ran.
+    // device, only records it, and then marks that it has, for the console port it was given. The
+    // debug bridge reports the running emulator and its device, and says the boot is complete only
+    // where a script waits for that and only for an emulator that is running: one that was already
+    // up on the serial the script asks about, or the one the script started on it, as a device
+    // cannot finish booting before its emulator has begun, and one emulator never answers for
+    // another's serial. It records each boot answer it gives, with the serial. A script that goes on
+    // at that answer therefore finds the emulator's start in the record, however late the program
+    // ran.
     let stopped = root.join("emulator-stopped");
     stand_in_after(
         &sdk.join("emulator"),
@@ -510,7 +513,7 @@ fn run_with(
         },
         &format!(
             "[ \"$1\" = -list-avds ] && cat \"{}\"\n\
-             [ \"$1\" = -list-avds ] || : >\"{}\"\n{}exit 0",
+             [ \"$1\" = -list-avds ] || {{ port=5554; previous=; for each in \"$@\"; do [ \"$previous\" = -port ] && port=$each; previous=$each; done; : >\"{}-$port\"; }}\n{}exit 0",
             root.join("avds.txt").display(),
             root.join("emulator-started").display(),
             // A device that boots stays up until the script that started it has gone or has asked
@@ -537,7 +540,7 @@ fn run_with(
              *'emu kill'*) : >\"{stopped}\" ;;\n\
              *install*) [ -f \"{installs_fail}\" ] && exit 1 ;;\n\
              *'emu avd name'*) [ -f \"{running_avd}\" ] && {{ cat \"{running_avd}\"; echo OK; }} ;;\n\
-             *getprop*sys.boot_completed*) [ -f \"{booted}\" ] && {{ [ -f \"{running}\" ] || [ -f \"{emulator_started}\" ]; }} && echo 1 ;;\n\
+             *getprop*sys.boot_completed*) [ -f \"{booted}\" ] || exit 0; serial=; previous=; for each in \"$@\"; do [ \"$previous\" = -s ] && serial=$each; previous=$each; done; up=; if [ -n \"$serial\" ]; then cut -f1 \"{running}\" 2>/dev/null | grep -qx \"$serial\" && up=1; [ -f \"{emulator_started}-${{serial#emulator-}}\" ] && up=1; else [ -f \"{running}\" ] && up=1; for each in \"{emulator_started}\"-*; do [ -e \"$each\" ] && up=1; done; fi; [ -n \"$up\" ] && {{ echo \"boot-answer $serial\" >>\"{record}\"; echo 1; }} ;;\n\
              *getprop*) echo stand-in ;;\n\
              devices*) echo 'List of devices attached'; [ -f \"{running}\" ] && cat \"{running}\"; [ -f \"{started}\" ] && cat \"{started}\" ;;\n\
              esac\nexit 0",
@@ -545,6 +548,7 @@ fn run_with(
             booted = root.join("booted").display(),
             running = root.join("running.txt").display(),
             emulator_started = root.join("emulator-started").display(),
+            record = record.display(),
             started = root.join("started.txt").display(),
             installs_fail = root.join("installs-fail").display(),
             stopped = stopped.display(),
@@ -990,6 +994,76 @@ fn a_device_on_any_scripts_own_serial_that_is_not_kalareachs_is_left_alone() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// The console port an emulator was started with, as the record of its call has it.
+fn port_of(call: &str) -> Option<&str> {
+    let mut words = call.split_whitespace();
+    if words.next() != Some("emulator") {
+        return None;
+    }
+    words.skip_while(|word| *word != "-port").nth(1)
+}
+
+/// An emulator that already stands on another port does not answer the boot wait of the one a script
+/// starts. The debug bridge says that a boot is complete for a serial only when an emulator stands on
+/// that serial or has been started on it, so a script that waits for the boot of its own emulator is
+/// answered after that emulator was started, and not by the device that was up before it.
+#[test]
+fn an_emulator_already_up_on_another_port_does_not_answer_for_the_one_a_script_starts() {
+    let mut problems = Vec::new();
+    let mut answered_after_start = 0;
+    // The scripts that start no emulator beside a device that is up, and so ask no boot of one.
+    let mut unread = Vec::new();
+    for path in OWN_SERIAL {
+        let script = SCRIPTS
+            .iter()
+            .find(|script| script.path == path)
+            .expect("a script of the cases");
+        let run = run_with(
+            script,
+            &[OTHERS[0], KALAREACH],
+            Some(("emulator-5554", OTHERS[0])),
+            &[],
+            &Setup {
+                boots_as: Some(OTHERS[0]),
+                emulator_starts_late: true,
+                installs_fail: true,
+                ..Setup::default()
+            },
+        );
+        let Some((started, port)) = run
+            .calls
+            .iter()
+            .enumerate()
+            .find_map(|(at, call)| port_of(call).map(|port| (at, port)))
+        else {
+            unread.push(path);
+            continue;
+        };
+        if port == "5554" {
+            problems.push(format!(
+                "{path}: it starts its emulator on the standing one's port"
+            ));
+            continue;
+        }
+        let own = format!("boot-answer emulator-{port}");
+        match run.calls.iter().position(|call| *call == own) {
+            Some(answered) if answered < started => problems.push(format!(
+                "{path}: the boot of emulator-{port} was answered before an emulator was started on it:\n{}",
+                run.calls.join("\n")
+            )),
+            Some(_) => answered_after_start += 1,
+            None => {}
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(
+        answered_after_start >= OWN_SERIAL.len() / 2,
+        "only {answered_after_start} of {} scripts waited for the boot of an emulator of their own; \
+         those that started none: {unread:?}",
+        OWN_SERIAL.len()
+    );
+}
+
 /// The driver moves the emulator's camera through its controller's port of the loopback interface, so
 /// a port that already answers is some other program's and no emulator is started while it does.
 #[test]
@@ -1115,6 +1189,38 @@ fn shell_scripts(directory: &Path, found: &mut Vec<PathBuf>) {
             found.push(path);
         }
     }
+}
+
+/// Every script of the repository's `scripts` folder, a library among them, parses under the system's
+/// bash. On a Mac that is bash 3.2, whose parser reads the text of a here-document inside a command
+/// substitution for quotes, so a script it cannot parse ends where it fails and a caller that does not
+/// stop on an error goes on without the rest of it.
+#[test]
+fn every_script_parses_under_the_systems_bash() {
+    let mut scripts = Vec::new();
+    shell_scripts(&repository().join("scripts"), &mut scripts);
+    assert!(
+        scripts
+            .iter()
+            .any(|script| script.ends_with("lib/voice-call-lock-screen.sh")),
+        "the libraries are among the scripts read"
+    );
+    let mut problems = Vec::new();
+    for script in &scripts {
+        let output = Command::new("/bin/bash")
+            .arg("-n")
+            .arg(script)
+            .output()
+            .expect("bash starts");
+        if !output.status.success() {
+            problems.push(format!(
+                "{}: {}",
+                script.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 /// Whether `line` spells out a virtual device's name, such as `Name_API_36_Play`.
