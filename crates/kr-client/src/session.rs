@@ -563,6 +563,110 @@ pub(crate) struct LaneSupport {
     pub(crate) windows: tokio::sync::watch::Receiver<Issued>,
     pub(crate) requests: Arc<AtomicU64>,
     pub(crate) transport: Arc<dyn ControlTransport>,
+    pub(crate) connection: ConnectionWatch,
+    pub(crate) local: LocalInput,
+}
+
+/// What a lane learns of its session's connection: that it has ended, and what the host refused it
+/// with when it was the host that ended it.
+#[derive(Clone)]
+pub(crate) struct ConnectionWatch {
+    state: Arc<SessionState>,
+}
+
+impl ConnectionWatch {
+    /// Resolves once the connection has ended, at once when it already has.
+    pub(crate) async fn ended(&self) {
+        let mut ended = self.state.ended.subscribe();
+        let _ = ended.wait_for(|ended| *ended).await;
+    }
+
+    /// Whether the connection has ended.
+    pub(crate) fn has_ended(&self) -> bool {
+        *self.state.ended.borrow()
+    }
+
+    /// What the host refused the connection with, when it did.
+    pub(crate) fn refusal(&self) -> Option<kr_protocol::error::ProtocolError> {
+        self.state.waiters().refusal.clone()
+    }
+}
+
+/// Writes raw input as ordered `input.write` requests on the session's own connection, which is how
+/// a lane reaches a host on this machine: the connection that attached carries the typing, and the
+/// host answers each request in the order it read them.
+///
+/// Raw input is the one write that is not a mutation. It is an ordered stream keyed by lease epoch
+/// and sequence, with no durable de-duplication and nothing replayed on reconnection, so it carries
+/// no action identifier and receives no receipt: the host's answer is the acknowledgement.
+#[derive(Clone)]
+pub(crate) struct LocalInput {
+    transport: Arc<dyn ControlTransport>,
+    state: Arc<SessionState>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+impl LocalInput {
+    /// Writes one ordered batch of raw input and waits for the host's answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal, including the lease refusal when the attachment no longer holds
+    /// input, and the failure of the connection when it ended.
+    pub(crate) async fn write(
+        &self,
+        params: &kr_protocol::input::InputWriteParams,
+    ) -> Result<kr_protocol::input::InputWriteResult> {
+        let entry = Method::InputWrite.entry();
+        debug_assert!(
+            entry.idempotency == kr_protocol::authority::IdempotencyBehaviour::OrderedStream,
+            "input is written as an ordered stream"
+        );
+        let request_id = RequestId::new(self.next_request_id.fetch_add(1, Ordering::AcqRel));
+        let waiter = register(&self.state, request_id)?;
+        let request = Request {
+            request_id,
+            method: Method::InputWrite.into(),
+            method_version: entry.version,
+            params: ParamsValue::from_typed(params)?,
+        };
+        // A write that fails after the host refused the connection is answered as the calls that
+        // were waiting are: the waiter holds the refusal, and the host decided nothing else.
+        if let Err(error) = self.transport.send(&ControlFrame::Request(request)).await
+            && self.state.waiters().refusal.is_none()
+        {
+            return Err(error);
+        }
+        match waiter.wait().await? {
+            Answer::Response(response) => match response.outcome {
+                Outcome::Ok(value) => Ok(value.to_typed()?),
+                Outcome::Error(error) => Err(ClientError::from(error)),
+            },
+            Answer::Receipt(_) => Err(ClientError::refusal(
+                kr_protocol::error::ErrorCode::InvalidArgument,
+                crate::shown::Shown::said("raw input is an ordered stream and receives no receipt"),
+            )),
+        }
+    }
+}
+
+/// Registers a request, so that the reader hands the answer to the call that waits for it.
+fn register(state: &Arc<SessionState>, request_id: RequestId) -> Result<Waiter> {
+    let mut waiters = state.waiters();
+    if waiters.ended {
+        return Err(waiters
+            .refusal
+            .clone()
+            .map_or(ClientError::ConnectionEnded, ClientError::Host));
+    }
+    let (sender, receiver) = oneshot::channel();
+    waiters.pending.insert(request_id, sender);
+    drop(waiters);
+    Ok(Waiter {
+        state: Arc::clone(state),
+        request_id,
+        receiver: Some(receiver),
+    })
 }
 
 /// The shared state of one connection.
@@ -704,6 +808,14 @@ impl Session {
             windows: self.state.action_window.subscribe(),
             requests: Arc::clone(&self.next_request_id),
             transport: Arc::clone(&self.transport),
+            connection: ConnectionWatch {
+                state: Arc::clone(&self.state),
+            },
+            local: LocalInput {
+                transport: Arc::clone(&self.transport),
+                state: Arc::clone(&self.state),
+                next_request_id: Arc::clone(&self.next_request_id),
+            },
         }
     }
 
@@ -1561,51 +1673,6 @@ impl Session {
         self.read(Method::AgentApprovalInspect, params).await
     }
 
-    /// Writes one ordered batch of raw input under the lease this attachment holds.
-    ///
-    /// Raw input is the one write that is not a mutation. Section 9 makes it a separate ordered
-    /// stream keyed by connection, lease epoch and sequence, with no durable de-duplication and
-    /// nothing replayed on reconnection, so it carries no action identifier and receives no
-    /// receipt: it is ordered by its own sequence and acknowledged by what the host forwarded.
-    ///
-    /// # Errors
-    ///
-    /// Returns the host's refusal, including the lease refusal when this attachment no longer
-    /// holds input.
-    pub async fn write_input(
-        &self,
-        params: &kr_protocol::input::InputWriteParams,
-    ) -> Result<kr_protocol::input::InputWriteResult> {
-        let entry = Method::InputWrite.entry();
-        debug_assert!(
-            entry.idempotency == kr_protocol::authority::IdempotencyBehaviour::OrderedStream,
-            "input is written as an ordered stream"
-        );
-        let request_id = self.next_request_id();
-        let waiter = self.register(request_id)?;
-        let request = Request {
-            request_id,
-            method: Method::InputWrite.into(),
-            method_version: entry.version,
-            params: ParamsValue::from_typed(params)?,
-        };
-        if let Err(error) = self.transport.send(&ControlFrame::Request(request)).await
-            && !self.connection_was_refused()
-        {
-            return Err(error);
-        }
-        match waiter.wait().await? {
-            Answer::Response(response) => match response.outcome {
-                Outcome::Ok(value) => Ok(value.to_typed()?),
-                Outcome::Error(error) => Err(ClientError::from(error)),
-            },
-            Answer::Receipt(_) => Err(ClientError::refusal(
-                kr_protocol::error::ErrorCode::InvalidArgument,
-                crate::shown::Shown::said("raw input is an ordered stream and receives no receipt"),
-            )),
-        }
-    }
-
     /// Records that a consumer applied a stream's content up to `cursor`.
     ///
     /// This is the position the next subscription resumes from, so only a consumer that has folded
@@ -1681,21 +1748,7 @@ impl Session {
     }
 
     fn register(&self, request_id: RequestId) -> Result<Waiter> {
-        let mut waiters = self.state.waiters();
-        if waiters.ended {
-            return Err(waiters
-                .refusal
-                .clone()
-                .map_or(ClientError::ConnectionEnded, ClientError::Host));
-        }
-        let (sender, receiver) = oneshot::channel();
-        waiters.pending.insert(request_id, sender);
-        drop(waiters);
-        Ok(Waiter {
-            state: Arc::clone(&self.state),
-            request_id,
-            receiver: Some(receiver),
-        })
+        register(&self.state, request_id)
     }
 
     fn next_request_id(&self) -> RequestId {

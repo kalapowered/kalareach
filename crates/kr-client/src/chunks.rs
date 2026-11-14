@@ -164,6 +164,7 @@ impl ChunkRoute {
             windows,
             requests,
             transport,
+            ..
         } = session.lane_support();
         let Some(opener) = transport.stream_opener() else {
             return Err(refusal(
