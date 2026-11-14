@@ -57,6 +57,7 @@ impl AtTheNetworkDoor {
 
 pub(crate) mod arrivals;
 pub(crate) mod chunks;
+mod input;
 pub mod clock_trust;
 pub mod config;
 mod device_errors;
@@ -610,6 +611,19 @@ impl Network {
             .await;
     }
 
+    /// Has this host connect the input lanes it opens to `endpoint`, where a suite's scripted
+    /// worker lane listens, instead of to the worker's own endpoint.
+    #[cfg(feature = "testing")]
+    pub fn use_input_lane_at(&self, endpoint: kr_ipc::paths::Endpoint) {
+        *self
+            .guard
+            .host
+            .input
+            .lane_endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(endpoint);
+    }
+
     /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) {
         self.guard.shutdown().await;
@@ -749,6 +763,8 @@ pub struct NetworkHost {
     /// The data streams devices send chunks on: which stream serves each transfer, the gate of
     /// each, and the places of each device principal's lookups.
     chunks: Arc<chunks::ChunkStreams>,
+    /// The terminal-input streams devices send typing on.
+    input: Arc<input::InputStreams>,
     /// The connections each device holds, in the order they were counted, which
     /// [`DEVICE_LIVE_CONNECTIONS`] bounds.
     device_connections: Arc<DeviceConnections>,
@@ -2046,6 +2062,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         endpoint_id,
         reconnects: reconnects::Reconnects::new(Arc::clone(controller.metrics())),
         chunks: Arc::default(),
+        input: Arc::default(),
         device_connections: Arc::default(),
         #[cfg(feature = "testing")]
         end_hold: kr_transport::listener::EndHold::default(),
