@@ -9,7 +9,7 @@
 # themselves), so that no program imports
 # `VCRUNTIME140.dll` or an API set of the universal runtime. A machine without Microsoft's
 # redistributable can then start the program, and nothing is installed or shipped beside it. The C
-# libraries built here (aws-lc, SQLite, ring, blake3, and llama.cpp through the two settings in
+# libraries built here (aws-lc, SQLite, ring, blake3, and llama.cpp through the three settings in
 # `[env]` below) are compiled for that runtime, and libsodium's prebuilt MSVC binaries ask for it
 # in their objects, so the whole image uses one runtime: one heap and one copy of the runtime's
 # own state. The linker reports two runtimes in one link as `LNK4098`, and the release workflow
