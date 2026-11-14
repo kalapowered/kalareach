@@ -163,6 +163,36 @@ fn a_transfer_never_takes_the_room_a_keystroke_needs() {
     assert_eq!(budget.bulk_queued_bytes(), 0);
 }
 
+/// Every writer that is waiting for room is told when a transfer gives room back, including one
+/// that has not been polled since it made its wait. Connections have more than one writer, and a
+/// release that reached only one of them would leave a keystroke waiting while room was free.
+#[test]
+fn room_a_transfer_gives_back_reaches_every_writer_that_was_waiting_for_it() {
+    use futures::FutureExt as _;
+
+    let limits = SendLimits::default();
+    let budget = Arc::new(StreamBudget::new(limits));
+    let transfer = budget
+        .reserve(StreamClass::Bulk, limits.max_bulk_queued_bytes)
+        .expect("a transfer that holds its whole ceiling");
+    let _control = budget
+        .reserve(StreamClass::Interactive, CONTROL_RESERVE_BYTES)
+        .expect("the control reserve");
+
+    let first = Box::pin(budget.released());
+    let second = Box::pin(budget.released());
+    drop(transfer);
+
+    assert!(
+        first.now_or_never().is_some(),
+        "a writer that waited before the room came back was not told"
+    );
+    assert!(
+        second.now_or_never().is_some(),
+        "a second writer that waited was not told"
+    );
+}
+
 /// A header for any kind, with the resource each kind's validation requires.
 fn header_for(kind: StreamKind, connection_id: ConnectionId) -> StreamHeader {
     let session = Nullable::some(SessionId::new(Uuid::from_bytes([8; 16])));
