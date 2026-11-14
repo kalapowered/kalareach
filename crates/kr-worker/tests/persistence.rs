@@ -238,9 +238,17 @@ async fn close(client: &mut LocalClient, host: &Host) -> kr_protocol::session::S
         )
         .await
         .expect("the call reaches the worker");
-    outcome
+    let result = outcome
         .map(|value| value.to_typed().expect("decodes"))
-        .unwrap_or_else(|error| panic!("the authorised stop was refused: {error}"))
+        .unwrap_or_else(|error| panic!("the authorised stop was refused: {error}"));
+    // The close goes on after it is accepted, and its own steps, the drain among them, end before
+    // the fixture's directory is removed, which would otherwise be refused the journal they hold.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        host.runtime.wait_closed(),
+    )
+    .await;
+    result
 }
 
 fn actor() -> ActorId {
@@ -383,7 +391,7 @@ fn the_dispatch_marker_is_committed_before_the_effect_could_have_left() {
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn output_bytes_write_no_row_to_the_journal_at_all() {
     // KR-REQ-24.03, first half. The live parser is in worker memory and the retained output is a
     // bounded indexed spool, so a session producing output leaves the journal exactly as it found
@@ -686,7 +694,7 @@ fn collecting_receipts_never_takes_an_event_a_consumer_still_owes() {
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn no_terminal_body_and_no_provider_key_reaches_the_control_log() {
     // KR-REQ-24.21. The check is a search of the journal's own bytes after a session has produced
     // output carrying a recognisable provider key, and after the acceptance and dispatch commit
@@ -808,7 +816,7 @@ fn authority_and_dispatch_data_is_never_evicted_under_a_history_cap() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_full_durable_store_refuses_a_new_mutation_before_anything_is_dispatched() {
     // KR-REQ-24.23. The store is made full for real, with the page bound SQLite enforces itself,
     // so what refuses the mutation is the store rather than a flag this test set.
@@ -849,7 +857,7 @@ async fn a_full_durable_store_refuses_a_new_mutation_before_anything_is_dispatch
 
 /// KR-REQ-07.57: a full journal does not stop an authorised close, whose answer says its
 /// durability is volatile.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_full_store_still_admits_the_authorised_stop_and_says_its_durability_is_volatile() {
     // KR-REQ-24.23's exceptions, which are exactly two and are stated in sections 7 and 11 rather
     // than invented here. This is the section 7 one.
@@ -2204,7 +2212,7 @@ fn the_stores_kept_for_a_period_name_the_archive_as_their_collector_once_the_ses
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_live_session_applies_output_retention_and_leaves_a_gap_a_reader_is_told_about() {
     // KR-REQ-20.20 and 20.21 through the session, rather than through the history alone: the
     // maintenance path is what a running host uses, and the gap it leaves carries the bound.
@@ -3967,7 +3975,7 @@ fn the_store_declarations_say_what_survives_a_daemon_restart_and_what_a_crash_en
 // KR-REQ-24.26: owner-only local state
 // ---------------------------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_state_directories_this_host_creates_are_owner_only() {
     // KR-REQ-24.26 on this machine. The headless Linux limitation is documented in
     // docs/host/README.md and is about key storage rather than about these directories.
