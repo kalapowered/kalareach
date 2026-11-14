@@ -568,22 +568,37 @@ impl Rig {
 
     /// Asks the daemon to delete the copy `privacy.status` lists under `reference`, as
     /// [`Self::delete_retained`] does, while the service loses the answer to each of the first
-    /// [`ANSWERS_LOST`] requests it is sent, and mends the service once the call is answered.
+    /// [`ANSWERS_LOST`] requests it is sent.
     ///
     /// The carrier sends a request for each pass it makes, and a call waits for the first pass
     /// that begins after it is made, which is the second when one was already under way. So the
     /// deletion is asked and not confirmed when the call answers whichever passes there were, and
     /// not only when the call's own pass is the first to send.
+    ///
+    /// The faults the carrier has not met stay in place when the call returns, because a pass
+    /// that was already owed may still send after it: the case lifts them with
+    /// `served.web().mend()`, which clears every fault of the service that has not been met, at
+    /// the step that needs the service to answer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the call made more requests than answers were lost, since the service then
+    /// answered one and the call's answer says nothing of a lost one.
     async fn delete_retained_while_answers_are_lost(
         &self,
         reference: &str,
     ) -> Result<PrivacyRetainedDeleteResult, ProtocolError> {
         let web = self.served.web();
+        let before = web.requests_to(DELETE);
         for nth in 1..=ANSWERS_LOST {
             web.fail(DELETE, nth, Moment::After);
         }
         let answered = self.delete_retained(reference).await;
-        web.mend();
+        let sent = web.requests_to(DELETE) - before;
+        assert!(
+            sent <= usize::try_from(ANSWERS_LOST).expect("a small count"),
+            "the call made {sent} requests, more than the {ANSWERS_LOST} whose answers are lost"
+        );
         answered
     }
 
@@ -9382,6 +9397,8 @@ async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_a
         assert!(rig.held_at_the_service(object), "{object} is not asked for");
     }
 
+    // The service answers again, so the request asked for again is confirmed.
+    rig.served.web().mend();
     let second = rig
         .delete_retained(&reference_of(1))
         .await
@@ -9403,7 +9420,6 @@ async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_a
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deletion_asked_under_privacy_mode_is_sent_after_a_restart_once_privacy_mode_is_off() {
     let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
-    let web = Arc::clone(rig.served.web());
     rig.set_up_after(2);
     rig.fence().await;
     assert!(
@@ -9412,10 +9428,13 @@ async fn a_deletion_asked_under_privacy_mode_is_sent_after_a_restart_once_privac
             .expect("the call is answered")
             .deleted
     );
-    let sent = web.requests_to(DELETE);
 
+    // The requests the first daemon sent are counted once it has stopped, and the service
+    // answers the restarted daemon's.
     let environment = rig.host.environment_id();
     let (host, served, timer) = rig.stop().await;
+    let sent = served.web().requests_to(DELETE);
+    served.web().mend();
     let (controller, endpoint, _serving) = start_daemon(&host, timer).await;
     let runtime = controller.backup_runtime().expect("a carrier");
     let mut passes = runtime.passes();
@@ -9476,8 +9495,8 @@ async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_p
         .await;
     let before = opened_members(&rig, 1);
 
-    // The answers to the first requests are lost, so the deletion is only partly confirmed when
-    // privacy mode goes off.
+    // The answers to the first requests are lost, so the host has not confirmed the deletion when
+    // privacy mode goes off, and the service answers the requests it sends after that.
     rig.fence().await;
     assert!(
         !rig.delete_retained_while_answers_are_lost(&reference_of(1))
@@ -9485,6 +9504,7 @@ async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_p
             .expect("the call is answered")
             .deleted
     );
+    web.mend();
     assert!(rig.set_privacy(false).await);
 
     rig.until("a new generation is published", |rig| rig.published(2))
