@@ -3,18 +3,21 @@ name: companion-bundle
 # Builds the companion's desktop bundle on Windows the way a person builds it (`pnpm desktop build`),
 # and reads what that makes: the link of the application and both installers.
 #
-# The application links the dynamic Visual C++ runtime. The workspace's linker options leave the
-# static one out of the x86-64 and ARM64 MSVC links, since the C library it vendors asks for it,
-# and the Tauri command line asks for it again unless the environment says otherwise. The build
-# step below starts with `STATIC_VCRUNTIME=true` in its environment, which is what the command
-# line would have set, so a build that passes shows that the entry replaces it. Two reads then
-# look at the link: the build's log has no `LNK4098` (the linker's report of objects that ask for
-# two runtimes), and the executable imports the dynamic runtime's libraries and no other
-# runtime's. Static runtime code that no warning names adds no import and is seen by neither. Each
-# installer is then opened: the NSIS installer is run silently into a directory of the runner's
-# own and removed again, and the MSI is extracted with an administrative install, which registers
-# nothing. In both, the files are listed and the installed executable's imports are read again.
-# The application is never started.
+# The application links the static C runtime, through the `crt-static` target feature that the
+# workspace's configuration gives the MSVC targets, so it imports no runtime library. The Tauri
+# command line asks for its own static runtime, a hybrid that would put a second runtime in the link,
+# unless the environment says otherwise. The build step below starts with `STATIC_VCRUNTIME=true` in
+# its environment, which is what the command line would have set, so a build that passes shows that
+# the entry replaces it. Two reads then look at the link: the build's log has no `LNK4098` (the
+# linker's report of objects that ask for two runtimes), and the executable imports no runtime
+# library (none of Visual C++'s, the universal runtime's, an older or a debug one, or libsodium's)
+# and every import is a Windows library. A step before the build links three small programs, one
+# that carries its runtime, one that imports the dynamic runtime and one that asks for both, and
+# shows that each read refuses what it must: a read that finds nothing is worth something only when
+# it is shown to find the fault. Each installer is then opened: the NSIS installer is run silently
+# into a directory of the runner's own and removed again, and the MSI is extracted with an
+# administrative install, which registers nothing. In both, the files are listed and the installed
+# executable's imports are read again. The application is never started.
 #
 # Nothing is uploaded and no cache is saved. A tool that a read needs and the runner lacks fails the
 # job; no read is skipped.
@@ -26,6 +29,16 @@ on:
     paths:
       - apps/companion/src-tauri/**
       - apps/companion/scripts/desktop.mjs
+      - apps/companion/package.json
+      - pnpm-lock.yaml
+      - .cargo/config.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - crates/kr-crypto/build.rs
+      - crates/kr-crypto/build/**
+      - scripts/read-windows-imports.py
+      - scripts/place-libsodium-archive.sh
+      - .github/actions/libsodium-archive/**
       - .github/workflows/companion-bundle.yml
 
 permissions:
@@ -71,24 +84,32 @@ jobs:
           node-version: 22.23.1
           package-manager-cache: false
 
-      # The tool both reads need, found before the long build so that a runner without it stops the
+      # The tool every read needs, found before the long build so that a runner without it stops the
       # job at once. It is Microsoft's, from the Visual C++ tools on the runner.
       - name: Find dumpbin
         shell: bash
         run: |
-          vswhere="C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-          install=$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')
-          dumpbin=$(find "$(cygpath -u "$install")/VC/Tools/MSVC" -path '*/bin/Hostx64/x64/dumpbin.exe' | sort -V | tail -1)
-          if [ -z "$dumpbin" ] || [ ! -f "$dumpbin" ]; then
-            echo "::error::dumpbin is not on this runner, so the link cannot be read."
-            exit 1
-          fi
+          dumpbin=$(python scripts/read-windows-imports.py find-dumpbin --arch x64)
           echo "dumpbin: $dumpbin"
-          echo "DUMPBIN=$(cygpath -w "$dumpbin")" >> "$GITHUB_ENV"
+          echo "DUMPBIN=$dumpbin" >> "$GITHUB_ENV"
+
+      # The reads, put through what they must refuse before they are trusted with the build: recorded
+      # output of the tool first, then real links on this runner.
+      - name: Hold the reads to what they must refuse
+        shell: bash
+        run: |
+          python scripts/read-windows-imports.py self-test
+          python scripts/read-windows-imports.py control --dumpbin "$DUMPBIN"
 
       - name: Install the packages
         run: |
           pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The entry's own cases, which no other job runs.
+      - name: Run the entry's cases
+        run: |
+          pnpm -C apps/companion test:desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # The bundle build, as a person starts it, with the variable that the Tauri command line would
@@ -122,37 +143,14 @@ jobs:
           fi
 
           # Read one: the linker did not report objects that ask for two C runtimes.
-          found=0
-          grep -n 'LNK4098' "$log" || found=$?
-          if [ "$found" -eq 0 ]; then
-            echo '::error::The link reported LNK4098: objects asking for two different C runtimes.'
-            exit 1
-          fi
-          if [ "$found" -ne 1 ]; then
-            echo '::error::The bundle build log could not be searched for LNK4098.'
-            exit 1
-          fi
-          echo 'No link reported LNK4098.'
+          python scripts/read-windows-imports.py messages "$log"
 
-          # Read two: the libraries the executable imports. The dynamic runtime is there, and no other
-          # runtime is: not an older one, not a debug one.
-          "$(cygpath -u "$DUMPBIN")" -nologo -dependents "$exe" | tr -d '\r' | tee dependents.txt
-          libraries=$(sed -n 's/^ *\([A-Za-z0-9_.+-]*\.dll\) *$/\1/p' dependents.txt | tr 'A-Z' 'a-z' | sort -u)
-          if [ -z "$libraries" ]; then
-            echo "::error::dumpbin listed no libraries for $exe."
-            exit 1
-          fi
-          echo "$libraries" | grep -q '^vcruntime140\.dll$' || { echo '::error::The executable does not import vcruntime140.dll.'; exit 1; }
-          echo "$libraries" | grep -q '^api-ms-win-crt-' || { echo '::error::The executable imports no library of the universal C runtime.'; exit 1; }
-          other=$(echo "$libraries" | grep -E '^(msvcrt\.dll|msvcr[0-9]+d?\.dll|ucrtbased\.dll|vcruntime[0-9_]+d\.dll|msvcp[0-9_]+d\.dll)$' || true)
-          if [ -n "$other" ]; then
-            echo "::error::The executable imports another C runtime as well: $other"
-            exit 1
-          fi
-          echo 'The executable imports the dynamic C runtime and no other.'
+          # Read two: the libraries the executable imports. No runtime library is among them, and
+          # every one is a Windows API set or a library of the system directory.
+          python scripts/read-windows-imports.py imports --dumpbin "$DUMPBIN" "$exe"
 
       # The installer run silently into a directory of the runner's own, and then removed. The
-      # installed executable must import what the built one does.
+      # installed executable must import what the built one does, and the same reads hold it.
       - name: Open the NSIS installer
         shell: pwsh
         run: |
@@ -176,15 +174,8 @@ jobs:
           if ($installed.Count -ne 1) { throw "expected one installed executable, found $($installed.Count)" }
           $after = Get-Imports $installed[0].FullName
           if (Compare-Object $built $after) { throw "the installed executable imports other libraries than the built one" }
-          foreach ($name in $after) {
-            $where =
-              if (Test-Path (Join-Path $installed[0].DirectoryName $name)) { 'beside the executable' }
-              elseif ($name -match '^(api|ext)-ms-win-') { 'a Windows API set' }
-              elseif ($name -match '^(vcruntime|msvcp|concrt|vcomp)') { 'the Visual C++ runtime, from the runner' }
-              elseif (Test-Path (Join-Path $env:SystemRoot "System32\$name")) { 'a Windows system library' }
-              else { 'NOT FOUND' }
-            '{0,-40} {1}' -f $name, $where
-          }
+          python scripts/read-windows-imports.py imports --dumpbin $env:DUMPBIN $installed[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'the installed executable imports a runtime library or one that no Windows library holds' }
 
           $uninstall = Join-Path $dir 'uninstall.exe'
           if (-not (Test-Path $uninstall)) { throw 'the installation has no uninstaller' }
@@ -217,13 +208,6 @@ jobs:
           if ($extracted.Count -ne 1) { throw "expected one extracted executable, found $($extracted.Count)" }
           $after = Get-Imports $extracted[0].FullName
           if (Compare-Object $built $after) { throw "the extracted executable imports other libraries than the built one" }
-          foreach ($name in $after) {
-            $where =
-              if (Test-Path (Join-Path $extracted[0].DirectoryName $name)) { 'beside the executable' }
-              elseif ($name -match '^(api|ext)-ms-win-') { 'a Windows API set' }
-              elseif ($name -match '^(vcruntime|msvcp|concrt|vcomp)') { 'the Visual C++ runtime, from the runner' }
-              elseif (Test-Path (Join-Path $env:SystemRoot "System32\$name")) { 'a Windows system library' }
-              else { 'NOT FOUND' }
-            '{0,-40} {1}' -f $name, $where
-          }
+          python scripts/read-windows-imports.py imports --dumpbin $env:DUMPBIN $extracted[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'the extracted executable imports a runtime library or one that no Windows library holds' }
           Remove-Item $dir -Recurse -Force

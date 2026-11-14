@@ -144,12 +144,14 @@ jobs:
       release: ${{ steps.release.outputs.release }}
     env:
       TARGET: ${{ matrix.target }}
-      # What this job does not set is RUSTFLAGS. The link needs arguments about the vendored C
-      # library: leave the static C runtime out, and stop the linker naming the library's missing
-      # debug database once per object file. `.cargo/config.toml` carries them so that every Windows
-      # build gets them, and RUSTFLAGS in the environment replaces that file's flags rather than
-      # adding to them. LNK4098, which reports objects asking for two different C runtimes, is
-      # deliberately not silenced: the step after the builds refuses it.
+      # What this job does not set is RUSTFLAGS. Every program links the static C runtime, which the
+      # `crt-static` target feature in `.cargo/config.toml` asks for, and the link needs two
+      # arguments about libsodium's prebuilt libraries: leave the debug runtime out, and stop the
+      # linker naming the libraries' missing debug database once per object file. That file carries
+      # them so that every Windows build gets them, and RUSTFLAGS in the environment replaces its
+      # flags rather than adding to them. LNK4098, which reports objects asking for two different C
+      # runtimes, is deliberately not silenced: the step after the builds refuses it, and a step
+      # after that refuses a program that imports a runtime library.
       CARGO_INCREMENTAL: "0"
     steps:
       # By identifier, not by ref: the commit the gate job settled, whatever has happened to the
@@ -196,6 +198,21 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustc --version
           cargo --version
+
+      # The tool that reads each program's imports, found for this runner's architecture before the
+      # long builds so that a runner without it stops the job at once, and the reads put through what
+      # they must refuse: recorded output of the tool first, then real links on this runner. A read
+      # that finds nothing is worth something only when it is shown to find the fault.
+      - name: Find dumpbin and hold the reads to what they must refuse
+        shell: bash
+        run: |
+          arch=x64
+          if [ "$TARGET" = aarch64-pc-windows-msvc ]; then arch=arm64; fi
+          dumpbin=$(python scripts/read-windows-imports.py find-dumpbin --arch "$arch")
+          echo "dumpbin: $dumpbin"
+          echo "DUMPBIN=$dumpbin" >> "$GITHUB_ENV"
+          python scripts/read-windows-imports.py self-test
+          python scripts/read-windows-imports.py control --dumpbin "$dumpbin"
 
       # libsodium's prebuilt libraries come from files this places, not from a download in the
       # middle of the compile. The script holds the size and the digest of the release tag's
@@ -273,10 +290,10 @@ jobs:
           "TOP=kalareach-$($env:TARGET)-$release" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "release $release at $commit for $($env:TARGET)"
 
-      # RUSTFLAGS in the environment replaces the flags in `.cargo/config.toml`, the link flags
-      # among them, even when it is empty, and the link then says whatever it says. Nothing here
-      # sets it, so a run that finds it set stops before building rather than depending on what the
-      # linker reports.
+      # RUSTFLAGS in the environment replaces the flags in `.cargo/config.toml`, the `crt-static`
+      # target feature and the link flags among them, even when it is empty, and the link then says
+      # whatever it says. Nothing here sets it, so a run that finds it set stops before building
+      # rather than depending on what the linker reports.
       - name: Refuse an environment that replaces the workspace's link flags
         shell: bash
         run: |
@@ -298,34 +315,37 @@ jobs:
           done
 
       # `LNK4098` is the linker saying that objects in one link ask for two different C runtimes.
-      # The C library this workspace vendors was built against the static runtime and Rust links the
-      # dynamic one, and `.cargo/config.toml` leaves the static one out of the link. Without that
-      # flag the static runtime can be pulled into the image beside the dynamic one, which gives two
-      # heaps and two copies of the runtime's state, and any other source of the warning wants a
-      # look too. This reads what the builds printed and stops the run before anything is
-      # staged, let alone signed. A log it cannot read stops the run as well.
+      # The C libraries this workspace links, libsodium's prebuilt ones among them, ask for the
+      # static runtime, and every program links it through the `crt-static` target feature in
+      # `.cargo/config.toml`. Without that feature Rust links the dynamic runtime beside it, which
+      # gives two heaps and two copies of the runtime's state, and any other source of the warning
+      # wants a look too. This reads what the builds printed and stops the run before anything is
+      # staged, let alone signed. A log it cannot read stops the run as well. The control step
+      # above showed that a link that asks for both runtimes prints the message the read looks for.
       - name: Refuse a build whose link reported conflicting C runtimes
         shell: bash
         run: |
           logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          files=()
           for build in $KR_BUILDS; do
-            name="${build#*/}"
-            if [ ! -s "$logs/$name.log" ]; then
-              echo "::error::The log of the $name build is not there, so its link cannot be read."
-              exit 1
-            fi
+            files+=("$logs/${build#*/}.log")
           done
-          found=0
-          grep -n 'LNK4098' "$logs"/*.log || found=$?
-          if [ "$found" -eq 0 ]; then
-            echo '::error::A link reported LNK4098: objects asking for two different C runtimes. Look for what replaced the workspace link flags in .cargo/config.toml.'
-            exit 1
-          fi
-          if [ "$found" -ne 1 ]; then
-            echo '::error::The build logs could not be searched for LNK4098.'
-            exit 1
-          fi
-          echo 'No link reported LNK4098.'
+          python scripts/read-windows-imports.py messages "${files[@]}"
+
+      # No program of the tree imports a runtime library: none of Visual C++'s, the universal
+      # runtime's, an older or a debug one, or libsodium's, and every other import is a Windows API
+      # set or a library of the system directory. An import read cannot see two static runtimes, but
+      # the only way a second one enters these links is Tauri's hybrid, which also imports the
+      # universal runtime, and the companion's build refuses that. A program that is not there, or
+      # that dumpbin cannot read, stops the run.
+      - name: Refuse a program that imports a runtime library
+        shell: bash
+        run: |
+          programs=()
+          for name in $(python scripts/release-programs.py names --target "$TARGET"); do
+            programs+=("target/release/$name.exe")
+          done
+          python scripts/read-windows-imports.py imports --dumpbin "$DUMPBIN" "${programs[@]}"
 
       - name: Build the release tool
         shell: bash
