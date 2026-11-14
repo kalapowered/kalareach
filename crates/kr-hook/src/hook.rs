@@ -15,12 +15,16 @@
 //! the answer is written and the process ends, whatever is still in flight. The answer goes before
 //! anything the run says about itself: a diagnostic goes to standard error after it, and is waited
 //! for until the same deadline or [`DIAGNOSTIC_ALLOWANCE`] after the answer, whichever is later, so
-//! a standard error nobody reads can hold neither the answer nor, past that, the end. The longest
-//! a run lasts is therefore 600 ms on Windows: the deadline and the allowance after it. On Unix a
-//! hook started in place of another waits first, for at most `helper::CLAIM_WAIT` (100 ms), for a
-//! replacement that is being started, and the allowance counts from the answer, so the longest run
-//! is 700 ms there. Both are inside the one second, by 400 ms and 300 ms. The diagnostic says how
-//! long the run had run, on its own clock, when its answer was written
+//! a standard error nobody reads can hold neither the answer nor, past that, the end. The waits a
+//! run asks for therefore add up to 600 ms on Windows at the most: the deadline and the allowance
+//! after it. On Unix a hook that is handing its launch over to the forwarder of the worker's own
+//! release holds its answer, after the wait for its work and before the answer, for at most
+//! `helper::CLAIM_WAIT` (100 ms) while that forwarder starts in its place, and the allowance counts
+//! from the answer, so the waits add up to 700 ms there. Both sums are inside the one second, by
+//! 400 ms and 300 ms. They are sums of what a run asks to wait, held by cases on a clock that the
+//! cases move; on the system's clock a loaded machine adds its own delay to each wake-up (a hosted
+//! Windows run read 1.13 seconds for a run of this shape). The diagnostic says how long the run
+//! had run, on its own clock, when its answer was written
 //! ([`answered_after`]), which is the figure to hold against an application's timeout: how long the
 //! machine took to start the process and to let it end lies outside the run.
 
@@ -235,9 +239,9 @@ fn resumed_by(
 /// gets what remains of the deadline, and at least [`DIAGNOSTIC_ALLOWANCE`] after the answer
 /// ([`diagnostic_bound`]). A run whose work finished says nothing. `claim` is what a run does first
 /// of all to be the one that answers, `answer` and `write` are what writes each, and `run` passes
-/// the real ones. So are `now`, the clock every reading of the run's time is taken from, and
-/// `wait`, which waits for a message until the moment it is given, on that clock: `run` passes the
-/// system's.
+/// the real ones. `now` is the clock that the moment of the answer is read from, and `wait` waits
+/// for a message until the moment it is given: `run` passes the system's. The work and the claim
+/// read their own clocks.
 fn run_with(
     started: std::time::Instant,
     work: impl FnOnce(std::time::Instant) -> Result<(), String> + Send + 'static,
@@ -885,8 +889,9 @@ mod tests {
     /// on the system's clock and with the system's wait: the work waits for ever, the diagnostic's
     /// write stalls, and the run answers no earlier than the deadline, waits at least the allowance
     /// after its answer for the line, and is through while the work and the write are both still
-    /// stalled. That the run is through by its bound and no later is held by the cases that give it
-    /// a clock of their own. The bound the run sets itself, the deadline and the allowance after
+    /// stalled. That the waits it asks for end by its bound and no later is held by the cases that
+    /// give it a clock of their own and, for the system's wait, by the text of `wait_by`. The bound
+    /// the run sets itself, the deadline and the allowance after
     /// the run's start, is inside the one-second timeout a session ending is given. How soon after
     /// its bound the machine lets a run end is the machine's: it is not held against the run.
     #[test]
@@ -964,6 +969,17 @@ mod tests {
         Finishes,
     }
 
+    /// What takes time on the made clock besides the waits of a run.
+    #[derive(Clone, Copy, Default)]
+    struct Takes {
+        /// How far the clock has moved when the run begins to wait: its thread started late.
+        before: Duration,
+        /// The claim.
+        claim: Duration,
+        /// The write of the answer.
+        answer: Duration,
+    }
+
     /// What one run did on a clock that a case moves, as how long after the run's start.
     struct OnMade {
         ended: Duration,
@@ -974,11 +990,12 @@ mod tests {
         write_ended: bool,
     }
 
-    /// Runs `run_with` once on a clock that stands still until a wait runs out or the claim takes
-    /// time, with `work` and `write` going as given and the claim taking `claim_takes`. Nothing in
-    /// it waits for a duration: a stalled thread waits for the case to let it go, which is after the
-    /// run, and the run's waits are read off the clock.
-    fn on_made_clock(work: Work, write: Write, claim_takes: Duration) -> OnMade {
+    /// Runs `run_with` once on a clock that stands still until a wait runs out or something in
+    /// `takes` passes time, with `work` and `write` going as given. A wait that is not given a
+    /// message moves the clock to the moment it was asked to wait until, so what a run waits is
+    /// read off the clock; a stalled thread waits for the case to let it go, which is after the run,
+    /// and the guard that ends a thread of a case with a fault is the only real wait.
+    fn on_made_clock(work: Work, write: Write, takes: Takes) -> OnMade {
         use crate::made::{Made, Wait};
         use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
         use std::sync::{Arc, mpsc};
@@ -999,6 +1016,7 @@ mod tests {
         let write_ended = Arc::new(AtomicBool::new(false));
         let (work_ends, write_ends) = (Arc::clone(&work_ended), Arc::clone(&write_ended));
         let answered = std::cell::Cell::new(None);
+        made.pass(takes.before);
         run_with(
             made.start(),
             move |_| match work {
@@ -1010,8 +1028,11 @@ mod tests {
                 }
                 Work::FailsAtOnce => Err("the input was not an event".to_owned()),
             },
-            || made.pass(claim_takes),
-            || answered.set(Some(made.passed())),
+            || made.pass(takes.claim),
+            || {
+                made.pass(takes.answer);
+                answered.set(Some(made.passed()));
+            },
             move |_| {
                 if matches!(write, Write::Stalls) {
                     // The write stalls too, until the case lets it go.
@@ -1036,8 +1057,8 @@ mod tests {
 
     /// What every run holds, whatever stalls: no wait it makes is asked to last past its bound,
     /// which is the deadline, or the allowance after its answer when that came later; it is through
-    /// by then; and it is through at its bound when the write stalls, or at its answer when the
-    /// write finishes, with its work and its write still stalled when it was through.
+    /// by then; it is through at its bound when the write stalls, or at its answer when the write
+    /// finishes; and a thread that stalled is still stalled when the run is through.
     fn assert_held_to_its_bound(ran: &OnMade, work: Work, write: Write) {
         let bound = HOOK_DEADLINE.max(ran.answered + DIAGNOSTIC_ALLOWANCE);
         assert!(
@@ -1081,16 +1102,16 @@ mod tests {
     /// written at once.
     #[test]
     fn a_run_whose_work_never_answers_is_through_at_the_deadline() {
-        let ran = on_made_clock(Work::NeverAnswers, Write::Finishes, Duration::ZERO);
+        let ran = on_made_clock(Work::NeverAnswers, Write::Finishes, Takes::default());
         assert_held_to_its_bound(&ran, Work::NeverAnswers, Write::Finishes);
         assert_eq!(ran.ended, HOOK_DEADLINE);
     }
 
-    /// A diagnostic whose write stalls holds a run that had its observation at once until the
-    /// deadline: the allowance after an answer that early ends before it.
+    /// A diagnostic whose write stalls holds a run whose work failed at once until the deadline:
+    /// the allowance after an answer that early ends before it.
     #[test]
     fn a_run_whose_diagnostic_write_stalls_is_through_at_the_deadline() {
-        let ran = on_made_clock(Work::FailsAtOnce, Write::Stalls, Duration::ZERO);
+        let ran = on_made_clock(Work::FailsAtOnce, Write::Stalls, Takes::default());
         assert_held_to_its_bound(&ran, Work::FailsAtOnce, Write::Stalls);
         assert_eq!(ran.ended, HOOK_DEADLINE);
     }
@@ -1100,20 +1121,63 @@ mod tests {
     #[test]
     fn a_run_whose_work_never_answers_and_whose_write_stalls_is_through_at_the_deadline_and_the_allowance()
      {
-        let ran = on_made_clock(Work::NeverAnswers, Write::Stalls, Duration::ZERO);
+        let ran = on_made_clock(Work::NeverAnswers, Write::Stalls, Takes::default());
         assert_held_to_its_bound(&ran, Work::NeverAnswers, Write::Stalls);
         assert_eq!(ran.ended, HOOK_DEADLINE + DIAGNOSTIC_ALLOWANCE);
     }
 
-    /// A claim that comes late moves the answer, and with it the bound: the run is through at the
-    /// allowance after its answer when that is later than the deadline, and no later, whichever
-    /// way its work and its write go.
+    /// A run whose thread began to wait after its start is asked to wait until its deadline from
+    /// its start, and not from the moment it began to wait.
     #[test]
-    fn a_run_whose_claim_comes_late_is_through_at_the_allowance_after_its_answer_and_no_later() {
+    fn a_run_that_began_to_wait_after_its_start_is_asked_to_wait_until_the_deadline_from_its_start()
+    {
+        let takes = Takes {
+            before: Duration::from_millis(40),
+            ..Takes::default()
+        };
+        for write in [Write::Stalls, Write::Finishes] {
+            let ran = on_made_clock(Work::NeverAnswers, write, takes);
+            assert_held_to_its_bound(&ran, Work::NeverAnswers, write);
+            assert_eq!(
+                ran.asked[0], HOOK_DEADLINE,
+                "the work's wait is asked until"
+            );
+            let ran = on_made_clock(Work::FailsAtOnce, write, takes);
+            assert_held_to_its_bound(&ran, Work::FailsAtOnce, write);
+            assert_eq!(ran.answered, takes.before, "the answer follows the start");
+        }
+    }
+
+    /// The write of an answer takes time, and the allowance counts from when it was through: the
+    /// run is through at the allowance after that, and no later.
+    #[test]
+    fn a_run_whose_answer_takes_time_is_through_at_the_allowance_after_it_and_no_later() {
+        let takes = Takes {
+            answer: Duration::from_millis(20),
+            ..Takes::default()
+        };
+        let ran = on_made_clock(Work::NeverAnswers, Write::Stalls, takes);
+        assert_held_to_its_bound(&ran, Work::NeverAnswers, Write::Stalls);
+        assert_eq!(
+            ran.ended,
+            HOOK_DEADLINE + takes.answer + DIAGNOSTIC_ALLOWANCE,
+            "the allowance counts from the answer's end"
+        );
+    }
+
+    /// A claim that comes late moves the answer, and with it the bound: when the write stalls the
+    /// run is through at the allowance after its answer, or at the deadline when that is later,
+    /// and when the write finishes it is through at its answer, whichever way its work goes.
+    #[test]
+    fn a_run_whose_claim_comes_late_is_through_at_its_bound_and_no_later() {
         for claim in [100, 300, 450].map(Duration::from_millis) {
             for work in [Work::NeverAnswers, Work::FailsAtOnce] {
                 for write in [Write::Stalls, Write::Finishes] {
-                    let ran = on_made_clock(work, write, claim);
+                    let takes = Takes {
+                        claim,
+                        ..Takes::default()
+                    };
+                    let ran = on_made_clock(work, write, takes);
                     assert_held_to_its_bound(&ran, work, write);
                     let work_waited = match work {
                         Work::NeverAnswers => HOOK_DEADLINE,
@@ -1129,29 +1193,34 @@ mod tests {
         }
     }
 
-    /// A run whose worker is silent is through inside the one-second timeout a session ending is
-    /// given, by the run's own clock: the longest it waits is its deadline, what its claim waits for
-    /// a replacement that is being started (on Unix, where a hook can be started in place of
-    /// another), and the allowance after its answer. That is 700 ms on Unix and 600 ms on Windows,
-    /// which has no claim to wait for: 300 ms and 400 ms inside the timeout. The clock is made, so
-    /// how fast the machine is does not enter.
+    /// The waits that a run whose worker is silent asks for add up to less than the one-second
+    /// timeout a session ending is given: its deadline, what its claim waits for a replacement
+    /// that is starting in its place (on Unix, where a launch is handed over), and the allowance
+    /// after its answer. That sum is 700 ms on Unix and 600 ms on Windows, which has no claim to
+    /// wait for: 300 ms and 400 ms inside the timeout. The clock is made, so the sum is of what the
+    /// run asks to wait and not of the time a machine takes: on the system's clock each wake-up
+    /// can come later, and that is the machine's.
     #[test]
-    fn a_run_whose_worker_is_silent_is_through_inside_the_session_end_timeout_on_its_own_clock() {
+    fn the_waits_of_a_run_whose_worker_is_silent_add_up_to_less_than_the_session_end_timeout() {
         #[cfg(unix)]
         let claim = crate::helper::CLAIM_WAIT;
         #[cfg(not(unix))]
         let claim = Duration::ZERO;
+        let takes = Takes {
+            claim,
+            ..Takes::default()
+        };
         let longest = Duration::from_millis(if cfg!(unix) { 700 } else { 600 });
         for write in [Write::Stalls, Write::Finishes] {
-            let ran = on_made_clock(Work::NeverAnswers, write, claim);
+            let ran = on_made_clock(Work::NeverAnswers, write, takes);
             assert_held_to_its_bound(&ran, Work::NeverAnswers, write);
             assert!(
                 ran.ended < SESSION_END_TIMEOUT,
-                "the run was through at {:?}, past the {SESSION_END_TIMEOUT:?} timeout",
+                "the waits add up to {:?}, past the {SESSION_END_TIMEOUT:?} timeout",
                 ran.ended
             );
             if matches!(write, Write::Stalls) {
-                assert_eq!(ran.ended, longest, "the longest a run lasts");
+                assert_eq!(ran.ended, longest, "the most a run waits");
             }
         }
     }
