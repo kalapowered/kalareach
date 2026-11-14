@@ -1712,7 +1712,10 @@ impl Session {
     /// this returns, no write of that lease's bytes can begin, and none was part way through while
     /// the count was taken. That is what makes the number a receipt can quote exact rather than an
     /// estimate of what a writer might still be doing.
-    fn end_lease(&mut self, input: &mut InputDomain) -> LeaseEnded {
+    ///
+    /// `base` is what the end discards beyond what the writer still held, which the domain adds
+    /// to the notice its lane is given.
+    fn end_lease(&mut self, input: &mut InputDomain, base: u64) -> LeaseEnded {
         // The engine learns who holds the keys here. The fence itself is published by the domain,
         // inside the writer's boundary and after it has read whether a paste is open, which is what
         // makes the count it takes exact.
@@ -1720,7 +1723,7 @@ impl Session {
             input.holder(),
             kr_protocol::ids::InputLeaseEpoch::new(input.epoch()),
         );
-        input.end_lease()
+        input.end_lease(base)
     }
 
     /// Sets the name of the application in the session's foreground, or clears it when the
@@ -2483,9 +2486,14 @@ impl Session {
         let held = input.holder() == Some(attachment_id);
         let ending_epoch = input.epoch();
         let discarded_queue = input.release_attachment(attachment_id);
+        let mut fenced = 0;
         if held {
             let framing = input.close_framing_for_takeover();
-            let ended = self.end_lease(&mut input);
+            let prefix = framing.discarded_prefix.len() as u64;
+            let ended = self.end_lease(&mut input, discarded_queue.saturating_add(prefix));
+            fenced = discarded_queue
+                .saturating_add(prefix)
+                .saturating_add(ended.left);
             // The source of this input has gone, which is the loss section 8 asks to be reported.
             // The attachment that is leaving has no answer left to read it in, so it is carried to
             // whoever takes the keys next.
@@ -2511,6 +2519,9 @@ impl Session {
             // What the first stimulus left for the session is carried out before the second is
             // put to the machine, as it was when one pass handled each in turn. The lease has
             // already ended and its fence is out, so a keystroke in between finds no holder.
+            // The end of the lease is told to its lane when the machine's share is counted, in the
+            // hold below, so the notice carries the whole count.
+            input.defer_ending();
             drop(input);
             self.carry_out(owed, &mut FenceOutcome::default());
             owed = Vec::new();
@@ -2519,6 +2530,7 @@ impl Session {
         if held {
             let (carried, more) = input.note_lease_change(0);
             input.carry_bytes(carried);
+            fenced = fenced.saturating_add(carried);
             owed.extend(more);
         }
         drop(input);
@@ -2549,7 +2561,7 @@ impl Session {
             attachment_id,
             geometry: change.state,
             remaining: U64::new(self.attachments.len() as u64),
-            fenced_bytes: None,
+            fenced_bytes: Some(U64::new(fenced)),
         })
     }
 
@@ -2798,10 +2810,11 @@ impl Session {
         // being written while it was counted. Taking the counter rather than reading it is what
         // makes the answer that lease's own: the next takeover starts from zero and cannot report
         // these bytes again.
-        let ended = self.end_lease(&mut input);
+        let prefix = framing.discarded_prefix.len() as u64;
+        let ended = self.end_lease(&mut input, discarded_queue.saturating_add(prefix));
         let mut discarded = ended.left;
         discarded += discarded_queue;
-        discarded += framing.discarded_prefix.len() as u64;
+        discarded += prefix;
         // A paste is reported as closed when one was open in the stream this lease accepted, or
         // when one is open at the application: the writer keeps the second, because a terminator
         // the framer accepted may have been queued behind a writer that never wrote it.
@@ -2830,7 +2843,8 @@ impl Session {
         })
     }
 
-    /// Releases the lease held by this attachment.
+    /// Releases the lease held by this attachment, and returns the lease and how many bytes the
+    /// release discarded.
     ///
     /// # Errors
     ///
@@ -2839,15 +2853,15 @@ impl Session {
         &mut self,
         attachment_id: AttachmentId,
         epoch: u64,
-    ) -> Result<InputLeaseState> {
+    ) -> Result<(InputLeaseState, u64)> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
-        let owed = self.release_input_locked(&mut input, attachment_id, epoch)?;
+        let (owed, fenced) = self.release_input_locked(&mut input, attachment_id, epoch)?;
         let lease = input.lease();
         drop(input);
         self.carry_out(owed, &mut FenceOutcome::default());
         self.pump_replies();
-        Ok(lease)
+        Ok((lease, fenced))
     }
 
     /// Releases the lease under the input domain the caller already holds, and returns the steps
@@ -2857,7 +2871,7 @@ impl Session {
         input: &mut InputDomain,
         attachment_id: AttachmentId,
         epoch: u64,
-    ) -> Result<Vec<crate::fence::Step>> {
+    ) -> Result<(Vec<crate::fence::Step>, u64)> {
         let ending_epoch = input.epoch();
         let discarded_queue = input
             .release(attachment_id, epoch)
@@ -2872,7 +2886,8 @@ impl Session {
         // lease state, which has nowhere to say it, so it is carried to whoever takes the keys next
         // rather than dropped: an actor that let go of the keys still interrupted whatever it had
         // not delivered.
-        let ended = self.end_lease(input);
+        let prefix = framing.discarded_prefix.len() as u64;
+        let ended = self.end_lease(input, discarded_queue.saturating_add(prefix));
         input.carry_interrupted(
             discarded_queue,
             &ended,
@@ -2883,7 +2898,11 @@ impl Session {
         // rest until an acquire has an answer to report it in.
         let (held, owed) = input.note_lease_change(0);
         input.carry_bytes(held);
-        Ok(owed)
+        let fenced = discarded_queue
+            .saturating_add(prefix)
+            .saturating_add(ended.left)
+            .saturating_add(held);
+        Ok((owed, fenced))
     }
 
     /// Takes the input lease away from a caller acting under a grant, with whatever it had not
@@ -2974,7 +2993,7 @@ impl Session {
             };
             if to_fence {
                 let epoch = input.epoch();
-                if let Ok(steps) = self.release_input_locked(&mut input, holder, epoch) {
+                if let Ok((steps, _)) = self.release_input_locked(&mut input, holder, epoch) {
                     owed = steps;
                 }
             }
@@ -2982,6 +3001,28 @@ impl Session {
         if let Some(revision) = install {
             input.install_revision(revision);
         }
+        drop(input);
+        self.carry_out(owed, &mut FenceOutcome::default());
+        self.pump_replies();
+    }
+
+    /// Ends the lease of `epoch` when it is still the lease in force: the writer dropped a batch
+    /// of it at its authority's deadline. The end discards what the writer still holds of it, the
+    /// dropped batch with it, and reports that to the view that typed it, on its lane, or to
+    /// whoever takes the keys next. A lease that has already moved is left alone.
+    pub fn end_lease_whose_batch_expired(&mut self, epoch: u64) {
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        let Some(holder) = input.holder() else {
+            return;
+        };
+        if input.epoch() != epoch {
+            return;
+        }
+        let owed = self
+            .release_input_locked(&mut input, holder, epoch)
+            .map(|(owed, _)| owed)
+            .unwrap_or_default();
         drop(input);
         self.carry_out(owed, &mut FenceOutcome::default());
         self.pump_replies();
@@ -3472,7 +3513,8 @@ impl Session {
         let ending_epoch = input.epoch();
         let discarded_queue = input.release_attachment(holder);
         let framing = input.close_framing_for_takeover();
-        let ended = self.end_lease(&mut input);
+        let prefix = framing.discarded_prefix.len() as u64;
+        let ended = self.end_lease(&mut input, discarded_queue.saturating_add(prefix));
         // What this lease lost is carried rather than dropped. Nobody asked for the release, so
         // there is no answer to put it in; the next acquire reports it with its own.
         input.carry_interrupted(
@@ -5043,11 +5085,11 @@ impl Session {
                 // a shell that is being stopped. It is done in the same hold of the input domain as
                 // the state, so the recogniser's timer finds no prefix to forward and no lease to
                 // forward it under.
-                if let Some(holder) = input.holder() {
-                    input.release_attachment(holder);
-                }
-                input.close_framing_for_takeover();
-                let _ = self.end_lease(&mut input).left;
+                let queue = input
+                    .holder()
+                    .map_or(0, |holder| input.release_attachment(holder));
+                let prefix = input.close_framing_for_takeover().discarded_prefix.len() as u64;
+                let _ = self.end_lease(&mut input, queue.saturating_add(prefix)).left;
                 // The root editor's machine hears it too: a fence is invalidated, a launch the
                 // reader is still deciding is revoked and its caller answered, and whatever is held
                 // is discarded rather than typed into a shell that is being stopped.

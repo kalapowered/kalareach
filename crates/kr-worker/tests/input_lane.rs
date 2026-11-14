@@ -82,6 +82,17 @@ struct Lane {
 impl Lane {
     /// Writes one frame of the lane's attachment, in the epoch and the sequence it is at.
     async fn send(&mut self, bytes: &[u8]) -> RequestId {
+        self.send_with(bytes, Nullable::null()).await
+    }
+
+    /// Writes one frame admitted under an authority that ends at `deadline`, on the machine's
+    /// continuous clock in milliseconds.
+    async fn send_before(&mut self, bytes: &[u8], deadline: u64) -> RequestId {
+        self.send_with(bytes, Nullable::some(U64::new(deadline)))
+            .await
+    }
+
+    async fn send_with(&mut self, bytes: &[u8], deadline: Nullable<U64>) -> RequestId {
         self.requests += 1;
         let id = RequestId::new(1_000 + self.requests);
         let params = InputWriteParams {
@@ -103,7 +114,7 @@ impl Lane {
                     params: ParamsValue::from_typed(&params).expect("encodes"),
                 },
                 actor: self.actor.clone(),
-                authority_deadline_boot_ms: Nullable::null(),
+                authority_deadline_boot_ms: deadline,
                 history: None,
             })))
             .await
@@ -1759,5 +1770,61 @@ async fn an_acceptance_stopped_after_its_hold_is_still_answered_before_the_ended
         Some(Seen::Window(window)) => assert!(!window.holder && window.ended.is_present()),
         other => panic!("the ended notice did not follow the answer: {other:?}"),
     }
+    rig.finish().await;
+}
+
+/// Reads the next window state the worker puts on the lane, keeping nothing else but credit.
+async fn next_window(lane: &mut Lane) -> LaneWindow {
+    loop {
+        match lane.next().await.expect("the lane stays open") {
+            Seen::Window(window) => return window,
+            Seen::Credit(_) => {}
+            Seen::Answer(id, outcome) => panic!("an answer, {id:?}: {outcome:?}, with nothing sent"),
+        }
+    }
+}
+
+/// Holds the writer while a frame admitted under an authority that ends soon is accepted, and lets
+/// it go once that authority has ended. The writer then meets a batch it must not write.
+async fn a_batch_that_expires_in_the_writer(rig: &Rig, lane: &mut Lane, bytes: &[u8]) {
+    let (stopped, release) = rig.runtime.input().writer_hold().arm();
+    let deadline = kr_ipc::clock::boot_elapsed_ms() + 1_500;
+    let id = lane.send_before(bytes, deadline).await;
+    assert_eq!(lane.accepted().await, id, "the frame is accepted before its deadline");
+    stopped.await.expect("the writer took the batch");
+    until("the batch's authority ended", WAIT, || {
+        kr_ipc::clock::boot_elapsed_ms() >= deadline
+    })
+    .await;
+    release.send(()).expect("lets the writer go");
+}
+
+/// KR-REQ-23.36: typing that the session accepted is never discarded with no word. A batch whose
+/// authority ends while the writer holds it is not written, it ends its holder's epoch, and the
+/// lane's notice carries its bytes as fenced bytes. The view's next frame is refused with the
+/// lease's word and nothing of the batch reaches the application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_the_writer_drops_at_its_deadline_ends_the_epoch_and_the_notice_carries_its_bytes() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    a_batch_that_expires_in_the_writer(&rig, &mut lane, b"abc").await;
+
+    let notice = next_window(&mut lane).await;
+    assert!(!notice.holder, "the view no longer holds the keys");
+    let ended = notice.ended.0.expect("the notice says an epoch ended");
+    assert_eq!((ended.epoch, ended.fenced_bytes.get()), (epoch, 3));
+
+    let late = lane.send(b"z").await;
+    match lane.next_event().await {
+        Some(Seen::Answer(answered, outcome)) => {
+            assert_eq!(answered, late);
+            assert_eq!(refusal(&outcome), Some(ErrorCode::LeaseLost));
+        }
+        other => panic!("expected the lease's refusal, read {other:?}"),
+    }
+    tokio::time::sleep(SETTLE).await;
+    assert!(rig.received().is_empty(), "no piece of the batch reached the application");
     rig.finish().await;
 }

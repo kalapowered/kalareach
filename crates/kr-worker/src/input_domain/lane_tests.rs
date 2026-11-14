@@ -58,7 +58,8 @@ impl Rig {
     fn take(&mut self, view: &mut View) {
         self.input.close_framing_for_takeover();
         self.input.acquire(view.attachment, view.connection);
-        self.input.end_lease();
+        self.input.end_lease(0);
+        self.input.settle_ending(0);
         view.epoch = self.input.epoch();
         view.sequence = 0;
     }
@@ -67,7 +68,8 @@ impl Rig {
     fn release(&mut self, view: &View) {
         self.input.release(view.attachment, view.epoch);
         self.input.close_framing_for_takeover();
-        self.input.end_lease();
+        self.input.end_lease(0);
+        self.input.settle_ending(0);
     }
 
     /// A lane for the view, bound under its connection.
