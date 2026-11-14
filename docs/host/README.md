@@ -2343,9 +2343,12 @@ runs the protocol's library and a named set of the control daemon's cases and su
 its `project`, `network_project`, `shell`, `privacy` and `descriptions` suites, in steps of the
 workflow.
 Nothing has to be set for the link: `.cargo/config.toml` carries what the MSVC targets need, which
-is to leave the static C runtime out of the image and to stop the linker reporting the vendored C
-library's missing debug database once per object file. Setting `RUSTFLAGS` in the environment
-replaces those flags rather than adding to them, so a Windows build is run without it.
+is the `crt-static` target feature, so that every program links the static C runtime and imports no
+runtime library, to leave the debug static runtime out of a debug link, and to stop the linker
+reporting the vendored C library's missing debug database once per object file. Setting `RUSTFLAGS`
+in the environment replaces those flags rather than adding to them, so a Windows build is run
+without it, and the build script of `kr-crypto` refuses an MSVC build whose target features lack
+`crt-static`.
 
 `cargo test -p kr-worker --test windows` is the platform suite: it opens a pseudo-console, starts
 PowerShell 7 inside it, resizes it and reads the new geometry back from the application, drains

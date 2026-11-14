@@ -1395,6 +1395,11 @@ fn windows() -> Vec<Step> {
             "the directory secret store and the libsodium boundary",
             &["test", "--locked", "-p", "kr-crypto"],
         ),
+        Step::cargo(
+            Group::Rust,
+            "the libsodium boundary in the release profile",
+            &["test", "--locked", "--release", "-p", "kr-crypto"],
+        ),
         qualified_only(
             "the machine group record",
             &[

@@ -98,13 +98,22 @@ release). `scripts/build-release.sh` then copies them, by specific name, from th
 directory into the tree's `bin\`. It's important to copy them by specific name, so that the list alone
 decides what the archive holds and an executable that is missing stops the copy by its name.
 
-The included prebuilt libsodium is built to use the static C runtime, and the Rust MSVC targets use
-the dynamic C runtime. Including both in the same executable causes issues with the two different
-heaps, and the linker reports `LNK4098`. To avoid including the static C runtime when linking, the
-`.cargo/config.toml` file excludes it. However, if `RUSTFLAGS` is set, that replaces the flags which
-exclude the static C runtime. So the job doesn't set `RUSTFLAGS`, and will stop before it builds if
-it finds it set. Additionally, after the builds, the job reads the build logs and will stop if
-it finds that any link reported `LNK4098`, before anything is assembled or signed.
+Every Windows program of the release links the static C runtime, through the `crt-static` target
+feature in `.cargo/config.toml`. None of them imports a runtime library, so a machine without
+Microsoft's Visual C++ redistributable starts them, and nothing is installed beside them. The
+included prebuilt libsodium is built for the same runtime, so each program holds one runtime and one
+heap. The runtime is part of each program: a security fix of the C runtime reaches a user only in a
+rebuilt release.
+
+If `RUSTFLAGS` is set, that replaces the flags in `.cargo/config.toml` and the feature is lost, so
+the job doesn't set `RUSTFLAGS` and will stop before it builds if it finds it set. The build script
+of `kr-crypto` refuses an MSVC build that lacks the feature as well. Before the builds, the job
+links three small programs, one that carries its runtime, one that imports the dynamic runtime and
+one that asks for both, and checks that each read below refuses what it must. After the builds, the
+job reads the build logs and will stop if any link reported `LNK4098`. It then reads each program's
+imports with `dumpbin` and will stop if one is a library of Visual C++, of the universal runtime, an
+older or a debug runtime, or libsodium's own, or is neither a Windows API set nor a library of the
+system directory. Both reads run before anything is assembled or signed.
 
 The archive holds a `share\signatures.txt` written by the verification step, not by the build. It
 records one line per signed artefact: the SHA-256 of the bytes that were verified, the certificate

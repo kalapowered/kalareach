@@ -554,10 +554,12 @@ jobs:
           - name: windows-second
             part: second
     env:
-      # What this job does *not* set is RUSTFLAGS. The Windows link needs two arguments about the
-      # vendored C library, and they are in `.cargo/config.toml` so that every Windows build gets
+      # What this job does *not* set is RUSTFLAGS. Every Windows program links the static C runtime,
+      # which the `crt-static` target feature asks for, and the link needs two arguments about the
+      # vendored C library. They are all in `.cargo/config.toml` so that every Windows build gets
       # them; RUSTFLAGS in the environment replaces that file's flags rather than adding to them,
-      # so setting it here would quietly undo them.
+      # so setting it here would quietly undo them, and `kr-crypto`'s build script would refuse the
+      # build.
       # Section 27 puts every test artefact in one platform-resolved directory. This runner's
       # temporary directory is where that is on Windows.
       KR_TEST_ARTIFACTS_DIR: C:\kr-test-artifacts
@@ -1095,10 +1097,17 @@ jobs:
 
       # The directory secret store a test run or `--secret-store file` names flushes each name it
       # creates, replaces or removes, a directory made for a secret's scope among them, and reports
-      # a flush that is refused. The crate's whole suite runs, the libsodium boundary among it.
+      # a flush that is refused. The crate's whole suite runs, the libsodium boundary among it. It
+      # runs in pwsh: from bash two store cases fail, for a reason that is not the runtime.
       - name: Test the directory secret store and the libsodium boundary
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-crypto
+
+      # The same suite against libsodium's release library, which is the one the shipped programs
+      # link, and the profile whose link carries the static C runtime alone.
+      - name: Test the libsodium boundary in the release profile
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked --release -p kr-crypto
 
       # The machine group record on this platform. A step renames a new record over the old one,
       # which Windows refuses while another program, a scanner among them, holds the record
