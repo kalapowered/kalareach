@@ -546,8 +546,9 @@ async fn the_fence_is_owed_while_a_worker_is_pending_and_settled_when_the_pass_h
     }
     assert_eq!(
         host.controller().announcements_sent_for_tests().len(),
-        announced,
-        "the daemon made no announcement of its own: the pass told the worker"
+        announced + host.controller().pending_asks_for_tests().len(),
+        "the daemon made no announcement of its own: each one after the restriction's was an ask \
+         of the pass"
     );
     host.stop().await;
     drop(workers);

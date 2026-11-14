@@ -93,6 +93,7 @@ pub use backup_production::PassPause;
 pub use backup_production::{Held as ProductionHeld, ProducerBounds, StopBackupProduction};
 
 pub use barrier::DEBT_PASS_INTERVAL;
+pub(crate) use barrier::{Asked, Told};
 pub use capabilities::{CAPABILITY_REVISION_FILE, DESKTOP_REREAD_INTERVAL};
 pub use close::{CLOSE_EXCHANGE, CLOSURE_WATCH_TIMEOUT};
 pub use create::{CREATE_WAIT, RENDEZVOUS_TIMEOUT};

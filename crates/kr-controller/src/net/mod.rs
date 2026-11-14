@@ -82,7 +82,7 @@ use kr_transport::window::AcceptedDeadline;
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
-use crate::service::{AdmittedConnection, Controller, FeedStanding, LeaseDenied};
+use crate::service::{AdmittedConnection, Asked, Controller, FeedStanding, LeaseDenied, Told};
 use config::NetworkSettings;
 use devices::{DeviceDirectory, DeviceRecord};
 use dispatch::RemoteConnection;
@@ -2501,12 +2501,35 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when the registry cannot be read or written, or when the worker is not in
-    /// the directory.
+    /// Returns an error when the registry cannot be read or written, when the worker is not in
+    /// the directory, or when the worker did not acknowledge the revision.
     pub(crate) async fn acknowledge_worker_revision(
         self: &Arc<Self>,
         session_id: kr_protocol::ids::SessionId,
     ) -> Result<()> {
+        match self.ask_worker_revision(session_id).await? {
+            Asked::Acknowledged => Ok(()),
+            Asked::Refused | Asked::Failed => Err(ControllerError::supervision(
+                "this session's worker has not installed the environment's authority revision",
+            )),
+        }
+    }
+
+    /// Asks one worker to install this environment's authority revision, and says what came of it.
+    ///
+    /// The worker that is inside a dispatch transition refuses for the moment. That is a complete
+    /// exchange: it has recorded what it owes, a worker that has not acknowledged cannot renew a
+    /// lease, and the link is good, so it goes back and the next ask meets the worker's own
+    /// attempt at its boundary on the same link instead of opening one that waits there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written, or when the worker is not in
+    /// the directory.
+    pub(crate) async fn ask_worker_revision(
+        self: &Arc<Self>,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<Asked> {
         // A worker that ends while this exchange is on the wire is held until it is over, so the
         // names its acknowledgement carries still have a record to go to.
         let _exchange = self.leases.begin_round();
@@ -2546,27 +2569,30 @@ impl Controller {
         // not be a bound at all.
         let exchange = async {
             // The link is taken out of the shared slot for the exchange and goes back only when it
-            // finished. A cancelled exchange, this one running out of time, would otherwise leave
-            // a connection in the slot with an acknowledgement still on the wire, and the next
-            // caller would read somebody else's answer as its own.
+            // ended in an answer. A cancelled exchange, this one running out of time, would
+            // otherwise leave a connection in the slot with an acknowledgement still on the wire,
+            // and the next caller would read somebody else's answer as its own.
             let mut link = self.worker_client(&worker).await?;
             // The first page of whatever its fence named: this worker has said nothing about this
             // revocation yet, so there is nothing to continue from.
-            let answered = self
+            let told = self
                 .tell_revisions(session_id, binding, &mut link, revision, held, None)
                 .await;
-            Ok::<_, ControllerError>(answered.inspect(|_| link.give_back()))
+            if !matches!(told, Told::Failed) {
+                link.give_back();
+            }
+            Ok::<_, ControllerError>(told)
         };
-        let answered = match tokio::time::timeout(ACKNOWLEDGEMENT_TIMEOUT, exchange).await {
-            Ok(Ok(answered)) => answered,
+        let told = match tokio::time::timeout(ACKNOWLEDGEMENT_TIMEOUT, exchange).await {
+            Ok(Ok(told)) => told,
             // A worker that did not answer, or that could not be reached, has not installed the
             // revision. Renewal stops for it until it does: the link it was reached over gave up
             // its path as it was dropped, while the slot was still held. A wait for the link that
             // ran out holds nothing and gives nothing up.
-            Ok(Err(_)) | Err(_) => None,
+            Ok(Err(_)) | Err(_) => Told::Failed,
         };
-        match answered {
-            Some(ack) if ack.revision.get() >= revision.get() => {
+        match told {
+            Told::Acknowledged(ack) if ack.revision.get() >= revision.get() => {
                 // What its fence rejected and could not take back travels with the
                 // acknowledgement, because section 9 makes the acknowledgement two statements. A
                 // worker that said nothing about its fence has made one of them, and the barrier
@@ -2587,16 +2613,17 @@ impl Controller {
                     self.collect_owed_evidence(session_id, binding, revision)
                         .await;
                 }
-                Ok(())
+                Ok(Asked::Acknowledged)
             }
-            _ => {
+            // Refused for the moment: the worker is there and has recorded what it owes, and what
+            // a worker that is not confirmed ended is owed is another ask.
+            Told::Refused => Ok(Asked::Refused),
+            Told::Acknowledged(_) | Told::Failed => {
                 // A worker that is confirmed gone answers the question a different way: it can no
                 // longer act under anything. A closure this records tells the barrier in the
                 // section that records it.
                 self.reconcile(session_id).await?;
-                Err(ControllerError::supervision(
-                    "this session's worker has not installed the environment's authority revision",
-                ))
+                Ok(Asked::Failed)
             }
         }
     }
