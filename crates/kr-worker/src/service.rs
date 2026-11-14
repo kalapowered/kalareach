@@ -377,11 +377,10 @@ pub struct WorkerService {
     controller_public_key: AuthorisationKey,
     /// Which generation and which connections speak for this environment.
     ///
-    /// The order of every lock that is held while another is taken is one order, everywhere: this
-    /// one first, then the input domain, then the connection registry, then one registration's
-    /// list of attachments. Nothing that holds the input domain takes this lock, so a path that
-    /// holds this lock may wait for the domain, and a path that holds the domain never waits for
-    /// this.
+    /// This lock comes before the input domain wherever a path holds both: a path that holds this
+    /// lock may wait for the domain, and a path that holds the domain never waits for this. After
+    /// the domain come the connection registry and then one registration's list of attachments.
+    /// The dispatch boundary, where a path holds it, is taken before this lock.
     authority: Mutex<Authority>,
     /// What this session's local owner may do, as the control daemon last told this worker.
     gate: Arc<crate::local_gate::LocalGate>,
@@ -1959,7 +1958,21 @@ impl WorkerService {
             .take();
         if let Some((arrived, go)) = armed {
             let _ = arrived.send(());
-            let _ = go.recv();
+            // The wait gives the runtime's thread to another before it blocks, as `Stall::stand`
+            // does: a thread that blocks with the runtime's I/O and timer driver in its hands
+            // leaves both stopped until some other wake comes, and a case that waits on a timer
+            // while this frame is held would never be told.
+            let wait = move || {
+                let _ = go.recv();
+            };
+            let several = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+                runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            });
+            if several {
+                tokio::task::block_in_place(wait);
+            } else {
+                wait();
+            }
         }
     }
 
