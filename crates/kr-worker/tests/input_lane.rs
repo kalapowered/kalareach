@@ -35,13 +35,19 @@ use kr_protocol::local::{
     ControllerConnectionRole, ForwardedRequest, InputLane, InputLaneReady, LaneCredit, LaneLaunch,
     LaneWindow,
 };
-use kr_protocol::root::{
-    EditorBufferRevision, LaunchCommand, PromptGeneration, ShellLaunchParams,
-};
 use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::root::{
+    CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, FenceAcknowledgement,
+    KeyQueueSnapshot, LaunchCommand, PendingReaderInput, PromptGeneration, QueueDrainReport,
+    ReaderContext, ReaderRevision, RootEditorEnterParams, RootEditorFenceResult, ShellLaunchParams,
+};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, U64};
 use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
 use kr_protocol::worker::{AuthorityRevisionNotice, RevisionReach};
+use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
+use kr_shell_integration::contract::qualification::ShellKind;
+use kr_shell_integration::contract::requests::{BridgeAnswer, WorkerRequest};
+use kr_worker::fence::{Outbound, Step};
 use kr_worker::input_room::Cost;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
@@ -289,8 +295,9 @@ impl Rig {
         Self::start_built(close_bound, false).await
     }
 
-    /// A rig whose session has the root editor's fence machine, not qualified: a launch asked of
-    /// it is refused by the machine at once.
+    /// A rig whose session is a managed shell with the root editor's fence machine, its bridge
+    /// registered and its hooks live, and no reader in an editor yet: input is accepted as it is
+    /// outside an editor, and a launch asked of it is refused by the machine at once.
     async fn start_fenced() -> Self {
         Self::start_built(None, true).await
     }
@@ -311,7 +318,11 @@ impl Rig {
                 "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee {}",
                 kr_worker::testing::shell_quoted(&received)
             )),
-            shell_mode: ShellMode::NativeCompat,
+            shell_mode: if fenced {
+                ShellMode::Managed
+            } else {
+                ShellMode::NativeCompat
+            },
             worker_profile: WorkerProfile::HeadlessUser,
             desktop: DesktopBinding::none(),
             dimensions: Dimensions::new(80, 24),
@@ -350,6 +361,19 @@ impl Rig {
                 kr_shell_integration::contract::fence::LeaseView::unheld(InputLeaseEpoch::new(0)),
                 Arc::new(kr_transport::clock::ManualClock::new()),
             ));
+            // Registered and qualified without a bridge: the phases are the driver's own, and a
+            // launch asked of the session reaches the machine.
+            let mut driver = session.fence_mut().expect("a driver");
+            assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
+            let _ = driver.bridge_event(
+                RequestId::new(1),
+                &BridgeEvent::HooksActivated(HooksActivated {
+                    session_id,
+                    prompt_generation: PromptGeneration::new(1),
+                    modules: Vec::new(),
+                }),
+            );
+            assert!(driver.phase().reports_ready());
         }
         let runtime = Arc::new(
             SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
@@ -512,6 +536,99 @@ impl Rig {
             .expect("reaches the worker")
     }
 
+    /// Asks for a launch that names a position and does not wait for the answer, which comes when
+    /// the reader decides. The proxy link goes with the call and comes back with the answer, so
+    /// the rig makes no other request in the meantime.
+    fn launching(
+        &mut self,
+        after: Option<InputBarrier>,
+    ) -> tokio::task::JoinHandle<(BoundLink, Result<ParamsValue, ProtocolError>)> {
+        let params = self.launch_params(after);
+        let target = self.target();
+        let actor = self.actor(1);
+        let mut proxy = self.proxy.take().expect("the proxy link is open");
+        tokio::spawn(async move {
+            let mutation = proxy
+                .compose(
+                    Method::ShellLaunch,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target,
+                    &params,
+                )
+                .await
+                .expect("the mutation is composed");
+            let deadline = U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000);
+            let outcome = proxy
+                .forward(
+                    &mutation,
+                    &actor,
+                    &Self::rights(),
+                    deadline,
+                    Some(common::a_lease(1, 1)),
+                )
+                .await
+                .expect("reaches the worker");
+            (proxy, outcome)
+        })
+    }
+
+    /// Puts the reader of the root editor at an empty prompt behind an acknowledged fence, as the
+    /// shell's bridge reports it, so that a launch asked of the session is reserved.
+    fn at_a_prompt(&self) {
+        let session_id = self.session_id;
+        let editor = EditorState {
+            buffer_empty: true,
+            buffer_revision: EditorBufferRevision::new(1),
+            keymap: EditorKeymap::Emacs,
+            pending: PendingReaderInput::NONE,
+        };
+        let mut asked = None;
+        self.runtime
+            .session()
+            .stimulate_fence(|driver| {
+                let effects = driver.bridge_event(
+                    RequestId::new(2),
+                    &BridgeEvent::EditorEnter(RootEditorEnterParams {
+                        session_id,
+                        root_process: kr_ipc::identity::current_process_start_identity()
+                            .expect("this process"),
+                        prompt_generation: PromptGeneration::new(1),
+                        reader_revision: ReaderRevision::new(1),
+                        reader_context: ReaderContext::Primary,
+                        editor: editor.clone(),
+                        cwd_revision: CwdRevision::new(1),
+                    }),
+                );
+                asked = effects.steps.iter().find_map(|step| match step {
+                    Step::Send(Outbound::Request(request)) => match request.as_ref() {
+                        WorkerRequest::Fence(params) => Some(params.fence_id),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                effects
+            })
+            .expect("the session has a fence machine");
+        let fence_id = asked.expect("the reader was asked for a fence");
+        self.runtime
+            .session()
+            .stimulate_fence(|driver| {
+                driver.bridge_answer(&BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(
+                    FenceAcknowledgement {
+                        fence_id,
+                        reader_context: ReaderContext::Primary,
+                        prompt_generation: PromptGeneration::new(1),
+                        reader_revision: ReaderRevision::new(1),
+                        queues: QueueDrainReport::CLEAR,
+                        snapshot: KeyQueueSnapshot::drained(),
+                        editor,
+                        cwd_revision: CwdRevision::new(1),
+                    },
+                )))
+            })
+            .expect("the session has a fence machine");
+    }
+
     /// Attaches a terminal that may type.
     async fn attach(&mut self) -> AttachmentId {
         let mut requested = CanonicalSet::new();
@@ -633,18 +750,23 @@ impl Rig {
             .map(|answer| answer.to_typed().expect("a detach result"))
     }
 
-    /// Asks for a launch that names a position, as the daemon forwards it.
-    async fn launch_with(
-        &mut self,
-        after: Option<InputBarrier>,
-    ) -> Result<ParamsValue, ProtocolError> {
-        let params = ShellLaunchParams {
+    /// The launch of the cases, which names the position `after` when it is given.
+    fn launch_params(&self, after: Option<InputBarrier>) -> ShellLaunchParams {
+        ShellLaunchParams {
             session_id: self.session_id,
             command: LaunchCommand::QuotedCommand("true".to_owned()),
             expected_prompt_generation: PromptGeneration::new(1),
             expected_buffer_revision: EditorBufferRevision::new(1),
             after_input: after,
-        };
+        }
+    }
+
+    /// Asks for a launch that names a position, as the daemon forwards it.
+    async fn launch_with(
+        &mut self,
+        after: Option<InputBarrier>,
+    ) -> Result<ParamsValue, ProtocolError> {
+        let params = self.launch_params(after);
         self.forward_at(Method::ShellLaunch, &params, 1).await
     }
 
@@ -1860,7 +1982,9 @@ async fn next_window(lane: &mut Lane) -> LaneWindow {
         match lane.next().await.expect("the lane stays open") {
             Seen::Window(window) => return window,
             Seen::Credit(_) | Seen::Launch(_) => {}
-            Seen::Answer(id, outcome) => panic!("an answer, {id:?}: {outcome:?}, with nothing sent"),
+            Seen::Answer(id, outcome) => {
+                panic!("an answer, {id:?}: {outcome:?}, with nothing sent")
+            }
         }
     }
 }
@@ -1871,7 +1995,11 @@ async fn a_batch_that_expires_in_the_writer(rig: &Rig, lane: &mut Lane, bytes: &
     let (stopped, release) = rig.runtime.input().writer_hold().arm();
     let deadline = kr_ipc::clock::boot_elapsed_ms() + 1_500;
     let id = lane.send_before(bytes, deadline).await;
-    assert_eq!(lane.accepted().await, id, "the frame is accepted before its deadline");
+    assert_eq!(
+        lane.accepted().await,
+        id,
+        "the frame is accepted before its deadline"
+    );
     stopped.await.expect("the writer took the batch");
     until("the batch's authority ended", WAIT, || {
         kr_ipc::clock::boot_elapsed_ms() >= deadline
@@ -1885,7 +2013,8 @@ async fn a_batch_that_expires_in_the_writer(rig: &Rig, lane: &mut Lane, bytes: &
 /// lane's notice carries its bytes as fenced bytes. The view's next frame is refused with the
 /// lease's word and nothing of the batch reaches the application.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_batch_the_writer_drops_at_its_deadline_ends_the_epoch_and_the_notice_carries_its_bytes() {
+async fn a_batch_the_writer_drops_at_its_deadline_ends_the_epoch_and_the_notice_carries_its_bytes()
+{
     let mut rig = Rig::start().await;
     let attachment = rig.attach().await;
     let epoch = rig.acquire(attachment).await;
@@ -1906,7 +2035,10 @@ async fn a_batch_the_writer_drops_at_its_deadline_ends_the_epoch_and_the_notice_
         other => panic!("expected the lease's refusal, read {other:?}"),
     }
     tokio::time::sleep(SETTLE).await;
-    assert!(rig.received().is_empty(), "no piece of the batch reached the application");
+    assert!(
+        rig.received().is_empty(),
+        "no piece of the batch reached the application"
+    );
     rig.finish().await;
 }
 
@@ -1948,7 +2080,12 @@ async fn a_release_or_a_detach_beyond_the_position_of_a_live_epoch_applies_nothi
     rig.received_exactly(b"abc").await;
 
     let release = rig
-        .release_with(attachment, epoch, Some(barrier(attachment, epoch, 4, None)), true)
+        .release_with(
+            attachment,
+            epoch,
+            Some(barrier(attachment, epoch, 4, None)),
+            true,
+        )
         .await
         .expect_err("the position was not reached");
     assert_eq!(release.code, ErrorCode::DraftConflict);
@@ -1962,10 +2099,39 @@ async fn a_release_or_a_detach_beyond_the_position_of_a_live_epoch_applies_nothi
     typed(&mut lane, &[b"d"]).await;
     rig.received_exactly(b"abcd").await;
     let released = rig
-        .release_with(attachment, epoch, Some(barrier(attachment, epoch, 3, None)), true)
+        .release_with(
+            attachment,
+            epoch,
+            Some(barrier(attachment, epoch, 3, None)),
+            true,
+        )
         .await
         .expect("the position is reached");
     assert_eq!(released.fenced_bytes.map(U64::get), Some(0));
+
+    // A refused ending is sent once more with no position, as the client does, and the refusal
+    // leaves no outcome behind that holds the resend back.
+    let epoch = rig.acquire(attachment).await;
+    let early = Some(barrier(attachment, epoch, 1, None));
+    let release = rig
+        .release_with(attachment, epoch, early.clone(), true)
+        .await
+        .expect_err("nothing was typed in this epoch");
+    assert_eq!(release.code, ErrorCode::DraftConflict);
+    rig.release_with(attachment, epoch, None, true)
+        .await
+        .expect("the resend with no position is taken");
+    let epoch = rig.acquire(attachment).await;
+    let detach = rig
+        .detach_with(attachment, Some(barrier(attachment, epoch, 1, None)), true)
+        .await
+        .expect_err("nothing was typed in this epoch");
+    assert_eq!(detach.code, ErrorCode::DraftConflict);
+    let detached = rig
+        .detach_with(attachment, None, true)
+        .await
+        .expect("the resend with no position is taken");
+    assert_eq!(detached.attachment_id, attachment);
     rig.finish().await;
 }
 
@@ -2022,7 +2188,10 @@ async fn the_fenced_count_is_exact_in_the_answer_and_in_the_notice() {
         .expect("released");
     assert_eq!(released.fenced_bytes.map(U64::get), Some(5));
     let notice = next_window(&mut lane).await;
-    assert_eq!(notice.ended.0.expect("an epoch ended").fenced_bytes.get(), 5);
+    assert_eq!(
+        notice.ended.0.expect("an epoch ended").fenced_bytes.get(),
+        5
+    );
     go.send(()).expect("lets the writer go");
     rig.drained().await;
 
@@ -2040,7 +2209,13 @@ async fn the_fenced_count_is_exact_in_the_answer_and_in_the_notice() {
         .expect("released");
     assert_eq!(released.fenced_bytes, None);
     assert_eq!(
-        next_window(&mut lane).await.ended.0.expect("an epoch ended").fenced_bytes.get(),
+        next_window(&mut lane)
+            .await
+            .ended
+            .0
+            .expect("an epoch ended")
+            .fenced_bytes
+            .get(),
         2
     );
     go.send(()).expect("lets the writer go");
@@ -2056,7 +2231,10 @@ async fn the_fenced_count_is_exact_in_the_answer_and_in_the_notice() {
     stopped.await.expect("the writer took the batch");
     rig.acquire(other).await;
     let notice = next_window(&mut lane).await;
-    assert_eq!(notice.ended.0.expect("an epoch ended").fenced_bytes.get(), 3);
+    assert_eq!(
+        notice.ended.0.expect("an epoch ended").fenced_bytes.get(),
+        3
+    );
     go.send(()).expect("lets the writer go");
     rig.drained().await;
 
@@ -2074,7 +2252,13 @@ async fn the_fenced_count_is_exact_in_the_answer_and_in_the_notice() {
         .expect("detached");
     assert_eq!(detached.fenced_bytes.map(U64::get), Some(3));
     assert_eq!(
-        next_window(&mut lane).await.ended.0.expect("an epoch ended").fenced_bytes.get(),
+        next_window(&mut lane)
+            .await
+            .ended
+            .0
+            .expect("an epoch ended")
+            .fenced_bytes
+            .get(),
         3
     );
     go.send(()).expect("lets the writer go");
@@ -2083,7 +2267,9 @@ async fn the_fenced_count_is_exact_in_the_answer_and_in_the_notice() {
 
 /// KR-REQ-23.36, C21: a launch whose barrier names an epoch the attachment no longer holds, or an
 /// attachment that is not the holder, is a lost lease with nothing reserved, and a position the
-/// live epoch has not reached is a definite refusal.
+/// live epoch has not reached is a definite refusal. A refusal of the barrier is the launch's
+/// whole answer: it writes no marker on the lane and leaves no outcome that holds the next launch
+/// back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_launch_is_checked_against_the_holder_the_epoch_and_the_position() {
     let mut rig = Rig::start_fenced().await;
@@ -2093,6 +2279,7 @@ async fn a_launch_is_checked_against_the_holder_the_epoch_and_the_position() {
     rig.acquire(other).await;
     let second = rig.acquire(attachment).await;
     assert_ne!(first, second);
+    let mut lane = rig.lane(attachment).await;
 
     let stale = rig
         .launch_with(Some(barrier(attachment, first, 0, Some(1))))
@@ -2109,13 +2296,21 @@ async fn a_launch_is_checked_against_the_holder_the_epoch_and_the_position() {
         .await
         .expect_err("the position was not reached");
     assert_eq!(early.code, ErrorCode::DraftConflict);
+
+    // No marker was written for any of the three: the first thing the lane carries is the
+    // acceptance of a key typed afterwards.
+    typed(&mut lane, &[b"k"]).await;
+    // And the next launch is dealt with by the machine, which has no reader in an editor to ask.
+    let dealt_with = rig
+        .launch_with(Some(barrier(attachment, second, 1, Some(4))))
+        .await
+        .expect_err("the machine refuses a launch while its reader is not in an editor");
+    assert_eq!(dealt_with.code, ErrorCode::EditorBusy);
     rig.finish().await;
 }
 
 /// KR-REQ-23.36, C26: the worker writes the launch marker when it has dealt with the launch, also
-/// when the machine refused the launch at once. A session with a fence machine takes no external
-/// typing until its shell is authenticated, so this case types nothing: the marker's place behind
-/// acceptances is not shown here.
+/// when the machine refused the launch at once, and the marker is the launch's own number.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_immediate_refusal_of_a_launch_writes_the_marker() {
     let mut rig = Rig::start_fenced().await;
@@ -2126,8 +2321,8 @@ async fn an_immediate_refusal_of_a_launch_writes_the_marker() {
     let refused = rig
         .launch_with(Some(barrier(attachment, epoch, 0, Some(7))))
         .await
-        .expect_err("the machine refuses a launch of a session that is not qualified");
-    assert_ne!(refused.code, ErrorCode::LeaseLost);
+        .expect_err("the machine refuses a launch while its reader is not in an editor");
+    assert_eq!(refused.code, ErrorCode::EditorBusy);
     match lane.next_event().await {
         Some(Seen::Launch(marker)) => {
             assert_eq!((marker.attachment_id, marker.launch), (attachment, 7));
@@ -2135,6 +2330,53 @@ async fn an_immediate_refusal_of_a_launch_writes_the_marker() {
         other => panic!("the launch's marker did not come: {other:?}"),
     }
     rig.finish().await;
+}
+
+/// KR-REQ-23.36, C26: a launch that the machine has reserved for its reader is marked on the lane
+/// while it is still unanswered, and the marker comes behind the acceptance of every frame before
+/// the barrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_marker_of_a_reserved_launch_follows_the_acceptances_before_its_barrier() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    rig.at_a_prompt();
+
+    // Three frames, whose acceptances the case does not read before the launch is asked for.
+    for frame in [b"a", b"b", b"c"] {
+        lane.send(frame).await;
+    }
+    until("the worker accepted the three frames", WAIT, || {
+        rig.runtime.input().lock().lease().next_sequence.get() == 3
+    })
+    .await;
+    let launching = rig.launching(Some(barrier(attachment, epoch, 3, Some(9))));
+
+    for _ in 0..3 {
+        lane.accepted().await;
+    }
+    match lane.next_event().await {
+        Some(Seen::Launch(marker)) => {
+            assert_eq!((marker.attachment_id, marker.launch), (attachment, 9));
+        }
+        other => panic!("the launch's marker did not follow the acceptances: {other:?}"),
+    }
+    assert!(
+        !launching.is_finished(),
+        "the launch is with its reader and unanswered when the marker comes"
+    );
+
+    // The session's close revokes the reservation, which answers the launch.
+    rig.runtime.close(ClosureReason::CloseRequested).1.release();
+    let (_proxy, answer) = tokio::time::timeout(WAIT, launching)
+        .await
+        .expect("the close answers the launch")
+        .expect("the launch's task ran");
+    assert!(
+        answer.is_err(),
+        "nothing was installed in the closing session"
+    );
 }
 
 /// KR-REQ-23.36: the hello states the lane's capability, which promises the window, the position

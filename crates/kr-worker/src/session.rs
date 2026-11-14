@@ -1045,10 +1045,7 @@ impl Session {
     {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
-        if input.holder() != Some(barrier.attachment_id) || input.epoch() != barrier.epoch.get() {
-            return Err(WorkerError::LeaseLost);
-        }
-        input.check_position(barrier)?;
+        input.check_launch_barrier(barrier)?;
         let Some(driver) = input.fence_mut() else {
             return Ok(None);
         };
@@ -1060,6 +1057,33 @@ impl Session {
         drop(input);
         self.finish_fence(owed, &mut outcome);
         Ok(Some(outcome))
+    }
+
+    /// Refuses a release or a detach of `attachment_id` whose barrier names typing of the live
+    /// epoch that has not all arrived. It changes nothing, so a caller that makes it before the
+    /// request's dispatch marker refuses the request with no effect and no uncertain outcome; the
+    /// action checks again in its own hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::PreconditionFailed`] when the position has not been reached.
+    pub fn check_position(
+        &self,
+        attachment_id: AttachmentId,
+        barrier: &InputBarrier,
+    ) -> Result<()> {
+        self.input.lock().check_position(attachment_id, barrier)
+    }
+
+    /// The same for the barrier of a launch, which also has to name the holder at the current
+    /// epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::LeaseLost`] and [`WorkerError::PreconditionFailed`] as
+    /// [`Self::stimulate_fence_after`] does.
+    pub fn check_launch_barrier(&self, barrier: &InputBarrier) -> Result<()> {
+        self.input.lock().check_launch_barrier(barrier)
     }
 
     /// Returns the input domain this session shares with its keystroke path.
@@ -2544,10 +2568,8 @@ impl Session {
         let mut input = shared.lock();
         // The position is checked first, in the hold that does the removals, so a refusal has no
         // effect. A stale epoch proceeds: a detach does not depend on the lease.
-        if let Some(barrier) = after
-            && barrier.attachment_id == attachment_id
-        {
-            input.check_position(barrier)?;
+        if let Some(barrier) = after {
+            input.check_position(attachment_id, barrier)?;
         }
         self.content_scopes.remove(&attachment_id);
         self.resource_views.remove(&attachment_id);
@@ -2935,8 +2957,7 @@ impl Session {
     ) -> Result<(InputLeaseState, u64)> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
-        let (owed, fenced) =
-            self.release_input_locked(&mut input, attachment_id, epoch, after)?;
+        let (owed, fenced) = self.release_input_locked(&mut input, attachment_id, epoch, after)?;
         let lease = input.lease();
         drop(input);
         self.carry_out(owed, &mut FenceOutcome::default());
@@ -2959,9 +2980,7 @@ impl Session {
             if input.holder() != Some(attachment_id) || input.epoch() != epoch {
                 return Err(WorkerError::LeaseLost);
             }
-            if barrier.attachment_id == attachment_id {
-                input.check_position(barrier)?;
-            }
+            input.check_position(attachment_id, barrier)?;
         }
         let ending_epoch = input.epoch();
         let discarded_queue = input
@@ -5251,7 +5270,9 @@ impl Session {
                     .holder()
                     .map_or(0, |holder| input.release_attachment(holder));
                 let prefix = input.close_framing_for_takeover().discarded_prefix.len() as u64;
-                let _ = self.end_lease(&mut input, queue.saturating_add(prefix)).left;
+                let _ = self
+                    .end_lease(&mut input, queue.saturating_add(prefix))
+                    .left;
                 // The root editor's machine hears it too: a fence is invalidated, a launch the
                 // reader is still deciding is revoked and its caller answered, and whatever is held
                 // is discarded rather than typed into a shell that is being stopped.

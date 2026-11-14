@@ -2286,20 +2286,27 @@ impl InputDomain {
         });
     }
 
-    /// Checks the position a dependent request names: the typing it must come after has been
-    /// accepted. It runs in the same hold as the request's action, so no frame of the epoch is
-    /// accepted between the two.
+    /// Checks the position a dependent request of `attachment_id` names: the typing it must come
+    /// after has been accepted. A request makes the check before anything is recorded or done, and
+    /// the action makes it again in its own hold, so no frame of the epoch is accepted between the
+    /// last check and the action.
     ///
-    /// The position is consulted only while the barrier's epoch is the current one and its
-    /// attachment holds the lease. After a takeover the old epoch accepts no more frames, so
-    /// there is nothing left to order and the request goes on to the checks of its own.
+    /// The position is consulted only while the barrier names the requester, its epoch is the
+    /// current one and its attachment holds the lease. After a takeover the old epoch accepts no
+    /// more frames, so there is nothing left to order and the request goes on to the checks of its
+    /// own.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::PreconditionFailed`] when the epoch is live and fewer frames of it
     /// have been accepted than the barrier counts.
-    pub(crate) fn check_position(&self, barrier: &InputBarrier) -> Result<()> {
-        if barrier.epoch.get() != self.lease.epoch()
+    pub(crate) fn check_position(
+        &self,
+        attachment_id: AttachmentId,
+        barrier: &InputBarrier,
+    ) -> Result<()> {
+        if barrier.attachment_id != attachment_id
+            || barrier.epoch.get() != self.lease.epoch()
             || self.lease.holder() != Some(barrier.attachment_id)
             || self.lease.next_sequence() >= barrier.count.get()
         {
@@ -2308,6 +2315,23 @@ impl InputDomain {
         Err(WorkerError::PreconditionFailed {
             detail: "The typing before this request has not all arrived.".to_owned(),
         })
+    }
+
+    /// Checks the barrier of a launch: its attachment holds the lease at the barrier's epoch, and
+    /// then its position has been reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::LeaseLost`] when the barrier's attachment is not the holder or the
+    /// epoch is not the current one, and [`WorkerError::PreconditionFailed`] as
+    /// [`Self::check_position`] does.
+    pub(crate) fn check_launch_barrier(&self, barrier: &InputBarrier) -> Result<()> {
+        if self.lease.holder() != Some(barrier.attachment_id)
+            || self.lease.epoch() != barrier.epoch.get()
+        {
+            return Err(WorkerError::LeaseLost);
+        }
+        self.check_position(barrier.attachment_id, barrier)
     }
 
     /// Tells the lane of `attachment_id` that the worker has dealt with the launch the client
@@ -2319,12 +2343,13 @@ impl InputDomain {
             .values()
             .find(|lane| lane.attachment_id == attachment_id && lane.parent_ok)
         {
-            lane.queue.push_frame(ControlFrame::Event(
-                ControlEvent::InputLaunchReserved(LaneLaunch {
-                    attachment_id,
-                    launch,
-                }),
-            ));
+            lane.queue
+                .push_frame(ControlFrame::Event(ControlEvent::InputLaunchReserved(
+                    LaneLaunch {
+                        attachment_id,
+                        launch,
+                    },
+                )));
         }
     }
 
