@@ -375,6 +375,13 @@ pub struct WorkerService {
     /// The action windows of every connection this worker serves.
     windows: ActionWindowIssuer,
     controller_public_key: AuthorisationKey,
+    /// Which generation and which connections speak for this environment.
+    ///
+    /// The order of every lock that is held while another is taken is one order, everywhere: this
+    /// one first, then the input domain, then the connection registry, then one registration's
+    /// list of attachments. Nothing that holds the input domain takes this lock, so a path that
+    /// holds this lock may wait for the domain, and a path that holds the domain never waits for
+    /// this.
     authority: Mutex<Authority>,
     /// What this session's local owner may do, as the control daemon last told this worker.
     gate: Arc<crate::local_gate::LocalGate>,
@@ -564,6 +571,30 @@ pub struct WorkerService {
     /// preparation for as long as they need. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     preparation_stall: crate::testing::Stall,
+    /// A stop in an input lane's bind, after the first of the two locks it takes and before the
+    /// second, which this host's own tests arm. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    bind_stall: crate::testing::Stall,
+    /// A stop in the record of a revision a held dispatch boundary refused, after the authority
+    /// lock and before the input domain, which this host's own tests arm. It is compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    owe_fence_stall: crate::testing::Stall,
+    /// A stop in an input lane's `input.write`, after the hold of the input domain that accepted
+    /// the frame has ended, which this host's own tests arm. It is compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    acceptance_stall: crate::testing::Stall,
+    /// How many times a thread has found the authority lock held by another and waited for it,
+    /// for this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    authority_waits: std::sync::atomic::AtomicUsize,
+    /// How many tasks are writing an input lane's queue to its link, for this host's own tests.
+    /// It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    lane_writers: std::sync::atomic::AtomicUsize,
+    /// How long a closed lane queue has to be written out before its link is ended.
+    lane_close_bound: std::time::Duration,
     /// How long, in milliseconds, an admitted operation has to reach its upstream, which this
     /// host's own tests shorten to reach the deadline without waiting out the shipped one. It is
     /// compiled away in every shipped build.
@@ -994,6 +1025,17 @@ impl WorkerService {
             #[cfg(feature = "testing")]
             preparation_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
+            bind_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            owe_fence_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            acceptance_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            authority_waits: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            lane_writers: std::sync::atomic::AtomicUsize::new(0),
+            lane_close_bound: crate::runtime::ACCEPTANCE_WRITE_TIMEOUT,
+            #[cfg(feature = "testing")]
             upstream_deadline_ms: std::sync::atomic::AtomicU64::new(
                 u64::try_from(UPSTREAM_SUBMIT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
             ),
@@ -1029,6 +1071,16 @@ impl WorkerService {
     #[must_use]
     pub const fn with_keepalive(mut self, period: std::time::Duration) -> Self {
         self.keepalive = period;
+        self
+    }
+
+    /// Ends the link of an input lane whose queue has closed after `bound` rather than after
+    /// [`crate::runtime::ACCEPTANCE_WRITE_TIMEOUT`], so a test with a host that does not read does
+    /// not wait for five seconds.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn with_lane_close_bound(mut self, bound: std::time::Duration) -> Self {
+        self.lane_close_bound = bound;
         self
     }
 
@@ -1626,6 +1678,103 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.fence_stall.arm()
+    }
+
+    /// Stops the next input lane's bind between the two locks it takes, for this host's own
+    /// tests.
+    ///
+    /// Returns the end that says the bind has arrived, and the end that lets it go. The stop fires
+    /// once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_lane_bind(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.bind_stall.arm()
+    }
+
+    /// Stops the next record of a revision that a held dispatch boundary refused between the two
+    /// locks it takes, for this host's own tests.
+    ///
+    /// Returns the end that says the record has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_owed_fence(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.owe_fence_stall.arm()
+    }
+
+    /// Stops the next input lane `input.write` after the hold that accepted it has ended, for
+    /// this host's own tests.
+    ///
+    /// Returns the end that says the frame has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_lane_acceptance(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.acceptance_stall.arm()
+    }
+
+    /// Returns how many times a thread has found the authority lock held and waited for it, for
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn authority_waits(&self) -> usize {
+        self.authority_waits
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns how many tasks are writing an input lane's queue to its link, for this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn lane_writers(&self) -> usize {
+        self.lane_writers.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns how many connections this worker is serving: a connection's loop and its clean-up
+    /// have not ended, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn served_connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Returns how many connections this worker has admitted and not withdrawn, for this host's
+    /// own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn admitted_connections(&self) -> usize {
+        self.admitted
+            .lock()
+            .expect("the connection registry is not poisoned")
+            .len()
+    }
+
+    /// Takes the authority lock. Where this host's own tests are built in, it counts each time it
+    /// found the lock held, which is how a test knows that a thread is about to wait for it.
+    fn lock_authority(&self) -> std::sync::MutexGuard<'_, Authority> {
+        #[cfg(feature = "testing")]
+        if let Err(std::sync::TryLockError::WouldBlock) = self.authority.try_lock() {
+            self.authority_waits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.authority
+            .lock()
+            .expect("the authority lock is not poisoned")
     }
 
     /// Sets how long an admitted operation has to reach its upstream before the worker records an
@@ -2817,8 +2966,9 @@ impl WorkerService {
                 });
             }
             // A lane that has just been bound is written by a task of its own, which drains the
-            // lane's ordered queue: nothing else writes a frame on a lane but this loop's
-            // keepalive.
+            // lane's ordered queue: nothing else writes a frame on a lane. A lane owes no
+            // keepalive, because a controller's hello cannot carry the origin that makes a
+            // connection owe one.
             if let Some(queue) = state.pending_lane.take() {
                 tokio::spawn(Arc::clone(&self).write_lane(
                     queue,
@@ -3375,14 +3525,17 @@ impl WorkerService {
                     if forwarded.request.method.method() == Some(Method::InputWrite)
             )
         {
-            return Some(failure(
-                request_id_of(&message),
-                &ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "an input lane carries the forwarded input.write of its attachment and \
-                     nothing else",
+            return self.on_the_lane(
+                state,
+                failure(
+                    request_id_of(&message),
+                    &ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "an input lane carries the forwarded input.write of its attachment and \
+                         nothing else",
+                    ),
                 ),
-            ));
+            );
         }
         // The attention connection carries the attention requests and nothing else once it speaks
         // for a generation. It holds no authority to act and forwards no caller, so anything else
@@ -3523,11 +3676,7 @@ impl WorkerService {
                 self.bind_input_lane(state, &lane);
                 None
             }
-            ControlFrame::ForwardedRead(forwarded) => {
-                let reply = self.forwarded_read(state, &forwarded);
-                // Every answer on a lane goes through the lane's ordered queue.
-                state.facts.lane.is_none().then_some(reply)
-            }
+            ControlFrame::ForwardedRead(forwarded) => self.forwarded_read(state, &forwarded),
             ControlFrame::AttentionSources(request) => self.attention_sources(state, request),
             ControlFrame::DescriptionFacts(request) => {
                 self.description_facts_request(state, request)
@@ -5316,10 +5465,7 @@ impl WorkerService {
         if facts.client_kind != LocalClientKind::Controller {
             return Ok(());
         }
-        let authority = self
-            .authority
-            .lock()
-            .expect("the authority lock is not poisoned");
+        let authority = self.lock_authority();
         Self::check_bound(facts, &authority)
     }
 
@@ -5344,11 +5490,13 @@ impl WorkerService {
         state: &ConnectionState,
         notice: &kr_protocol::worker::AuthorityRevisionNotice,
     ) -> Result<()> {
-        let mut authority = self
-            .authority
-            .lock()
-            .expect("the authority lock is not poisoned");
+        // The authority lock is taken first and the input domain second, as at every other place
+        // that holds both: this path waits for the domain while it holds the authority lock, so
+        // nothing that holds the domain may wait for the authority lock.
+        let mut authority = self.lock_authority();
         Self::check_bound(&state.facts, &authority)?;
+        #[cfg(feature = "testing")]
+        self.owe_fence_stall.stand();
         // An announcement of a revision this worker has already fenced owes nothing, and recording
         // it would join its reach, which is the whole host's for a repeat or a continuation page,
         // with the reach of the next revision it is refused for.
@@ -6544,21 +6692,32 @@ impl WorkerService {
     /// is checked against the ingress the daemon vouched for. Without that, a read that asks about
     /// an action would ask about the daemon's own actions, and a method the registry keeps to
     /// private IPC would be reachable from the network through the proxy.
+    ///
+    /// The answer of a lane connection is not returned: it is queued on the lane, or the link is
+    /// closed when there is no lane yet, and nothing is written on its own.
     fn forwarded_read(
         &self,
         state: &mut ConnectionState,
         forwarded: &kr_protocol::local::ForwardedRequest,
-    ) -> ControlFrame {
+    ) -> Option<ControlFrame> {
         let caller = match Self::forwarded_caller(&state.facts, forwarded) {
             Ok(caller) => caller,
-            Err(refusal) => return failure(forwarded.request.request_id, &refusal),
+            Err(refusal) => {
+                return self.on_the_lane(state, failure(forwarded.request.request_id, &refusal));
+            }
         };
         if forwarded.request.method.method() == Some(Method::InputWrite) {
             let served = self.keystroke(&state.facts, &forwarded.request, &caller);
             state.answering_held = served.held;
-            return served.reply;
+            // The answer of a bound lane's frame was queued by the keystroke.
+            return if state.facts.lane.is_some() {
+                None
+            } else {
+                self.on_the_lane(state, served.reply)
+            };
         }
-        self.request(state, &forwarded.request, &caller)
+        let reply = self.request(state, &forwarded.request, &caller);
+        self.on_the_lane(state, reply)
     }
 
     /// The caller a read the control daemon admitted is served as, or why it is refused: it does
@@ -9820,7 +9979,9 @@ impl WorkerService {
                     utc_ms: caller.authority_utc_deadline_ms,
                 },
                 arrived,
-                facts.lane,
+                facts
+                    .lane
+                    .map(|lane| crate::input_lane::LaneFrame { lane, request_id }),
             )?;
             acquisition.deadline(input.paste_deadline());
             // Handed to the writer while the domain is still held, so two writers cannot
@@ -9845,6 +10006,8 @@ impl WorkerService {
             }
             (result, opened_the_gate || owes || input.replies_waiting())
         };
+        #[cfg(feature = "testing")]
+        self.acceptance_stall.stand();
         if pump {
             self.runtime.input().wake_pump();
         }

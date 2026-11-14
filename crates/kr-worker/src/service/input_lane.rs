@@ -14,32 +14,41 @@
 use std::sync::Arc;
 
 use kr_protocol::envelope::ControlFrame;
-use kr_protocol::local::InputLane;
+use kr_protocol::local::{ControllerConnectionRole, InputLane, LocalClientKind};
 
-use super::{ConnectionState, WorkerService, Writing, write_frame};
+use super::{Authority, ConnectionState, WorkerService, Writing, write_frame};
 use crate::error::{Result, WorkerError};
 use crate::input_lane::LaneQueue;
 
 impl WorkerService {
     /// Binds the lane a connection asked for, or closes the link.
     ///
-    /// The parent mark, the parent's latch and its list of attachments are all read in the one
-    /// hold of the input domain that registers the lane, so a bind cannot slip between the first
-    /// step of the parent's withdrawal and its last.
+    /// The lock order is the worker's one order, the authority lock before the input domain: this
+    /// takes the authority lock first and keeps it through the hold of the domain that registers
+    /// the lane, so that every check of the bind is made inside one hold of both. The generation,
+    /// the set of proxies and the connection's own binding are read under the authority lock, and
+    /// the parent mark, the parent's latch, its list of attachments and the registry of lanes in
+    /// the domain's hold, so a bind cannot slip between the first step of the parent's withdrawal
+    /// and its last, and a generation cannot be replaced between a check and the registration.
     pub(super) fn bind_input_lane(&self, state: &mut ConnectionState, lane: &InputLane) {
+        let authority = self.lock_authority();
         let refused = state.facts.lane.is_some()
             || !state.facts.negotiated
-            || self.check_authority(&state.facts).is_err();
+            || (state.facts.client_kind == LocalClientKind::Controller
+                && Self::check_bound(&state.facts, &authority).is_err());
         let bound = if refused {
             None
         } else {
+            #[cfg(feature = "testing")]
+            self.bind_stall.stand();
             let mut input = self.runtime.input().lock();
             input
                 .bind_lane(lane.attachment_id, lane.proxy_connection, || {
-                    self.parent_owns(state, lane)
+                    self.parent_owns(&authority, state, lane)
                 })
                 .ok()
         };
+        drop(authority);
         let Some(bound) = bound else {
             // The host reads the close as the refusal.
             self.withdraw(state.facts.connection_id);
@@ -50,15 +59,18 @@ impl WorkerService {
     }
 
     /// Says whether the connection the lane names is a live proxy of this connection's generation
-    /// that owns the attachment. Read inside the domain's hold, which only ever reads it.
-    fn parent_owns(&self, state: &ConnectionState, lane: &InputLane) -> Result<()> {
+    /// that owns the attachment. Read inside the domain's hold, which only ever reads it, with the
+    /// authority lock held by the caller: the registry and the attachment list come after both in
+    /// the order of locks.
+    fn parent_owns(
+        &self,
+        authority: &Authority,
+        state: &ConnectionState,
+        lane: &InputLane,
+    ) -> Result<()> {
         let refused = |detail: &str| WorkerError::PermissionDenied {
             detail: detail.to_owned(),
         };
-        let authority = self
-            .authority
-            .lock()
-            .expect("the authority lock is not poisoned");
         if authority.accepted_generation != state.facts.generation
             || !authority.proxy_connections.contains(&lane.proxy_connection)
         {
@@ -66,7 +78,6 @@ impl WorkerService {
                 "an input lane binds only under a live proxy connection of its generation",
             ));
         }
-        drop(authority);
         let admitted = self
             .admitted
             .lock()
@@ -90,8 +101,38 @@ impl WorkerService {
         Ok(())
     }
 
+    /// Says where a frame owed to a lane connection goes, which is one rule for every frame the
+    /// worker writes on a lane: once the lane's ready frame is queued, a frame reaches the link
+    /// only through the lane's ordered queue, and before that nothing is written at all, so the
+    /// host reads the close as the refusal. A frame owed to any other connection is handed back to
+    /// be written as it always was.
+    pub(super) fn on_the_lane(
+        &self,
+        state: &ConnectionState,
+        frame: ControlFrame,
+    ) -> Option<ControlFrame> {
+        if state.facts.controller_role != ControllerConnectionRole::ProxyInput
+            || !state.facts.controller
+        {
+            return Some(frame);
+        }
+        match state.facts.lane {
+            Some(lane) => self.runtime.input().lock().lane_answer(lane, frame),
+            None => self.withdraw(state.facts.connection_id),
+        }
+        None
+    }
+
     /// Writes the lane's queue to its link until the queue is closed and empty or the link fails,
     /// and then closes the link.
+    ///
+    /// A queue that closes ends the link within `lane_close_bound` of the close, whatever the
+    /// host reads: the write that is waiting for a host that has stopped reading is cut and the
+    /// connection withdrawn, which ends the lane's task, its registration and its window. The
+    /// bound is five seconds, the one a closing session's acceptance is given, and it starts at
+    /// the close, never earlier: a queue that is open is never cut. A host that reads takes the
+    /// whole of a closed queue, at most 4,097 frames of a few hundred bytes, from a local socket in
+    /// far less, so the bound cuts only a link nobody is reading.
     pub(super) async fn write_lane(
         self: Arc<Self>,
         queue: Arc<LaneQueue>,
@@ -100,13 +141,26 @@ impl WorkerService {
         withdrawn: Arc<super::Withdrawal>,
         connection_id: kr_protocol::ids::ConnectionId,
     ) {
+        #[cfg(feature = "testing")]
+        let _counted = Counted::begin(&self.lane_writers);
+        let bound = self.lane_close_bound;
+        let cut = async {
+            queue.closed().await;
+            tokio::time::sleep(bound).await;
+        };
+        tokio::pin!(cut);
         'lane: loop {
-            // What is queued is taken before the closed flag is read, so a queue that closed
-            // after the last take has nothing in it that this does not write.
+            // The closed flag is read before the queue is taken. Nothing is queued after a close,
+            // so when the flag reads true the take holds everything that was ever queued, and the
+            // lane ends after writing it.
             let closed = queue.is_closed();
             let frames: Vec<ControlFrame> = queue.drain();
             for frame in &frames {
-                if !write_frame(&writable, &writer, frame, &withdrawn, true).await {
+                let written = tokio::select! {
+                    written = write_frame(&writable, &writer, frame, &withdrawn, true) => written,
+                    () = &mut cut => false,
+                };
+                if !written {
                     break 'lane;
                 }
             }
@@ -118,5 +172,24 @@ impl WorkerService {
             }
         }
         self.withdraw(connection_id);
+    }
+}
+
+/// Counts a running lane writer for as long as it lives, for this host's own tests.
+#[cfg(feature = "testing")]
+struct Counted<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(feature = "testing")]
+impl<'a> Counted<'a> {
+    fn begin(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }

@@ -111,6 +111,39 @@ impl Lane {
         id
     }
 
+    /// Writes `count` frames that name an attachment the lane does not carry, each of which the
+    /// worker refuses and answers on the lane, and reads nothing. Stops at the first frame the link
+    /// does not take, and returns how many it wrote.
+    async fn flood(&mut self, count: usize) -> usize {
+        for sent in 0..count {
+            self.requests += 1;
+            let params = InputWriteParams {
+                session_id: self.session_id,
+                attachment_id: AttachmentId::new(kr_ipc::new_uuid()),
+                epoch: self.epoch,
+                sequence: InputSequence::new(0),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(b"x".to_vec()),
+                },
+            };
+            let frame = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+                request: Request {
+                    request_id: RequestId::new(1_000 + self.requests),
+                    method: Method::InputWrite.into(),
+                    method_version: MethodVersion::V1,
+                    params: ParamsValue::from_typed(&params).expect("encodes"),
+                },
+                actor: self.actor.clone(),
+                authority_deadline_boot_ms: Nullable::null(),
+                history: None,
+            }));
+            if self.link.send(&frame).await.is_err() {
+                return sent;
+            }
+        }
+        count
+    }
+
     /// Reads the next thing the worker wrote on the lane, or none when the link has ended.
     async fn next(&mut self) -> Option<Seen> {
         let received = tokio::time::timeout(WAIT, self.link.recv())
@@ -183,6 +216,21 @@ impl Lane {
     }
 }
 
+/// Waits until `condition` holds, which the case says by `what` when it does not within `bound`.
+/// The bound decides nothing but how long a case that is wrong takes to say so.
+async fn until(what: &str, bound: Duration, mut condition: impl FnMut() -> bool) {
+    if tokio::time::timeout(bound, async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        panic!("{what}: not so after {bound:?}");
+    }
+}
+
 /// The error code an answer refused with.
 fn refusal(outcome: &Outcome) -> Option<ErrorCode> {
     match outcome {
@@ -212,6 +260,12 @@ struct Rig {
 
 impl Rig {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// A rig whose worker ends the link of a closed lane queue after `close_bound`, where one is
+    /// given, rather than after the five seconds of the shipped worker.
+    async fn start_with(close_bound: Option<Duration>) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -268,22 +322,24 @@ impl Rig {
             .worker_endpoint(DisplayNumber::new(1))
             .expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-        let service = Arc::new(
-            WorkerService::new(
-                Arc::clone(&runtime),
-                identity,
-                endpoint.clone(),
-                ServiceBinding {
-                    environment_id,
-                    boot_identity: boot.clone(),
-                    controller_public_key: *controller.public_key(),
-                    controller_generation: ControllerGeneration::new(1),
-                    build_id: build(),
-                    journal_path: None,
-                },
-            )
-            .expect("a worker service"),
-        );
+        let service = WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot.clone(),
+                controller_public_key: *controller.public_key(),
+                controller_generation: ControllerGeneration::new(1),
+                build_id: build(),
+                journal_path: None,
+            },
+        )
+        .expect("a worker service");
+        let service = Arc::new(match close_bound {
+            Some(bound) => service.with_lane_close_bound(bound),
+            None => service,
+        });
         tokio::spawn(Arc::clone(&service).serve(listener));
         common::produced(&runtime, b"kr-ready.").await;
         let mut rig = Self {
@@ -620,15 +676,25 @@ async fn a_frame_beyond_the_credit_closes_the_lane_and_is_never_written() {
         lane.accepted().await;
     }
     // The window is spent and nothing has been given back: one frame more is beyond the credit.
-    lane.send(b"!").await;
-    while let Some(seen) = lane.next().await {
-        if let Seen::Answer(_, outcome) = &seen {
+    let beyond = lane.send(b"!").await;
+    // The host is told why its link ends: the refusal of the frame, with its reason, comes first
+    // and the close behind it.
+    match lane.next_event().await {
+        Some(Seen::Answer(answered, Outcome::Error(error))) => {
+            assert_eq!(answered, beyond);
+            assert_eq!(error.code, ErrorCode::ResourceUnavailable);
             assert!(
-                refusal(outcome).is_some(),
-                "the frame beyond the credit was accepted"
+                error.message.contains("lane credit breach"),
+                "the refusal says why: {}",
+                error.message
             );
         }
+        other => panic!("the link ended without the refusal of the breach: {other:?}"),
     }
+    assert!(
+        lane.next_event().await.is_none(),
+        "the link closes behind the refusal"
+    );
     release.send(()).expect("lets the writer go");
     rig.drained().await;
     rig.received_exactly(&typed).await;
@@ -933,7 +999,9 @@ async fn arrived(at: std::sync::mpsc::Receiver<()>) {
 }
 
 /// A frame of a lane that has passed everything the connection checks and has not yet taken the
-/// input domain, while the lane's parent withdraws by `how`. It is refused and never written.
+/// input domain, while the lane's parent withdraws by `how`. The withdrawal's first step has run
+/// and its detach waits for the session, which a thread of the case holds: the frame is let go
+/// between the two, so that only that first step can refuse it. It is refused and never written.
 async fn a_frame_at_the_seam_when_the_parent_goes(how: Withdrawal) {
     let mut rig = Rig::start().await;
     let attachment = rig.attach().await;
@@ -944,26 +1012,58 @@ async fn a_frame_at_the_seam_when_the_parent_goes(how: Withdrawal) {
     lane.send(b"seam-frame").await;
     arrived(at).await;
 
+    // A thread of the case holds the session, as a commit does, until the case lets it go.
+    let (held, holding) = std::sync::mpsc::channel::<()>();
+    let (let_go, letting_go) = std::sync::mpsc::channel::<()>();
+    let commit = {
+        let runtime = Arc::clone(&rig.runtime);
+        std::thread::spawn(move || {
+            let _commit = runtime.session();
+            held.send(()).expect("says it holds the session");
+            let _ = letting_go.recv();
+        })
+    };
+    tokio::task::spawn_blocking(move || holding.recv_timeout(WAIT))
+        .await
+        .expect("the wait ran")
+        .expect("the session was taken");
+    assert_ne!(
+        rig.runtime.input().lock().ledger().reserved,
+        Cost::default(),
+        "the lane has its window before the parent goes"
+    );
+
+    // The first step of the parent's withdrawal takes the input domain alone, which nothing holds,
+    // and ends the window; everything after it waits for the session.
+    if matches!(how, Withdrawal::ItsLinkEnds) {
+        rig.proxy = None;
+    }
+    let steps = async {
+        until(
+            "the first step of the withdrawal ended the lane's window",
+            WAIT,
+            || rig.runtime.input().lock().ledger().reserved == Cost::default(),
+        )
+        .await;
+        release.send(()).expect("lets the frame go");
+        while let Some(seen) = lane.next().await {
+            if let Seen::Answer(_, outcome) = seen {
+                assert!(refusal(&outcome).is_some(), "the held frame was accepted");
+            }
+        }
+        // A frame that was wrongly accepted is queued in the hold that accepts it, and the writer
+        // has it in far less than this.
+        tokio::time::sleep(SETTLE).await;
+        let_go.send(()).expect("lets the session go");
+    };
     match how {
-        Withdrawal::ItsLinkEnds => {
-            // The connection's own clean-up path.
-            rig.proxy = None;
-        }
+        Withdrawal::ItsLinkEnds => steps.await,
         Withdrawal::AReplacementGeneration => {
-            // The generation fence withdraws every connection of the generation it replaces.
-            let _second = rig.connect(2, None).await;
+            // The generation's handshake waits for the withdrawals it makes.
+            let ((), _second) = tokio::join!(steps, rig.connect(2, None));
         }
     }
-    // The first step of a withdrawal stops the lane from accepting. The rest of it waits for the
-    // frame that is held, so there is nothing to wait for here but that first step.
-    tokio::time::sleep(SETTLE).await;
-    release.send(()).expect("lets the frame go");
-    while let Some(seen) = lane.next().await {
-        if let Seen::Answer(_, outcome) = seen {
-            assert!(refusal(&outcome).is_some(), "the held frame was accepted");
-        }
-    }
-    tokio::time::sleep(SETTLE).await;
+    commit.join().expect("the thread ended");
     rig.drained().await;
     assert!(
         !String::from_utf8_lossy(&rig.received()).contains("seam-frame"),
@@ -1251,6 +1351,330 @@ async fn a_holder_the_revision_does_not_reach_keeps_typing_on_its_lane_and_nothi
             Seen::Credit(_) => {}
             Seen::Window(window) => panic!("the epoch ended: {window:?}"),
         }
+    }
+    rig.finish().await;
+}
+
+/// Runs a case that can deadlock the worker on a runtime and a thread of its own, and waits for it
+/// by `bound`. A worker whose threads wait for each other then fails the case with its say, and
+/// the test process is not held by threads that never return.
+fn within<Fut: std::future::Future<Output = ()>>(
+    bound: Duration,
+    what: &str,
+    case: impl FnOnce() -> Fut + Send + 'static,
+) {
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(case());
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(bound) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what}: the worker did not finish within {bound:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: the case failed"),
+    }
+}
+
+/// A lane's bind and a deferred revision announcement each hold one of the two locks the other
+/// takes, and let go of it only by taking the second. The bind stands between its two locks and the
+/// announcement between its own; with one order everywhere they pass each other, and with two they
+/// wait for each other for good.
+#[test]
+fn a_lane_bind_and_a_deferred_revision_announcement_do_not_wait_for_each_other() {
+    within(
+        Duration::from_secs(20),
+        "a lane bind and a deferred revision announcement waited for each other",
+        || async {
+            let mut rig = Rig::start().await;
+            let attachment = rig.attach().await;
+            rig.acquire(attachment).await;
+            // The daemon's authority link, open before anything stands: its own handshake takes
+            // the authority lock.
+            let mut daemon = rig.connect(1, None).await;
+            let notice = AuthorityRevisionNotice {
+                environment_id: rig.environment_id,
+                revision: AuthorityRevision::new(2),
+                reach: reach(&rig, Reach::Others),
+                evidence_from: 0,
+            };
+            let (bind_at, bind_go) = rig.service.stall_next_lane_bind();
+            let (fence_at, fence_go) = rig.service.stall_next_owed_fence();
+            // The next announcement finds the dispatch boundary held, which is the path that
+            // records the revision as owed.
+            rig.service.hold_the_boundary_for_one_announcement_after(0);
+            let waits = rig.service.authority_waits();
+
+            // The bind first: it reaches its stop holding the first lock it takes.
+            let mut lane_link = rig
+                .ask_for_a_lane(1, rig.proxy_connection, attachment)
+                .await;
+            bind_at.await.expect("the bind reached its stop");
+            let announcing = tokio::spawn(async move { daemon.announce_revision(notice).await });
+            // The announcement either holds its first lock at its own stop or waits for the lock
+            // the bind holds: the authority lock is counted as found held when it waits.
+            let mut fence_at = fence_at;
+            until(
+                "the announcement is at its stop or waits for the bind",
+                WAIT,
+                || fence_at.try_recv().is_ok() || rig.service.authority_waits() > waits,
+            )
+            .await;
+            bind_go.send(()).expect("lets the bind go");
+            fence_go.send(()).expect("lets the announcement go");
+
+            match lane_link.recv().await {
+                Ok(ControlFrame::InputLaneReady(_)) => {}
+                other => panic!("the lane was not bound: {other:?}"),
+            }
+            let answered = announcing.await.expect("the announcement task ended");
+            assert!(
+                answered.is_err(),
+                "the held boundary refused the announcement"
+            );
+            rig.finish().await;
+        },
+    );
+}
+
+/// A forwarded `input.write` that the worker refuses before it reads the frame, because a paired
+/// device's envelope names no device, is answered on the lane: the host gets the refusal and the
+/// lane goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_refused_before_it_is_read_is_answered_on_the_lane() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let device = std::mem::replace(&mut lane.actor.device_id, Nullable::null());
+    let refused = lane.send(b"k").await;
+    match tokio::time::timeout(Duration::from_secs(10), lane.next_event()).await {
+        Ok(Some(Seen::Answer(answered, outcome))) => {
+            assert_eq!(answered, refused);
+            assert_eq!(refusal(&outcome), Some(ErrorCode::PermissionDenied));
+        }
+        other => panic!("the refused frame was not answered on the lane: {other:?}"),
+    }
+    // The refusal took no sequence number, and the lane is still bound.
+    lane.actor.device_id = device;
+    lane.sequence -= 1;
+    lane.send(b"a").await;
+    lane.accepted().await;
+    rig.received_exactly(b"a").await;
+    rig.finish().await;
+}
+
+/// A request that carries nothing for a lane.
+fn a_request() -> ControlFrame {
+    ControlFrame::Request(Request {
+        request_id: RequestId::new(7),
+        method: Method::SessionRead.into(),
+        method_version: MethodVersion::V1,
+        params: ParamsValue::empty(),
+    })
+}
+
+/// Before its ready frame, a lane connection is written nothing: a frame it sends ahead of its bind
+/// ends the link, whatever the frame is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lane_connection_that_sends_before_its_bind_is_written_nothing_and_is_closed() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    rig.acquire(attachment).await;
+    let lane = rig.lane(attachment).await;
+    let write = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+        request: Request {
+            request_id: RequestId::new(8),
+            method: Method::InputWrite.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&InputWriteParams {
+                session_id: rig.session_id,
+                attachment_id: attachment,
+                epoch: lane.epoch,
+                sequence: InputSequence::new(0),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(b"k".to_vec()),
+                },
+            })
+            .expect("encodes"),
+        },
+        actor: rig.actor(1),
+        authority_deadline_boot_ms: Nullable::null(),
+        history: None,
+    }));
+    for early in [a_request(), write] {
+        let mut link = rig
+            .connect(1, Some(ControllerConnectionRole::ProxyInput))
+            .await;
+        link.send(&early).await.expect("the frame is written");
+        let read = tokio::time::timeout(WAIT, link.recv())
+            .await
+            .expect("the worker acts");
+        assert!(
+            read.is_err(),
+            "a lane connection that had not bound was written a frame: {read:?}"
+        );
+    }
+    rig.finish().await;
+}
+
+/// A frame that a bound lane refuses by its role, sent straight behind the bind, is written behind
+/// the ready frame, as everything else on the lane is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_the_lane_refuses_by_its_role_comes_behind_the_ready_frame() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    rig.acquire(attachment).await;
+    let mut link = rig
+        .connect(1, Some(ControllerConnectionRole::ProxyInput))
+        .await;
+    link.send(&ControlFrame::InputLane(InputLane {
+        proxy_connection: rig.proxy_connection,
+        attachment_id: attachment,
+    }))
+    .await
+    .expect("asks for the lane");
+    link.send(&a_request()).await.expect("the frame is written");
+    match tokio::time::timeout(WAIT, link.recv())
+        .await
+        .expect("the worker answers")
+    {
+        Ok(ControlFrame::InputLaneReady(_)) => {}
+        other => panic!("the ready frame did not come first: {other:?}"),
+    }
+    match tokio::time::timeout(WAIT, link.recv())
+        .await
+        .expect("the worker answers")
+    {
+        Ok(ControlFrame::Response(response)) => {
+            assert_eq!(response.request_id, RequestId::new(7));
+            assert_eq!(
+                refusal(&response.outcome),
+                Some(ErrorCode::PermissionDenied)
+            );
+        }
+        other => panic!("the refusal did not follow the ready frame: {other:?}"),
+    }
+    rig.finish().await;
+}
+
+/// How long a case that expects a closed lane to be gone waits for it, which is longer than the
+/// bound the worker is given and decides nothing.
+const GONE: Duration = Duration::from_secs(20);
+
+/// KR-REQ-23.36: a host that stops reading ends its own lane. The answers it never reads pile up
+/// until the queue passes its bound and closes; the lane's task, its registration and its window
+/// then go within the worker's bound, though a write to the host is waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_stops_reading_loses_its_lane_when_the_queue_overflows() {
+    let mut rig = Rig::start_with(Some(Duration::from_millis(300))).await;
+    let attachment = rig.attach().await;
+    rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    assert_eq!(rig.service.lane_writers(), 1);
+    assert_ne!(
+        rig.runtime.input().lock().ledger().reserved,
+        Cost::default()
+    );
+    let served = rig.service.served_connections();
+    let admitted = rig.service.admitted_connections();
+
+    // Far more answers than a socket and the queue's bound hold, and the host reads none.
+    lane.flood(12_000).await;
+
+    until("the lane's task is gone", GONE, || {
+        rig.service.lane_writers() == 0
+    })
+    .await;
+    until(
+        "the lane's connection and registration are gone",
+        GONE,
+        || {
+            rig.service.served_connections() == served - 1
+                && rig.service.admitted_connections() == admitted - 1
+        },
+    )
+    .await;
+    assert_eq!(rig.runtime.input().lock().lane_count(), 0);
+    assert_eq!(
+        rig.runtime.input().lock().ledger().reserved,
+        Cost::default(),
+        "the window was returned"
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: five lanes of one attachment in a row, each replaced while its host reads
+/// nothing and the worker waits to write to it, leave no task and no registration behind but the
+/// live lane's, which has the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn five_replacements_in_a_row_leave_no_lane_behind_but_the_last() {
+    let mut rig = Rig::start_with(Some(Duration::from_millis(300))).await;
+    let attachment = rig.attach().await;
+    rig.acquire(attachment).await;
+    let served = rig.service.served_connections();
+    let admitted = rig.service.admitted_connections();
+
+    // Each lane has more answers waiting for its host than a socket holds, below the queue's bound.
+    let mut hosts = Vec::new();
+    for _ in 0..5 {
+        let mut lane = rig.lane(attachment).await;
+        lane.flood(3_000).await;
+        hosts.push(lane);
+    }
+    until("one lane's task is left", GONE, || {
+        rig.service.lane_writers() == 1
+    })
+    .await;
+    until(
+        "one lane's connection and registration are left",
+        GONE,
+        || {
+            rig.service.served_connections() == served + 1
+                && rig.service.admitted_connections() == admitted + 1
+        },
+    )
+    .await;
+    assert_eq!(rig.runtime.input().lock().lane_count(), 1);
+    let mut last = hosts.pop().expect("the last lane");
+    // Its window is whole, and it types.
+    last.sequence = 0;
+    last.send(b"k").await;
+    assert_eq!(
+        last.next_event()
+            .await
+            .map(|seen| matches!(seen, Seen::Answer(..))),
+        Some(true)
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: the answer to a lane's frame is queued in the hold that accepted it, before the
+/// frame has left the connection's hands. A frame that stands there while another view takes the
+/// keys is answered before the notice that its epoch ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acceptance_stopped_after_its_hold_is_still_answered_before_the_ended_notice() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let other = rig.attach().await;
+    rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let (at, release) = rig.service.stall_next_lane_acceptance();
+    let sent = lane.send(b"k").await;
+    at.await.expect("the frame reached its stop");
+    // Another view takes the keys while the frame stands: the notice that the epoch ended is queued.
+    rig.acquire(other).await;
+    release.send(()).expect("lets the frame go");
+    assert_eq!(lane.accepted().await, sent, "the answer is first");
+    match lane.next_event().await {
+        Some(Seen::Window(window)) => assert!(!window.holder && window.ended.is_present()),
+        other => panic!("the ended notice did not follow the answer: {other:?}"),
     }
     rig.finish().await;
 }
