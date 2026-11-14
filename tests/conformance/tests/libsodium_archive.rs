@@ -1,6 +1,7 @@
 //! The libsodium archive a Windows build links: the placing script holds the size and the SHA-256
 //! of the archive and of its signature and refuses any other bytes, whether they were fetched or
-//! were already in the directory, and no job restores a cargo cache before it has placed them.
+//! were already in the directory, and no job restores a cargo cache before it has placed them. A job
+//! whose later steps run after a failure runs the placing action after one too.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -209,13 +210,11 @@ fn is_job_key(line: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// A job that restores a cargo cache places the archive first: the cache's key reads the name of
-/// the directory the archive is placed in, which holds its digests, and the restore comes after
-/// that name is set.
-#[test]
-fn a_job_places_the_libsodium_archive_before_it_restores_a_cargo_cache() {
+/// Every job of every workflow, as the text from its key to the next one, with the path of the
+/// workflow it is in.
+fn jobs() -> Vec<(PathBuf, String)> {
     let workflows = repository().join(".github").join("workflows");
-    let mut checked = 0;
+    let mut all = Vec::new();
     for entry in fs::read_dir(&workflows).expect("the workflows are listed") {
         let path = entry.expect("an entry").path();
         if path.extension().is_none_or(|extension| extension != "yml") {
@@ -236,22 +235,115 @@ fn a_job_places_the_libsodium_archive_before_it_restores_a_cargo_cache() {
                 job.push('\n');
             }
         }
-        for job in jobs {
-            let place = job.find("uses: ./.github/actions/libsodium-archive");
-            let restore = job.find("uses: ./.github/actions/cargo-cache-restore");
-            if let (Some(place), Some(restore)) = (place, restore) {
-                checked += 1;
-                assert!(
-                    place < restore,
-                    "{} restores a cargo cache before it places the libsodium archive",
-                    path.display()
-                );
-            }
+        all.extend(jobs.into_iter().map(|job| (path.clone(), job)));
+    }
+    all
+}
+
+/// A job that restores a cargo cache places the archive first: the cache's key reads the name of
+/// the directory the archive is placed in, which holds its digests, and the restore comes after
+/// that name is set.
+#[test]
+fn a_job_places_the_libsodium_archive_before_it_restores_a_cargo_cache() {
+    let mut checked = 0;
+    for (path, job) in jobs() {
+        let place = job.find("uses: ./.github/actions/libsodium-archive");
+        let restore = job.find("uses: ./.github/actions/cargo-cache-restore");
+        if let (Some(place), Some(restore)) = (place, restore) {
+            checked += 1;
+            assert!(
+                place < restore,
+                "{} restores a cargo cache before it places the libsodium archive",
+                path.display()
+            );
         }
     }
     assert!(
         checked > 0,
         "no job places the archive and restores a cache: the check read nothing"
+    );
+}
+
+/// The steps of a job, each as its own text: a step starts at a dash of six spaces' indent under
+/// the job's `steps:`.
+fn steps(job: &str) -> Vec<String> {
+    let mut steps: Vec<String> = Vec::new();
+    let mut in_steps = false;
+    for line in job.lines() {
+        if line == "    steps:" {
+            in_steps = true;
+        } else if in_steps && line.starts_with("      - ") {
+            steps.push(String::new());
+        }
+        if in_steps && let Some(step) = steps.last_mut() {
+            step.push_str(line);
+            step.push('\n');
+        }
+    }
+    steps
+}
+
+/// A step's own key, of the step's indent and not of a block under another key: the first line
+/// carries the dash, and the others sit at eight spaces.
+fn step_key<'a>(step: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}:");
+    step.lines().find_map(|line| {
+        line.strip_prefix("      - ")
+            .or_else(|| {
+                line.strip_prefix("        ")
+                    .filter(|rest| !rest.starts_with(' '))
+            })
+            .and_then(|rest| rest.strip_prefix(prefix.as_str()))
+            .map(str::trim)
+    })
+}
+
+/// A later step of a job runs after an earlier failure only when its condition names a status
+/// function that lets it: any other condition has `success()` put in front of it.
+fn runs_after_a_failure(step: &str) -> bool {
+    step_key(step, "if").is_some_and(|condition| {
+        ["!cancelled()", "always()", "failure()"]
+            .iter()
+            .any(|function| condition.contains(function))
+    })
+}
+
+/// A step that fails before the placing action skips the whole composite action, which takes its
+/// step that closes the route to the download host with it. A job whose later steps run after a
+/// failure (they name `!cancelled()` or `always()`) would then run cargo with the route open and
+/// `SODIUM_DIST_DIR` unset, and the crate's build script would fetch the archive that no digest
+/// holds. So where a later step can run after a failure the use of the action runs after one too.
+/// A job whose later steps are all skipped after a failure needs nothing.
+#[test]
+fn the_placing_action_runs_in_a_job_whose_later_steps_run_after_a_failure() {
+    let (mut guarded, mut unguarded) = (0, Vec::new());
+    for (path, job) in jobs() {
+        let steps = steps(&job);
+        for (index, step) in steps.iter().enumerate() {
+            if step_key(step, "uses") != Some("./.github/actions/libsodium-archive") {
+                continue;
+            }
+            if !steps[index + 1..]
+                .iter()
+                .any(|later| runs_after_a_failure(later))
+            {
+                continue;
+            }
+            guarded += 1;
+            let condition = step_key(step, "if").unwrap_or_default();
+            if !(condition.contains("!cancelled()") || condition.contains("always()")) {
+                unguarded.push(format!("{} (condition {condition:?})", path.display()));
+            }
+        }
+    }
+    assert!(
+        guarded > 0,
+        "no job uses the action and has a later step that runs after a failure: the check read nothing"
+    );
+    assert!(
+        unguarded.is_empty(),
+        "a later step of the job runs after a failure, and the use of the libsodium archive action \
+         does not: {unguarded:#?}"
     );
 }
 

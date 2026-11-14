@@ -117,8 +117,10 @@ jobs:
           cargo --version
 
       # libsodium's prebuilt libraries come from the files this places, not from a download in the
-      # middle of the compile.
+      # middle of the compile. The step runs after an earlier failure too, so that the action
+      # closes the route to the host for the steps that run then.
       - name: Place libsodium's archives
+        if: ${{ !cancelled() }}
         uses: ./.github/actions/libsodium-archive
 
       # What the acceptance reaches the distributions with. The script looks for them in
