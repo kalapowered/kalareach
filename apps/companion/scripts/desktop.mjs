@@ -9,8 +9,16 @@
 // line tool sets it to `true` for a desktop build unless it is already `false`, the Tauri build step
 // reads it before the attribute this package gives it, and the package's build script then refuses
 // the build. So on Windows this gives the build `STATIC_VCRUNTIME=false`, whatever the caller's
-// environment holds, and says so when it replaces another value. On the other platforms the build
-// gets the caller's environment as it is.
+// environment holds, and says so when it replaces another value.
+//
+// On every platform the build is also given this application's own project (`TAURI_APP_PATH`), the
+// directory its interface is built in (`TAURI_FRONTEND_PATH`) and the production mode (`NODE_ENV`),
+// whatever the caller's environment holds, and none of the harness's variable (`KR_COMPANION_HARNESS`):
+// the command line tool builds the project that the first names, in the directory that the second names,
+// the interface's build emits a development bundle for another mode, and with the harness's variable
+// the interface is written to a directory that the bundle does not take it from, so that an earlier
+// build's interface would be bundled. Each value replaced is said in a line. The rest of the caller's
+// environment is the build's as it is.
 //
 // On Windows the build also starts only after libsodium's prebuilt archive is placed by
 // `scripts/place-libsodium-archive.sh`, which compares both files with the size and SHA-256 it holds
@@ -67,6 +75,16 @@ const RUNTIME_VARIABLE = 'STATIC_VCRUNTIME'
 const ARCHIVE_VARIABLE = 'SODIUM_DIST_DIR'
 const ARCHIVE_SCRIPT = 'scripts/place-libsodium-archive.sh'
 const REPOSITORY = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+const COMPANION = join(REPOSITORY, 'apps', 'companion')
+
+/** What the build is given on every platform, whatever the caller's environment holds, with why. */
+const OWN_VARIABLES = [
+  ['TAURI_APP_PATH', join(COMPANION, 'src-tauri'), 'the command line tool builds the project that it names, and this command builds this application'],
+  ['TAURI_FRONTEND_PATH', COMPANION, "the command line tool builds the interface in the directory that it names, and this application's is this one"],
+  ['NODE_ENV', 'production', 'the interface for the bundle is built for production, and another mode makes the build emit a development bundle']
+]
+/** The variable that makes the interface's build write to `dist-harness`, while the bundle takes it from `dist`. */
+const HARNESS_VARIABLE = 'KR_COMPANION_HARNESS'
 
 /** The long options of `tauri build`, each with whether it takes the one value that must follow it. */
 const LONG = new Map([
@@ -434,26 +452,49 @@ export function placeArchive(env, home = homedir(), platform = process.platform)
 }
 
 /**
- * The environment the build gets on a platform, and the line to say when it replaced a value: on
- * Windows `STATIC_VCRUNTIME=false` whatever the caller's environment held (Windows names variables
- * without regard to case, so every spelling of the name is replaced by the one) and the directory
- * that holds libsodium's archive, and on the other platforms the caller's environment as it is.
+ * The environment the build gets on a platform, and the lines to say when it replaced a value. On every
+ * platform: this application's own project, interface directory and mode, and none of the harness's
+ * variable, whatever the caller's environment held. On Windows also `STATIC_VCRUNTIME=false` and the
+ * directory that holds libsodium's archive. Windows names variables without regard to case, so every
+ * spelling of a name is replaced by the one; elsewhere a name is exact. The rest is the caller's.
  */
 export function childEnvironment(platform, env, archive = null) {
-  if (platform !== WINDOWS) return { env: { ...env }, said: null }
-  const given = (name) => Object.keys(env).filter((key) => key.toUpperCase() === name)
-  const named = given(RUNTIME_VARIABLE)
-  const replaced = named.map((key) => env[key]).find((value) => value !== 'false')
-  const dropped = [...named, ...given(ARCHIVE_VARIABLE)]
-  const kept = Object.fromEntries(Object.entries(env).filter(([key]) => !dropped.includes(key)))
-  return {
-    env: { ...kept, [RUNTIME_VARIABLE]: 'false', [ARCHIVE_VARIABLE]: archive },
-    said:
-      replaced === undefined
-        ? null
-        : `pnpm desktop: ${RUNTIME_VARIABLE} was \`${replaced}\` in the environment, and this build gets \`false\`, ` +
-          "since Tauri's static runtime is a hybrid, and the application links the static C runtime through the workspace's target feature."
+  const windows = platform === WINDOWS
+  const spelled = (name) => Object.keys(env).filter((key) => (windows ? key.toUpperCase() === name : key === name))
+  const lines = []
+  const dropped = []
+  const fixed = {}
+  for (const [name, value, why] of OWN_VARIABLES) {
+    const named = spelled(name)
+    dropped.push(...named)
+    const replaced = named.map((key) => env[key]).find((given) => given !== value)
+    if (replaced !== undefined) {
+      lines.push(`pnpm desktop: ${name} was \`${replaced}\` in the environment, and this build gets \`${value}\`, since ${why}.`)
+    }
+    fixed[name] = value
   }
+  const harness = spelled(HARNESS_VARIABLE)
+  dropped.push(...harness)
+  if (harness.some((key) => env[key] === '1')) {
+    lines.push(
+      `pnpm desktop: ${HARNESS_VARIABLE} was \`1\` in the environment, and this build is given none, since the bundle ` +
+        'takes its interface from `dist` and the harness build writes `dist-harness`.'
+    )
+  }
+  if (windows) {
+    const named = spelled(RUNTIME_VARIABLE)
+    const replaced = named.map((key) => env[key]).find((value) => value !== 'false')
+    if (replaced !== undefined) {
+      lines.push(
+        `pnpm desktop: ${RUNTIME_VARIABLE} was \`${replaced}\` in the environment, and this build gets \`false\`, ` +
+          "since Tauri's static runtime is a hybrid, and the application links the static C runtime through the workspace's target feature."
+      )
+    }
+    dropped.push(...named, ...spelled(ARCHIVE_VARIABLE))
+    Object.assign(fixed, { [RUNTIME_VARIABLE]: 'false', [ARCHIVE_VARIABLE]: archive })
+  }
+  const kept = Object.fromEntries(Object.entries(env).filter(([key]) => !dropped.includes(key)))
+  return { env: { ...kept, ...fixed }, said: lines.length === 0 ? null : lines.join('\n') }
 }
 
 /**

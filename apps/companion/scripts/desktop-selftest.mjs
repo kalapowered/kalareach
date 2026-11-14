@@ -17,6 +17,10 @@ import { fileURLToPath } from 'node:url'
 import { archiveDirectory, buildPlan, childArguments, childEnvironment, placeArchive, refusal } from './desktop.mjs'
 
 const REPOSITORY = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+// What the build is given for the project it builds, the directory its interface is built in and its mode.
+const COMPANION = join(REPOSITORY, 'apps', 'companion')
+const OWN = { TAURI_APP_PATH: join(COMPANION, 'src-tauri'), TAURI_FRONTEND_PATH: COMPANION, NODE_ENV: 'production' }
+const UNSET = { TAURI_APP_PATH: undefined, TAURI_FRONTEND_PATH: undefined, NODE_ENV: undefined }
 
 let failures = 0
 
@@ -523,7 +527,11 @@ for (const env of [{}, { PATH: 'x', RUSTC_WRAPPER: 'sccache', CARGO_BUILD_JOBS: 
   const refusedPlan = buildPlan(['build', '--no-bundle'], 'darwin', { PATH: '/usr/bin' })
   held('a refused run has its reason and starts nothing', 'true', String(typeof refusedPlan.problem === 'string' && refusedPlan.args === undefined && refusedPlan.env === undefined))
   const mac = buildPlan(['build', '--no-sign'], 'darwin', { PATH: '/usr/bin' })
-  held('a plan for macOS gives cargo as the runner and the environment as it is', JSON.stringify([['build', '--runner', 'cargo', '--no-sign'], { PATH: '/usr/bin' }, null]), JSON.stringify([mac.args, mac.env, mac.said]))
+  held(
+    'a plan for macOS gives cargo as the runner and the environment with this application\'s own project, interface and mode',
+    JSON.stringify([['build', '--runner', 'cargo', '--no-sign'], { PATH: '/usr/bin', ...OWN }, null]),
+    JSON.stringify([mac.args, mac.env, mac.said])
+  )
 }
 
 // On Windows the build gets `STATIC_VCRUNTIME=false`, whatever the caller's environment held.
@@ -536,7 +544,7 @@ function windowsBuild(env) {
   const none = windowsBuild(other)
   held('Windows: an environment with no setting gets false', 'false', none.given.STATIC_VCRUNTIME)
   held('Windows: nothing is said when no value was replaced', 'null', String(none.said))
-  held('Windows: the rest of the environment is kept', JSON.stringify(other), JSON.stringify({ ...none.given, STATIC_VCRUNTIME: undefined, SODIUM_DIST_DIR: undefined }))
+  held('Windows: the rest of the environment is kept', JSON.stringify(other), JSON.stringify({ ...none.given, STATIC_VCRUNTIME: undefined, SODIUM_DIST_DIR: undefined, ...UNSET }))
 
   const already = windowsBuild({ ...other, STATIC_VCRUNTIME: 'false' })
   held('Windows: false stays false', 'false', already.given.STATIC_VCRUNTIME)
@@ -571,17 +579,76 @@ function windowsBuild(env) {
   held('Windows: the caller\'s environment is not changed', 'true', untouched.STATIC_VCRUNTIME)
 }
 
-// On the other platforms the build gets the caller's environment as it is: nothing is added, and a
-// value of this variable is none of this command's.
+// On the other platforms the build gets the caller's environment as it is, with this application's own project,
+// interface and mode (below) and nothing else added, and a value of this variable is none of this command's.
 for (const platform of ['darwin', 'linux']) {
   const env = { PATH: '/usr/bin', APPLE_SIGNING_IDENTITY: '-', CI: 'true' }
   const { env: given, said } = childEnvironment(platform, env)
-  held(`${platform}: the environment is the caller's`, JSON.stringify(env), JSON.stringify(given))
+  held(`${platform}: the rest of the environment is the caller's`, JSON.stringify(env), JSON.stringify({ ...given, ...UNSET }))
   held(`${platform}: no value of STATIC_VCRUNTIME is added`, 'false', String('STATIC_VCRUNTIME' in given))
   held(`${platform}: nothing is said`, 'null', String(said))
   const asked = childEnvironment(platform, { ...env, STATIC_VCRUNTIME: 'true' })
   held(`${platform}: a value of STATIC_VCRUNTIME is left as it was`, 'true', asked.env.STATIC_VCRUNTIME)
   held(`${platform}: leaving it is not said`, 'null', String(asked.said))
+}
+
+// Variables that change WHAT the bundle holds or WHERE it is read from, on every platform. Tauri's command line
+// builds the project that `TAURI_APP_PATH` names (an older checkout's, for one) and runs the interface's build in
+// the directory `TAURI_FRONTEND_PATH` names; the interface's build writes the harness's output to another
+// directory than the one the bundle takes its interface from when `KR_COMPANION_HARNESS` is `1`, and builds a
+// development bundle when `NODE_ENV` says so. The build is given this application's own project, directory and
+// mode, and not the harness's variable, whatever the caller's environment holds.
+for (const platform of ['darwin', 'linux', 'win32']) {
+  const own = (env) => childEnvironment(platform, env, 'C:/k')
+  const elsewhere = platform === 'win32' ? 'D:\\older\\apps\\companion' : '/older/apps/companion'
+  for (const name of ['TAURI_APP_PATH', 'TAURI_FRONTEND_PATH']) {
+    const wanted = OWN[name]
+    const another = name === 'TAURI_APP_PATH' ? `${elsewhere}/src-tauri` : elsewhere
+    const replaced = own({ PATH: 'x', [name]: another })
+    held(`${platform}: a caller's ${name} that names another directory does not reach the build`, wanted, replaced.env[name])
+    held(`${platform}: replacing ${name} is said in one line that names the old value`, 'true', String(replaced.said !== null && !replaced.said.includes('\n') && replaced.said.includes(name) && replaced.said.includes(`\`${another}\``)))
+    held(`${platform}: ${name} with no value is set to this application's and nothing is said`, 'true', String(own({ PATH: 'x' }).env[name] === wanted && own({ PATH: 'x' }).said === null))
+    held(`${platform}: ${name} that is already this application's is not said`, 'null', String(own({ PATH: 'x', [name]: wanted }).said))
+  }
+  for (const value of ['development', 'test', '', 'Production']) {
+    const replaced = own({ PATH: 'x', NODE_ENV: value })
+    held(`${platform}: NODE_ENV=${JSON.stringify(value)} is replaced by production`, 'production', replaced.env.NODE_ENV)
+    held(`${platform}: replacing NODE_ENV=${JSON.stringify(value)} is said in one line`, 'true', String(replaced.said !== null && !replaced.said.includes('\n') && replaced.said.includes('NODE_ENV') && replaced.said.includes('production')))
+  }
+  held(`${platform}: NODE_ENV=production is not said`, 'null', String(own({ PATH: 'x', NODE_ENV: 'production' }).said))
+  for (const value of ['1', 'true']) {
+    const harness = own({ PATH: 'x', KR_COMPANION_HARNESS: value })
+    held(`${platform}: KR_COMPANION_HARNESS=${value} does not reach the build`, 'false', String('KR_COMPANION_HARNESS' in harness.env))
+    held(
+      `${platform}: dropping KR_COMPANION_HARNESS=${value} is ${value === '1' ? '' : 'not '}said`,
+      String(value === '1'),
+      String(harness.said !== null && harness.said.includes('KR_COMPANION_HARNESS') && harness.said.includes('dist') && !harness.said.includes('\n'))
+    )
+  }
+  held(`${platform}: the harness's variable is not there when the caller gave none`, 'false', String('KR_COMPANION_HARNESS' in own({ PATH: 'x' }).env))
+  // Every one at once: each is said on a line of its own, and the rest of the environment is kept.
+  const all = own({ PATH: 'x', CI: 'true', TAURI_APP_PATH: `${elsewhere}/src-tauri`, TAURI_FRONTEND_PATH: elsewhere, NODE_ENV: 'development', KR_COMPANION_HARNESS: '1' })
+  held(`${platform}: every replaced value is said on a line of its own`, 'true', String((all.said ?? '').split('\n').filter((line) => /TAURI_APP_PATH|TAURI_FRONTEND_PATH|NODE_ENV|KR_COMPANION_HARNESS/.test(line)).length >= 4))
+  held(`${platform}: the rest of the environment is kept beside them`, JSON.stringify({ PATH: 'x', CI: 'true' }), JSON.stringify({ ...all.env, ...UNSET, KR_COMPANION_HARNESS: undefined, SODIUM_DIST_DIR: undefined, STATIC_VCRUNTIME: undefined }))
+  const caller = { PATH: 'x', TAURI_APP_PATH: `${elsewhere}/src-tauri`, KR_COMPANION_HARNESS: '1' }
+  own(caller)
+  held(`${platform}: the caller's environment is not changed`, 'true', String(caller.KR_COMPANION_HARNESS === '1' && caller.TAURI_APP_PATH === `${elsewhere}/src-tauri`))
+  // The plan carries them, for the build's own cargo command (which cleans a crate for the profile) as well.
+  const plan = buildPlan(['build'], platform, { PATH: 'x', TAURI_APP_PATH: `${elsewhere}/src-tauri`, KR_COMPANION_HARNESS: '1' }, 'C:/k')
+  held(`${platform}: a plan starts the build with this application's own project`, OWN.TAURI_APP_PATH, plan.env?.TAURI_APP_PATH)
+  held(`${platform}: a plan starts the build without the harness's variable`, 'false', String('KR_COMPANION_HARNESS' in (plan.env ?? {})))
+  held(`${platform}: a plan says what it replaced`, 'true', String(plan.said?.includes('TAURI_APP_PATH') && plan.said?.includes('KR_COMPANION_HARNESS')))
+}
+// Windows names variables without regard to case: every spelling is replaced by the one that Tauri reads, and a
+// spelling of the harness's variable is dropped. On the other platforms another spelling is another variable.
+{
+  const spelled = childEnvironment('win32', { PATH: 'C:\\x', tauri_app_path: 'D:\\o\\src-tauri', Tauri_App_Path: 'D:\\p', node_env: 'development', kr_companion_harness: '1' }, 'C:/k')
+  const names = (pattern) => Object.keys(spelled.env).filter((key) => pattern.test(key))
+  held('Windows: every spelling of TAURI_APP_PATH is replaced by the one', 'TAURI_APP_PATH', names(/^tauri_app_path$/i).join(','))
+  held('Windows: every spelling of NODE_ENV is replaced by the one', 'NODE_ENV', names(/^node_env$/i).join(','))
+  held('Windows: every spelling of the harness\'s variable is dropped', '', names(/^kr_companion_harness$/i).join(','))
+  const other = childEnvironment('linux', { PATH: '/usr/bin', node_env: 'development', kr_companion_harness: '1' })
+  held('Linux: another spelling is another variable and is left as it is', 'development,1', [other.env.node_env, other.env.kr_companion_harness].join(','))
 }
 
 // The command itself: arguments it refuses are refused before anything is run, with the exit code 2
