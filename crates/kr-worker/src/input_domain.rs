@@ -142,6 +142,14 @@ impl InputShared {
         writes.all()
     }
 
+    /// Makes the terminal refuse every write from now on, so that its writer ends, for this host's
+    /// own tests.
+    #[cfg(feature = "testing")]
+    pub fn fail_terminal_writes(&self) {
+        let writes = Arc::clone(&self.lock().writer().terminal_writes);
+        writes.fail_from_now_on();
+    }
+
     /// Returns the stop the terminal's writer stands in when it has taken a batch, for this host's
     /// own tests.
     ///

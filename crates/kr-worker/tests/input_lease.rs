@@ -2634,6 +2634,67 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
     });
 }
 
+/// KR-REQ-08.49: a terminal that refuses a write ends the writer, and what the writer leaves
+/// behind is settled: the room of every batch it held, the answer waiting in the lane for that
+/// room, and the count of answers that did not reach the application.
+///
+/// The share of the host's answers is full when the first write fails: one answer is in the
+/// writer's hands, the rest are queued behind it, and one more waits in the lane. The room all of
+/// them held comes back, so the answer in the lane is taken, and every answer the writer did not
+/// write is counted as dropped. This goes through the writer thread's own exit, as a real
+/// terminal's failure does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_that_ends_on_a_failed_write_gives_back_the_room_it_held_and_the_answer_waits_no_more()
+ {
+    let (_host, runtime, clock, _session_id, _holder, _epoch) = silent_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let room = runtime.input().lock().input_room();
+    let (writer_stopped, release_writer) = runtime.input().writer_hold().arm();
+
+    {
+        let mut session = runtime.session();
+        session.ingest_output(&STATUS_QUESTION.repeat(256));
+        runtime.flush_input();
+        clock.advance(Duration::from_secs(1));
+        session.ingest_output(STATUS_QUESTION);
+    }
+    tokio::time::timeout(Duration::from_secs(20), writer_stopped)
+        .await
+        .expect("the writer takes the first batch")
+        .expect("the writer's stop fires");
+    assert_eq!(room.held_replies(), 256, "the share is full");
+    assert!(
+        runtime.session().engine().replies_pending(),
+        "the 257th answer waits in the lane for room"
+    );
+
+    runtime.input().fail_terminal_writes();
+    drop(release_writer);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while room.held() != kr_worker::input_room::Cost::default()
+            || room.held_replies() != 0
+            || runtime.session().engine().replies_pending()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the room is {:?} with {} answers, and the lane still waits: {}",
+            room.held(),
+            room.held_replies(),
+            runtime.session().engine().replies_pending()
+        )
+    });
+    assert!(
+        runtime.session().replies_dropped() >= 256,
+        "the answers that were queued behind the first, and the one that was taken after, are \
+         counted as dropped: {}",
+        runtime.session().replies_dropped()
+    );
+}
+
 /// A harness that plays the terminal's writer settles what it takes as the writer settles what it
 /// writes: the room, the answers' places, the unwritten answer bytes and the lease's queued bytes
 /// are all given back, so a long exchange is held to the bounds of the product and not to those of
