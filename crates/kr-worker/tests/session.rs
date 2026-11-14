@@ -1098,7 +1098,6 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
             <= kr_worker::session::MAX_QUEUED_INPUT_BYTES,
         "and nothing beyond the budget was ever queued"
     );
-    let runtime = std::sync::Arc::clone(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1311,7 +1310,6 @@ async fn takeover_mid_paste(one_frame: bool) {
          given {given} of the {sent} bytes the body held, and the {abandoned} of them in the tail \
          the takeover discarded were never among them"
     );
-    let runtime = std::sync::Arc::clone(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1402,7 +1400,6 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
         taken.discarded_bytes.get() > 0,
         "the takeover reports what it did not deliver: {taken:?}"
     );
-    let runtime = std::sync::Arc::clone(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1575,7 +1572,6 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
         "every byte was either received or reported as discarded, and none was both: \
          {received} received, {discarded} discarded, {SENT} sent"
     );
-    let runtime = std::sync::Arc::clone(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread")]
