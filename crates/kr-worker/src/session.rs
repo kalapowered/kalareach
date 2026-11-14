@@ -5572,6 +5572,15 @@ pub const MAX_PENDING_REPLY_BYTES: usize = 64 * 1024;
 /// is only ever reached by an application that has genuinely stopped reading its input.
 pub const MAX_QUEUED_INPUT_BYTES: usize = 1024 * 1024;
 
+/// How many writes may be waiting for the pseudo-terminal, across every producer at once.
+///
+/// Bytes alone do not bound the queue: every write is an entry with a cost of its own, so a client
+/// that sends one byte at a time to an application that does not read would hold about a million
+/// entries inside the same megabyte. This is counted beside [`MAX_QUEUED_INPUT_BYTES`], from the
+/// moment a write is accepted until the writer has given the terminal its last byte or has dropped
+/// it, and a write beyond either bound is refused with the same named result.
+pub const MAX_QUEUED_INPUT_FRAMES: usize = 4096;
+
 /// A cursor on the output stream.
 #[must_use]
 pub const fn cursor(value: u64) -> StreamCursor {

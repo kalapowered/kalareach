@@ -107,6 +107,20 @@ pub enum WorkerError {
         /// What was unavailable.
         detail: String,
     },
+    /// The application is not reading its input and what waits for it is at a bound, so the write
+    /// was not accepted and took no sequence number.
+    ///
+    /// It is reported under the code of an unavailable resource, as a terminal that has gone is,
+    /// and a caller tells the two apart by this variant: here the session is open and the same
+    /// write is accepted when the application reads again.
+    #[error(
+        "the application is not reading its input and {bound} are already waiting for it, so \
+         these bytes were not accepted"
+    )]
+    InputRoomFull {
+        /// The bound that the write would have passed.
+        bound: crate::input_room::Full,
+    },
     /// The subject preconditions the mutation requires did not hold.
     #[error("{detail}")]
     PreconditionFailed {
@@ -206,7 +220,9 @@ impl WorkerError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Storage { .. } | Self::JournalUnavailable { .. } => ErrorCode::StorageUnavailable,
-            Self::Pty { .. } | Self::ResourceUnavailable { .. } => ErrorCode::ResourceUnavailable,
+            Self::Pty { .. } | Self::ResourceUnavailable { .. } | Self::InputRoomFull { .. } => {
+                ErrorCode::ResourceUnavailable
+            }
             Self::Dimensions(_) | Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::UnknownAttachment { .. } | Self::AmbiguousDetach { .. } => {
                 ErrorCode::AmbiguousAttachment
