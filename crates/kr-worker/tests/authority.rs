@@ -483,6 +483,53 @@ async fn a_connection_that_proves_nothing_moves_no_record() {
     }
 }
 
+/// KR-REQ-02.05: the record outlives its connection: once the later connection has ended, the
+/// earlier one that is still waiting to present is refused all the same.
+///
+/// The worker serves a bounded number of connections, and the test fills it, so that the end of
+/// the later connection is a condition it can wait for: a further connection is admitted once the
+/// worker has finished with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_connection_stays_refused_after_the_newer_one_has_ended() {
+    let host = host(1).await;
+    let mut older = declared(&host, ControllerConnectionRole::Authority).await;
+    let mut newer = declared(&host, ControllerConnectionRole::Authority).await;
+    present(&mut newer, host.signer(), 1)
+        .await
+        .expect("the later connection is accepted");
+    read_session(&mut newer, host.session_id)
+        .await
+        .expect("the later connection is served");
+
+    let mut fillers = Vec::new();
+    while fillers.len() < kr_worker::service::MAX_CONNECTIONS - 2 {
+        fillers.push(
+            BoundLink::connect(&host.endpoint, build())
+                .await
+                .expect("the worker admits the connection"),
+        );
+    }
+    assert!(
+        BoundLink::connect(&host.endpoint, build()).await.is_err(),
+        "the worker admits no more than its bound"
+    );
+    drop(newer);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let _admitted = loop {
+        match BoundLink::connect(&host.endpoint, build()).await {
+            Ok(link) => break link,
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the worker did not finish with the ended connection within {WAIT:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    };
+    assert_refused_for_order(present(&mut older, host.signer(), 1).await);
+}
+
 /// KR-REQ-02.05: a controller connection from a generation a newer daemon has replaced cannot
 /// dispatch anything afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
