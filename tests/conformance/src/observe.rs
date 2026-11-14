@@ -285,7 +285,7 @@ fn shell_refusal(line: &str) -> Option<String> {
 
 /// What a step's log, read at the moment the step ended, says of the programs it could not run.
 /// `None` when it names none, or when there is no log. A log that is a link or another object that is
-/// not a regular file, or that cannot be read in [`READ_LIMIT`], is recorded as such and not read.
+/// not a regular file, or that cannot be read in ten seconds, is recorded as such and not read.
 #[must_use]
 pub fn observe_log(log: &Path, now: SystemTime) -> Option<Observed> {
     if matches!(std::fs::symlink_metadata(log), Err(error) if error.kind() == ErrorKind::NotFound) {
