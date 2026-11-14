@@ -236,8 +236,8 @@ fn run(
             return ExitCode::from(2);
         }
         Err(Stopped::PrivateCopy(problem)) => {
-            eprintln!("kr-conformance: no step was run: {problem}");
-            return ExitCode::from(1);
+            eprintln!("kr-conformance: refused, no step was run: {problem}");
+            return ExitCode::from(2);
         }
     };
     let path = report::result_path(&evidence);
