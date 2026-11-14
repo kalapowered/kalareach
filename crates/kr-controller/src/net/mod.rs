@@ -65,6 +65,8 @@ pub mod dispatch;
 mod earlier_attention_clock;
 mod heard;
 mod input;
+#[cfg(feature = "testing")]
+pub use input::{InputStageCounts, InputStages};
 pub mod invitations;
 pub mod lifetimes;
 pub mod methods;
@@ -611,6 +613,13 @@ impl Network {
             .await;
     }
 
+    /// Where a suite stops the stages of the terminal-input door and reads what they hold.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn input_stages(&self) -> &InputStages {
+        self.guard.host.input.stages()
+    }
+
     /// Has this host connect the input lanes it opens to `endpoint`, where a suite's scripted
     /// worker lane listens, instead of to the worker's own endpoint.
     #[cfg(feature = "testing")]
@@ -1077,14 +1086,17 @@ impl NetworkHost {
             runtime.synchronised_before_serving().await;
         }
         let (notifications, relayed) = tokio::sync::mpsc::channel(RELAY_DEPTH);
-        let remote = Arc::new(RemoteConnection::new(
-            Arc::clone(&controller),
-            self.records(),
-            device,
-            &session,
-            notifications,
-            grant_deadline,
-        ));
+        let remote = Arc::new(
+            RemoteConnection::new(
+                Arc::clone(&controller),
+                self.records(),
+                device,
+                &session,
+                notifications,
+                grant_deadline,
+            )
+            .with_inputs(Arc::clone(&self.input)),
+        );
         self.live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
