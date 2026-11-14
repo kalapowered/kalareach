@@ -330,6 +330,37 @@ fn an_answer_reads_from_the_json_the_schema_names() {
     );
 }
 
+/// What the JSON form refuses as well: it is what a client in another language writes, and serde
+/// itself, not only the wire's canonical re-encoding, turns away a member that has no place.
+#[test]
+fn the_json_form_refuses_what_it_has_no_place_for() {
+    let frame = |extra: serde_json::Value| {
+        let mut document = json!({ "epoch": "3", "sequence": "7", "bytes": "cQ" });
+        document
+            .as_object_mut()
+            .expect("an object")
+            .extend(extra.as_object().expect("an object").clone());
+        document
+    };
+    assert!(serde_json::from_value::<InputFrame>(frame(json!({}))).is_ok());
+    assert!(serde_json::from_value::<InputFrame>(frame(json!({ "input": "x" }))).is_err());
+    let ended = |members: serde_json::Value| {
+        let mut document = json!({ "kind": "epoch_ended", "epoch": "3" });
+        document
+            .as_object_mut()
+            .expect("an object")
+            .extend(members.as_object().expect("an object").clone());
+        document
+    };
+    assert!(serde_json::from_value::<InputAck>(ended(json!({ "fenced_bytes": "0" }))).is_ok());
+    assert!(
+        serde_json::from_value::<InputAck>(ended(json!({ "fenced_bytes": "0", "reason": "x" })))
+            .is_err()
+    );
+    assert!(serde_json::from_value::<InputAck>(ended(json!({}))).is_err());
+    assert!(serde_json::from_value::<InputAck>(ended(json!({ "fenced_bytes": null }))).is_err());
+}
+
 /// The window is the client's own: the most it may have written to the stream and not had accepted.
 #[test]
 fn the_window_reads_from_the_wire_and_refuses_a_third_member() {
