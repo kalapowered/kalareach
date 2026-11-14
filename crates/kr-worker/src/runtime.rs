@@ -716,9 +716,30 @@ impl Sink {
     }
 }
 
+/// The tasks a runtime started, which end when the runtime is dropped.
+///
+/// Each of them holds a clone of something the runtime owns, the session and its journal among
+/// it, and none of them has an end of its own while the session's owner is there to be asked
+/// anything. Dropping a handle to a task leaves it running, so the runtime keeps their abort
+/// handles and lets go of them here: nothing is waited for, and a task that is in the middle of
+/// work it began without a wait finishes that work before the abort reaches it.
+#[derive(Debug, Default)]
+struct OwnedTasks(Vec<tokio::task::AbortHandle>);
+
+impl Drop for OwnedTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 /// A running session and the tasks around it.
 #[derive(Debug)]
 pub struct SessionRuntime {
+    /// Ended with the runtime, so a closed session's files are not held open by a task that has
+    /// nothing left to serve.
+    tasks: OwnedTasks,
     session: Arc<Mutex<Session>>,
     /// What a keystroke touches, which is taken after the session and never before it.
     domain: Arc<crate::input_domain::InputShared>,
@@ -1161,7 +1182,8 @@ impl SessionRuntime {
             }
         });
 
-        let runtime = Self {
+        let mut runtime = Self {
+            tasks: OwnedTasks::default(),
             session: Arc::clone(&session),
             domain: Arc::clone(&domain),
             shared_clock: Arc::clone(&shared_clock),
@@ -1179,7 +1201,7 @@ impl SessionRuntime {
         let ingest_domain = Arc::clone(&domain);
         let ingest_activity = Arc::clone(&activity);
         let ingest_trace = trace.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Some(event) = output_receiver.recv().await {
                 match event {
                     ReadEvent::Bytes(bytes) => {
@@ -1258,6 +1280,7 @@ impl SessionRuntime {
                 }
             }
         });
+        runtime.tasks.0.push(task.abort_handle());
 
         // The root shell's status is watched independently of the terminal. An explicit exit, an
         // end of file at the root prompt and a crash all close the session, and KalaReach never
@@ -1274,13 +1297,14 @@ impl SessionRuntime {
         let monitor_progress = progress;
         let monitor_trace = trace.clone();
         let monitor_observing = Arc::clone(&observing);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // The monitor holds a runtime of its own so a closure it begins publishes its fence and
             // its paste terminator the same way a requested one does. Building it only once the
             // closure had started would leave those inside the session until something else
             // flushed, and a desktop that has gone or a shell that has exited is exactly when
             // nothing else is going to.
             let runtime = Arc::new(SessionRuntime {
+                tasks: OwnedTasks::default(),
                 session: Arc::clone(&monitor_session),
                 domain: Arc::clone(&monitor_domain),
                 shared_clock: monitor_clock,
@@ -1446,6 +1470,7 @@ impl SessionRuntime {
                 };
             }
         });
+        runtime.tasks.0.push(task.abort_handle());
 
         // The paste recogniser's deadline runs on the clock, not on the arrival of more input. The
         // timer takes the input domain and nothing else: whatever the session is busy with, a
@@ -1453,7 +1478,7 @@ impl SessionRuntime {
         let timer_domain = Arc::clone(&domain);
         let timer_sink = sink.clone();
         let timer_trace = trace.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 let deadline = {
                     let mut acquisition = timer_trace.acquisition(Site::TimerLook);
@@ -1491,6 +1516,7 @@ impl SessionRuntime {
                 }
             }
         });
+        runtime.tasks.0.push(task.abort_handle());
 
         // The pump does what a keystroke and the timer cannot do for themselves, because they do
         // not take the session: letting out the replies the response lane held back while a paste
@@ -1499,7 +1525,7 @@ impl SessionRuntime {
         let pump_session = Arc::clone(&session);
         let pump_domain = Arc::clone(&domain);
         let pump_sink = sink.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 pump_domain.pump_asked().await;
                 // Waited for off the executor: the session may be held by a commit.
@@ -1511,6 +1537,7 @@ impl SessionRuntime {
                 });
             }
         });
+        runtime.tasks.0.push(task.abort_handle());
 
         Ok(runtime)
     }
