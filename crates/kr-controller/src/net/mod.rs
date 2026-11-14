@@ -57,7 +57,6 @@ impl AtTheNetworkDoor {
 
 pub(crate) mod arrivals;
 pub(crate) mod chunks;
-mod input;
 pub mod clock_trust;
 pub mod config;
 mod device_errors;
@@ -65,6 +64,7 @@ pub mod devices;
 pub mod dispatch;
 mod earlier_attention_clock;
 mod heard;
+mod input;
 pub mod invitations;
 pub mod lifetimes;
 pub mod methods;
@@ -615,13 +615,15 @@ impl Network {
     /// worker lane listens, instead of to the worker's own endpoint.
     #[cfg(feature = "testing")]
     pub fn use_input_lane_at(&self, endpoint: kr_ipc::paths::Endpoint) {
-        *self
-            .guard
-            .host
-            .input
-            .lane_endpoint
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(endpoint);
+        self.guard.host.input.use_lane_at(endpoint);
+    }
+
+    /// How many tasks that serve a terminal-input stream have ended, however they ended, as a count
+    /// a suite can wait on to know that the task of a stream it dropped is gone.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn input_tasks_ended(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.guard.host.input.tasks_ended()
     }
 
     /// Stops accepting connections and closes the endpoint.
@@ -1126,9 +1128,11 @@ impl NetworkHost {
         guard.watch = Some(
             tokio::spawn({
                 let remote = Arc::clone(&remote);
+                let host = Arc::clone(&self);
                 async move {
                     remote.grant_ended().await;
                     remote.output().withdraw();
+                    host.input.revoke_connection(connection_id);
                     remote.release().await;
                 }
             })
@@ -1141,7 +1145,7 @@ impl NetworkHost {
         // admitted and its guard ends this task, so a stream the device opens earlier finds nobody
         // reading it. They are read on a task of their own, never by this loop, which stays inside
         // `serve_frame` for as long as a control request waits for its effect.
-        let door = Arc::new(chunks::ChunkDoor {
+        let door = Arc::new(chunks::DataDoor {
             host: Arc::clone(&self),
             remote: Arc::clone(&remote),
             connection: session.connection.clone(),
@@ -2121,6 +2125,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     config.preauth_limits = setup.settings.preauth_limits;
     // The streams this host reads from a device, which `transfer.streams` tells a device too.
     config.accepted_kinds = chunks::ACCEPTED_STREAMS.to_vec();
+    config.max_input_streams = host.input.max_per_connection();
     if let Some(validity) = setup.settings.action_window_validity {
         config.action_window_validity = validity.min(kr_transport::window::MAX_WINDOW_VALIDITY);
     }
@@ -2240,6 +2245,32 @@ impl Controller {
         // every worker would make one paused session everybody's wait.
         let _ = self.acknowledge_worker_revision(session_id).await;
         Ok(proxy)
+    }
+
+    /// Opens the link that carries one attachment's typing to the worker that owns `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session has no live worker, or when the worker refuses the link.
+    pub(crate) async fn open_input_lane(
+        self: &Arc<Self>,
+        session_id: kr_protocol::ids::SessionId,
+        receive: kr_protocol::hello::ReceiveLimits,
+    ) -> Result<(
+        kr_ipc::client::LinkReader,
+        kr_ipc::client::LinkWriter,
+        kr_protocol::retained::Level,
+    )> {
+        let worker: KnownWorker = self
+            .directory
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| ControllerError::UnknownSession {
+                session: session_id.to_string(),
+            })?;
+        WorkerProxy::open_input_lane(self, &worker, receive).await
     }
 
     /// Releases what the connections the authority feed refuses hold at their workers.
