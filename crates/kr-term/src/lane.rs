@@ -347,6 +347,21 @@ impl ResponseLane {
         self.queue.len()
     }
 
+    /// Returns when the first of the waiting replies that age lapses, as a reading of the clock the
+    /// lane is driven by.
+    ///
+    /// A reply a hold keeps does not age, and one with no deadline never lapses, so neither is
+    /// counted. A caller that cannot drain the lane before then, for want of room, looks again at
+    /// this reading to have the lapsed reply dropped and recorded.
+    #[must_use]
+    pub fn next_expiry_ms(&self) -> Option<u64> {
+        self.queue
+            .iter()
+            .filter(|reply| reply.held_since.is_none() && reply.expires_at_ms != 0)
+            .map(|reply| reply.expires_at_ms)
+            .min()
+    }
+
     /// Bytes waiting to be written.
     #[must_use]
     pub const fn queued_bytes(&self) -> usize {
