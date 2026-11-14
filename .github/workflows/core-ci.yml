@@ -3332,7 +3332,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15-intel
     # The build alone is about an hour on this runner when its cache is warm. With no cache the
-    # first of its two commands took from 47 to 120 minutes, on a runner that was slow that day,
+    # first of its two commands took from 47 to 120 minutes, the longest on two runners of one run,
     # and the second had run 40 more without ending. Every step has a limit of its own, and the
     # limits add up to less than this one: the build's 240 minutes, twice the 120, and the other
     # steps' 111 make 351, and this limit of 355 is under the 360 at which GitHub ends a hosted job.
@@ -3378,8 +3378,8 @@ jobs:
 
       # Everything the script below builds before it measures, so that the script has as little
       # left to build as it can. Its limit is twice the 120 minutes the first command took with no
-      # cache on a slow runner, so that a slow build with no cache still ends here and is saved
-      # below, where one that is cut leaves the next run as cold as this one.
+      # cache on a slow runner, so that a build with no cache still ends here and is saved below,
+      # where one that is cut leaves the next run as cold as this one.
       - name: Build what the measurements run
         id: build
         timeout-minutes: 240
