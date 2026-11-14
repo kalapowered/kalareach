@@ -241,7 +241,9 @@ impl InputStreams {
         }
     }
 
-    /// Tells the streams that serve `attachment`, of any connection, that it was detached. Each
+    /// Tells the streams that serve `attachment`, of every connection, that it was detached. The
+    /// attachment is gone for all of them, so each ends; it is called for a detach that took effect
+    /// or may have, and for no other. Each
     /// stream waits [`DETACH_NOTICE_WAIT`] for the worker's notice that the lease ended, if the view
     /// held it and none came yet, writes it to the device, and ends.
     pub(super) fn detached(&self, attachment: AttachmentId) {
@@ -423,8 +425,9 @@ struct State {
     refused_epoch: Option<InputLeaseEpoch>,
     ended: Option<End>,
     next_request: u64,
-    /// Whether the device has been told that an epoch of this lane's lease ended.
-    epoch_ended: bool,
+    /// The newest epoch of this lane's lease whose end the device has been told. The notice of an
+    /// older epoch does not stand for the notice of the epoch the view holds now.
+    epoch_ended: Option<InputLeaseEpoch>,
     /// Frames queued for the lane's writer or written and not yet answered.
     in_flight: usize,
 }
@@ -474,7 +477,7 @@ impl Flow {
                 refused_epoch: None,
                 ended: None,
                 next_request: 1,
-                epoch_ended: false,
+                epoch_ended: None,
                 in_flight: 0,
             }),
             version: watch::channel(0).0,
@@ -679,7 +682,12 @@ impl Flow {
                         };
                     }
                     if let Some(ended) = window.ended.0 {
-                        state.epoch_ended = true;
+                        if state
+                            .epoch_ended
+                            .is_none_or(|told| told.get() < ended.epoch.get())
+                        {
+                            state.epoch_ended = Some(ended.epoch);
+                        }
                         state.tell(InputAck::EpochEnded {
                             epoch: ended.epoch,
                             fenced_bytes: ended.fenced_bytes,
@@ -1226,9 +1234,13 @@ async fn end_at_detach(flow: Arc<Flow>) {
             version.borrow_and_update();
             {
                 let state = flow.lock();
-                if state.epoch_ended
-                    || state.ended.is_some()
-                    || !matches!(state.window, Window::Holder { .. })
+                let Window::Holder { epoch: held, .. } = state.window else {
+                    return;
+                };
+                if state.ended.is_some()
+                    || state
+                        .epoch_ended
+                        .is_some_and(|told| told.get() >= held.get())
                 {
                     return;
                 }
