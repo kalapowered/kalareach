@@ -17,16 +17,17 @@
 # in one: a build writes its largest files while it runs. Each report names the lowest sample since
 # the report before it, and the label of the report that ends each interval is the step or the
 # steps the interval covers. The sampler is one Python process that wakes to read the volume's free
-# space and sleeps again, so it starts no other program; `end` stops it by the pid `begin`
-# recorded. A measurement that asserts on an idle host is preceded by `end` and followed by `report`.
+# space and sleeps again, so it starts no other program; `end` stops it by a stop file that it
+# reads at each wake, and signals no process. A measurement that asserts on an idle host is
+# preceded by `end` and followed by `report`.
 #
 # On a hosted macOS runner `end` also reads the kernel's log for the lines that say a write to the
 # data volume failed, from the first sample to now, and keeps them in `disk-faults.txt` in the
 # test evidence directory. The volume has returned I/O errors in bursts while a build ran, and a
 # program the linker wrote in a burst cannot be started: these lines are what says so.
 #
-# This reads and reports. It removes nothing, and it exits 0 whatever it could not read, including
-# a disk with no room left to write the samples to.
+# This reads and reports. It removes nothing and signals no process, and it exits 0 whatever it
+# could not read, including a disk with no room left to write the samples to.
 
 set -uo pipefail
 
@@ -39,7 +40,8 @@ fi
 
 state="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/kr-disk-report"
 samples="$state/samples"
-pidfile="$state/sampler.pid"
+tokenfile="$state/sampler.token"
+stopfile="$state/sampler.stop"
 interval=2
 
 # A size in KiB as GiB, or MiB below one GiB.
@@ -111,20 +113,31 @@ report() {
 }
 
 # The sampler: one process that reads the free space of the volume it was started in and sleeps.
-# A write that fails, on a disk with no room, is skipped and tried again at the next wake.
+# A write that fails, on a disk with no room, is skipped and tried again at the next wake. At each
+# wake it reads the stop file, and it ends, after one last line `E <time>` in the samples, when
+# the file holds the token it was started with. A sampler that an earlier `begin` left running has
+# another token and is told to end by the stop file that `begin` writes first.
 start_sampler() {
     if ! command -v python3 > /dev/null 2>&1; then
         echo "  no sampling: python3 is not installed"
         return
     fi
+    token="$$.$(date +%s).$RANDOM"
+    printf '%s\n' "$token" > "$tokenfile" 2> /dev/null || return
     python3 -I -c '
 # kr-disk-sampler
 import os
 import sys
 import time
 
-path, interval = sys.argv[1], float(sys.argv[2])
+path, interval, stop, token = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
 while True:
+    try:
+        with open(stop) as told:
+            if told.read().strip() == token:
+                break
+    except OSError:
+        pass
     try:
         volume = os.statvfs(".")
         with open(path, "a") as samples:
@@ -132,19 +145,26 @@ while True:
     except OSError:
         pass
     time.sleep(interval)
-' "$samples" "$interval" < /dev/null > /dev/null 2>&1 &
-    echo "$!" > "$pidfile"
+try:
+    with open(path, "a") as samples:
+        samples.write("E %d\n" % time.time())
+except OSError:
+    pass
+' "$samples" "$interval" "$stopfile" "$token" < /dev/null > /dev/null 2>&1 &
     disown 2> /dev/null || true
 }
 
-# Ends the sampler this script started, after checking that the pid is still that process.
+# Tells the sampler this script started to end, by writing its token to the stop file, and waits
+# a few seconds for the line it ends with. No process is signalled, so no process number is read
+# or held, and a process that has another number's place is not touched.
 stop_sampler() {
-    [ -f "$pidfile" ] || return 0
-    pid="$(cat "$pidfile")"
-    if ps -p "$pid" -o command= 2> /dev/null | grep -q kr-disk-sampler; then
-        kill "$pid" 2> /dev/null || true
-    fi
-    rm -f "$pidfile"
+    [ -f "$tokenfile" ] || return 0
+    cat "$tokenfile" > "$stopfile" 2> /dev/null || return 0
+    waited=0
+    while [ "$waited" -lt 10 ] && ! grep -q '^E ' "$samples" 2> /dev/null; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
 }
 
 # The lowest sample after the last mark, as "<KiB> <epoch>", or nothing without one.
@@ -216,9 +236,28 @@ list_intervals() {
     done
 }
 
+# Runs a command whose output goes to a file, with a limit on its time that it carries itself: the
+# program that starts it sets its own alarm and then becomes the command, so the alarm outlives the
+# change and nobody signals the command from outside. The words before `--` run that program (for
+# example `sudo -n`, so that the alarm is the root process's own). The status is the command's, or
+# 142 when the alarm ended it.
+# alarmed <seconds> <file> [<prefix word>...] -- <command word>...
+alarmed() {
+    limit="$1"
+    out="$2"
+    shift 2
+    prefix=()
+    while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+        prefix+=("$1")
+        shift
+    done
+    shift
+    "${prefix[@]+"${prefix[@]}"}" /usr/bin/perl -e 'alarm shift; exec @ARGV or exit 127' "$limit" "$@" > "$out" 2> /dev/null
+}
+
 # The kernel's lines about a write to storage that failed, from the first sample to now, on a
-# hosted macOS runner. The log is read as root where the runner allows it and the read is given up
-# after 90 seconds.
+# hosted macOS runner. The log is read as root where the runner allows it (`sudo -n`, which never
+# asks for a password) and the read ends by itself after 90 seconds.
 kernel_storage_errors() {
     [ "$(uname -s)" = Darwin ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] || return 0
     first="$(awk '$1 == "S" { print $2; exit }' "$samples" 2> /dev/null)"
@@ -230,23 +269,17 @@ kernel_storage_errors() {
     read_ok=0
     for attempt in sudo plain; do
         if [ "$attempt" = sudo ]; then
-            # shellcheck disable=SC2024 # the runner's own shell writes the file, in its directory
-            sudo -n /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate" > "$out" 2> /dev/null &
+            # the redirect is in alarmed, so the runner's own shell writes the file, in its directory
+            alarmed 90 "$out" sudo -n -- /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate"
         else
-            /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate" > "$out" 2> /dev/null &
+            alarmed 90 "$out" -- /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate"
         fi
-        reader=$!
-        waited=0
-        while kill -0 "$reader" 2> /dev/null && [ "$waited" -lt 90 ]; do
-            sleep 1
-            waited=$((waited + 1))
-        done
-        if kill -0 "$reader" 2> /dev/null; then
-            kill "$reader" 2> /dev/null || true
+        status=$?
+        if [ "$status" -eq 142 ]; then
             echo "  the kernel's log was not read in 90 seconds"
             return 0
         fi
-        if wait "$reader"; then
+        if [ "$status" -eq 0 ]; then
             read_ok=1
             break
         fi
@@ -263,9 +296,13 @@ kernel_storage_errors() {
     fi
 }
 
+# A shell that sources this file gets the functions and nothing is run.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
 case "$mode" in
     begin)
         mkdir -p "$state" 2> /dev/null
+        stop_sampler
         : > "$samples"
         report
         mark
