@@ -525,6 +525,45 @@ fn a_repair_of_a_refused_service_that_is_gone_makes_the_service_and_the_record_s
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_repair_over_a_refused_record_that_dies_after_the_creation_leaves_an_intent() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let person = Person::make();
+    a_refused_service_after_the_directories_step(&person);
+    // The service that stood there is deleted by the case before the repair.
+    drop(StrangersService::made_by_the_seam());
+    assert!(!snapshot().service, "the case did not delete its service");
+    // A repair that is aborted right after the call that made the service returned.
+    let (code, text) = install_with(&person, &[("KR_BOUNDARY_DIE_AT", "service")]);
+    assert_ne!(code, Some(0), "the repair did not die: {text}");
+    let paths = Paths::system().unwrap();
+    let manifest = Manifest::load(&paths.manifest).expect("a manifest that the removal can read");
+    let object = manifest
+        .find(ObjectKind::Service, SERVICE)
+        .unwrap_or_else(|| panic!("the manifest holds no Service entry: {manifest:?}"));
+    observed(&format!("the record holds the Service entry as {object:?}"));
+    assert_eq!(
+        object.outcome, None,
+        "the record still holds a result for a service that the repair made: {object:?}"
+    );
+    assert!(
+        the_service_at_the_brokers_name().is_some(),
+        "the repair made no service before it died: {text}"
+    );
+    // The removal takes the service that the repair made, as the intent shows.
+    let (removal_code, removal) = ordinary_removal();
+    assert_eq!(removal_code, Some(0), "the removal succeeds: {removal}");
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the removal the computer is as it was: {removal}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_run_that_fails_before_its_first_record_and_whose_rollback_fails_leaves_a_record_that_the_removal_accepts()
  {
     let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
