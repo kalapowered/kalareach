@@ -1789,7 +1789,7 @@ async fn faults_opened(health: &kr_worker::persistence::JournalHealth, count: u6
 /// notice's own, and this test's runtime runs nothing else until it waits. Only the journal
 /// recovers before each notice is looked for, so what brings the write is the journal's recovery,
 /// not the broker's or another notice.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn an_adapter_transition_the_journal_refuses_is_written_once_the_journal_recovers() {
     let host = host().await;
     let bound = bound(&host);
