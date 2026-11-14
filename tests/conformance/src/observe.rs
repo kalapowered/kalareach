@@ -44,27 +44,32 @@ const SEGMENT_64: u32 = 0x19;
 /// What a step's log says about programs the system would not start.
 #[derive(Clone, Debug, Serialize)]
 pub struct Observed {
-    /// Why the log was not read, when it was not: what was found at its path in place of a regular
-    /// file, or why it could not be read. No program is then named.
+    /// Why the log was not read whole, when it was not: what was found at its path in place of a
+    /// regular file, why it could not be read, or that its read failed part of the way. A log that
+    /// was not opened, or that was not read in time, names no program. After a read that failed
+    /// part of the way, the programs read before the failure are kept.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<Found>,
-    /// Each program, in the order the log names them.
+    /// Each program, first those that Cargo's or the runner's lines name, in the order the log
+    /// names them, then those that only the shell's lines name.
     pub programs: Vec<Program>,
     /// Whether the log also shows a test that ran and failed. Such a step failed for more than a
     /// program that could not be run, whatever the programs show.
     pub test_failed: bool,
-    /// Whether the log shows a failure that no program named accounts for: a program that ended
-    /// without being refused, a target with a harness of its own that exited with a failure, or a
-    /// build that did not compile.
+    /// Whether the log shows a failure that no refused program accounts for: a failed target that
+    /// has no cause after Cargo's line about it that names a refused program (a target that exits
+    /// with status 101 has none), a failed command whose program is not a refused one, or a build
+    /// that did not compile. Only lines of Cargo and of the runner are read, and not what a test
+    /// printed.
     pub unexplained_failure: bool,
-    /// Whether the log names more programs than the record holds.
+    /// Whether the log names more programs than the observation holds.
     pub incomplete: bool,
 }
 
 impl Observed {
     /// Whether the step fits a program written damaged: its log was read whole, no test ran and
-    /// failed, no failure is left that a refused program does not account for, the record names
-    /// every program that was refused, and every one of them shows damage.
+    /// failed, no failure is left that a refused program does not account for, the observation
+    /// holds every program that the log names as refused, and every one of them shows damage.
     #[must_use]
     pub fn damage_seen(&self) -> bool {
         self.log.is_none()
@@ -91,8 +96,9 @@ pub struct Program {
     pub path: String,
     /// The log's own lines about it.
     pub lines: Vec<String>,
-    /// Whether the runner recorded, in a file of its own that no program is told of, that it could
-    /// not start the program. The log's lines say the same for people and do not decide this.
+    /// Whether the runner recorded, in a file of its own for this step, that it could not start
+    /// the program. The log's lines select the programs that are looked up; the runner's record,
+    /// and not a line, decides this.
     pub said_by_runner: bool,
     /// When the file was looked at, in seconds since the epoch.
     pub observed_at: u64,
@@ -544,8 +550,9 @@ fn same_object(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
 }
 
-/// Windows offers no stable identity of an open file, so a regular file that replaced the one
-/// that was examined is not told apart here: only a link is.
+/// Off Unix the identity of an open file is not used (on Windows the standard library gives it
+/// only through an unstable accessor), so a regular file that replaced the one that was examined
+/// is not told apart here: only a link is.
 #[cfg(not(unix))]
 fn same_object(_a: &Metadata, _b: &Metadata) -> bool {
     true
@@ -620,7 +627,8 @@ fn examine(path: &Path) -> Result<Metadata, Found> {
 }
 
 /// Opens the regular file that [`examine`] described, and takes it only if the object opened is
-/// that file: a link put at the name since, or any other object, is what is found instead.
+/// not a link or another object that is not a regular file, and, on Unix, is the same file by
+/// device and inode: what is found instead is a link put at the name since, or any other object.
 fn open_looked(path: &Path, seen: &Metadata) -> Result<(File, Metadata), Found> {
     let file = match open_without_following(path) {
         Ok(file) => file,
@@ -678,8 +686,8 @@ pub fn observe_file(path: &Path) -> Found {
     }
 }
 
-/// The first bytes of the file `seen` described, and what the opened file is, when the path still
-/// leads to that regular file.
+/// The first bytes of the file `seen` described, and what the opened file is, when the path leads
+/// to a regular file (to the same one on Unix; elsewhere another regular file is not told apart).
 fn read_head(path: &Path, seen: &Metadata) -> Result<(Vec<u8>, Metadata), Found> {
     let (file, opened) = open_looked(path, seen)?;
     let mut head = Vec::new();
@@ -1357,7 +1365,8 @@ mod files {
     }
 
     /// Moves the file at `name` to `moved` and puts a link at `name` to it. Windows lets an account
-    /// make a link only with a privilege, so this says whether the link was made.
+    /// make a link only with a privilege or in developer mode, so this says whether the link was
+    /// made.
     fn replaced_by_a_link(name: &Path, moved: &Path) -> bool {
         std::fs::rename(name, moved).unwrap();
         #[cfg(unix)]

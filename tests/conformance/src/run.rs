@@ -352,9 +352,10 @@ pub const STEP_VARIABLE: &str = "KR_CONFORMANCE_STEP";
 /// that is not recorded.
 pub const MOST_RECORDS: usize = 64;
 
-/// Records that `executable` could not be started in this step: the report reads this, and not the
-/// log, to know that a program never ran. A record that cannot be made is not made, and the
-/// program then counts as one that ran and failed.
+/// Records that `executable` could not be started in this step: the report reads this, and not a
+/// line of the log, to know that a program never ran. A record that cannot be made is not made, and
+/// a file that holds part of a record does not match the program, so a test of that program is
+/// then failed and not `not_run`.
 fn record_refusal(executable: &str, error: &std::io::Error) {
     let Some(step) = std::env::var(STEP_VARIABLE)
         .ok()
