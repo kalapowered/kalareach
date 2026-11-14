@@ -1304,23 +1304,25 @@ What each platform needs:
 The `companion-bundle` workflow builds and reads the Windows bundle. No job builds a macOS or a
 Linux bundle.
 
-The application itself links against the dynamic Visual C++ runtime. The workspace's
-`.cargo/config.toml` excludes the static runtime from the linker options for the
-`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` targets because the C library the workspace
-vendors asks for the static runtime. This causes problems with the static and dynamic runtime both
-being linked because then there are two heaps and two copies of the runtime state. The Tauri command
-line sets `STATIC_VCRUNTIME=true` in the environment for the desktop build unless it's already
-`false`. The build script refuses a build that asks for the static runtime. To avoid this error this
-command sets it to `false` on Windows, whatever the environment holds. If it was already set to
-something else it prints the previous value and that it's replacing it. Each build, on any platform,
-prints tauri-build's warning that `STATIC_VCRUNTIME` is deprecated, which is expected while the
-variable is set.
+The application links the static C runtime. The workspace's `.cargo/config.toml` gives the
+`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` targets the `crt-static` target feature, and
+the C library the workspace vendors is built for that runtime too, so the program and the library
+share one heap and one copy of the runtime state. Tauri's own `STATIC_VCRUNTIME` is a different
+thing: it links the Visual C++ runtime statically and the universal runtime dynamically, and its link
+arguments would put a second runtime in the link. The Tauri command line sets `STATIC_VCRUNTIME=true`
+in the environment for the desktop build unless it's already `false`, and the build script refuses a
+build that asks for it. To avoid this error this command sets it to `false` on Windows, whatever the
+environment holds. If it was already set to something else it prints the previous value and that it's
+replacing it. Each build, on any platform, prints tauri-build's warning that `STATIC_VCRUNTIME` is
+deprecated, which is expected while the variable is set.
 
 On Windows the build takes its rustflags from the repository's `.cargo/config.toml` file alone, as
 far as the environment and the command's arguments reach. If any of `RUSTFLAGS`,
 `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` or `CARGO_TARGET_*_RUSTFLAGS` are set in the
-environment then it errors and explains why. The first two replace the link options in the file, and
-the other two are a second source of flags that the command does not take. It also errors if `LINK`
+environment then it errors and explains why. The first two replace the `crt-static` target feature
+and the link options in the file with no message, and the other two are a second source of flags
+that the command does not take. `kr-crypto`'s build script refuses any MSVC build whose target
+features lack `crt-static`, whichever way the feature was lost. It also errors if `LINK`
 or `_LINK_`, which the linker reads before and after its options, or `SODIUM_LIB_DIR` or
 `SODIUM_USE_PKG_CONFIG`, which make libsodium's crate link another library than the archive, are set. Running `tauri build` on
 Windows without this command, with `STATIC_VCRUNTIME` not already `false`, causes the build to error
@@ -1342,7 +1344,8 @@ or the Visual C++ runtime, by its name, or as not found, and none of these fails
 C++ runtime comes from the runner, because neither installer carries it. It never runs the
 application. It doesn't upload anything.
 
-The installers bring the program alone, so the Visual C++ runtime must already be on the machine.
+The program needs no runtime library on the machine: the installers bring it alone, and it imports
+Windows system libraries only.
 
 Building the macOS bundle currently doesn't work with Xcode 27.2 (`ld-27106.1`) and macOS 27.2.1.
 Tauri sets the `MACOSX_DEPLOYMENT_TARGET` environment variable to the value of the

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Holds the desktop bundle build's entry to what it must give and refuse.
 //
-// The entry runs the desktop bundle build with the static Visual C++ runtime turned off on Windows,
-// where the command line tool turns it on and the package's build script refuses that build. None of
+// The entry runs the desktop bundle build with Tauri's static Visual C++ runtime (a hybrid that would
+// put two runtimes in the link) turned off on Windows, where the command line tool turns it on and the
+// package's build script refuses that build. None of
 // these cases runs a build: the decision about a command's arguments and the environment a build is
 // given are functions that take the platform and the environment in, so each platform's answer is held
 // here on whichever machine this runs on. The last cases start the command itself, with arguments it
@@ -116,8 +117,8 @@ for (const platform of ['darwin', 'linux']) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}`, 'true', refused(argv, platform))
   }
 }
-// On Windows the MSVC targets are the two that the link options of `.cargo/config.toml` name, and any
-// other is refused: the static runtime would not be left out of its link.
+// On Windows the MSVC targets are the two that `.cargo/config.toml` gives the `crt-static` target feature,
+// and any other is refused: its link would not carry the static C runtime.
 for (const argv of [
   ['build', '--target', 'x86_64-pc-windows-msvc'],
   ['build', '--target=aarch64-pc-windows-msvc'],
@@ -133,7 +134,7 @@ for (const argv of [
   ['build', '--tar', 'x86_64-uwp-windows-msvc'],
   ['build', '-dt', 'thumbv7a-pc-windows-msvc']
 ]) {
-  held(`\`pnpm desktop ${argv.join(' ')}\` is refused on Windows, since its link has no options that leave the static runtime out`, 'true', refused(argv, 'win32'))
+  held(`\`pnpm desktop ${argv.join(' ')}\` is refused on Windows, since .cargo/config.toml gives it no crt-static`, 'true', refused(argv, 'win32'))
 }
 // The command line tool does not read `CARGO_BUILD_TARGET`, and cargo builds for it into the directory of
 // that target, so the bundle would be made from the program of another build: it is refused on every
@@ -291,8 +292,8 @@ held(
 )
 
 // On Windows an environment that gives the compiler flags is refused, in every spelling of the name and
-// with any value, an empty one included. `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` replace the link
-// options that keep the static runtime out of the link (an empty value leaves cargo no flags from its
+// with any value, an empty one included. `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` replace the `crt-static`
+// target feature and the link options of the configuration (an empty value leaves cargo no flags from its
 // configuration either); the other two add to them or are ignored, and are refused as a second source.
 for (const name of [
   'RUSTFLAGS',
