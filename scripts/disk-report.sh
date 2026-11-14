@@ -20,6 +20,11 @@
 # space and sleeps again, so it starts no other program; `end` stops it by the pid `begin`
 # recorded. A measurement that asserts on an idle host is preceded by `end` and followed by `report`.
 #
+# On a hosted macOS runner `end` also reads the kernel's log for the lines that say a write to the
+# data volume failed, from the first sample to now, and keeps them in `disk-faults.txt` in the
+# test evidence directory. The volume has returned I/O errors in bursts while a build ran, and a
+# program the linker wrote in a burst cannot be started: these lines are what says so.
+#
 # This reads and reports. It removes nothing, and it exits 0 whatever it could not read, including
 # a disk with no room left to write the samples to.
 
@@ -211,6 +216,52 @@ list_intervals() {
     done
 }
 
+# The kernel's lines about a write to storage that failed, from the first sample to now, on a
+# hosted macOS runner. The log is read as root where the runner allows it and the read is given up
+# after 90 seconds.
+kernel_storage_errors() {
+    [ "$(uname -s)" = Darwin ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] || return 0
+    first="$(awk '$1 == "S" { print $2; exit }' "$samples" 2> /dev/null)"
+    [ -n "${first:-}" ] || return 0
+    minutes=$((($(date +%s) - first) / 60 + 2))
+    out="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/disk-faults.txt"
+    mkdir -p "$(dirname "$out")" 2> /dev/null
+    predicate='process == "kernel" AND (eventMessage CONTAINS "I/O error" OR eventMessage CONTAINS "cluster_pageout" OR eventMessage CONTAINS "cluster_push() failed" OR eventMessage CONTAINS "trim_list failed")'
+    read_ok=0
+    for attempt in sudo plain; do
+        if [ "$attempt" = sudo ]; then
+            sudo -n /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate" > "$out" 2> /dev/null &
+        else
+            /usr/bin/log show --last "${minutes}m" --style compact --predicate "$predicate" > "$out" 2> /dev/null &
+        fi
+        reader=$!
+        waited=0
+        while kill -0 "$reader" 2> /dev/null && [ "$waited" -lt 90 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if kill -0 "$reader" 2> /dev/null; then
+            kill "$reader" 2> /dev/null || true
+            echo "  the kernel's log was not read in 90 seconds"
+            return 0
+        fi
+        if wait "$reader"; then
+            read_ok=1
+            break
+        fi
+    done
+    if [ "$read_ok" -ne 1 ]; then
+        echo "  the kernel's log could not be read"
+        return 0
+    fi
+    count="$(grep -c 'kernel\[' "$out" || true)"
+    if [ "${count:-0}" -eq 0 ]; then
+        echo "  the kernel logged no storage error since the job began"
+    else
+        echo "  the kernel logged $count storage error lines since the job began, from $(grep 'kernel\[' "$out" | sed -n '1p' | cut -c1-19) to $(grep 'kernel\[' "$out" | sed -n '$p' | cut -c1-19) (kept in disk-faults.txt)"
+    fi
+}
+
 case "$mode" in
     begin)
         mkdir -p "$state" 2> /dev/null
@@ -230,6 +281,7 @@ case "$mode" in
         say_lowest
         mark
         list_intervals
+        kernel_storage_errors
         ;;
     report)
         report
