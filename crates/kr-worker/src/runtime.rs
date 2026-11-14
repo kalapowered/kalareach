@@ -23,6 +23,7 @@ use kr_shell_integration::host::package::PUBLISH_COMMAND;
 use tokio::sync::{Notify, mpsc};
 
 use crate::error::{Result, WorkerError};
+use crate::input_room::Carried;
 use crate::session::{
     CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, InputBatch, PasteTransition, Session,
 };
@@ -676,7 +677,7 @@ pub(crate) fn lock_session(
 /// domain go, so the order bytes reach the terminal in is the order they were accepted in.
 #[derive(Clone, Debug)]
 struct Sink {
-    input: mpsc::UnboundedSender<InputBatch>,
+    input: mpsc::UnboundedSender<Carried>,
     /// Woken when something new is held and the recogniser's timer has to look again.
     wake: Arc<Notify>,
     /// What tells the supervision that a process this session owns can have appeared.
@@ -690,7 +691,7 @@ impl Sink {
     /// the writer is handed has come through the domain's queue. That queue is where a published
     /// fence holds back the input behind it, and a batch handed over any other way could reach the
     /// terminal ahead of its fence.
-    fn send(&self, batches: Vec<InputBatch>) {
+    fn send(&self, batches: Vec<Carried>) {
         let sent = !batches.is_empty();
         for batch in batches {
             let _ = self.input.send(batch);
@@ -713,6 +714,9 @@ impl Sink {
     fn flush(&self, domain: &crate::input_domain::InputShared) {
         let mut input = domain.lock();
         self.send(input.take_pending());
+        // The pump tops the lane's window up at every wake: it is the one task that is sure to
+        // run after the writer has dropped what it was done with.
+        input.top_up();
     }
 }
 
@@ -796,7 +800,6 @@ impl SessionRuntime {
         let domain = session.input();
         let (
             gate,
-            room,
             dropped_replies,
             unwritten_replies,
             queued_lease,
@@ -809,7 +812,6 @@ impl SessionRuntime {
             let writer = input.writer();
             (
                 Arc::clone(&writer.gate),
-                Arc::clone(&writer.room),
                 Arc::clone(&writer.dropped_replies),
                 Arc::clone(&writer.unwritten_replies),
                 Arc::clone(&writer.queued_lease_bytes),
@@ -848,7 +850,7 @@ impl SessionRuntime {
         let trace = crate::trace::LockTrace::shared();
         session.record_into(trace.clone());
         let session = Arc::new(Mutex::new(session));
-        let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
+        let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<Carried>();
         // Bounded on purpose. Section 9 says a slow *client* must never hold the read loop, and it
         // also says the worker honours the operating system's own backpressure when parsing itself
         // cannot keep up, and never drops parser input. A bounded handoff does both: clients are
@@ -951,7 +953,6 @@ impl SessionRuntime {
 
         let writer_fence = Arc::clone(&fence);
         let writer_gate = Arc::clone(&gate);
-        let writer_room = Arc::clone(&room);
         let writer_dropped_replies = Arc::clone(&dropped_replies);
         let writer_unwritten_replies = Arc::clone(&unwritten_replies);
         let writer_lease = Arc::clone(&queued_lease);
@@ -973,12 +974,14 @@ impl SessionRuntime {
             // whether it needs a paste terminator. The framer says what the accepted stream means;
             // a batch this writer never wrote never happened to the application.
             let mut last_fence = writer_fence.load(Ordering::Acquire);
-            while let Some(batch) = input_receiver.blocking_recv() {
+            while let Some(mut carried) = input_receiver.blocking_recv() {
                 // What this batch holds in the room is given back however the writer is done with
                 // it: by the bytes the terminal takes as they are written, and for the rest when
-                // this goes out of scope, whether the batch was written whole, dropped as stale or
-                // expired, abandoned part way, or the writer ended.
-                let mut owed = writer_room.owed_for(&batch);
+                // this goes out of scope with the debt it carries, whether the batch was written
+                // whole, dropped as stale or expired, abandoned part way, or the writer ended. The
+                // guard of its write goes at the same moment.
+                let mut debt = carried.debt.take();
+                let batch = &carried.batch;
                 #[cfg(feature = "testing")]
                 writer_hold.stand();
                 #[cfg(feature = "testing")]
@@ -1099,7 +1102,9 @@ impl SessionRuntime {
                     },
                     &mut |written| {
                         // Released only once the application has it. Until then it is owed.
-                        owed.written(written);
+                        if let Some(debt) = debt.as_mut() {
+                            debt.written(written);
+                        }
                         if is_reply {
                             release(&writer_unwritten_replies, written);
                         }
@@ -1507,6 +1512,17 @@ impl SessionRuntime {
         let pump_session = Arc::clone(&session);
         let pump_domain = Arc::clone(&domain);
         let pump_sink = sink.clone();
+        // The window's top-up. A guard or a debt that drops anywhere, the writer's thread among
+        // them, asks for it without a lock; this task takes the input domain alone, never the
+        // session, so a commit that holds the session cannot keep the credit from the host.
+        let topup_domain = Arc::clone(&domain);
+        let topup_room = topup_domain.lock().input_room();
+        tokio::spawn(async move {
+            loop {
+                topup_room.topup().asked().await;
+                topup_domain.lock().top_up();
+            }
+        });
         tokio::spawn(async move {
             loop {
                 pump_domain.pump_asked().await;
