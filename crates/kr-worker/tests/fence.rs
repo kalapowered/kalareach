@@ -1506,7 +1506,7 @@ async fn keys_typed_behind_a_written_fence_are_not_held() {
                 std::time::Instant::now(),
             )
             .expect("the keys are accepted");
-        session.take_pending_input()
+        kr_worker::testing::take_pending_input(&mut session)
     };
     assert!(
         taken.iter().any(|batch| matches!(
@@ -7298,8 +7298,7 @@ async fn an_answer_leaves_the_lane_with_the_lanes_deadline() {
     // The terminal's own question about what it is talking to, which the host answers itself.
     session.ingest_output(b"\x1b[c");
     let after = clock.boot_elapsed_ms();
-    let replies: Vec<_> = session
-        .take_pending_input()
+    let replies: Vec<_> = kr_worker::testing::take_pending_input(&mut session)
         .into_iter()
         .filter_map(|batch| match batch {
             kr_worker::session::InputBatch::Reply {
@@ -7350,7 +7349,7 @@ async fn answers_that_outrun_one_drain_of_the_lane_reach_the_terminal_in_the_ord
         }
         session.ingest_output(&asked);
         let mut handed = Vec::new();
-        for batch in session.take_pending_input() {
+        for batch in kr_worker::testing::take_pending_input(&mut session) {
             if let kr_worker::session::InputBatch::Reply { bytes, .. } = batch {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
                 for answer in text.split("\x1b]4;").skip(1) {
