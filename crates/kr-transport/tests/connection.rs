@@ -1288,6 +1288,76 @@ async fn every_stream_class_is_charged_against_the_connection_send_budget() {
     let _ = accepting.await.expect("the host task");
 }
 
+/// A write that finds the connection's send budget full is refused with nothing charged, and its
+/// writer can wait for room to be given back and write again. The wait is made before the attempt,
+/// as a writer that retries makes it, so room given back between the refusal and the wait is not
+/// missed.
+#[tokio::test]
+async fn a_write_that_finds_the_send_budget_full_goes_out_once_room_is_given_back() {
+    let (host, client) = paired_pair().await;
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let registry = registry(
+        authorised.connection_id,
+        SendLimits {
+            max_bulk_streams: 4,
+            max_bulk_queued_bytes: 1024,
+            max_queued_bytes: 2048,
+        },
+    );
+    let mut stream = registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a terminal stream");
+    let message = ParamsValue::new(CanonicalValue::bytes(b"keys".to_vec()));
+    let held = registry
+        .budget()
+        .reserve(StreamClass::Live, 2048)
+        .expect("another write holding the whole ceiling");
+
+    let mut released = Box::pin(registry.budget().released());
+    let error = stream
+        .write_message(&message)
+        .await
+        .expect_err("a write the budget has no room for");
+    assert!(
+        matches!(
+            error,
+            TransportError::LimitExceeded {
+                what: "queued bytes",
+                limit: 2048
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(registry.budget().queued_bytes(), 2048);
+    assert!(
+        futures::poll!(&mut released).is_pending(),
+        "the wait for room ended with nothing given back"
+    );
+
+    drop(held);
+    assert!(
+        futures::poll!(&mut released).is_ready(),
+        "room was given back and the wait did not end"
+    );
+    stream
+        .write_message(&message)
+        .await
+        .expect("the write goes out in the room that was given back");
+    assert_eq!(registry.budget().queued_bytes(), 0);
+
+    let _ = accepting.await.expect("the host task");
+}
+
 #[tokio::test]
 async fn a_message_is_bounded_by_the_ceiling_it_will_be_charged_against() {
     // A message is encoded under the smallest bound that applies, so a frame the budget would
