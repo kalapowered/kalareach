@@ -761,7 +761,7 @@ fn a_run_with_a_step_run_again_ends_red_with_no_warning_where_the_evidence_is_no
     let script = source.path().join("script");
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
     let full = ROOM_UNDER_FLOOR;
-    let cases: [(&str, Option<&Path>, Evidence, &str); 4] = [
+    let cases: [(&str, Option<&Path>, Evidence, &str); 5] = [
         (
             "a damaged program and no line of the kernel's log",
             None,
@@ -797,6 +797,15 @@ fn a_run_with_a_step_run_again_ends_red_with_no_warning_where_the_evidence_is_no
                 free: Ok(ROOM),
             },
             "no damage found",
+        ),
+        (
+            "a damaged program, a kernel line and a volume whose free space could not be read",
+            None,
+            Evidence {
+                kernel: Ok(KERNEL_FAULT),
+                free: Err("no df"),
+            },
+            "the volume's free space was not read: no df",
         ),
     ];
     for (what, source, evidence, said) in cases {
