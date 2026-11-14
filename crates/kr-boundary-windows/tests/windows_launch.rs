@@ -2785,17 +2785,21 @@ fn the_four_ways_to_start_a_program_outside_the_job_start_nothing_from_a_launche
         r#"$m = '{program}'; $d = '{scratch}'
 'ran' | Out-File -FilePath "$d\ran.txt"
 function Form($name, [scriptblock]$body) {{ try {{ & $body; "$name finished" }} catch {{ "$name failed: $($_.Exception.GetType().Name) 0x$($_.Exception.HResult.ToString('X8')) $($_.Exception.Message.Trim())" }} }}
-function Native($label, [scriptblock]$call) {{
+function Quote($a) {{ '"' + ($a -replace '"', '\"') + '"' }}
+function Native($label, $file, [string[]]$arguments) {{
   try {{
-    $all = @(& $call 2>&1); $code = $LASTEXITCODE
-    $out = (($all | Where-Object {{ $_ -isnot [System.Management.Automation.ErrorRecord] }} | Out-String).Trim() -replace '\s+', ' ')
-    $err = (($all | Where-Object {{ $_ -is [System.Management.Automation.ErrorRecord] }} | Out-String).Trim() -replace '\s+', ' ')
-    "$label exit $code; stdout: $out; stderr: $err"
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $file
+    $info.Arguments = (($arguments | ForEach-Object {{ Quote $_ }}) -join ' ')
+    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($info)
+    $out = $p.StandardOutput.ReadToEndAsync(); $err = $p.StandardError.ReadToEndAsync()
+    if ($p.WaitForExit(60000)) {{ "$label exit $($p.ExitCode); stdout: $($out.Result.Trim() -replace '\s+', ' '); stderr: $($err.Result.Trim() -replace '\s+', ' ')" }} else {{ $p.Kill(); "$label did not end within 60 seconds and was ended" }}
   }} catch {{ "$label could not start: $($_.Exception.GetType().Name) 0x$($_.Exception.HResult.ToString('X8')) $($_.Exception.Message.Trim() -replace '\s+', ' ')" }}
 }}
 Form 'wmi' {{ $r = ([wmiclass]'Win32_Process').Create("`"$m`" marker `"$d\wmi.txt`""); "wmi returned $($r.ReturnValue)" }}
-Form 'task' {{ Native 'schtasks /create' {{ schtasks.exe /create /tn KrLaunchTask /tr "`"$m`" marker `"$d\task.txt`"" /sc once /st 00:00 /f }}; Native 'schtasks /run' {{ schtasks.exe /run /tn KrLaunchTask }} }}
-Form 'bits' {{ Native 'bitsadmin /create' {{ bitsadmin.exe /create /download KrLaunchJob }}; Native 'bitsadmin /addfile' {{ bitsadmin.exe /addfile KrLaunchJob C:\Windows\System32\drivers\etc\hosts "$d\bits-out.txt" }}; Native 'bitsadmin /setnotifycmdline' {{ bitsadmin.exe /setnotifycmdline KrLaunchJob $m "x marker $d\bits.txt" }}; Native 'bitsadmin /resume' {{ bitsadmin.exe /resume KrLaunchJob }}; Start-Sleep 10; Native 'bitsadmin /complete' {{ bitsadmin.exe /complete KrLaunchJob }} }}
+Form 'task' {{ $s = 'C:\Windows\System32\schtasks.exe'; Native 'schtasks /create' $s @('/create', '/tn', 'KrLaunchTask', '/tr', ('"' + $m + '" marker "' + $d + '\task.txt"'), '/sc', 'once', '/st', '00:00', '/f'); Native 'schtasks /run' $s @('/run', '/tn', 'KrLaunchTask') }}
+Form 'bits' {{ $b = 'C:\Windows\System32\bitsadmin.exe'; Native 'bitsadmin /create' $b @('/create', '/download', 'KrLaunchJob'); Native 'bitsadmin /addfile' $b @('/addfile', 'KrLaunchJob', 'C:\Windows\System32\drivers\etc\hosts', "$d\bits-out.txt"); Native 'bitsadmin /setnotifycmdline' $b @('/setnotifycmdline', 'KrLaunchJob', $m, "x marker $d\bits.txt"); Native 'bitsadmin /resume' $b @('/resume', 'KrLaunchJob'); Start-Sleep 10; Native 'bitsadmin /complete' $b @('/complete', 'KrLaunchJob') }}
 Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.Application')); $a.Document.ActiveView.ExecuteShellCommand($m, $d, "marker `"$d\com.txt`"", '7') }}
 'done' | Out-File -FilePath "$d\done.txt""#
     );
