@@ -1770,22 +1770,26 @@ impl WorkerService {
     ///
     /// Returns an error when accepting fails for a reason other than a peer going away.
     pub async fn serve(self: Arc<Self>, listener: Listener) -> Result<()> {
+        // Everything this starts is kept in one set, which ends its tasks when this call is
+        // dropped. Each of them holds a clone of the service, and a task that nothing ends would
+        // keep the session and its files for as long as the program runs.
+        let mut tasks = tokio::task::JoinSet::new();
         // The host's own cadence, started before the first connection is accepted. Retention and
         // the clocks are the host's business rather than a caller's, and a session that is never
         // asked anything still has records to collect and a clock that can move.
         let maintenance = Arc::clone(&self);
-        tokio::spawn(async move { maintenance.maintain().await });
+        tasks.spawn(async move { maintenance.maintain().await });
         // The copies a recovery is read out of have a deadline of their own, shorter than that
         // cadence, and a client that stops paging makes no call to notice it in. This waits for
         // the next one rather than looking on a cadence, so the memory goes back when the copy
         // ends and not at some later pass.
         let reclaiming = Arc::clone(&self);
-        tokio::spawn(async move { reclaiming.reclaim_recoveries().await });
+        tasks.spawn(async move { reclaiming.reclaim_recoveries().await });
         // The transitions of a package's revocation state, the agent turns that ended and the
         // commands that failed go to the session's journal, which is where the attention source
         // reads them from.
         let session_notices = self.runtime.session().notices();
-        tokio::spawn(Self::record_notices(
+        tasks.spawn(Self::record_notices(
             Arc::downgrade(&self),
             Arc::clone(&self.broker),
             session_notices,
@@ -1798,18 +1802,28 @@ impl WorkerService {
             .expect("the expiry channel is not poisoned")
             .take()
         {
-            tokio::spawn(Arc::clone(&self).release_expired_grants(expired));
+            tasks.spawn(Arc::clone(&self).release_expired_grants(expired));
         }
         // The components of this session's bindings are registered with the plugin runtime from
         // here. Nothing is asked of anybody until a binding wants one.
         if let Some(request) = self.plugin_runtime.clone() {
-            tokio::spawn(crate::plugin_runtime::link(
+            tasks.spawn(crate::plugin_runtime::link(
                 request,
                 Arc::downgrade(&self.broker),
             ));
         }
         loop {
-            let (connection, peer) = listener.accept().await?;
+            let (connection, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // A listener that failed ends this call and not the host's own work, as it
+                    // always has: the tasks go on, and only dropping this call ends them.
+                    tasks.detach_all();
+                    return Err(error.into());
+                }
+            };
+            // The connections that have ended are let go of before another is counted.
+            while tasks.try_join_next().is_some() {}
             // One session serves a bounded number of connections at once. Without a bound a caller
             // that opened connections and never spoke would take this worker's memory a frame
             // buffer at a time.
@@ -1820,7 +1834,7 @@ impl WorkerService {
             }
             held.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let service = Arc::clone(&self);
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _ = service.run_connection(connection, peer).await;
                 held.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             });
