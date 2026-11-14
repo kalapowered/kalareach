@@ -26,6 +26,7 @@ use crate::libtest::Outcome as LibtestOutcome;
 use crate::map::{self, Binding, Declarations, Map, Place, Reference};
 use crate::plan::{self, ApplicationsPlan, Group, Platform};
 use crate::run::{self, Executed};
+use crate::runner_copy;
 use crate::workspace::{TargetId, TargetKind};
 
 /// The result's schema identifier.
@@ -344,8 +345,9 @@ pub struct Options {
     pub steps: Option<Vec<plan::Step>>,
     /// Variables every step is run with, beyond the report's own environment.
     pub environment: Vec<(String, String)>,
-    /// The `kr-conformance` program, which Cargo runs each test binary through while a step's
-    /// tests are listed.
+    /// The `kr-conformance` program. The run copies it into a directory of its own, compares
+    /// the copy's bytes with it, and gives Cargo the copy as the runner of every listing and
+    /// every run, so a step that links the program again cannot damage the runner.
     pub lister: PathBuf,
     /// Which part of the platform's plan this run is, as the number of the part from 1 and the
     /// number of parts, when the plan is run in parts by separate runs.
@@ -362,6 +364,23 @@ pub enum Stopped {
     /// The evidence directory cannot take this run: it holds an earlier run's report, or the
     /// report's own directory in it could not be made.
     Evidence(String),
+    /// The report's own program could not be copied where no step builds, or the copy is not
+    /// equal to it. No step has run.
+    PrivateCopy(String),
+}
+
+/// Every directory a step of `options` builds in: the repository, which holds the build
+/// directories the plan's scripts name, and the target directory a step is given.
+fn build_directories(options: &Options) -> Vec<PathBuf> {
+    let given = options
+        .environment
+        .iter()
+        .find(|(name, _)| name == "CARGO_TARGET_DIR")
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR"));
+    std::iter::once(options.root.clone())
+        .chain(given.map(PathBuf::from))
+        .collect()
 }
 
 /// Builds the map for a run of `options`.
@@ -464,6 +483,12 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
         Some(part) => plan::part_of(steps, part),
         None => steps,
     };
+    let runner = runner_copy::private_copy(
+        &options.lister,
+        &std::env::temp_dir(),
+        &build_directories(options),
+    )
+    .map_err(Stopped::PrivateCopy)?;
     let mut executed = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         progress(&format!(
@@ -480,7 +505,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                 root: &options.root,
                 evidence: &options.evidence,
                 environment: &options.environment,
-                lister: &options.lister,
+                lister: &runner,
             },
             &map.packages,
         );

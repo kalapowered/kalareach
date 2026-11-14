@@ -1808,11 +1808,17 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
     assert!(document.passed(), "a test no step runs fails nothing");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error() {
-    // Cargo cannot take a runner whose path has a space in it, so the step stops after its build,
-    // before its tests are listed or run.
+    // A runner that ends with a failure for every program it is given, so the step stops after its
+    // build, before its tests are listed or run.
+    use std::os::unix::fs::PermissionsExt;
     let evidence = tempfile::tempdir().expect("an evidence directory");
+    let held = tempfile::tempdir().expect("a directory");
+    let failing = held.path().join("kr-conformance");
+    std::fs::write(&failing, "#!/bin/sh\nexit 1\n").expect("a runner");
+    std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).expect("runnable");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms-lib");
     let options = Options {
         root: tree("forms"),
@@ -1829,9 +1835,7 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
             "the library's tests",
             &["test", "--locked", "--lib"],
         )]),
-        lister: std::env::temp_dir()
-            .join("a directory with spaces")
-            .join("kr-conformance"),
+        lister: failing,
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
@@ -1846,7 +1850,7 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
     assert!(
         reason.starts_with("`cargo test --locked --lib")
             && reason.contains("built this target, and no run of it can be read from that step")
-            && reason.contains("its path has a space in it"),
+            && reason.contains("did not list the step's tests"),
         "{reason}"
     );
     assert!(!document.passed(), "a step that stopped fails the run");
