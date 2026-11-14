@@ -49,6 +49,9 @@ MUTANTS = {
     "M7": [(WINDOWS, VERDICT, "    let _ = (identity(&named)?, identity(&directory)?);\n    Ok(Pointed::Done)\n")],
     # What is not a junction on the first look is said to be done.
     "M8": [(WINDOWS, FIRST_TAG_CHECK, FIRST_TAG_CHECK.replace("NotAJunction", "Done"))],
+    # The junction is pointed in place and then a new one is renamed over it as well.
+    "M11": [(INSTALL, "            windows::Pointed::Done => return Ok(()),\n",
+             "            windows::Pointed::Done => {}\n")],
     # A junction that cannot be opened to be changed is replaced by a rename.
     "M9": [(WINDOWS, CHANGE_OPEN, CHANGE_OPEN.replace("        Err(error) => return Err(error),\n", "        Err(_) => return Ok(Pointed::NotAJunction),\n"))],
 }

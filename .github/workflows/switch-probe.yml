@@ -1,8 +1,8 @@
 name: switch-probe
 
-# Runs the store's tests, a loop of switches beside readers of `current`, and mutations of the
-# in-place switch on hosted Windows. It starts on a push to this one branch whose newest commit
-# message ends in "(run)", and nowhere else.
+# Runs the store's tests on hosted Windows, then one mutation of the in-place switch. It starts on
+# a push to this one branch whose newest commit message ends in "(run)", and nowhere else. It holds
+# no secret, no environment and no deployment step, and only reads the repository.
 on:
   push:
     branches: ["scratch/T-INSTALL-SWITCH-WIN-1-probe"]
@@ -20,21 +20,10 @@ env:
 
 jobs:
   probe:
-    name: ${{ matrix.name }}
+    name: install-and-mutation
     if: ${{ endsWith(github.event.head_commit.message, '(run)') }}
     runs-on: windows-2025
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: loop-1, kind: loop }
-          - { name: loop-2, kind: loop }
-          - { name: loop-3, kind: loop }
-          - { name: loop-4, kind: loop }
-          - { name: mutants-a, kind: mutants, ids: "M1 M2 M3" }
-          - { name: mutants-b, kind: mutants, ids: "M4 M5 M6" }
-          - { name: mutants-c, kind: mutants, ids: "M7 M8 M9" }
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -55,29 +44,13 @@ jobs:
         id: libsodium
         uses: ./.github/actions/libsodium-archive
 
-      - name: What this runner is
-        run: |
-          [System.Environment]::OSVersion.VersionString
-          (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
-          (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
-          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled | Format-List
-
       - name: Build the store's tests
-        if: ${{ matrix.kind == 'loop' }}
         run: cargo test --locked -p kr-ipc --test install --no-run
 
       - name: Run the store's tests, as the landing workflow does
-        if: ${{ matrix.kind == 'loop' }}
         run: cargo test --locked -p kr-ipc --test install -- --skip probe_current_during_a_switch
 
-      - name: Run the loop of switches beside readers
-        if: ${{ !cancelled() && matrix.kind == 'loop' }}
-        env:
-          KR_PROBE_PROTECTION: unchanged
-          KR_PROBE_SECONDS: "840"
-        run: cargo test --locked -p kr-ipc --test install probe_current_during_a_switch -- --nocapture --test-threads=1
-
-      - name: Run the mutations
-        if: ${{ matrix.kind == 'mutants' }}
+      - name: Run the mutation
+        if: ${{ !cancelled() }}
         shell: bash
-        run: bash .github/mutants/run-mutants.sh ${{ matrix.ids }}
+        run: bash .github/mutants/run-mutants.sh M11

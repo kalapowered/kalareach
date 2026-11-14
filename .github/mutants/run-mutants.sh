@@ -36,6 +36,7 @@ for id in "$@"; do
     echo "MUTANT $id: survived: $(grep -E '^test result' "run-$id.log" | head -1)"
   else
     echo "MUTANT $id: killed (exit $code) by: $(grep -E '^test .* FAILED' "run-$id.log" | sed 's/^test //; s/ \.\.\. FAILED//' | tr '\n' ' ')"
+    grep -n -E 'panicked at|the name still names|a_reader_that_holds' "run-$id.log" | head -12
   fi
 done
 git checkout -q -- crates
