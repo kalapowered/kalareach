@@ -296,7 +296,7 @@ impl Drop for EvidenceTask {
 /// The worker's endpoint server.
 pub struct WorkerService {
     /// What the session's application is doing, followed for as long as this service lives.
-    evidence: EvidenceTask,
+    _evidence: EvidenceTask,
     runtime: Arc<SessionRuntime>,
     /// The session's marks and its beat, which this service's idle clocks fall on.
     activity: Arc<crate::lifecycle::Activity>,
@@ -792,7 +792,7 @@ impl WorkerService {
         }
         let activity = runtime.session().activity();
         Ok(Self {
-            evidence,
+            _evidence: evidence,
             activity,
             runtime,
             identity,
