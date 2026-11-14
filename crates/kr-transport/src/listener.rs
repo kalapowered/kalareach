@@ -49,6 +49,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// connections, not by forgetting a challenge.
 pub const DEFAULT_MAX_OUTSTANDING_CHALLENGES: usize = 1024;
 
+/// Default number of terminal-input streams a connection may hold: one for each attachment that
+/// may type at once.
+pub const DEFAULT_MAX_INPUT_STREAMS: usize = 4;
+
 /// Everything the listener needs beyond the host's own implementation.
 #[derive(Debug)]
 pub struct ListenerConfig {
@@ -61,6 +65,14 @@ pub struct ListenerConfig {
     pub controller_generation: ControllerGeneration,
     /// The bulk-stream limits each connection is held to.
     pub send_limits: SendLimits,
+    /// How many terminal-input streams a connection may hold, for a host whose
+    /// [`ListenerConfig::accepted_kinds`] names [`StreamKind::TerminalInput`]: the stream limit
+    /// the library gives the device has room for this many beside the control stream, the bulk
+    /// streams and the places for headers. A host that does not take input streams gives a device
+    /// no room for them, whatever this is. The library holds the device to the stream limit and
+    /// no further: counting the input streams a host has taken, and refusing one past this
+    /// number, is the host's.
+    pub max_input_streams: usize,
     /// What an unpaired connection may do.
     pub preauth_limits: PreAuthLimits,
     /// How long an action window lasts, capped at five minutes.
@@ -107,6 +119,7 @@ impl ListenerConfig {
             epochs,
             controller_generation,
             send_limits: SendLimits::default(),
+            max_input_streams: DEFAULT_MAX_INPUT_STREAMS,
             preauth_limits: PreAuthLimits::default(),
             action_window_validity: MAX_WINDOW_VALIDITY,
             max_outstanding_challenges: DEFAULT_MAX_OUTSTANDING_CHALLENGES,
@@ -515,8 +528,8 @@ pub struct AuthorisedSession {
     /// of the connection's bulk slots, which the four places share with every other attachment
     /// stream; a stream of any other kind holds none, so a host that accepts one can hold more
     /// streams than the queue's depth: at most as many as the connection's stream limit allows
-    /// beside its control stream, 9 with the defaults, of which at most `max_bulk_streams` are
-    /// attachment streams. The receiver ends when the connection does, and a stream still queued
+    /// beside its control stream, 9 with the defaults, or 13 when it also takes input streams, of
+    /// which at most `max_bulk_streams` are attachment streams. The receiver ends when the connection does, and a stream still queued
     /// when it is dropped is reset.
     pub data_streams: DataStreams,
     /// The deadlines a data stream is held to ([`ListenerConfig::deadlines`]), for the waits a
@@ -565,6 +578,8 @@ pub struct DataStreams {
 struct Credit {
     connection: Connection,
     max_bulk_streams: usize,
+    /// Nothing when the host takes no terminal-input stream.
+    max_input_streams: usize,
     /// Set once the first `recv` has raised the limit.
     raised: bool,
 }
@@ -582,7 +597,11 @@ impl DataStreams {
     /// asks [`DataStream::is_revoked`] again where it relies on it.
     pub async fn recv(&mut self) -> Option<DataStream> {
         if let Some(credit) = self.credit.as_mut().filter(|credit| !credit.raised) {
-            allow_data_streams(&credit.connection, credit.max_bulk_streams);
+            allow_data_streams(
+                &credit.connection,
+                credit.max_bulk_streams,
+                credit.max_input_streams,
+            );
             credit.raised = true;
         }
         loop {
@@ -1261,6 +1280,15 @@ async fn serve_authorised<H: HostHandler>(
         credit: (!state.config.accepted_kinds.is_empty()).then(|| Credit {
             connection: connection.clone(),
             max_bulk_streams: state.config.send_limits.max_bulk_streams,
+            max_input_streams: if state
+                .config
+                .accepted_kinds
+                .contains(&StreamKind::TerminalInput)
+            {
+                state.config.max_input_streams
+            } else {
+                0
+            },
             raised: false,
         }),
     };

@@ -376,6 +376,9 @@ pub struct FrameReader {
     interrupted: bool,
     /// The deadlines a frame is read under, when it is read under any.
     deadlines: Option<Arc<dyn Deadlines>>,
+    /// Whether the wait for a frame to begin is held to [`DeadlineKind::Idle`], when the reader
+    /// has deadlines at all.
+    idle_bound: bool,
 }
 
 /// How far a read into a buffer got.
@@ -397,6 +400,7 @@ impl FrameReader {
             max_payload: codec.max_payload_len(),
             interrupted: false,
             deadlines: None,
+            idle_bound: true,
         }
     }
 
@@ -410,6 +414,17 @@ impl FrameReader {
     #[must_use]
     pub fn with_deadlines(mut self, deadlines: Arc<dyn Deadlines>) -> Self {
         self.deadlines = Some(deadlines);
+        self
+    }
+
+    /// Leaves the wait for a frame to begin without a deadline.
+    ///
+    /// For a stream that is quiet for as long as its peer has nothing to say. A frame that has
+    /// begun is still held to [`DeadlineKind::Stall`]: what this lifts is the bound on the quiet
+    /// between frames, and nothing else.
+    #[must_use]
+    pub fn without_idle_deadline(mut self) -> Self {
+        self.idle_bound = false;
         self
     }
 
@@ -448,6 +463,7 @@ impl FrameReader {
             max_payload: codec.max_payload_len(),
             interrupted: self.interrupted,
             deadlines: self.deadlines,
+            idle_bound: self.idle_bound,
         }
     }
 
@@ -568,7 +584,12 @@ impl FrameReader {
             } else {
                 DeadlineKind::Stall
             };
-            let mut deadline = Deadline::start(self.deadlines.as_ref(), kind);
+            let source = if kind == DeadlineKind::Idle && !self.idle_bound {
+                None
+            } else {
+                self.deadlines.as_ref()
+            };
+            let mut deadline = Deadline::start(source, kind);
             let read = tokio::select! {
                 read = self.stream.read(&mut buffer[filled..]) => Some(read),
                 () = &mut deadline => None,
