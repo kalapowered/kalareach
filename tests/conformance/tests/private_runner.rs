@@ -49,7 +49,7 @@ fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged
     let held = tempfile::tempdir().expect("a directory");
     let program = Path::new(env!("CARGO_BIN_EXE_kr-conformance"));
     let shared = held.path().join(program.file_name().expect("a file name"));
-    std::fs::copy(program, &shared).expect("a program to damage");
+    kr_ipc::testing::place_program(program, &shared);
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let base = tempfile::tempdir().expect("a directory for the copy");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-private-runner");
@@ -137,7 +137,7 @@ fn the_runner_records_a_program_it_could_not_start_for_its_step_by_its_whole_pat
         let held = tempfile::tempdir().expect("a directory");
         let program = Path::new(env!("CARGO_BIN_EXE_kr-conformance"));
         let runner = held.path().join(program.file_name().expect("a file name"));
-        std::fs::copy(program, &runner).expect("a copy of the program");
+        kr_ipc::testing::place_program(program, &runner);
         let first = held.path().join("no-such-dir").join("prog-0123");
         let second = held.path().join("other-dir").join("prog-0123");
         for (step, program) in [

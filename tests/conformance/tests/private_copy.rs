@@ -64,7 +64,10 @@ fn options(evidence: &Path, base: &Path, lister: PathBuf, steps: Vec<Step>) -> O
 fn a_step_that_writes_zeros_at_the_programs_shared_path_does_not_break_a_later_listing() {
     let held = tempfile::tempdir().expect("a directory");
     let shared = held.path().join("kr-conformance");
-    std::fs::copy(env!("CARGO_BIN_EXE_kr-conformance"), &shared).expect("a program to damage");
+    kr_ipc::testing::place_program(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-conformance")),
+        &shared,
+    );
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let base = tempfile::tempdir().expect("a directory for the copy");
     let steps = vec![
