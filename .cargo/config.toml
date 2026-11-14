@@ -13,7 +13,9 @@
 # in their objects, so the whole image uses one runtime: one heap and one copy of the runtime's
 # own state. The linker reports two runtimes in one link as `LNK4098`, and the release workflow
 # refuses a link that reports it. Rust adds `/defaultlib:libcmt` itself under this feature, so no
-# link argument of ours names the runtime's library.
+# link argument of ours names the runtime's library. A `RUSTFLAGS` in the environment replaces the
+# flags below with no message, and the feature is then lost: the build script of `kr-crypto`, which
+# every program that links libsodium builds, refuses an MSVC build whose target features lack it.
 #
 # libsodium's prebuilt debug library asks for `LIBCMTD`, the static runtime's debug name, while a
 # link under `crt-static` takes `LIBCMT` whatever the profile. The one exclusion that is left
