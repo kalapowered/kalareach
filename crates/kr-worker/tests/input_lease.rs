@@ -2412,6 +2412,16 @@ async fn a_takeover_stops_the_keystrokes_waiting_for_the_terminal_and_not_the_ho
         "the keystrokes of the lease that was taken reached the application: {:?}",
         String::from_utf8_lossy(&seen)
     );
+    // The answer took one of the places that the host's own answers share, and the writer gives it
+    // back with the entry once it has written it.
+    let room = runtime.input().lock().input_room();
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while room.held_replies() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the writer gave back the answer's place in the room");
 }
 
 /// KR-REQ-08.48: authority that ends while a batch waits for the terminal ends the keystrokes
@@ -6230,12 +6240,6 @@ async fn a_frame_refused_for_room_keeps_its_sequence_and_arrives_once_and_in_ord
         &expected,
         "the terminal was given every accepted frame once and in order, and the refused ones not at all",
     );
-    typing
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// The queue for the terminal is bounded in frames beside bytes: a program that does not read is
@@ -6283,12 +6287,6 @@ async fn the_queue_for_the_terminal_is_bounded_in_frames_as_well_as_in_bytes() {
         &expected,
         "every accepted frame reached the terminal once",
     );
-    typing
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// A frame is charged what the worker stores for it. A key record of a few bytes on the wire spells
@@ -6328,12 +6326,6 @@ async fn a_key_record_is_charged_the_bytes_it_spells_and_not_the_bytes_it_takes_
     );
 
     release.send(()).expect("the writer is waiting");
-    typing
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// Waits until the room holds `cost`, which the writer reaches by itself once it is let go.
@@ -6407,12 +6399,6 @@ async fn the_room_is_charged_while_the_worker_holds_a_write_and_whole_when_it_is
         &expected,
         "the terminal was given every write once and in order",
     );
-    typing
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
 
 /// A lease that ends does not give its room back at once, because the worker still holds what the
@@ -6490,10 +6476,4 @@ async fn the_room_of_an_ended_lease_comes_back_when_the_writer_drops_what_it_que
         &expected,
         "nothing the ended lease queued was written, and the new holder's writes were",
     );
-    typing
-        .wired
-        .runtime
-        .close(ClosureReason::CloseRequested)
-        .1
-        .release();
 }
