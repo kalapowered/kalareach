@@ -186,6 +186,16 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--', '--target-dir', 'C:/cached-target'],
     ['build', '--', '--target-dir=target-other'],
     ['build', '--', '--manifest-path', 'other/Cargo.toml'],
+    // Tauri reads its own options by prefix and Cargo ends in an error on a word it does not know, so a word
+    // that only begins with one of these names is refused too, with a value or without.
+    ['build', '--', '--profile-x=dev'],
+    ['build', '--', '--profile-x'],
+    ['build', '--', '--releases'],
+    ['build', '--', '--configuration'],
+    ['build', '--', '--config-x=env.A=b'],
+    ['build', '--', '--targets'],
+    ['build', '--', '--target-dirs=other'],
+    ['build', '--', '--manifest-pathx', 'other/Cargo.toml'],
     ['build', '--', '-m', 'other/Cargo.toml'],
     ['build', '--', '-mCargo.toml'],
     ['build', '--', '-mother/Cargo.toml'],
@@ -197,9 +207,7 @@ for (const platform of ['darwin', 'linux', 'win32']) {
   for (const argv of [
     ['build', '--', '--locked'],
     ['build', '--', '--offline', '--frozen'],
-    ['build', '--', '--configuration'],
-    ['build', '--', '--profile-x'],
-    ['build', '--', '--releases'],
+    ['build', '--', '--keep-going', '--timings'],
     ['build', '--', '-v'],
     ['build', '--', '-vv'],
     ['build', '--', '-q'],
