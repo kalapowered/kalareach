@@ -73,7 +73,8 @@ pub struct BoundLane {
     pub queue: Arc<LaneQueue>,
     /// What the answer says.
     pub ready: InputLaneReady,
-    /// The older lanes of the same attachment that this one replaced, which are to be closed.
+    /// The queues of the older lanes of the same attachment that this one replaced, which the bind
+    /// has already closed.
     pub replaced: Vec<Arc<LaneQueue>>,
 }
 
