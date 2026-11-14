@@ -4805,18 +4805,18 @@ async fn the_attempt_a_copy_finds_still_running_at_the_pause(landing: AtThePause
         .expect("the first attempt has been admitted and has not claimed");
 
     let mut second = client(&host).await;
-    let copy = tokio::spawn(async move { second.repeat(&original).await });
+    let copy = tokio::spawn(async move {
+        let told = second.repeat(&original).await;
+        (second, told)
+    });
     looked
         .await
         .expect("the copy has looked for a claim and found none");
 
     landing.lands(&host).await;
     let_the_copy_go_on.send(()).expect("the copy is waiting");
-    let told = failure(
-        copy.await
-            .expect("the copy ran")
-            .expect("the call reaches the daemon"),
-    );
+    let (mut second, told) = copy.await.expect("the copy ran");
+    let told = failure(told.expect("the call reaches the daemon"));
     host.controller.hold_fence(false);
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
     assert!(
@@ -4826,6 +4826,20 @@ async fn the_attempt_a_copy_finds_still_running_at_the_pause(landing: AtThePause
     assert!(
         !told.message.contains("has not finished"),
         "the host's account of the attempt is not shown: {told:?}"
+    );
+    // The connection the copy was told on stands and no fence is owed, so a read on it is answered:
+    // only what the copy was admitted under has changed.
+    let _: ProjectListResult = typed(
+        &second
+            .request(
+                Method::ProjectList,
+                &ProjectListParams {
+                    environment_id: host.environment_id,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.list is answered on the connection that stood"),
     );
 
     let_it_go_on.send(()).expect("the first attempt is waiting");

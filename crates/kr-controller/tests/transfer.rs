@@ -3893,7 +3893,7 @@ async fn the_attempt_a_copy_finds_still_running_is_not_shown_when_a_fence_lands_
 /// alone, and the word it is told is the one that says what became of the action is not shown. The
 /// host's own account says the attempt has not finished: the text is what tells the two apart,
 /// since both are `OUTCOME_UNKNOWN`. The revocation also moves the revision the first attempt itself
-/// was admitted under, so its service refuses it where it would begin the upload.
+/// was admitted under, so its service refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_attempt_a_copy_finds_still_running_is_not_shown_when_another_devices_authority_is_revoked_at_the_pause()
  {
@@ -3927,18 +3927,18 @@ async fn the_attempt_a_copy_finds_still_running_at_the_pause(landing: AtThePause
         .expect("the first attempt has been admitted and has not reached the service");
 
     let mut second = client(&host).await;
-    let copy = tokio::spawn(async move { second.repeat(&original).await });
+    let copy = tokio::spawn(async move {
+        let told = second.repeat(&original).await;
+        (second, told)
+    });
     looked
         .await
         .expect("the copy has looked for a claim and found none");
 
     landing.lands(&host).await;
     let_the_copy_go_on.send(()).expect("the copy is waiting");
-    let told = failure(
-        copy.await
-            .expect("the copy ran")
-            .expect("the call reaches the daemon"),
-    );
+    let (mut second, told) = copy.await.expect("the copy ran");
+    let told = failure(told.expect("the call reaches the daemon"));
     host.controller.hold_fence(false);
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
     assert!(
@@ -3961,9 +3961,21 @@ async fn the_attempt_a_copy_finds_still_running_at_the_pause(landing: AtThePause
         }
         AtThePause::AnotherDevicesRevocation => {
             // The revocation moved the revision the first attempt was admitted under, so the
-            // service refuses it where it would begin the upload.
+            // service refuses it.
             let refused = failure(first);
             assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+            // The connection the copy was told on stands and no fence is owed: a new action on it
+            // is admitted under the revision now in force and begins the upload.
+            second
+                .mutate(
+                    Method::UploadBegin,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(host.environment_id),
+                    &params,
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("a new action on the connection that stood is answered");
         }
     }
     host.stop().await;
