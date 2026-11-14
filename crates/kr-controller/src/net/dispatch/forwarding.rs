@@ -945,6 +945,8 @@ impl RemoteConnection {
             Err(error) => return Err(error),
         };
         self.fix(session_id, acting).map_err(fixed)?;
+        self.had_a_link
+            .store(true, std::sync::atomic::Ordering::Release);
         *held = Some(Arc::clone(&proxy));
         Ok(proxy)
     }
