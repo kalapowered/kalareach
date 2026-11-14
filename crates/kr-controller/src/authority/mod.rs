@@ -1390,15 +1390,17 @@ impl AuthorityBarrier {
             BarrierState::Pending if acknowledged.is_some() => format!(
                 "this worker has installed revision {revision} but reports nothing about the \
                  actions its fence rejected or could not take back, so the revocation is not \
-                 complete for it"
+                 complete for it; a worker that no longer holds those names, which it keeps for \
+                 its newest {} revocations only, answers this way",
+                kr_worker::journal::MAX_HELD_REVOCATIONS
             ),
             BarrierState::Pending => format!(
                 "this worker has not acknowledged revision {revision} and has not been confirmed \
                  ended, so the revocation is not complete for it. While the directory lists it, \
                  this host asks it again on its own, and a later `kr doctor` shows when every \
-                 worker has acknowledged; this answer is not rewritten then, and it names none of \
-                 the actions that won the dispatch race at this worker, which keeps those names \
-                 for its newest {} revocations only",
+                 worker has acknowledged. Repeating the revocation asks it again and shows the \
+                 names of the actions that won the dispatch race at this worker, which keeps those \
+                 names for its newest {} revocations only",
                 kr_worker::journal::MAX_HELD_REVOCATIONS
             ),
         };

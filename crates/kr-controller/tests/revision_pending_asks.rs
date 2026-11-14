@@ -14,8 +14,11 @@ use std::time::Duration;
 
 use kr_controller::service::{Controller, DEBT_PASS_INTERVAL};
 use kr_protocol::ids::{ActorId, SessionEpoch, SessionId};
+use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
-use net_support::worker::{Adopted, Worker};
+use kr_protocol::sharing::{RoleSelection, SessionRole};
+use net_support::worker::{Adopted, Worker, share};
+use net_support::{Host, on_the_host, recipient};
 
 /// How long a case waits for something the daemon does on its own timer, past the passes it is
 /// owed.
@@ -410,25 +413,47 @@ async fn the_asks_end_when_the_worker_acknowledged() {
     drop(workers);
 }
 
-/// KR-REQ-09.12: the asks end when the worker is confirmed ended.
+/// KR-REQ-09.12: the asks end when a worker is confirmed ended, and only then.
+///
+/// Two workers are pending, each behind a boundary that stays held. One has no live link, so the
+/// pass's ask opens one that waits at the boundary: an ask that does not answer, after which the
+/// pass asks whether the worker has ended. Its process is the test's own and is running, so the
+/// answer is that it has not, and it must stay pending, be looked at again and keep the fence
+/// owed. The other worker's session is closed, and it leaves the barrier and is asked no more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_asks_end_when_the_worker_is_confirmed_ended() {
     let Adopted {
         host,
         owner: _,
         workers,
-    } = Adopted::start(1).await;
-    let worker = &workers[0];
-    let session_id = worker.session_id;
-    let held = restricted_while_the_boundary_is_held(host.controller(), worker).await;
-    until(DEBT_PASS_INTERVAL * 2 + SLACK, "an ask of the pass", || {
-        !asks_of(host.controller(), session_id).is_empty()
-    })
+    } = Adopted::start(2).await;
+    let ended = &workers[0];
+    let live = &workers[1];
+    let held_ended = ended.hold_the_dispatch_boundary().await;
+    let held_live = live.hold_the_dispatch_boundary().await;
+    let barrier = host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the restriction is recorded");
+    assert!(!barrier.holds(), "both workers are pending: {barrier:?}");
+    host.controller()
+        .forget_the_worker_link_for_tests(live.session_id)
+        .await;
+    until(
+        Duration::from_secs(40),
+        "an ask of each worker and a look at whether the live one has ended",
+        || {
+            !asks_of(host.controller(), ended.session_id).is_empty()
+                && !asks_of(host.controller(), live.session_id).is_empty()
+                && host.controller().reconciliations_for_tests() > 0
+        },
+    )
     .await;
 
     host.controller()
         .retire(&kr_protocol::session::ClosureRecord {
-            session_id,
+            session_id: ended.session_id,
             session_epoch: SessionEpoch::V1,
             reason: kr_protocol::session::ClosureReason::CloseRequested,
             root_exit_code: Nullable::some(kr_protocol::scalars::U64::new(0)),
@@ -441,23 +466,44 @@ async fn the_asks_end_when_the_worker_is_confirmed_ended() {
         })
         .await
         .expect("the closure is recorded");
-    let asked = asks_of(host.controller(), session_id).len();
-    assert!(
+    let asked = asks_of(host.controller(), ended.session_id).len();
+    let looked_at = host.controller().reconciliations_for_tests();
+
+    until(
+        Duration::from_secs(70),
+        "a look at the worker that is running, after the closure",
+        || host.controller().reconciliations_for_tests() > looked_at,
+    )
+    .await;
+    assert_eq!(
         host.controller()
             .revision_pending()
             .await
-            .expect("the registry is read")
-            .is_empty(),
-        "a worker confirmed ended is not pending"
+            .expect("the registry is read"),
+        vec![live.session_id],
+        "a worker confirmed ended is not pending, and a worker that is running still is"
     );
-
-    tokio::time::sleep(DEBT_PASS_INTERVAL * 2 + Duration::from_secs(1)).await;
     assert_eq!(
-        asks_of(host.controller(), session_id).len(),
+        asks_of(host.controller(), ended.session_id).len(),
         asked,
         "a worker confirmed ended is not asked again"
     );
-    held.release();
+    assert!(
+        host.controller()
+            .fence_owed_for_tests()
+            .await
+            .expect("the registry is read")
+            .is_some(),
+        "a worker that is running keeps the fence owed"
+    );
+    held_live.release();
+    until_nobody_is_pending(
+        host.controller(),
+        DEBT_PASS_INTERVAL * 3 + SLACK,
+        "the running worker acknowledged once its boundary was free",
+    )
+    .await;
+    held_ended.release();
     host.stop().await;
     drop(workers);
 }
@@ -644,6 +690,438 @@ async fn the_fence_is_owed_while_a_worker_is_pending_and_settled_when_the_pass_h
         "the daemon made no announcement of its own: each one after the restriction's was an ask \
          of the pass"
     );
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12, KR-ACC-022: at most one presentation of the host waits at a worker's held
+/// dispatch boundary, however many passes go by.
+///
+/// An ask that has no link opens one, and its presentation waits at the boundary for the whole
+/// hold, on one thread of the worker's and with one of its connections. A host that opened another
+/// at each ask would take the worker's connections one after another, the owner's own included.
+/// The real boundary is held for twenty passes with no link in the slot, and the worker's own
+/// count of the presentations waiting is what shows how many the host made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_presentation_of_the_host()
+{
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let service = Arc::clone(&worker.service);
+    let held = restricted_while_the_boundary_is_held(host.controller(), worker).await;
+    host.controller()
+        .forget_the_worker_link_for_tests(worker.session_id)
+        .await;
+
+    tokio::time::sleep(DEBT_PASS_INTERVAL * 20).await;
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        1,
+        "the host's presentations waiting at the held boundary after twenty passes"
+    );
+    tokio::time::timeout(Duration::from_secs(10), worker.client())
+        .await
+        .expect("a connection of another client is still accepted");
+
+    held.release();
+    until_nobody_is_pending(
+        host.controller(),
+        DEBT_PASS_INTERVAL * 3 + SLACK,
+        "the worker acknowledged once its boundary was free",
+    )
+    .await;
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        0,
+        "the one presentation was decided once the boundary was free"
+    );
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12, KR-REQ-10.45: after a restart the pass asks the worker that the barrier counts
+/// pending, though the registry's row says it acknowledged, and the fence settles.
+///
+/// Two workers, one of which refuses the restriction: the other acknowledges, and its row says so.
+/// The daemon stops, and starts again with that other worker refusing every announcement, so the
+/// start's announcement is not answered. The registry then says every worker acknowledged and the
+/// barrier of the new daemon counts one pending. The pass asks it at every pass while it refuses,
+/// and the fence stays owed, which no check of the rows alone can see. It is settled once the
+/// pass has been answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn after_a_restart_the_pass_asks_a_worker_the_barrier_counts_pending() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(2).await;
+    let acknowledged_before = &workers[0];
+    let refusing = &workers[1];
+    let held_refusing = refusing.hold_the_dispatch_boundary().await;
+    let barrier = host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the restriction is recorded");
+    assert_eq!(
+        barrier.pending(),
+        vec![refusing.session_id],
+        "one worker refused, the other acknowledged"
+    );
+    let stopped = host.shut_down().await;
+    held_refusing.release();
+    let service = Arc::clone(&acknowledged_before.service);
+    service.refuse_announcements_for_tests(true);
+    let refused = service.refusals_for_the_boundary();
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+
+    assert!(
+        service.refusals_for_the_boundary() > refused,
+        "the start's announcement met the boundary held"
+    );
+    assert!(
+        host.controller()
+            .revision_pending()
+            .await
+            .expect("the registry is read")
+            .is_empty(),
+        "the registry says every worker acknowledged: the start's announcement told the one, and \
+         the other's row was written before the restart"
+    );
+    until(
+        DEBT_PASS_INTERVAL * 3 + SLACK,
+        "an ask of the pass for the worker the barrier counts pending",
+        || !asks_of(host.controller(), acknowledged_before.session_id).is_empty(),
+    )
+    .await;
+    tokio::time::sleep(DEBT_PASS_INTERVAL * 2).await;
+    assert!(
+        host.controller()
+            .fence_owed_for_tests()
+            .await
+            .expect("the registry is read")
+            .is_some(),
+        "the barrier counts a worker pending, so the fence is owed while it refuses"
+    );
+
+    service.refuse_announcements_for_tests(false);
+    let deadline = tokio::time::Instant::now() + DEBT_PASS_INTERVAL * 3 + SLACK;
+    while host
+        .controller()
+        .fence_owed_for_tests()
+        .await
+        .expect("the registry is read")
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fence was still owed {:?} after the worker stopped refusing, with {} asks of the \
+             pass",
+            DEBT_PASS_INTERVAL * 3 + SLACK,
+            host.controller().pending_asks_for_tests().len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    host.stop().await;
+    drop(workers);
+}
+
+/// The revocation of a share that `session_id`'s worker has an undispatched intent of, composed
+/// for a repeat: the actions the fence takes back are named in its result.
+async fn a_revocation_to_repeat(
+    host: &Host,
+    owner: &kr_crypto::keys::DeviceKeys,
+    worker: &Worker,
+    intents: usize,
+) -> (
+    kr_ipc::client::LocalClient,
+    kr_protocol::envelope::MutationRequest,
+) {
+    let (device, record) = recipient(host, owner).await;
+    let granted = share(
+        host,
+        worker.session_id,
+        &device,
+        &record,
+        RoleSelection::plain(SessionRole::Controller),
+    )
+    .await;
+    worker.seed_undispatched_intents(&ActorId::new("device:phone").expect("a principal"), intents);
+    let mut client = host.client().await;
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(host),
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: granted.grant_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+    (client, mutation)
+}
+
+/// The answer to a revocation, or to its repeat, and the entry of one worker in its barrier.
+async fn the_answer_to(
+    client: &mut kr_ipc::client::LocalClient,
+    mutation: &kr_protocol::envelope::MutationRequest,
+    session_id: SessionId,
+) -> (
+    kr_protocol::sharing::RevocationResult,
+    kr_protocol::action::WorkerBarrier,
+) {
+    let result: kr_protocol::sharing::RevocationResult = client
+        .repeat(mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered")
+        .to_typed()
+        .expect("a revocation result");
+    let entry = result
+        .barrier
+        .workers
+        .iter()
+        .find(|entry| entry.session_id == session_id)
+        .expect("the worker is in the barrier")
+        .clone();
+    (result, entry)
+}
+
+/// KR-REQ-09.12, KR-REQ-10.45: a repeat of a revocation names the actions at a worker that was
+/// pending in the first answer, once that worker has acknowledged.
+///
+/// The first answer carries the worker as pending, with no names. The pass tells the worker, and
+/// the names of what its fence took back reach the daemon. The repeat reads them into the entry
+/// that was pending, as it does for a worker that owed names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_a_revocation_names_the_actions_of_a_worker_that_acknowledged_later() {
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let (mut client, mutation) = a_revocation_to_repeat(&host, &owner, worker, 3).await;
+    worker
+        .service
+        .hold_the_boundary_for_one_announcement_after(0);
+    let (_, first) = the_answer_to(&mut client, &mutation, worker.session_id).await;
+    assert!(
+        !first.state.holds() && first.rejected_actions_total.get() == 0,
+        "the first answer carries the worker as pending, with no names: {first:?}"
+    );
+    until_nobody_is_pending(
+        host.controller(),
+        DEBT_PASS_INTERVAL * 2 + SLACK,
+        "the worker acknowledged at a pass",
+    )
+    .await;
+
+    let (_, repeated) = the_answer_to(&mut client, &mutation, worker.session_id).await;
+    assert!(
+        repeated.state.holds(),
+        "the repeat carries the worker's answer: {repeated:?}"
+    );
+    assert_eq!(
+        repeated.rejected_actions_total.get(),
+        3,
+        "the repeat names the actions the fence took back at this worker: {repeated:?}"
+    );
+    drop(client);
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12, KR-REQ-10.45: a repeat of a revocation asks a worker that is still pending, and
+/// carries what it answers.
+///
+/// The repeat comes straight after the first answer, before the pass has asked again, so the
+/// worker is still pending and the repeat's own ask is the first to be answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_a_revocation_asks_the_worker_that_is_still_pending() {
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let (mut client, mutation) = a_revocation_to_repeat(&host, &owner, worker, 3).await;
+    worker
+        .service
+        .hold_the_boundary_for_one_announcement_after(0);
+    let (_, first) = the_answer_to(&mut client, &mutation, worker.session_id).await;
+    assert!(
+        !first.state.holds(),
+        "the first answer carries the worker as pending: {first:?}"
+    );
+
+    let (_, repeated) = the_answer_to(&mut client, &mutation, worker.session_id).await;
+    assert!(
+        repeated.state.holds() && repeated.rejected_actions_total.get() == 3,
+        "the repeat asked the worker and carries what it named: {repeated:?}"
+    );
+    drop(client);
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12, KR-REQ-10.45: a repeat of a revocation says so when the worker no longer holds the
+/// names.
+///
+/// A worker keeps the names of its newest eight revocations, and answers for an older one that it
+/// holds none. The repeat asks, and the entry that was pending becomes the worker's answer: it
+/// installed the revision, holds no names for it, and the revocation is not complete for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_a_revocation_says_so_when_the_worker_no_longer_holds_the_names() {
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let (mut client, mutation) = a_revocation_to_repeat(&host, &owner, worker, 3).await;
+    worker
+        .service
+        .hold_the_boundary_for_one_announcement_after(0);
+    let (first_answer, first) = the_answer_to(&mut client, &mutation, worker.session_id).await;
+    assert!(
+        !first.state.holds() && first.acknowledged_revision.0.is_none(),
+        "the first answer carries the worker as pending, having installed nothing: {first:?}"
+    );
+    worker
+        .service
+        .forget_evidence_for_tests(first_answer.authority_revision.get());
+
+    let (_, repeated) = the_answer_to(&mut client, &mutation, worker.session_id).await;
+    assert_eq!(
+        repeated.acknowledged_revision.0,
+        Some(first_answer.authority_revision),
+        "the repeat carries the worker's answer, which installed the revision: {repeated:?}"
+    );
+    assert!(
+        repeated.detail.contains("no longer holds"),
+        "the entry says that the worker no longer holds the names: {repeated:?}"
+    );
+    drop(client);
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12: a whole ask is cut at its bound, however long the names step after an
+/// acknowledgement takes.
+///
+/// The worker acknowledges at once, and every page of names after the first takes four seconds,
+/// inside the page's own bound, so the pages that follow could take as long as there are pages. The
+/// ask ends at fifteen seconds, and the pass, which settles the fence when its asks have ended,
+/// settles it then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_whole_ask_ends_at_its_bound_though_the_pages_after_the_acknowledgement_go_on() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let device = ActorId::new("device:phone").expect("a principal");
+    worker.limit_evidence_page_for_tests(1);
+    worker.seed_undispatched_intents(&device, 10);
+    worker
+        .service
+        .delay_evidence_continuations_for_tests(Duration::from_secs(4));
+    worker
+        .service
+        .hold_the_boundary_for_one_announcement_after(0);
+    let barrier = host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the restriction is recorded");
+    assert!(!barrier.holds(), "the worker refused for the moment");
+
+    until(DEBT_PASS_INTERVAL * 2 + SLACK, "an ask of the pass", || {
+        !asks_of(host.controller(), worker.session_id).is_empty()
+    })
+    .await;
+    let began = asks_of(host.controller(), worker.session_id)[0];
+    let by = began + Duration::from_secs(15) + SLACK;
+    while host
+        .controller()
+        .fence_owed_for_tests()
+        .await
+        .expect("the registry is read")
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the ask had not ended {:?} after it began, so the fence was still owed",
+            tokio::time::Instant::now() - began
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12: a long names step does not bring an ask of a refused worker forward.
+///
+/// One worker owes more names than a pass collects in the time between two passes, and another
+/// refuses every ask for its held boundary. The names step comes before the asks in a pass, so the
+/// refused worker is asked late in a pass that began long before. Its next ask is one pass after
+/// that ask began, not one pass after the pass began, which would have made it due again as soon as
+/// the pass ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_long_names_step_does_not_bring_the_next_ask_of_a_refused_worker_forward() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(2).await;
+    let owing = &workers[0];
+    let refusing = &workers[1];
+    let device = ActorId::new("device:phone").expect("a principal");
+    owing.limit_evidence_page_for_tests(1);
+    owing.seed_undispatched_intents(&device, 5);
+    owing
+        .service
+        .delay_evidence_continuations_for_tests(Duration::from_secs(3));
+    host.controller().limit_evidence_pages_for_tests(0);
+    let held = refusing.hold_the_dispatch_boundary().await;
+    let barrier = host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the restriction is recorded");
+    assert!(!barrier.holds(), "one worker refused for its held boundary");
+    assert_eq!(
+        host.controller().names_owed_for_tests(),
+        vec![owing.session_id],
+        "the first worker owes names that the restriction did not collect"
+    );
+    host.controller().limit_evidence_pages_for_tests(usize::MAX);
+
+    until(
+        Duration::from_secs(60),
+        "two asks of the worker that refuses",
+        || asks_of(host.controller(), refusing.session_id).len() >= 2,
+    )
+    .await;
+    let asks = asks_of(host.controller(), refusing.session_id);
+    assert!(
+        host.controller().names_owed_for_tests().is_empty(),
+        "the pass collected the names, which took longer than a pass"
+    );
+    assert!(
+        asks[1] - asks[0] >= DEBT_PASS_INTERVAL - Duration::from_millis(500),
+        "the refused worker was asked again {:?} after it was asked, which is less than a pass",
+        asks[1] - asks[0]
+    );
+    held.release();
     host.stop().await;
     drop(workers);
 }

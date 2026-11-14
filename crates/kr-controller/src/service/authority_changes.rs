@@ -242,12 +242,14 @@ impl Controller {
         mutation: &MutationRequest,
         answer: ParamsValue,
     ) -> Result<ParamsValue> {
+        // A worker that was pending in the answer is owed a look too: it may have acknowledged
+        // since, and its entry then names what it took back.
         let owes = |result: &kr_protocol::sharing::RevocationResult| {
             result
                 .barrier
                 .workers
                 .iter()
-                .any(|worker| worker.names_pending.get() > 0)
+                .any(|worker| worker.names_pending.get() > 0 || !worker.state.holds())
         };
         match mutation.method.method() {
             Some(Method::GrantRevoke | Method::DeviceRevoke) => {
@@ -306,15 +308,29 @@ impl Controller {
         }
     }
 
-    /// The barrier of `given`, with the entry of each worker that had names to give replaced by the
-    /// daemon's own entry for it now, when that carries at least what `given` held of it and has
-    /// fewer names still to come. `None` when the barrier as it stands cannot be read.
+    /// The barrier of `given`, with the entry of each worker that was pending in it, or had names to
+    /// give, replaced by the daemon's own entry for it now. `None` when the barrier as it stands
+    /// cannot be read.
+    ///
+    /// A worker that was pending is asked again first, and its entry is replaced by what it says
+    /// when that is an answer: the revision acknowledged, or installed with no names held for it.
+    /// A worker that is still pending keeps the entry it had. An entry that had names to give is
+    /// replaced when the daemon's own carries at least what `given` held of it and has fewer names
+    /// still to come.
     async fn with_the_names_since(
         &self,
         audience: Audience,
         named: Option<kr_protocol::ids::GrantId>,
         given: &kr_protocol::sharing::RevocationResult,
     ) -> Option<kr_protocol::action::RevocationBarrier> {
+        let pending: Vec<kr_protocol::ids::SessionId> = given
+            .barrier
+            .workers
+            .iter()
+            .filter(|worker| !worker.state.holds())
+            .map(|worker| worker.session_id)
+            .collect();
+        self.ask_again(&pending).await;
         let live = self
             .barrier_as_it_stands(given.authority_revision)
             .await
@@ -322,6 +338,15 @@ impl Controller {
         let live = self.barrier_for(audience, named, live).ok()?;
         let mut barrier = given.barrier.clone();
         for worker in &mut barrier.workers {
+            if !worker.state.holds() {
+                if let Some(now) = live.workers.iter().find(|now| {
+                    now.session_id == worker.session_id
+                        && (now.state.holds() || now.acknowledged_revision.0.is_some())
+                }) {
+                    *worker = now.clone();
+                }
+                continue;
+            }
             if worker.names_pending.get() == 0 {
                 continue;
             }
@@ -332,6 +357,30 @@ impl Controller {
             }
         }
         Some(barrier)
+    }
+
+    /// Asks each of `sessions` for its acknowledgement of the revision in force, together, each
+    /// bounded as the pass's asks are. A worker whose earlier presentation has not been decided is
+    /// not asked: another link would only leave a second presentation behind it.
+    async fn ask_again(&self, sessions: &[kr_protocol::ids::SessionId]) {
+        let Some(controller) = self.me.upgrade() else {
+            return;
+        };
+        let asks = sessions
+            .iter()
+            .copied()
+            .filter(|session_id| !controller.presentation_in_flight(*session_id))
+            .map(|session_id| {
+                let controller = std::sync::Arc::clone(&controller);
+                async move {
+                    let _ = tokio::time::timeout(
+                        super::barrier::PASS_ASK_BOUND,
+                        controller.ask_worker_revision(session_id),
+                    )
+                    .await;
+                }
+            });
+        super::barrier::all_at_once(asks).await;
     }
 
     /// The answer a record is owed, when nothing has to run first: every state but an unfinished

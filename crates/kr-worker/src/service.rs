@@ -568,6 +568,42 @@ pub struct WorkerService {
     /// held, which this host's own tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     announcements_before_a_held_boundary: Mutex<Option<usize>>,
+    /// How many presentations of a generation are waiting for the dispatch boundary now, which
+    /// this host's own tests read. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    presentations_waiting: std::sync::atomic::AtomicUsize,
+    /// Whether every announcement of an authority revision finds the dispatch boundary held, which
+    /// this host's own tests arm. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    refusing_announcements: std::sync::atomic::AtomicBool,
+    /// How long a page of evidence after the first waits before it is answered, which this host's
+    /// own tests arm. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    evidence_continuation_delay: Mutex<Option<std::time::Duration>>,
+    /// The revisions whose names this worker answers that it no longer holds, which this host's own
+    /// tests arm. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    evidence_forgotten: Mutex<std::collections::BTreeSet<u64>>,
+}
+
+/// A presentation that is waiting for the dispatch boundary, counted for as long as it waits. It is
+/// compiled away in every shipped build.
+#[cfg(feature = "testing")]
+struct PresentationWaiting<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(feature = "testing")]
+impl<'a> PresentationWaiting<'a> {
+    fn begin(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for PresentationWaiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl WorkerService {
@@ -938,6 +974,14 @@ impl WorkerService {
             announcement_watch: Mutex::new(None),
             #[cfg(feature = "testing")]
             announcements_before_a_held_boundary: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            presentations_waiting: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            refusing_announcements: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
+            evidence_continuation_delay: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            evidence_forgotten: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -1359,6 +1403,44 @@ impl WorkerService {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// How many presentations of a generation are waiting for the dispatch boundary now, for this
+    /// host's own tests: each is a link whose opener has not been answered.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn presentations_waiting_for_tests(&self) -> usize {
+        self.presentations_waiting
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Makes every announcement of an authority revision find the dispatch boundary held, or stops
+    /// doing so, for this host's own tests. Presentations of a generation are not held, so a link
+    /// opens as usual.
+    #[cfg(feature = "testing")]
+    pub fn refuse_announcements_for_tests(&self, refusing: bool) {
+        self.refusing_announcements
+            .store(refusing, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes every page of evidence after the first wait `delay` before it is answered, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn delay_evidence_continuations_for_tests(&self, delay: std::time::Duration) {
+        *self
+            .evidence_continuation_delay
+            .lock()
+            .expect("the delay is not poisoned") = Some(delay);
+    }
+
+    /// Makes this worker answer, for `revision`, that it no longer holds the names of that
+    /// revocation's fence, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn forget_evidence_for_tests(&self, revision: u64) {
+        self.evidence_forgotten
+            .lock()
+            .expect("the set is not poisoned")
+            .insert(revision);
+    }
+
     /// How many announcements of an authority revision have been refused so far because the
     /// dispatch boundary was held, for this host's own tests.
     #[cfg(feature = "testing")]
@@ -1750,6 +1832,16 @@ impl WorkerService {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     fn hold_the_boundary_for_this_announcement(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        if self
+            .refusing_announcements
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Some(
+                self.dispatch
+                    .lock()
+                    .expect("the dispatch barrier is not poisoned"),
+            );
+        }
         let mut armed = self
             .announcements_before_a_held_boundary
             .lock()
@@ -4251,10 +4343,14 @@ impl WorkerService {
         // Taken before the authority lock, and held for the whole decision. A generation that
         // arrives while a mutation is between its authority check and its effect waits here, so no
         // request is ever fenced half way through.
+        #[cfg(feature = "testing")]
+        let waiting = PresentationWaiting::begin(&self.presentations_waiting);
         let _barrier = self
             .dispatch
             .lock()
             .expect("the dispatch barrier is not poisoned");
+        #[cfg(feature = "testing")]
+        drop(waiting);
         // One lock for the whole decision. Reading the accepted generation, checking the token
         // against it and installing the new generation with the connection that presented it
         // happen without a window in between, so two tokens cannot interleave and leave the
@@ -4801,6 +4897,31 @@ impl WorkerService {
             .facts
             .generation
             .map_or(0, kr_protocol::ids::ControllerGeneration::get);
+        #[cfg(feature = "testing")]
+        {
+            if from > 0
+                && let Some(delay) = *self
+                    .evidence_continuation_delay
+                    .lock()
+                    .expect("the delay is not poisoned")
+            {
+                std::thread::sleep(delay);
+            }
+            if self
+                .evidence_forgotten
+                .lock()
+                .expect("the set is not poisoned")
+                .contains(&revision.get())
+            {
+                return ControlFrame::AuthorityRevisionAck(
+                    kr_protocol::worker::AuthorityRevisionAck {
+                        session_id,
+                        revision,
+                        fence: None,
+                    },
+                );
+            }
+        }
         let page = {
             let session = self.runtime.session();
             session.journal().map(|journal| {

@@ -1,5 +1,6 @@
 //! The workers this daemon knows: the directory, the one connection to each, a read from one.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use kr_ipc::client::BoundLink;
@@ -66,6 +67,34 @@ pub(crate) struct WorkerLink {
     returned: bool,
     /// The slot, held from taking the link until the link is dropped.
     slot: tokio::sync::OwnedMutexGuard<Option<BoundLink>>,
+}
+
+/// The opening of this daemon's link to one worker, which outlives the caller that began it.
+#[derive(Default)]
+pub(crate) struct Opening {
+    /// The task that opens the link, while it is under way and after it has ended until a caller
+    /// has taken what it came to.
+    task: tokio::sync::Mutex<Option<OpenTask>>,
+    /// Whether the worker has not yet decided the presentation: the task is still running.
+    running: Arc<AtomicBool>,
+}
+
+/// The task that opens a link, ended with the opening that owns it.
+struct OpenTask(tokio::task::JoinHandle<Result<BoundLink>>);
+
+impl Drop for OpenTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Says the task that opens a link has ended, however it ended.
+struct OpeningEnds(Arc<AtomicBool>);
+
+impl Drop for OpeningEnds {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl WorkerLink {
@@ -209,6 +238,7 @@ impl Controller {
         let registry = self.registry.lock().await;
         if registry.closure(session_id)?.is_some() {
             drop(registry);
+            self.forget_opening(session_id);
             self.retire_descriptor(session_id)?;
             return Ok(());
         }
@@ -507,6 +537,92 @@ impl Controller {
         self.worker_client(&worker).await
     }
 
+    /// Opens this daemon's link to a worker, or waits for the opening that is already under way.
+    ///
+    /// A worker decides the presentation of a generation at its dispatch boundary, so a
+    /// presentation that arrives while the boundary is held waits there for the whole hold, on a
+    /// thread of the worker's and with one of its connections. The opening is therefore a task of
+    /// its own that keeps the connection until the worker has decided the presentation: the worker
+    /// answered it, refused it, or the connection ended, which is how this daemon knows that the
+    /// presentation is over. A caller whose time runs out leaves the task running, and the caller
+    /// after it waits for the same task instead of beginning another presentation. One that comes
+    /// after the task has ended takes the link it opened, or, when it ended in a failure that
+    /// nobody was told of, opens once more.
+    async fn open_worker(&self, worker: &KnownWorker) -> Result<BoundLink> {
+        let opening = self.opening_of(worker.descriptor.session_id);
+        let mut task = opening.task.lock().await;
+        let mut begun_here = task.is_none();
+        loop {
+            let open = task.get_or_insert_with(|| self.begin_opening(worker, &opening.running));
+            let ended_before = !begun_here && open.0.is_finished();
+            // Waiting for a task that is not finished is safe to give up: the task stays in its
+            // place, and the next caller waits for it.
+            let result = (&mut open.0).await;
+            *task = None;
+            match result {
+                Ok(Ok(link)) => return Ok(link),
+                Ok(Err(_)) if ended_before => begun_here = true,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err(ControllerError::supervision(
+                        "the task that opens a worker's link did not finish",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Starts the opening of a link to `worker` on a task that holds this daemon only while
+    /// something else does ([`super::barrier::while_held`]).
+    fn begin_opening(&self, worker: &KnownWorker, running: &Arc<AtomicBool>) -> OpenTask {
+        running.store(true, Ordering::SeqCst);
+        let ends = OpeningEnds(Arc::clone(running));
+        let daemon = self.me.clone();
+        let worker = worker.clone();
+        OpenTask(tokio::spawn(async move {
+            let _ends = ends;
+            super::barrier::while_held(&daemon, async |controller: &Arc<Controller>| {
+                controller.open_worker_displaced_once(&worker).await
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(ControllerError::supervision(
+                    "this daemon stopped before it opened a link to a worker",
+                ))
+            })
+        }))
+    }
+
+    /// The opening of the link to a worker's session, made when there is none.
+    fn opening_of(&self, session_id: SessionId) -> Arc<Opening> {
+        Arc::clone(
+            self.openings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(session_id)
+                .or_default(),
+        )
+    }
+
+    /// Lets go of what is held of a session's opening, which a closed session's worker never
+    /// completes: the task ends with its connection.
+    pub(super) fn forget_opening(&self, session_id: SessionId) {
+        self.openings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id);
+    }
+
+    /// Whether a presentation this daemon made to the worker of `session_id` has not been decided
+    /// yet, so that opening another link would leave a second one behind it.
+    pub(super) fn presentation_in_flight(&self, session_id: SessionId) -> bool {
+        self.openings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .is_some_and(|opening| opening.running.load(Ordering::SeqCst))
+    }
+
     /// Opens this daemon's link to a worker, and one more where the worker says that a later
     /// connection of this daemon holds its authority.
     ///
@@ -518,7 +634,7 @@ impl Controller {
     /// generation has replaced this daemon. A request whose link is displaced is not refused for
     /// that: one further link is opened inside the time the request has, and a second refusal is
     /// the answer, which is how a replaced daemon's request ends.
-    async fn open_worker(&self, worker: &KnownWorker) -> Result<BoundLink> {
+    async fn open_worker_displaced_once(&self, worker: &KnownWorker) -> Result<BoundLink> {
         match self.open_worker_once(worker).await {
             Err(error) if is_displaced_by_a_later_connection(&error) => {
                 self.open_worker_once(worker).await
