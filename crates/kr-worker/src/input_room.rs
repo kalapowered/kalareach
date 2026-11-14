@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::session::{InputBatch, MAX_QUEUED_INPUT_BYTES, MAX_QUEUED_INPUT_FRAMES};
 
@@ -110,6 +110,12 @@ pub struct InputRoom {
     bytes: AtomicUsize,
     /// How many of the entries are the host's own answers, which have a share of their own.
     replies: AtomicUsize,
+    /// Whether the response lane still holds answers that the gate lets out, after the last time
+    /// it was drained. Room that comes back while this is set is room for them.
+    replies_waiting: AtomicBool,
+    /// Woken when something is owed that only the session can do, among it the answers that wait
+    /// in the lane for room.
+    pump: Arc<tokio::sync::Notify>,
 }
 
 impl InputRoom {
@@ -126,6 +132,22 @@ impl InputRoom {
     #[must_use]
     pub fn held_replies(&self) -> usize {
         self.replies.load(Ordering::Acquire)
+    }
+
+    /// Records whether the response lane still holds answers after a drain.
+    pub(crate) fn set_replies_waiting(&self, waiting: bool) {
+        self.replies_waiting.store(waiting, Ordering::Release);
+    }
+
+    /// Returns whether the response lane held answers the gate allows out when it was last drained.
+    #[must_use]
+    pub(crate) fn replies_waiting(&self) -> bool {
+        self.replies_waiting.load(Ordering::Acquire)
+    }
+
+    /// Returns what wakes the pump that serves the session.
+    pub(crate) fn pump(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.pump)
     }
 
     /// Charges what a batch costs, as it is queued.
@@ -199,5 +221,10 @@ impl Drop for Owed {
     fn drop(&mut self) {
         self.room
             .give_back_counts(self.left, usize::from(self.reply));
+        // What has come back may be the room that an answer in the lane waits for, and the lane is
+        // the session's, which the writer does not take: the pump looks again.
+        if self.room.replies_waiting() {
+            self.room.pump.notify_one();
+        }
     }
 }

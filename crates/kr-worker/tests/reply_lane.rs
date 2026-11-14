@@ -250,6 +250,54 @@ async fn a_reply_that_waited_over_two_seconds_is_dropped_when_the_paste_ends() {
     assert!(after.is_empty(), "the reply expired: {after:?}");
 }
 
+/// KR-REQ-08.49: the host's answers have a share of the queue's entries, and the answers past it
+/// wait in the response lane for room.
+///
+/// An application that asks without reading gets as many answers as the share holds, a person's
+/// keys still have room beside them, and the questions past the share are neither answered at once
+/// nor lost: they stay in the lane, and are let out as the writer gives places back.
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_past_their_share_wait_in_the_lane_and_are_let_out_when_places_come_back() {
+    let (clock, time) = manual();
+    let mut fixture = Fixture::new(time);
+    let share = kr_worker::session::MAX_PENDING_REPLY_FRAMES;
+
+    let _ = fixture.session.ingest_output(&QUESTION.repeat(share));
+    // The batches stay in hand, as they are while the writer holds them, so what they are charged
+    // is still charged when the room is read.
+    let mut in_hand = fixture.session.take_pending_input();
+    assert_eq!(in_hand.len(), share, "the share is answered");
+
+    // A second later, the rate allows more questions, and the share is spent.
+    clock.advance(Duration::from_secs(1));
+    let _ = fixture.session.ingest_output(&QUESTION.repeat(10));
+    assert!(
+        fixture.session.take_pending_input().is_empty(),
+        "no answer is queued past the share"
+    );
+    assert!(
+        fixture.session.replies_pending(),
+        "the questions past it are kept in the lane"
+    );
+    let room = fixture.session.input().lock().input_room();
+    assert!(
+        kr_worker::input_room::admit(room.held(), kr_worker::input_room::Cost::claimed_by(1))
+            .is_ok(),
+        "a keystroke still fits beside a full share of answers"
+    );
+
+    // The writer gives the places back, and the lane lets the rest out.
+    kr_worker::testing::settle_written_input(&fixture.session, &in_hand);
+    in_hand.clear();
+    fixture.session.pump_replies();
+    assert_eq!(
+        fixture.session.take_pending_input().len(),
+        10,
+        "what waited for room is answered"
+    );
+    assert!(!fixture.session.replies_pending());
+}
+
 /// Section 9: a wall clock stepped an hour forward while a reply waits does not drop it. The reply
 /// has waited half a second of continuous time, and a lane that measured the wait on the wall clock
 /// would read an hour and drop it.
