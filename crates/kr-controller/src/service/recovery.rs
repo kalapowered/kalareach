@@ -209,10 +209,16 @@ impl Controller {
     ) -> Result<Option<Cleanup>> {
         let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
         let challenged = match reservation.claimed_key {
-            Some(key) => Some(
-                self.challenge(&endpoint, &key, reservation.session_id)
-                    .await,
-            ),
+            // A presentation to this worker that is still under way answers nothing yet, as a
+            // challenge that ran out of time does not.
+            Some(key) => match self
+                .challenge(&endpoint, &key, reservation.session_id)
+                .await
+            {
+                Ok(Some(answer)) => Some(Ok(answer)),
+                Ok(None) => None,
+                Err(refused) => Some(Err(refused)),
+            },
             None => None,
         };
         if let Some(Err(refused)) = &challenged {
@@ -394,7 +400,9 @@ impl Controller {
             registry.workers()?
         };
         for row in rows {
-            if self.directory.lock().await.get(row.session_id).is_some() {
+            if self.directory.lock().await.get(row.session_id).is_some()
+                || self.presentation_in_flight(row.session_id)
+            {
                 continue;
             }
             // A fenced reservation is one the host stopped trusting. Publishing its worker again
@@ -426,7 +434,10 @@ impl Controller {
                 .challenge(&endpoint, &row.public_key, row.session_id)
                 .await
             {
-                Ok((proof, described, level)) => {
+                // A presentation to this worker is under way, which nothing here adds to; its
+                // answer is taken by the first look after the worker has decided.
+                Ok(None) => {}
+                Ok(Some((proof, described, level))) => {
                     self.adopt(
                         row.display_number,
                         &row.public_key,
@@ -458,44 +469,34 @@ impl Controller {
     /// Challenges a worker against a key this daemon already holds, presents its generation, and
     /// then asks the worker to describe its session ([`crate::directory::describe`]), which it may
     /// not do.
-    pub(super) async fn challenge(
+    ///
+    /// This is the task of a worker's opening ([`Self::challenge`]), which holds the connection
+    /// until the worker has decided the presentation and so has no bound of its own.
+    pub(super) async fn challenge_once(
         &self,
         endpoint: &Endpoint,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         session_id: SessionId,
-    ) -> Result<(
-        kr_protocol::worker::WorkerVerifyProof,
-        Option<SessionSummary>,
-        kr_protocol::retained::Level,
-    )> {
+    ) -> Result<super::workers::Challenged> {
         let identity = &self.identity;
         let generation = self.generation;
         let boot = self.boot_identity.clone();
-        let endpoint_text = endpoint.as_text();
-        let (proof, mut client) =
-            tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, async move {
-                let mut client = BoundLink::connect(endpoint, self.build_id.clone()).await?;
-                let proof = client
-                    .challenge_worker(
-                        worker_public_key,
-                        session_id,
-                        SessionEpoch::V1,
-                        &endpoint_text,
-                    )
-                    .await?;
-                client
-                    .present_generation(move |nonce| {
-                        identity
-                            .generation_token(generation, &boot, nonce)
-                            .map_err(kr_ipc::IpcError::from)
-                    })
-                    .await?;
-                Ok::<_, ControllerError>((proof, client))
+        let mut client = BoundLink::connect(endpoint, self.build_id.clone()).await?;
+        let proof = client
+            .challenge_worker(
+                worker_public_key,
+                session_id,
+                SessionEpoch::V1,
+                &endpoint.as_text(),
+            )
+            .await?;
+        client
+            .present_generation(move |nonce| {
+                identity
+                    .generation_token(generation, &boot, nonce)
+                    .map_err(kr_ipc::IpcError::from)
             })
-            .await
-            .map_err(|_| {
-                ControllerError::supervision("the worker did not answer its challenge in time")
-            })??;
+            .await?;
         let described = crate::directory::describe(&mut client, session_id).await;
         Ok((proof, described, client.level()))
     }

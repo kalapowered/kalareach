@@ -209,6 +209,7 @@ async fn challenged(
         )
         .await
         .expect("the worker answers its challenge")
+        .expect("no presentation to the worker is under way")
 }
 
 /// Adopts the worker on what a challenge of it gave.
@@ -401,7 +402,8 @@ async fn an_adoption_held_before_its_publication(
             world.session_id,
         )
         .await
-        .expect("the worker answers its challenge");
+        .expect("the worker answers its challenge")
+        .expect("no presentation to the worker is under way");
     let (arrived, go) = world.controller.before_a_worker_is_published.arm();
     let endpoint = world.worker.endpoint.clone();
     let controller = std::sync::Arc::clone(&world.controller);

@@ -79,12 +79,47 @@ pub(crate) struct Opening {
     running: Arc<AtomicBool>,
 }
 
-/// The task that opens a link, ended with the opening that owns it.
-struct OpenTask(tokio::task::JoinHandle<Result<BoundLink>>);
+/// What a worker answered to a challenge against the key this daemon holds for it: its proof, its
+/// own description of its session where it gave one, and the level it speaks at. Recovery adopts a
+/// worker on it.
+pub(super) type Challenged = (
+    kr_protocol::worker::WorkerVerifyProof,
+    Option<SessionSummary>,
+    kr_protocol::retained::Level,
+);
+
+/// What the task of an opening came to.
+enum Opened {
+    /// This daemon's link to the worker, presented and told what the host's local owner may do.
+    Link(BoundLink),
+    /// The worker's answer to a recovery's challenge, which presents the generation as a link does.
+    Challenged(Challenged),
+}
+
+/// What an opening's task presents to the worker.
+enum Presentation {
+    /// A link to a worker the directory lists.
+    Link(KnownWorker),
+    /// A challenge against the key this daemon holds, for a worker it has not reached.
+    Challenge {
+        endpoint: kr_ipc::paths::Endpoint,
+        worker_public_key: kr_protocol::scalars::AuthorisationKey,
+        session_id: SessionId,
+    },
+}
+
+/// The task that opens a link, or challenges a worker, ended with the opening that owns it. One
+/// opening has one such task at a time, whichever of the two it is, so a worker is never presented
+/// to twice at once by this daemon.
+struct OpenTask {
+    handle: tokio::task::JoinHandle<Result<Opened>>,
+    /// Whether it is a recovery's challenge, whose answer a caller that wants a link has no use for.
+    challenge: bool,
+}
 
 impl Drop for OpenTask {
     fn drop(&mut self) {
-        self.0.abort();
+        self.handle.abort();
     }
 }
 
@@ -553,14 +588,21 @@ impl Controller {
         let mut task = opening.task.lock().await;
         let mut begun_here = task.is_none();
         loop {
-            let open = task.get_or_insert_with(|| self.begin_opening(worker, &opening.running));
-            let ended_before = !begun_here && open.0.is_finished();
+            let open = task.get_or_insert_with(|| {
+                self.begin_opening(Presentation::Link(worker.clone()), &opening.running)
+            });
+            // A recovery's challenge that is under way is waited for like any other opening, so
+            // that no second presentation is made beside it; what it came to is of no use here.
+            let challenge = open.challenge;
+            let ended_before = !begun_here && open.handle.is_finished();
             // Waiting for a task that is not finished is safe to give up: the task stays in its
             // place, and the next caller waits for it.
-            let result = (&mut open.0).await;
+            let result = (&mut open.handle).await;
             *task = None;
             match result {
-                Ok(Ok(link)) => return Ok(link),
+                Ok(Ok(Opened::Link(link))) => return Ok(link),
+                Ok(_) if challenge => begun_here = true,
+                Ok(Ok(Opened::Challenged(_))) => begun_here = true,
                 Ok(Err(_)) if ended_before => begun_here = true,
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
@@ -572,25 +614,101 @@ impl Controller {
         }
     }
 
-    /// Starts the opening of a link to `worker` on a task that holds this daemon only while
-    /// something else does ([`super::barrier::while_held`]).
-    fn begin_opening(&self, worker: &KnownWorker, running: &Arc<AtomicBool>) -> OpenTask {
+    /// Challenges the worker of `session_id` against the key this daemon holds for it, which a
+    /// recovery does for a worker it has not reached, and waits for its answer for the bound a
+    /// start waits for any worker ([`crate::directory::RECONNECT_TIMEOUT`]).
+    ///
+    /// The challenge presents the generation, which a worker decides at its dispatch boundary, so
+    /// one that arrives while the boundary is held waits there for the whole hold, with one of the
+    /// worker's connections. It is therefore a task of the worker's opening, which keeps the
+    /// connection until the worker has decided, and a wait that runs out leaves the task running
+    /// and abandons only the wait. Another look at the same worker while the task runs presents
+    /// nothing and says so with `None`. A look after the task ended takes the answer it came to.
+    pub(super) async fn challenge(
+        &self,
+        endpoint: &kr_ipc::paths::Endpoint,
+        worker_public_key: &kr_protocol::scalars::AuthorisationKey,
+        session_id: SessionId,
+    ) -> Result<Option<Challenged>> {
+        let opening = self.opening_of(session_id);
+        // An opening that is taken, or whose task still runs, has a presentation under way.
+        let Ok(mut task) = opening.task.try_lock() else {
+            return Ok(None);
+        };
+        if task.as_ref().is_some_and(|open| !open.handle.is_finished()) {
+            return Ok(None);
+        }
+        // What an earlier opening left that is not a challenge's answer is for no caller here: the
+        // session is not in the directory, so nothing takes a link.
+        if task.as_ref().is_some_and(|open| !open.challenge) {
+            *task = None;
+        }
+        let open = task.get_or_insert_with(|| {
+            self.begin_opening(
+                Presentation::Challenge {
+                    endpoint: endpoint.clone(),
+                    worker_public_key: *worker_public_key,
+                    session_id,
+                },
+                &opening.running,
+            )
+        });
+        let Ok(joined) =
+            tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, &mut open.handle).await
+        else {
+            // The task stays in its place, with the presentation it holds.
+            return Err(ControllerError::supervision(
+                "the worker did not answer its challenge in time",
+            ));
+        };
+        *task = None;
+        match joined {
+            Ok(Ok(Opened::Challenged(answer))) => Ok(Some(answer)),
+            Ok(Ok(Opened::Link(_))) => Err(ControllerError::supervision(
+                "the task that challenges a worker opened a link",
+            )),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(ControllerError::supervision(
+                "the task that challenges a worker did not finish",
+            )),
+        }
+    }
+
+    /// Starts the presentation to a worker on a task that holds this daemon only while something
+    /// else does ([`super::barrier::while_held`]).
+    fn begin_opening(&self, presentation: Presentation, running: &Arc<AtomicBool>) -> OpenTask {
         running.store(true, Ordering::SeqCst);
         let ends = OpeningEnds(Arc::clone(running));
         let daemon = self.me.clone();
-        let worker = worker.clone();
-        OpenTask(tokio::spawn(async move {
-            let _ends = ends;
-            super::barrier::while_held(&daemon, async |controller: &Arc<Controller>| {
-                controller.open_worker_displaced_once(&worker).await
-            })
-            .await
-            .unwrap_or_else(|| {
-                Err(ControllerError::supervision(
-                    "this daemon stopped before it opened a link to a worker",
-                ))
-            })
-        }))
+        let challenge = matches!(presentation, Presentation::Challenge { .. });
+        OpenTask {
+            challenge,
+            handle: tokio::spawn(async move {
+                let _ends = ends;
+                super::barrier::while_held(&daemon, async |controller: &Arc<Controller>| {
+                    match presentation {
+                        Presentation::Link(worker) => controller
+                            .open_worker_displaced_once(&worker)
+                            .await
+                            .map(Opened::Link),
+                        Presentation::Challenge {
+                            endpoint,
+                            worker_public_key,
+                            session_id,
+                        } => controller
+                            .challenge_once(&endpoint, &worker_public_key, session_id)
+                            .await
+                            .map(Opened::Challenged),
+                    }
+                })
+                .await
+                .unwrap_or_else(|| {
+                    Err(ControllerError::supervision(
+                        "this daemon stopped before it presented itself to a worker",
+                    ))
+                })
+            }),
+        }
     }
 
     /// The opening of the link to a worker's session, made when there is none.
