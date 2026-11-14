@@ -1506,6 +1506,33 @@ async fn a_stream_ends_when_a_feed_refusal_releases_its_connections_link() {
     rig.stop().await;
 }
 
+/// A grant that ends at its deadline ends the streams of the connection that stands on it, while a
+/// stream is open and the device says nothing: the connection's grant watch ends the connection,
+/// and releasing its link ends its input streams.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_that_ends_at_its_deadline_ends_the_open_stream() {
+    let rig = Rig::start().await;
+    let host = &rig.adopted.host;
+    let mut short = proposal(&[ActionRight::SessionView, ActionRight::TerminalInput]);
+    short.expiry = kr_protocol::grant::GrantExpiry::At {
+        expires_at_ms: kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get() + 6_000),
+    };
+    let device = Device::create().await;
+    let record = pair_with(host, &device, &rig.adopted.owner, short).await;
+    let connection = RawDevice::connect(host, &device, &record).await;
+    let second = rig.attach_second(connection, device, record).await;
+    let mut stream = rig.open_second(&second).await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+
+    let ended = reads_to_the_end(&mut stream, 1).await;
+    assert!(
+        ended.is_err(),
+        "the stream is reset when the grant ends: {ended:?}"
+    );
+    drop(second);
+    rig.stop().await;
+}
+
 /// C6, the end the plan is for: the device's control stream ends while its connection stands. The
 /// input stream goes with it and the lane ends. Two streams have no order between them, so a frame
 /// written at the same moment as the control stream's end may reach the host first and is decided
