@@ -1301,9 +1301,9 @@ impl NetworkHost {
     ///
     /// A refusal the authority feed puts on a grant moves no revision, so a worker learns of it
     /// from nothing but the link ending: closing the link detaches the connection's attachments,
-    /// and detaching ends the input lease and discards the input the worker holds for it. A
-    /// connection stays up and refused, and a request it makes after the refusal ends opens a link
-    /// again.
+    /// and detaching ends the input lease and discards the input the worker holds for it. The
+    /// connection's relay learns that its link is gone and ends the connection, and the device
+    /// connects again once the refusal has ended.
     fn release_the_links_that(&self, refused: impl Fn(&RemoteConnection) -> bool) {
         // Asked of the connections taken out of the table, so that nothing the answer reads is
         // read under the table's lock.

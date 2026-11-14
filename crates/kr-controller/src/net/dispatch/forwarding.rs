@@ -155,13 +155,14 @@ fn unreadable_retained_answer() -> ProtocolError {
 /// Whether a detach whose call to the worker ended as `carried_out` took effect, or may have.
 ///
 /// The worker removes the attachment before the geometry step that follows, so an answer that is an
-/// error counts only when it is one the worker gives after the removal: a refused resize
-/// (`RESOURCE_UNAVAILABLE`) or an outcome that is unknown. Every refusal that comes before the
-/// effect leaves the attachment and its stream as they were: the grant's (`PERMISSION_DENIED`), the
-/// parameters' (`INVALID_ARGUMENT`), a subject precondition that no longer holds
-/// (`DRAFT_CONFLICT`), a journal that refuses the intent (`STORAGE_UNAVAILABLE`). A call this host
-/// refused before it was sent did nothing either; any other failure of the call leaves its outcome
-/// unknown, and so counts.
+/// error counts only when it is one the worker can give after the removal: a refused resize
+/// (`RESOURCE_UNAVAILABLE`, or `INVALID_ARGUMENT` from the size's own validation) or an outcome that
+/// is unknown. Every refusal that comes before the effect leaves the attachment and its stream as
+/// they were: the grant's (`PERMISSION_DENIED`), an attachment the link does not hold
+/// (`AMBIGUOUS_ATTACHMENT`), a subject precondition that no longer holds (`DRAFT_CONFLICT`), a
+/// journal that refuses the intent (`STORAGE_UNAVAILABLE`). A call this host refused before it was
+/// sent did nothing either; any other failure of the call leaves its outcome unknown, and so
+/// counts. The one stream a call can end is the asking connection's own.
 pub(super) fn a_detach_may_have_acted(
     carried_out: &std::result::Result<Result<Forwarded>, tokio::task::JoinError>,
 ) -> bool {
@@ -170,7 +171,9 @@ pub(super) fn a_detach_may_have_acted(
             Outcome::Ok(_) => true,
             Outcome::Error(error) => matches!(
                 error.code,
-                ErrorCode::ResourceUnavailable | ErrorCode::OutcomeUnknown
+                ErrorCode::ResourceUnavailable
+                    | ErrorCode::InvalidArgument
+                    | ErrorCode::OutcomeUnknown
             ),
         },
         Ok(Err(ControllerError::PermissionDenied { .. } | ControllerError::InvalidArgument(_))) => {
@@ -605,12 +608,12 @@ impl RemoteConnection {
                 .await
         });
         let carried_out = effect.await;
-        // A detach that took effect, or may have, ends the attachment's stream of typing, whichever
-        // connection holds it: the attachment is gone for all of them.
+        // A detach that took effect, or may have, ends this connection's stream of typing for the
+        // attachment.
         if let Some(attachment) = detaching
             && a_detach_may_have_acted(&carried_out)
         {
-            self.inputs.detached(attachment);
+            self.inputs.detached(self.connection_id(), attachment);
         }
         match carried_out {
             Ok(Ok(answered)) => {
