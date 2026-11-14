@@ -18,7 +18,8 @@ const CHUNK: usize = 1 << 16;
 /// How many directories this process has named, so that two copies made in one clock tick differ.
 static MADE: AtomicU64 = AtomicU64::new(0);
 
-/// Copies `original` into a new directory made under `base`, and returns the copy's path.
+/// Copies `original` into a new directory made under `base`, named for the time it was made, and
+/// returns the copy's path.
 ///
 /// `outside` holds every directory a step builds in; `base` may not lie inside any of them. The
 /// copy's path has no space in it, because Cargo's runner is one word. A copy that cannot be made,
@@ -58,10 +59,10 @@ fn private_copy_with(
     }
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
+        .map_or(0, |elapsed| elapsed.as_secs());
     let count = MADE.fetch_add(1, Ordering::Relaxed);
     let directory = base.join(format!(
-        "kr-conformance-runner-{}-{stamp}-{count}",
+        "kr-conformance-runner-{stamp}-{}-{count}",
         std::process::id()
     ));
     let copy = directory.join(name);
@@ -70,7 +71,8 @@ fn private_copy_with(
         .is_none_or(|path| path.chars().any(char::is_whitespace))
     {
         return Err(format!(
-            "{} cannot be Cargo's runner: its path has a space in it",
+            "{} cannot be Cargo's runner: its path has a space in it, so the temporary directory's path \
+             must hold none: set TMPDIR (TMP on Windows) to a directory whose path has no space",
             copy.display()
         ));
     }
@@ -258,6 +260,7 @@ mod tests {
         std::fs::create_dir(&spaced).unwrap();
         let problem = private_copy(&original, &spaced, &[]).unwrap_err();
         assert!(problem.contains("has a space in it"), "{problem}");
+        assert!(problem.contains("TMPDIR"), "{problem}");
         assert!(std::fs::read_dir(&spaced).unwrap().next().is_none());
     }
 
