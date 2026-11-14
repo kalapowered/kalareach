@@ -41,6 +41,8 @@ fi
 
 artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/permissions"
 mkdir -p "$artefacts"
+# Absolute, because the session this script starts runs in another directory.
+artefacts="$(cd "$artefacts" && pwd)"
 
 echo "kalareach first-start permission demonstration"
 echo "  commit: $(git rev-parse HEAD)"
@@ -452,7 +454,8 @@ PYTHON
 
 echo
 echo "4. the tools an agent reaches for, from the session's own shell"
-# Everything this step runs lives on the internal disk. The browser driver is copied out of the
+# Everything this step runs lives on the internal disk, and its one picture goes to the artefacts
+# folder, which is on it unless the caller names a folder elsewhere. The browser driver is copied out of the
 # workspace first, because a process a service manager launches is a new identity to the operating
 # system and one that reaches a removable volume asks the person at the machine for permission.
 node_binary="$(command -v node || true)"
