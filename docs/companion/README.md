@@ -1274,12 +1274,20 @@ in `tauri.conf.json` names, which is every format the platform supports. The mac
 app bundle and the `.dmg` disk image. On Linux it bundles the `.deb`, `.rpm` and AppImage bundles.
 On Windows it bundles the MSI and NSIS installers. All options are forwarded to `tauri build` as
 given. The command gives it cargo as its runner, and it refuses `--runner`, `--no-bundle`,
-`--bundles` with no value, a first word other than `build`, and cargo's own `--config` and
-`--target` after a bare `--`. It also errors if `--target` names a Windows target triple on a
+`--bundles` with no value, a first word other than `build`, `--config` or `-c` and `TAURI_CONFIG`
+(a configuration merged over the repository's can switch the bundle off), and cargo's own `--config`
+and `--target` after a bare `--`. It also errors if `--target` names a Windows target triple on a
 non-Windows machine, or an MSVC target other than `x86_64-pc-windows-msvc` and
 `aarch64-pc-windows-msvc` on Windows, and if `CARGO_BUILD_TARGET` is set, since the Tauri command
 line does not read it and would bundle the program of another build. The package's build script
 refuses an MSVC build for any other architecture, however its target was chosen.
+
+On Windows the command first runs `scripts/place-libsodium-archive.sh` on the directory
+`SODIUM_DIST_DIR` names, or on one in the home directory that is named by the archive's digests. The
+script refuses a file whose size and SHA-256 differ from the ones it holds. The build is given that
+directory, and the build of libsodium's crate that an earlier build left in the target directory is
+removed first, so the program links the archive that was compared. This needs `bash` from Git for
+Windows, `curl` and `cargo` on the path.
 
 What each platform needs:
 
@@ -1312,7 +1320,9 @@ On Windows the build takes its rustflags from the repository's `.cargo/config.to
 far as the environment and the command's arguments reach. If any of `RUSTFLAGS`,
 `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` or `CARGO_TARGET_*_RUSTFLAGS` are set in the
 environment then it errors and explains why. The first two replace the link options in the file, and
-the other two are a second source of flags that the command does not take. Running `tauri build` on
+the other two are a second source of flags that the command does not take. It also errors if `LINK`
+or `_LINK_`, which the linker reads before and after its options, or `SODIUM_LIB_DIR` or
+`SODIUM_USE_PKG_CONFIG`, which make libsodium's crate link another library than the archive, are set. Running `tauri build` on
 Windows without this command, with `STATIC_VCRUNTIME` not already `false`, causes the build to error
 in a build script with a message naming this command.
 

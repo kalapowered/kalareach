@@ -8,10 +8,14 @@
 // here on whichever machine this runs on. The last cases start the command itself, with arguments it
 // refuses before anything is run.
 import { spawnSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { buildPlan, childArguments, childEnvironment, refusal } from './desktop.mjs'
+import { archiveDirectory, buildPlan, childArguments, childEnvironment, placeArchive, refusal } from './desktop.mjs'
+
+const REPOSITORY = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
 let failures = 0
 
@@ -31,7 +35,7 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--no-sign', '--bundles', 'app'],
     ['build', '-b', 'app,dmg', '--ci'],
     ['build', '--debug', '--features', 'a', 'b', '--bundles', 'nsis'],
-    ['build', '--config', '{"build":{"frontendDist":"../dist"}}', '--ignore-version-mismatches'],
+    ['build', '--ignore-version-mismatches'],
     ['build', '--target', 'aarch64-apple-darwin'],
     ['build', '-t', 'universal-apple-darwin', '--no-sign'],
     // What follows a bare `--` is passed on to cargo, whatever it looks like.
@@ -66,9 +70,7 @@ for (const argv of [
 // A value that merely spells a runner's flag is not one.
 for (const argv of [
   ['build', '-fr'],
-  ['build', '-t', 'x86_64-unknown-linux-gnu'],
-  ['build', '--config', 'runner.json'],
-  ['build', '-c', 'r.json']
+  ['build', '-t', 'x86_64-unknown-linux-gnu']
 ]) {
   held(`\`pnpm desktop ${argv.join(' ')}\` names no runner`, 'false', refused(argv))
 }
@@ -173,13 +175,119 @@ for (const platform of ['darwin', 'linux', 'win32']) {
   }
 }
 
+// Tauri's own configuration, given as `--config` (or `-c`) or in `TAURI_CONFIG`, is merged over the
+// repository's, and can switch the bundle off (`bundle.active`), name another command to run before the
+// build, or change what the bundle holds. This build takes the repository's configuration alone: the
+// refusal is on every platform, in every form of the option, and for the variable in any spelling on Windows.
+for (const platform of ['darwin', 'linux', 'win32']) {
+  for (const argv of [
+    ['build', '--config', '{"bundle":{"active":false}}'],
+    ['build', '--config={"bundle":{"active":false}}'],
+    ['build', '-c', 'tauri.other.json'],
+    ['build', '-ctauri.other.json'],
+    ['build', '-c=tauri.other.json'],
+    ['build', '-dc', 'tauri.other.json'],
+    ['build', '--conf', 'x.json'],
+    ['build', '--ci', '--config', 'x.json', '--bundles', 'nsis']
+  ]) {
+    held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}, since it merges a configuration over the repository's`, 'true', refused(argv, platform))
+  }
+  held(`TAURI_CONFIG is refused on ${platform}`, 'true', refused(['build'], platform, { TAURI_CONFIG: '{"bundle":{"active":false}}' }))
+  held(`the refusal for TAURI_CONFIG on ${platform} names it`, 'true', String(refusal(['build'], platform, { TAURI_CONFIG: '{}' })?.includes('TAURI_CONFIG') ?? false))
+}
+held('Windows reads TAURI_CONFIG without regard to case', 'true', refused(['build'], 'win32', { tauri_config: '{}' }))
+held('macOS reads TAURI_CONFIG as it is spelled', 'false', refused(['build'], 'darwin', { tauri_config: '{}', TAURI_CONFIG_DEPTH: '2', MY_TAURI_CONFIG: '{}' }))
+
+// The linker reads `LINK` before the options it is given and `_LINK_` after them, and either can name
+// runtime libraries to add or leave out. Only Windows has the linker. Names that contain them are no matter.
+for (const name of ['LINK', 'link', '_LINK_', '_link_', 'Link']) {
+  for (const value of ['/DEFAULTLIB:msvcrt', '']) {
+    const answer = refusal(['build'], 'win32', { PATH: 'x', [name]: value })
+    held(`${name}=${JSON.stringify(value)} is refused on Windows`, 'true', String(answer !== null))
+    held(`the refusal for ${name} names the variable`, 'true', String(answer?.includes(name.toUpperCase()) ?? false))
+  }
+  held(`${name} is no matter on macOS`, 'false', refused(['build'], 'darwin', { [name]: '/DEFAULTLIB:msvcrt' }))
+  held(`${name} is no matter on Linux`, 'false', refused(['build'], 'linux', { [name]: '/DEFAULTLIB:msvcrt' }))
+}
+held('names that only contain LINK are no matter on Windows', 'false', refused(['build'], 'win32', { LINKER: 'x', CARGO_LINK: 'x', MY_LINK_: 'x', LINK_X: 'x' }))
+
+// The crate that links libsodium takes a library directory (`SODIUM_LIB_DIR`) or a system's library
+// (`SODIUM_USE_PKG_CONFIG`) before it reads the archive that a digest holds, and links whatever those name.
+// Both are refused on Windows in any spelling, whatever their value; they are no matter elsewhere.
+for (const name of ['SODIUM_LIB_DIR', 'sodium_lib_dir', 'SODIUM_USE_PKG_CONFIG', 'Sodium_Use_Pkg_Config']) {
+  for (const value of ['C:\\sodium', '']) {
+    const answer = refusal(['build'], 'win32', { PATH: 'x', [name]: value })
+    held(`${name}=${JSON.stringify(value)} is refused on Windows`, 'true', String(answer !== null))
+    held(`the refusal for ${name} names the variable`, 'true', String(answer?.includes(name.toUpperCase()) ?? false))
+  }
+  held(`${name} is no matter on Linux`, 'false', refused(['build'], 'linux', { [name]: '/x' }))
+}
+
+// A Windows build is started only with libsodium's archive placed by the script that holds its size and
+// digest, and the build is given the directory the script compared. Another directory in the caller's
+// environment is the one the script is run on, in every spelling of the name.
+{
+  const SCRIPT = 'scripts/place-libsodium-archive.sh'
+  const without = buildPlan(['build'], 'win32', { PATH: 'C:\\x' })
+  held('a plan for Windows with no placed archive is a refusal', 'true', String(typeof without.problem === 'string' && without.args === undefined && without.env === undefined))
+  held('that refusal names the script and the variable', 'true', String(without.problem?.includes(SCRIPT) && without.problem?.includes('SODIUM_DIST_DIR')))
+  const placed = buildPlan(['build', '--bundles', 'nsis'], 'win32', { PATH: 'C:\\x', Sodium_Dist_Dir: 'D:\\other', SODIUM_DIST_DIR: '' }, 'C:/Users/a/key')
+  held('a plan for Windows with the archive placed has no problem', 'null', String(placed.problem))
+  held('the build is given the directory that was compared', 'C:/Users/a/key', placed.env?.SODIUM_DIST_DIR)
+  held('no other spelling of the variable goes on', 'SODIUM_DIST_DIR', Object.keys(placed.env ?? {}).filter((key) => key.toUpperCase() === 'SODIUM_DIST_DIR').join(','))
+  const mac = buildPlan(['build'], 'darwin', { PATH: '/usr/bin' })
+  held('a plan for macOS needs no archive and gives none', 'false', String('SODIUM_DIST_DIR' in (mac.env ?? { SODIUM_DIST_DIR: 1 })))
+  held('a plan for macOS cleans nothing', 'null', String(mac.clean))
+
+  // The crate's build script does not run again when the directory changes, so a target directory that
+  // already holds the crate's build keeps what that build linked. The plan removes that build, for the
+  // profile and the target the bundle is built for, before the bundle is built.
+  const clean = (argv) => JSON.stringify(buildPlan(argv, 'win32', { PATH: 'x' }, 'C:/k').clean)
+  held('the release build removes the release build of the crate', JSON.stringify(['clean', '-p', 'libsodium-sys-stable', '--release']), clean(['build']))
+  held('a debug build removes the debug build', JSON.stringify(['clean', '-p', 'libsodium-sys-stable']), clean(['build', '--debug']))
+  held('a short debug option does the same', JSON.stringify(['clean', '-p', 'libsodium-sys-stable']), clean(['build', '-d', '--ci']))
+  held('a target is kept', JSON.stringify(['clean', '-p', 'libsodium-sys-stable', '--release', '--target', 'aarch64-pc-windows-msvc']), clean(['build', '--target', 'aarch64-pc-windows-msvc']))
+  held('a target in a bundle of short options is kept', JSON.stringify(['clean', '-p', 'libsodium-sys-stable', '--target', 'x86_64-pc-windows-msvc']), clean(['build', '-dt', 'x86_64-pc-windows-msvc']))
+
+  // The directory: the one the caller named, else one in the home directory that is named by the digests
+  // the script holds, so that a directory is never shared by two sets of bytes.
+  held('the directory the caller named is kept', 'D:/cache/libsodium', archiveDirectory({ SODIUM_DIST_DIR: 'D:\\cache\\libsodium' }, 'C:\\Users\\a', 'key', 'win32'))
+  held('a name in another spelling is read on Windows', 'D:/c', archiveDirectory({ sodium_dist_dir: 'D:/c' }, 'C:\\Users\\a', 'key', 'win32'))
+  held('with no name the directory is in the home directory and named by the key', 'C:/Users/a/key', archiveDirectory({}, 'C:\\Users\\a', 'key', 'win32'))
+  held('an empty name is no name', 'C:/Users/a/key', archiveDirectory({ SODIUM_DIST_DIR: '' }, 'C:\\Users\\a', 'key', 'win32'))
+
+  // The script itself, run for real on directories that hold other bytes: it compares what is in a
+  // directory before anything is fetched, and refuses, so no network is needed and nothing is placed.
+  const root = mkdtempSync(join(tmpdir(), 'desktop-archive-'))
+  try {
+    const key = spawnSync('bash', [join(REPOSITORY, SCRIPT), '--key'], { encoding: 'utf8' }).stdout.trim()
+    held('the script prints a key that holds digests', 'true', String(/^libsodium-archive-[0-9.]+-[0-9a-f]{12}-[0-9a-f]{12}$/.test(key)))
+    const wrong = (directory) => {
+      mkdirSync(directory, { recursive: true })
+      writeFileSync(join(directory, 'libsodium-1.0.22-stable-msvc.zip'), 'not the archive')
+    }
+    const named = join(root, 'named')
+    wrong(named)
+    const byName = placeArchive({ SODIUM_DIST_DIR: named }, root, 'linux')
+    held('a named directory that holds other bytes is refused', 'null', String(byName.directory))
+    held('the refusal names the script and the variable', 'true', String(byName.problem?.includes(SCRIPT) && byName.problem?.includes('SODIUM_DIST_DIR')))
+    held('the refusal carries the script\'s own words', 'true', String(byName.problem?.includes('refused libsodium-1.0.22-msvc.zip')))
+    wrong(join(root, key))
+    const byDefault = placeArchive({}, root, 'linux')
+    held('the default directory that holds other bytes is refused too', 'null', String(byDefault.directory))
+    held('and it is the directory in the home directory that was compared', 'true', String(byDefault.problem?.includes(key)))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
 // The command line tool takes the runner from the build's configuration unless it is given one, and a
-// configuration that the caller passes can name another program: the build is given cargo.
+// configuration file can name another program: the build is given cargo.
 held('the build is given cargo as its runner, right after the build', JSON.stringify(['build', '--runner', 'cargo']), JSON.stringify(childArguments(['build'])))
 held(
   'what the caller gave follows the runner as it was given',
-  JSON.stringify(['build', '--runner', 'cargo', '--config', '{"build":{"runner":"cargo-xwin"}}', '--', '--locked']),
-  JSON.stringify(childArguments(['build', '--config', '{"build":{"runner":"cargo-xwin"}}', '--', '--locked']))
+  JSON.stringify(['build', '--runner', 'cargo', '--ci', '--bundles', 'nsis', '--', '--locked']),
+  JSON.stringify(childArguments(['build', '--ci', '--bundles', 'nsis', '--', '--locked']))
 )
 
 // On Windows an environment that gives the compiler flags is refused, in every spelling of the name and
@@ -209,7 +317,7 @@ for (const env of [{}, { PATH: 'x', RUSTC_WRAPPER: 'sccache', CARGO_BUILD_JOBS: 
 // What a run does is what the plan says: the arguments and the environment that the command line tool is
 // started with, and nothing of them for a run that is refused.
 {
-  const plan = buildPlan(['build', '--bundles', 'nsis'], 'win32', { PATH: 'C:\\x', STATIC_VCRUNTIME: 'true' })
+  const plan = buildPlan(['build', '--bundles', 'nsis'], 'win32', { PATH: 'C:\\x', STATIC_VCRUNTIME: 'true' }, 'C:/k')
   held('a plan for Windows starts the build with cargo as its runner', JSON.stringify(['build', '--runner', 'cargo', '--bundles', 'nsis']), JSON.stringify(plan.args))
   held('a plan for Windows starts the build with the variable false', 'false', plan.env?.STATIC_VCRUNTIME)
   held('a plan for Windows keeps the rest of the environment', 'C:\\x', plan.env?.PATH)
@@ -223,7 +331,7 @@ for (const env of [{}, { PATH: 'x', RUSTC_WRAPPER: 'sccache', CARGO_BUILD_JOBS: 
 
 // On Windows the build gets `STATIC_VCRUNTIME=false`, whatever the caller's environment held.
 function windowsBuild(env) {
-  const { env: given, said } = childEnvironment('win32', env)
+  const { env: given, said } = childEnvironment('win32', env, 'C:/k')
   return { given, said }
 }
 {
@@ -231,7 +339,7 @@ function windowsBuild(env) {
   const none = windowsBuild(other)
   held('Windows: an environment with no setting gets false', 'false', none.given.STATIC_VCRUNTIME)
   held('Windows: nothing is said when no value was replaced', 'null', String(none.said))
-  held('Windows: the rest of the environment is kept', JSON.stringify(other), JSON.stringify({ ...none.given, STATIC_VCRUNTIME: undefined }))
+  held('Windows: the rest of the environment is kept', JSON.stringify(other), JSON.stringify({ ...none.given, STATIC_VCRUNTIME: undefined, SODIUM_DIST_DIR: undefined }))
 
   const already = windowsBuild({ ...other, STATIC_VCRUNTIME: 'false' })
   held('Windows: false stays false', 'false', already.given.STATIC_VCRUNTIME)
