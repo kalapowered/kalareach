@@ -11,7 +11,7 @@ mod push_origin;
 #[path = "build_push_gateway.rs"]
 mod build_push_gateway;
 
-// The refusal of a build that asks for the static Visual C++ runtime.
+// The refusal of a build that asks for Tauri's static Visual C++ runtime.
 #[path = "build_windows_runtime.rs"]
 mod build_windows_runtime;
 
@@ -52,11 +52,12 @@ fn attributes() -> tauri_build::Attributes {
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
-    // The Tauri build's default is the static Visual C++ runtime, which excludes the dynamic one and
-    // asks for `libcmt`. The workspace leaves `LIBCMT` out of every MSVC link on purpose (see
-    // `.cargo/config.toml`), so both start-ups would be excluded and no program of this package
-    // could link. The dynamic runtime stays. An environment that asks for the static one is
-    // refused before this point, since the Tauri build step reads the environment first.
+    // The Tauri build's default is a hybrid: the Visual C++ runtime static and the universal runtime
+    // dynamic, with link arguments that name `libvcruntime.lib` and `ucrt.lib` beside the `libcmt`
+    // of the workspace's `crt-static` target feature (see `.cargo/config.toml`), which would put two
+    // runtimes in the link. The static C runtime comes from the target feature alone, so the
+    // hybrid stays off. An environment that asks for it is refused before this point, since the
+    // Tauri build step reads the environment first.
     attributes.windows_attributes(
         tauri_build::WindowsAttributes::new_without_app_manifest().static_vc_runtime(false),
     )
