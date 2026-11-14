@@ -113,11 +113,22 @@ export function confine(value: string): string {
   return real
 }
 
+/**
+ * A directory of this run's own under `temporary`, which has to be inside a root. The folder is
+ * checked before the directory is made in it, so that a temporary folder that is no root is left
+ * as it was.
+ */
+export function ownDirectory(temporary: string): string {
+  const prefix = 'kr-test-artifacts-'
+  confine(join(temporary, `${prefix}XXXXXX`))
+  return confine(mkdtempSync(join(temporary, prefix)))
+}
+
 /** The directory this run keeps its artefacts in. */
 export function artefactsDirectory(): string {
   const named = env[VARIABLE]
   if (named !== undefined) return confine(named)
-  const own = confine(mkdtempSync(join(tmpdir(), 'kr-test-artifacts-')))
+  const own = ownDirectory(tmpdir())
   // The variable now names it, for this process's later reads and for the workers it starts.
   env[VARIABLE] = own
   console.error(`${VARIABLE} is not set: this run keeps its evidence in ${own}`)

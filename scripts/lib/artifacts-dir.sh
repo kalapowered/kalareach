@@ -195,9 +195,12 @@ _kr_artifacts_confine() {
   printf '%s\n' "$_kr_real"
 }
 
-# Makes a directory of this run's own under the temporary folder and prints its real path.
+# Makes a directory of this run's own under the temporary folder and prints its real path. The
+# folder is checked before the directory is made in it, so that a temporary folder that is no root
+# is left as it was.
 _kr_artifacts_own() {
   local _kr_made
+  _kr_artifacts_confine "${TMPDIR:-/tmp}/kr-test-artifacts.XXXXXX" > /dev/null || return 1
   _kr_made="$(mktemp -d "${TMPDIR:-/tmp}/kr-test-artifacts.XXXXXX")" || {
     echo "kr-artifacts: no directory of this run's own can be made for its evidence" >&2
     return 1

@@ -526,6 +526,29 @@ fn a_temporary_folder_whose_name_holds_line_feeds_admits_nothing_outside_the_roo
     }
 }
 
+/// A temporary folder that is no root is left as it was: the reader checks it before it makes the
+/// run's own directory in it.
+#[cfg(unix)]
+#[test]
+fn a_temporary_folder_that_is_no_root_is_left_without_a_directory_of_the_runs_own() {
+    for reader in readers() {
+        let working = tempfile::tempdir().expect("a working directory");
+        std::fs::create_dir(working.path().join("tmp")).expect("a folder");
+        // A relative name is no root, though the folder exists under the working directory.
+        let reading = reader.read_in(None, Some(Path::new("tmp")), Some(working.path()));
+        assert!(!reading.succeeded, "{reader:?}: {reading:?}");
+        assert!(
+            reading.words.contains("temporary roots"),
+            "{reader:?} refused without naming the roots: {}",
+            reading.words
+        );
+        let left = std::fs::read_dir(working.path().join("tmp"))
+            .expect("reads the folder")
+            .count();
+        assert_eq!(left, 0, "{reader:?} made a directory in a refused folder");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_relative_temporary_folder_is_no_root_though_it_exists_under_the_working_directory() {
