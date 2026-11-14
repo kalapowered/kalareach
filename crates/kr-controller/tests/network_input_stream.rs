@@ -776,6 +776,73 @@ async fn a_frame_that_waits_for_the_writer_past_its_deadline_is_cut_and_not_writ
     rig.stop().await;
 }
 
+/// A window of an older epoch that reaches the host after a newer one does not replace it: the
+/// stream goes on in the newer epoch. The device reads the older epoch's end first, so the window
+/// has been applied when the frame is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_of_an_older_epoch_does_not_replace_a_newer_one() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let newer = rig.epoch.get() + 1;
+    rig.lane.send_window(holding(newer));
+    rig.lane.send_window(LaneWindow {
+        epoch: rig.epoch,
+        holder: false,
+        frames: 0,
+        bytes: U64::new(0),
+        ended: Nullable::some(LaneEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+    });
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::EpochEnded { epoch, .. }) if epoch == rig.epoch
+        ),
+        "the older window is applied"
+    );
+    stream
+        .write_message(&frame_of(newer, 0, b"n"))
+        .await
+        .expect("the frame is written");
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::Accepted { epoch, .. }) if epoch.get() == newer
+        ),
+        "the newer epoch's window stands"
+    );
+    rig.stop().await;
+}
+
+/// A frame of an epoch newer than the lane's window waits for the window of its epoch: it is not
+/// refused when it is read, and it is accepted when the window comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_of_a_newer_epoch_waits_for_its_window_and_is_not_refused() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let newer = rig.epoch.get() + 1;
+    stream
+        .write_message(&frame_of(newer, 0, b"n"))
+        .await
+        .expect("the frame is written");
+    until("the host holds the frame", || {
+        stages.counts().host_holds == 1
+    })
+    .await;
+    rig.lane.send_window(holding(newer));
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::Accepted { epoch, .. }) if epoch.get() == newer
+        ),
+        "the frame waited for its window and was accepted"
+    );
+    rig.stop().await;
+}
+
 /// Opens a stream with `header` and says the host ended it without serving it: the device is not
 /// told `Ready`, and no lane was bound for it at the worker.
 async fn is_not_served(rig: &Rig, header: StreamHeader) {
