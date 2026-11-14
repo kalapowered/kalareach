@@ -1916,6 +1916,11 @@ mod tests {
             held.held_added, 4,
             "the keys wait while the reader is asked"
         );
+        assert_eq!(
+            driver.held_frames(),
+            1,
+            "and the write that carried them is held, which takes room beside the queue"
+        );
         driver.bridge_answer(&BridgeAnswer::Fence(
             kr_protocol::root::RootEditorFenceResult::Acknowledged(FenceAcknowledgement {
                 fence_id,
@@ -1938,6 +1943,11 @@ mod tests {
         driver.send_through(outbound);
 
         let effects = acknowledged(&mut driver);
+        assert_eq!(
+            driver.held_frames(),
+            0,
+            "what the answer let go of is no longer held"
+        );
         let published = effects
             .steps
             .iter()

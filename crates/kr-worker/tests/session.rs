@@ -1069,6 +1069,15 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
     }
 
     let refusal = refusal.expect("the queue is bounded, so the writes stop being accepted");
+    assert!(
+        matches!(
+            refusal,
+            kr_worker::error::WorkerError::InputRoomFull {
+                bound: kr_worker::input_room::Full::Bytes
+            }
+        ),
+        "the room is named as what ran out, apart from a terminal that has gone: {refusal:?}"
+    );
     assert_eq!(
         refusal.to_protocol_error().code,
         kr_protocol::error::ErrorCode::ResourceUnavailable,
