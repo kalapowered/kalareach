@@ -1,11 +1,11 @@
 name: win-runtime-probe
 
-# A probe of what the Windows programs link and import under the static C runtime. It builds the
-# host's programs on each architecture the way the release workflow builds them, then prints each
-# program's size and imports, the runtime each native library asks for, and whether the debug and
-# release test programs of the crypto crate link. It signs nothing, uploads nothing, saves no cache
-# and reads no secret: the only token it holds reads this repository's contents, and the logs of the
-# run are the whole of its output.
+# A probe of the crypto crate's test programs under the static C runtime. Two of its store tests
+# fail on a hosted runner when a bash step runs them: each denies an access right on a directory
+# and expects the open that asks for it to be refused. This run starts each program from the
+# shell the landing workflow uses and from bash, with the workspace's link flags and with the
+# dynamic runtime's, and prints the account's privileges. It signs nothing, uploads nothing, saves
+# no cache and reads no secret: the only token it holds reads this repository's contents.
 #
 # It is started by a push to a branch whose name ends in `-probe` under `scratch/`, and by nothing
 # else.
@@ -25,7 +25,7 @@ jobs:
   probe:
     name: ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.minutes }}
+    timeout-minutes: 90
     strategy:
       # One architecture's failure says nothing about the other's, and each is worth seeing.
       fail-fast: false
@@ -34,11 +34,9 @@ jobs:
           - arch: x64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
-            minutes: 240
           - arch: arm64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
-            minutes: 150
     env:
       TARGET: ${{ matrix.target }}
       CARGO_INCREMENTAL: "0"
@@ -48,11 +46,10 @@ jobs:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       # Some runner images carry no Rust at all. The installer is rustup's own, and it installs no
-      # toolchain: the step after the next one installs the one this repository pins.
+      # toolchain: the next step installs the one this repository pins.
       - name: Install rustup where the image has none
         run: |
           if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
@@ -63,20 +60,6 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:USERPROFILE '.cargo\bin')
           }
-
-      # Every executable this target carries, as the package that builds it and its name, read
-      # from the one list the release builds.
-      - name: Name the executables
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python scripts/release-programs.py self-test
-          if ($LASTEXITCODE -ne 0) { throw 'The reader of the program list failed its own test.' }
-          $builds = @(python scripts/release-programs.py builds --target $env:TARGET)
-          if ($LASTEXITCODE -ne 0 -or $builds.Count -eq 0) {
-            throw 'The program list names no executable for this release.'
-          }
-          "KR_BUILDS=$($builds -join ' ')" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "executables: $($builds -join ', ')"
 
       - name: Install the pinned toolchain
         run: |
@@ -90,290 +73,49 @@ jobs:
         with:
           restore: 'false'
 
-      - name: What this runner is
+      # What the account holds in each shell, and which program a bare name reaches. An access
+      # list binds an account that holds no privilege which overrides lists.
+      - name: Account and programs in PowerShell
+        if: ${{ !cancelled() }}
         run: |
-          [System.Environment]::OSVersion.VersionString
-          "runner architecture: $env:RUNNER_ARCH, image: $env:ImageVersion"
-          rustc -vV
-          if (Get-Command cmake -ErrorAction SilentlyContinue) { cmake --version | Select-Object -First 1 }
-          git rev-parse HEAD
-          Select-String -Path .cargo/config.toml -Pattern 'crt-static|NODEFAULTLIB|LLAMA_STATIC_CRT|CMAKE_MSVC_RUNTIME_LIBRARY' | ForEach-Object { $_.Line }
+          whoami /user
+          whoami /priv
+          where.exe whoami.exe icacls.exe
           exit 0
 
-      # The functions the reads below share: where dumpbin is, what an executable's size and
-      # imports are (the ordinary ones and the delay-load ones apart), and what runtime each
-      # native library asks for.
-      - name: Write the readers
-        run: |
-          $dir = Join-Path $env:RUNNER_TEMP 'probe'
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          @'
-          function Find-Dumpbin {
-            $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
-            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-            if (-not (Test-Path -LiteralPath $vswhere)) { $vswhere = (Get-Command vswhere -ErrorAction Stop).Source }
-            $install = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)[0]
-            if (-not $install) { $install = @(& $vswhere -latest -products '*' -property installationPath)[0] }
-            if (-not $install) { throw 'vswhere found no Visual Studio install.' }
-            $found = @(Get-ChildItem -Path (Join-Path $install 'VC\Tools\MSVC\*\bin\Host*\*\dumpbin.exe') | Sort-Object FullName)
-            $pick = $found | Where-Object { $_.FullName -like "*\bin\Host$arch\$arch\dumpbin.exe" } | Select-Object -Last 1
-            if (-not $pick) { $pick = $found | Where-Object { $_.FullName -like '*\bin\Hostx64\x64\dumpbin.exe' } | Select-Object -Last 1 }
-            if (-not $pick) { $pick = $found | Select-Object -Last 1 }
-            if (-not $pick) { throw "No dumpbin.exe under $install." }
-            return $pick.FullName
-          }
-
-          function Read-Executables([string]$Label, [string[]]$Paths) {
-            $dumpbin = Find-Dumpbin
-            Write-Host "dumpbin: $dumpbin"
-            $deny = 'VCRUNTIME|MSVCP|VCOMP|CONCRT|api-ms-win-crt-|ucrtbase|libsodium|MSVCR|UCRT'
-            $table = @("### $Label", '', '| program | bytes | machine | imports | delay-load imports | on the deny list |', '|---|---|---|---|---|---|')
-            foreach ($path in $Paths) {
-              $name = [IO.Path]::GetFileName($path)
-              if (-not (Test-Path -LiteralPath $path)) {
-                Write-Host "::error::$path is not there, so it cannot be read."
-                $global:ProbeFailed = $true
-                $table += "| $name | missing | | | | |"
-                continue
-              }
-              $size = (Get-Item -LiteralPath $path).Length
-              $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
-              $machine = 'unknown'
-              $line = @(& $dumpbin /nologo /headers $path) | Where-Object { $_ -match '^\s*[0-9A-Fa-f]+ machine' } | Select-Object -First 1
-              if ($line) { $machine = $line.Trim() }
-              $dependents = @(& $dumpbin /nologo /dependents $path)
-              if ($LASTEXITCODE -ne 0) {
-                Write-Host "::error::dumpbin /dependents failed on $path."
-                $global:ProbeFailed = $true
-                continue
-              }
-              $imports = @()
-              $delay = @()
-              $mode = ''
-              foreach ($row in $dependents) {
-                if ($row -match 'Image has the following dependencies') { $mode = 'normal'; continue }
-                if ($row -match 'Image has the following delay load dependencies') { $mode = 'delay'; continue }
-                if ($row -match '^\s*Summary') { $mode = ''; continue }
-                if ($mode -and $row -match '^\s+(\S+\.dll)\s*$') {
-                  if ($mode -eq 'normal') { $imports += $Matches[1] } else { $delay += $Matches[1] }
-                }
-              }
-              if ($imports.Count -eq 0) {
-                Write-Host "::error::dumpbin /dependents listed no import for $path."
-                $global:ProbeFailed = $true
-              }
-              $section = @(@(& $dumpbin /nologo /imports $path) | Where-Object { $_ -match 'delay load imports' }).Count -gt 0
-              $denied = @(($imports + $delay) | Where-Object { $_ -match $deny })
-              $importText = $imports -join ', '
-              $delayText = if ($delay.Count -gt 0) { $delay -join ', ' } else { 'none' }
-              $deniedText = if ($denied.Count -gt 0) { $denied -join ', ' } else { 'none' }
-              Write-Host "== $name ($Label): $size bytes, $machine, sha256 $hash"
-              Write-Host "   imports ($($imports.Count)): $importText"
-              Write-Host "   delay-load imports ($($delay.Count)): $delayText; dumpbin /imports shows a delay-load section: $section"
-              Write-Host "   on the deny list: $deniedText"
-              $table += "| $name | $size | $machine | $importText | $delayText | $deniedText |"
-            }
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $table
-          }
-
-          function Read-LibraryRuntimes([string[]]$Libs) {
-            $dumpbin = Find-Dumpbin
-            Write-Host '== runtime directives per native library: the default libraries and runtime checks that its objects carry, with the number of objects naming each'
-            foreach ($lib in $Libs) {
-              $text = (@(& $dumpbin /nologo /directives $lib)) -join "`n"
-              $defaults = @([regex]::Matches($text, '/DEFAULTLIB:"?([^"\s]+)"?', 'IgnoreCase') | ForEach-Object { 'lib:' + $_.Groups[1].Value.ToLowerInvariant() })
-              $checks = @([regex]::Matches($text, '/FAILIFMISMATCH:"?(RuntimeLibrary=[^"\s]+)"?', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value })
-              $groups = @(($defaults + $checks) | Group-Object | Sort-Object Name | ForEach-Object { '{0} x{1}' -f $_.Name, $_.Count })
-              $shown = $lib.Replace($PWD.Path + '\', '')
-              $detail = if ($groups.Count -gt 0) { $groups -join ', ' } else { 'no runtime directive' }
-              Write-Host ('{0} ({1:N0} bytes): {2}' -f $shown, (Get-Item -LiteralPath $lib).Length, $detail)
-            }
-          }
-          '@ | Set-Content -Path (Join-Path $dir 'tools.ps1')
-
-      # RUSTFLAGS in the environment replaces the flags in `.cargo/config.toml`, the runtime flag
-      # among them, so a run that finds it set stops before building.
-      - name: Refuse an environment that replaces the workspace's link flags
+      - name: Account and programs in bash
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
-          if [ -n "${RUSTFLAGS+set}${CARGO_ENCODED_RUSTFLAGS+set}" ]; then
-            echo '::error::RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS is set, and either one replaces the link flags in .cargo/config.toml.'
-            exit 1
-          fi
-
-      # One command per executable, as the release workflow builds them, and each one keeps what
-      # it printed. A program that fails to build does not stop the others: the step ends with a
-      # failure once every program has been tried, so that one red link hides no other.
-      - name: Build each executable
-        id: build
-        shell: bash
-        run: |
-          logs="$(cygpath -u "$RUNNER_TEMP")/build"
-          mkdir -p "$logs"
-          failed=0
-          start=$(date +%s)
-          for build in $KR_BUILDS; do
-            began=$(date +%s)
-            cargo build --locked --release -p "${build%/*}" --bin "${build#*/}" 2>&1 | tee "$logs/${build#*/}.log" || {
-              echo "::error::The build of ${build#*/} failed."
-              failed=1
-            }
-            echo "build time of ${build#*/}: $(( $(date +%s) - began )) s"
-          done
-          echo "build time of all programs: $(( $(date +%s) - start )) s"
-          exit "$failed"
-
-      # What the linker printed: each LNK code with the number of lines that carry it, then every
-      # LNK4098 line, which reports objects in one link asking for two different C runtimes.
-      - name: What the linker said
-        if: ${{ !cancelled() && steps.build.conclusion != 'skipped' }}
-        shell: bash
-        run: |
-          logs="$(cygpath -u "$RUNNER_TEMP")/build"
-          for log in "$logs"/*.log; do
-            echo "== $(basename "$log")"
-            echo "   warning lines: $(grep -c '^warning' "$log" || true)"
-            grep -o -E 'LNK[0-9]{4}' "$log" | sort | uniq -c || echo '   no LNK code'
-            grep -n -E 'LNK[0-9]{4}|linker stderr|error: linking' "$log" | head -30 || true
-          done
-          echo '== every line with LNK4098'
-          grep -n 'LNK4098' "$logs"/*.log || echo '   none'
+          cmd.exe //c "whoami.exe /priv"
+          type -a whoami.exe icacls.exe || true
+          echo "$PATH" | tr ':' '\n' | head -12
           exit 0
 
-      - name: Size and imports of each program
-        if: ${{ !cancelled() && steps.build.conclusion != 'skipped' }}
-        run: |
-          . (Join-Path $env:RUNNER_TEMP 'probe\tools.ps1')
-          $names = @(python scripts/release-programs.py names --target $env:TARGET)
-          $paths = @($names | ForEach-Object { "target\release\$_.exe" })
-          Read-Executables $env:TARGET $paths
-          if ($global:ProbeFailed) { exit 1 }
-          exit 0
+      # The two failing programs' whole suite, started the way the landing workflow starts it.
+      - name: Test kr-crypto in PowerShell with the workspace's flags
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-crypto
 
-      - name: Runtime each native library asks for
-        if: ${{ !cancelled() && steps.build.conclusion != 'skipped' }}
-        run: |
-          . (Join-Path $env:RUNNER_TEMP 'probe\tools.ps1')
-          $libs = @(Get-ChildItem -Path target\release\build -Recurse -Filter *.lib -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object { $_.FullName })
-          if ($env:SODIUM_DIST_DIR) {
-            $libs += @(Get-ChildItem -Path $env:SODIUM_DIST_DIR -Recurse -Filter *.lib -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
-          }
-          Write-Host "native libraries found: $($libs.Count)"
-          Read-LibraryRuntimes $libs
-          exit 0
-
-      # What the compile lines of llama.cpp carry: the runtime setting CMake kept, the runtime each
-      # generated project names, and the runtime option on each compiler command line. The
-      # description process is built for x86-64 only.
-      - name: Runtime of the llama.cpp compile
-        if: ${{ !cancelled() && steps.build.conclusion != 'skipped' && matrix.target == 'x86_64-pc-windows-msvc' }}
-        run: |
-          $roots = @(Get-ChildItem -Path target\release\build -Directory -Filter 'llama-cpp-sys-2-*' | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'out\build') })
-          if ($roots.Count -eq 0) { Write-Host '::error::No llama-cpp-sys-2 build directory holds a CMake tree.'; exit 1 }
-          foreach ($root in $roots) {
-            $tree = Join-Path $root.FullName 'out\build'
-            Write-Host "== $($root.Name)"
-            $cache = Join-Path $tree 'CMakeCache.txt'
-            if (Test-Path -LiteralPath $cache) {
-              Select-String -Path $cache -Pattern '^(CMAKE_GENERATOR|CMAKE_BUILD_TYPE|CMAKE_MSVC_RUNTIME_LIBRARY|CMAKE_C_FLAGS|CMAKE_CXX_FLAGS|CMAKE_C_FLAGS_RELEASE|CMAKE_CXX_FLAGS_RELEASE)[:=]' | ForEach-Object { Write-Host "   $($_.Line)" }
-            } else {
-              Write-Host '   no CMakeCache.txt'
-            }
-            $projects = @(Get-ChildItem -Path $tree -Recurse -Filter *.vcxproj -ErrorAction SilentlyContinue)
-            $values = @($projects | Select-String -Pattern '<RuntimeLibrary>([^<]*)</RuntimeLibrary>' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Group-Object | ForEach-Object { '{0}={1}' -f $_.Name, $_.Count })
-            Write-Host "   $($projects.Count) project files; RuntimeLibrary values, every configuration counted: $($values -join ' ')"
-            $files = @(Get-ChildItem -Path $tree -Recurse -Include 'CL.command.*.tlog', 'build.ninja', '*.rsp' -ErrorAction SilentlyContinue)
-            $tokens = @()
-            foreach ($file in $files) {
-              $encoding = if ($file.Name -like '*.tlog') { 'Unicode' } else { 'UTF8' }
-              $text = Get-Content -LiteralPath $file.FullName -Encoding $encoding -Raw
-              if ($text) { $tokens += @([regex]::Matches($text, '(?<=\s)/M[TD]d?(?=\s|$)') | ForEach-Object { $_.Value }) }
-            }
-            $counts = @($tokens | Group-Object | ForEach-Object { '{0}={1}' -f $_.Name, $_.Count })
-            Write-Host "   runtime options on the compiler command lines of $($files.Count) command files: $($counts -join ' ')"
-          }
-          exit 0
-
-      # The linker's own command line for one program, and the libraries Rust asks the linker to
-      # add. Rebuilding that program with the print options relinks it after the reads above.
-      - name: The link line of one program
-        if: ${{ !cancelled() && steps.build.conclusion != 'skipped' }}
+      # The two failing tests alone, from bash, with the same build.
+      - name: Test the two store cases in bash with the workspace's flags
+        if: ${{ !cancelled() }}
         shell: bash
-        run: |
-          logs="$(cygpath -u "$RUNNER_TEMP")/build"
-          cargo rustc --locked --release -p kr-hook --bin kr-hook -- --print link-args --print native-static-libs > "$logs/link-line.log" 2>&1 || echo "::warning::cargo rustc with the print options ended with $?."
-          echo "lines printed: $(wc -l < "$logs/link-line.log")"
-          echo '== link line, without the object files and Rust libraries'
-          tr ' ' '\n' < "$logs/link-line.log" | grep -v -E '\.(rlib|o|obj|rmeta)"?$' | head -250 || true
-          echo '== native-static-libs'
-          grep -E 'native-static-libs' "$logs/link-line.log" || echo '   no native-static-libs line'
-          exit 0
+        run: cargo test --locked -p kr-crypto --lib -- store::tests::directories_are_made_and_confirmed store::tests::a_confirmed_scope_takes_secrets
 
-      # A failure here prints the linker's errors and the symbols it could not resolve, and the
-      # steps after it still run.
-      - name: Test kr-crypto in the debug profile
-        if: ${{ !cancelled() && steps.build.conclusion != 'skipped' }}
-        shell: bash
-        run: |
-          logs="$(cygpath -u "$RUNNER_TEMP")/build"
-          rc=0
-          cargo test --locked -p kr-crypto 2>&1 | tee "$logs/kr-crypto-debug.log" || rc=$?
-          echo "== kr-crypto debug test exit $rc"
-          grep -E '^test result|FAILED|panicked' "$logs/kr-crypto-debug.log" | head -20 || true
-          if [ "$rc" -ne 0 ]; then
-            echo '== linker errors and unresolved symbols'
-            grep -n -E 'LNK[0-9]{4}|unresolved external|error: linking' "$logs/kr-crypto-debug.log" | head -100 || true
-          fi
-          exit "$rc"
+      # The link flags the workspace had before the change, given by the environment, which
+      # replaces the flags in `.cargo/config.toml`, and a target directory of their own.
+      - name: Test kr-crypto in PowerShell with the dynamic runtime's flags
+        if: ${{ !cancelled() }}
+        env:
+          RUSTFLAGS: -Clink-arg=/NODEFAULTLIB:LIBCMT -Clink-arg=/NODEFAULTLIB:LIBCMTD -Clink-arg=/IGNORE:4099
+          CARGO_TARGET_DIR: target-dynamic
+        run: cargo test --locked -p kr-crypto
 
-      - name: Test kr-crypto in the release profile
-        if: ${{ !cancelled() && steps.build.conclusion != 'skipped' }}
-        shell: bash
-        run: |
-          logs="$(cygpath -u "$RUNNER_TEMP")/build"
-          rc=0
-          cargo test --locked -p kr-crypto --release 2>&1 | tee "$logs/kr-crypto-release.log" || rc=$?
-          echo "== kr-crypto release test exit $rc"
-          grep -E '^test result|FAILED|panicked' "$logs/kr-crypto-release.log" | head -20 || true
-          if [ "$rc" -ne 0 ]; then
-            echo '== linker errors and unresolved symbols'
-            grep -n -E 'LNK[0-9]{4}|unresolved external|error: linking' "$logs/kr-crypto-release.log" | head -100 || true
-          fi
-          exit "$rc"
-
-      # The companion's program, built as a plain cargo build of its binary and not as an
-      # application bundle. The variable keeps Tauri's own static-runtime helper out of the link.
-      - name: Build the companion's program
-        id: companion
-        if: ${{ !cancelled() && steps.build.conclusion != 'skipped' && matrix.target == 'x86_64-pc-windows-msvc' }}
+      - name: Test the two store cases in bash with the dynamic runtime's flags
+        if: ${{ !cancelled() }}
         shell: bash
         env:
-          STATIC_VCRUNTIME: 'false'
-        run: |
-          logs="$(cygpath -u "$RUNNER_TEMP")/build"
-          start=$(date +%s)
-          rc=0
-          cargo build --locked --release -p companion-tauri --bin kalareach-companion 2>&1 | tee "$logs/kalareach-companion.log" || rc=$?
-          echo "build time of the companion's program: $(( $(date +%s) - start )) s, exit $rc"
-          exit "$rc"
-
-      - name: Size and imports of the companion's program
-        if: ${{ !cancelled() && steps.companion.conclusion != 'skipped' }}
-        run: |
-          . (Join-Path $env:RUNNER_TEMP 'probe\tools.ps1')
-          $log = Join-Path $env:RUNNER_TEMP 'build\kalareach-companion.log'
-          Write-Host '== what the linker said'
-          if (Test-Path -LiteralPath $log) {
-            Select-String -Path $log -Pattern 'LNK[0-9]{4}|linker stderr|error: linking' | Select-Object -First 30 | ForEach-Object { Write-Host "   $($_.Line)" }
-            Write-Host "   lines with LNK4098: $(@(Select-String -Path $log -Pattern 'LNK4098').Count)"
-          } else {
-            Write-Host '::error::The companion build log is not there.'
-            $global:ProbeFailed = $true
-          }
-          Read-Executables 'companion' @('target\release\kalareach-companion.exe')
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
-          $loader = @(Get-ChildItem -Path (Join-Path $cargoHome 'registry\src\*\webview2-com-sys-*') -Recurse -Filter WebView2LoaderStatic.lib -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match '\\x64\\' } | ForEach-Object { $_.FullName })
-          Write-Host "WebView2 loader libraries found: $($loader.Count)"
-          if ($loader.Count -gt 0) { Read-LibraryRuntimes $loader }
-          if ($global:ProbeFailed) { exit 1 }
-          exit 0
+          RUSTFLAGS: -Clink-arg=/NODEFAULTLIB:LIBCMT -Clink-arg=/NODEFAULTLIB:LIBCMTD -Clink-arg=/IGNORE:4099
+          CARGO_TARGET_DIR: target-dynamic
+        run: cargo test --locked -p kr-crypto --lib -- store::tests::directories_are_made_and_confirmed store::tests::a_confirmed_scope_takes_secrets
