@@ -18,6 +18,7 @@
 
 #![cfg(unix)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -902,8 +903,10 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
     }
 }
 
-/// The variable that names the one directory every test artefact of a run is kept in.
-const ARTIFACTS_VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
+/// The variable that names the one directory every test artefact of a run is kept in. Its name is
+/// written in two pieces, so that this file's own lines name it only in comments and in the held
+/// list, and the case reads this file as it reads every other.
+const VARIABLE: &str = concat!("KR_TEST_", "ARTIFACTS_DIR");
 
 /// How a value may begin and still lie in a temporary folder: `/tmp`, or the runner's or the
 /// platform's temporary folder, spelled as a shell, PowerShell and the workflow syntax spell it. A
@@ -918,24 +921,6 @@ const TEMPORARY_FOLDERS: [&str; 7] = [
     "$env:TEMP",
     "$env:TMP",
 ];
-
-/// The values made from the variable's own value, which is the one checked where it was set: the
-/// variable itself, and the two commands that make its path absolute or a Windows path a POSIX one.
-const DERIVED_FROM_ITSELF: [&str; 4] = [
-    "$KR_TEST_ARTIFACTS_DIR",
-    "${KR_TEST_ARTIFACTS_DIR}",
-    "$(cygpath -u \"$KR_TEST_ARTIFACTS_DIR\")",
-    "$(cd \"$KR_TEST_ARTIFACTS_DIR\" && pwd)",
-];
-
-/// The assignments the build's own scripts make that the case cannot follow to a temporary folder,
-/// each with the reason it is allowed: the file, the text of the line, and why.
-const UNFOLLOWED_ASSIGNMENTS: [(&str, &str, &str); 1] = [(
-    "scripts/store-android.sh",
-    "KR_TEST_ARTIFACTS_DIR=\"$leg/e2e\"",
-    "the store build keeps the logs of its release check beside the signed bundle, in the directory \
-     the caller names, and that check keeps its screenshots in the folder its own default names",
-)];
 
 /// The tools that take a screenshot, by the name a workflow step runs them under.
 const SCREENSHOT_TOOLS: [&str; 12] = [
@@ -999,85 +984,6 @@ fn leading_value(rest: &str) -> String {
     value
 }
 
-/// The value a line gives the variable: an entry of a workflow's `env` (`NAME: value`) or an
-/// assignment (`NAME=value`, after `export`, in front of a command, or inside the quoted line a
-/// PowerShell step writes to the job's environment file). A comment gives none.
-fn artifacts_assignment(line: &str) -> Option<String> {
-    let line = line.trim();
-    if line.starts_with('#') || line.starts_with("//") {
-        return None;
-    }
-    if let Some(rest) = line.strip_prefix(&format!("{ARTIFACTS_VARIABLE}:")) {
-        return Some(unquoted(without_comment(rest)).to_owned());
-    }
-    let at = line.find(&format!("{ARTIFACTS_VARIABLE}="))?;
-    Some(leading_value(&line[at + ARTIFACTS_VARIABLE.len() + 1..]))
-}
-
-/// Whether a line writes the variable in a way `artifacts_assignment` does not read: PowerShell's
-/// `$env:NAME = value`, `NAME += value`, a setter that takes the name and a value
-/// (`SetEnvironmentVariable('NAME', value)`), an object key in a script, or an expansion with a
-/// form of default or alternate other than `${NAME:-default}`, `${NAME:?}` and `${NAME:+word}`. A
-/// comparison, a plain read and an expansion with a default are not writes.
-///
-/// Where a `[` or `test ` stands anywhere before the name on the line, the `=` after the name is
-/// taken for a comparison. So Python's `os.environ["NAME"] = value` and JavaScript's
-/// `process.env['NAME'] = value` are not read as writes, and nor is a write with no `=` or `:`
-/// after the name (`printf` into the environment file, `printf -v`, `read`, `NAME<<EOF`).
-fn writes_unread(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') || trimmed.starts_with("//") || artifacts_assignment(line).is_some()
-    {
-        return false;
-    }
-    line.match_indices(ARTIFACTS_VARIABLE).any(|(at, _)| {
-        let head = &line[..at];
-        let after = line[at + ARTIFACTS_VARIABLE.len()..]
-            .trim_start_matches(['"', '\'', ']', ')'])
-            .trim_start();
-        if head.ends_with("${") {
-            return !(after.starts_with(":-")
-                || after.starts_with(":?")
-                || after.starts_with(":+")
-                || after.starts_with('}'));
-        }
-        let call_or_key = head.trim_end_matches(['"', '\'', ' ', '\t']);
-        let comparison = head.contains('[') || head.contains("test ");
-        (after.starts_with('=')
-            && !after.starts_with("==")
-            && !after.starts_with("=~")
-            && !comparison)
-            || after.starts_with("+=")
-            || (after.starts_with(',') && call_or_key.ends_with('('))
-            || (after.starts_with(':')
-                && !after.starts_with(":-")
-                && call_or_key.ends_with(['{', ',']))
-    })
-}
-
-/// What a script falls back on where the variable is unset: the text of each `${NAME:-default}` on
-/// a line, less the empty ones, which only pass on what the caller gave.
-fn artifacts_defaults(line: &str) -> Vec<String> {
-    let opening = format!("${{{ARTIFACTS_VARIABLE}:-");
-    line.match_indices(&opening)
-        .map(|(at, _)| {
-            let mut depth = 0_usize;
-            let mut default = String::new();
-            for character in line[at + opening.len()..].chars() {
-                match character {
-                    '{' => depth += 1,
-                    '}' if depth == 0 => break,
-                    '}' => depth -= 1,
-                    _ => {}
-                }
-                default.push(character);
-            }
-            default
-        })
-        .filter(|default| !default.is_empty())
-        .collect()
-}
-
 /// The name of the variable a value begins with, in a shell's (`$name`, `${name`) or PowerShell's
 /// (`$name`) spelling. `$env:` and `$(` begin no name.
 fn leading_variable(value: &str) -> Option<&str> {
@@ -1120,27 +1026,42 @@ fn values_of(text: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `value` is made from the variable's own value: the variable itself, or the two commands
+/// that make its path absolute or a Windows path a POSIX one. The value it is made from is the one
+/// the held list shows where it was given.
+fn derived_from_itself(value: &str) -> bool {
+    [
+        format!("${VARIABLE}"),
+        format!("${{{VARIABLE}}}"),
+        format!("$env:{VARIABLE}"),
+        format!("$(cygpath -u \"${VARIABLE}\")"),
+        format!("$(cd \"${VARIABLE}\" && pwd)"),
+    ]
+    .iter()
+    .any(|own| own == value)
+        || value.starts_with(&format!("${VARIABLE}/"))
+        || value.starts_with(&format!("${{{VARIABLE}}}/"))
+}
+
 /// Whether `value`, as a script or a workflow writes it, lies in a temporary folder: it begins with
 /// one, or with the default that a `${NAME:-default}` falls back on, or with a command that makes a
-/// directory in one, or with another variable of `text` whose every value does. A value made from
-/// the variable's own value is the one checked where that was set. A step up (`..`) is never inside.
+/// directory in one, or with another variable that `text` gives a value, every one of which does. A
+/// value made from the variable's own value is the one checked where that was given. A step up
+/// (`..`) is never inside.
 fn lies_in_a_temporary_folder(value: &str, text: &str, depth: usize) -> bool {
     let value = unquoted(value);
     if depth == 0 || value.is_empty() || value.split(['/', '\\']).any(|part| part == "..") {
         return false;
     }
-    if DERIVED_FROM_ITSELF.contains(&value)
-        || value.starts_with("$KR_TEST_ARTIFACTS_DIR/")
-        || value.starts_with("${KR_TEST_ARTIFACTS_DIR}/")
-    {
+    if derived_from_itself(value) {
         return true;
     }
     if let Some((name, default)) = expansion_default(value) {
         // The variable's own default is the one to check; a folder variable's default may be `/tmp`
-        // itself, which a path under it then extends; any other name is also read where this text
-        // gives it a value, since that value is what the expansion yields when it is set.
+        // itself, which a path under it then extends; any other name is also read where `text` gives
+        // it a value, since that value is what the expansion yields when it is set.
         let in_a_folder = lies_in_a_temporary_folder(&default, text, depth - 1);
-        return if name == ARTIFACTS_VARIABLE {
+        return if name == VARIABLE {
             default.is_empty() || in_a_folder
         } else if ["TMPDIR", "RUNNER_TEMP", "TEMP", "TMP"].contains(&name) {
             default == "/tmp" || in_a_folder
@@ -1211,26 +1132,638 @@ fn never_runs(step: &str) -> bool {
     })
 }
 
-/// KR-REQ-27.03, the part about the build's directory: every value the workflows and scripts it
-/// reads give the artefacts directory, as `NAME=value`, `NAME: value` or the default of
-/// `${NAME:-default}`, lies in a temporary folder (`/tmp`, or the runner's or the platform's own),
-/// and a job that runs a screenshot tool has the variable set when that step starts. A value
-/// spelled in a way this does not know is refused; the one assignment it cannot follow is named,
-/// with its reason.
+/// The value a line gives the variable in a workflow: an entry of an `env` (`NAME: value`) or an
+/// assignment (`NAME=value`, after `export`, in front of a command, or inside the quoted line a
+/// PowerShell step writes to the job's environment file). A comment gives none. This is read only
+/// to tell whether a step has the variable; the values themselves are the held list's.
+fn artifacts_assignment(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.starts_with('#') || line.starts_with("//") {
+        return None;
+    }
+    if let Some(rest) = line.strip_prefix(&format!("{VARIABLE}:")) {
+        return Some(unquoted(without_comment(rest)).to_owned());
+    }
+    let at = line.find(&format!("{VARIABLE}="))?;
+    Some(leading_value(&line[at + VARIABLE.len() + 1..]))
+}
+
+/// The file that holds the held list: the lines between the two markers below are the list's own
+/// text, and they are let through as data.
+const THIS_FILE: &str = "tests/conformance/tests/ci_evidence.rs";
+const HELD_OPENS: &str = "const HELD: &str = r##\"";
+const HELD_CLOSES: &str = "\"##;";
+
+/// What a held entry holds.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// A line that gives the variable a value: the value stands right after the name.
+    Write,
+    /// A line that hands a value to a program as an argument; the value is a word of the line.
+    Argument,
+    /// A line that cannot run and that no line rule lets through.
+    Comment,
+}
+
+/// How an entry shows that its value lies in a temporary folder.
+enum Proof {
+    /// By the text of the entry's own lines: the value begins with a temporary folder, or with a
+    /// variable that one of those lines gives such a value.
+    Text,
+    /// By a line of the entry that makes a temporary directory, for a value in a language whose
+    /// expressions the case does not follow.
+    Folder(String),
+    /// By a reason, stated in the entry, that it lies elsewhere or comes from outside.
+    Reason,
+}
+
+/// One entry of the held list: where the lines stand, what they give, and why that is allowed.
+struct Held {
+    file: String,
+    kind: Kind,
+    /// Blocks of consecutive lines, in the order they stand in the file; the last line of the last
+    /// block is the held line, and the others define what its value names.
+    parts: Vec<Vec<String>>,
+    value: String,
+    proof: Proof,
+}
+
+impl Held {
+    fn held_line(&self) -> &str {
+        self.parts
+            .last()
+            .and_then(|part| part.last())
+            .map_or("", String::as_str)
+    }
+
+    /// Every line of the entry but the held one.
+    fn definitions(&self) -> Vec<&str> {
+        let all: Vec<&str> = self.parts.iter().flatten().map(String::as_str).collect();
+        all[..all.len() - 1].to_vec()
+    }
+}
+
+fn parse_entry(lines: &[&str]) -> Held {
+    let (mut file, mut kind, mut value) = (None, Kind::Write, String::new());
+    let (mut folder, mut why) = (None, None);
+    let mut parts: Vec<Vec<String>> = vec![Vec::new()];
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("file:") {
+            file = Some(rest.trim().to_owned());
+        } else if let Some(rest) = line.strip_prefix("kind:") {
+            kind = match rest.trim() {
+                "argument" => Kind::Argument,
+                "comment" => Kind::Comment,
+                other => panic!("an entry of the held list has the kind {other}"),
+            };
+        } else if let Some(rest) = line.strip_prefix("value:") {
+            value = rest.trim().to_owned();
+        } else if let Some(rest) = line.strip_prefix("folder:") {
+            folder = Some(rest.trim().to_owned());
+        } else if let Some(rest) = line.strip_prefix("why:") {
+            why = Some(rest.trim().to_owned());
+        } else if *line == "..." {
+            parts.push(Vec::new());
+        } else if let Some(rest) = line.strip_prefix("| ") {
+            parts
+                .last_mut()
+                .expect("a part")
+                .push(rest.trim().to_owned());
+        } else {
+            panic!("a line of the held list that is none of its forms: {line}");
+        }
+    }
+    let file = file.unwrap_or_else(|| panic!("an entry of the held list names no file: {lines:?}"));
+    assert!(
+        parts.iter().all(|part| !part.is_empty()),
+        "an entry of the held list for {file} has an empty block"
+    );
+    assert!(
+        kind == Kind::Comment || !value.is_empty(),
+        "an entry of the held list for {file} gives no value"
+    );
+    let proof = match (folder, why) {
+        (None, None) => Proof::Text,
+        (Some(folder), None) => Proof::Folder(folder),
+        (None, Some(why)) if !why.is_empty() => Proof::Reason,
+        _ => panic!("an entry of the held list for {file} has no single, non-empty proof"),
+    };
+    assert!(
+        kind != Kind::Comment || matches!(proof, Proof::Reason),
+        "a comment entry of the held list for {file} states its reason"
+    );
+    Held {
+        file,
+        kind,
+        parts,
+        value,
+        proof,
+    }
+}
+
+/// The entries of a held list: paragraphs set apart by blank lines.
+fn parse_held(text: &str) -> Vec<Held> {
+    let mut held = Vec::new();
+    let mut paragraph: Vec<&str> = Vec::new();
+    for line in text.lines().map(str::trim).chain([""]) {
+        if !line.is_empty() {
+            paragraph.push(line);
+        } else if !paragraph.is_empty() {
+            held.push(parse_entry(&paragraph));
+            paragraph.clear();
+        }
+    }
+    held
+}
+
+/// Where the entry's last line stands in `lines`: every block of the entry stands in exactly one
+/// place, after the block before it.
+fn locate(entry: &Held, lines: &[&str]) -> Result<usize, String> {
+    let mut next = 0;
+    for part in &entry.parts {
+        let stands: Vec<usize> = if lines.len() < part.len() {
+            Vec::new()
+        } else {
+            (0..=lines.len() - part.len())
+                .filter(|start| {
+                    part.iter()
+                        .enumerate()
+                        .all(|(offset, held)| lines[start + offset].trim() == held)
+                })
+                .collect()
+        };
+        match stands.as_slice() {
+            [] => return Err(format!("no line stands as `{}`", part[0])),
+            [only] if *only >= next => next = only + part.len(),
+            [_] => return Err(format!("`{}` stands above a line it must follow", part[0])),
+            many => return Err(format!("`{}` stands in {} places", part[0], many.len())),
+        }
+    }
+    Ok(next - 1)
+}
+
+/// What may stand between the name and the value it is given (`=`, `="`, `: `, `:-`, `", `,
+/// `'] ?? '`), and what may end the value.
+const GAP: [char; 10] = ['"', '\'', '=', ':', '-', ',', ']', '?', ' ', '['];
+const VALUE_ENDS: [char; 14] = [
+    ' ', '\t', '"', '\'', ')', '}', ';', ',', '&', '|', '\\', '`', '<', '>',
+];
+
+fn is_word(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// The span of `value` in `line` from `start`, when it is a whole value and not the start of a longer
+/// one (`/tmp/a` is not the start of `/tmp/a/../b`).
+fn delimited(line: &str, start: usize, value: &str) -> Option<(usize, usize)> {
+    let rest = line.get(start..)?.strip_prefix(value)?;
+    rest.chars()
+        .next()
+        .is_none_or(|character| VALUE_ENDS.contains(&character))
+        .then_some((start, start + value.len()))
+}
+
+/// The span of `value` where the name at `at` is given it: the value stands after nothing but the
+/// punctuation of a write.
+fn bound_value(line: &str, at: usize, value: &str) -> Option<(usize, usize)> {
+    let end = at + VARIABLE.len();
+    let after = &line[end..];
+    let start = end + after.len() - after.trim_start_matches(GAP).len();
+    (start > end)
+        .then(|| delimited(line, start, value))
+        .flatten()
+}
+
+/// The span of `value` where an argument's line holds it as a word of its own.
+fn argument_span(line: &str, value: &str) -> Option<(usize, usize)> {
+    line.match_indices(value).find_map(|(start, _)| {
+        let word_start = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_word(character));
+        word_start.then(|| delimited(line, start, value)).flatten()
+    })
+}
+
+/// Where the name stands in `line`, in any letter case.
+fn occurrences(line: &str) -> Vec<usize> {
+    line.to_ascii_lowercase()
+        .match_indices(&VARIABLE.to_ascii_lowercase())
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// Whether the name at `at` is a read, by the closed list of read forms: a whole name that is
 ///
-/// The case reads a fixed list of forms as text, and other forms pass it. It has four gaps:
+/// - in a workflow expression, `${{ env.NAME }}`;
+/// - in PowerShell, `$env:NAME` not followed by an assignment;
+/// - a shell expansion that gives no value: `$NAME`, `${NAME}`, `${NAME:?...}`, `${NAME:+...}` and
+///   `${NAME:-}` with an empty default (a default with text gives a value and is a write);
+/// - the argument of Rust's `env::var` or `env::var_os`;
+/// - alone on an `export` line, which gives the variable no new value.
+fn is_a_read(line: &str, at: usize) -> bool {
+    let (before, after) = (&line[..at], &line[at + VARIABLE.len()..]);
+    if before.chars().next_back().is_some_and(is_word) || after.chars().next().is_some_and(is_word)
+    {
+        return false;
+    }
+    let lower = before.to_ascii_lowercase();
+    let rest = after.trim_start();
+    if lower.ends_with("${{ env.") {
+        after.starts_with(" }}")
+    } else if lower.ends_with("$env:") {
+        !(rest.starts_with('=') || rest.starts_with("+=") || rest.starts_with("-="))
+    } else if before.ends_with("${") {
+        after.starts_with('}')
+            || after.starts_with(":?")
+            || after.starts_with(":+")
+            || after.starts_with(":-}")
+    } else if before.ends_with('$') {
+        !rest.starts_with('=')
+    } else if before.ends_with("env::var_os(\"") || before.ends_with("env::var(\"") {
+        after.starts_with("\")")
+    } else {
+        before.trim() == "export" && after.trim().is_empty()
+    }
+}
+
+/// The name of the constant that a line makes of the variable's name (`const NAME: &str = "..."`).
+fn alias_of(line: &str) -> Option<String> {
+    let mut line = line.trim();
+    for word in ["pub(crate) ", "pub "] {
+        line = line.strip_prefix(word).unwrap_or(line);
+    }
+    let rest = line
+        .strip_prefix("const ")
+        .or_else(|| line.strip_prefix("static "))?;
+    let (name, after) = rest.split_once(':')?;
+    let literal = after
+        .trim()
+        .strip_prefix("&str")?
+        .trim()
+        .strip_prefix('=')?
+        .trim()
+        .strip_prefix('"')?
+        .strip_suffix("\";")?;
+    literal
+        .eq_ignore_ascii_case(VARIABLE)
+        .then(|| name.trim().to_owned())
+}
+
+/// Where the constant `name` stands in `line` as a word of its own.
+fn word_positions(line: &str, name: &str) -> Vec<usize> {
+    line.match_indices(name)
+        .map(|(at, _)| at)
+        .filter(|at| {
+            !line[..*at].chars().next_back().is_some_and(is_word)
+                && !line[at + name.len()..].chars().next().is_some_and(is_word)
+        })
+        .collect()
+}
+
+/// Which lines of a file cannot run, by these rules and no others:
 ///
-/// - A variable that a value names is read from any definition of it in the same file (`name=value`
-///   or PowerShell's `$name = value`), wherever that stands, so a definition below the write or in
-///   another step can make the write pass. A definition in a workflow's `env` or one made through
-///   the environment file is not read.
-/// - An assignment after a `[` on the same line, which is how Python and JavaScript write
-///   `os.environ["NAME"] = value` and `process.env['NAME'] = value`, is taken for a comparison.
-/// - A write with no `=` or `:` after the name is not seen: `printf` into the environment file,
-///   `printf -v`, `read`, and the `NAME<<EOF` form.
-/// - Files outside `.github` and the root `scripts/` directory are not read, and inside them only
-///   workflows (`.yml`, `.yaml`) and scripts ending in `.sh`, `.bash`, `.py`, `.mjs`, `.js` or
-///   `.ps1`.
+/// - a line whose first characters are `#`, in `.sh`, `.bash`, `.yml`, `.yaml`, `.py` and `.ps1`
+///   files, where a line that starts so is a comment to the end;
+/// - a line whose first characters are `//` (so `///` and `//!` too), in `.rs`, `.ts`, `.tsx`,
+///   `.js` and `.mjs` files, except the lines of a code block in a doc comment, which the Rust
+///   documentation tests compile and run;
+/// - a line of a `.md` file outside a fenced code block and not indented as code, which is prose.
+///
+/// A line that starts a comment and goes on does not start with these characters, and a line that
+/// ends a block comment starts with `*` or `*/`: neither is let through.
+fn lines_that_cannot_run(path: &str, lines: &[&str]) -> Vec<bool> {
+    let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
+    let mut fenced = false;
+    lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            match extension {
+                "sh" | "bash" | "yml" | "yaml" | "py" | "ps1" => trimmed.starts_with('#'),
+                "rs" | "ts" | "tsx" | "js" | "mjs" => {
+                    let doc = trimmed
+                        .strip_prefix("///")
+                        .or_else(|| trimmed.strip_prefix("//!"));
+                    if let Some(body) = doc {
+                        if body.trim_start().starts_with("```") {
+                            fenced = !fenced;
+                            return true;
+                        }
+                        return !fenced;
+                    }
+                    fenced = false;
+                    trimmed.starts_with("//")
+                }
+                "md" => {
+                    if line.len() - trimmed.len() < 4
+                        && (trimmed.starts_with("```") || trimmed.starts_with("~~~"))
+                    {
+                        fenced = !fenced;
+                        return true;
+                    }
+                    !fenced && !line.starts_with("    ") && !line.starts_with('\t')
+                }
+                _ => false,
+            }
+        })
+        .collect()
+}
+
+/// The lines of this file that are the held list: between the line that opens it and the line that
+/// closes it, and equal to the list that the program holds, so that every line let through is data.
+fn held_region(lines: &[&str], held_text: &str) -> Result<std::ops::Range<usize>, String> {
+    let opens: Vec<usize> = (0..lines.len())
+        .filter(|index| lines[*index].trim() == HELD_OPENS)
+        .collect();
+    let [open] = opens.as_slice() else {
+        return Err(format!(
+            "{THIS_FILE} has {} lines that open the held list, not one",
+            opens.len()
+        ));
+    };
+    let close = lines[open + 1..]
+        .iter()
+        .position(|line| line.trim() == HELD_CLOSES)
+        .map(|offset| open + 1 + offset)
+        .ok_or_else(|| format!("{THIS_FILE} does not close the held list"))?;
+    let expected: Vec<&str> = held_text.lines().skip(1).collect();
+    if lines[open + 1..close] != expected[..] {
+        return Err(format!(
+            "the lines between the held list's markers in {THIS_FILE} are not the held list"
+        ));
+    }
+    Ok(open + 1..close)
+}
+
+/// What is wrong with an entry's proof that its value lies in a temporary folder.
+fn proof_problem(entry: &Held) -> Option<String> {
+    let label = format!("held entry for {} ({})", entry.file, entry.held_line());
+    match (&entry.kind, &entry.proof) {
+        (Kind::Comment, _) | (_, Proof::Reason) => None,
+        (_, Proof::Folder(folder)) => {
+            let makes_one = ["TempDir::new(", "tempdir(", "env::temp_dir()"]
+                .iter()
+                .any(|maker| folder.contains(maker));
+            (!(makes_one && entry.definitions().contains(&folder.as_str()))).then(|| {
+                format!("{label}: the folder line is not a line of the entry that makes a temporary directory")
+            })
+        }
+        (_, Proof::Text) => {
+            (!lies_in_a_temporary_folder(&entry.value, &entry.definitions().join("\n"), 6)).then(
+                || {
+                    format!(
+                        "{label}: the value {} does not lie in a temporary folder",
+                        entry.value
+                    )
+                },
+            )
+        }
+    }
+}
+
+/// What this case finds wrong in `files` (every tracked file, by path and bytes) when `held_text` is
+/// the held list.
+fn findings(files: &[(String, Vec<u8>)], held_text: &str) -> Vec<String> {
+    let held = parse_held(held_text);
+    let mut problems = Vec::new();
+    // Each held entry stands once in its file, its value is given by its line, and it shows that the
+    // value lies in a temporary folder.
+    let mut at_line: HashMap<(&str, usize), Vec<usize>> = HashMap::new();
+    let mut covered: HashMap<(&str, usize), Vec<(usize, usize)>> = HashMap::new();
+    for (index, entry) in held.iter().enumerate() {
+        let Some((_, bytes)) = files.iter().find(|(path, _)| *path == entry.file) else {
+            problems.push(format!(
+                "held entry for {}: the file is not tracked",
+                entry.file
+            ));
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            problems.push(format!(
+                "held entry for {}: the file is not text",
+                entry.file
+            ));
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let last = match locate(entry, &lines) {
+            Ok(last) => last,
+            Err(error) => {
+                problems.push(format!("held entry for {}: {error}", entry.file));
+                continue;
+            }
+        };
+        at_line
+            .entry((entry.file.as_str(), last))
+            .or_default()
+            .push(index);
+        problems.extend(proof_problem(entry));
+        let line = lines[last];
+        let span = match entry.kind {
+            Kind::Write => occurrences(line)
+                .into_iter()
+                .find_map(|at| bound_value(line, at, &entry.value).map(|span| (at, span))),
+            Kind::Argument => argument_span(line, &entry.value).map(|span| (span.0, span)),
+            Kind::Comment => continue,
+        };
+        match span {
+            Some((at, (from, to))) => {
+                let spans = covered.entry((entry.file.as_str(), last)).or_default();
+                if entry.kind == Kind::Write {
+                    spans.push((at, at + VARIABLE.len()));
+                }
+                spans.push((from, to));
+            }
+            None => problems.push(format!(
+                "held entry for {}: its line does not give the variable the value {}: {}",
+                entry.file, entry.value, line
+            )),
+        }
+    }
+
+    // Every other line that names the variable is a read, a line that cannot run, or a line of the
+    // held list in this file.
+    let needle = VARIABLE.to_ascii_lowercase();
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    for (path, bytes) in files {
+        if !String::from_utf8_lossy(&bytes.to_ascii_lowercase()).contains(&needle) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            problems.push(format!(
+                "{path}: a file that is not text names the variable"
+            ));
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let mut passes = lines_that_cannot_run(path, &lines);
+        if path == THIS_FILE {
+            match held_region(&lines, held_text) {
+                Ok(region) => passes[region].fill(true),
+                Err(error) => problems.push(error),
+            }
+        }
+        for (index, line) in lines.iter().enumerate() {
+            let entries = at_line
+                .get(&(path.as_str(), index))
+                .map_or(&[][..], Vec::as_slice);
+            if entries
+                .iter()
+                .any(|entry| held[*entry].kind == Kind::Comment)
+            {
+                continue;
+            }
+            if passes[index] || occurrences(line).is_empty() {
+                continue;
+            }
+            if let Some(name) = alias_of(line) {
+                aliases.push((
+                    name,
+                    path.rsplit_once('.').map_or("", |(_, e)| e).to_owned(),
+                ));
+                continue;
+            }
+            let spans = covered
+                .get(&(path.as_str(), index))
+                .map_or(&[][..], Vec::as_slice);
+            let unexplained = occurrences(line).into_iter().any(|at| {
+                !spans.iter().any(|(from, to)| (*from..*to).contains(&at)) && !is_a_read(line, at)
+            });
+            if unexplained {
+                problems.push(format!(
+                    "{path}:{}: this line names the variable and is neither a known read nor a held \
+                     write: {}\n  Show where its value lies (a temporary folder: /tmp, the runner's \
+                     or the platform's own, or under the variable's own earlier value) and add \
+                     the line to the held list, in the form the list shows.",
+                    index + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+
+    // A constant that holds the name is read where it is used: through Rust's environment calls,
+    // and nowhere else.
+    for (name, extension) in &aliases {
+        for (path, bytes) in files
+            .iter()
+            .filter(|(path, _)| path.ends_with(&format!(".{extension}")))
+        {
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            if !text.contains(name.as_str()) {
+                continue;
+            }
+            let lines: Vec<&str> = text.lines().collect();
+            let passes = lines_that_cannot_run(path, &lines);
+            for (index, line) in lines.iter().enumerate() {
+                let uses = word_positions(line, name);
+                let read = |at: &usize| {
+                    let before = &line[..*at];
+                    (before.ends_with("env::var_os(") || before.ends_with("env::var("))
+                        && line[at + name.len()..].starts_with(')')
+                };
+                if !passes[index]
+                    && alias_of(line).as_deref() != Some(name)
+                    && !uses.iter().all(read)
+                {
+                    problems.push(format!(
+                        "{path}:{}: a use of the constant {name}, which holds the variable's name, \
+                         that is not a read: {}",
+                        index + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// The tracked files of the checkout at `root`, as the checkout's own index lists them, by path and
+/// bytes, and what is wrong with the listing: no repository, no `git` program, a listed file that the
+/// checkout does not hold. A listed path that is not a regular file (a link, a submodule) holds a
+/// path or a commit id and no text of a build, and is not read. A file that is not yet added to the
+/// index is not listed.
+fn tracked_files(root: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+    let listing = Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "-C"])
+        .arg(root)
+        .args(["ls-files", "-z", "--cached"])
+        .output()
+        .unwrap_or_else(|error| panic!("git is needed to list the tracked files: {error}"));
+    assert!(
+        listing.status.success(),
+        "git could not list the tracked files of {}: {}",
+        root.display(),
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let (mut files, mut problems) = (Vec::new(), Vec::new());
+    for path in listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = String::from_utf8(path.to_vec()).expect("a tracked path is text");
+        match fs::symlink_metadata(root.join(&path)) {
+            Err(error) => problems.push(format!(
+                "{path} is tracked and the checkout lacks it: {error}"
+            )),
+            Ok(metadata) if !metadata.is_file() => {}
+            Ok(_) => {
+                let bytes = fs::read(root.join(&path))
+                    .unwrap_or_else(|error| panic!("{path} is read: {error}"));
+                files.push((path, bytes));
+            }
+        }
+    }
+    (files, problems)
+}
+
+/// KR-REQ-27.03, the part about the build's directory: every value that a build gives the variable
+/// that names the artefacts directory lies in a temporary folder (`/tmp`, the runner's or the
+/// platform's own, or under the variable's own earlier value). The case fails on what it does not
+/// know.
+///
+/// It reads every tracked file of every type: the checkout's own list, from `git ls-files`, and the
+/// bytes of each file that the checkout holds (a link or a submodule holds a path or a commit and is
+/// not read). The name is searched in any letter case, since Windows takes it in any. A file that
+/// names the variable and is not text fails the case. Each line that names the variable is exactly
+/// one of these, and a line that is none of them fails the case with the lines to add:
+///
+/// 1. A held write. The held list holds each line that gives the variable a value (a workflow's
+///    `env` entry, an assignment, the default of `${NAME:-default}`, a program's environment call)
+///    whole by its text: the file, the line, the value that stands right after the name, and, for
+///    each variable that the value names, the line that defines it, in the order they stand. Every
+///    block of lines of an entry must stand in exactly one place of its file, so an entry that
+///    matches no line, or more than one, fails the case, and so does a value that is only the start
+///    of the line's value or a line that gives the variable a second value. The case shows from
+///    the entry's own lines that the value lies in a temporary folder. For a value in Rust, whose
+///    expressions it does not follow, the entry names its line that makes a temporary directory.
+///    A value that lies elsewhere, or is the caller's, carries its reason. A held argument is a
+///    line that hands the variable's value to a program, held the same way.
+/// 2. A known read, and only these: `${{ env.NAME }}` in a workflow, `$env:NAME` in PowerShell, a
+///    shell's `$NAME`, `${NAME}`, `${NAME:?...}`, `${NAME:+...}` and `${NAME:-}` with an empty
+///    default, a call of Rust's `env::var` or `env::var_os`, and a bare `export NAME`. A default
+///    with text (`${NAME:-default}`) gives a value, and is a held write. A constant that holds the
+///    name (`const X: &str = "..."`) is allowed when every use of `X` in a file of its type is
+///    such a call.
+/// 3. A line that cannot run, by these rules only: a line that starts with `#` in a `.sh`,
+///    `.bash`, `.yml`, `.yaml`, `.py` or `.ps1` file; a line that starts with `//` (so `///` and
+///    `//!`) in a `.rs`, `.ts`, `.tsx`, `.js` or `.mjs` file, except the lines of a code block in a
+///    doc comment, which the Rust documentation tests run; a line of a `.md` file outside a fenced
+///    code block and not indented as code; and a line of this file between the two lines that open
+///    and close its held list, which equal the list the program holds, so that every line let
+///    through is data. A line that has anything before its comment marker, a line that ends a
+///    block comment, and a line inside a block comment are not let through: the one such line that
+///    names the variable is held as a comment with its reason.
+///
+/// A text hold detects a change to the lines it holds, and not a wrong change: it does not read
+/// what a line elsewhere does to a variable that a held line names, or what an `env` entry does
+/// to `TEMP`. A name made at run time (`${!name}`, a joined string) is out of reach of any case
+/// that reads text, and so is a file that is not yet added to the index.
 ///
 /// Not shown here: that each run gets a directory of its own (the scripts' fixed default is shared
 /// by successive runs on one machine) and that on macOS the default is the OS-resolved `$TMPDIR`
@@ -1239,62 +1772,17 @@ fn never_runs(step: &str) -> bool {
 #[test]
 fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder() {
     let root = repository();
-    let mut workflows = Vec::new();
-    files_ending(&root.join(".github"), &[".yml", ".yaml"], &mut workflows);
-    let mut scripts = Vec::new();
-    files_ending(
-        &root.join("scripts"),
-        &[".sh", ".bash", ".py", ".mjs", ".js", ".ps1"],
-        &mut scripts,
-    );
-    let mut outside = Vec::new();
-    let mut seen = 0_usize;
-    for path in workflows.iter().chain(&scripts) {
-        let name = path
-            .strip_prefix(&root)
-            .expect("under the repository")
-            .to_string_lossy()
-            .into_owned();
-        let text =
-            fs::read_to_string(path).unwrap_or_else(|error| panic!("{name} is read: {error}"));
-        for (number, line) in text.lines().enumerate() {
-            if writes_unread(line) {
-                outside.push(format!(
-                    "{name}:{}: a write of the variable this case does not read: {}",
-                    number + 1,
-                    line.trim()
-                ));
-            }
-            let mut values: Vec<String> = artifacts_assignment(line).into_iter().collect();
-            seen += values.len();
-            if let Some(excused) = UNFOLLOWED_ASSIGNMENTS
-                .iter()
-                .find(|(file, needle, _)| *file == name && line.contains(needle))
-            {
-                assert!(!excused.2.is_empty(), "an exception names its reason");
-                values.clear();
-            }
-            for default in artifacts_defaults(line) {
-                seen += 1;
-                values.push(default);
-            }
-            for value in values {
-                if !lies_in_a_temporary_folder(&value, &text, 6) {
-                    outside.push(format!("{name}:{}: {value}", number + 1));
-                }
-            }
-        }
-    }
-    assert!(seen >= 30, "the case found only {seen} values to read");
+    let (files, mut problems) = tracked_files(&root);
+    problems.extend(findings(&files, HELD));
     assert!(
-        outside.is_empty(),
-        "values outside a temporary folder:\n{}",
-        outside.join("\n")
+        problems.is_empty(),
+        "the artefacts directory is named or given a value where this case does not know it:\n{}",
+        problems.join("\n")
     );
 
-    // The one assignment the case does not follow is made by a store build whose release check keeps
-    // its screenshots where the check's own default puts them: that has to stay in a temporary
-    // folder, or the exception hides a screenshot outside one.
+    // The one held write whose value is not in a temporary folder is made by a store build whose
+    // release check keeps its screenshots where the check's own default puts them: that has to stay
+    // in a temporary folder, or the exception hides a screenshot outside one.
     let check = fs::read_to_string(root.join("scripts/e2e-android-release.sh")).expect("the check");
     let shots = values_of(&check, "shots");
     assert!(
@@ -1308,19 +1796,16 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
         !store.contains("KR_PAIRING_SHOTS"),
         "the store build gives its release check another folder for its screenshots"
     );
+}
 
-    // The companion's browser tests keep their screenshots under the variable, and under `/tmp`
-    // where it is unset.
-    let browser =
-        fs::read_to_string(root.join("apps/companion/e2e/evidence.ts")).expect("evidence");
-    assert!(
-        browser.contains("env['KR_TEST_ARTIFACTS_DIR'] ?? '/tmp/kr-test-artifacts'"),
-        "the browser tests' default directory is not under /tmp"
-    );
-
-    // A job that runs a screenshot tool has the variable when that step starts: from its workflow,
-    // from its own `env`, from a step that wrote it to the job's environment file earlier, or from
-    // the step's own `env` or an assignment in the step ahead of the tool.
+/// KR-REQ-27.03: a job that runs a screenshot tool has the variable when that step starts: from its
+/// workflow, from its own `env`, from a step that wrote it to the job's environment file earlier,
+/// or from the step's own `env` or an assignment in the step ahead of the tool.
+#[test]
+fn a_job_that_runs_a_screenshot_tool_has_the_artifacts_directory_when_the_step_starts() {
+    let root = repository();
+    let mut workflows = Vec::new();
+    files_ending(&root.join(".github"), &[".yml", ".yaml"], &mut workflows);
     let mut steps_with_a_tool = 0_usize;
     for path in &workflows {
         let name = path
@@ -1359,7 +1844,7 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
                 });
                 let in_env = lines
                     .iter()
-                    .any(|line| line.trim().starts_with(&format!("{ARTIFACTS_VARIABLE}:")));
+                    .any(|line| line.trim().starts_with(&format!("{VARIABLE}:")));
                 let own = lines.iter().position(|line| {
                     !line.contains("GITHUB_ENV") && artifacts_assignment(line).is_some()
                 });
@@ -1368,7 +1853,7 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
                     assert!(
                         set || in_env || own.is_some_and(|own| own <= tool),
                         "{name}: the job {job_name} runs a screenshot tool in a step that has no \
-                         {ARTIFACTS_VARIABLE} yet:\n{step}"
+                         {VARIABLE} yet:\n{step}"
                     );
                 }
                 if lines
@@ -1385,3 +1870,608 @@ fn every_value_a_build_gives_the_artifacts_directory_lies_in_a_temporary_folder(
         "the case found {steps_with_a_tool} steps that run a screenshot tool"
     );
 }
+
+/// Writes `@V@` for the variable's name as the files spell it, and `@v@` for it in lower case, so
+/// that the lines of a small tree below do not name the variable themselves.
+fn named(text: &str) -> String {
+    text.replace("@V@", VARIABLE)
+        .replace("@v@", &VARIABLE.to_ascii_lowercase())
+}
+
+fn tree(files: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
+    files
+        .iter()
+        .map(|(path, text)| ((*path).to_owned(), named(text).into_bytes()))
+        .collect()
+}
+
+/// This file as a small tree holds it: some code, then the held list between its two markers.
+fn this_file(outside: &str, held: &str) -> String {
+    format!("{outside}\n{HELD_OPENS}\n{held}\n{HELD_CLOSES}\n")
+}
+
+/// The source case fails on a write it has no held entry for, in any spelling and in any file, and
+/// on an entry that no longer holds: each tree below has one fault, and the case names it.
+#[test]
+fn the_source_case_fails_on_what_it_does_not_know() {
+    let held_a = "file: scripts/a.sh\n| d=\"${@V@:-/tmp/kr-a}\"\nvalue: /tmp/kr-a";
+    let a_sh = "d=\"${@V@:-/tmp/kr-a}\"\necho \"$@V@/x\" \"${@V@:?}\"\n# @V@ is a directory\n";
+    let unknown = "neither a known read nor a held write";
+    let outside = "does not lie in a temporary folder";
+    let value = "does not give the variable the value";
+    let this_ok = this_file("fn main() {}", held_a);
+    let this_write = this_file(
+        "fn f() { std::env::set_var(\"@V@\", \"/home/x\"); }",
+        held_a,
+    );
+    let this_other = this_file(
+        "fn main() {}",
+        "file: scripts/a.sh\n| d=\"${@V@:-/tmp/kr-other}\"\nvalue: /tmp/kr-other",
+    );
+    let this_twice = format!("{this_ok}{this_ok}");
+    let a = ("scripts/a.sh", a_sh);
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str, Option<&'a str>);
+    let cases: Vec<Case> = vec![
+        (
+            "a held default, plain reads and a comment pass",
+            vec![a],
+            held_a,
+            None,
+        ),
+        (
+            "a held line that is gone",
+            vec![("scripts/a.sh", "d=\"${@V@:-/tmp/kr-b}\"\n")],
+            held_a,
+            Some("no line stands"),
+        ),
+        (
+            "a held line that stands twice",
+            vec![(
+                "scripts/a.sh",
+                "d=\"${@V@:-/tmp/kr-a}\"\nd=\"${@V@:-/tmp/kr-a}\"\n",
+            )],
+            held_a,
+            Some("stands in 2 places"),
+        ),
+        (
+            "a held entry of a file that is not tracked",
+            vec![],
+            held_a,
+            Some("the file is not tracked"),
+        ),
+        (
+            "an assignment in Python",
+            vec![a, ("tools/x.py", "os.environ[\"@V@\"] = \"/home/x\"\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a printf into the environment file",
+            vec![
+                a,
+                (
+                    ".github/workflows/w.yml",
+                    "run: printf '%s=%s\\n' '@V@' '/home/x' >> \"$GITHUB_ENV\"\n",
+                ),
+            ],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "an assignment in a script outside the script folders",
+            vec![a, ("apps/x/y.mjs", "process.env['@V@'] = '/home/x'\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a definition below its use",
+            vec![("scripts/b.sh", "export @V@=\"$d/e\"\nd=/tmp/x\n")],
+            "file: scripts/b.sh\n| d=/tmp/x\n...\n| export @V@=\"$d/e\"\nvalue: $d/e",
+            Some("stands above a line it must follow"),
+        ),
+        (
+            "a value that names a variable that no held line defines",
+            vec![("scripts/b.sh", "d=/tmp/x\nexport @V@=\"$d/e\"\n")],
+            "file: scripts/b.sh\n| export @V@=\"$d/e\"\nvalue: $d/e",
+            Some(outside),
+        ),
+        (
+            "a value that names a variable that a held line defines",
+            vec![("scripts/b.sh", "d=/tmp/x\nexport @V@=\"$d/e\"\n")],
+            "file: scripts/b.sh\n| d=/tmp/x\n| export @V@=\"$d/e\"\nvalue: $d/e",
+            None,
+        ),
+        (
+            "a held value outside the temporary folders",
+            vec![("scripts/c.sh", "d=\"${@V@:-/home/x}\"\n")],
+            "file: scripts/c.sh\n| d=\"${@V@:-/home/x}\"\nvalue: /home/x",
+            Some(outside),
+        ),
+        (
+            "a default that no entry holds",
+            vec![a, ("scripts/c.sh", "d=\"${@V@:-/home/x}\"\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "an expansion that is no known read",
+            vec![a, ("scripts/c.sh", "x=\"${@V@#/tmp}\"\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a bare name",
+            vec![a, ("scripts/c.sh", "echo @V@\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a write in lower case",
+            vec![a, ("scripts/c.sh", "export @v@=/home/x\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a comment marker inside a string",
+            vec![a, ("scripts/c.sh", "x=\"#\"; export @V@=/home/x\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a line that ends a block comment and goes on",
+            vec![a, ("apps/x/y.ts", "*/ process.env['@V@'] = '/home/x'\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a line inside a block comment",
+            vec![a, ("apps/x/y.ts", " * @V@ names the directory\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a comment line held with its reason",
+            vec![a, ("apps/x/y.ts", " * @V@ names the directory\n")],
+            "file: scripts/a.sh\n| d=\"${@V@:-/tmp/kr-a}\"\nvalue: /tmp/kr-a\n\n\
+             file: apps/x/y.ts\nkind: comment\n| * @V@ names the directory\nwhy: inside a block comment",
+            None,
+        ),
+        (
+            "comment lines of a script and of Rust, and prose, pass",
+            vec![
+                a,
+                ("scripts/c.sh", "# export @V@=/home/x\n"),
+                ("crates/x/src/lib.rs", "// @V@\n/// @V@ is read\n"),
+                ("docs/x.md", "The directory is @V@ here.\n"),
+            ],
+            held_a,
+            None,
+        ),
+        (
+            "a fenced line of a document",
+            vec![
+                a,
+                ("docs/x.md", "text\n```sh\n@V@=/home/x cargo test\n```\n"),
+            ],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "an indented line of a document",
+            vec![a, ("docs/x.md", "    @V@=/home/x cargo test\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a code block of a documentation test",
+            vec![
+                a,
+                (
+                    "crates/x/src/lib.rs",
+                    "/// ```\n/// std::env::set_var(\"@V@\", \"/home/x\");\n/// ```\n",
+                ),
+            ],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a held line that gives no value",
+            vec![("scripts/a.sh", "echo hi\n")],
+            "file: scripts/a.sh\n| echo hi\nvalue: /tmp/a",
+            Some(value),
+        ),
+        (
+            "a held value that is the start of a longer one",
+            vec![("scripts/c.sh", "d=\"${@V@:-/tmp/a/../../home}\"\n")],
+            "file: scripts/c.sh\n| d=\"${@V@:-/tmp/a/../../home}\"\nvalue: /tmp/a",
+            Some(value),
+        ),
+        (
+            "a second write on a held line",
+            vec![("scripts/c.sh", "@V@=/tmp/a @V@=/home/b cmd\n")],
+            "file: scripts/c.sh\n| @V@=/tmp/a @V@=/home/b cmd\nvalue: /tmp/a",
+            Some(unknown),
+        ),
+        (
+            "this file with only its held list",
+            vec![a, (THIS_FILE, &this_ok)],
+            held_a,
+            None,
+        ),
+        (
+            "a write in this file outside its held list",
+            vec![a, (THIS_FILE, &this_write)],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a held list that is not the lines between the markers",
+            vec![a, (THIS_FILE, &this_other)],
+            held_a,
+            Some("are not the held list"),
+        ),
+        (
+            "two lines that open the held list",
+            vec![a, (THIS_FILE, &this_twice)],
+            held_a,
+            Some("lines that open the held list"),
+        ),
+        (
+            "a constant that holds the name, read through the environment",
+            vec![
+                a,
+                (
+                    "crates/x/src/lib.rs",
+                    "const ENV: &str = \"@V@\";\nfn f() { std::env::var_os(ENV); }\n",
+                ),
+            ],
+            held_a,
+            None,
+        ),
+        (
+            "a write through a constant that holds the name",
+            vec![
+                a,
+                (
+                    "crates/x/src/lib.rs",
+                    "const ENV: &str = \"@V@\";\nfn f() { cmd.env(ENV, \"/home/x\"); }\n",
+                ),
+            ],
+            held_a,
+            Some("a use of the constant"),
+        ),
+        (
+            "an argument whose value lies in a temporary folder",
+            vec![("scripts/d.sh", "e=/tmp/x\nrun --evidence \"$e\"\n")],
+            "file: scripts/d.sh\nkind: argument\n| e=/tmp/x\n...\n| run --evidence \"$e\"\nvalue: $e",
+            None,
+        ),
+        (
+            "an argument whose value lies elsewhere",
+            vec![("scripts/d.sh", "e=/home/x\nrun --evidence \"$e\"\n")],
+            "file: scripts/d.sh\nkind: argument\n| e=/home/x\n...\n| run --evidence \"$e\"\nvalue: $e",
+            Some(outside),
+        ),
+        (
+            "a Rust value shown by the line that makes a temporary directory",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = TempDir::new().unwrap();\ncmd.env(\"@V@\", dir.path());\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = TempDir::new().unwrap();\n...\n| cmd.env(\"@V@\", dir.path());\n\
+             value: dir.path()\nfolder: let dir = TempDir::new().unwrap();",
+            None,
+        ),
+        (
+            "a Rust value with a folder line that makes no directory",
+            vec![(
+                "crates/x/tests/t.rs",
+                "let dir = make();\ncmd.env(\"@V@\", dir.path());\n",
+            )],
+            "file: crates/x/tests/t.rs\n| let dir = make();\n...\n| cmd.env(\"@V@\", dir.path());\n\
+             value: dir.path()\nfolder: let dir = make();",
+            Some("makes a temporary directory"),
+        ),
+        (
+            "a value that comes with its reason",
+            vec![("scripts/e.sh", "@V@=\"$leg/e2e\" cmd\n")],
+            "file: scripts/e.sh\n| @V@=\"$leg/e2e\" cmd\nvalue: $leg/e2e\nwhy: the caller's folder",
+            None,
+        ),
+        (
+            "a held line that gives no value, as a write",
+            vec![("scripts/c.sh", "export @V@\n")],
+            "file: scripts/c.sh\n| export @V@\nvalue: /tmp/a",
+            Some(value),
+        ),
+        (
+            "a held value with a step up",
+            vec![("scripts/c.sh", "d=\"${@V@:-/tmp/a/../b}\"\n")],
+            "file: scripts/c.sh\n| d=\"${@V@:-/tmp/a/../b}\"\nvalue: /tmp/a/../b",
+            Some(outside),
+        ),
+        (
+            "a plain expansion followed by an assignment",
+            vec![a, ("scripts/c.sh", "echo $@V@ = x\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "two slashes inside a script line that is not a comment",
+            vec![a, ("apps/x/y.mjs", "process.env['@V@'] = 'http://x'\n")],
+            held_a,
+            Some(unknown),
+        ),
+        (
+            "a held value that stands right against the name",
+            vec![("scripts/c.sh", "echo @V@/tmp/a\n")],
+            "file: scripts/c.sh\n| echo @V@/tmp/a\nvalue: /tmp/a",
+            Some(value),
+        ),
+        (
+            "an argument that is the end of a longer word",
+            vec![("scripts/d.sh", "e=/tmp/x\nrun --evidence x$e\n")],
+            "file: scripts/d.sh\nkind: argument\n| e=/tmp/x\n...\n| run --evidence x$e\nvalue: $e",
+            Some(value),
+        ),
+    ];
+    for (name, files, held, fails_with) in cases {
+        let problems = findings(&tree(&files), &format!("\n{}\n", named(held)));
+        match fails_with {
+            None => assert!(problems.is_empty(), "{name}: {problems:?}"),
+            Some(text) => assert!(
+                problems.iter().any(|problem| problem.contains(text)),
+                "{name}: no finding says {text}: {problems:?}"
+            ),
+        }
+    }
+
+    // A file that is not text, with the name in it.
+    let mut files = tree(&[a]);
+    let mut binary = VARIABLE.as_bytes().to_vec();
+    binary.push(0xff);
+    files.push(("data/x.bin".to_owned(), binary));
+    let problems = findings(&files, &named(held_a));
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("is not text")),
+        "{problems:?}"
+    );
+}
+
+/// The held list: one entry for each place that gives the variable a value, set apart by blank
+/// lines. `file:` names the file. A line that starts `| ` is a line of the file, compared without
+/// its indentation; the lines of a block stand together, a line `...` sets apart blocks that stand
+/// further from each other, and the last line is the held one. `value:` is the text that stands
+/// right after the name in that line. `folder:` names the line that makes the temporary directory a
+/// Rust value lies in, and `why:` gives the reason a value lies elsewhere. `kind:` is `argument`
+/// for a line that hands the value to a program, or `comment` for a line that cannot run and that
+/// no line rule lets through.
+const HELD: &str = r##"
+file: .github/workflows/conformance.yml
+| # The evidence directory: inside the platform's temporary directory, new for the run.
+| KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence
+value: /tmp/kr-conformance-evidence
+
+file: .github/workflows/conformance.yml
+| KR_REQUIRE_PLUGIN_FIXTURES: "1"
+| KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence
+value: /tmp/kr-conformance-evidence
+
+file: .github/workflows/core-ci.yml
+| # verdict here before it asserts anything, so a run the target failed on keeps the number.
+| KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
+value: /tmp/kr-test-artifacts
+
+file: .github/workflows/core-ci.yml
+| KR_TEST_ARTIFACTS_DIR: /tmp/kr-shell-qualification
+value: /tmp/kr-shell-qualification
+
+file: .github/workflows/core-ci.yml
+| env:
+| KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
+value: /tmp/kr-test-artifacts
+
+file: scripts/disk-report.sh
+| size_of "the test evidence" "${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-android-release.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/release-tls-android"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-backup.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-deployment.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-device-records.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/device-records-ios"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-fence.sh
+| artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-m1b.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-mobile.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/companion-mobile"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-pairing-device.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/pairing-device-$platform"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-permissions.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/permissions"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-privacy.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-push-android-receiver.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/push-android-receiver"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-push-device.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/push-device-$platform"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-voice-call-bridge.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-call-bridge-$platform"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-voice-call-device.sh
+| artefacts_base="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-call-device-$platform-$mode${KR_RUN_TAG:+-$KR_RUN_TAG}"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-voice-device.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-device"
+value: /tmp/kr-test-artifacts
+
+file: scripts/e2e-wsl.sh
+| artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+value: /tmp/kr-test-artifacts
+
+file: scripts/ios-privacy-manifest.sh
+| artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/privacy-manifest-ios"
+value: /tmp/kr-test-artifacts
+
+file: apps/companion/e2e/evidence.ts
+| export const ARTEFACTS: string = env['KR_TEST_ARTIFACTS_DIR'] ?? '/tmp/kr-test-artifacts'
+value: /tmp/kr-test-artifacts
+
+file: .github/workflows/conformance.yml
+| $temporary = (Get-Item $env:TEMP).FullName
+| "KR_TEST_ARTIFACTS_DIR=$temporary\kr-conformance-evidence" >> $env:GITHUB_ENV
+value: $temporary\kr-conformance-evidence
+
+file: .github/workflows/core-ci.yml
+| $temporary = (Get-Item $env:TEMP).FullName
+| "KR_TEST_ARTIFACTS_DIR=$temporary\kr-test-artifacts" >> $env:GITHUB_ENV
+value: $temporary\kr-test-artifacts
+
+file: .github/workflows/core-ci.yml
+| export KR_TEST_ARTIFACTS_DIR="$RUNNER_TEMP/kr-shell-qualification-second"
+value: $RUNNER_TEMP/kr-shell-qualification-second
+
+file: .github/workflows/wsl-acceptance.yml
+| $temporary = (Get-Item $env:TEMP).FullName
+| $directory = Join-Path $temporary 'kr-test-artifacts'
+| New-Item -ItemType Directory -Force $directory | Out-Null
+| "KR_TEST_ARTIFACTS_DIR=$directory" >> $env:GITHUB_ENV
+value: $directory
+
+file: .github/workflows/wsl-acceptance.yml
+| KR_TEST_ARTIFACTS_DIR="$(cygpath -u "$KR_TEST_ARTIFACTS_DIR")"
+value: $(cygpath -u "$KR_TEST_ARTIFACTS_DIR")
+
+file: scripts/bench-all.sh
+| if [ -z "${KR_TEST_ARTIFACTS_DIR:-}" ]; then
+| temporary="${TMPDIR:-/tmp}"
+| KR_TEST_ARTIFACTS_DIR="$(mktemp -d "${temporary%/}/kalareach-bench.XXXXXX")" || exit 1
+value: $(mktemp -d "${temporary%/}/kalareach-bench.XXXXXX")
+
+file: scripts/bench-all.sh
+| evidence="$(cd "$KR_TEST_ARTIFACTS_DIR" && pwd)"
+| KR_TEST_ARTIFACTS_DIR="$evidence"
+value: $evidence
+
+file: scripts/e2e-fence.sh
+| artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
+...
+| if ! KR_TEST_ARTIFACTS_DIR="$artifacts" \
+value: $artifacts
+
+file: scripts/e2e-update.sh
+| work="$(mktemp -d "${TMPDIR:-/tmp}/kr-e2e-update.XXXXXX")"
+...
+| KR_E2E_PROGRAMS="$programs" KR_E2E_STATE="$work/state-permissions" KR_TEST_ARTIFACTS_DIR="$work/artifacts" \
+value: $work/artifacts
+
+file: scripts/e2e-voice-call-device.sh
+| artefacts_base="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-call-device-$platform-$mode${KR_RUN_TAG:+-$KR_RUN_TAG}"
+...
+| artefacts=""
+...
+| artefacts="$artefacts_base${leg:+-$leg}"
+...
+| KR_HARNESS_PLATFORM="$platform" KR_TEST_ARTIFACTS_DIR="$artefacts" \
+value: $artefacts
+
+file: scripts/run-conformance.sh
+| evidence="${KR_TEST_ARTIFACTS_DIR:-}"
+| if [ -z "$evidence" ]; then
+| evidence="$(mktemp -d "${TMPDIR:-/tmp}/kr-conformance.XXXXXX")"
+| fi
+| export KR_TEST_ARTIFACTS_DIR="$evidence"
+value: $evidence
+
+file: scripts/store-android.sh
+| leg="$device_dir/device"
+...
+| KR_TEST_ARTIFACTS_DIR="$leg/e2e" KR_RELEASE_APK="$apk" bash "$here/scripts/e2e-android-release.sh" \
+value: $leg/e2e
+why: the store build keeps the logs of its release check beside the signed bundle, in the leg folder under the directory the caller names ($leg is $device_dir/device), so this value lies where the caller says and not in a temporary folder; the release check keeps its screenshots in the folder its own default names, which the case reads in scripts/e2e-android-release.sh
+
+file: tests/conformance/src/run.rs
+| .env("KR_TEST_ARTIFACTS_DIR", self.evidence)
+value: self.evidence
+why: the directory the run was given by its --evidence argument; the two callers' lines that give it are held below as arguments
+
+file: tests/conformance/tests/device_scripts.rs
+| ) -> Run {
+| let directory = TempDir::new().expect("a directory");
+| let root = directory.path();
+...
+| .env("KR_TEST_ARTIFACTS_DIR", root.join("artefacts"))
+value: root.join("artefacts")
+folder: let directory = TempDir::new().expect("a directory");
+
+file: tests/conformance/tests/fetch.rs
+| root: TempDir::new().expect("a directory for the case"),
+...
+| fn path(&self, relative: &str) -> PathBuf {
+| self.root.path().join(relative)
+...
+| .env("KR_TEST_ARTIFACTS_DIR", self.path("evidence"))
+value: self.path("evidence")
+folder: root: TempDir::new().expect("a directory for the case"),
+
+file: tests/e2e/m1b/tests/origin.rs
+| let path = std::env::temp_dir().join(format!("krm-{name}-{}-{nanos}", std::process::id()));
+...
+| let artefacts = scratch.0.join("artefacts");
+...
+| .env("KR_TEST_ARTIFACTS_DIR", &artefacts)
+value: &artefacts
+folder: let path = std::env::temp_dir().join(format!("krm-{name}-{}-{nanos}", std::process::id()));
+
+file: .github/workflows/conformance.yml
+kind: argument
+| cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR @arguments
+value: $env:KR_TEST_ARTIFACTS_DIR
+
+file: scripts/run-conformance.sh
+kind: argument
+| evidence="${KR_TEST_ARTIFACTS_DIR:-}"
+| if [ -z "$evidence" ]; then
+| evidence="$(mktemp -d "${TMPDIR:-/tmp}/kr-conformance.XXXXXX")"
+| fi
+...
+| arguments=(run --root "$root" --evidence "$evidence")
+value: $evidence
+
+file: apps/companion/e2e/evidence.ts
+kind: comment
+| * Section 27 puts every test artefact in one platform-resolved directory, `KR_TEST_ARTIFACTS_DIR`,
+why: a line inside the block comment that opens the module
+"##;
