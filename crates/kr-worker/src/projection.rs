@@ -42,7 +42,7 @@ use kr_protocol::scalars::U64;
 use kr_protocol::session::Dimensions;
 use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
-use kr_term::lane::LaneGate;
+use kr_term::lane::{DrainBudget, LaneGate};
 use kr_term::modes::KeyboardEncoding;
 use kr_term::sideeffect::{LeaseHolder, SideEffect, SideEffectKind};
 use kr_term::snapshot::{Snapshot, Viewport, restoration_operations};
@@ -545,14 +545,22 @@ impl TerminalEngine {
     ///
     /// This is the look the session makes with the gate as it really stands, so it is also where the
     /// lane learns that the root editor is no longer owed the reply to its cursor question.
-    pub fn drain_replies(&mut self, gate: LaneGate) -> Vec<LaneReply> {
+    ///
+    /// `room` is what the writer's queue can still hold of the host's own answers. The lane gives up
+    /// no more than that, and no more than one drain may take: an answer past either stays in the
+    /// lane, under its own deadline, until a later drain finds room for it.
+    pub fn drain_replies(&mut self, gate: LaneGate, room: DrainBudget) -> Vec<LaneReply> {
         let now_ms = self.now_ms();
         if !gate.cursor_report_first {
             self.engine.lane_mut().end_hold();
         }
+        let budget = DrainBudget {
+            bytes: room.bytes.min(MAX_REPLY_BYTES),
+            replies: room.replies,
+        };
         self.engine
             .lane_mut()
-            .drain(gate, MAX_REPLY_BYTES, now_ms)
+            .drain_within(gate, budget, now_ms)
             .iter()
             .map(LaneReply::of)
             .collect()
