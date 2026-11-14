@@ -145,9 +145,10 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       # What this job does not set is RUSTFLAGS. Every program links the static C runtime, which the
-      # `crt-static` target feature in `.cargo/config.toml` asks for, and the link needs two
-      # arguments about libsodium's prebuilt libraries: leave the debug runtime out, and stop the
-      # linker naming the libraries' missing debug database once per object file. That file carries
+      # `crt-static` target feature in `.cargo/config.toml` asks for, and the link needs one more
+      # argument about libsodium's prebuilt libraries: stop the linker naming the libraries' missing
+      # debug database once per object file (the file also leaves the debug runtime out of a debug
+      # link, which these release links never ask for). That file carries
       # them so that every Windows build gets them, and RUSTFLAGS in the environment replaces its
       # flags rather than adding to them. LNK4098, which reports objects asking for two different C
       # runtimes, is deliberately not silenced: the step after the builds refuses it, and a step
@@ -325,7 +326,7 @@ jobs:
       - name: Refuse a build whose link reported conflicting C runtimes
         shell: bash
         run: |
-          # Python is a Windows program: it is given paths as Windows writes them.
+          # Python is a Windows program: it is given paths with forward slashes, which it reads.
           logs="$(cygpath -m "$RUNNER_TEMP")/build"
           files=()
           for build in $KR_BUILDS; do
@@ -335,10 +336,9 @@ jobs:
 
       # No program of the tree imports a runtime library: none of Visual C++'s, the universal
       # runtime's, an older or a debug one, or libsodium's, and every other import is a Windows API
-      # set or a library of the system directory. An import read cannot see two static runtimes, but
-      # the only way a second one enters these links is Tauri's hybrid, which also imports the
-      # universal runtime, and the companion's build refuses that. A program that is not there, or
-      # that dumpbin cannot read, stops the run.
+      # set or a library of the system directory. An import read cannot see two static runtimes: the
+      # `LNK4098` read above is the check for that, and its control shows that it finds the fault. A
+      # program that is not there, or that dumpbin cannot read, stops the run.
       - name: Refuse a program that imports a runtime library
         shell: bash
         run: |

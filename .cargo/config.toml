@@ -4,8 +4,9 @@
 
 # Windows, x86-64 and ARM64: every program of the product links the static C runtime.
 #
-# `-Ctarget-feature=+crt-static` makes Rust's MSVC targets link `LIBCMT` and the static C++ library
-# instead of the import libraries of the dynamic runtime, so that no program imports
+# `-Ctarget-feature=+crt-static` makes Rust's MSVC targets link `LIBCMT`, the static C runtime,
+# instead of the import libraries of the dynamic runtime (C++ objects ask for the static C++ library
+# themselves), so that no program imports
 # `VCRUNTIME140.dll` or an API set of the universal runtime. A machine without Microsoft's
 # redistributable can then start the program, and nothing is installed or shipped beside it. The C
 # libraries built here (aws-lc, SQLite, ring, blake3, and llama.cpp through the two settings in
@@ -20,8 +21,8 @@
 # libsodium's prebuilt debug library asks for `LIBCMTD`, the static runtime's debug name, while a
 # link under `crt-static` takes `LIBCMT` whatever the profile. The one exclusion that is left
 # leaves `LIBCMTD` out of the link, so that the debug library's objects resolve against the one
-# runtime. Test programs are what is built in the debug profile, and the exclusion does nothing in
-# a release link, where nothing asks for `LIBCMTD`.
+# runtime. No program that ships is built in the debug profile (test programs are, and so is a local
+# debug build), and the exclusion does nothing in a release link, where nothing asks for `LIBCMTD`.
 #
 # The same prebuilt binaries ship no debug database, so the linker says so once per object file:
 # several thousand `LNK4099` lines on every link that produces a binary, which is most of a build's
@@ -70,9 +71,13 @@ GGML_AMX_INT8 = { value = "OFF", force = true }
 GGML_AMX_BF16 = { value = "OFF", force = true }
 
 # llama.cpp's static runtime. Its Rust crate compiles the vendored CMake project for the dynamic
-# runtime unless `LLAMA_STATIC_CRT` is set, and the CMake project takes its runtime from
-# `CMAKE_MSVC_RUNTIME_LIBRARY`. Both name the one runtime of the Windows MSVC link above and do
-# nothing on any other target. `force` keeps an environment variable of the same name from changing
-# them.
+# runtime unless `LLAMA_STATIC_CRT` is `1`, and the CMake project takes its runtime from
+# `CMAKE_MSVC_RUNTIME_LIBRARY`, which the crate passes on from the environment with every other
+# `CMAKE_` variable. Both name the one runtime of the Windows MSVC link above and do nothing on any
+# other target. The crate builds llama.cpp in CMake's release configuration whatever the Rust profile
+# is, and `LLAMA_LIB_PROFILE=Debug` would make it link the debug runtime's library by name, which the
+# exclusion above does not stop, so the profile is pinned too. `force` keeps an environment variable
+# of the same name from changing them.
 LLAMA_STATIC_CRT = { value = "1", force = true }
 CMAKE_MSVC_RUNTIME_LIBRARY = { value = "MultiThreaded", force = true }
+LLAMA_LIB_PROFILE = { value = "Release", force = true }

@@ -3,9 +3,9 @@
 //! This program links the static C runtime through the workspace's target feature
 //! (`-Ctarget-feature=+crt-static` in `.cargo/config.toml`), and `kr-crypto`'s build script refuses an
 //! MSVC build that lacks it. Tauri's own request is another thing: `STATIC_VCRUNTIME` makes a hybrid
-//! (the Visual C++ runtime static, the universal runtime dynamic) with link arguments that name
-//! `libvcruntime.lib` and `ucrt.lib` beside the `libcmt` of the target feature, so the link would
-//! hold two runtimes. The Tauri build step reads the variable before the attribute this package
+//! (the Visual C++ runtime static, the universal runtime dynamic) whose program imports the
+//! universal runtime's `api-ms-win-crt-*` libraries, which the static C runtime exists to avoid. The
+//! Tauri build step reads the variable before the attribute this package
 //! gives it, and the Tauri command line sets it to `true` for a desktop build unless it is already
 //! `false`. A build started that way is stopped at once, in words, whoever starts it.
 //!
@@ -19,7 +19,7 @@ const STATIC_RUNTIME_INPUT: &str = "STATIC_VCRUNTIME";
 
 /// What a build that asks for Tauri's static runtime is told.
 const REFUSAL: &str = "this program links the static C runtime through the workspace's target feature, and the environment asks for \
-     Tauri's hybrid runtime (static Visual C++ runtime, dynamic universal runtime), which would put two runtimes in the link \
+     Tauri's hybrid runtime (static Visual C++ runtime, dynamic universal runtime), whose program imports the universal runtime's api-ms-win-crt-* libraries \
      (STATIC_VCRUNTIME is set to something other than `false`, which the Tauri command line does for a bundle build), \
      so build the bundle with `pnpm -C apps/companion desktop build`, which gives the build STATIC_VCRUNTIME=false";
 

@@ -1,8 +1,8 @@
 //! The build's refusal of Tauri's static Visual C++ runtime, shown by the code the build runs.
 //!
 //! The package's build script stops a build for an MSVC target whose environment asks for Tauri's
-//! static runtime, a hybrid that would put two runtimes in the link next to the workspace's target
-//! feature. These cases run the decision the build script runs.
+//! static runtime, a hybrid whose program imports the universal runtime next to the workspace's
+//! target feature. These cases run the decision the build script runs.
 
 use std::ffi::OsStr;
 
