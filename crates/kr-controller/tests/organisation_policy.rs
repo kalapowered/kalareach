@@ -12,6 +12,7 @@ mod fence_support;
 mod net_support;
 mod organisation_fixture;
 mod organisation_support;
+mod restamp_support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -315,12 +316,14 @@ async fn kr_req_18_06_an_applied_policy_leaves_a_package_outside_its_allowlist_o
 /// KR-REQ-09.09, KR-REQ-18.06: what `organisation.policy.apply` answers is made from the policies
 /// the host holds, so the door tells it only while the authority the request was admitted under
 /// stands. With a valid policy applied, the adapter lists are told; the same policy applied again
-/// while this host comes to owe a fence after the route has answered is not shown, although the
-/// repeat changed nothing and the list is in force; and once the fence is gone the same policy is
-/// answered with the same lists.
+/// is not shown when this host comes to owe a fence after the route has answered, nor when another
+/// device's revocation completes there and stamps the connection's registration with a newer
+/// revision with no fence owed (a fence withholds the lists whichever label they carry, so the
+/// revocation is the leg that tells the label apart), although the repeat changed nothing and the
+/// list is in force; and once nothing is owed the same policy is answered with the same lists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_adapter_lists_a_policy_apply_answers_are_not_shown_when_a_fence_lands_after_the_read()
-{
+async fn the_adapter_lists_a_policy_apply_answers_are_not_shown_when_a_fence_or_a_restamp_lands_after_the_read()
+ {
     let fixture = Fixture::start().await;
     let _repository = install_the_example(&fixture).await;
     let policy = fixture
@@ -334,42 +337,52 @@ async fn the_adapter_lists_a_policy_apply_answers_are_not_shown_when_a_fence_lan
 
     let environment = fixture.host.environment_id;
     let controller = fixture.host.controller();
-    let mut client = fixture.host.client().await;
-    let (arrived, release) = controller.pause_after_a_route_answers();
-    let telling = tokio::spawn({
-        let policy = policy.clone();
-        async move {
-            let told: Result<OrganisationPolicyApplyResult, ProtocolError> = calls::mutate_as(
-                environment,
-                &mut client,
-                ActionId::new(kr_ipc::new_uuid()),
-                Method::OrganisationPolicyApply,
-                &OrganisationPolicyApplyParams {
-                    policy,
-                    authority: Nullable::null(),
-                },
-            )
-            .await;
-            told
+    for another_devices_revocation in [false, true] {
+        let mut client = fixture.host.client().await;
+        let (arrived, release) = controller.pause_after_a_route_answers();
+        let telling = tokio::spawn({
+            let policy = policy.clone();
+            async move {
+                let told: Result<OrganisationPolicyApplyResult, ProtocolError> = calls::mutate_as(
+                    environment,
+                    &mut client,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    Method::OrganisationPolicyApply,
+                    &OrganisationPolicyApplyParams {
+                        policy,
+                        authority: Nullable::null(),
+                    },
+                )
+                .await;
+                told
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the route answers")
+            .expect("the pause is armed");
+        if another_devices_revocation {
+            restamp_support::another_devices_authority_is_revoked(&controller, environment).await;
+        } else {
+            controller.hold_fence(true);
         }
-    });
-    tokio::time::timeout(Duration::from_secs(30), arrived)
-        .await
-        .expect("the route answers")
-        .expect("the pause is armed");
-    controller.hold_fence(true);
-    release.send(()).expect("the door goes on");
-    let refused = telling
-        .await
-        .expect("the door tells it")
-        .expect_err("lists made from the policies held are not shown under a fence");
-    assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
-    controller.hold_fence(false);
+        release.send(()).expect("the door goes on");
+        let refused = telling
+            .await
+            .expect("the door tells it")
+            .expect_err("lists made from the policies held are not shown once authority moved");
+        controller.hold_fence(false);
+        assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
+        assert!(
+            refused.message.contains("may have been carried out"),
+            "what is told is that what became of the action is not shown: {refused:?}"
+        );
 
-    let again = apply(&fixture, policy, None)
-        .await
-        .expect("the same policy is answered once the fence is gone");
-    assert_eq!(again, applied, "it is answered with the same lists");
+        let again = apply(&fixture, policy.clone(), None)
+            .await
+            .expect("the same policy is answered once nothing is owed");
+        assert_eq!(again, applied, "it is answered with the same lists");
+    }
     fixture.host.stop().await;
 }
 
