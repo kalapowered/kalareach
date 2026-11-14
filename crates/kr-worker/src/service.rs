@@ -8040,8 +8040,35 @@ impl WorkerService {
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(&mutation.params)?;
                 // Whether this attachment holds the lease at the epoch it names, which is what the
-                // release itself answers.
-                Self::check_lease_holder(session, params.attachment_id, params.epoch).map(|()| None)
+                // release itself answers, and then whether the typing the request counts has all
+                // arrived. A position that has not been reached is a refusal with no effect, so it
+                // is decided here and not after the marker, where it would stand as an outcome
+                // nobody can establish and hold back the release that is sent again without it.
+                Self::check_lease_holder(session, params.attachment_id, params.epoch)?;
+                if let Some(barrier) = params.after_input.as_ref() {
+                    session.check_position(params.attachment_id, barrier)?;
+                }
+                Ok(None)
+            }
+            Method::SessionDetach => {
+                let params: SessionDetachParams = parse(&mutation.params)?;
+                // The position of a detach is decided here for the same reason. A detach does not
+                // depend on the lease, so an epoch that has ended is no refusal.
+                if let Some(barrier) = params.after_input.as_ref() {
+                    let attachment_id = Self::detach_subject(session, &params)?;
+                    session.check_position(attachment_id, barrier)?;
+                }
+                Ok(None)
+            }
+            Method::ShellLaunch => {
+                let params: kr_protocol::root::ShellLaunchParams = parse(&mutation.params)?;
+                // A launch that carries a position names the holder and the epoch it marked, and
+                // a launch of another holder or epoch, or of a position the typing has not reached,
+                // is refused with nothing reserved and nothing written on the lane.
+                if let Some(barrier) = params.after_input.as_ref() {
+                    session.check_launch_barrier(barrier)?;
+                }
+                Ok(None)
             }
             Method::InputInterrupt => {
                 let params: InputInterruptParams = parse(&mutation.params)?;
