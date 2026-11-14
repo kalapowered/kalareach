@@ -26,7 +26,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 /// The variable that names where a run keeps its evidence.
-pub const VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
+const VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
 
 /// Why an evidence directory is refused, in words that name the variable and the roots.
 #[derive(Clone, Debug, PartialEq, Eq)]

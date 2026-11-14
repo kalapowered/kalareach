@@ -1039,22 +1039,156 @@ fn language(path: &str) -> Option<Language> {
     }
 }
 
-/// Whether the whole line is a comment.
-fn is_comment(language: Language, line: &str) -> bool {
-    let line = line.trim_start();
-    match language {
-        Language::Prose => true,
-        Language::Hash => line.starts_with('#'),
-        Language::Slashes => {
-            line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
-        }
-    }
+/// For each line, whether the whole line is a comment. A block comment is a comment only up to its
+/// end: a line that closes one and goes on with code is code.
+fn comment_lines(language: Language, text: &str) -> Vec<bool> {
+    let mut inside = false;
+    text.lines()
+        .map(|line| {
+            let line = line.trim();
+            match language {
+                Language::Prose => true,
+                Language::Hash => line.starts_with('#'),
+                Language::Slashes => {
+                    if !inside && line.starts_with("//") {
+                        return true;
+                    }
+                    let mut rest = line;
+                    if !inside {
+                        let Some(opened) = rest.strip_prefix("/*") else {
+                            return false;
+                        };
+                        rest = opened;
+                        inside = true;
+                    }
+                    match rest.find("*/") {
+                        None => true,
+                        Some(end) => {
+                            inside = false;
+                            rest[end + 2..].trim().is_empty()
+                        }
+                    }
+                }
+            }
+        })
+        .collect()
 }
 
-/// Where the name stands in `line` as a whole name.
+/// Whether the file names the variable, in any letter case (Windows and a workflow's expressions
+/// read a name without regard to case) and in any of the encodings a file may be written in.
+fn names_variable(bytes: &[u8]) -> bool {
+    let name = VARIABLE.as_bytes();
+    let letter = |found: u8, wanted: u8| found.eq_ignore_ascii_case(&wanted);
+    bytes.windows(name.len()).any(|w| {
+        w.iter()
+            .zip(name)
+            .all(|(&found, &wanted)| letter(found, wanted))
+    }) || bytes.windows(2 * name.len()).any(|w| {
+        w.chunks(2)
+            .zip(name)
+            .all(|(pair, &wanted)| pair[1] == 0 && letter(pair[0], wanted))
+    }) || bytes.windows(2 * name.len()).any(|w| {
+        w.chunks(2)
+            .zip(name)
+            .all(|(pair, &wanted)| pair[0] == 0 && letter(pair[1], wanted))
+    })
+}
+
+/// One non-blank line of a workflow with its indentation, a list item's dash counted as part of
+/// the indentation so that a step's keys all stand at one column.
+struct Row {
+    line: usize,
+    indent: usize,
+    content: String,
+    starts_step: bool,
+}
+
+/// For each line of a workflow, whether it is the directory handed to the upload of a run's
+/// evidence: the `path:` of the `with:` of a step that uses `actions/upload-artifact`, as the value
+/// of `path:` or as a line of its list. That step reads files and writes none; the same words
+/// anywhere else (a `run:` script, another action's input, a condition) are a read.
+fn upload_lines(text: &str) -> Vec<bool> {
+    let expression = format!("${{{{ ENV.{VARIABLE} }}}}");
+    let mut rows = Vec::new();
+    for (line, text) in text.lines().enumerate() {
+        let trimmed = text.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = text.len() - trimmed.len();
+        let (indent, content, starts_step) = match trimmed.strip_prefix("- ") {
+            Some(item) => {
+                let item = item.trim_start();
+                (indent + trimmed.len() - item.len(), item, true)
+            }
+            None => (indent, trimmed, false),
+        };
+        rows.push(Row {
+            line,
+            indent,
+            content: content.trim_end().to_owned(),
+            starts_step,
+        });
+    }
+    let parent = |at: usize| {
+        (0..at)
+            .rev()
+            .find(|&row| rows[row].indent < rows[at].indent)
+    };
+    let uses_upload = |with: usize| {
+        let indent = rows[with].indent;
+        let mut start = with;
+        while !(rows[start].indent == indent && rows[start].starts_step) {
+            if start == 0 || rows[start - 1].indent < indent {
+                return false;
+            }
+            start -= 1;
+        }
+        let mut at = start;
+        loop {
+            if rows[at].indent == indent
+                && rows[at]
+                    .content
+                    .starts_with("uses: actions/upload-artifact@")
+            {
+                return true;
+            }
+            at += 1;
+            if at == rows.len()
+                || rows[at].indent < indent
+                || (rows[at].indent == indent && rows[at].starts_step)
+            {
+                return false;
+            }
+        }
+    };
+    let under_with = |at: usize| {
+        parent(at).is_some_and(|with| rows[with].content == "with:" && uses_upload(with))
+    };
+    let mut uploads = vec![false; text.lines().count()];
+    for (at, row) in rows.iter().enumerate() {
+        let folded = row.content.to_ascii_uppercase();
+        let is_upload = if row.content.starts_with("path: ") {
+            folded["path: ".len()..] == expression && under_with(at)
+        } else {
+            folded == expression
+                && parent(at).is_some_and(|path| {
+                    let key = &rows[path].content;
+                    key.starts_with("path:")
+                        && key.ends_with(['|', '>', '-', '+'])
+                        && under_with(path)
+                })
+        };
+        uploads[row.line] = is_upload;
+    }
+    uploads
+}
+
+/// Where the name stands in `line` as a whole name, in any letter case.
 fn occurrences(line: &str) -> Vec<usize> {
     let word = |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric() || c == '_');
-    line.match_indices(VARIABLE)
+    line.to_ascii_uppercase()
+        .match_indices(VARIABLE)
         .map(|(at, _)| at)
         .filter(|&at| {
             !word(line[..at].chars().next_back())
@@ -1066,57 +1200,64 @@ fn occurrences(line: &str) -> Vec<usize> {
 /// Whether the name at `at` is being given a value, in one of the forms a write takes: an
 /// assignment (`NAME=value`, also behind `export`, a quote or a PowerShell `$env:`), a key of a
 /// workflow's `env` (`NAME: value`), or a program's environment (`.env("NAME", value)`). A write
-/// needs no proof here: the reader refuses a wrong value where it is used.
+/// needs no proof here: the reader refuses a wrong value where it is used. A name that stands
+/// inside a brace, parenthesis or bracket opened earlier on the line is bound there
+/// (`const { NAME = x } = process.env`), not assigned, and a value that reads the name is a read.
 fn is_write(line: &str, at: usize) -> bool {
     let before = &line[..at];
     let after = &line[at + VARIABLE.len()..];
     let assigns = after
         .trim_start()
         .strip_prefix('=')
-        .is_some_and(|rest| !rest.starts_with('='));
+        .is_some_and(|rest| !rest.starts_with(['=', '>']));
     let target = before.is_empty()
         || before.ends_with(char::is_whitespace)
         || before.ends_with(['"', '\'', ';'])
-        || before.ends_with("$env:");
+        || before.to_ascii_lowercase().ends_with("$env:");
+    let opened = before
+        .chars()
+        .filter(|c| matches!(c, '{' | '(' | '['))
+        .count();
+    let closed = before
+        .chars()
+        .filter(|c| matches!(c, '}' | ')' | ']'))
+        .count();
     let key = before.trim().is_empty() && after.starts_with(": ");
     let program = before.ends_with(".env(\"") && after.starts_with("\",");
-    (assigns && target && !before.ends_with("${")) || key || program
-}
-
-/// Whether the line hands the directory to the upload of a run's evidence (`path:` or a line of its
-/// list), which reads the files the readers' directory holds and writes none.
-fn is_upload(line: &str) -> bool {
-    let expression = format!("${{{{ env.{VARIABLE} }}}}");
-    let line = line.trim();
-    line == expression || line == format!("path: {expression}")
+    (assigns && target && opened <= closed) || key || program
 }
 
 /// What is wrong with one file's naming of the variable, one finding for each line.
 fn findings(path: &str, bytes: &[u8]) -> Vec<String> {
-    if READERS.contains(&path)
-        || !bytes
-            .windows(VARIABLE.len())
-            .any(|w| w == VARIABLE.as_bytes())
-    {
+    if READERS.contains(&path) || !names_variable(bytes) {
         return Vec::new();
     }
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return vec![format!(
-            "{path}: names {VARIABLE} and is not text this case can read"
-        )];
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => text,
+        _ => {
+            return vec![format!(
+                "{path}: names {VARIABLE} and is not text this case can read"
+            )];
+        }
     };
     let Some(language) = language(path) else {
         return vec![format!(
             "{path}: names {VARIABLE} in a language this case does not know"
         )];
     };
+    let comments = comment_lines(language, text);
+    let uploads = if path.ends_with(".yml") || path.ends_with(".yaml") {
+        upload_lines(text)
+    } else {
+        vec![false; comments.len()]
+    };
     let mut found = Vec::new();
     for (number, line) in text.lines().enumerate() {
         let names = occurrences(line);
-        if names.is_empty() || is_comment(language, line) {
+        if names.is_empty() || comments[number] || uploads[number] {
             continue;
         }
-        if names.iter().all(|&at| is_write(line, at)) || is_upload(line) {
+        if names.iter().all(|&at| is_write(line, at)) {
             continue;
         }
         found.push(format!(
@@ -1161,11 +1302,14 @@ fn repository_files(root: &Path) -> Vec<String> {
 /// took; their own cases run them in `artifacts_readers.rs`, in the reader's crate and in the
 /// companion's tests.
 ///
-/// So this case holds only what the readers cannot: that nothing else reads the variable. A line
-/// that names it passes when it is a whole-line comment, an assignment, a workflow `env` key, a
-/// program's `.env("NAME", value)` or the upload of the directory as a run's evidence; every other
-/// line fails with its file and line, and so does a file that names it in a language this case does
-/// not know or that is not text. Writes are not listed: a wrong write fails at the reader.
+/// So this case holds only what the readers cannot: that nothing else reads the variable. The name
+/// is matched in any letter case. A line that names it passes when it is a whole-line comment, an
+/// assignment whose value does not read it, a workflow `env` key, a program's `.env("NAME", value)`
+/// or, in a workflow, the directory handed to the `path:` of an `actions/upload-artifact` step as
+/// that run's evidence; every other line fails with its file and line, and so does a file that
+/// names it in a language this case does not know or that is not text (UTF-16 included). Writes
+/// are not listed: a wrong write fails at the reader. The readers do not export the name as a
+/// constant, which would let a file read the variable without writing the name.
 ///
 /// Not seen: a name put together at run time, and a value that reaches a program in an argument
 /// instead of the variable (the conformance runner's `--evidence` passes the same check).
@@ -1180,10 +1324,7 @@ fn nothing_reads_the_artifacts_variable_beside_the_reader_of_its_language() {
             continue;
         }
         let bytes = fs::read(&file).unwrap_or_else(|error| panic!("{path} is read: {error}"));
-        if bytes
-            .windows(VARIABLE.len())
-            .any(|w| w == VARIABLE.as_bytes())
-        {
+        if names_variable(&bytes) {
             named += 1;
         }
         found.extend(findings(&path, &bytes));
@@ -1192,6 +1333,11 @@ fn nothing_reads_the_artifacts_variable_beside_the_reader_of_its_language() {
         let text = fs::read_to_string(root.join(reader))
             .unwrap_or_else(|error| panic!("the reader {reader} is read: {error}"));
         assert!(text.contains(VARIABLE), "{reader} does not name {VARIABLE}");
+        assert!(
+            !(reader.ends_with("lib.rs") || reader.ends_with("evidence.ts"))
+                || !(text.contains("pub const VARIABLE") || text.contains("export const VARIABLE")),
+            "{reader} exports the variable's name"
+        );
     }
     assert!(
         named > READERS.len(),
@@ -1244,6 +1390,25 @@ fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
             flow,
             "          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}/more",
         ),
+        (
+            script,
+            "const { KR_TEST_ARTIFACTS_DIR = '/x' } = process.env",
+        ),
+        (power, "$evidence = $env:kr_test_artifacts_dir"),
+        (
+            rust,
+            "let dir = std::env::var_os(\"kr_test_artifacts_dir\");",
+        ),
+        (flow, "        run: ls ${{ env.kr_test_artifacts_dir }}"),
+        (
+            script,
+            "/* evidence */ const dir = process.env.KR_TEST_ARTIFACTS_DIR",
+        ),
+        (
+            rust,
+            "        .env(\"KR_TEST_ARTIFACTS_DIR\", std::env::var(\"KR_TEST_ARTIFACTS_DIR\").unwrap())",
+        ),
+        (rust, "        \"KR_TEST_ARTIFACTS_DIR\" => 1,"),
     ] {
         assert_eq!(
             findings(path, line.as_bytes()).len(),
@@ -1269,8 +1434,6 @@ fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
         ),
         (power, "$env:KR_TEST_ARTIFACTS_DIR = $directory"),
         (flow, "  KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts"),
-        (flow, "          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}"),
-        (flow, "            ${{ env.KR_TEST_ARTIFACTS_DIR }}"),
         (
             "docs/x.md",
             "Set `KR_TEST_ARTIFACTS_DIR` to a folder under /tmp.",
@@ -1302,4 +1465,89 @@ fn the_source_case_fails_on_a_read_in_every_language_and_passes_a_write() {
         1
     );
     assert!(findings("scripts/x.sh", b"\xff\xfe").is_empty());
+}
+
+/// A workflow with one step: `uses` and the lines of its `with:`, then `after` as a later step.
+fn step(uses: &str, with: &str) -> String {
+    format!(
+        "jobs:\n  run:\n    steps:\n      - name: Keep\n        uses: {uses}\n        with:\n          name: kept\n{with}\n      - name: After\n        run: true\n"
+    )
+}
+
+const UPLOAD: &str = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1";
+
+/// A line that is only the directory's expression is the upload of the run's evidence only in the
+/// `with: path:` of an upload step; anywhere else, in any letter case, it is a read. A block
+/// comment is a comment up to its end only.
+#[test]
+fn the_source_case_lets_the_evidence_upload_name_the_directory_and_nothing_else() {
+    let flow = ".github/workflows/x.yml";
+    let expression = "${{ env.KR_TEST_ARTIFACTS_DIR }}";
+    for with in [
+        format!("          path: {expression}"),
+        format!(
+            "          path: |\n            C:\\x.log\n            {expression}\n            !**/y/**"
+        ),
+        format!("          path: {}", expression.to_lowercase()),
+    ] {
+        assert!(
+            findings(flow, step(UPLOAD, &with).as_bytes()).is_empty(),
+            "an upload of the directory is no read: {with}"
+        );
+    }
+    for (uses, with) in [
+        ("actions/cache@v4", format!("          path: {expression}")),
+        (UPLOAD, format!("          name: {expression}")),
+        (UPLOAD, format!("          path: {expression}/more")),
+        (
+            UPLOAD,
+            format!("          path: x\n          key: {expression}"),
+        ),
+        (
+            UPLOAD,
+            format!("          env:\n            path: {expression}"),
+        ),
+    ] {
+        assert_eq!(
+            findings(flow, step(uses, &with).as_bytes()).len(),
+            1,
+            "{uses}: {with} is a read"
+        );
+    }
+    let run = format!(
+        "jobs:\n  run:\n    steps:\n      - run: |\n          mkdir -p \\\n            {expression}\n          cd \\\n            {expression}\n          adb pull x \\\n            {expression}\n"
+    );
+    assert_eq!(
+        findings(flow, run.as_bytes()).len(),
+        3,
+        "a script's own line is a read"
+    );
+    let script = "apps/companion/e2e/x.ts";
+    assert!(
+        findings(
+            script,
+            b"/*\n * KR_TEST_ARTIFACTS_DIR is read by the reader.\n */\nconst a = 1\n"
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        findings(
+            script,
+            b"/*\n KR_TEST_ARTIFACTS_DIR\n */ const dir = process.env.KR_TEST_ARTIFACTS_DIR\n"
+        )
+        .len(),
+        1,
+        "the line that closes a block comment and goes on with code is code"
+    );
+}
+
+/// A file that is not UTF-8 text names the variable without a byte string that says so.
+#[test]
+fn the_source_case_fails_a_file_that_names_the_variable_in_utf_16() {
+    let name = "KR_TEST_ARTIFACTS_DIR=/x\n";
+    let little: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let big: Vec<u8> = name.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    for bytes in [little, big] {
+        assert_eq!(findings("scripts/x.sh", &bytes).len(), 1);
+    }
 }
