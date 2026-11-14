@@ -66,10 +66,11 @@ use kr_term::win32::{Fidelity, KeyRecord, Keyboard, Refused};
 
 use crate::error::{Result, WorkerError};
 use crate::fence::{Effects, FenceDriver, FenceFrame, Outbound, Step, TakeoverReceipt};
-use crate::input::{InputLease, LeaseRefusal, PASTE_END, PasteFramer, TakeoverFraming};
+use crate::input::{InputLease, LeaseRefusal, PasteFramer, TakeoverFraming};
+use crate::input_room::{Cost, InputRoom, admit};
 use crate::session::{
     FenceOutcome, GrantedBy, InputAccepted, InputAuthority, InputBatch, Interrupted, LeaseEnded,
-    MAX_PENDING_REPLY_BYTES, MAX_QUEUED_INPUT_BYTES, PasteTransition,
+    MAX_PENDING_REPLY_BYTES, PasteTransition,
 };
 
 /// One entry in a session's queue for the pseudo-terminal.
@@ -309,8 +310,9 @@ pub(crate) struct WriterHandles {
     pub(crate) gate: Arc<Mutex<()>>,
     /// Set by the writer on its way out, when the terminal will take nothing more.
     pub(crate) terminal_gone: Arc<AtomicBool>,
-    /// Every byte queued for the pseudo-terminal, across every producer, released by the writer.
-    pub(crate) queued_input_bytes: Arc<AtomicUsize>,
+    /// What is queued for the pseudo-terminal, across every producer, in entries and bytes: charged
+    /// as a batch is queued, and given back by the writer.
+    pub(crate) room: Arc<InputRoom>,
     /// The part of that which belongs to the current lease.
     pub(crate) queued_lease_bytes: Arc<crate::runtime::LeaseBytes>,
     /// How many answers the writer has dropped because their lane deadline passed.
@@ -336,7 +338,7 @@ impl WriterHandles {
         Self {
             gate: Arc::new(Mutex::new(())),
             terminal_gone: Arc::new(AtomicBool::new(false)),
-            queued_input_bytes: Arc::new(AtomicUsize::new(0)),
+            room: Arc::default(),
             queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
             dropped_replies: Arc::new(AtomicU64::new(0)),
             unwritten_replies: Arc::new(AtomicUsize::new(0)),
@@ -584,10 +586,24 @@ impl InputDomain {
         Arc::clone(&self.writer.terminal_gone)
     }
 
-    /// Returns the counter the writer releases as the application takes its input.
+    /// Returns the room the writer gives back as the application takes its input.
     #[must_use]
-    pub fn queued_input_bytes(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.writer.queued_input_bytes)
+    pub fn input_room(&self) -> Arc<InputRoom> {
+        Arc::clone(&self.writer.room)
+    }
+
+    /// Returns what this worker holds for the terminal: what is queued for it, with the writer or
+    /// being written, and what the root editor's machine is holding for a reader transition.
+    ///
+    /// What the machine holds has been accepted and not delivered, so it is against the same bound.
+    /// Leaving it out would let a client that keeps typing through a hold exceed the bound without
+    /// limit.
+    #[must_use]
+    fn held_for_the_terminal(&self) -> Cost {
+        self.writer.room.held().plus(Cost {
+            frames: self.fence.as_ref().map_or(0, FenceDriver::held_frames),
+            bytes: self.held_input_bytes,
+        })
     }
 
     /// Returns the counter holding the current lease's share of the queue.
@@ -915,9 +931,7 @@ impl InputDomain {
     /// Queues one batch at a place in the queue for the terminal, counted as [`Self::queue_input`]
     /// counts it.
     fn queue_input_at(&mut self, at: usize, batch: InputBatch) {
-        self.writer
-            .queued_input_bytes
-            .fetch_add(batch.len(), Ordering::AcqRel);
+        self.writer.room.charge(Cost::of(&batch));
         if let InputBatch::Lease { epoch, .. } = batch {
             self.writer.queued_lease_bytes.add(epoch, batch.len());
         }
@@ -1017,7 +1031,6 @@ impl InputDomain {
             .flatten();
         let mut cursor_reported = false;
         for reply in replies {
-            let queued = self.writer.queued_input_bytes.load(Ordering::Acquire);
             // What the replies themselves hold: queued and neither written nor dropped. The queue
             // holds more than that. The keystrokes a takeover made stale stay in it until the
             // writer reaches them, and the count of the lease they were accepted under went with
@@ -1026,12 +1039,15 @@ impl InputDomain {
             let held = self.writer.unwritten_replies.load(Ordering::Acquire);
             // Two bounds, both of them this reply's: its own share, so an application that asks
             // questions without reading the answers cannot fill the terminal by itself, and the
-            // whole budget, so its share cannot be spent on top of a full queue. What the root
-            // editor's machine is holding counts towards the second, because it is accepted input
-            // on its way to the same terminal.
-            let outstanding = queued.saturating_add(self.held_input_bytes);
+            // whole room, in entries and in bytes, so its share cannot be spent on top of a full
+            // queue. What the root editor's machine is holding counts towards the second, because
+            // it is accepted input on its way to the same terminal.
             if held.saturating_add(reply.bytes.len()) > MAX_PENDING_REPLY_BYTES
-                || outstanding.saturating_add(reply.bytes.len()) > MAX_QUEUED_INPUT_BYTES
+                || admit(
+                    self.held_for_the_terminal(),
+                    Cost::claimed_by(reply.bytes.len()),
+                )
+                .is_err()
             {
                 break;
             }
@@ -1241,27 +1257,13 @@ impl InputDomain {
                 &spelled
             }
         };
-        // The budget is checked before the recogniser is fed, so a refused frame leaves the
-        // framing exactly as it was: what is refused is the whole frame, not part of it. A push
-        // can also release a prefix it was holding, which is at most one delimiter short of a
-        // whole one, so that is counted too.
-        let claimed = bytes.len().saturating_add(PASTE_END.len());
-        let queued = self
-            .writer
-            .queued_input_bytes
-            .load(Ordering::Acquire)
-            // What the root editor's machine is holding for a reader transition has been accepted
-            // and not delivered, so it is against the same bound. Leaving it out would let a client
-            // that keeps typing through a hold exceed the bound without limit.
-            .saturating_add(self.held_input_bytes);
-        if queued.saturating_add(claimed) > MAX_QUEUED_INPUT_BYTES {
-            return Err(WorkerError::ResourceUnavailable {
-                detail: format!(
-                    "the application is not reading its input and {MAX_QUEUED_INPUT_BYTES} bytes \
-                     are already waiting for it, so these bytes were not accepted"
-                ),
-            });
-        }
+        // The room is checked before the recogniser is fed, so a refused frame leaves the framing
+        // exactly as it was: what is refused is the whole frame, not part of it. What the frame
+        // claims is what the worker will hold for it, which is the bytes it spells and not the
+        // size it came in, and a push can also release a prefix the recogniser was holding, which
+        // is why the claim is a little longer than the frame.
+        admit(self.held_for_the_terminal(), Cost::claimed_by(bytes.len()))
+            .map_err(|bound| WorkerError::InputRoomFull { bound })?;
         if !self.accepts_external_input() {
             // Section 7 paragraph 4: in managed mode nothing external reaches the terminal until
             // the private reader and pre-EOF bridge are authenticated and ABI-checked. The refusal

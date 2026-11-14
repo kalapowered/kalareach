@@ -1088,12 +1088,7 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
         "an application that is not reading still accepts what fits"
     );
     assert!(
-        runtime
-            .session()
-            .input()
-            .lock()
-            .queued_input_bytes()
-            .load(std::sync::atomic::Ordering::Acquire)
+        runtime.session().input().lock().input_room().held().bytes
             <= kr_worker::session::MAX_QUEUED_INPUT_BYTES,
         "and nothing beyond the budget was ever queued"
     );
