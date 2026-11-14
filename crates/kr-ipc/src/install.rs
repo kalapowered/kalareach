@@ -90,11 +90,19 @@
 //!
 //! # Windows
 //!
-//! `current` is a directory junction, which any account can make, and it is replaced by renaming a
-//! new junction over it with the file system's own replacing rename. A junction names an absolute
-//! path, so a store that is moved or copied has a `current` that names the place it was made for,
-//! and [`Store::current`] refuses it. A store is kept on an NTFS volume. A release is sealed by
-//! attribute and by an access-control list that lets its owner read it and nothing that writes it.
+//! `current` is a directory junction, which any account can make. A switch points the junction
+//! that is there at the new release in place, in one operation, so a program that reads or opens
+//! `current` at any moment of it finds the old release or the new one whole and is never refused.
+//! Renaming a new junction over the name would replace the junction, and an open that meets the
+//! old one on its way out is answered with access denied. A new junction is renamed in only where
+//! no `current` is there yet, or where something else than a junction is. With none there, a reader
+//! finds no `current`, which is the answer for a store with no current release, and then the new
+//! junction: nothing is replaced for it to meet. Something else than a junction is refused by
+//! [`Store::current`] until the switch has replaced it, so a read that is refused meanwhile was
+//! refused before. A junction names an absolute path, so a store that is moved or copied has a
+//! `current` that names the place it was made for, and [`Store::current`] refuses it. A store is
+//! kept on an NTFS volume. A release is sealed by attribute and by an access-control list that
+//! lets its owner read it and nothing that writes it.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -1262,7 +1270,9 @@ impl Store {
     /// A read that finds no `current`, or on Unix a `current` that is no link, reads again (three
     /// times in all) before it says so: on macOS a switch that runs while a read is under way can
     /// take away the link the read had looked up. A read held up three times in a row for as long
-    /// as a switch takes still gives that answer.
+    /// as a switch takes still gives that answer. On Windows a switch points the junction that is
+    /// there at the new release in place, so a read finds the old release or the new one whole at
+    /// every moment of it; a read that is refused is an error, and is not read again.
     ///
     /// # Errors
     ///
@@ -2358,8 +2368,15 @@ pub fn hold_writers(
 
 #[cfg(windows)]
 impl Store {
-    /// Makes `release` current: one new junction, renamed over `current` in one step, and the
-    /// store's directory flushed so the rename survives a crash. Nothing else changes.
+    /// Makes `release` current: a `current` that is a junction is pointed at the release in place,
+    /// in one step, and flushed. Where nothing is named `current`, as in a first install, or what
+    /// is there is not a junction, a new junction is renamed over the name in one step instead, and
+    /// the store's directory is flushed so the rename survives a crash. Nothing else changes.
+    ///
+    /// A program that reads or opens `current` meanwhile finds the old release or the new one whole:
+    /// the junction is never replaced while it is there, so no reader can meet it half gone. A
+    /// rename over it would replace the junction, and a reader whose open met the old one on its
+    /// way out would be answered with access denied.
     ///
     /// `update` is the update lock, so what `current` names stays what an install or an update
     /// found it to be for as long as that holds it. `install` is the install lock, taken
@@ -2369,7 +2386,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError::Io`] when the junction cannot be made, renamed or flushed, and
+    /// Returns [`InstallError::Io`] when the junction cannot be made, pointed, renamed or flushed, and
     /// [`InstallError::Replaced`] when the release is not in this store or the store is not on an
     /// NTFS volume.
     pub fn switch(
@@ -2403,6 +2420,11 @@ impl Store {
         }
         let target = std::path::absolute(self.release_directory(release))
             .map_err(|error| InstallError::io("resolve", self.release_directory(release), error))?;
+        if windows::point_junction(&self.current_link(), &target)
+            .map_err(|error| InstallError::io("point the link", self.current_link(), error))?
+        {
+            return Ok(());
+        }
         let temporary = self.root.join(format!(".{CURRENT}-{}", crate::new_uuid()));
         windows::create_junction(&temporary, &target)
             .map_err(|error| InstallError::io("make the link", &temporary, error))?;
