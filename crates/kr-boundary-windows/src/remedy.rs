@@ -1674,6 +1674,9 @@ pub enum RecordLeft {
         why: String,
         /// Each object that this run made and that stays, by path.
         stays: Vec<String>,
+        /// Whether a write of the record began: where the run held no handle of the data
+        /// directory no write was made, so nothing says that a write published a record.
+        write_began: bool,
     },
 }
 
@@ -1695,16 +1698,28 @@ pub fn rollback_failed(failures: &[String], record: &RecordLeft, unread_prior: &
             "the removal did not finish: {failed}. {}, so this run wrote its record at {manifest}, through the write that proves it, and the administrator's removal takes the rest{unread_prior}",
             found.words()
         ),
-        RecordLeft::NotSaved { found, why, stays } => {
+        RecordLeft::NotSaved {
+            found,
+            why,
+            stays,
+            write_began,
+        } => {
             let left = if stays.is_empty() {
                 "this run held no object that it had made".to_owned()
             } else {
                 stays.join("; ")
             };
-            format!(
-                "the removal did not finish: {failed}. {}, and writing this run's record failed ({why}), so a record of this run could not be confirmed on disk: the write may have published it before its proof failed, and a record that an earlier write left may stand. What this run made and the rollback did not take away: {left}{unread_prior}",
-                found.words()
-            )
+            if *write_began {
+                format!(
+                    "the removal did not finish: {failed}. {}, and writing this run's record failed ({why}), so a record of this run could not be confirmed on disk: the write may have published it before its proof failed, and a record that an earlier write left may stand. What this run made and the rollback did not take away: {left}{unread_prior}",
+                    found.words()
+                )
+            } else {
+                format!(
+                    "the removal did not finish: {failed}. {}, and no write of this run's record was made ({why}), so this run left no record of its own on disk, and a record that an earlier run left may stand. What this run made and the rollback did not take away: {left}{unread_prior}",
+                    found.words()
+                )
+            }
         }
     }
 }

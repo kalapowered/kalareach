@@ -3997,12 +3997,15 @@ impl Run {
             Ok(()) => return remedy::RecordLeft::Proved { manifest },
             Err(found) => found,
         };
+        // A write begins only where the run holds a handle of the data directory.
+        let write_began = self.directory.is_some();
         match self.save() {
             Ok(()) => remedy::RecordLeft::Saved { manifest, found },
             Err(error) => remedy::RecordLeft::NotSaved {
                 found,
                 why: error.to_string(),
                 stays: self.held_paths(),
+                write_began,
             },
         }
     }
@@ -6957,17 +6960,19 @@ mod tests {
         let error = roll_back(&mut run).unwrap_err().to_string();
         assert!(error.contains("found nothing there"), "{error}");
         assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), run.manifest);
-        // The write fails too (no handle of the data directory is held): the ending says so, names
-        // what stays, and never says that a record is kept.
+        // The write cannot begin (no handle of the data directory is held): the ending says so,
+        // names what stays, never says that a write may have published a record, and never says
+        // that a record is kept.
         let top = tempfile::tempdir().unwrap();
         let mut run = laid_run(top.path());
         run.directory = None;
         crate::manifest::forced::fail_the_next("manager");
         let error = roll_back(&mut run).unwrap_err().to_string();
         assert!(
-            error.contains("writing this run's record failed"),
+            error.contains("and no write of this run's record was made"),
             "{error}"
         );
+        assert!(!error.contains("may have published it"), "{error}");
         // No read was made, and the words do not say that one failed; a write that failed shows
         // neither that a record is on disk nor that none is.
         assert!(
@@ -6979,7 +6984,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains("a record of this run could not be confirmed on disk"),
+            error.contains("this run left no record of its own on disk"),
             "{error}"
         );
         assert!(
