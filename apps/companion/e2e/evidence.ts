@@ -58,18 +58,25 @@ function resolveThrough(path: string): string {
   return join(realpathSync.native(probe), ...rest)
 }
 
-/** Each temporary root that exists, resolved through its links. */
-function roots(): string[] {
-  const named = [tmpdir(), ...(windows ? [] : ['/tmp']), env['RUNNER_TEMP'] ?? '']
+/**
+ * Each of `named` that is a fully qualified path (by the rules of `onWindows`) to a folder that
+ * exists, resolved through its links, as a root. A filesystem root is not one.
+ */
+export function temporaryRoots(named: readonly string[], onWindows: boolean = windows): string[] {
   const found: string[] = []
   for (const candidate of named) {
-    if (candidate === '' || !fullyQualified(candidate) || !existsSync(candidate)) continue
+    if (candidate === '' || !fullyQualified(candidate, onWindows) || !existsSync(candidate)) continue
     const real = realpathSync.native(candidate)
     // A temporary folder that is a filesystem root (`/`, `C:\`) would admit every path on its disk.
     if (dirname(real) === real) continue
     if (!found.includes(real)) found.push(real)
   }
   return found
+}
+
+/** This platform's temporary roots: its temporary folder, `/tmp` off Windows, and the runner's. */
+function roots(): string[] {
+  return temporaryRoots([tmpdir(), ...(windows ? [] : ['/tmp']), env['RUNNER_TEMP'] ?? ''])
 }
 
 function refused(value: string, why: string): Error {

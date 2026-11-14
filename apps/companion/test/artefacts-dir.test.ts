@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { chdir, cwd } from 'node:process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { artefactsDirectory, fullyQualified } from '../e2e/evidence'
+import { artefactsDirectory, fullyQualified, temporaryRoots } from '../e2e/evidence'
 
 const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
@@ -127,6 +127,14 @@ describe('the evidence directory reader', () => {
   it.skipIf(!windows)('takes a runner folder that depends on the current drive for no root', () => {
     vi.stubEnv('RUNNER_TEMP', '\\Windows')
     expect(() => read(elsewhere)).toThrow(/temporary roots/)
+  })
+
+  it('takes a path for a root only when it is fully qualified by the platform rules', () => {
+    // The temporary folder is an absolute path here and not on the other platform: the same folder
+    // is a root by one platform's rules and none by the other's.
+    const real = realpathSync.native(tmpdir())
+    expect(temporaryRoots([tmpdir()], windows)).toEqual([real])
+    expect(temporaryRoots([tmpdir()], !windows)).toEqual([])
   })
 
   it.each([
