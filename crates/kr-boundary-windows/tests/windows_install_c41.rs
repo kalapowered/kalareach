@@ -480,8 +480,8 @@ fn a_rollback_with_a_failed_step(how: Option<&str>) -> String {
     );
     match how {
         Some("garbage") | Some("absent") => assert!(
-            text.contains("wrote its record again at"),
-            "{label}: the ending does not say that the run wrote its record again: {text}"
+            text.contains("so this run wrote its record at"),
+            "{label}: the ending does not say that the run wrote its record: {text}"
         ),
         _ => assert!(
             text.contains("found the manifest that this run holds"),
