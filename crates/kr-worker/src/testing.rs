@@ -599,7 +599,7 @@ impl TerminalWrites {
     }
 }
 
-/// A session that is closed when this is dropped.
+/// A session that is closed when this is dropped, on Unix.
 ///
 /// A session that is only dropped is not ended in the way a close ends it: the shell and the
 /// controller's link to the worker go on until the runtime is dropped. A fixture keeps this as a
@@ -610,10 +610,13 @@ impl TerminalWrites {
 pub struct ClosedOnDrop(Option<std::sync::Arc<crate::runtime::SessionRuntime>>);
 
 impl ClosedOnDrop {
-    /// Closes `runtime`'s session when this is dropped.
+    /// Closes `runtime`'s session when this is dropped, on Unix alone. On Windows the shell ends
+    /// with the job that holds it when the session is dropped, and a close would keep the session's
+    /// journal open through its two-second drain, which is as long as the removal of a directory
+    /// is tried again.
     #[must_use]
     pub fn of(runtime: &std::sync::Arc<crate::runtime::SessionRuntime>) -> Self {
-        Self(Some(std::sync::Arc::clone(runtime)))
+        Self(cfg!(unix).then(|| std::sync::Arc::clone(runtime)))
     }
 
     /// Lets the session go on after this is dropped, for a fixture that hands it to another.
