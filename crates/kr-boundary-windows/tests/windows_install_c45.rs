@@ -564,6 +564,70 @@ fn a_repair_over_a_refused_record_that_dies_after_the_creation_leaves_an_intent(
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
+fn a_repair_whose_creation_of_the_service_fails_puts_the_refusal_back_in_the_record() {
+    let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    require_elevated();
+    let before = snapshot();
+    assert_clean(&before);
+    let person = Person::make();
+    a_refused_service_after_the_directories_step(&person);
+    // The service that stood there is deleted by the case before the repair.
+    drop(StrangersService::made_by_the_seam());
+    assert!(!snapshot().service, "the case did not delete its service");
+    // A repair over the record of that refusal, with a service made at the broker's name between
+    // the service step's open and its creation: the creation fails.
+    let (code, text) = install_with(
+        &person,
+        &[("KR_BOUNDARY_MAKE_AFTER", "service-open:service")],
+    );
+    let made = StrangersService::made_by_the_seam();
+    let paths = Paths::system().unwrap();
+    observed(&format!(
+        "after the repair the record holds the Service entry as {}; exit {code:?}",
+        service_outcome(&paths)
+    ));
+    assert_ne!(code, Some(0), "the repair did not fail: {text}");
+    assert!(
+        text.to_lowercase().contains("already exist"),
+        "the repair does not end with the creation's own error: {text}"
+    );
+    assert_eq!(
+        service_outcome(&paths),
+        "Some(Refused)",
+        "the record does not hold the refusal after the failed creation: {text}"
+    );
+    // A later repair refuses at its first look and does not touch the service.
+    let (later_code, later) = install_with(&person, &[]);
+    assert_ne!(
+        later_code,
+        Some(0),
+        "the later repair did not refuse: {later}"
+    );
+    assert!(
+        later.contains(&first_look_refusal()),
+        "the later repair does not refuse as the first run did: {later}"
+    );
+    assert_eq!(
+        the_service_at_the_brokers_name(),
+        Some(false),
+        "the later repair changed the state of the service: {later}"
+    );
+    let (removal_code, removal) = ordinary_removal();
+    assert_eq!(
+        removal_code,
+        Some(0),
+        "the removal ends with a failure: {removal}"
+    );
+    drop(made);
+    assert_eq!(
+        snapshot(),
+        before,
+        "after the case deleted its service the computer is as it was: {removal}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_run_that_fails_before_its_first_record_and_whose_rollback_fails_leaves_a_record_that_the_removal_accepts()
  {
     let _one_at_a_time = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
