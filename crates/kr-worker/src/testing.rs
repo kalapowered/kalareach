@@ -18,6 +18,7 @@
 //! drives PowerShell 7 itself.
 
 use crate::pty::ShellCommand;
+use crate::session::{InputBatch, Session};
 
 /// The environment every test shell is given.
 ///
@@ -658,5 +659,22 @@ impl Drop for ClosedOnDrop {
                 .1
                 .release();
         }
+    }
+}
+
+/// Settles batches that a test took out of a session's queue with
+/// [`Session::take_pending_input`], as the terminal's writer settles batches it has written whole.
+///
+/// This is test support for a harness that plays the terminal's writer. A session with no writer
+/// to take its queue leaves everything taken charged to the room: the entry and its bytes, the
+/// answer's place among the host's own answers, the bytes still counted as unwritten, and a
+/// lease's queued bytes. The harness calls this once it has read what it took, so that a long
+/// exchange meets the bounds the product keeps and not the bounds of a queue that is never
+/// emptied. No program of the product calls it.
+pub fn settle_written_input(session: &Session, batches: &[InputBatch]) {
+    let shared = session.input();
+    let domain = shared.lock();
+    for batch in batches {
+        domain.settle_written(batch);
     }
 }
