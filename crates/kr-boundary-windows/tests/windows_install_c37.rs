@@ -439,8 +439,11 @@ impl Drop for ParentMadeByHand {
     }
 }
 
-/// Makes the program directory's parent by hand, as the account that runs the case makes a folder
-/// in `Program Files`, and prints its owner and its list.
+/// Makes the program directory's parent by hand, as an administrator makes a folder in
+/// `Program Files`, and prints its owner and its list. The Administrators group owns it: that is
+/// what an elevated administrator's folder gets where the token's default owner is the group. A
+/// token whose default owner is its own account makes a folder that the installer refuses, which
+/// is not what these cases observe.
 fn make_the_program_parent_by_hand(paths: &Paths) -> ParentMadeByHand {
     let parent = paths
         .program
@@ -449,6 +452,12 @@ fn make_the_program_parent_by_hand(paths: &Paths) -> ParentMadeByHand {
         .to_owned();
     assert!(!parent.exists(), "the program directory's parent is there");
     std::fs::create_dir(&parent).unwrap();
+    let owned = Command::new("icacls")
+        .arg(&parent)
+        .args(["/setowner", "*S-1-5-32-544"])
+        .output()
+        .unwrap();
+    assert!(owned.status.success(), "{owned:?}");
     let owner = Command::new("powershell")
         .args(["-NoProfile", "-Command"])
         .arg(format!(
