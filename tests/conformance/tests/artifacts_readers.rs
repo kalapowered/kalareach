@@ -762,6 +762,27 @@ mod windows_paths {
         assert!(same(directory, &ordinary.join("evidence")), "{directory:?}");
     }
 
+    /// `folder` by the machine's own administrative share of its drive: the same folder, by a UNC
+    /// path. `None` where the share cannot be reached, and a hosted run reaches it, so there that
+    /// fails.
+    fn by_unc(folder: &Path) -> Option<PathBuf> {
+        let text = folder.to_string_lossy().into_owned();
+        let unc = PathBuf::from(format!(r"\\localhost\{}${}", &text[..1], &text[2..]));
+        if std::fs::metadata(&unc).is_ok() {
+            return Some(unc);
+        }
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "a hosted run reaches {}, and it could not",
+            unc.display()
+        );
+        eprintln!(
+            "{} cannot be reached here: the UNC case is not run",
+            unc.display()
+        );
+        None
+    }
+
     #[test]
     fn a_unc_value_is_read_under_a_unc_runner_folder_and_refused_without_one() {
         if powershell().is_none() {
@@ -769,16 +790,9 @@ mod windows_paths {
         }
         let temporary = tempfile::tempdir().expect("a temporary folder");
         let ordinary = real(temporary.path());
-        let text = ordinary.to_string_lossy().into_owned();
-        // The machine's own administrative share of the drive: the same folder, by a UNC path.
-        let unc = PathBuf::from(format!(r"\\localhost\{}${}", &text[..1], &text[2..]));
-        if std::fs::metadata(&unc).is_err() {
-            eprintln!(
-                "{} cannot be reached here: the UNC case is not run",
-                unc.display()
-            );
+        let Some(unc) = by_unc(&ordinary) else {
             return;
-        }
+        };
         let value = unc.join("evidence");
         let named = POWER.read_with(
             Some(value.as_os_str()),
@@ -791,6 +805,75 @@ mod windows_paths {
             &POWER.read(Some(value.as_os_str()), None),
             "a UNC value under no UNC root",
             OUTSIDE,
+        );
+    }
+
+    /// The reader takes the extended-length spelling of a value and of a root (`\\?\C:\…`, and
+    /// `\\?\UNC\server\share\…` for a share) as the ordinary one. The temporary folder is another
+    /// one, so that only the runner's root can admit the value.
+    #[test]
+    fn the_extended_length_spelling_of_a_value_or_of_a_runner_folder_is_read_as_the_ordinary_one() {
+        if powershell().is_none() {
+            return;
+        }
+        let runner = tempfile::tempdir().expect("a runner folder");
+        let other = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(runner.path());
+        let evidence = ordinary.join("evidence");
+        let extended = PathBuf::from(format!(r"\\?\{}", ordinary.display()));
+        let reading = POWER.read_all(
+            Some(evidence.as_os_str()),
+            Some(other.path()),
+            None,
+            &[("RUNNER_TEMP", extended.as_os_str())],
+        );
+        assert!(reading.succeeded, "an extended runner folder: {reading:?}");
+        let directory = reading.directory.as_deref().expect("a directory");
+        assert!(same(directory, &evidence), "{directory:?}");
+
+        let Some(unc) = by_unc(&ordinary) else {
+            return;
+        };
+        let share = unc.to_string_lossy().into_owned();
+        // `\\localhost\C$\x` is `\\?\UNC\localhost\C$\x`.
+        let extended_unc = |path: &str| PathBuf::from(format!(r"\\?\UNC\{}", &path[2..]));
+        let value = extended_unc(&share).join("evidence");
+        let reading = POWER.read_with(
+            Some(value.as_os_str()),
+            Some(other.path()),
+            &[("RUNNER_TEMP", unc.as_os_str())],
+        );
+        assert!(reading.succeeded, "an extended UNC value: {reading:?}");
+        let root = extended_unc(&share);
+        let reading = POWER.read_with(
+            Some(unc.join("evidence").as_os_str()),
+            Some(other.path()),
+            &[("RUNNER_TEMP", root.as_os_str())],
+        );
+        assert!(
+            reading.succeeded,
+            "an extended UNC runner folder: {reading:?}"
+        );
+    }
+
+    /// Git Bash settles a `..` of a Windows path by its text when it converts the path, so the
+    /// shell reader looks for it in the value as it was written.
+    #[test]
+    fn a_windows_path_that_steps_up_is_refused_by_the_shell_reader_as_it_was_written() {
+        if shell().is_none() {
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let value = real(temporary.path())
+            .join("evidence")
+            .join("..")
+            .join("evidence");
+        let reading = Reader::Shell.read(Some(value.as_os_str()), None);
+        assert_refused(
+            Reader::Shell,
+            &reading,
+            "a Windows path with a step up",
+            "steps up a directory",
         );
     }
 }

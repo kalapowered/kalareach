@@ -88,7 +88,7 @@ _kr_artifacts_refuse() {
 
 # Prints the real path of $1 when it is inside a temporary root; else says why not and returns 1.
 _kr_artifacts_confine() {
-  local _kr_value="$1" _kr_probe _kr_rest="" _kr_real _kr_real_folded _kr_root _kr_inside=0
+  local _kr_value="$1" _kr_written="$1" _kr_probe _kr_rest="" _kr_real _kr_real_folded _kr_root _kr_inside=0
   _kr_value="$(_kr_artifacts_posix "$_kr_value")"
   if [ -z "$_kr_value" ]; then
     _kr_artifacts_refuse "$1" "it is empty"
@@ -101,7 +101,10 @@ _kr_artifacts_confine() {
       return 1
       ;;
   esac
-  case "/$_kr_value/" in
+  # A step up is looked for in the value as it was written: the conversion of a Windows path above
+  # settles a `..` by its text, so the converted value no longer shows it.
+  case "$_kr_written" in [A-Za-z]:[\\/]*) _kr_written="${_kr_written//\\//}" ;; esac
+  case "/$_kr_written/" in
     */../*)
       _kr_artifacts_refuse "$1" "it steps up a directory with \`..\`"
       return 1
