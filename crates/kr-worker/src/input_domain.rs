@@ -1690,6 +1690,8 @@ impl InputDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::PASTE_END;
+    use crate::session::{MAX_QUEUED_INPUT_BYTES, MAX_QUEUED_INPUT_FRAMES};
     use kr_protocol::ids::SessionId;
 
     fn domain() -> InputDomain {
@@ -1800,6 +1802,57 @@ mod tests {
             vec![room],
             "a reply that fills the share is queued and the one past it is not"
         );
+    }
+
+    /// The host's own answers are bounded by the whole room beside a person's keystrokes, in entries
+    /// and in bytes, and they leave the place and the delimiter that the recogniser can still
+    /// release, as the keystrokes do.
+    #[test]
+    fn the_answers_are_bounded_by_the_whole_room_beside_the_keystrokes() {
+        let keys = |len: usize| InputBatch::Lease {
+            epoch: 0,
+            bytes: vec![b'x'; len],
+            paste: PasteTransition::default(),
+            authority_deadline_boot_ms: None,
+            authority_utc_deadline_ms: None,
+        };
+        let reply = |len: usize| crate::projection::LaneReply {
+            cursor_report: false,
+            bytes: vec![b'r'; len],
+            expires_at_ms: None,
+        };
+        let delimiter = PASTE_END.len();
+
+        // Bytes: what is free is what a reply and one delimiter need, to the byte.
+        let mut input = domain();
+        input.queue_input(keys(MAX_QUEUED_INPUT_BYTES - delimiter - 4));
+        let _ = input.take_pending();
+        let _ = input.queue_replies(vec![reply(5)]);
+        assert!(
+            input.take_pending().is_empty(),
+            "five bytes and a delimiter do not fit"
+        );
+        let _ = input.queue_replies(vec![reply(4)]);
+        assert_eq!(
+            input.take_pending().len(),
+            1,
+            "four bytes and a delimiter fit"
+        );
+
+        // Entries: a reply and the place kept for a released prefix.
+        let mut input = domain();
+        for _ in 0..MAX_QUEUED_INPUT_FRAMES - 2 {
+            input.queue_input(keys(1));
+        }
+        let _ = input.take_pending();
+        let _ = input.queue_replies(vec![reply(1)]);
+        assert_eq!(input.take_pending().len(), 1, "one more entry fits");
+        let _ = input.queue_replies(vec![reply(1)]);
+        assert!(
+            input.take_pending().is_empty(),
+            "the entry that is left is the one kept for the recogniser"
+        );
+        assert!(input.input_room().held().frames <= MAX_QUEUED_INPUT_FRAMES);
     }
 
     /// KR-REQ-08.48: a reply bypasses the paste recogniser. Bytes of a reply that the recogniser
