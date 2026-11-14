@@ -480,35 +480,85 @@ fn reparse_tag(file: &File) -> io::Result<Option<u32>> {
         .map(|tag| u32::from_le_bytes(*tag)))
 }
 
-/// Points the junction `link` at the directory `target`, in place, and flushes the change. Returns
-/// whether it did: `false`, with nothing changed, where nothing is named `link` or what is there
-/// is not a directory junction.
+/// What [`point_junction`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pointed {
+    /// The junction names the target, the change is flushed, and the name still names the junction
+    /// that was changed.
+    Done,
+    /// Nothing is named `link`, or what is there is not a directory junction. Nothing was changed.
+    NotAJunction,
+    /// The target was set and flushed on the junction that was looked at, and the name no longer
+    /// names it: something else was put in its place meanwhile.
+    Moved,
+}
+
+/// Opens the directory or junction `link` itself, not what a junction names, with no access to it
+/// at all, as the standard library's read of a link does: it asks what the object is and conflicts
+/// with no other handle's share mode.
+fn open_to_look(link: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(0)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(link)
+}
+
+/// Points the junction `link` at the directory `target`, in place, and flushes the change.
+///
+/// The name is looked at without a right to change it, so that what is not a junction, or is not
+/// there, is told apart from a junction that this account may not change. Then it is opened to be
+/// changed, and the object that handle is open on is checked to be a junction again before its
+/// target is set through that handle: what was put in the name's place between the look and the set
+/// is not changed. The change is flushed through the same handle, and the name is checked to still
+/// name that object before the answer is [`Pointed::Done`].
 ///
 /// The junction stays the one object it is and only its target changes, in one operation, so a
-/// program that opens or reads `link` meanwhile finds the old target or the new one whole.
-/// Renaming a new junction over it replaces the object instead, and an open of the name that meets
-/// the replaced one on its way out is answered with access denied; that is not a state a program
-/// can be asked to expect of a name that is there.
+/// program that reads `link` or walks a path through it meanwhile finds the old target or the new
+/// one whole. Renaming a new junction over it replaces the object instead, and an open of the name
+/// that meets the replaced one on its way out is answered with access denied. A junction that this
+/// account cannot open to change is an error and is not replaced: that replacement is the one this
+/// avoids.
 ///
 /// # Errors
 ///
-/// Returns the operating system's error when `link` cannot be opened for a change, its reparse
-/// data cannot be read or set, or the change cannot be flushed.
-pub(super) fn point_junction(link: &Path, target: &Path) -> io::Result<bool> {
+/// Returns the operating system's error when `link` cannot be opened, its reparse data cannot be
+/// read or set, or the change cannot be flushed, and an invalid-input error when `target` cannot
+/// be named by a junction.
+pub(super) fn point_junction(link: &Path, target: &Path) -> io::Result<Pointed> {
     let data = junction_data(target)?;
+    let looked = match open_to_look(link) {
+        Ok(looked) => looked,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Pointed::NotAJunction),
+        Err(error) => return Err(error),
+    };
+    if reparse_tag(&looked)? != Some(IO_REPARSE_TAG_MOUNT_POINT) {
+        return Ok(Pointed::NotAJunction);
+    }
+    drop(looked);
+    at(Moment::JunctionLooked, link);
     let directory = match open_to_change(link) {
         Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Pointed::NotAJunction),
         Err(error) => return Err(error),
     };
     if reparse_tag(&directory)? != Some(IO_REPARSE_TAG_MOUNT_POINT) {
-        return Ok(false);
+        return Ok(Pointed::NotAJunction);
     }
     at(Moment::JunctionChecked, link);
     set_reparse_data(&directory, &data)?;
     at(Moment::JunctionPointed, link);
     directory.sync_all()?;
-    Ok(true)
+    let named = match open_for_identity(link) {
+        Ok(named) => named,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Pointed::Moved),
+        Err(error) => return Err(error),
+    };
+    Ok(if identity(&named)? == identity(&directory)? {
+        Pointed::Done
+    } else {
+        Pointed::Moved
+    })
 }
 
 /// Makes the existing empty directory `directory` a junction that names `target`, as another
@@ -766,14 +816,17 @@ pub enum Moment {
     Opened,
     /// The access list of a file is open and is about to be reset.
     AboutToGiveBack,
-    /// The name `current` was opened and found to be a junction, and its target is about to be set
-    /// through that handle.
+    /// The name `current` was looked at and found to be a junction, and is about to be opened to be
+    /// changed.
+    JunctionLooked,
+    /// The name `current` was opened to be changed and found to be a junction, and its target is
+    /// about to be set through that handle.
     JunctionChecked,
     /// The target of `current` was set, and the change is about to be flushed.
     JunctionPointed,
 }
 
-/// What a test runs at each moment, with the path of what the removal is at.
+/// What a test runs at each moment, with the path of what the removal or the switch is at.
 #[cfg(feature = "testing")]
 pub(super) static HOOK: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
 
