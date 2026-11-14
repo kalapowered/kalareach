@@ -1015,10 +1015,15 @@ fn artifacts_assignment(line: &str) -> Option<String> {
 }
 
 /// Whether a line writes the variable in a way `artifacts_assignment` does not read: PowerShell's
-/// `$env:NAME = value`, a script's `os.environ["NAME"] = value` or `NAME += value`, a setter that
-/// takes the name and a value (`SetEnvironmentVariable('NAME', value)`), an object key in a script,
-/// or an expansion with a form of default or alternate other than `${NAME:-default}`, `${NAME:?}` and
-/// `${NAME:+word}`. A comparison, a plain read and an expansion with a default are not writes.
+/// `$env:NAME = value`, `NAME += value`, a setter that takes the name and a value
+/// (`SetEnvironmentVariable('NAME', value)`), an object key in a script, or an expansion with a
+/// form of default or alternate other than `${NAME:-default}`, `${NAME:?}` and `${NAME:+word}`. A
+/// comparison, a plain read and an expansion with a default are not writes.
+///
+/// Where a `[` or `test ` stands anywhere before the name on the line, the `=` after the name is
+/// taken for a comparison. So Python's `os.environ["NAME"] = value` and JavaScript's
+/// `process.env['NAME'] = value` are not read as writes, and nor is a write with no `=` or `:`
+/// after the name (`printf` into the environment file, `printf -v`, `read`, `NAME<<EOF`).
 fn writes_unread(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.starts_with('#') || trimmed.starts_with("//") || artifacts_assignment(line).is_some()
@@ -1206,12 +1211,26 @@ fn never_runs(step: &str) -> bool {
     })
 }
 
-/// KR-REQ-27.03, the part about the build's directory: every workflow and script of the repository
-/// that gives the artefacts directory a value, or a default, puts it in a temporary folder (`/tmp`,
-/// or the runner's or the platform's own), and a job that runs a screenshot tool has the variable
-/// set when that step starts. The values are read as text, so a value spelled in a way this does
-/// not know is refused, and so is a write of the variable that it cannot read; the one assignment it
-/// cannot follow is named, with its reason.
+/// KR-REQ-27.03, the part about the build's directory: every value the workflows and scripts it
+/// reads give the artefacts directory, as `NAME=value`, `NAME: value` or the default of
+/// `${NAME:-default}`, lies in a temporary folder (`/tmp`, or the runner's or the platform's own),
+/// and a job that runs a screenshot tool has the variable set when that step starts. A value
+/// spelled in a way this does not know is refused; the one assignment it cannot follow is named,
+/// with its reason.
+///
+/// The case reads a fixed list of forms as text, and other forms pass it. It has four gaps:
+///
+/// - A variable that a value names is read from any definition of it in the same file (`name=value`
+///   or PowerShell's `$name = value`), wherever that stands, so a definition below the write or in
+///   another step can make the write pass. A definition in a workflow's `env` or one made through
+///   the environment file is not read.
+/// - An assignment after a `[` on the same line, which is how Python and JavaScript write
+///   `os.environ["NAME"] = value` and `process.env['NAME'] = value`, is taken for a comparison.
+/// - A write with no `=` or `:` after the name is not seen: `printf` into the environment file,
+///   `printf -v`, `read`, and the `NAME<<EOF` form.
+/// - Files outside `.github` and the root `scripts/` directory are not read, and inside them only
+///   workflows (`.yml`, `.yaml`) and scripts ending in `.sh`, `.bash`, `.py`, `.mjs`, `.js` or
+///   `.ps1`.
 ///
 /// Not shown here: that each run gets a directory of its own (the scripts' fixed default is shared
 /// by successive runs on one machine) and that on macOS the default is the OS-resolved `$TMPDIR`
