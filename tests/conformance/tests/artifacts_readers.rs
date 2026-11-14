@@ -404,6 +404,29 @@ fn a_step_up_is_refused_even_when_it_ends_inside_a_root() {
     }
 }
 
+/// A line feed at the end of a value is not part of the value to a shell that reads it with a
+/// command substitution, so a `..` before it is the value's last name, and a step up.
+#[test]
+fn a_step_up_before_a_final_line_feed_is_refused_by_the_shell_reader() {
+    for reader in readers()
+        .into_iter()
+        .filter(|reader| matches!(reader, Reader::Shell))
+    {
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        std::fs::create_dir(temporary.path().join("evidence")).expect("a folder");
+        let mut value =
+            spelled_for(reader, &temporary.path().join("evidence").join("..")).into_os_string();
+        value.push("\n");
+        let reading = reader.read(Some(value.as_os_str()), None);
+        assert_refused(
+            reader,
+            &reading,
+            "a path with a step up and a final line feed",
+            "steps up a directory",
+        );
+    }
+}
+
 #[test]
 fn a_relative_value_that_names_a_folder_under_the_working_directory_is_still_refused() {
     for reader in readers() {

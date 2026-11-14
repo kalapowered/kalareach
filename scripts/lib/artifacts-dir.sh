@@ -102,7 +102,10 @@ _kr_artifacts_confine() {
       ;;
   esac
   # A step up is looked for in the value as it was written: the conversion of a Windows path above
-  # settles a `..` by its text, so the converted value no longer shows it.
+  # settles a `..` by its text, so the converted value no longer shows it. The line feeds at its end
+  # are dropped as the substitution above dropped them from the converted one, so that a `..` before
+  # them is still the last name.
+  _kr_written="$(printf '%s' "$_kr_written")"
   case "$_kr_written" in [A-Za-z]:[\\/]*) _kr_written="${_kr_written//\\//}" ;; esac
   case "/$_kr_written/" in
     */../*)
