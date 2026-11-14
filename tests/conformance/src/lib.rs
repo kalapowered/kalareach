@@ -18,6 +18,7 @@ pub mod ignored;
 pub mod lane;
 pub mod libtest;
 pub mod map;
+pub mod observe;
 pub mod plan;
 pub mod report;
 pub mod run;

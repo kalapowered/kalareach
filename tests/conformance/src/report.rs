@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::Serialize;
 
@@ -24,6 +25,7 @@ use crate::identity::{self, Commit, PackageVersion, System, TerminalProfile, Too
 use crate::lane::{self, Part};
 use crate::libtest::Outcome as LibtestOutcome;
 use crate::map::{self, Binding, Declarations, Map, Place, Reference};
+use crate::observe::{self, Observed};
 use crate::plan::{self, ApplicationsPlan, Group, Platform};
 use crate::run::{self, Executed};
 use crate::runner_copy;
@@ -72,6 +74,10 @@ pub struct StepRecord {
     pub log: String,
     /// Why it could not be run or read.
     pub error: Option<String>,
+    /// The programs its log says could not be run, and what their files looked like when the
+    /// step ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Observed>,
 }
 
 /// One run of one test.
@@ -272,6 +278,29 @@ pub struct Summary {
     pub tests: Counts,
     /// Steps that did not exit 0 or could not be read.
     pub failed_steps: Vec<usize>,
+    /// The failed steps whose log names a program the system would not start, whose file
+    /// shows damage, and in whose log no test ran and failed.
+    pub failed_with_damage_seen: Vec<usize>,
+    /// The other failed steps.
+    pub failed_otherwise: Vec<usize>,
+}
+
+impl Summary {
+    /// The line that says how many failed steps carry an observation of a program that could
+    /// not be run with damage seen, and how many failed otherwise, when a step failed. It says
+    /// what was seen; the run fails whatever it says.
+    #[must_use]
+    pub fn failure_line(&self) -> Option<String> {
+        (!self.failed_steps.is_empty()).then(|| {
+            format!(
+                "{} failed steps: {} carry an observation of a program that could not be run with \
+                 damage seen, {} failed otherwise",
+                self.failed_steps.len(),
+                self.failed_with_damage_seen.len(),
+                self.failed_otherwise.len()
+            )
+        })
+    }
 }
 
 /// The result.
@@ -498,7 +527,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             step.what,
             step.line()
         ));
-        let done = run::execute(
+        let mut done = run::execute(
             step,
             index + 1,
             &run::Place {
@@ -509,6 +538,10 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             },
             &map.packages,
         );
+        if done.error.is_some() || done.exit != Some(0) {
+            done.observation =
+                observe::observe_log(&options.evidence.join(&done.log), SystemTime::now());
+        }
         progress(&format!(
             "  exit {} in {} s{}",
             done.exit
@@ -674,6 +707,13 @@ pub fn assemble(
         })
         .map(|(index, _)| index + 1)
         .collect();
+    (summary.failed_with_damage_seen, summary.failed_otherwise) =
+        summary.failed_steps.iter().partition(|step| {
+            executed[**step - 1]
+                .observation
+                .as_ref()
+                .is_some_and(Observed::damage_seen)
+        });
     let typescript = groups.contains(&Group::TypeScript) && options.platform != Platform::Windows;
     let mut toolchain = identity::toolchain(&options.root, typescript);
     for step in executed {
@@ -737,6 +777,7 @@ pub fn assemble(
                 seconds: step.seconds,
                 log: step.log.clone(),
                 error: step.error.clone(),
+                observation: step.observation.clone(),
             })
             .collect(),
         identifiers,
@@ -1105,7 +1146,26 @@ impl<'a> Resolver<'a> {
         let mut runs = Vec::new();
         for (index, binary) in self.ran.get(target).into_iter().flatten() {
             let step = &self.executed[*index].step;
-            let record = if let Some(problem) = &binary.problem {
+            let refused = self.executed[*index]
+                .observation
+                .as_ref()
+                .and_then(|observed| {
+                    observed.programs.iter().find(|program| {
+                        run::file_name(&program.path) == run::file_name(&binary.executable)
+                    })
+                });
+            let record = if let (Some(_), Some(program)) = (&binary.problem, refused) {
+                // The program was never started, so none of its tests ran.
+                RunRecord {
+                    step: index + 1,
+                    outcome: Outcome::NotRun,
+                    reason: Some(format!(
+                        "the program of {target} could not be started in this step: {}; {}",
+                        program.lines.first().map_or("", String::as_str),
+                        program.file
+                    )),
+                }
+            } else if let Some(problem) = &binary.problem {
                 RunRecord {
                     step: index + 1,
                     outcome: Outcome::Failed,

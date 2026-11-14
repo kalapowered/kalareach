@@ -290,6 +290,13 @@ fn run(
             "step {step} did not pass: {} (log {})",
             record.command, record.log
         );
+        for program in record
+            .observation
+            .iter()
+            .flat_map(|observed| &observed.programs)
+        {
+            println!("  could not run {}: {}", program.path, program.file);
+        }
     }
     for failure in &document.failures_outside_identifiers {
         println!("failed outside any identifier: {failure}");
@@ -303,6 +310,9 @@ fn run(
         }
     }
     println!("result: {}", path.display());
+    if let Some(line) = summary.failure_line() {
+        println!("{line}");
+    }
     if document.passed() {
         ExitCode::SUCCESS
     } else {
