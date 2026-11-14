@@ -877,14 +877,17 @@ mod tests {
         );
     }
 
-    /// A run whose work never finishes, with a standard error nobody reads, is held by neither:
-    /// the work waits for ever, the diagnostic's write stalls, and the run answers at the deadline,
-    /// waits the allowance after its answer for the line, and is through while the work and the
-    /// write are both still stalled. The bound the run sets itself, the deadline and the allowance
-    /// after the run's start, is inside the one-second timeout a session ending is given. How soon
-    /// after its bound the machine lets a run end is the machine's: it is not held against the run.
+    /// A run whose work never finishes, with a standard error nobody reads, is held by neither,
+    /// on the system's clock and with the system's wait: the work waits for ever, the diagnostic's
+    /// write stalls, and the run answers no earlier than the deadline, waits at least the allowance
+    /// after its answer for the line, and is through while the work and the write are both still
+    /// stalled. That the run is through by its bound and no later is held by the cases that give it
+    /// a clock of their own. The bound the run sets itself, the deadline and the allowance after
+    /// the run's start, is inside the one-second timeout a session ending is given. How soon after
+    /// its bound the machine lets a run end is the machine's: it is not held against the run.
     #[test]
-    fn a_run_that_waits_for_ever_and_whose_diagnostic_nobody_reads_ends_at_the_bound() {
+    fn a_run_that_waits_for_ever_and_whose_diagnostic_nobody_reads_is_through_while_both_still_wait()
+     {
         let (release_work, stalled_work) = std::sync::mpsc::channel::<()>();
         let (release_write, stalled_write) = std::sync::mpsc::channel::<()>();
         let work_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -937,6 +940,189 @@ mod tests {
             HOOK_DEADLINE + DIAGNOSTIC_ALLOWANCE < SESSION_END_TIMEOUT,
             "the bound is inside the one-second timeout of a session ending"
         );
+    }
+
+    /// How a run's work goes, for the cases that give a run a clock of their own.
+    #[derive(Clone, Copy)]
+    enum Work {
+        /// It never says anything: the run waits for it until its deadline.
+        NeverAnswers,
+        /// It fails at once.
+        FailsAtOnce,
+    }
+
+    /// How the write of a run's diagnostic goes.
+    #[derive(Clone, Copy)]
+    enum Write {
+        /// It never finishes.
+        Stalls,
+        /// It finishes at once.
+        Finishes,
+    }
+
+    /// What one run did on a clock that a case moves, as how long after the run's start.
+    struct OnMade {
+        ended: Duration,
+        answered: Duration,
+        /// Every moment its waits were asked to wait until.
+        asked: Vec<Duration>,
+        work_ended: bool,
+        write_ended: bool,
+    }
+
+    /// Runs `run_with` once on a clock that stands still until a wait runs out or the claim takes
+    /// time, with `work` and `write` going as given and the claim taking `claim_takes`. Nothing in
+    /// it waits for a duration: a stalled thread waits for the case to let it go, which is after the
+    /// run, and the run's waits are read off the clock.
+    fn on_made_clock(work: Work, write: Write, claim_takes: Duration) -> OnMade {
+        use crate::made::{Made, Wait};
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use std::sync::{Arc, mpsc};
+
+        let made = Made::new([
+            match work {
+                Work::NeverAnswers => Wait::RunsOut,
+                Work::FailsAtOnce => Wait::Message,
+            },
+            match write {
+                Write::Stalls => Wait::RunsOut,
+                Write::Finishes => Wait::Message,
+            },
+        ]);
+        let (release_work, stalled_work) = mpsc::channel::<()>();
+        let (release_write, stalled_write) = mpsc::channel::<()>();
+        let work_ended = Arc::new(AtomicBool::new(false));
+        let write_ended = Arc::new(AtomicBool::new(false));
+        let (work_ends, write_ends) = (Arc::clone(&work_ended), Arc::clone(&write_ended));
+        let answered = std::cell::Cell::new(None);
+        run_with(
+            made.start(),
+            move |_| match work {
+                Work::NeverAnswers => {
+                    // Waits until the case lets it go, which is after the run is through.
+                    let _ = stalled_work.recv_timeout(HUNG_WRITER);
+                    work_ends.store(true, SeqCst);
+                    Ok(())
+                }
+                Work::FailsAtOnce => Err("the input was not an event".to_owned()),
+            },
+            || made.pass(claim_takes),
+            || answered.set(Some(made.passed())),
+            move |_| {
+                if matches!(write, Write::Stalls) {
+                    // The write stalls too, until the case lets it go.
+                    let _ = stalled_write.recv_timeout(HUNG_WRITER);
+                }
+                write_ends.store(true, SeqCst);
+            },
+            || made.now(),
+            |channel, by| made.wait(channel, by),
+        );
+        let ran = OnMade {
+            ended: made.passed(),
+            answered: answered.get().expect("the answer is written"),
+            asked: made.asked(),
+            work_ended: work_ended.load(SeqCst),
+            write_ended: write_ended.load(SeqCst),
+        };
+        drop(release_work);
+        drop(release_write);
+        ran
+    }
+
+    /// What every run holds, whatever stalls: no wait it makes is asked to last past its bound,
+    /// which is the deadline, or the allowance after its answer when that came later; it is through
+    /// by then; and it is through at its bound when the write stalls, or at its answer when the
+    /// write finishes, with its work and its write still stalled when it was through.
+    fn assert_held_to_its_bound(ran: &OnMade, work: Work, write: Write) {
+        let bound = HOOK_DEADLINE.max(ran.answered + DIAGNOSTIC_ALLOWANCE);
+        assert!(
+            ran.asked.iter().all(|until| *until <= bound),
+            "a wait was asked to last past the bound {bound:?}: {:?}",
+            ran.asked
+        );
+        assert!(
+            ran.ended <= bound,
+            "the run ended at {:?}, past {bound:?}",
+            ran.ended
+        );
+        match write {
+            Write::Stalls => {
+                assert_eq!(
+                    ran.ended, bound,
+                    "a stalled write holds the run to its bound"
+                );
+                assert!(
+                    !ran.write_ended,
+                    "it was through while the write was stalled"
+                );
+            }
+            Write::Finishes => {
+                assert_eq!(
+                    ran.ended, ran.answered,
+                    "a write that finished holds nothing"
+                );
+            }
+        }
+        if matches!(work, Work::NeverAnswers) {
+            assert!(!ran.work_ended, "it was through while its work was stalled");
+            assert!(
+                ran.answered >= HOOK_DEADLINE,
+                "work that never finishes is answered no earlier than the deadline"
+            );
+        }
+    }
+
+    /// Work that never answers holds a run to its deadline, and no longer when the diagnostic is
+    /// written at once.
+    #[test]
+    fn a_run_whose_work_never_answers_is_through_at_the_deadline() {
+        let ran = on_made_clock(Work::NeverAnswers, Write::Finishes, Duration::ZERO);
+        assert_held_to_its_bound(&ran, Work::NeverAnswers, Write::Finishes);
+        assert_eq!(ran.ended, HOOK_DEADLINE);
+    }
+
+    /// A diagnostic whose write stalls holds a run that had its observation at once until the
+    /// deadline: the allowance after an answer that early ends before it.
+    #[test]
+    fn a_run_whose_diagnostic_write_stalls_is_through_at_the_deadline() {
+        let ran = on_made_clock(Work::FailsAtOnce, Write::Stalls, Duration::ZERO);
+        assert_held_to_its_bound(&ran, Work::FailsAtOnce, Write::Stalls);
+        assert_eq!(ran.ended, HOOK_DEADLINE);
+    }
+
+    /// Work that never answers and a write that stalls hold a run to the deadline and the allowance
+    /// after its start, and no longer.
+    #[test]
+    fn a_run_whose_work_never_answers_and_whose_write_stalls_is_through_at_the_deadline_and_the_allowance()
+     {
+        let ran = on_made_clock(Work::NeverAnswers, Write::Stalls, Duration::ZERO);
+        assert_held_to_its_bound(&ran, Work::NeverAnswers, Write::Stalls);
+        assert_eq!(ran.ended, HOOK_DEADLINE + DIAGNOSTIC_ALLOWANCE);
+    }
+
+    /// A claim that comes late moves the answer, and with it the bound: the run is through at the
+    /// allowance after its answer when that is later than the deadline, and no later, whichever
+    /// way its work and its write go.
+    #[test]
+    fn a_run_whose_claim_comes_late_is_through_at_the_allowance_after_its_answer_and_no_later() {
+        for claim in [100, 300, 450].map(Duration::from_millis) {
+            for work in [Work::NeverAnswers, Work::FailsAtOnce] {
+                for write in [Write::Stalls, Write::Finishes] {
+                    let ran = on_made_clock(work, write, claim);
+                    assert_held_to_its_bound(&ran, work, write);
+                    let work_waited = match work {
+                        Work::NeverAnswers => HOOK_DEADLINE,
+                        Work::FailsAtOnce => Duration::ZERO,
+                    };
+                    assert_eq!(
+                        ran.answered,
+                        work_waited + claim,
+                        "the answer follows the claim"
+                    );
+                }
+            }
+        }
     }
 
     /// A run whose work failed says why, with how long it had run when its answer was written.

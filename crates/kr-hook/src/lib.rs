@@ -34,6 +34,8 @@ pub mod gemini_cli;
 pub mod helper;
 pub mod hook;
 pub mod launch;
+#[cfg(test)]
+mod made;
 pub mod qoder_cli;
 pub mod registration;
 pub mod relay;
@@ -417,6 +419,48 @@ mod tests {
         drop(release);
         assert!(took >= Duration::from_millis(100), "{took:?}");
         assert!(took < Duration::from_secs(10), "{took:?}");
+    }
+
+    /// A write that stalls is waited for until the bound and no later, on the clock the wait is
+    /// given: no wait is asked to last past the bound, and the clock is where the bound is when the
+    /// caller goes on.
+    #[test]
+    fn a_write_that_stalls_is_waited_for_until_the_bound_on_the_waits_own_clock() {
+        use crate::made::{Made, Wait};
+
+        let made = Made::new([Wait::RunsOut]);
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let bound = Duration::from_millis(100);
+        write_by(
+            b"a line".to_vec(),
+            made.start() + bound,
+            move |_| {
+                let _ = stalled.recv_timeout(Duration::from_secs(30));
+            },
+            |channel, by| made.wait(channel, by),
+        );
+        drop(release);
+        assert!(
+            made.asked().iter().all(|until| *until <= bound),
+            "{:?}",
+            made.asked()
+        );
+        assert_eq!(made.passed(), bound);
+    }
+
+    /// A write that finishes takes no time on the wait's clock.
+    #[test]
+    fn a_write_that_finishes_takes_no_time_on_the_waits_own_clock() {
+        use crate::made::{Made, Wait};
+
+        let made = Made::new([Wait::Message]);
+        write_by(
+            b"a line".to_vec(),
+            made.start() + Duration::from_millis(100),
+            |_| {},
+            |channel, by| made.wait(channel, by),
+        );
+        assert_eq!(made.passed(), Duration::ZERO);
     }
 
     /// The control: a write that finishes is waited for, and gets the whole line.
