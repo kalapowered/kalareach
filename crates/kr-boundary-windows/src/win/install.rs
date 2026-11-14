@@ -7274,6 +7274,55 @@ mod tests {
         assert_eq!(Manifest::load(&run.paths.manifest).unwrap(), published);
     }
 
+    /// A refusal that a repair cannot put back where its creation of the service failed: the error
+    /// says the creation's failure and the failed save, `refused` stands in the run's manifest, and
+    /// the intent that the repair saved before the creation is still on the disk.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_refusal_that_cannot_be_put_back_says_the_creation_and_the_failed_save_and_leaves_the_intent()
+     {
+        let _one = ffi::locked(&FORCED);
+        let top = tempfile::tempdir().unwrap();
+        let mut run = unwritten_run(top.path(), true);
+        run.manifest
+            .conclude(ObjectKind::Service, SERVICE, Outcome::Refused);
+        assert!(run.manifest.drop_refusal(ObjectKind::Service, SERVICE));
+        run.save().unwrap();
+        let intent = run.manifest.clone();
+        crate::manifest::forced::fail_the_next("replacement");
+        let error = restore_refusal(
+            &mut run,
+            Error::Io {
+                what: "making the service".to_owned(),
+                source: io::Error::other("the platform's words"),
+            },
+        )
+        .to_string();
+        assert!(
+            error.contains("making the service: the platform's words"),
+            "{error}"
+        );
+        assert!(
+            error.contains("putting the refusal back in the record also failed"),
+            "{error}"
+        );
+        assert!(error.contains("a failure forced for a case"), "{error}");
+        assert_eq!(
+            run.manifest
+                .find(ObjectKind::Service, SERVICE)
+                .unwrap()
+                .outcome,
+            Some(Outcome::Refused)
+        );
+        // The disk after it still holds the intent: no outcome for the Service.
+        let on_disk = Manifest::load(&run.paths.manifest).unwrap();
+        assert_eq!(on_disk, intent);
+        assert_eq!(
+            on_disk.find(ObjectKind::Service, SERVICE).unwrap().outcome,
+            None
+        );
+    }
+
     /// The refusal of a service that stands at the broker's name, where the one save of its result
     /// fails: the error says the refusal and the failed save (not the save's error alone), and the
     /// result `refused` stands in the run's manifest, which a rollback acts on. A run before its
