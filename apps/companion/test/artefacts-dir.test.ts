@@ -54,9 +54,11 @@ describe('the evidence directory reader', () => {
   })
 
   it.each([
+    // `/tmp` is a root off Windows, whatever the temporary folder is, so a folder beside the
+    // temporary folder can lie inside it.
     [
       'a name that only begins like a root',
-      `${realpathSync.native(tmpdir())}foo${windows ? '\\' : '/'}evidence`,
+      windows ? `${realpathSync.native(tmpdir())}foo\\evidence` : '/tmpfoo/evidence',
       'not inside a temporary root'
     ],
     ['a relative value', 'evidence', 'not an absolute path'],
@@ -64,7 +66,7 @@ describe('the evidence directory reader', () => {
     ['an empty value', '', 'it is empty'],
     // Written out, because `join` would remove the step up before the reader saw it.
     ['a step up that ends inside a root', `${tmpdir()}/evidence/../evidence`, 'steps up a directory'],
-    ['the root itself', realpathSync.native(tmpdir()), 'not inside a temporary root']
+    ['the root itself', windows ? realpathSync.native(tmpdir()) : '/tmp', 'not inside a temporary root']
   ])('refuses %s', (_name, value, why) => {
     expect(() => read(value)).toThrow(/KR_TEST_ARTIFACTS_DIR.*temporary roots/s)
     expect(() => read(value)).toThrow(why)
