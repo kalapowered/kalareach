@@ -1168,9 +1168,12 @@ async fn a_notice_after_a_refusal_is_told_with_its_count() {
     rig.script
         .refuse(5, 1, Some(0), ErrorCode::PermissionDenied);
     rig.script.epoch_ended(5, 321);
-    let notice = rig
-        .event_where(|event| matches!(event, InputEvent::EpochEnded { .. }))
-        .await;
+    let told = rig.settled().await;
+    let notice = told
+        .iter()
+        .find(|event| matches!(event, InputEvent::EpochEnded { .. }))
+        .cloned()
+        .expect("the notice was told");
     assert_eq!(
         notice,
         InputEvent::EpochEnded {
@@ -1191,9 +1194,12 @@ async fn a_notice_for_an_older_epoch_is_told_without_sets() {
     rig.lane.try_send(&key(0)).expect("admitted");
     rig.lane.begin_epoch(epoch(6)).expect("a later epoch");
     rig.script.epoch_ended(5, 9);
-    let notice = rig
-        .event_where(|event| matches!(event, InputEvent::EpochEnded { .. }))
-        .await;
+    let told = rig.settled().await;
+    let notice = told
+        .iter()
+        .find(|event| matches!(event, InputEvent::EpochEnded { .. }))
+        .cloned()
+        .expect("the notice was told");
     assert_eq!(
         notice,
         InputEvent::EpochEnded {
@@ -1216,9 +1222,12 @@ async fn a_notice_is_told_when_every_frame_was_accepted() {
     }
     rig.accept_all(5, 2).await;
     rig.script.epoch_ended(5, 10);
-    let notice = rig
-        .event_where(|event| matches!(event, InputEvent::EpochEnded { .. }))
-        .await;
+    let told = rig.settled().await;
+    let notice = told
+        .iter()
+        .find(|event| matches!(event, InputEvent::EpochEnded { .. }))
+        .cloned()
+        .expect("the notice was told");
     assert_eq!(
         notice,
         InputEvent::EpochEnded {
@@ -1457,9 +1466,12 @@ async fn a_refusal_above_the_accepted_prefix_leaves_the_frames_between_uncertain
         .await;
     rig.script.accept(5, 0);
     rig.script.refuse(5, 3, Some(0), ErrorCode::LeaseLost);
-    let refused = rig
-        .event_where(|event| matches!(event, InputEvent::Refused { .. }))
-        .await;
+    let told = rig.settled().await;
+    let refused = told
+        .iter()
+        .find(|event| matches!(event, InputEvent::Refused { .. }))
+        .cloned()
+        .expect("the refusal was told");
     let InputEvent::Refused {
         sequence: first,
         accepted_through,
@@ -1640,6 +1652,12 @@ async fn the_window_outlives_the_epoch(answer: impl FnOnce(&Script)) {
     );
     assert_eq!(rig.script.frames().len(), 1);
     answer(&rig.script);
+    let mut told = rig.settled().await;
+    assert_eq!(
+        rig.sets().uncertain,
+        count(1, 5),
+        "the answer lifted the charge, so the new epoch's frame was written"
+    );
     rig.script
         .until("the new epoch's frame", |seen| seen.frames.len() >= 2)
         .await;
@@ -1648,7 +1666,7 @@ async fn the_window_outlives_the_epoch(answer: impl FnOnce(&Script)) {
         (frames[1].epoch, frames[1].sequence, frames[1].bytes.clone()),
         (6, 0, key(100))
     );
-    let mut told = rig.settled().await;
+    told.extend(rig.settled().await);
     while let Some(event) = rig.events.try_recv() {
         told.push(event);
     }
@@ -1686,7 +1704,7 @@ async fn the_byte_half_of_the_window_holds_the_lane_back() {
         rig.lane.try_send(&[b'x'; FLOOR_FRAME]).expect("admitted");
     }
     rig.script
-        .until("two frames", |seen| seen.frames.len() >= 2)
+        .until("a frame", |seen| !seen.frames.is_empty())
         .await;
     rig.settled().await;
     let two = 2 * FLOOR_FRAME as u64;
@@ -1697,9 +1715,6 @@ async fn the_byte_half_of_the_window_holds_the_lane_back() {
     );
     assert_eq!(rig.sets().unsent, count(2, two));
     rig.script.accept(5, 0);
-    rig.script
-        .until("a third frame", |seen| seen.frames.len() >= 3)
-        .await;
     rig.settled().await;
     assert_eq!(rig.sets().uncertain, count(2, two));
     assert_eq!(rig.sets().unsent, count(1, FLOOR_FRAME as u64));
@@ -1797,9 +1812,7 @@ async fn an_epoch_ends_while_the_writer_waits_for_room(how: EndsBy) {
         }
     }
     rig.script
-        .until("the new epoch's frame", |seen| {
-            seen.frames.iter().any(|frame| frame.epoch == 6)
-        })
+        .until("a frame", |seen| !seen.frames.is_empty())
         .await;
     assert_eq!(
         rig.script.frames(),
@@ -1917,18 +1930,21 @@ async fn finishing_the_lane_writes_every_frame_and_finishes_the_stream() {
         Err(InputRefusal::Over(Over::StreamEnded))
     );
     let mut accepted = 0;
-    while accepted < 5 {
+    loop {
         rig.script
-            .until("a frame to accept", |seen| seen.frames.len() > accepted)
+            .until("a frame to accept or the stream's end", |seen| {
+                seen.frames.len() > accepted || seen.finished_streams + seen.reset_streams >= 1
+            })
             .await;
+        if rig
+            .script
+            .seen(|seen| seen.finished_streams + seen.reset_streams >= 1)
+        {
+            break;
+        }
         rig.script.accept(5, accepted as u64);
         accepted += 1;
     }
-    rig.script
-        .until("the stream's end", |seen| {
-            seen.finished_streams + seen.reset_streams >= 1
-        })
-        .await;
     assert_eq!(
         rig.script.seen(|seen| seen.finished_streams),
         1,
@@ -2289,6 +2305,275 @@ async fn a_cut_never_falls_inside_the_start_delimiter() {
     assert!(rig.script.frames()[1].bytes.starts_with(PASTE_START));
 }
 
+/* ---------------------------------------------------------------------------------------- */
+/* The bound across epochs, the finish, the events                                            */
+/* ---------------------------------------------------------------------------------------- */
+
+/// The combined bound counts the frames of earlier epochs that the host has not answered: with one
+/// such frame standing, the next epoch admits one frame fewer than the bound, and the host's answer
+/// gives the room back.
+#[tokio::test]
+async fn the_bound_counts_the_unanswered_frames_of_an_older_epoch_once() {
+    let mut rig = rig(4).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.script
+        .until("the frame", |seen| !seen.frames.is_empty())
+        .await;
+    rig.lane.begin_epoch(epoch(6)).expect("a new epoch");
+    for number in 0..1_023_u64 {
+        rig.lane
+            .try_send(&key(number))
+            .expect("admitted within the bound");
+    }
+    assert_eq!(
+        rig.lane.try_send(&key(9)),
+        Err(InputRefusal::Full),
+        "one frame of epoch 5 still stands in the bound"
+    );
+    rig.script.accept(5, 0);
+    rig.settled().await;
+    rig.lane
+        .try_send(&key(9))
+        .expect("admitted once the older frame was answered");
+}
+
+/// Finishing ends a hold: its frames are counted unsent, a later release finds nothing to give, and
+/// the writer finishes the stream.
+#[tokio::test]
+async fn finishing_the_lane_ends_a_hold_and_reports_its_frames_unsent() {
+    let rig = rig(2).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.script
+        .until("the frame", |seen| !seen.frames.is_empty())
+        .await;
+    rig.lane.mark(Some(7)).expect("a barrier");
+    rig.lane.try_send(&key(1)).expect("held");
+    rig.lane.finish();
+    assert_eq!(
+        rig.lane.release_hold(7),
+        Count::default(),
+        "the hold is gone, so a release has nothing to give"
+    );
+    assert_eq!(rig.sets().unsent, count(1, 5));
+    rig.script
+        .until("the stream's end", |seen| {
+            seen.finished_streams + seen.reset_streams >= 1
+        })
+        .await;
+    assert_eq!(rig.script.seen(|seen| seen.finished_streams), 1);
+    assert_eq!(
+        rig.script.frames().len(),
+        1,
+        "the held frame was never written"
+    );
+}
+
+/// The queue of unread events does not grow with the number of keys: acceptances that nobody has
+/// read join into one event with their counts added up.
+#[tokio::test]
+async fn unread_acceptances_join_into_one_event_whatever_the_number_of_keys() {
+    let mut rig = rig(8).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    for number in 0..60_u64 {
+        rig.lane.try_send(&key(number)).expect("admitted");
+        rig.script
+            .until("the frame", |seen| seen.frames.len() > number as usize)
+            .await;
+        rig.script.accept(5, number);
+    }
+    // The lane has applied every acceptance, and the case has read none of the events.
+    within(async {
+        while rig.sets().accepted != count(60, 300) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let told = rig.settled().await;
+    let accepted: Vec<&InputEvent> = told
+        .iter()
+        .filter(|event| matches!(event, InputEvent::Accepted { .. }))
+        .collect();
+    assert_eq!(accepted.len(), 1, "{told:?}");
+    assert_eq!(
+        accepted[0],
+        &InputEvent::Accepted {
+            epoch: epoch(5),
+            through: sequence(59),
+            frames: 60,
+            bytes: 300,
+        }
+    );
+}
+
+/// The frames of an epoch that a notice ended are answered late, as a host does after a takeover:
+/// the answer lifts their charge from the window, and the next epoch's frame is written.
+async fn an_ended_epochs_late_answer_lifts_its_charge(answer: impl FnOnce(&Script)) {
+    let mut rig = rig(2).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.lane.try_send(&key(1)).expect("admitted");
+    rig.script
+        .until("both frames", |seen| seen.frames.len() >= 2)
+        .await;
+    rig.script.epoch_ended(5, 0);
+    rig.settled().await;
+    answer(&rig.script);
+    rig.settled().await;
+    rig.lane.begin_epoch(epoch(6)).expect("a new epoch");
+    rig.lane
+        .try_send(&key(100))
+        .expect("admitted under epoch 6");
+    rig.settled().await;
+    assert_eq!(
+        rig.sets().uncertain,
+        count(1, 5),
+        "the late answer lifted the charge, so the new epoch's frame was written"
+    );
+    rig.script
+        .until("the new epoch's frame", |seen| seen.frames.len() >= 3)
+        .await;
+    let frames = rig.script.frames();
+    assert_eq!(
+        (frames[2].epoch, frames[2].sequence, frames[2].bytes.clone()),
+        (6, 0, key(100))
+    );
+}
+
+#[tokio::test]
+async fn an_ended_epochs_late_acceptance_lifts_its_charge() {
+    an_ended_epochs_late_answer_lifts_its_charge(|script| script.accept(5, 1)).await;
+}
+
+#[tokio::test]
+async fn an_ended_epochs_late_refusal_lifts_its_charge() {
+    an_ended_epochs_late_answer_lifts_its_charge(|script| {
+        script.refuse(5, 0, None, ErrorCode::LeaseLost);
+    })
+    .await;
+}
+
+/// The lane keeps eight notices for epochs it has not begun, and breaks the contract at the ninth.
+#[tokio::test]
+async fn the_lane_keeps_eight_notices_for_epochs_not_begun_and_breaks_at_the_ninth() {
+    let mut rig = rig(2).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    for ahead in 6..14 {
+        rig.script.epoch_ended(ahead, 0);
+    }
+    assert!(
+        rig.settled().await.is_empty(),
+        "eight notices are kept and none is told yet"
+    );
+    rig.script.epoch_ended(14, 0);
+    let ended = rig.ended_by_breach().await;
+    assert!(
+        matches!(
+            ended,
+            InputEvent::Ended {
+                cause: EndCause::Breach(_),
+                ..
+            }
+        ),
+        "{ended:?}"
+    );
+}
+
+/// A refusal's accepted prefix reaches a barrier that names exactly that prefix.
+#[tokio::test]
+async fn a_barrier_that_the_refusals_accepted_prefix_covers_is_reached() {
+    let mut rig = rig(8).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.lane.try_send(&key(1)).expect("admitted");
+    let barrier = rig.lane.mark(Some(7)).expect("a barrier");
+    assert_eq!(barrier.count.get(), 2);
+    rig.lane.try_send(&key(2)).expect("held");
+    rig.script.marker(7);
+    rig.script
+        .until("three frames", |seen| seen.frames.len() >= 3)
+        .await;
+    rig.script.refuse(5, 2, Some(1), ErrorCode::LeaseLost);
+    let told = rig.settled().await;
+    assert!(
+        told.contains(&InputEvent::Reached(barrier)),
+        "the prefix of the refusal covers the barrier: {told:?}"
+    );
+    assert!(
+        !told
+            .iter()
+            .any(|event| matches!(event, InputEvent::NotReached { .. })),
+        "{told:?}"
+    );
+}
+
+/// The stream is lost with the connection before the session has recorded the connection's end: the
+/// lane waits for that record and ends with what the connection ended with.
+#[tokio::test]
+async fn a_stream_lost_with_the_connection_waits_for_the_sessions_record_of_the_end() {
+    let mut rig = rig(2).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.script
+        .until("the frame", |seen| !seen.frames.is_empty())
+        .await;
+    rig.session.transport().revoke_streams();
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rig.events.try_recv().is_none(),
+        "the lane waits for the session's record before it says why the stream ended"
+    );
+    rig.script
+        .control_out
+        .send(answer(
+            RequestId::new(0),
+            Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the connection was withdrawn",
+            )),
+        ))
+        .expect("the control stream's writer");
+    let event = rig
+        .event_where(|event| matches!(event, InputEvent::Ended { .. }))
+        .await;
+    let InputEvent::Ended {
+        cause: EndCause::Connection {
+            refusal: Some(refusal),
+        },
+        ..
+    } = event
+    else {
+        panic!("the connection's end with the host's refusal, not {event:?}");
+    };
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+}
+
+/// The most paste the lane says an empty lane certainly admits is admitted whole when every cut
+/// loses the most it can to a delimiter.
+#[tokio::test]
+async fn the_paste_capacity_is_admitted_whole_when_every_cut_loses_the_most() {
+    let rig = floor_rig().await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    let each = FLOOR_FRAME - (PASTE_START.len() - 1);
+    let capacity = rig.lane.paste_capacity();
+    let mut paste = vec![b'a'; each.min(capacity)];
+    while paste.len() < capacity {
+        paste.extend_from_slice(PASTE_START);
+        let room = capacity - paste.len();
+        paste.extend(std::iter::repeat_n(
+            b'a',
+            (each - PASTE_START.len()).min(room),
+        ));
+    }
+    paste.truncate(capacity);
+    rig.lane
+        .try_send_paste(&paste)
+        .expect("the capacity is admitted whole");
+}
+
 /// What a hold's end counts and what nothing releases afterwards, four ways, each with the two
 /// sequences that make the fault visible. After any ending, neither the caller's release nor the
 /// launch's late marker writes a key that was held, whatever epoch is current.
@@ -2462,13 +2747,51 @@ async fn nothing_is_marked_without_a_live_epoch() {
 
 mod local {
     use super::*;
+    use kr_protocol::envelope::ActionTarget;
     use kr_protocol::input::{InputContent, InputWriteParams, InputWriteResult};
+    use kr_protocol::scalars::DurationMs;
 
-    /// What the scripted local host did, in the order it did it.
-    #[derive(Default)]
-    struct Ledger {
-        order: Vec<String>,
-        writes: Vec<(u64, u64, Vec<u8>)>,
+    #[derive(serde::Serialize)]
+    struct Empty {}
+
+    /// A real mutation composed on this session, as a release, a detach or a launch is.
+    async fn request_of(session: &Session, number: u8) -> kr_client::session::ComposedMutation {
+        session
+            .compose(
+                Method::SessionCreate,
+                kr_protocol::ids::ActionId::new(Uuid::from_bytes([number; 16])),
+                ActionTarget::environment(environment()),
+                None,
+                &Empty {},
+                &Empty {},
+                DurationMs::new(120_000),
+            )
+            .await
+            .expect("composed")
+    }
+
+    /// Queues a real request behind the lane's typing.
+    async fn queue_request(
+        lane: &InputLane,
+        session: &Arc<Session>,
+        number: u8,
+    ) -> tokio::sync::oneshot::Receiver<kr_client::Result<kr_client::Settled>> {
+        let composed = request_of(session, number).await;
+        let sender = Arc::clone(session);
+        lane.after_keys(move || async move { sender.send_written(&composed).await })
+            .expect("queued")
+    }
+
+    /// What a frame the client wrote is, and the request identifier the host answers it by.
+    fn labelled(frame: &ControlFrame) -> (String, RequestId) {
+        match frame {
+            ControlFrame::Request(request) => {
+                let params: InputWriteParams = request.params.to_typed().expect("input.write");
+                (format!("key{}", params.sequence.get()), request.request_id)
+            }
+            ControlFrame::Mutation(mutation) => ("request".to_owned(), mutation.request_id),
+            _ => panic!("a frame the lane never writes"),
+        }
     }
 
     /// A transport to a host on this machine: no data streams, one connection, requests answered by
@@ -2492,6 +2815,30 @@ mod local {
                 incoming: Mutex::new(Some(incoming)),
                 claimed: AtomicBool::new(false),
             })
+        }
+
+        /// Waits for the next frame of any kind that the client wrote, as the host reads it.
+        async fn next_frame_within(&self, limit: Duration) -> Option<ControlFrame> {
+            tokio::time::timeout(limit, async {
+                loop {
+                    let changed = self.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if let Some(frame) = self.sent.lock().expect("sent").pop_front() {
+                        return frame;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .ok()
+        }
+
+        /// The host answers a mutation it read.
+        fn answer_mutation(&self, request_id: RequestId) {
+            self.words
+                .send(answer(request_id, typed(&Empty {})))
+                .expect("the reader");
         }
 
         /// Waits for the next request the client wrote, as the host reads it.
@@ -2588,11 +2935,22 @@ mod local {
         fn close(&self) {}
     }
 
-    async fn local_lane(states_input_lane: bool) -> (Arc<Socket>, Session, InputLane, InputEvents) {
+    async fn local_lane(
+        states_input_lane: bool,
+    ) -> (Arc<Socket>, Arc<Session>, InputLane, InputEvents) {
+        local_lane_with(states_input_lane, &ManualDeadlines::new()).await
+    }
+
+    async fn local_lane_with(
+        states_input_lane: bool,
+        deadlines: &Arc<ManualDeadlines>,
+    ) -> (Arc<Socket>, Arc<Session>, InputLane, InputEvents) {
         let socket = Socket::new();
-        let session =
-            Session::start(Arc::clone(&socket) as Arc<dyn ControlTransport>).expect("a session");
+        let session = Arc::new(
+            Session::start(Arc::clone(&socket) as Arc<dyn ControlTransport>).expect("a session"),
+        );
         let target = InputTarget::new(environment(), session_id(), attachment())
+            .bounded_by(deadlines.clone())
             .worker_states_input_lane(states_input_lane);
         let lane = within(session.input_lane(target)).await.expect("a lane");
         let events = lane.events().expect("events");
@@ -2639,23 +2997,15 @@ mod local {
         session.close();
     }
 
-    /// A request that must follow the typing runs once every earlier key is answered and before any
-    /// later one is written.
+    /// A request that must follow the typing is written after every earlier key and before any later
+    /// one, by the lane, and the next key is written without waiting for the host's answer to it.
     #[tokio::test]
     async fn ordered_work_runs_behind_earlier_keys_and_ahead_of_later_ones() {
         let (socket, session, lane, mut events) = local_lane(true).await;
         assert!(lane.fenced_report(), "the worker states the input lane");
         lane.begin_epoch(epoch(5)).expect("an epoch");
-        let ledger = Arc::new(Mutex::new(Ledger::default()));
         lane.try_send(&key(0)).expect("admitted");
-        let note = Arc::clone(&ledger);
-        let answer = lane
-            .after_keys(move |sent| async move {
-                note.lock().expect("ledger").order.push("launch".to_owned());
-                sent.sent();
-                7_u32
-            })
-            .expect("queued");
+        let answer = queue_request(&lane, &session, 1).await;
         lane.try_send(&key(1)).expect("admitted");
         let barrier = lane.mark(Some(1)).expect("a barrier");
         assert_eq!(barrier.count.get(), 2, "a local launch holds nothing");
@@ -2665,28 +3015,29 @@ mod local {
             Some(sequence(2)),
             "later typing is sequenced at once"
         );
-        for number in 0..3_u64 {
-            let (request, params) = socket.next_write().await;
-            ledger.lock().expect("ledger").writes.push((
-                params.sequence.get(),
-                number,
-                params.input_bytes(),
-            ));
-            ledger
-                .lock()
-                .expect("ledger")
-                .order
-                .push(format!("key{}", params.sequence.get()));
-            socket.accept(request);
-            event(&mut events).await;
+        let mut order = Vec::new();
+        let mut asked = None;
+        for _ in 0..4 {
+            let frame = socket
+                .next_frame_within(Duration::from_secs(5))
+                .await
+                .expect("the next frame reaches the socket while the request waits for its answer");
+            let (label, request_id) = labelled(&frame);
+            order.push(label);
+            if matches!(frame, ControlFrame::Mutation(_)) {
+                asked = Some(request_id);
+            } else {
+                socket.accept(request_id);
+                event(&mut events).await;
+            }
         }
-        let order = ledger.lock().expect("ledger").order.clone();
-        assert_eq!(order, ["key0", "launch", "key1", "key2"]);
-        assert_eq!(
-            within(answer).await,
-            Ok(7),
-            "the answer comes back on a channel"
-        );
+        assert_eq!(order, ["key0", "request", "key1", "key2"]);
+        socket.answer_mutation(asked.expect("the request was written"));
+        let settled = within(answer)
+            .await
+            .expect("the channel stays open until the answer")
+            .expect("the host answered");
+        assert!(matches!(settled, kr_client::Settled::Result(_)));
         session.close();
     }
 
@@ -2813,57 +3164,107 @@ mod local {
         let (socket, session, lane, mut events) = local_lane(false).await;
         lane.begin_epoch(epoch(5)).expect("an epoch");
         lane.try_send(&key(0)).expect("admitted");
-        let ran = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&ran);
-        let first = lane
-            .after_keys(move |sent| async move {
-                flag.store(true, Ordering::SeqCst);
-                sent.sent();
-            })
-            .expect("queued");
+        let first = queue_request(&lane, &session, 1).await;
         let (request, _) = socket.next_write().await;
         socket.refuse(request, ProtocolError::new(ErrorCode::LeaseLost, "lost"));
         let refused = event(&mut events).await;
         assert!(matches!(refused, InputEvent::Refused { .. }), "{refused:?}");
-        within(first).await.expect("the request ran");
-        assert!(ran.load(Ordering::SeqCst));
-        let second = lane
-            .after_keys(|sent| async move {
-                sent.sent();
-            })
-            .expect("a request can be queued after the refusal");
-        within(second).await.expect("the second request ran");
+        let frame = socket
+            .next_frame_within(Duration::from_secs(5))
+            .await
+            .expect("the queued request was still sent after the refusal");
+        let (label, id) = labelled(&frame);
+        assert_eq!(label, "request");
+        socket.answer_mutation(id);
+        within(first)
+            .await
+            .expect("the channel stays open")
+            .expect("answered");
+        let second = queue_request(&lane, &session, 2).await;
+        let frame = socket
+            .next_frame_within(Duration::from_secs(5))
+            .await
+            .expect("a request queued after the refusal is sent");
+        socket.answer_mutation(labelled(&frame).1);
+        within(second)
+            .await
+            .expect("the channel stays open")
+            .expect("answered");
         session.close();
     }
 
-    /// A request that is on the connection lets the next key go: a launch holds no later typing
-    /// while it waits for its answer.
+    /// A lane that ends before a queued request's turn never sends it, and its caller is told so at
+    /// once, so that it can send its own ending request.
     #[tokio::test]
-    async fn a_request_that_is_sent_holds_no_later_key_for_its_answer() {
+    async fn a_request_the_lane_never_sent_is_withheld_when_the_lane_ends() {
         let (socket, session, lane, mut events) = local_lane(false).await;
         lane.begin_epoch(epoch(5)).expect("an epoch");
-        let (finish, finished) = tokio::sync::oneshot::channel::<u32>();
-        let answer = lane
-            .after_keys(move |sent| async move {
-                sent.sent();
-                finished.await.unwrap_or(0)
-            })
-            .expect("queued");
         lane.try_send(&key(0)).expect("admitted");
-        let (request, params) = socket.next_write().await;
-        assert_eq!(
-            params.input_bytes(),
-            key(0),
-            "the key is written while the request waits for its answer"
+        let queued = queue_request(&lane, &session, 1).await;
+        let (request, _) = socket.next_write().await;
+        socket.refuse(
+            request,
+            ProtocolError::new(ErrorCode::UnsupportedCapability, "no"),
         );
+        let ended = event(&mut events).await;
+        assert!(
+            matches!(
+                ended,
+                InputEvent::Ended {
+                    cause: EndCause::Uncertain(_),
+                    ..
+                }
+            ),
+            "{ended:?}"
+        );
+        let resolved = tokio::time::timeout(Duration::from_secs(5), queued).await;
+        assert!(
+            resolved.is_ok(),
+            "the request's channel resolves when the lane ends"
+        );
+        assert!(
+            matches!(resolved, Ok(Ok(Err(ClientError::Withheld)))),
+            "{resolved:?}"
+        );
+        assert!(
+            socket.sent.lock().expect("sent").is_empty(),
+            "the request was never written"
+        );
+        session.close();
+    }
+
+    /// A local lane takes no barrier: a mark waits for nothing and tells nothing of one, and the mark
+    /// of an ending still ends the typing.
+    #[tokio::test]
+    async fn a_local_mark_waits_for_nothing() {
+        let deadlines = ManualDeadlines::new();
+        let (socket, session, lane, mut events) = local_lane_with(false, &deadlines).await;
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        lane.try_send(&key(0)).expect("admitted");
+        let barrier = lane.mark(Some(1)).expect("a barrier");
+        assert_eq!(barrier.count.get(), 1);
+        assert_eq!(
+            deadlines.armed(DeadlineKind::Admission),
+            0,
+            "a local mark starts no wait"
+        );
+        let (request, _) = socket.next_write().await;
         socket.accept(request);
         let accepted = event(&mut events).await;
         assert!(
             matches!(accepted, InputEvent::Accepted { .. }),
             "{accepted:?}"
         );
-        finish.send(9).expect("the request waits");
-        assert_eq!(within(answer).await, Ok(9));
+        lane.mark(None).expect("the mark of an ending");
+        assert_eq!(
+            lane.try_send(&key(1)),
+            Err(InputRefusal::Ending),
+            "the mark of an ending still ends the typing"
+        );
+        assert!(
+            events.try_recv().is_none(),
+            "a local mark tells nothing of a barrier"
+        );
         session.close();
     }
 
@@ -2873,22 +3274,11 @@ mod local {
         let rig = rig(2).await;
         rig.lane.begin_epoch(epoch(5)).expect("an epoch");
         assert_eq!(
-            rig.lane.after_keys(|_| async {}).err(),
+            rig.lane
+                .after_keys(|| async { Err(ClientError::ConnectionEnded) })
+                .err(),
             Some(InputRefusal::NotLocal)
         );
         assert!(!rig.lane.fenced_report(), "a paired host sets it itself");
-    }
-
-    trait InputBytes {
-        fn input_bytes(&self) -> Vec<u8>;
-    }
-
-    impl InputBytes for InputWriteParams {
-        fn input_bytes(&self) -> Vec<u8> {
-            match &self.input {
-                InputContent::Bytes { bytes } => bytes.as_slice().to_vec(),
-                InputContent::ConsoleKeys { .. } => Vec::new(),
-            }
-        }
     }
 }

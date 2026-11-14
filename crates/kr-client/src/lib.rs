@@ -80,7 +80,7 @@ pub mod viewport;
 mod wss;
 
 pub use error::{ClientError, Result};
-pub use session::{LaunchCommandsRead, LaunchSurfaceRead, Session, Settled};
+pub use session::{Answering, LaunchCommandsRead, LaunchSurfaceRead, Session, Settled};
 pub use shown::{IoFault, Plain, Said, Shown};
 // The proxy a login is for and the login the daemon is given, which the command line names
 // through this crate and not through the transport's.
