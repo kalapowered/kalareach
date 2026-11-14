@@ -590,6 +590,22 @@ fn a_service_that_a_new_installation_refused_is_acted_on_by_neither_tree() {
         again.find(ObjectKind::Service, SERVICE).unwrap().outcome,
         Some(Outcome::Refused)
     );
+    // A repair's `found` never replaces `refused`, and only a `made` of its own does.
+    manifest.conclude(ObjectKind::Service, SERVICE, Outcome::Found);
+    assert_eq!(
+        manifest.find(ObjectKind::Service, SERVICE).unwrap().outcome,
+        Some(Outcome::Refused)
+    );
+    manifest.conclude(ObjectKind::Service, SERVICE, Outcome::Made);
+    assert_eq!(
+        manifest.find(ObjectKind::Service, SERVICE).unwrap().outcome,
+        Some(Outcome::Made)
+    );
+    manifest.conclude(ObjectKind::Service, SERVICE, Outcome::Refused);
+    assert_eq!(
+        manifest.find(ObjectKind::Service, SERVICE).unwrap().outcome,
+        Some(Outcome::Made)
+    );
     // The same service as a repair found and used it is acted on by the removal.
     let mut repair = Manifest::begin();
     repair.record(ObjectKind::Service, SERVICE, None);

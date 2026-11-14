@@ -4641,7 +4641,18 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     let broker_service = manager.open(SERVICE)?;
     // A new installation does not take over a service that stands at the broker's name: it ends at
     // this first look, before any call that changes the service (the stop below is a repair's).
-    if broker_service.is_some() && !existing {
+    // A service that an earlier run refused is refused again by a repair that finds one standing,
+    // so that a repair never takes over what a new installation refused; where none stands, the
+    // repair goes on and its own creation records `made`. The refusal is recorded as the service
+    // step records it, before the return, so that the record that a failed rollback leaves names
+    // the service as one that no tree acts on.
+    let refused_before = run
+        .manifest
+        .find(ObjectKind::Service, SERVICE)
+        .is_some_and(|object| object.outcome == Some(Outcome::Refused));
+    if broker_service.is_some() && (!existing || refused_before) {
+        run.record(ObjectKind::Service, SERVICE, None)?;
+        run.conclude(ObjectKind::Service, SERVICE, Outcome::Refused)?;
         return Err(refused_service());
     }
     // A repair has no rollback: the broker is said to stay stopped only where a read of its service
@@ -4807,7 +4818,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     // A new installation does not take over a service that stood there: it ends, and the rollback
     // leaves the service as it was. A repair finds the service that the manifest lists.
     let broker_service = match manager.open(SERVICE)? {
-        Some(service) if existing => {
+        Some(service) if existing && !refused_before => {
             run.conclude(ObjectKind::Service, SERVICE, Outcome::Found)?;
             service
         }
