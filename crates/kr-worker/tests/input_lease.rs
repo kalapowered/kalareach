@@ -2470,11 +2470,14 @@ async fn the_answers_a_writer_has_written_leave_their_share_free_for_the_next_se
         runtime.flush_input();
     }
     until_the_room_holds(&room, kr_worker::input_room::Cost::default()).await;
-    assert_eq!(
-        room.held_replies(),
-        0,
-        "the places of the answers the writer wrote are given back"
-    );
+    // The writer gives back the entries, the bytes and the answers' places in separate steps.
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while room.held_replies() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the places of the answers the writer wrote are given back");
 
     {
         clock.advance(Duration::from_secs(1));
@@ -2636,6 +2639,56 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
             written()
         )
     });
+}
+
+/// KR-REQ-08.48 and KR-REQ-08.49: an answer that waits in the lane for room is dropped at its own
+/// deadline, and the drop is recorded, though room never comes back and nothing else happens.
+///
+/// The share of the host's answers is full and the writer holds all of them, so room does not
+/// return. One more answer waits in the lane. Its deadline passes with no output from the
+/// application, no key from a person, and no write from the writer: nothing but the clock moves.
+/// The answer must not wait on past its deadline with no record of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_waits_for_room_is_dropped_at_its_deadline_with_nothing_else_happening() {
+    let (_host, runtime, clock, _session_id, _holder, _epoch) = silent_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let (writer_stopped, _release_writer) = runtime.input().writer_hold().arm();
+
+    {
+        let mut session = runtime.session();
+        session.ingest_output(&STATUS_QUESTION.repeat(256));
+        runtime.flush_input();
+        clock.advance(Duration::from_secs(1));
+        session.ingest_output(STATUS_QUESTION);
+    }
+    tokio::time::timeout(Duration::from_secs(20), writer_stopped)
+        .await
+        .expect("the writer takes the first batch")
+        .expect("the writer's stop fires");
+    {
+        let session = runtime.session();
+        assert!(
+            session.engine().replies_pending(),
+            "the 257th answer waits in the lane for room"
+        );
+        assert_eq!(session.engine().replies_expired(), 0);
+    }
+
+    // Two seconds and a little more after the answer was offered.
+    clock.advance(Duration::from_millis(2_100));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.session().engine().replies_expired() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the answer is dropped at its deadline, and the drop is recorded");
+    let session = runtime.session();
+    assert_eq!(session.engine().replies_expired(), 1);
+    assert!(
+        !session.engine().replies_pending(),
+        "an answer past its deadline is not kept"
+    );
 }
 
 /// KR-REQ-08.49: a terminal that refuses a write ends the writer, and what the writer leaves
