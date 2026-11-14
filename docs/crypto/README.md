@@ -616,8 +616,10 @@ as they are, and a build that does not reproduce them is the build that is wrong
 | `wycheproof/` | The X25519, Ed25519 and XChaCha20-Poly1305 files of the Wycheproof project at a named commit, unchanged and with their Apache License 2.0 text, and `ed25519-verdicts.json`, libsodium's verdict on each Ed25519 case |
 
 libsodium picks its ChaCha20 and Salsa20 code by the processor and then by the length of the call. The
-release's widest loop takes 512 bytes at a time, and the AVX-512 code in the stable branch's snapshot, which
-upstream's Windows prebuilt holds, takes 1,024. A test that stops below those lengths never reaches that code,
+release's widest loop takes 512 bytes at a time. The stable branch's snapshot also has AVX-512 code, which takes
+1,024, and the tag's archive that the jobs' Windows builds link holds none of it: only an MSVC build that links the
+snapshot, which is one whose environment names no placed archive directory (see [Release manifest](#release-manifest)),
+reaches it. A test that stops below those lengths never reaches that code,
 and a round trip cannot find a wrong keystream, because the same keystream takes off what it put on. The cipher cases therefore run up to a mebibyte and compare the whole
 sealed output. The tests that read these files are in `crates/kr-crypto/src/sodium/`.
 
