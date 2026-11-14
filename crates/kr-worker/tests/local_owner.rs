@@ -66,7 +66,7 @@ use kr_protocol::root::{
 };
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{
-    ClosureReason, Dimensions, DisplayNumber, SessionReadParams, SessionReadResult, ShellMode,
+    Dimensions, DisplayNumber, SessionReadParams, SessionReadResult, ShellMode,
 };
 use kr_protocol::worker::{AuthorityRevisionNotice, MAX_REVISION_REACH_NAMES, RevisionReach};
 use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
@@ -1213,11 +1213,14 @@ impl Wired {
         .await;
     }
 
+    /// Ends what this fixture started: asks for the session's close where the shell does not end
+    /// with the session, and stops the task that serves the bridge.
+    ///
+    /// The close is not waited for. On Windows the shell ends with the job that holds it when the
+    /// session is dropped, and a close would keep the session's journal open through its grace
+    /// period and its drain, longer than the removal of the directory is tried again.
     fn close(&self) {
-        self.runtime
-            .close(ClosureReason::CloseRequested)
-            .1
-            .release();
+        drop(kr_worker::testing::ClosedOnDrop::of(&self.runtime));
         if let Some((_, serving)) = self.bridge.as_ref() {
             serving.abort();
         }
