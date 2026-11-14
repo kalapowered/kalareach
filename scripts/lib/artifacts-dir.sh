@@ -20,27 +20,46 @@
 # is resolved through its links as the platform resolves it (/tmp is /private/tmp on macOS), and so
 # is the part of the value that exists, so a link inside a root that leads out of it is refused and
 # a root that is itself behind a link is honoured. A value is compared with a root by path
-# components, never by text: /tmpfoo is not inside /tmp. A relative value, an empty value and a
-# value with a `..` in it are refused, and so is a root itself.
+# components, never by text: /tmpfoo is not inside /tmp. On Windows the comparison ignores letter
+# case. A relative value, an empty value and a value with a `..` in it are refused, and so is a
+# root itself.
 #
 # Where the variable is not set, the run makes a directory of its own under the temporary folder
 # (readable by this account only) and says where it is on standard error.
 
+# Succeeds on Windows (Git Bash), where a name is the same in any letter case.
+_kr_artifacts_windows() {
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) return 0 ;;
+  esac
+  return 1
+}
+
+# Prints $1 as it is compared with a root: in lower case on Windows, as it is.
+_kr_artifacts_fold() {
+  if _kr_artifacts_windows; then
+    printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]'
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 # Prints each temporary root that exists, resolved through its links, one to a line.
 _kr_artifacts_roots() {
-  local _kr_candidate _kr_real _kr_windows=0
+  local _kr_candidate _kr_real _kr_windows=0 _kr_seen=$'\n'
   local _kr_named=(/tmp "${TMPDIR:-}" "${RUNNER_TEMP:-}")
-  case "$(uname -s)" in
-    MINGW* | MSYS* | CYGWIN*)
-      _kr_windows=1
-      _kr_named+=("${TEMP:-}")
-      ;;
-  esac
+  if _kr_artifacts_windows; then
+    _kr_windows=1
+    _kr_named+=("${TEMP:-}")
+  fi
   for _kr_candidate in "${_kr_named[@]}"; do
     [ "$_kr_windows" = 1 ] && _kr_candidate="$(_kr_artifacts_posix "$_kr_candidate")"
     case "$_kr_candidate" in /*) ;; *) continue ;; esac
     _kr_real="$(cd -P -- "$_kr_candidate" 2>/dev/null && pwd -P)" || continue
     if [ -n "$_kr_real" ] && [ "$_kr_real" != / ]; then
+      # Two names for one folder (/tmp and the folder TMPDIR names) are one root.
+      case "$_kr_seen" in *$'\n'"$_kr_real"$'\n'*) continue ;; esac
+      _kr_seen="$_kr_seen$_kr_real"$'\n'
       printf '%s\n' "$_kr_real"
     fi
   done
@@ -65,7 +84,7 @@ _kr_artifacts_refuse() {
 
 # Prints the real path of $1 when it is inside a temporary root; else says why not and returns 1.
 _kr_artifacts_confine() {
-  local _kr_value="$1" _kr_probe _kr_rest="" _kr_real _kr_root _kr_inside=0
+  local _kr_value="$1" _kr_probe _kr_rest="" _kr_real _kr_real_folded _kr_root _kr_inside=0
   _kr_value="$(_kr_artifacts_posix "$_kr_value")"
   if [ -z "$_kr_value" ]; then
     _kr_artifacts_refuse "$1" "it is empty"
@@ -106,9 +125,10 @@ _kr_artifacts_confine() {
   }
   [ "$_kr_real" = / ] && _kr_real=""
   _kr_real="$_kr_real$_kr_rest"
+  _kr_real_folded="$(_kr_artifacts_fold "$_kr_real")"
   while IFS= read -r _kr_root; do
-    case "$_kr_real" in
-      "$_kr_root"/*) _kr_inside=1 ;;
+    case "$_kr_real_folded" in
+      "$(_kr_artifacts_fold "$_kr_root")"/*) _kr_inside=1 ;;
     esac
   done < <(_kr_artifacts_roots)
   if [ "$_kr_inside" != 1 ]; then

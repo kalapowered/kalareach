@@ -64,9 +64,48 @@ fn powershell() -> Option<&'static str> {
     None
 }
 
+/// The program that runs the shell reader: `bash` on Unix, and Git's own `bash.exe` on Windows,
+/// where the `bash` on the path may be the Linux subsystem's launcher. `None` where Git Bash is not
+/// installed and the run is not a hosted one; a hosted run has it, so there its absence fails.
+fn shell() -> Option<PathBuf> {
+    if cfg!(unix) {
+        return Some(PathBuf::from("bash"));
+    }
+    let found = ["ProgramFiles", "ProgramW6432"]
+        .iter()
+        .filter_map(|name| std::env::var_os(name))
+        .map(|folder| PathBuf::from(folder).join(r"Git\bin\bash.exe"))
+        .find(|path| path.is_file());
+    assert!(
+        found.is_some() || std::env::var_os("CI").is_none(),
+        "a hosted run has Git Bash, and none was found"
+    );
+    if found.is_none() {
+        eprintln!("no Git Bash is installed here: the shell reader's cases are not run");
+    }
+    found
+}
+
+/// A path Git Bash printed (`/c/Users/x`) as Windows writes it (`C:\Users\x`); a path of any other
+/// form, and every path off Windows, as it is.
+fn from_bash(text: &str) -> PathBuf {
+    let bytes = text.as_bytes();
+    if cfg!(windows)
+        && bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b'/'
+    {
+        let drive = char::from(bytes[1].to_ascii_uppercase());
+        PathBuf::from(format!("{drive}:{}", text[2..].replace('/', "\\")))
+    } else {
+        PathBuf::from(text)
+    }
+}
+
 fn readers() -> Vec<Reader> {
     let mut readers = Vec::new();
-    if cfg!(unix) {
+    if shell().is_some() {
         readers.push(Reader::Shell);
     }
     if powershell().is_some() {
@@ -114,7 +153,7 @@ impl Reader {
         let root = repository();
         let mut run = match self {
             Reader::Shell => {
-                let mut run = Command::new("bash");
+                let mut run = Command::new(shell().expect("a shell is installed"));
                 run.args([
                     "-c",
                     r#". "$1"
@@ -122,7 +161,15 @@ impl Reader {
                     printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)""#,
                     "bash",
                 ])
-                .arg(root.join("scripts").join("lib").join("artifacts-dir.sh"));
+                // With forward slashes, which Git Bash reads and a Windows path's backslashes it
+                // would take for escapes.
+                .arg(
+                    root.join("scripts")
+                        .join("lib")
+                        .join("artifacts-dir.sh")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
                 run
             }
             Reader::PowerShell => {
@@ -162,7 +209,10 @@ impl Reader {
         let line = |name: &str| {
             text.lines()
                 .find_map(|line| line.strip_prefix(&format!("{name}=")))
-                .map(|rest| PathBuf::from(rest.trim()))
+                .map(|rest| match self {
+                    Reader::Shell => from_bash(rest.trim()),
+                    Reader::PowerShell => PathBuf::from(rest.trim()),
+                })
         };
         Reading {
             succeeded: output.status.success(),
@@ -182,10 +232,11 @@ fn real(path: &Path) -> PathBuf {
     }
 }
 
-/// Whether two paths are the same, ignoring letter case on Windows.
+/// Whether two paths are the same, ignoring letter case and the kind of slash on Windows.
 fn same(left: &Path, right: &Path) -> bool {
+    let folded = |path: &Path| path.to_string_lossy().to_lowercase().replace('/', "\\");
     if cfg!(windows) {
-        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+        folded(left) == folded(right)
     } else {
         left == right
     }
@@ -592,6 +643,36 @@ fn a_temporary_folder_that_is_a_filesystem_root_admits_nothing_beside_the_other_
 #[cfg(windows)]
 mod windows_paths {
     use super::*;
+
+    /// The value the Windows acceptance run passes (the temporary folder by its long name) where
+    /// the machine's own `TEMP` may be its short name, and the same value in another letter case.
+    #[test]
+    fn the_long_name_and_a_changed_letter_case_of_the_temporary_folder_are_read_by_every_reader() {
+        for reader in readers() {
+            let temporary = tempfile::tempdir().expect("a temporary folder");
+            let long = real(temporary.path());
+            let evidence = long.join("evidence");
+            let lower = PathBuf::from(evidence.to_string_lossy().to_lowercase());
+            for value in [evidence.clone(), lower] {
+                let reading = reader.read(Some(value.as_os_str()), None);
+                assert!(
+                    reading.succeeded,
+                    "{reader:?} refused {value:?}: {reading:?}"
+                );
+                let directory = reading.directory.as_deref().expect("a directory");
+                assert!(same(directory, &evidence), "{reader:?}: {directory:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn git_bashs_slash_tmp_is_the_temporary_folder() {
+        if shell().is_none() {
+            return;
+        }
+        let reading = Reader::Shell.read(Some(OsStr::new("/tmp/kr-evidence")), None);
+        assert!(reading.succeeded, "{reading:?}");
+    }
 
     const POWER: Reader = Reader::PowerShell;
 
